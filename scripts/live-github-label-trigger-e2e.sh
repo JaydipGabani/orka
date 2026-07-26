@@ -71,7 +71,6 @@ preflight_only=0
 work_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/live-github-label-trigger-e2e.XXXXXX")"
 api_pf_log="${work_dir}/api-port-forward.log"
 manager_kustomization="${repo_root}/config/manager/kustomization.yaml"
-manager_kustomization_backup="${work_dir}/manager-kustomization.yaml.bak"
 
 redact() {
   local text
@@ -91,12 +90,6 @@ cleanup_port_forward() {
     fi
     wait "${api_pf_pid}" 2>/dev/null || true
     api_pf_pid=""
-  fi
-}
-
-restore_manager_kustomization() {
-  if [[ -f "${manager_kustomization_backup}" ]]; then
-    cp "${manager_kustomization_backup}" "${manager_kustomization}" || true
   fi
 }
 
@@ -150,7 +143,6 @@ on_exit() {
   fi
   kubectl delete agent "${agent_name}" -n default --ignore-not-found=true >/dev/null 2>&1 || true
 
-  restore_manager_kustomization
   make cleanup-test-e2e KIND_CLUSTER="${kind_cluster}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}" >/dev/null 2>&1 || true
 
@@ -386,7 +378,6 @@ main() {
     rm -rf "${work_dir}" >/dev/null 2>&1 || true
     exit 0
   fi
-  cp "${manager_kustomization}" "${manager_kustomization_backup}"
 
   trap 'status=$?; on_exit "${status}"; exit "${status}"' EXIT
 

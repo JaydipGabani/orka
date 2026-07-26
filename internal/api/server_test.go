@@ -11,14 +11,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	gatewayruntime "github.com/orka-agents/orka/internal/gateway"
 	"github.com/orka-agents/orka/internal/store/sqlite"
 )
 
@@ -51,6 +54,82 @@ func TestNewServer(t *testing.T) {
 	}
 	if server.config.Port != 8080 {
 		t.Errorf("Port = %d, want 8080", server.config.Port)
+	}
+}
+
+func TestServerConfigHandlersConfig(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1alpha1.AddToScheme(scheme)
+	resourceClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	apiReader := fake.NewClientBuilder().WithScheme(scheme).Build()
+	clientset := kubernetesfake.NewSimpleClientset()
+
+	db, err := sqlite.NewDB(":memory:")
+	if err != nil {
+		t.Fatalf("create sqlite database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	stores := sqlite.NewStore(db, ":memory:")
+	healthChecker := &mockHealthChecker{}
+	gatewayService := &gatewayruntime.Service{}
+	authorization := ContextTokenAuthorizationConfig{
+		Mode:           ContextTokenAuthorizationModeEnforce,
+		TaskReadScopes: []string{ContextTokenScopeTaskGet},
+	}
+
+	config := ServerConfig{
+		APIReader:                 apiReader,
+		WatchNamespace:            "test-namespace",
+		EnforceNamespaceIsolation: true,
+		ContextTokenAuthorization: authorization,
+		ResultStore:               stores,
+		SessionStore:              stores,
+		PlanStore:                 stores,
+		ArtifactStore:             stores,
+		MemoryStore:               stores,
+		MemoryProposalStore:       stores,
+		SecurityStore:             stores,
+		RepositoryMonitorStore:    stores,
+		ExecutionEventStore:       stores,
+		GatewayEventStore:         stores,
+		GatewayDeliveryStore:      stores,
+		GatewayService:            gatewayService,
+		HealthChecker:             healthChecker,
+		Clientset:                 clientset,
+	}
+
+	got := config.handlersConfig(resourceClient)
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{name: "client", got: got.Client, want: resourceClient},
+		{name: "API reader", got: got.APIReader, want: apiReader},
+		{name: "watch namespace", got: got.WatchNamespace, want: "test-namespace"},
+		{name: "namespace isolation", got: got.EnforceNamespaceIsolation, want: true},
+		{name: "context token authorization", got: got.ContextTokenAuthorization, want: authorization},
+		{name: "result store", got: got.ResultStore, want: stores},
+		{name: "session store", got: got.SessionStore, want: stores},
+		{name: "plan store", got: got.PlanStore, want: stores},
+		{name: "Kubernetes client", got: got.KubeClient, want: clientset},
+		{name: "health checker", got: got.HealthChecker, want: healthChecker},
+		{name: "artifact store", got: got.ArtifactStore, want: stores},
+		{name: "memory store", got: got.MemoryStore, want: stores},
+		{name: "memory proposal store", got: got.MemoryProposalStore, want: stores},
+		{name: "security store", got: got.SecurityStore, want: stores},
+		{name: "repository monitor store", got: got.RepositoryMonitorStore, want: stores},
+		{name: "execution event store", got: got.ExecutionEventStore, want: stores},
+		{name: "gateway event store", got: got.GatewayEventStore, want: stores},
+		{name: "gateway delivery store", got: got.GatewayDeliveryStore, want: stores},
+		{name: "gateway service", got: got.GatewayService, want: gatewayService},
+	}
+	for _, check := range checks {
+		t.Run(check.name, func(t *testing.T) {
+			if !reflect.DeepEqual(check.got, check.want) {
+				t.Fatalf("got %#v, want %#v", check.got, check.want)
+			}
+		})
 	}
 }
 

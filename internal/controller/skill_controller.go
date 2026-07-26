@@ -26,6 +26,8 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 )
 
+const skillPhaseReady = "Ready"
+
 const (
 	// skillContentSizeWarning is the threshold above which a warning condition is set
 	skillContentSizeWarning = 10 * 1024 // 10KB
@@ -72,7 +74,7 @@ func (r *SkillReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 	r.setContentSizeCondition(skill, contentSize)
 
-	return r.updateStatus(ctx, skill, "Ready", contentHash, "")
+	return r.updateStatus(ctx, skill, skillPhaseReady, contentHash, "")
 }
 
 // validateSkill validates the Skill spec.
@@ -142,7 +144,7 @@ func (r *SkillReconciler) updateStatus(ctx context.Context, skill *corev1alpha1.
 		ObservedGeneration: skill.Generation,
 	}
 
-	if phase == "Ready" {
+	if phase == skillPhaseReady {
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = "ContentValid"
 		condition.Message = "Skill content validated successfully"

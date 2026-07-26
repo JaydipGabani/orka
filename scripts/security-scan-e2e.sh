@@ -55,7 +55,6 @@ kind_config="${ORKA_SECURITY_SCAN_KIND_CONFIG:-${work_dir}/kind-config.yaml}"
 fake_dockerfile="${work_dir}/Dockerfile.fake-codex"
 api_pf_log="${work_dir}/api-port-forward.log"
 manager_kustomization="${repo_root}/config/manager/kustomization.yaml"
-manager_kustomization_backup="${work_dir}/manager-kustomization.yaml.bak"
 api_base=""
 api_token=""
 
@@ -80,12 +79,6 @@ run_redacted() {
   local rc=${PIPESTATUS[0]}
   set -e
   return "${rc}"
-}
-
-restore_manager_kustomization() {
-  if [[ -f "${manager_kustomization_backup}" ]]; then
-    cp "${manager_kustomization_backup}" "${manager_kustomization}" || true
-  fi
 }
 
 cleanup_port_forward() {
@@ -156,7 +149,6 @@ on_exit() {
     fi
   fi
   cleanup_port_forward
-  restore_manager_kustomization
   if [[ "${created_kind_cluster}" == "1" && "${keep_cluster}" != "1" ]]; then
     kind delete cluster --name "${kind_cluster}" >/dev/null 2>&1 || true
   elif [[ "${keep_cluster}" == "1" ]]; then
@@ -787,7 +779,6 @@ main() {
 
   cd "${repo_root}"
   [[ -f "${manager_kustomization}" ]] || die "missing ${manager_kustomization}"
-  cp "${manager_kustomization}" "${manager_kustomization_backup}"
 
   trap 'status=$?; on_exit "${status}"; exit "${status}"' EXIT
 

@@ -1,9 +1,8 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { http, HttpResponse } from 'msw'
-import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { server } from '@/test/mocks/server'
+import { createTestQueryClient, createTestQueryClientWrapper } from '@/test/test-utils'
 
 vi.mock('zustand/middleware', () => ({
   persist: (fn: unknown) => fn,
@@ -22,18 +21,6 @@ import {
   useRepositoryMonitorWorkActions,
   useRunRepositoryMonitor,
 } from './use-monitors'
-
-function createTestQueryClient() {
-  return new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
-  })
-}
-
-function createWrapper(queryClient: QueryClient) {
-  return ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
-  )
-}
 
 function useRepositoryMonitorCollections(name: string) {
   return {
@@ -73,7 +60,7 @@ describe('repository monitor collection hooks', () => {
     )
 
     const { result } = renderHook(() => useRepositoryMonitorCollections('example-app'), {
-      wrapper: createWrapper(queryClient),
+      wrapper: createTestQueryClientWrapper({ client: queryClient }),
     })
 
     await waitFor(() => {
@@ -141,7 +128,7 @@ describe('repository monitor collection hooks', () => {
   it('does not fetch collections until a monitor name is available', () => {
     const queryClient = createTestQueryClient()
     const { result } = renderHook(() => useRepositoryMonitorCollections(''), {
-      wrapper: createWrapper(queryClient),
+      wrapper: createTestQueryClientWrapper({ client: queryClient }),
     })
 
     expect(Object.values(result.current).every((query) => query.fetchStatus === 'idle')).toBe(true)
@@ -181,7 +168,7 @@ describe('useCreateRepositoryMonitorCommand', () => {
 
     const body = { kind: 'pull_request', number: 42, intent: 'review', targetSHA: 'abc123' }
     const { result } = renderHook(() => useCreateRepositoryMonitorCommand('example-app'), {
-      wrapper: createWrapper(queryClient),
+      wrapper: createTestQueryClientWrapper({ client: queryClient }),
     })
 
     await act(async () => {
@@ -226,7 +213,7 @@ describe('useCreateRepositoryMonitor', () => {
       },
     }
 
-    const { result } = renderHook(() => useCreateRepositoryMonitor(), { wrapper: createWrapper(queryClient) })
+    const { result } = renderHook(() => useCreateRepositoryMonitor(), { wrapper: createTestQueryClientWrapper({ client: queryClient }) })
 
     await act(async () => {
       await result.current.mutateAsync(body)
@@ -252,7 +239,7 @@ describe('useRunRepositoryMonitor', () => {
     )
 
     const { result } = renderHook(() => useRunRepositoryMonitor('example-app'), {
-      wrapper: createWrapper(queryClient),
+      wrapper: createTestQueryClientWrapper({ client: queryClient }),
     })
 
     await act(async () => {

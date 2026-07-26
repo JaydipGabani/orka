@@ -89,27 +89,7 @@ func NewServer(c client.Client, sessionManager *sessionmanager.Manager, config S
 		sessionManager: sessionManager,
 	}
 
-	server.handlers = NewHandlers(HandlersConfig{
-		Client:                    c,
-		APIReader:                 config.APIReader,
-		WatchNamespace:            config.WatchNamespace,
-		EnforceNamespaceIsolation: config.EnforceNamespaceIsolation,
-		ContextTokenAuthorization: config.ContextTokenAuthorization,
-		ResultStore:               config.ResultStore,
-		SessionStore:              config.SessionStore,
-		PlanStore:                 config.PlanStore,
-		KubeClient:                config.Clientset,
-		HealthChecker:             config.HealthChecker,
-		ArtifactStore:             config.ArtifactStore,
-		MemoryStore:               config.MemoryStore,
-		MemoryProposalStore:       config.MemoryProposalStore,
-		SecurityStore:             config.SecurityStore,
-		RepositoryMonitorStore:    config.RepositoryMonitorStore,
-		ExecutionEventStore:       config.ExecutionEventStore,
-		GatewayEventStore:         config.GatewayEventStore,
-		GatewayDeliveryStore:      config.GatewayDeliveryStore,
-		GatewayService:            config.GatewayService,
-	})
+	server.handlers = NewHandlers(config.handlersConfig(c))
 	resolver := NewProviderResolver(c, config.Chat)
 	server.chatHandler = NewChatHandler(c, sessionManager, config.Chat, config.WatchNamespace, config.EnforceNamespaceIsolation, config.SessionStore, config.ResultStore, resolver, config.Clientset)
 	server.chatHandler.contextTokenAuthorization = config.ContextTokenAuthorization

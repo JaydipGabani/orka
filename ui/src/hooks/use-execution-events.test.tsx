@@ -1,9 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { http, HttpResponse } from 'msw'
 import { renderHook, waitFor } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import type { ReactNode } from 'react'
 import { server } from '@/test/mocks/server'
+import { createTestQueryClient, createTestQueryClientWrapper as createWrapper } from '@/test/test-utils'
 import { useUIStore } from '@/stores/ui'
 import {
   useTaskEvents,
@@ -19,15 +18,6 @@ const API = '/api/v1'
 vi.mock('zustand/middleware', () => ({
   persist: (fn: unknown) => fn,
 }))
-
-function createWrapper() {
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
-  })
-  return ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
-  )
-}
 
 describe('use-execution-events hooks', () => {
   beforeEach(() => {
@@ -99,9 +89,7 @@ describe('use-execution-events hooks', () => {
     // never overwrites the other with an incompatible shape/partial page. Seed the
     // ['taskEvents', ...] entry with a sentinel and confirm this hook ignores it
     // and fetches its own data.
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
-    })
+    const client = createTestQueryClient()
     // Sentinel under the OTHER hook's key (same id/namespace/uid tuple).
     client.setQueryData(
       ['taskEvents', 'tk', 'default', 'uid-1'],
@@ -116,9 +104,7 @@ describe('use-execution-events hooks', () => {
         })
       }),
     )
-    const wrapper = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
-    )
+    const wrapper = createWrapper({ client })
     const { result } = renderHook(() => useTaskEvents('tk', true, 'uid-1'), { wrapper })
     await waitFor(() => expect(result.current.isSuccess).toBe(true))
     // It fetched fresh (didn't read the sentinel under the other hook's key) and
@@ -365,17 +351,13 @@ describe('use-execution-events hooks', () => {
         ),
       ),
     )
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
-    })
+    const client = createTestQueryClient()
     const invalidated: unknown[] = []
     const spy = vi.spyOn(client, 'invalidateQueries').mockImplementation((filters?: { queryKey?: unknown }) => {
       invalidated.push(filters?.queryKey)
       return Promise.resolve()
     })
-    const wrapper = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
-    )
+    const wrapper = createWrapper({ client })
     const { result } = renderHook(() => useForkTask('tk'), { wrapper })
     await result.current.mutateAsync({ afterSeq: 1 })
     const keys = invalidated.map((k) => (Array.isArray(k) ? k[0] : k))

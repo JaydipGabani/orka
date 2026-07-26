@@ -1124,21 +1124,9 @@ func (r *RepositoryScanReconciler) progressScanRunAfterMapper(ctx context.Contex
 		return true, nil
 	}
 
+	defaultSummary := "Threat model generated; no reviewable security slices found"
 	if run.Mode == scanModeIncremental && run.SliceCount > 0 && run.SkippedSliceCount == run.SliceCount {
-		now := time.Now()
-		run.Phase = scanRunPhaseSucceeded
-		run.CompletedAt = &now
-		run.ErrorMessage = ""
-		if needsNoopScanSummary(run.Summary) {
-			run.Summary = "Threat model generated; no changed files matched deterministic review slices"
-		}
-		if err := r.SecurityStore.UpdateScanRun(ctx, run); err != nil {
-			return false, err
-		}
-		if err := r.updateNoopScanStatus(ctx, scan, run); err != nil {
-			return false, err
-		}
-		return true, nil
+		defaultSummary = "Threat model generated; no changed files matched deterministic review slices"
 	}
 
 	now := time.Now()
@@ -1146,56 +1134,85 @@ func (r *RepositoryScanReconciler) progressScanRunAfterMapper(ctx context.Contex
 	run.CompletedAt = &now
 	run.ErrorMessage = ""
 	if needsNoopScanSummary(run.Summary) {
-		run.Summary = "Threat model generated; no reviewable security slices found"
+		run.Summary = defaultSummary
 	}
 	if err := r.SecurityStore.UpdateScanRun(ctx, run); err != nil {
 		return false, err
 	}
-	if err := r.updateNoopScanStatus(ctx, scan, run); err != nil {
+	if err := r.updateSuccessfulScanStatus(ctx, scan, run); err != nil {
 		return false, err
 	}
 
 	return true, nil
 }
 
-func (r *RepositoryScanReconciler) updateNoopScanStatus(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) error {
-	counts, err := r.SecurityStore.GetFindingCounts(ctx, scan.Namespace, scan.Name)
+func (r *RepositoryScanReconciler) updateSuccessfulScanStatus(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) error {
+	counts, threatModelVersion, err := r.repositoryScanStatusProjection(ctx, scan)
 	if err != nil {
 		return err
+	}
+
+	return r.updateStatusWithRetry(ctx, scan, func(s *corev1alpha1.RepositoryScan) {
+		applySuccessfulScanRunStatus(s, run, counts, threatModelVersion)
+	})
+}
+
+func (r *RepositoryScanReconciler) repositoryScanStatusProjection(
+	ctx context.Context,
+	scan *corev1alpha1.RepositoryScan,
+) (store.FindingCounts, int64, error) {
+	counts, err := r.SecurityStore.GetFindingCounts(ctx, scan.Namespace, scan.Name)
+	if err != nil {
+		return store.FindingCounts{}, 0, err
 	}
 
 	var threatModelVersion int64
 	if model, err := r.SecurityStore.GetLatestThreatModel(ctx, scan.Namespace, scan.Name); err == nil {
 		threatModelVersion = model.Version
 	}
+	return counts, threatModelVersion, nil
+}
 
-	return r.updateStatusWithRetry(ctx, scan, func(s *corev1alpha1.RepositoryScan) {
-		s.Status.Phase = repositoryScanPhaseReady
-		s.Status.LastScanID = run.ID
-		s.Status.LastScanTaskName = run.TaskName
-		s.Status.LastObservedHeadSHA = run.HeadCommit
-		s.Status.LastProcessedCommit = run.HeadCommit
-		s.Status.ThreatModelVersion = threatModelVersion
-		s.Status.FindingCounts = corev1alpha1.FindingCountsStatus{
-			Total:    counts.Total,
-			Critical: counts.Critical,
-			High:     counts.High,
-			Medium:   counts.Medium,
-			Low:      counts.Low,
-		}
-		if run.CompletedAt != nil {
-			completedAt := &metav1.Time{Time: *run.CompletedAt}
-			s.Status.LastScanAt = completedAt
-			s.Status.LastSuccessfulScanAt = completedAt
-		}
-		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionTrue,
-			Reason:             "ScanSucceeded",
-			Message:            repositoryScanConditionMessage(run.Summary, "scan completed successfully"),
-			LastTransitionTime: metav1.Now(),
-			ObservedGeneration: s.Generation,
-		})
+func applyScanRunStatusProjection(
+	scan *corev1alpha1.RepositoryScan,
+	run *store.ScanRun,
+	counts store.FindingCounts,
+	threatModelVersion int64,
+) {
+	scan.Status.LastScanID = run.ID
+	scan.Status.LastScanTaskName = run.TaskName
+	scan.Status.LastObservedHeadSHA = run.HeadCommit
+	scan.Status.ThreatModelVersion = threatModelVersion
+	scan.Status.FindingCounts = corev1alpha1.FindingCountsStatus{
+		Total:    counts.Total,
+		Critical: counts.Critical,
+		High:     counts.High,
+		Medium:   counts.Medium,
+		Low:      counts.Low,
+	}
+}
+
+func applySuccessfulScanRunStatus(
+	scan *corev1alpha1.RepositoryScan,
+	run *store.ScanRun,
+	counts store.FindingCounts,
+	threatModelVersion int64,
+) {
+	applyScanRunStatusProjection(scan, run, counts, threatModelVersion)
+	scan.Status.Phase = repositoryScanPhaseReady
+	scan.Status.LastProcessedCommit = run.HeadCommit
+	if run.CompletedAt != nil {
+		completedAt := &metav1.Time{Time: *run.CompletedAt}
+		scan.Status.LastScanAt = completedAt
+		scan.Status.LastSuccessfulScanAt = completedAt
+	}
+	meta.SetStatusCondition(&scan.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		Reason:             "ScanSucceeded",
+		Message:            repositoryScanConditionMessage(run.Summary, "scan completed successfully"),
+		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: scan.Generation,
 	})
 }
 
@@ -1823,29 +1840,18 @@ func (r *RepositoryScanReconciler) refreshScanRunStatus(
 		return nil
 	}
 
-	counts, err := r.SecurityStore.GetFindingCounts(ctx, scan.Namespace, scan.Name)
+	counts, threatModelVersion, err := r.repositoryScanStatusProjection(ctx, scan)
 	if err != nil {
 		return err
 	}
 
-	var threatModelVersion int64
-	if model, err := r.SecurityStore.GetLatestThreatModel(ctx, scan.Namespace, scan.Name); err == nil {
-		threatModelVersion = model.Version
-	}
-
 	return r.updateStatusWithRetry(ctx, scan, func(s *corev1alpha1.RepositoryScan) {
-		s.Status.LastScanID = run.ID
-		s.Status.LastScanTaskName = run.TaskName
-		s.Status.LastObservedHeadSHA = run.HeadCommit
-		s.Status.ThreatModelVersion = threatModelVersion
-		s.Status.FindingCounts = corev1alpha1.FindingCountsStatus{
-			Total:    counts.Total,
-			Critical: counts.Critical,
-			High:     counts.High,
-			Medium:   counts.Medium,
-			Low:      counts.Low,
+		if run.Phase == scanRunPhaseSucceeded {
+			applySuccessfulScanRunStatus(s, run, counts, threatModelVersion)
+			return
 		}
 
+		applyScanRunStatusProjection(s, run, counts, threatModelVersion)
 		switch run.Phase {
 		case scanRunPhaseRunning, scanRunPhasePending:
 			s.Status.Phase = repositoryScanPhaseScanning
@@ -1854,22 +1860,6 @@ func (r *RepositoryScanReconciler) refreshScanRunStatus(
 				Status:             metav1.ConditionFalse,
 				Reason:             "Scanning",
 				Message:            repositoryScanConditionMessage(run.Summary, scanSummaryRunning),
-				LastTransitionTime: metav1.Now(),
-				ObservedGeneration: s.Generation,
-			})
-		case scanRunPhaseSucceeded:
-			s.Status.Phase = repositoryScanPhaseReady
-			s.Status.LastProcessedCommit = run.HeadCommit
-			if run.CompletedAt != nil {
-				t := &metav1.Time{Time: *run.CompletedAt}
-				s.Status.LastScanAt = t
-				s.Status.LastSuccessfulScanAt = t
-			}
-			meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionTrue,
-				Reason:             "ScanSucceeded",
-				Message:            repositoryScanConditionMessage(run.Summary, "scan completed successfully"),
 				LastTransitionTime: metav1.Now(),
 				ObservedGeneration: s.Generation,
 			})

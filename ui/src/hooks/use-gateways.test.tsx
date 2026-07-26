@@ -1,22 +1,13 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { http, HttpResponse } from 'msw'
-import type { ReactNode } from 'react'
 import { server } from '@/test/mocks/server'
+
+import { createTestQueryClientWrapper as createWrapper } from '@/test/test-utils'
 
 vi.mock('zustand/middleware', () => ({ persist: (fn: unknown) => fn }))
 
 import { useUIStore } from '@/stores/ui'
 import { useGatewayBinding, useGatewayDeliveries, useGatewayEvents, useGatewayLedgerPagination, useGateways } from './use-gateways'
-
-function createWrapper() {
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
-  })
-  return ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
-  )
-}
 
 beforeEach(() => {
   useUIStore.setState({ namespace: 'default', sidebarCollapsed: false, theme: 'light' })

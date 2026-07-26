@@ -671,7 +671,7 @@ func (r *ToolReconciler) cleanupSubstrateMCPPoolActor(
 	if err := r.Delete(ctx, lease, deleteCurrentObjectPreconditions(lease)...); err != nil && !errors.IsNotFound(err) {
 		if errors.IsConflict(err) {
 			stillHeld, verifyErr := substrateLeaseStillMatchesAfterDeleteConflict(ctx, r.Client, lease, func(latest *coordinationv1.Lease) bool {
-				return substratePoolActorLeaseHeldByTool(latest, tool)
+				return substrateActorLeaseHeldByTool(latest, tool)
 			})
 			if verifyErr != nil {
 				return verifyErr
@@ -697,14 +697,14 @@ func (r *ToolReconciler) substrateMCPPoolActorLeaseHeldByTool(
 		return nil, false, nil
 	}
 	lease := &coordinationv1.Lease{}
-	key := types.NamespacedName{Namespace: leaseNamespace, Name: substratePoolActorLeaseName(actorID)}
+	key := types.NamespacedName{Namespace: leaseNamespace, Name: substrateActorLeaseName(actorID)}
 	if err := r.Get(ctx, key, lease); err != nil {
 		if errors.IsNotFound(err) {
 			return nil, false, nil
 		}
 		return nil, false, err
 	}
-	if !substratePoolActorLeaseHeldByTool(lease, tool) {
+	if !substrateActorLeaseHeldByTool(lease, tool) {
 		return lease, false, nil
 	}
 	return lease, true, nil
@@ -715,7 +715,7 @@ func (r *ToolReconciler) ensureSubstrateMCPToolActorLease(ctx context.Context, t
 	if actorID == "" {
 		return nil
 	}
-	key := types.NamespacedName{Namespace: tool.Namespace, Name: substrateMCPToolActorLeaseName(actorID)}
+	key := types.NamespacedName{Namespace: tool.Namespace, Name: substrateActorLeaseName(actorID)}
 	lease := &coordinationv1.Lease{}
 	if err := r.Get(ctx, key, lease); err != nil {
 		if !errors.IsNotFound(err) {
@@ -730,7 +730,7 @@ func (r *ToolReconciler) ensureSubstrateMCPToolActorLease(ctx context.Context, t
 		}
 		return nil
 	}
-	if !substrateMCPToolActorLeaseHeldByTool(lease, tool) {
+	if !substrateActorLeaseHeldByTool(lease, tool) {
 		return fmt.Errorf("substrate MCP tool actor lease %q in namespace %q is held by another owner", lease.Name, lease.Namespace)
 	}
 	patch := client.MergeFromWithOptions(lease.DeepCopy(), client.MergeFromWithOptimisticLock{})
@@ -787,10 +787,10 @@ func (r *ToolReconciler) substrateMCPToolActorLeaseDeleteRefs(
 	refs := make([]substrateMCPActorDeleteRef, 0, len(leases.Items))
 	for i := range leases.Items {
 		lease := &leases.Items[i]
-		if !substrateMCPToolActorLeaseHeldByTool(lease, tool) {
+		if !substrateActorLeaseHeldByTool(lease, tool) {
 			continue
 		}
-		actorID := substrateMCPToolActorLeaseActorID(lease)
+		actorID := substrateActorLeaseActorID(lease)
 		if actorID == "" {
 			continue
 		}
@@ -811,7 +811,7 @@ func (r *ToolReconciler) substrateMCPToolActorLeaseHeldByTool(
 		return nil, false, nil
 	}
 	lease := &coordinationv1.Lease{}
-	key := types.NamespacedName{Namespace: leaseNamespace, Name: substrateMCPToolActorLeaseName(actorID)}
+	key := types.NamespacedName{Namespace: leaseNamespace, Name: substrateActorLeaseName(actorID)}
 	if err := r.Get(ctx, key, lease); err != nil {
 		if errors.IsNotFound(err) {
 			return nil, false, nil
@@ -819,7 +819,7 @@ func (r *ToolReconciler) substrateMCPToolActorLeaseHeldByTool(
 		return nil, false, err
 	}
 	if lease.Labels[labels.LabelPurpose] != substrateMCPToolActorLeasePurpose ||
-		!substrateMCPToolActorLeaseHeldByTool(lease, tool) {
+		!substrateActorLeaseHeldByTool(lease, tool) {
 		return lease, false, nil
 	}
 	return lease, true, nil
@@ -841,7 +841,7 @@ func (r *ToolReconciler) deleteSubstrateMCPToolActorLease(
 	if err := r.Delete(ctx, lease, deleteCurrentObjectPreconditions(lease)...); err != nil && !errors.IsNotFound(err) {
 		if errors.IsConflict(err) {
 			stillHeld, verifyErr := substrateLeaseStillMatchesAfterDeleteConflict(ctx, r.Client, lease, func(latest *coordinationv1.Lease) bool {
-				return substrateMCPToolActorLeaseHeldByTool(latest, tool)
+				return substrateActorLeaseHeldByTool(latest, tool)
 			})
 			if verifyErr != nil {
 				return verifyErr
@@ -948,39 +948,17 @@ func (r *ToolReconciler) tryReserveSubstrateMCPPoolActor(
 	leaseNamespace string,
 	actorID string,
 ) (bool, error) {
-	leaseName := substratePoolActorLeaseName(actorID)
-	lease := &coordinationv1.Lease{}
-	key := types.NamespacedName{Namespace: leaseNamespace, Name: leaseName}
-	err := r.Get(ctx, key, lease)
-	if errors.IsNotFound(err) {
-		lease = newSubstrateMCPPoolActorLease(tool, leaseNamespace, leaseName, actorID)
-		if err := r.Create(ctx, lease); err != nil {
-			if errors.IsAlreadyExists(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if substratePoolActorLeaseHeldByTool(lease, tool) {
-		return true, nil
-	}
-	busy, err := substratePoolActorLeaseHasActiveHolder(ctx, r.Client, lease)
-	if err != nil || busy {
-		return false, err
-	}
-	patch := client.MergeFromWithOptions(lease.DeepCopy(), client.MergeFromWithOptimisticLock{})
-	setSubstrateMCPPoolActorLeaseHolder(lease, tool, actorID)
-	if err := r.Patch(ctx, lease, patch); err != nil {
-		if errors.IsConflict(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
+	return tryReserveSubstratePoolActorLease(ctx, r.Client, leaseNamespace, actorID, substratePoolActorLeaseHolderOps{
+		newLease: func(namespace, name, actorID string) *coordinationv1.Lease {
+			return newSubstrateMCPPoolActorLease(tool, namespace, name, actorID)
+		},
+		matches: func(lease *coordinationv1.Lease) bool {
+			return substrateActorLeaseHeldByTool(lease, tool)
+		},
+		assign: func(lease *coordinationv1.Lease, actorID string) {
+			setSubstrateMCPPoolActorLeaseHolder(lease, tool, actorID)
+		},
+	})
 }
 
 func (r *ToolReconciler) reserveSubstrateMCPPoolActor(
@@ -1034,10 +1012,10 @@ func (r *ToolReconciler) substrateMCPPoolActorLeaseForTool(
 	}
 	for i := range leases.Items {
 		lease := &leases.Items[i]
-		if !substratePoolActorLeaseHeldByTool(lease, tool) {
+		if !substrateActorLeaseHeldByTool(lease, tool) {
 			continue
 		}
-		actorID := substratePoolActorLeaseActorID(lease)
+		actorID := substrateActorLeaseActorID(lease)
 		if ordinal, ok := substratePoolActorOrdinalFromID(actorID, prefix); ok && ordinal < target {
 			return actorID, true, nil
 		}

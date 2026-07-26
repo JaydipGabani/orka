@@ -1,10 +1,10 @@
 import { renderHook, waitFor } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { http, HttpResponse } from 'msw'
-import type { ReactNode } from 'react'
 import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { server } from '@/test/mocks/server'
 import type { SecurityFinding } from '@/schemas/security'
+
+import { createTestQueryClientWrapper as createWrapper } from '@/test/test-utils'
 
 vi.mock('zustand/middleware', () => ({
   persist: (fn: unknown) => fn,
@@ -12,15 +12,6 @@ vi.mock('zustand/middleware', () => ({
 
 import { useUIStore } from '@/stores/ui'
 import { useAllFindings } from './use-security'
-
-function createWrapper() {
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
-  })
-  return ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
-  )
-}
 
 function makeFinding(id: string): SecurityFinding {
   return {

@@ -100,7 +100,7 @@ func setSubstrateMCPPoolActorLeaseHolder(lease *coordinationv1.Lease, tool *core
 	setSubstrateMCPToolLeaseHolder(lease, tool, actorID, substratePoolActorLeasePurpose)
 }
 
-func substrateMCPToolActorLeaseName(actorID string) string {
+func substrateActorLeaseName(actorID string) string {
 	return strings.TrimSpace(actorID)
 }
 
@@ -112,7 +112,7 @@ func newSubstrateMCPToolActorLease(
 	lease := &coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
-			Name:      substrateMCPToolActorLeaseName(actorID),
+			Name:      substrateActorLeaseName(actorID),
 		},
 	}
 	setSubstrateMCPToolActorLeaseHolder(lease, tool, actorID)
@@ -156,7 +156,7 @@ func substratePoolActorLeaseHeldByTask(lease *coordinationv1.Lease, task *corev1
 		lease.Annotations[substratePoolActorLeaseTaskUIDAnno] == string(task.UID)
 }
 
-func substratePoolActorLeaseHeldByTool(lease *coordinationv1.Lease, tool *corev1alpha1.Tool) bool {
+func substrateActorLeaseHeldByTool(lease *coordinationv1.Lease, tool *corev1alpha1.Tool) bool {
 	if lease == nil || tool == nil || lease.Annotations == nil {
 		return false
 	}
@@ -168,19 +168,7 @@ func substratePoolActorLeaseHeldByTool(lease *coordinationv1.Lease, tool *corev1
 	return leaseUID == "" || string(tool.UID) == "" || leaseUID == string(tool.UID)
 }
 
-func substrateMCPToolActorLeaseHeldByTool(lease *coordinationv1.Lease, tool *corev1alpha1.Tool) bool {
-	if lease == nil || tool == nil || lease.Annotations == nil {
-		return false
-	}
-	if lease.Annotations[substratePoolActorLeaseToolNSAnno] != tool.Namespace ||
-		lease.Annotations[substratePoolActorLeaseToolNameAnno] != tool.Name {
-		return false
-	}
-	leaseUID := lease.Annotations[substratePoolActorLeaseToolUIDAnno]
-	return leaseUID == "" || string(tool.UID) == "" || leaseUID == string(tool.UID)
-}
-
-func substratePoolActorLeaseActorID(lease *coordinationv1.Lease) string {
+func substrateActorLeaseActorID(lease *coordinationv1.Lease) string {
 	if lease == nil {
 		return ""
 	}
@@ -192,20 +180,52 @@ func substratePoolActorLeaseActorID(lease *coordinationv1.Lease) string {
 	return strings.TrimSpace(lease.Name)
 }
 
-func substrateMCPToolActorLeaseActorID(lease *coordinationv1.Lease) string {
-	if lease == nil {
-		return ""
-	}
-	if lease.Labels != nil {
-		if actorID := strings.TrimSpace(lease.Labels[substratePoolActorLeaseActorIDLabel]); actorID != "" {
-			return actorID
-		}
-	}
-	return strings.TrimSpace(lease.Name)
+type substratePoolActorLeaseHolderOps struct {
+	newLease func(namespace, name, actorID string) *coordinationv1.Lease
+	matches  func(*coordinationv1.Lease) bool
+	assign   func(*coordinationv1.Lease, string)
 }
 
-func substratePoolActorLeaseName(actorID string) string {
-	return strings.TrimSpace(actorID)
+func tryReserveSubstratePoolActorLease(
+	ctx context.Context,
+	kubeClient client.Client,
+	leaseNamespace string,
+	actorID string,
+	holder substratePoolActorLeaseHolderOps,
+) (bool, error) {
+	leaseName := substrateActorLeaseName(actorID)
+	lease := &coordinationv1.Lease{}
+	key := types.NamespacedName{Namespace: leaseNamespace, Name: leaseName}
+	err := kubeClient.Get(ctx, key, lease)
+	if apierrors.IsNotFound(err) {
+		lease = holder.newLease(leaseNamespace, leaseName, actorID)
+		if err := kubeClient.Create(ctx, lease); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if holder.matches(lease) {
+		return true, nil
+	}
+	busy, err := substratePoolActorLeaseHasActiveHolder(ctx, kubeClient, lease)
+	if err != nil || busy {
+		return false, err
+	}
+	patch := client.MergeFromWithOptions(lease.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	holder.assign(lease, actorID)
+	if err := kubeClient.Patch(ctx, lease, patch); err != nil {
+		if apierrors.IsConflict(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func substratePoolActorLeaseHasActiveHolder(ctx context.Context, reader client.Reader, lease *coordinationv1.Lease) (bool, error) {
@@ -337,7 +357,7 @@ func (r *SubstrateActorPoolReconciler) activeSubstratePoolActorLeaseCount(
 	active := 0
 	for i := range leases.Items {
 		lease := &leases.Items[i]
-		actorID := substratePoolActorLeaseActorID(lease)
+		actorID := substrateActorLeaseActorID(lease)
 		ordinal, ok := substratePoolActorOrdinalFromID(actorID, prefix)
 		if !ok || ordinal < target {
 			continue

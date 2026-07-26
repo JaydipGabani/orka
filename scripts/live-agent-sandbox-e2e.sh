@@ -74,7 +74,6 @@ api_pf_log="${work_dir}/api-port-forward.log"
 router_pf_log="${work_dir}/router-port-forward.log"
 smoke_go_dir="${repo_root}/.tmp-live-agent-sandbox-smoke-${e2e_run_id}"
 manager_kustomization="${repo_root}/config/manager/kustomization.yaml"
-manager_kustomization_backup="${work_dir}/manager-kustomization.yaml.bak"
 
 if [[ "${agent_sandbox_version}" != "v0.5.0" ]]; then
   die "this e2e is pinned to agent-sandbox v0.5.0 to match go.mod"
@@ -95,12 +94,6 @@ cleanup_port_forward() {
   api_pf_pid=""
   cleanup_one_port_forward "${router_pf_pid}"
   router_pf_pid=""
-}
-
-restore_manager_kustomization() {
-  if [[ -f "${manager_kustomization_backup}" ]]; then
-    cp "${manager_kustomization_backup}" "${manager_kustomization}" || true
-  fi
 }
 
 dump_diagnostics() {
@@ -163,7 +156,6 @@ on_exit() {
   fi
 
   cleanup_port_forward
-  restore_manager_kustomization
   if [[ "${created_kind_cluster}" == "1" ]]; then
     kind delete cluster --name "${kind_cluster}" >/dev/null 2>&1 || true
   fi
@@ -1103,7 +1095,6 @@ main() {
 
   cd "${repo_root}"
   [[ -f "${manager_kustomization}" ]] || die "missing ${manager_kustomization}"
-  cp "${manager_kustomization}" "${manager_kustomization_backup}"
 
   trap 'status=$?; on_exit "${status}"; exit "${status}"' EXIT
 

@@ -2134,7 +2134,7 @@ func TestTryReserveSubstratePoolActorDoesNotTakeOverMissingToolHolderLease(t *te
 	if err := r.Get(ctx, types.NamespacedName{Name: testSubstrateActorID, Namespace: "default"}, &got); err != nil {
 		t.Fatalf("Get lease: %v", err)
 	}
-	if !substratePoolActorLeaseHeldByTool(&got, oldHolder) {
+	if !substrateActorLeaseHeldByTool(&got, oldHolder) {
 		t.Fatalf("lease holder changed to annotations %#v, want missing old tool", got.Annotations)
 	}
 }

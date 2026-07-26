@@ -1379,7 +1379,7 @@ func (r *TaskReconciler) substratePoolActorLeaseForTask(
 		if !substratePoolActorLeaseHeldByTask(lease, task) {
 			continue
 		}
-		if actorID := substratePoolActorLeaseActorID(lease); actorID != "" {
+		if actorID := substrateActorLeaseActorID(lease); actorID != "" {
 			return actorID, true, nil
 		}
 	}
@@ -1392,39 +1392,17 @@ func (r *TaskReconciler) tryReserveSubstratePoolActor(
 	leaseNamespace string,
 	actorID string,
 ) (bool, error) {
-	leaseName := substratePoolActorLeaseName(actorID)
-	lease := &coordinationv1.Lease{}
-	key := types.NamespacedName{Namespace: leaseNamespace, Name: leaseName}
-	err := r.Get(ctx, key, lease)
-	if apierrors.IsNotFound(err) {
-		lease = newSubstratePoolActorLease(task, leaseNamespace, leaseName, actorID)
-		if err := r.Create(ctx, lease); err != nil {
-			if apierrors.IsAlreadyExists(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if substratePoolActorLeaseHeldByTask(lease, task) {
-		return true, nil
-	}
-	busy, err := substratePoolActorLeaseHasActiveHolder(ctx, r.Client, lease)
-	if err != nil || busy {
-		return false, err
-	}
-	patch := client.MergeFromWithOptions(lease.DeepCopy(), client.MergeFromWithOptimisticLock{})
-	setSubstratePoolActorLeaseHolder(lease, task, actorID)
-	if err := r.Patch(ctx, lease, patch); err != nil {
-		if apierrors.IsConflict(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
+	return tryReserveSubstratePoolActorLease(ctx, r.Client, leaseNamespace, actorID, substratePoolActorLeaseHolderOps{
+		newLease: func(namespace, name, actorID string) *coordinationv1.Lease {
+			return newSubstratePoolActorLease(task, namespace, name, actorID)
+		},
+		matches: func(lease *coordinationv1.Lease) bool {
+			return substratePoolActorLeaseHeldByTask(lease, task)
+		},
+		assign: func(lease *coordinationv1.Lease, actorID string) {
+			setSubstratePoolActorLeaseHolder(lease, task, actorID)
+		},
+	})
 }
 
 func (r *TaskReconciler) releaseSubstratePoolActorLeases(ctx context.Context, task *corev1alpha1.Task) error {
@@ -1521,7 +1499,7 @@ func (r *TaskReconciler) deleteSubstratePoolActorsForLeases(ctx context.Context,
 		if !substratePoolActorLeaseHeldByTask(current, task) {
 			continue
 		}
-		actorID := substratePoolActorLeaseActorID(current)
+		actorID := substrateActorLeaseActorID(current)
 		if actorID == "" {
 			continue
 		}

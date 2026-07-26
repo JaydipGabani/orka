@@ -78,7 +78,6 @@ kontxt_fixture_generator="${work_dir}/generate-kontxt-fixture.go"
 kontxt_tts_parent_token_file="${work_dir}/kontxt-tts-parent-token.txt"
 kontxt_child_token_file="${work_dir}/kontxt-child-token.txt"
 manager_kustomization="${repo_root}/config/manager/kustomization.yaml"
-manager_kustomization_backup="${work_dir}/manager-kustomization.yaml.bak"
 
 redact() {
   local text
@@ -125,12 +124,6 @@ cleanup_port_forward() {
   api_pf_pid=""
   kontxt_tts_pf_pid=""
   kontxt_downstream_pf_pid=""
-}
-
-restore_manager_kustomization() {
-  if [[ -f "${manager_kustomization_backup}" ]]; then
-    cp "${manager_kustomization_backup}" "${manager_kustomization}" || true
-  fi
 }
 
 dump_diagnostics() {
@@ -214,7 +207,6 @@ on_exit() {
   kubectl delete service "${kontxt_jwks_name}" "${kontxt_tts_name}" "${kontxt_downstream_name}" -n default --ignore-not-found=true >/dev/null 2>&1 || true
   kubectl delete configmap "${kontxt_jwks_name}" -n default --ignore-not-found=true >/dev/null 2>&1 || true
 
-  restore_manager_kustomization
   make cleanup-test-e2e KIND_CLUSTER="${kind_cluster}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}" >/dev/null 2>&1 || true
 
@@ -1048,7 +1040,6 @@ main() {
 
   cd "${repo_root}"
   [[ -f "${manager_kustomization}" ]] || die "missing ${manager_kustomization}"
-  cp "${manager_kustomization}" "${manager_kustomization_backup}"
 
   trap 'status=$?; on_exit "${status}"; exit "${status}"' EXIT
 

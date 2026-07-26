@@ -1112,7 +1112,7 @@ func TestProgressLatestScanRunCompletesNoopIncrementalWhenNoSlicesMatch(t *testi
 			APIVersion: corev1alpha1.GroupVersion.String(),
 			Kind:       "RepositoryScan",
 		},
-		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS, Generation: 7},
 		Spec: corev1alpha1.RepositoryScanSpec{
 			RepoURL:          "https://github.com/sozercan/kaset",
 			Branch:           "main",
@@ -1132,6 +1132,7 @@ func TestProgressLatestScanRunCompletesNoopIncrementalWhenNoSlicesMatch(t *testi
 		Scheme:        scheme,
 		SecurityStore: store,
 	}
+	threatModelVersion, findingCounts := seedSuccessfulRepositoryScanProjection(t, ctx, store, scan.Name, "scan_noop_incremental")
 	if err := store.CreateScanRun(ctx, &storepkg.ScanRun{
 		ID:                "scan_noop_incremental",
 		Namespace:         defaultNS,
@@ -1182,23 +1183,103 @@ func TestProgressLatestScanRunCompletesNoopIncrementalWhenNoSlicesMatch(t *testi
 	if run.Phase != scanRunPhaseSucceeded || run.CompletedAt == nil {
 		t.Fatalf("run phase/completedAt = %q/%v, want succeeded with completion", run.Phase, run.CompletedAt)
 	}
-	if run.Summary != "Threat model generated; no review slices matched 1 changed files" {
+	if run.SliceCount != 2 || run.SkippedSliceCount != 2 || run.ReviewedSliceCount != 0 {
+		t.Fatalf("run slice counts = total:%d skipped:%d reviewed:%d, want 2/2/0", run.SliceCount, run.SkippedSliceCount, run.ReviewedSliceCount)
+	}
+	if run.AcceptedFindings != 0 || run.DroppedFindings != 0 {
+		t.Fatalf("run finding counts = accepted:%d dropped:%d, want 0/0", run.AcceptedFindings, run.DroppedFindings)
+	}
+	const wantSummary = "Threat model generated; no review slices matched 1 changed files"
+	if run.Summary != wantSummary {
 		t.Fatalf("run.Summary = %q, want mapper no-op summary", run.Summary)
 	}
 	current := &corev1alpha1.RepositoryScan{}
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(scan), current); err != nil {
 		t.Fatalf("Get(scan) error = %v", err)
 	}
-	if current.Status.Phase != repositoryScanPhaseReady || current.Status.LastProcessedCommit != "head456" {
-		t.Fatalf("scan status phase/processed = %q/%q, want Ready/head456", current.Status.Phase, current.Status.LastProcessedCommit)
+	assertSuccessfulRepositoryScanStatus(t, current, run, threatModelVersion, findingCounts, wantSummary)
+	assertNoRepositoryScanReviewTasks(t, ctx, cl, scan.Name, run.ID)
+}
+
+func TestProgressLatestScanRunCompletesNoopFullScanWhenNoReviewSlicesExist(t *testing.T) {
+	ctx := context.Background()
+	store := setupControllerSQLiteStore(t)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
 	}
-	ready := meta.FindStatusCondition(current.Status.Conditions, "Ready")
-	if ready == nil {
-		t.Fatal("Ready condition missing")
+
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: corev1alpha1.GroupVersion.String(),
+			Kind:       "RepositoryScan",
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS, Generation: 9},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:          "https://github.com/sozercan/kaset",
+			Branch:           "main",
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "scan-reviewer"},
+		},
+		Status: corev1alpha1.RepositoryScanStatus{LastScanID: "scan_noop_full"},
 	}
-	if strings.Contains(ready.Message, "pending") {
-		t.Fatalf("Ready condition message = %q, want completed no-op summary", ready.Message)
+	threatTask := newSucceededSecurityTask("kaset-full-threat", "scan_noop_full", security.StageThreatModel, metav1.Now())
+	mapperTask := newSucceededSecurityTask("kaset-full-mapper", "scan_noop_full", security.StageMapper, metav1.Now())
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.RepositoryScan{}).
+		WithObjects(scan, threatTask, mapperTask).
+		Build()
+	reconciler := &RepositoryScanReconciler{
+		Client:        cl,
+		Scheme:        scheme,
+		SecurityStore: store,
 	}
+	threatModelVersion, findingCounts := seedSuccessfulRepositoryScanProjection(t, ctx, store, scan.Name, "scan_noop_full")
+	if err := store.CreateScanRun(ctx, &storepkg.ScanRun{
+		ID:             "scan_noop_full",
+		Namespace:      defaultNS,
+		RepositoryScan: "kaset",
+		TaskName:       threatTask.Name,
+		Mode:           "initial",
+		Phase:          scanRunPhaseRunning,
+		HeadCommit:     "full-head-456",
+		Summary:        scanSummaryThreatModelPending,
+		StartedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateScanRun() error = %v", err)
+	}
+
+	progressed, err := reconciler.progressLatestScanRun(ctx, scan)
+	if err != nil {
+		t.Fatalf("progressLatestScanRun() error = %v", err)
+	}
+	if !progressed {
+		t.Fatal("progressLatestScanRun() = false, want true")
+	}
+
+	run, err := store.GetScanRun(ctx, defaultNS, "scan_noop_full")
+	if err != nil {
+		t.Fatalf("GetScanRun() error = %v", err)
+	}
+	if run.Phase != scanRunPhaseSucceeded || run.CompletedAt == nil {
+		t.Fatalf("run phase/completedAt = %q/%v, want succeeded with completion", run.Phase, run.CompletedAt)
+	}
+	if run.SliceCount != 0 || run.SkippedSliceCount != 0 || run.ReviewedSliceCount != 0 {
+		t.Fatalf("run slice counts = total:%d skipped:%d reviewed:%d, want 0/0/0", run.SliceCount, run.SkippedSliceCount, run.ReviewedSliceCount)
+	}
+	if run.AcceptedFindings != 0 || run.DroppedFindings != 0 {
+		t.Fatalf("run finding counts = accepted:%d dropped:%d, want 0/0", run.AcceptedFindings, run.DroppedFindings)
+	}
+	const wantSummary = "Threat model generated; no reviewable security slices found"
+	if run.Summary != wantSummary {
+		t.Fatalf("run.Summary = %q, want full-scan no-review summary", run.Summary)
+	}
+	current := &corev1alpha1.RepositoryScan{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(scan), current); err != nil {
+		t.Fatalf("Get(scan) error = %v", err)
+	}
+	assertSuccessfulRepositoryScanStatus(t, current, run, threatModelVersion, findingCounts, wantSummary)
+	assertNoRepositoryScanReviewTasks(t, ctx, cl, scan.Name, run.ID)
 }
 
 func TestRefreshScanRunStatusKeepsReviewRunRunningWithPendingSlices(t *testing.T) {
@@ -2748,7 +2829,7 @@ func TestRefreshScanRunStatusSetsLastScanAtOnFailedRun(t *testing.T) {
 	}
 }
 
-func TestRefreshScanRunStatusSetsBothTimestampsOnSuccess(t *testing.T) {
+func TestRefreshScanRunStatusProjectsSuccessfulRun(t *testing.T) {
 	ctx := context.Background()
 	secStore := setupControllerSQLiteStore(t)
 	scheme := runtime.NewScheme()
@@ -2758,14 +2839,26 @@ func TestRefreshScanRunStatusSetsBothTimestampsOnSuccess(t *testing.T) {
 
 	scan := &corev1alpha1.RepositoryScan{
 		TypeMeta:   metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
-		ObjectMeta: metav1.ObjectMeta{Name: "ts-ok", Namespace: defaultNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "ts-ok", Namespace: defaultNS, Generation: 11},
 		Spec:       corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", AnalysisAgentRef: corev1alpha1.AgentReference{Name: "a"}},
+		Status: corev1alpha1.RepositoryScanStatus{
+			Phase: repositoryScanPhaseScanning,
+			Conditions: []metav1.Condition{{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "Scanning",
+				Message:            scanSummaryRunning,
+				LastTransitionTime: metav1.NewTime(mustParseTime(t, "2026-05-07T22:59:00Z")),
+				ObservedGeneration: 10,
+			}},
+		},
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.RepositoryScan{}).WithObjects(scan).Build()
 	r := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: secStore}
+	threatModelVersion, findingCounts := seedSuccessfulRepositoryScanProjection(t, ctx, secStore, scan.Name, "scan_s")
 
 	completed := mustParseTime(t, "2026-05-07T23:00:00Z")
-	run := &storepkg.ScanRun{ID: "scan_s", Namespace: defaultNS, RepositoryScan: "ts-ok", TaskName: "t", Mode: "initial", Phase: scanRunPhaseSucceeded, StartedAt: completed, CompletedAt: &completed, HeadCommit: "def"}
+	run := &storepkg.ScanRun{ID: "scan_s", Namespace: defaultNS, RepositoryScan: "ts-ok", TaskName: "successful-task", Mode: "initial", Phase: scanRunPhaseSucceeded, StartedAt: completed, CompletedAt: &completed, HeadCommit: "def"}
 	if err := secStore.CreateScanRun(ctx, run); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
@@ -2777,11 +2870,180 @@ func TestRefreshScanRunStatusSetsBothTimestampsOnSuccess(t *testing.T) {
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(scan), current); err != nil {
 		t.Fatalf("cl.Get() error = %v", err)
 	}
-	if current.Status.LastScanAt == nil || !current.Status.LastScanAt.Time.Equal(completed) {
-		t.Fatalf("LastScanAt = %v, want %v", current.Status.LastScanAt, completed)
+	assertSuccessfulRepositoryScanStatus(
+		t,
+		current,
+		run,
+		threatModelVersion,
+		findingCounts,
+		"Threat model generated successfully",
+	)
+	persisted, err := secStore.GetScanRun(ctx, defaultNS, run.ID)
+	if err != nil {
+		t.Fatalf("GetScanRun() error = %v", err)
 	}
-	if current.Status.LastSuccessfulScanAt == nil || !current.Status.LastSuccessfulScanAt.Time.Equal(completed) {
-		t.Fatalf("LastSuccessfulScanAt = %v, want %v", current.Status.LastSuccessfulScanAt, completed)
+	if persisted.Phase != scanRunPhaseSucceeded || persisted.Summary != "Threat model generated successfully" || persisted.ErrorMessage != "" {
+		t.Fatalf("persisted run phase/summary/error = %q/%q/%q, want succeeded/generic success/empty", persisted.Phase, persisted.Summary, persisted.ErrorMessage)
+	}
+	if persisted.CompletedAt == nil || !persisted.CompletedAt.Equal(completed) {
+		t.Fatalf("persisted.CompletedAt = %v, want %v", persisted.CompletedAt, completed)
+	}
+	if persisted.TaskName != "successful-task" || persisted.HeadCommit != "def" {
+		t.Fatalf("persisted task/head = %q/%q, want successful-task/def", persisted.TaskName, persisted.HeadCommit)
+	}
+}
+
+func seedSuccessfulRepositoryScanProjection(
+	t *testing.T,
+	ctx context.Context,
+	store *sqlitestore.Store,
+	repositoryScan string,
+	runID string,
+) (int64, corev1alpha1.FindingCountsStatus) {
+	t.Helper()
+
+	if err := store.SaveThreatModel(ctx, &storepkg.ThreatModel{
+		Namespace:       defaultNS,
+		RepositoryScan:  repositoryScan,
+		Version:         7,
+		Content:         "# Characterization threat model",
+		Source:          "generated",
+		GeneratedByScan: runID,
+	}); err != nil {
+		t.Fatalf("SaveThreatModel() error = %v", err)
+	}
+	model, err := store.GetLatestThreatModel(ctx, defaultNS, repositoryScan)
+	if err != nil {
+		t.Fatalf("GetLatestThreatModel() error = %v", err)
+	}
+
+	severityCounts := []struct {
+		severity string
+		count    int
+	}{
+		{severity: "critical", count: 1},
+		{severity: "high", count: 2},
+		{severity: "medium", count: 3},
+		{severity: "low", count: 4},
+	}
+	for _, severityCount := range severityCounts {
+		for i := range severityCount.count {
+			if err := store.UpsertFinding(ctx, &storepkg.Finding{
+				ID:               fmt.Sprintf("fnd_%s_%s_%d", runID, severityCount.severity, i),
+				Namespace:        defaultNS,
+				RepositoryScan:   repositoryScan,
+				ScanRunID:        runID,
+				Fingerprint:      fmt.Sprintf("sha256:%s:%s:%d", runID, severityCount.severity, i),
+				Title:            severityCount.severity + " finding",
+				Summary:          "status projection characterization",
+				Severity:         severityCount.severity,
+				Confidence:       confidenceHigh,
+				ValidationStatus: "unvalidated",
+				State:            findingStateOpen,
+			}); err != nil {
+				t.Fatalf("UpsertFinding(%s, %d) error = %v", severityCount.severity, i, err)
+			}
+		}
+	}
+
+	return model.Version, corev1alpha1.FindingCountsStatus{
+		Total:    10,
+		Critical: 1,
+		High:     2,
+		Medium:   3,
+		Low:      4,
+	}
+}
+
+func assertSuccessfulRepositoryScanStatus(
+	t *testing.T,
+	scan *corev1alpha1.RepositoryScan,
+	run *storepkg.ScanRun,
+	threatModelVersion int64,
+	findingCounts corev1alpha1.FindingCountsStatus,
+	summary string,
+) {
+	t.Helper()
+
+	status := scan.Status
+	if status.Phase != repositoryScanPhaseReady {
+		t.Fatalf("status.Phase = %q, want %q", status.Phase, repositoryScanPhaseReady)
+	}
+	if status.LastScanID != run.ID {
+		t.Fatalf("status.LastScanID = %q, want %q", status.LastScanID, run.ID)
+	}
+	if status.LastScanTaskName != run.TaskName {
+		t.Fatalf("status.LastScanTaskName = %q, want %q", status.LastScanTaskName, run.TaskName)
+	}
+	if status.LastObservedHeadSHA != run.HeadCommit {
+		t.Fatalf("status.LastObservedHeadSHA = %q, want %q", status.LastObservedHeadSHA, run.HeadCommit)
+	}
+	if status.LastProcessedCommit != run.HeadCommit {
+		t.Fatalf("status.LastProcessedCommit = %q, want %q", status.LastProcessedCommit, run.HeadCommit)
+	}
+	if status.ThreatModelVersion != threatModelVersion {
+		t.Fatalf("status.ThreatModelVersion = %d, want %d", status.ThreatModelVersion, threatModelVersion)
+	}
+	if status.FindingCounts != findingCounts {
+		t.Fatalf("status.FindingCounts = %#v, want %#v", status.FindingCounts, findingCounts)
+	}
+	if run.CompletedAt == nil {
+		t.Fatal("run.CompletedAt = nil, want successful completion timestamp")
+	}
+	wantCompletedAt := run.CompletedAt.Truncate(time.Second)
+	if status.LastScanAt == nil || !status.LastScanAt.Time.Equal(wantCompletedAt) {
+		t.Fatalf("status.LastScanAt = %v, want %v", status.LastScanAt, wantCompletedAt)
+	}
+	if status.LastSuccessfulScanAt == nil || !status.LastSuccessfulScanAt.Time.Equal(wantCompletedAt) {
+		t.Fatalf("status.LastSuccessfulScanAt = %v, want %v", status.LastSuccessfulScanAt, wantCompletedAt)
+	}
+
+	readyCount := 0
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == "Ready" {
+			readyCount++
+		}
+	}
+	if readyCount != 1 {
+		t.Fatalf("Ready condition count = %d, want 1", readyCount)
+	}
+	ready := meta.FindStatusCondition(status.Conditions, "Ready")
+	if ready == nil {
+		t.Fatal("Ready condition missing")
+	}
+	if ready.Status != metav1.ConditionTrue || ready.Reason != "ScanSucceeded" || ready.Message != summary {
+		t.Fatalf("Ready condition = %#v, want true/ScanSucceeded/%q", ready, summary)
+	}
+	if ready.ObservedGeneration != scan.Generation {
+		t.Fatalf("Ready.ObservedGeneration = %d, want %d", ready.ObservedGeneration, scan.Generation)
+	}
+	if ready.LastTransitionTime.Time.IsZero() {
+		t.Fatal("Ready.LastTransitionTime is zero")
+	}
+}
+
+func assertNoRepositoryScanReviewTasks(
+	t *testing.T,
+	ctx context.Context,
+	cl client.Client,
+	repositoryScan string,
+	runID string,
+) {
+	t.Helper()
+
+	var tasks corev1alpha1.TaskList
+	if err := cl.List(ctx, &tasks,
+		client.InNamespace(defaultNS),
+		client.MatchingLabels(map[string]string{
+			labels.LabelSecurityTarget: labels.SelectorValue(repositoryScan),
+			labels.LabelSecurityScanID: runID,
+			labels.LabelSecurityStage:  security.StageReview,
+		}),
+	); err != nil {
+		t.Fatalf("List(review tasks) error = %v", err)
+	}
+	if len(tasks.Items) != 0 {
+		t.Fatalf("len(review tasks) = %d, want 0", len(tasks.Items))
 	}
 }
 

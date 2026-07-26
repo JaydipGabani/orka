@@ -1120,7 +1120,7 @@ func TestToolReconcilerMCPSubstrateActorUsesPoolRef(t *testing.T) {
 	if err := r.Get(context.Background(), types.NamespacedName{Name: executor.claimName, Namespace: defaultNS}, &gotLease); err != nil {
 		t.Fatalf("Get pool actor lease: %v", err)
 	}
-	if !substratePoolActorLeaseHeldByTool(&gotLease, &got) {
+	if !substrateActorLeaseHeldByTool(&gotLease, &got) {
 		t.Fatalf("lease annotations = %#v, want held by mcp-tool", gotLease.Annotations)
 	}
 
@@ -1320,7 +1320,7 @@ func TestToolReconcilerMCPSubstrateActorMigratesPooledLeaseOutsideTarget(t *test
 	if err := r.Get(context.Background(), types.NamespacedName{Name: wantActorID, Namespace: defaultNS}, &gotLease); err != nil {
 		t.Fatalf("Get new in-range lease: %v", err)
 	}
-	if !substratePoolActorLeaseHeldByTool(&gotLease, &got) {
+	if !substrateActorLeaseHeldByTool(&gotLease, &got) {
 		t.Fatalf("new lease annotations = %#v, want held by mcp-tool", gotLease.Annotations)
 	}
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "mcp-tool", Namespace: defaultNS}, &got); err != nil {
@@ -1430,7 +1430,7 @@ func TestToolReconcilerMCPSubstrateActorProbesPoolOnLeaseCollision(t *testing.T)
 	if err := r.Get(context.Background(), types.NamespacedName{Name: wantActorID, Namespace: defaultNS}, &gotLease); err != nil {
 		t.Fatalf("Get probed pool actor lease: %v", err)
 	}
-	if !substratePoolActorLeaseHeldByTool(&gotLease, &got) {
+	if !substrateActorLeaseHeldByTool(&gotLease, &got) {
 		t.Fatalf("probed lease annotations = %#v, want held by mcp-tool", gotLease.Annotations)
 	}
 
@@ -1868,7 +1868,7 @@ func TestToolReconcilerFinalizerIgnoresPooledMCPActorHeldByAnotherTool(t *testin
 	if err := r.Get(context.Background(), types.NamespacedName{Name: actorID, Namespace: defaultNS}, &gotLease); err != nil {
 		t.Fatalf("Get lease: %v", err)
 	}
-	if !substratePoolActorLeaseHeldByTool(&gotLease, otherTool) {
+	if !substrateActorLeaseHeldByTool(&gotLease, otherTool) {
 		t.Fatalf("lease annotations = %#v, want held by other Tool", gotLease.Annotations)
 	}
 	var got corev1alpha1.Tool

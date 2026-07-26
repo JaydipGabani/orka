@@ -107,78 +107,38 @@ spec:
             {{- if .authzMode }}
             - {{ printf "--context-token-authz-mode=%s" .authzMode | quote }}
             {{- end }}
-            {{- with .scopes }}
-            {{- if .taskCreate }}
-            - {{ printf "--context-token-task-create-scopes=%s" .taskCreate | quote }}
-            {{- end }}
-            {{- if .taskRead }}
-            - {{ printf "--context-token-task-read-scopes=%s" .taskRead | quote }}
-            {{- end }}
-            {{- if .taskList }}
-            - {{ printf "--context-token-task-list-scopes=%s" .taskList | quote }}
-            {{- end }}
-            {{- if .taskDelete }}
-            - {{ printf "--context-token-task-delete-scopes=%s" .taskDelete | quote }}
-            {{- end }}
-            {{- if .taskUpdate }}
-            - {{ printf "--context-token-task-update-scopes=%s" .taskUpdate | quote }}
-            {{- end }}
-            {{- if .toolRead }}
-            - {{ printf "--context-token-tool-read-scopes=%s" .toolRead | quote }}
-            {{- end }}
-            {{- if .toolUse }}
-            - {{ printf "--context-token-tool-use-scopes=%s" .toolUse | quote }}
-            {{- end }}
-            {{- if .providerUse }}
-            - {{ printf "--context-token-provider-use-scopes=%s" .providerUse | quote }}
-            {{- end }}
-            {{- if .secretRead }}
-            - {{ printf "--context-token-secret-read-scopes=%s" .secretRead | quote }}
-            {{- end }}
-            {{- if .agentRead }}
-            - {{ printf "--context-token-agent-read-scopes=%s" .agentRead | quote }}
-            {{- end }}
-            {{- if .agentWrite }}
-            - {{ printf "--context-token-agent-write-scopes=%s" .agentWrite | quote }}
-            {{- end }}
-            {{- if .memoryRead }}
-            - {{ printf "--context-token-memory-read-scopes=%s" .memoryRead | quote }}
-            {{- end }}
-            {{- if .memoryWrite }}
-            - {{ printf "--context-token-memory-write-scopes=%s" .memoryWrite | quote }}
-            {{- end }}
-            {{- if .sessionRead }}
-            - {{ printf "--context-token-session-read-scopes=%s" .sessionRead | quote }}
-            {{- end }}
-            {{- if .sessionWrite }}
-            - {{ printf "--context-token-session-write-scopes=%s" .sessionWrite | quote }}
-            {{- end }}
-            {{- if .securityRead }}
-            - {{ printf "--context-token-security-read-scopes=%s" .securityRead | quote }}
-            {{- end }}
-            {{- if .securityWrite }}
-            - {{ printf "--context-token-security-write-scopes=%s" .securityWrite | quote }}
-            {{- end }}
-            {{- if .monitorRead }}
-            - {{ printf "--context-token-monitor-read-scopes=%s" .monitorRead | quote }}
-            {{- end }}
-            {{- if .monitorWrite }}
-            - {{ printf "--context-token-monitor-write-scopes=%s" .monitorWrite | quote }}
-            {{- end }}
-            {{- if .monitorOperate }}
-            - {{ printf "--context-token-monitor-operate-scopes=%s" .monitorOperate | quote }}
-            {{- end }}
-            {{- if .skillRead }}
-            - {{ printf "--context-token-skill-read-scopes=%s" .skillRead | quote }}
-            {{- end }}
-            {{- if .skillWrite }}
-            - {{ printf "--context-token-skill-write-scopes=%s" .skillWrite | quote }}
-            {{- end }}
-            {{- if .gatewayRead }}
-            - {{ printf "--context-token-gateway-read-scopes=%s" .gatewayRead | quote }}
-            {{- end }}
-            {{- if .gatewayOperate }}
-            - {{ printf "--context-token-gateway-operate-scopes=%s" .gatewayOperate | quote }}
+            {{- $scopeFlags := list
+              (dict "key" "taskCreate" "flag" "context-token-task-create-scopes")
+              (dict "key" "taskRead" "flag" "context-token-task-read-scopes")
+              (dict "key" "taskList" "flag" "context-token-task-list-scopes")
+              (dict "key" "taskDelete" "flag" "context-token-task-delete-scopes")
+              (dict "key" "taskUpdate" "flag" "context-token-task-update-scopes")
+              (dict "key" "toolRead" "flag" "context-token-tool-read-scopes")
+              (dict "key" "toolUse" "flag" "context-token-tool-use-scopes")
+              (dict "key" "providerUse" "flag" "context-token-provider-use-scopes")
+              (dict "key" "secretRead" "flag" "context-token-secret-read-scopes")
+              (dict "key" "secretCredentialRead" "flag" "context-token-secret-credential-read-scopes")
+              (dict "key" "configMapRead" "flag" "context-token-configmap-read-scopes")
+              (dict "key" "agentRead" "flag" "context-token-agent-read-scopes")
+              (dict "key" "agentWrite" "flag" "context-token-agent-write-scopes")
+              (dict "key" "memoryRead" "flag" "context-token-memory-read-scopes")
+              (dict "key" "memoryWrite" "flag" "context-token-memory-write-scopes")
+              (dict "key" "sessionRead" "flag" "context-token-session-read-scopes")
+              (dict "key" "sessionWrite" "flag" "context-token-session-write-scopes")
+              (dict "key" "securityRead" "flag" "context-token-security-read-scopes")
+              (dict "key" "securityWrite" "flag" "context-token-security-write-scopes")
+              (dict "key" "monitorRead" "flag" "context-token-monitor-read-scopes")
+              (dict "key" "monitorWrite" "flag" "context-token-monitor-write-scopes")
+              (dict "key" "monitorOperate" "flag" "context-token-monitor-operate-scopes")
+              (dict "key" "skillRead" "flag" "context-token-skill-read-scopes")
+              (dict "key" "skillWrite" "flag" "context-token-skill-write-scopes")
+              (dict "key" "gatewayRead" "flag" "context-token-gateway-read-scopes")
+              (dict "key" "gatewayOperate" "flag" "context-token-gateway-operate-scopes")
+            }}
+            {{- $scopes := default (dict) .scopes }}
+            {{- range $scope := $scopeFlags }}
+            {{- with index $scopes $scope.key }}
+            - {{ printf "--%s=%s" $scope.flag . | quote }}
             {{- end }}
             {{- end }}
             {{- with .tts }}
