@@ -413,6 +413,61 @@ func TestServer_SetupRoutes_OpenAI(t *testing.T) {
 	}
 }
 
+func TestServer_SetupRoutes_InternalAPIStoreRegistration(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	db, err := sqlite.NewDB(":memory:")
+	if err != nil {
+		t.Fatalf("create sqlite database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sqliteStore := sqlite.NewStore(db, ":memory:")
+
+	tests := []struct {
+		name         string
+		config       ServerConfig
+		wantInternal bool
+	}{
+		{name: "no stores", config: ServerConfig{}, wantInternal: false},
+		{name: "result store", config: ServerConfig{ResultStore: sqliteStore}, wantInternal: true},
+		{name: "session store", config: ServerConfig{SessionStore: sqliteStore}, wantInternal: true},
+		{name: "plan store", config: ServerConfig{PlanStore: sqliteStore}, wantInternal: true},
+		{name: "message store", config: ServerConfig{MessageStore: sqliteStore}, wantInternal: true},
+		{name: "artifact store", config: ServerConfig{ArtifactStore: sqliteStore}, wantInternal: true},
+		{name: "memory store", config: ServerConfig{MemoryStore: sqliteStore}, wantInternal: true},
+		{name: "memory proposal store", config: ServerConfig{MemoryProposalStore: sqliteStore}, wantInternal: true},
+		{name: "execution event store", config: ServerConfig{ExecutionEventStore: sqliteStore}, wantInternal: true},
+		{name: "security store only", config: ServerConfig{SecurityStore: sqliteStore}, wantInternal: false},
+		{name: "repository monitor store only", config: ServerConfig{RepositoryMonitorStore: sqliteStore}, wantInternal: false},
+		{name: "gateway event store only", config: ServerConfig{GatewayEventStore: sqliteStore}, wantInternal: false},
+		{name: "gateway delivery store only", config: ServerConfig{GatewayDeliveryStore: sqliteStore}, wantInternal: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := NewServer(fakeClient, nil, tt.config)
+			if got := server.internalHandlers != nil; got != tt.wantInternal {
+				t.Fatalf("internalHandlers configured = %t, want %t", got, tt.wantInternal)
+			}
+			if !tt.wantInternal {
+				return
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/internal/v1/results/default/task1", nil)
+			resp, err := server.app.Test(req)
+			if err != nil {
+				t.Fatalf("Test request failed: %v", err)
+			}
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+			}
+		})
+	}
+}
+
 func TestServer_SetupRoutes_InternalAPI(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1alpha1.AddToScheme(scheme)

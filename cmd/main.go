@@ -138,33 +138,7 @@ func main() {
 	var contextTokenAudience string
 	var contextTokenJWKSURL string
 	var contextTokenHeaders string
-	var contextTokenAuthzMode string
-	var contextTokenTaskCreateScopes string
-	var contextTokenTaskReadScopes string
-	var contextTokenTaskListScopes string
-	var contextTokenTaskDeleteScopes string
-	var contextTokenTaskUpdateScopes string
-	var contextTokenToolReadScopes string
-	var contextTokenToolUseScopes string
-	var contextTokenProviderUseScopes string
-	var contextTokenSecretReadScopes string
-	var contextTokenSecretCredentialReadScopes string
-	var contextTokenConfigMapReadScopes string
-	var contextTokenAgentReadScopes string
-	var contextTokenAgentWriteScopes string
-	var contextTokenMemoryReadScopes string
-	var contextTokenMemoryWriteScopes string
-	var contextTokenSessionReadScopes string
-	var contextTokenSessionWriteScopes string
-	var contextTokenSecurityReadScopes string
-	var contextTokenSecurityWriteScopes string
-	var contextTokenMonitorReadScopes string
-	var contextTokenMonitorWriteScopes string
-	var contextTokenMonitorOperateScopes string
-	var contextTokenSkillReadScopes string
-	var contextTokenSkillWriteScopes string
-	var contextTokenGatewayReadScopes string
-	var contextTokenGatewayOperateScopes string
+	var contextTokenAuthzOptions api.ContextTokenAuthorizationConfigOptions
 	var contextTokenTTSURL string
 	var contextTokenTTSAudience string
 	var contextTokenTTSTimeout string
@@ -371,87 +345,87 @@ func main() {
 	flag.StringVar(&contextTokenHeaders, "context-token-headers", os.Getenv("ORKA_CONTEXT_TOKEN_HEADERS"),
 		"Comma-separated context-token headers. Use Header for raw tokens or Header:Scheme for scheme-prefixed "+
 			"tokens (default for kontxt: Txn-Token; bearer opt-in: Txn-Token,Authorization:Bearer).")
-	flag.StringVar(&contextTokenAuthzMode, "context-token-authz-mode", os.Getenv("ORKA_CONTEXT_TOKEN_AUTHZ_MODE"),
+	flag.StringVar(&contextTokenAuthzOptions.Mode, "context-token-authz-mode", os.Getenv("ORKA_CONTEXT_TOKEN_AUTHZ_MODE"),
 		"Context-token authorization mode: off, audit, or enforce. Empty defaults to off.")
-	flag.StringVar(&contextTokenTaskCreateScopes, "context-token-task-create-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.TaskCreateScopes, "context-token-task-create-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_TASK_CREATE_SCOPES"),
 		"Comma-separated context-token scopes that authorize Task creation. Defaults to orka:tasks:create.")
-	flag.StringVar(&contextTokenTaskReadScopes, "context-token-task-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.TaskReadScopes, "context-token-task-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_TASK_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize Task reads and related data. Defaults to orka:tasks:get.")
-	flag.StringVar(&contextTokenTaskListScopes, "context-token-task-list-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.TaskListScopes, "context-token-task-list-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_TASK_LIST_SCOPES"),
 		"Comma-separated context-token scopes that authorize Task listing. Defaults to orka:tasks:list.")
-	flag.StringVar(&contextTokenTaskDeleteScopes, "context-token-task-delete-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.TaskDeleteScopes, "context-token-task-delete-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_TASK_DELETE_SCOPES"),
 		"Comma-separated context-token scopes that authorize Task deletion. Defaults to orka:tasks:delete.")
-	flag.StringVar(&contextTokenTaskUpdateScopes, "context-token-task-update-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.TaskUpdateScopes, "context-token-task-update-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_TASK_UPDATE_SCOPES"),
 		"Comma-separated context-token scopes that authorize Task-adjacent mutations. Defaults to orka:tasks:update.")
-	flag.StringVar(&contextTokenToolReadScopes, "context-token-tool-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.ToolReadScopes, "context-token-tool-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_TOOL_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize Tool reads. Defaults to orka:tools:read.")
-	flag.StringVar(&contextTokenToolUseScopes, "context-token-tool-use-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.ToolUseScopes, "context-token-tool-use-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_TOOL_USE_SCOPES"),
 		"Comma-separated context-token scopes that authorize Orka-managed tool execution. Defaults to orka:tools:use.")
-	flag.StringVar(&contextTokenProviderUseScopes, "context-token-provider-use-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.ProviderUseScopes, "context-token-provider-use-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_PROVIDER_USE_SCOPES"),
 		"Comma-separated context-token scopes that authorize model provider use and listing. Defaults to orka:providers:use.")
-	flag.StringVar(&contextTokenSecretReadScopes, "context-token-secret-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.SecretReadScopes, "context-token-secret-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_SECRET_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize Secret metadata reads. Defaults to orka:secrets:read.")
-	flag.StringVar(&contextTokenSecretCredentialReadScopes, "context-token-secret-credential-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.SecretCredentialReadScopes, "context-token-secret-credential-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_SECRET_CREDENTIAL_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize using Secret data as outbound credentials. "+
 			"Defaults to orka:secrets:credentials:read.")
-	flag.StringVar(&contextTokenConfigMapReadScopes, "context-token-configmap-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.ConfigMapReadScopes, "context-token-configmap-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_CONFIGMAP_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize ConfigMap reads used as operation inputs. "+
 			"Defaults to orka:configmaps:read.")
-	flag.StringVar(&contextTokenAgentReadScopes, "context-token-agent-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.AgentReadScopes, "context-token-agent-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_AGENT_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize Agent reads. Defaults to orka:agents:read.")
-	flag.StringVar(&contextTokenAgentWriteScopes, "context-token-agent-write-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.AgentWriteScopes, "context-token-agent-write-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_AGENT_WRITE_SCOPES"),
 		"Comma-separated context-token scopes that authorize Agent writes. Defaults to orka:agents:write.")
-	flag.StringVar(&contextTokenMemoryReadScopes, "context-token-memory-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.MemoryReadScopes, "context-token-memory-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_MEMORY_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize memory reads. Defaults to orka:memory:read.")
-	flag.StringVar(&contextTokenMemoryWriteScopes, "context-token-memory-write-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.MemoryWriteScopes, "context-token-memory-write-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_MEMORY_WRITE_SCOPES"),
 		"Comma-separated context-token scopes that authorize memory writes. Defaults to orka:memory:write.")
-	flag.StringVar(&contextTokenSessionReadScopes, "context-token-session-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.SessionReadScopes, "context-token-session-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_SESSION_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize session reads. Defaults to orka:sessions:read.")
-	flag.StringVar(&contextTokenSessionWriteScopes, "context-token-session-write-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.SessionWriteScopes, "context-token-session-write-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_SESSION_WRITE_SCOPES"),
 		"Comma-separated context-token scopes that authorize session writes. Defaults to orka:sessions:write.")
-	flag.StringVar(&contextTokenSecurityReadScopes, "context-token-security-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.SecurityReadScopes, "context-token-security-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_SECURITY_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize security scan reads. Defaults to orka:security:read.")
-	flag.StringVar(&contextTokenSecurityWriteScopes, "context-token-security-write-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.SecurityWriteScopes, "context-token-security-write-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_SECURITY_WRITE_SCOPES"),
 		"Comma-separated context-token scopes that authorize security scan writes. Defaults to orka:security:write.")
-	flag.StringVar(&contextTokenMonitorReadScopes, "context-token-monitor-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.MonitorReadScopes, "context-token-monitor-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_MONITOR_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize repository monitor reads. Defaults to orka:monitors:read.")
-	flag.StringVar(&contextTokenMonitorWriteScopes, "context-token-monitor-write-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.MonitorWriteScopes, "context-token-monitor-write-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_MONITOR_WRITE_SCOPES"),
 		"Comma-separated context-token scopes that authorize repository monitor writes. Defaults to orka:monitors:write.")
-	flag.StringVar(&contextTokenMonitorOperateScopes, "context-token-monitor-operate-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.MonitorOperateScopes, "context-token-monitor-operate-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_MONITOR_OPERATE_SCOPES"),
 		"Comma-separated context-token scopes that authorize repository monitor operations. "+
 			"Defaults to orka:monitors:operate.")
-	flag.StringVar(&contextTokenSkillReadScopes, "context-token-skill-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.SkillReadScopes, "context-token-skill-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_SKILL_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize Skill reads. Defaults to orka:skills:read.")
-	flag.StringVar(&contextTokenSkillWriteScopes, "context-token-skill-write-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.SkillWriteScopes, "context-token-skill-write-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_SKILL_WRITE_SCOPES"),
 		"Comma-separated context-token scopes that authorize Skill writes. Defaults to orka:skills:write.")
-	flag.StringVar(&contextTokenGatewayReadScopes, "context-token-gateway-read-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.GatewayReadScopes, "context-token-gateway-read-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_GATEWAY_READ_SCOPES"),
 		"Comma-separated context-token scopes that authorize gateway reads. Defaults to orka:gateways:read.")
-	flag.StringVar(&contextTokenGatewayOperateScopes, "context-token-gateway-operate-scopes",
+	flag.StringVar(&contextTokenAuthzOptions.GatewayOperateScopes, "context-token-gateway-operate-scopes",
 		os.Getenv("ORKA_CONTEXT_TOKEN_GATEWAY_OPERATE_SCOPES"),
 		"Comma-separated context-token scopes that authorize delivery retries. Defaults to orka:gateways:operate.")
 	flag.StringVar(&contextTokenTTSURL, "context-token-tts-url", os.Getenv("ORKA_CONTEXT_TOKEN_TTS_URL"),
@@ -532,35 +506,7 @@ func main() {
 		setupLog.Error(err, "invalid context token configuration")
 		os.Exit(1)
 	}
-	contextTokenAuthzConfig, err := api.NewContextTokenAuthorizationConfig(api.ContextTokenAuthorizationConfigOptions{
-		Mode:                       contextTokenAuthzMode,
-		TaskCreateScopes:           contextTokenTaskCreateScopes,
-		TaskReadScopes:             contextTokenTaskReadScopes,
-		TaskListScopes:             contextTokenTaskListScopes,
-		TaskDeleteScopes:           contextTokenTaskDeleteScopes,
-		TaskUpdateScopes:           contextTokenTaskUpdateScopes,
-		ToolReadScopes:             contextTokenToolReadScopes,
-		ToolUseScopes:              contextTokenToolUseScopes,
-		ProviderUseScopes:          contextTokenProviderUseScopes,
-		SecretReadScopes:           contextTokenSecretReadScopes,
-		SecretCredentialReadScopes: contextTokenSecretCredentialReadScopes,
-		ConfigMapReadScopes:        contextTokenConfigMapReadScopes,
-		AgentReadScopes:            contextTokenAgentReadScopes,
-		AgentWriteScopes:           contextTokenAgentWriteScopes,
-		MemoryReadScopes:           contextTokenMemoryReadScopes,
-		MemoryWriteScopes:          contextTokenMemoryWriteScopes,
-		SessionReadScopes:          contextTokenSessionReadScopes,
-		SessionWriteScopes:         contextTokenSessionWriteScopes,
-		SecurityReadScopes:         contextTokenSecurityReadScopes,
-		SecurityWriteScopes:        contextTokenSecurityWriteScopes,
-		MonitorReadScopes:          contextTokenMonitorReadScopes,
-		MonitorWriteScopes:         contextTokenMonitorWriteScopes,
-		MonitorOperateScopes:       contextTokenMonitorOperateScopes,
-		SkillReadScopes:            contextTokenSkillReadScopes,
-		SkillWriteScopes:           contextTokenSkillWriteScopes,
-		GatewayReadScopes:          contextTokenGatewayReadScopes,
-		GatewayOperateScopes:       contextTokenGatewayOperateScopes,
-	})
+	contextTokenAuthzConfig, err := api.NewContextTokenAuthorizationConfig(contextTokenAuthzOptions)
 	if err != nil {
 		setupLog.Error(err, "invalid context token authorization configuration")
 		os.Exit(1)

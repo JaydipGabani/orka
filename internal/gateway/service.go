@@ -582,7 +582,8 @@ func (s *Service) acknowledgeDuplicateEvent(
 	ctx context.Context,
 	existing, candidate *store.GatewayEvent,
 ) (*protocol.IngressResponse, error) {
-	if !matchingGatewayEventEnvelope(existing, candidate) {
+	if existing == nil || candidate == nil || existing.ID != candidate.ID ||
+		!store.GatewayEventsHaveSameEnvelope(existing, candidate) {
 		return nil, &HTTPError{
 			Code: http.StatusConflict, Message: "externalEventId already identifies a different gateway event",
 		}
@@ -596,36 +597,6 @@ func (s *Service) acknowledgeDuplicateEvent(
 	return &protocol.IngressResponse{
 		Status: ingressStatusDuplicate, EventID: existing.ID, State: string(existing.State), Message: existing.StateMessage,
 	}, nil
-}
-
-func matchingGatewayEventEnvelope(existing, candidate *store.GatewayEvent) bool {
-	if existing == nil || candidate == nil {
-		return false
-	}
-	return existing.ID == candidate.ID &&
-		existing.Namespace == candidate.Namespace &&
-		existing.NamespaceUID == candidate.NamespaceUID &&
-		existing.GatewayUID == candidate.GatewayUID &&
-		existing.GatewayName == candidate.GatewayName &&
-		existing.ExternalEventID == candidate.ExternalEventID &&
-		existing.ProtocolVersion == candidate.ProtocolVersion &&
-		existing.EventType == candidate.EventType &&
-		existing.AccountID == candidate.AccountID &&
-		existing.ContextID == candidate.ContextID &&
-		existing.ThreadID == candidate.ThreadID &&
-		existing.SenderID == candidate.SenderID &&
-		existing.SenderDisplayName == candidate.SenderDisplayName &&
-		existing.Text == candidate.Text &&
-		existing.ReplyTarget == candidate.ReplyTarget &&
-		maps.Equal(existing.Metadata, candidate.Metadata) &&
-		matchingOptionalTime(existing.OccurredAt, candidate.OccurredAt)
-}
-
-func matchingOptionalTime(left, right *time.Time) bool {
-	if left == nil || right == nil {
-		return left == nil && right == nil
-	}
-	return left.Equal(*right)
 }
 
 // DispatchOnce claims one FIFO event and creates/links its deterministic Task.

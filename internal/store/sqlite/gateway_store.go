@@ -60,7 +60,7 @@ func (s *Store) AdmitGatewayEvent(ctx context.Context, admission store.GatewayEv
 	defer tx.Rollback() //nolint:errcheck
 
 	if existing, err := getGatewayEventQuery(ctx, tx, event.Namespace, event.ID); err == nil {
-		if !gatewayEventsHaveSameEnvelope(existing, &event) {
+		if !store.GatewayEventsHaveSameEnvelope(existing, &event) {
 			return nil, false, store.ErrDuplicateMismatch
 		}
 		return existing, false, nil
@@ -260,14 +260,10 @@ func insertGatewayEventTx(
 	existing, err := getGatewayEventByExternalIDQuery(
 		ctx, tx, event.Namespace, event.GatewayUID, event.ExternalEventID,
 	)
-	if err == nil && !gatewayEventsHaveSameEnvelope(existing, event) {
+	if err == nil && !store.GatewayEventsHaveSameEnvelope(existing, event) {
 		return false, nil, store.ErrDuplicateMismatch
 	}
 	return false, existing, err
-}
-
-func gatewayEventsHaveSameEnvelope(left, right *store.GatewayEvent) bool {
-	return store.GatewayEventEnvelopeDigest(left) == store.GatewayEventEnvelopeDigest(right)
 }
 
 func retainedGatewayMessage(
@@ -398,7 +394,7 @@ func (s *Store) GetGatewayEventDuplicate(
 	if existing, err := getGatewayEventByExternalIDQuery(
 		ctx, tx, candidate.Namespace, candidate.GatewayUID, candidate.ExternalEventID,
 	); err == nil {
-		if store.GatewayEventEnvelopeDigest(existing) != store.GatewayEventEnvelopeDigest(candidate) {
+		if !store.GatewayEventsHaveSameEnvelope(existing, candidate) {
 			return nil, store.ErrDuplicateMismatch
 		}
 		return existing, nil

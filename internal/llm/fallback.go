@@ -15,6 +15,11 @@ type FallbackEntry struct {
 	Model    string
 }
 
+type fallbackCandidate struct {
+	provider Provider
+	model    string
+}
+
 // FallbackProvider tries a primary provider and falls back to alternatives on failure.
 type FallbackProvider struct {
 	primary   Provider
@@ -52,38 +57,11 @@ func (f *FallbackProvider) TelemetryProviderName() string {
 func (f *FallbackProvider) Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error) {
 	logger := log.FromContext(ctx)
 
-	type candidate struct {
-		provider Provider
-		model    string
-	}
-	candidates := make([]candidate, 0, 1+len(f.fallbacks))
-
-	// Add primary if not cooling down
-	if f.tracker == nil || !f.tracker.IsCoolingDown(f.primary.Name()) {
-		candidates = append(candidates, candidate{provider: f.primary})
-	}
-
-	// Add fallbacks that aren't cooling down
-	for _, fb := range f.fallbacks {
-		if f.tracker == nil || !f.tracker.IsCoolingDown(fb.Provider.Name()) {
-			candidates = append(candidates, candidate{provider: fb.Provider, model: fb.Model})
-		}
-	}
-
-	// If all are cooling down, try the one with shortest remaining cooldown
-	if len(candidates) == 0 {
-		shortest := f.shortestCooldown()
-		candidates = append(candidates, candidate{provider: shortest})
-	}
+	candidates := f.candidates()
 
 	var lastErr error
 	for _, c := range candidates {
-		callReq := req
-		if c.model != "" {
-			clone := *req
-			clone.Model = c.model
-			callReq = &clone
-		}
+		callReq := c.request(req)
 
 		resp, err := c.provider.Complete(ctx, callReq)
 		if err == nil {
@@ -120,33 +98,11 @@ func (f *FallbackProvider) Complete(ctx context.Context, req *CompletionRequest)
 func (f *FallbackProvider) Stream(ctx context.Context, req *CompletionRequest) (<-chan StreamChunk, error) {
 	logger := log.FromContext(ctx)
 
-	type candidate struct {
-		provider Provider
-		model    string
-	}
-	candidates := make([]candidate, 0, 1+len(f.fallbacks))
-
-	if f.tracker == nil || !f.tracker.IsCoolingDown(f.primary.Name()) {
-		candidates = append(candidates, candidate{provider: f.primary})
-	}
-	for _, fb := range f.fallbacks {
-		if f.tracker == nil || !f.tracker.IsCoolingDown(fb.Provider.Name()) {
-			candidates = append(candidates, candidate{provider: fb.Provider, model: fb.Model})
-		}
-	}
-	if len(candidates) == 0 {
-		shortest := f.shortestCooldown()
-		candidates = append(candidates, candidate{provider: shortest})
-	}
+	candidates := f.candidates()
 
 	var lastErr error
 	for _, c := range candidates {
-		callReq := req
-		if c.model != "" {
-			clone := *req
-			clone.Model = c.model
-			callReq = &clone
-		}
+		callReq := c.request(req)
 
 		innerCh, err := c.provider.Stream(ctx, callReq)
 		if err != nil {
@@ -206,6 +162,31 @@ func (f *FallbackProvider) Stream(ctx context.Context, req *CompletionRequest) (
 	}
 	close(ch)
 	return ch, nil
+}
+
+func (f *FallbackProvider) candidates() []fallbackCandidate {
+	candidates := make([]fallbackCandidate, 0, 1+len(f.fallbacks))
+	if f.tracker == nil || !f.tracker.IsCoolingDown(f.primary.Name()) {
+		candidates = append(candidates, fallbackCandidate{provider: f.primary})
+	}
+	for _, fallback := range f.fallbacks {
+		if f.tracker == nil || !f.tracker.IsCoolingDown(fallback.Provider.Name()) {
+			candidates = append(candidates, fallbackCandidate{provider: fallback.Provider, model: fallback.Model})
+		}
+	}
+	if len(candidates) == 0 {
+		candidates = append(candidates, fallbackCandidate{provider: f.shortestCooldown()})
+	}
+	return candidates
+}
+
+func (c fallbackCandidate) request(req *CompletionRequest) *CompletionRequest {
+	if c.model == "" {
+		return req
+	}
+	clone := *req
+	clone.Model = c.model
+	return &clone
 }
 
 func withStreamTelemetry(chunk StreamChunk, providerName, modelName string) StreamChunk {

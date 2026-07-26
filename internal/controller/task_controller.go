@@ -2104,43 +2104,17 @@ func (r *TaskReconciler) handleCompleted(ctx context.Context, task *corev1alpha1
 }
 
 func (r *TaskReconciler) cleanupDeletedTaskJob(ctx context.Context, task *corev1alpha1.Task) (bool, error) {
-	if task.Status.JobName == "" {
-		return false, nil
-	}
-
-	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Name: task.Status.JobName, Namespace: task.Namespace}, job); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("getting deleted task Job %q: %w", task.Status.JobName, err)
-	}
-
-	holdsPoolActor, err := r.taskHasSubstratePoolActorLeases(ctx, task)
-	if err != nil {
+	job, err := r.getTaskJobForCleanup(ctx, task.Namespace, task.Status.JobName, "deleted")
+	if err != nil || job == nil {
 		return false, err
 	}
-	propagationPolicy := metav1.DeletePropagationBackground
-	if holdsPoolActor {
-		propagationPolicy = metav1.DeletePropagationForeground
-	}
-	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil && !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("deleting deleted task Job %q: %w", task.Status.JobName, err)
-	}
-	return holdsPoolActor, nil
+	return r.deleteTaskJobForCleanup(ctx, task, job, task.Status.JobName, "deleted")
 }
 
 func (r *TaskReconciler) cleanupTerminalTaskJob(ctx context.Context, task *corev1alpha1.Task) (bool, error) {
-	if task.Status.JobName == "" {
-		return false, nil
-	}
-
-	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Name: task.Status.JobName, Namespace: task.Namespace}, job); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("getting terminal task Job %q: %w", task.Status.JobName, err)
+	job, err := r.getTaskJobForCleanup(ctx, task.Namespace, task.Status.JobName, "terminal")
+	if err != nil || job == nil {
+		return false, err
 	}
 
 	deleteJob := task.Status.Phase == corev1alpha1.TaskPhaseCancelled ||
@@ -2148,7 +2122,25 @@ func (r *TaskReconciler) cleanupTerminalTaskJob(ctx context.Context, task *corev
 	if !deleteJob {
 		return false, nil
 	}
+	return r.deleteTaskJobForCleanup(ctx, task, job, task.Status.JobName, "terminal")
+}
 
+func (r *TaskReconciler) getTaskJobForCleanup(ctx context.Context, namespace, jobName, cleanupKind string) (*batchv1.Job, error) {
+	if jobName == "" {
+		return nil, nil
+	}
+
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: namespace}, job); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("getting %s task Job %q: %w", cleanupKind, jobName, err)
+	}
+	return job, nil
+}
+
+func (r *TaskReconciler) deleteTaskJobForCleanup(ctx context.Context, task *corev1alpha1.Task, job *batchv1.Job, jobName, cleanupKind string) (bool, error) {
 	holdsPoolActor, err := r.taskHasSubstratePoolActorLeases(ctx, task)
 	if err != nil {
 		return false, err
@@ -2158,9 +2150,8 @@ func (r *TaskReconciler) cleanupTerminalTaskJob(ctx context.Context, task *corev
 		propagationPolicy = metav1.DeletePropagationForeground
 	}
 	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil && !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("deleting terminal task Job %q: %w", task.Status.JobName, err)
+		return false, fmt.Errorf("deleting %s task Job %q: %w", cleanupKind, jobName, err)
 	}
-
 	return holdsPoolActor, nil
 }
 
@@ -2378,30 +2369,11 @@ func (r *TaskReconciler) retryTask(ctx context.Context, task *corev1alpha1.Task)
 }
 
 func (r *TaskReconciler) cleanupRetryTaskJob(ctx context.Context, task *corev1alpha1.Task, jobName string) (bool, error) {
-	if jobName == "" {
-		return false, nil
-	}
-
-	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: task.Namespace}, job); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("getting retry task Job %q: %w", jobName, err)
-	}
-
-	holdsPoolActor, err := r.taskHasSubstratePoolActorLeases(ctx, task)
-	if err != nil {
+	job, err := r.getTaskJobForCleanup(ctx, task.Namespace, jobName, "retry")
+	if err != nil || job == nil {
 		return false, err
 	}
-	propagationPolicy := metav1.DeletePropagationBackground
-	if holdsPoolActor {
-		propagationPolicy = metav1.DeletePropagationForeground
-	}
-	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil && !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("deleting retry task Job %q: %w", jobName, err)
-	}
-	return holdsPoolActor, nil
+	return r.deleteTaskJobForCleanup(ctx, task, job, jobName, "retry")
 }
 
 // calculateRetryDelay calculates the delay before retry using exponential backoff

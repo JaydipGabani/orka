@@ -42,25 +42,13 @@ func newInProcessCodeExecTestTool(workDir string, timeout time.Duration, allowed
 		allowed = defaultCodeExecAllowedLangs()
 	}
 	return &CodeExecTool{
-		workDir:      workDir,
-		timeout:      timeout,
-		allowedLangs: allowed,
-		denyPatterns: defaultDenyPatterns,
-		executor:     &InProcessCodeExecutor{},
-		backend:      codeExecBackendInProcess,
+		workDir:       workDir,
+		timeout:       timeout,
+		allowedLangs:  allowed,
+		denyPatterns:  defaultDenyPatterns,
+		sandboxClient: &InProcessCodeExecutor{},
+		backend:       codeExecBackendInProcess,
 	}
-}
-
-type recordingCodeExecutor struct {
-	calls  int
-	req    CodeExecutionRequest
-	result CodeExecResult
-}
-
-func (e *recordingCodeExecutor) Execute(_ context.Context, req CodeExecutionRequest) CodeExecResult {
-	e.calls++
-	e.req = req
-	return e.result
 }
 
 type recordingSandboxClient struct {
@@ -746,8 +734,8 @@ func TestCodeExecTool_BackendSelector(t *testing.T) {
 	if tool.backend != codeExecBackendKubernetes {
 		t.Fatalf("empty backend = %q, want %q", tool.backend, codeExecBackendKubernetes)
 	}
-	if _, ok := tool.executor.(*KubernetesJobCodeExecutor); !ok {
-		t.Fatalf("empty backend executor type = %T, want *KubernetesJobCodeExecutor", tool.executor)
+	if _, ok := tool.sandboxClient.(*KubernetesJobCodeExecutor); !ok {
+		t.Fatalf("empty backend sandbox client type = %T, want *KubernetesJobCodeExecutor", tool.sandboxClient)
 	}
 
 	t.Setenv(codeExecBackendEnv, "in_process")
@@ -755,8 +743,8 @@ func TestCodeExecTool_BackendSelector(t *testing.T) {
 	if tool.backend != codeExecBackendInProcess {
 		t.Fatalf("backend = %q, want %q", tool.backend, codeExecBackendInProcess)
 	}
-	if _, ok := tool.executor.(*InProcessCodeExecutor); !ok {
-		t.Fatalf("executor type = %T, want *InProcessCodeExecutor", tool.executor)
+	if _, ok := tool.sandboxClient.(*InProcessCodeExecutor); !ok {
+		t.Fatalf("sandbox client type = %T, want *InProcessCodeExecutor", tool.sandboxClient)
 	}
 
 	t.Setenv(codeExecBackendEnv, "unsupported-test-backend")
@@ -790,13 +778,13 @@ func TestCodeExecTool_ExecuteUsesConfiguredExecutorWithoutScopedOverride(t *test
 		t.Setenv(envName, "")
 	}
 
-	recorder := &recordingCodeExecutor{result: CodeExecResult{Output: "from configured executor", ExitCode: 23}}
+	recorder := &recordingSandboxClient{result: SandboxRunResult{Output: "from configured executor", ExitCode: 23}}
 	tool := &CodeExecTool{
 		workDir:          t.TempDir(),
 		timeout:          time.Second,
 		allowedLangs:     defaultCodeExecAllowedLangs(),
 		denyPatterns:     defaultDenyPatterns,
-		executor:         recorder,
+		sandboxClient:    recorder,
 		backend:          codeExecBackendKubernetes,
 		outputLimitBytes: 123,
 	}
@@ -811,7 +799,7 @@ func TestCodeExecTool_ExecuteUsesConfiguredExecutorWithoutScopedOverride(t *test
 	}
 
 	if recorder.calls != 1 {
-		t.Fatalf("configured executor calls = %d, want 1", recorder.calls)
+		t.Fatalf("configured sandbox client calls = %d, want 1", recorder.calls)
 	}
 	if recorder.req.Backend != codeExecBackendKubernetes {
 		t.Fatalf("request backend = %q, want %q", recorder.req.Backend, codeExecBackendKubernetes)
@@ -838,7 +826,6 @@ func TestCodeExecTool_ExecuteUsesConfiguredExecutorWithoutScopedOverride(t *test
 func TestCodeExecTool_ExecuteUsesSandboxClient(t *testing.T) {
 	t.Setenv(codeExecBackendEnv, "")
 
-	executor := &recordingCodeExecutor{result: CodeExecResult{Output: "should not be used", ExitCode: 99}}
 	sandbox := &recordingSandboxClient{result: SandboxRunResult{
 		Output:          "from sandbox",
 		Error:           "sandbox stderr",
@@ -854,7 +841,6 @@ func TestCodeExecTool_ExecuteUsesSandboxClient(t *testing.T) {
 		allowedLangs:     defaultCodeExecAllowedLangs(),
 		denyPatterns:     defaultDenyPatterns,
 		sandboxClient:    sandbox,
-		executor:         executor,
 		backend:          codeExecBackendKubernetes,
 		outputLimitBytes: 321,
 	}
@@ -869,9 +855,6 @@ func TestCodeExecTool_ExecuteUsesSandboxClient(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	if executor.calls != 0 {
-		t.Fatalf("configured executor calls = %d, want 0 when sandbox client is configured", executor.calls)
-	}
 	if sandbox.calls != 1 {
 		t.Fatalf("sandbox calls = %d, want 1", sandbox.calls)
 	}
@@ -918,14 +901,14 @@ func TestCodeExecTool_ExecuteScopedBackendOverrideBypassesConfiguredExecutor(t *
 	}
 	t.Setenv(codeExecBackendEnv+"_PROVIDER_TEST_PROVIDER_OVERRIDE_TENANT_TEST_TENANT_OVERRIDE", "in_process")
 
-	recorder := &recordingCodeExecutor{result: CodeExecResult{Output: "should not be used", ExitCode: 99}}
+	recorder := &recordingSandboxClient{result: SandboxRunResult{Output: "should not be used", ExitCode: 99}}
 	tool := &CodeExecTool{
-		workDir:      t.TempDir(),
-		timeout:      time.Second,
-		allowedLangs: defaultCodeExecAllowedLangs(),
-		denyPatterns: defaultDenyPatterns,
-		executor:     recorder,
-		backend:      codeExecBackendKubernetes,
+		workDir:       t.TempDir(),
+		timeout:       time.Second,
+		allowedLangs:  defaultCodeExecAllowedLangs(),
+		denyPatterns:  defaultDenyPatterns,
+		sandboxClient: recorder,
+		backend:       codeExecBackendKubernetes,
 	}
 	ctx := WithToolContext(context.Background(), &ToolContext{
 		Tenant:   tenant,
@@ -937,7 +920,7 @@ func TestCodeExecTool_ExecuteScopedBackendOverrideBypassesConfiguredExecutor(t *
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if recorder.calls != 0 {
-		t.Fatalf("configured executor calls = %d, want 0 after scoped backend override", recorder.calls)
+		t.Fatalf("configured sandbox client calls = %d, want 0 after scoped backend override", recorder.calls)
 	}
 
 	var execResult CodeExecResult
@@ -1045,12 +1028,12 @@ func TestCodeExecTool_AuditLogRedactsCodeAndOutput(t *testing.T) {
 func TestCodeExecTool_BackendSelector_KubernetesAliases(t *testing.T) {
 	for _, backend := range []string{"kubernetes", "k8s", jobField} {
 		t.Run(backend, func(t *testing.T) {
-			executor, normalized := newCodeExecutorFromBackend(backend)
+			sandboxClient, normalized := newSandboxClientFromBackend(backend)
 			if normalized != codeExecBackendKubernetes {
 				t.Fatalf("backend = %q, want %q", normalized, codeExecBackendKubernetes)
 			}
-			if _, ok := executor.(*KubernetesJobCodeExecutor); !ok {
-				t.Fatalf("executor type = %T, want *KubernetesJobCodeExecutor", executor)
+			if _, ok := sandboxClient.(*KubernetesJobCodeExecutor); !ok {
+				t.Fatalf("sandbox client type = %T, want *KubernetesJobCodeExecutor", sandboxClient)
 			}
 		})
 	}

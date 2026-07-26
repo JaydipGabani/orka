@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"reflect"
 	"time"
 )
 
@@ -98,10 +99,28 @@ type GatewayEvent struct {
 	CompletedAt       *time.Time        `json:"completedAt,omitempty"`
 }
 
-// GatewayEventEnvelopeDigest returns a stable digest of immutable normalized ingress fields.
-func GatewayEventEnvelopeDigest(event *GatewayEvent) string {
+type gatewayEventEnvelope struct {
+	Namespace         string            `json:"namespace"`
+	NamespaceUID      string            `json:"namespaceUid"`
+	GatewayUID        string            `json:"gatewayUid"`
+	GatewayName       string            `json:"gatewayName"`
+	ExternalEventID   string            `json:"externalEventId"`
+	ProtocolVersion   string            `json:"protocolVersion"`
+	EventType         string            `json:"eventType"`
+	AccountID         string            `json:"accountId"`
+	ContextID         string            `json:"contextId"`
+	ThreadID          string            `json:"threadId"`
+	SenderID          string            `json:"senderId"`
+	SenderDisplayName string            `json:"senderDisplayName"`
+	Text              string            `json:"text"`
+	ReplyTarget       string            `json:"replyTarget"`
+	OccurredAt        string            `json:"occurredAt"`
+	Metadata          map[string]string `json:"metadata"`
+}
+
+func projectGatewayEventEnvelope(event *GatewayEvent) (*gatewayEventEnvelope, bool) {
 	if event == nil {
-		return ""
+		return nil, false
 	}
 	occurredAt := ""
 	if event.OccurredAt != nil {
@@ -111,32 +130,30 @@ func GatewayEventEnvelopeDigest(event *GatewayEvent) string {
 	if len(metadata) == 0 {
 		metadata = nil
 	}
-	payload := struct {
-		Namespace         string            `json:"namespace"`
-		NamespaceUID      string            `json:"namespaceUid"`
-		GatewayUID        string            `json:"gatewayUid"`
-		GatewayName       string            `json:"gatewayName"`
-		ExternalEventID   string            `json:"externalEventId"`
-		ProtocolVersion   string            `json:"protocolVersion"`
-		EventType         string            `json:"eventType"`
-		AccountID         string            `json:"accountId"`
-		ContextID         string            `json:"contextId"`
-		ThreadID          string            `json:"threadId"`
-		SenderID          string            `json:"senderId"`
-		SenderDisplayName string            `json:"senderDisplayName"`
-		Text              string            `json:"text"`
-		ReplyTarget       string            `json:"replyTarget"`
-		OccurredAt        string            `json:"occurredAt"`
-		Metadata          map[string]string `json:"metadata"`
-	}{
+	return &gatewayEventEnvelope{
 		Namespace: event.Namespace, NamespaceUID: event.NamespaceUID,
 		GatewayUID: event.GatewayUID, GatewayName: event.GatewayName,
 		ExternalEventID: event.ExternalEventID, ProtocolVersion: event.ProtocolVersion, EventType: event.EventType,
 		AccountID: event.AccountID, ContextID: event.ContextID, ThreadID: event.ThreadID,
 		SenderID: event.SenderID, SenderDisplayName: event.SenderDisplayName, Text: event.Text,
 		ReplyTarget: event.ReplyTarget, OccurredAt: occurredAt, Metadata: metadata,
+	}, true
+}
+
+// GatewayEventsHaveSameEnvelope reports whether two events have identical immutable normalized ingress fields.
+func GatewayEventsHaveSameEnvelope(left, right *GatewayEvent) bool {
+	leftEnvelope, leftOK := projectGatewayEventEnvelope(left)
+	rightEnvelope, rightOK := projectGatewayEventEnvelope(right)
+	return leftOK && rightOK && reflect.DeepEqual(leftEnvelope, rightEnvelope)
+}
+
+// GatewayEventEnvelopeDigest returns a stable digest of immutable normalized ingress fields.
+func GatewayEventEnvelopeDigest(event *GatewayEvent) string {
+	envelope, ok := projectGatewayEventEnvelope(event)
+	if !ok {
+		return ""
 	}
-	encoded, _ := json.Marshal(payload)
+	encoded, _ := json.Marshal(envelope)
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:])
 }

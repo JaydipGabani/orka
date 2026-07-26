@@ -62,28 +62,15 @@ type ServerConfig struct {
 
 // Server is the REST API server
 type Server struct {
-	app                    *fiber.App
-	client                 client.Client
-	config                 ServerConfig
-	sessionManager         *controller.SessionManager
-	handlers               *Handlers
-	chatHandler            *ChatHandler
-	openaiHandler          *OpenAICompatHandler
-	anthropicHandler       *AnthropicCompatHandler
-	internalHandlers       *InternalHandlers
-	ResultStore            store.ResultStore
-	SessionStore           store.SessionStore
-	PlanStore              store.PlanStore
-	MessageStore           store.MessageStore
-	ArtifactStore          store.ArtifactStore
-	MemoryStore            store.MemoryStore
-	MemoryProposalStore    store.MemoryProposalStore
-	SecurityStore          store.SecurityStore
-	RepositoryMonitorStore store.RepositoryMonitorStore
-	ExecutionEventStore    store.ExecutionEventStore
-	GatewayEventStore      store.GatewayEventStore
-	GatewayDeliveryStore   store.GatewayDeliveryStore
-	GatewayService         *gatewayruntime.Service
+	app              *fiber.App
+	client           client.Client
+	config           ServerConfig
+	sessionManager   *controller.SessionManager
+	handlers         *Handlers
+	chatHandler      *ChatHandler
+	openaiHandler    *OpenAICompatHandler
+	anthropicHandler *AnthropicCompatHandler
+	internalHandlers *InternalHandlers
 }
 
 // NewServer creates a new API server
@@ -96,23 +83,10 @@ func NewServer(c client.Client, sessionManager *controller.SessionManager, confi
 	app.Server().HeaderReceived = requestBodyConfig
 
 	server := &Server{
-		app:                    app,
-		client:                 c,
-		config:                 config,
-		sessionManager:         sessionManager,
-		ResultStore:            config.ResultStore,
-		SessionStore:           config.SessionStore,
-		PlanStore:              config.PlanStore,
-		MessageStore:           config.MessageStore,
-		ArtifactStore:          config.ArtifactStore,
-		MemoryStore:            config.MemoryStore,
-		MemoryProposalStore:    config.MemoryProposalStore,
-		SecurityStore:          config.SecurityStore,
-		RepositoryMonitorStore: config.RepositoryMonitorStore,
-		ExecutionEventStore:    config.ExecutionEventStore,
-		GatewayEventStore:      config.GatewayEventStore,
-		GatewayDeliveryStore:   config.GatewayDeliveryStore,
-		GatewayService:         config.GatewayService,
+		app:            app,
+		client:         c,
+		config:         config,
+		sessionManager: sessionManager,
 	}
 
 	server.handlers = NewHandlers(HandlersConfig{
@@ -406,18 +380,18 @@ func (s *Server) setupRoutes() {
 	// Internal API for worker communication
 	if s.hasInternalStores() {
 		s.internalHandlers = NewInternalHandlers(
-			s.ResultStore,
-			s.SessionStore,
-			s.PlanStore,
-			s.MessageStore,
-			s.ArtifactStore,
+			s.config.ResultStore,
+			s.config.SessionStore,
+			s.config.PlanStore,
+			s.config.MessageStore,
+			s.config.ArtifactStore,
 			InternalHandlersConfig{
 				Client:              s.client,
 				APIReader:           s.config.APIReader,
-				MemoryStore:         s.MemoryStore,
-				MemoryProposalStore: s.MemoryProposalStore,
-				ExecutionEventStore: s.ExecutionEventStore,
-				GatewayEventStore:   s.GatewayEventStore,
+				MemoryStore:         s.config.MemoryStore,
+				MemoryProposalStore: s.config.MemoryProposalStore,
+				ExecutionEventStore: s.config.ExecutionEventStore,
+				GatewayEventStore:   s.config.GatewayEventStore,
 			},
 		)
 		internal := s.app.Group("/internal/v1")
@@ -449,14 +423,14 @@ func (s *Server) setupRoutes() {
 }
 
 func (s *Server) hasInternalStores() bool {
-	return s.ResultStore != nil ||
-		s.SessionStore != nil ||
-		s.PlanStore != nil ||
-		s.MessageStore != nil ||
-		s.ArtifactStore != nil ||
-		s.MemoryStore != nil ||
-		s.MemoryProposalStore != nil ||
-		s.ExecutionEventStore != nil
+	return s.config.ResultStore != nil ||
+		s.config.SessionStore != nil ||
+		s.config.PlanStore != nil ||
+		s.config.MessageStore != nil ||
+		s.config.ArtifactStore != nil ||
+		s.config.MemoryStore != nil ||
+		s.config.MemoryProposalStore != nil ||
+		s.config.ExecutionEventStore != nil
 }
 
 // Start starts the API server

@@ -713,6 +713,27 @@ func TestDuplicateExternalEventIDRejectsDifferentEnvelope(t *testing.T) {
 	}
 }
 
+func TestAcknowledgeDuplicateEventRequiresMatchingID(t *testing.T) {
+	existing := &store.GatewayEvent{
+		ID: "event-one", Namespace: "default", NamespaceUID: "namespace-uid",
+		GatewayUID: "gateway-uid", GatewayName: "chat", ExternalEventID: "external-event",
+		ProtocolVersion: protocol.Version, EventType: protocol.EventTypeText,
+		AccountID: "acct", ContextID: "room", SenderID: "user-1", Text: "hello", ReplyTarget: "room",
+		State: store.GatewayEventQueued,
+	}
+	candidate := *existing
+	candidate.ID = "event-two"
+	if !store.GatewayEventsHaveSameEnvelope(existing, &candidate) {
+		t.Fatal("test setup: canonical envelopes should match despite different event IDs")
+	}
+
+	_, err := (&Service{}).acknowledgeDuplicateEvent(context.Background(), existing, &candidate)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Code != http.StatusConflict {
+		t.Fatalf("acknowledgeDuplicateEvent() error = %v, want HTTP 409", err)
+	}
+}
+
 func TestRetryDeliveryRejectsWhenProcessingDisabled(t *testing.T) {
 	service, _, _ := newGatewayServiceFixture(t)
 	service.Config.Enabled = false
