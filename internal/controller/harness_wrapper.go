@@ -31,8 +31,8 @@ import (
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/metrics"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/taskresult"
 	"github.com/orka-agents/orka/internal/workerenv"
-	"github.com/orka-agents/orka/workers/common"
 )
 
 const cliwrapperLocalOutputRef = "cliwrapper-result-v1"
@@ -867,11 +867,11 @@ func harnessWrapperCompletedResultBytes(completed *harness.TurnCompleted) []byte
 	if len(completed.Data) == 0 && len(completed.Artifacts) == 0 {
 		return []byte(completed.Result)
 	}
-	encoded, err := common.FormatStructuredResult(&common.StructuredResult{
+	encoded, err := taskresult.FormatStructuredResult(&taskresult.StructuredResult{
 		Version:   1,
 		Summary:   completed.Result,
 		Data:      completed.Data,
-		Artifacts: harnessArtifactRefsToStructured(completed.Artifacts),
+		Artifacts: normalizedHarnessArtifactRefs(completed.Artifacts),
 	})
 	if err != nil {
 		return []byte(completed.Result)
@@ -890,11 +890,11 @@ func harnessWrapperFailedResultBytes(failed *harness.TurnFailed) []byte {
 	if summary == "" {
 		summary = strings.TrimSpace(failed.Message)
 	}
-	encoded, err := common.FormatStructuredResult(&common.StructuredResult{
+	encoded, err := taskresult.FormatStructuredResult(&taskresult.StructuredResult{
 		Version:   1,
 		Summary:   summary,
 		Data:      failed.Data,
-		Artifacts: harnessArtifactRefsToStructured(failed.Artifacts),
+		Artifacts: normalizedHarnessArtifactRefs(failed.Artifacts),
 	})
 	if err != nil {
 		return []byte(failed.Result)
@@ -902,17 +902,17 @@ func harnessWrapperFailedResultBytes(failed *harness.TurnFailed) []byte {
 	return encoded
 }
 
-func harnessArtifactRefsToStructured(refs []harness.ArtifactRef) []common.ArtifactRef {
+func normalizedHarnessArtifactRefs(refs []harness.ArtifactRef) []taskresult.ArtifactRef {
 	if len(refs) == 0 {
 		return nil
 	}
-	out := make([]common.ArtifactRef, 0, len(refs))
+	out := make([]taskresult.ArtifactRef, 0, len(refs))
 	for _, ref := range refs {
 		filename := strings.TrimSpace(ref.Filename)
 		if filename == "" {
 			continue
 		}
-		out = append(out, common.ArtifactRef{
+		out = append(out, taskresult.ArtifactRef{
 			Filename:    filename,
 			ContentType: strings.TrimSpace(ref.ContentType),
 			Size:        ref.Size,

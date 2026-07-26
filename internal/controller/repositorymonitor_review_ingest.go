@@ -10,7 +10,7 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
-	"github.com/orka-agents/orka/workers/common"
+	"github.com/orka-agents/orka/internal/taskresult"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -220,7 +220,7 @@ func (r *RepositoryMonitorReconciler) ingestCompletedRepositoryMonitorReviewTask
 }
 
 func parseRepositoryMonitorReviewResult(raw []byte) (*repositoryMonitorReviewResult, error) {
-	summary := strings.TrimSpace(common.ParseStructuredResult(string(raw)).Summary)
+	summary := strings.TrimSpace(taskresult.ParseStructuredResult(string(raw)).Summary)
 	if summary == "" {
 		summary = strings.TrimSpace(string(raw))
 	}

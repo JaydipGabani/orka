@@ -1798,15 +1798,7 @@ func getGatewayDeliveryByEventQuery(ctx context.Context, q queryRower, namespace
 	return delivery, err
 }
 
-type queryRower interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}
-
-type gatewayRowScanner interface {
-	Scan(...any) error
-}
-
-func scanGatewayEvent(row gatewayRowScanner) (*store.GatewayEvent, error) {
+func scanGatewayEvent(row rowScanner) (*store.GatewayEvent, error) {
 	var event store.GatewayEvent
 	var metadataJSON string
 	var claimUntil, occurredAt, completedAt sql.NullTime
@@ -1830,7 +1822,7 @@ func scanGatewayEvent(row gatewayRowScanner) (*store.GatewayEvent, error) {
 	return &event, nil
 }
 
-func scanGatewayDelivery(row gatewayRowScanner) (*store.GatewayDelivery, error) {
+func scanGatewayDelivery(row rowScanner) (*store.GatewayDelivery, error) {
 	var delivery store.GatewayDelivery
 	var metadataJSON string
 	var claimUntil, deliveredAt sql.NullTime

@@ -25,8 +25,8 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/taskresult"
 	"github.com/orka-agents/orka/internal/workerenv"
-	"github.com/orka-agents/orka/workers/common"
 )
 
 const (
@@ -1676,6 +1676,181 @@ func TestRepositoryMonitorReviewPublishDisabledSkipsWithoutGitHubCall(t *testing
 	}
 	if len(publishRecords) != 1 || publishRecords[0].Phase != repositoryMonitorPublishPhaseSkipped || publishRecords[0].SkipReason != repositoryMonitorPublishSkipDisabled {
 		t.Fatalf("publishRecords = %#v, want one publish_disabled skip", publishRecords)
+	}
+}
+
+func TestRepositoryMonitorPullRequestGitHubListsPaginate(t *testing.T) {
+	tests := []struct {
+		name         string
+		endpointName string
+		item         func(int) any
+		list         func(context.Context, *RepositoryMonitorReconciler) ([]string, error)
+	}{
+		{
+			name:         "files",
+			endpointName: "files",
+			item: func(index int) any {
+				return repositoryMonitorPullRequestFileResponse{Filename: fmt.Sprintf("item-%d", index), Patch: fmt.Sprintf("patch-%d", index)}
+			},
+			list: func(ctx context.Context, reconciler *RepositoryMonitorReconciler) ([]string, error) {
+				files, err := reconciler.listRepositoryMonitorPullRequestFiles(ctx, "orka-agents", "orka", "test-token", 42)
+				if err != nil {
+					return nil, err
+				}
+				result := make([]string, 0, len(files))
+				for _, file := range files {
+					result = append(result, file.Filename)
+				}
+				return result, nil
+			},
+		},
+		{
+			name:         "reviews",
+			endpointName: "reviews",
+			item: func(index int) any {
+				return repositoryMonitorPullRequestReviewResponse{ID: int64(index), Body: fmt.Sprintf("item-%d", index)}
+			},
+			list: func(ctx context.Context, reconciler *RepositoryMonitorReconciler) ([]string, error) {
+				reviews, err := reconciler.listRepositoryMonitorPullRequestReviews(ctx, "orka-agents", "orka", "test-token", 42)
+				if err != nil {
+					return nil, err
+				}
+				result := make([]string, 0, len(reviews))
+				for _, review := range reviews {
+					result = append(result, review.Body)
+				}
+				return result, nil
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var requestedPages []int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/repos/orka-agents/orka/pulls/42/"+test.endpointName {
+					t.Fatalf("unexpected GitHub request %s %s", r.Method, r.URL.String())
+				}
+				if got := r.Header.Get("Authorization"); got != repositoryMonitorTestBearerHeader() {
+					t.Fatalf("Authorization header = %q, want %q", got, repositoryMonitorTestBearerHeader())
+				}
+				if got := r.Header.Get("Accept"); got != "application/vnd.github+json" {
+					t.Fatalf("Accept header = %q", got)
+				}
+				if got := r.Header.Get("X-GitHub-Api-Version"); got != "2022-11-28" {
+					t.Fatalf("X-GitHub-Api-Version header = %q", got)
+				}
+				if got := r.URL.Query().Get("per_page"); got != strconv.Itoa(repositoryMonitorGitHubPerPage) {
+					t.Fatalf("per_page = %q, want %d", got, repositoryMonitorGitHubPerPage)
+				}
+				page, err := strconv.Atoi(r.URL.Query().Get("page"))
+				if err != nil {
+					t.Fatalf("page query = %q: %v", r.URL.Query().Get("page"), err)
+				}
+				requestedPages = append(requestedPages, page)
+
+				var pageItems []any
+				switch page {
+				case 1:
+					pageItems = make([]any, repositoryMonitorGitHubPerPage)
+					for index := range repositoryMonitorGitHubPerPage {
+						pageItems[index] = test.item(index)
+					}
+				case 2:
+					pageItems = []any{test.item(repositoryMonitorGitHubPerPage)}
+				default:
+					t.Fatalf("unexpected page %d", page)
+				}
+				if err := json.NewEncoder(w).Encode(pageItems); err != nil {
+					t.Fatalf("encode page %d: %v", page, err)
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			items, err := test.list(context.Background(), &RepositoryMonitorReconciler{GitHubAPIBaseURL: server.URL})
+			if err != nil {
+				t.Fatalf("list %s: %v", test.name, err)
+			}
+			if len(items) != repositoryMonitorGitHubPerPage+1 || items[0] != "item-0" || items[repositoryMonitorGitHubPerPage-1] != fmt.Sprintf("item-%d", repositoryMonitorGitHubPerPage-1) || items[repositoryMonitorGitHubPerPage] != fmt.Sprintf("item-%d", repositoryMonitorGitHubPerPage) {
+				t.Fatalf("items = %#v, want ordered first page followed by second page", items)
+			}
+			if len(requestedPages) != 2 || requestedPages[0] != 1 || requestedPages[1] != 2 {
+				t.Fatalf("requested pages = %v, want [1 2]", requestedPages)
+			}
+		})
+	}
+}
+
+func TestRepositoryMonitorPullRequestGitHubListsPreserveErrors(t *testing.T) {
+	tests := []struct {
+		name          string
+		endpointName  string
+		operationName string
+		list          func(context.Context, *RepositoryMonitorReconciler) error
+	}{
+		{
+			name:          "files",
+			endpointName:  "files",
+			operationName: "pull request files",
+			list: func(ctx context.Context, reconciler *RepositoryMonitorReconciler) error {
+				_, err := reconciler.listRepositoryMonitorPullRequestFiles(ctx, "orka-agents", "orka", "test-token", 42)
+				return err
+			},
+		},
+		{
+			name:          "reviews",
+			endpointName:  "reviews",
+			operationName: "pull request reviews",
+			list: func(ctx context.Context, reconciler *RepositoryMonitorReconciler) error {
+				_, err := reconciler.listRepositoryMonitorPullRequestReviews(ctx, "orka-agents", "orka", "test-token", 42)
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name+"/transport", func(t *testing.T) {
+			reconciler := &RepositoryMonitorReconciler{HTTPClient: &http.Client{Transport: repositoryMonitorRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("transport failed")
+			})}}
+			got := test.list(context.Background(), reconciler)
+			want := fmt.Sprintf("GitHub %s request failed: Get \"https://api.github.com/repos/orka-agents/orka/pulls/42/%s?per_page=%d&page=1\": transport failed", test.operationName, test.endpointName, repositoryMonitorGitHubPerPage)
+			if got == nil || got.Error() != want {
+				t.Fatalf("error = %v, want %q", got, want)
+			}
+		})
+
+		t.Run(test.name+"/api", func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte("forbidden"))
+			}))
+			t.Cleanup(server.Close)
+
+			err := test.list(context.Background(), &RepositoryMonitorReconciler{GitHubAPIBaseURL: server.URL})
+			var apiErr *repositoryMonitorGitHubAPIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("error = %v, want repositoryMonitorGitHubAPIError", err)
+			}
+			if apiErr.Operation != test.operationName+" request" || apiErr.StatusCode != http.StatusForbidden || apiErr.Body != "forbidden" {
+				t.Fatalf("api error = %#v", apiErr)
+			}
+			if got, want := err.Error(), "GitHub "+test.operationName+" request returned 403: forbidden"; got != want {
+				t.Fatalf("error = %q, want %q", got, want)
+			}
+		})
+
+		t.Run(test.name+"/decode", func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("{"))
+			}))
+			t.Cleanup(server.Close)
+
+			err := test.list(context.Background(), &RepositoryMonitorReconciler{GitHubAPIBaseURL: server.URL})
+			if got, want := err.Error(), "failed to parse GitHub "+test.operationName+" response: unexpected end of JSON input"; got != want {
+				t.Fatalf("error = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -3679,6 +3854,12 @@ type repositoryMonitorPublishTestServer struct {
 	PostedReview repositoryMonitorPullRequestReviewRequest
 }
 
+type repositoryMonitorRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f repositoryMonitorRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func newRepositoryMonitorPublishTestServer(t *testing.T, cfg repositoryMonitorPublishTestServerConfig) *repositoryMonitorPublishTestServer {
 	t.Helper()
 	if cfg.State == "" {
@@ -5022,7 +5203,7 @@ func TestRepositoryMonitorIssueImplementToPRFakeGitHubE2E(t *testing.T) {
 		"status":         "patch_ready",
 		"summary":        "Implemented fake health endpoint.",
 	})
-	implBytes, _ := common.FormatStructuredResult(&common.StructuredResult{
+	implBytes, _ := taskresult.FormatStructuredResult(&taskresult.StructuredResult{
 		Summary: string(agentResult),
 		BaseSHA: "base77",
 		HeadSHA: "base77",
@@ -5063,7 +5244,7 @@ func TestRepositoryMonitorIssueImplementToPRFakeGitHubE2E(t *testing.T) {
 	if !taskEnvHasValue(mutationTask.Spec.Env, workerenv.PriorTaskDiffSHA256, repositoryMonitorIssuePatchDigest(implementationDiff)) {
 		t.Fatalf("mutation task env = %#v, want validated diff digest", mutationTask.Spec.Env)
 	}
-	mutationBytes, _ := common.FormatStructuredResult(&common.StructuredResult{
+	mutationBytes, _ := taskresult.FormatStructuredResult(&taskresult.StructuredResult{
 		Summary:    "Pushed validated implementation branch.",
 		BaseSHA:    "base77",
 		HeadSHA:    "head77",
@@ -5255,7 +5436,7 @@ func TestRepositoryMonitorIssueImplementationRecordBindsFinalizedDiffIdentity(t 
 	item := &store.MonitorItem{Number: 44, SnapshotDigest: "sha256:test"}
 	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "implementation-task", Namespace: "default", Annotations: map[string]string{repositoryMonitorIssueAnnotationCommandID: "cmd-impl"}}}
 	agentJSON := `{"schemaVersion":"orka.issueImplementation.v1","status":"patch_ready","summary":"Implemented Windows tray support."}`
-	raw, err := common.FormatStructuredResult(&common.StructuredResult{
+	raw, err := taskresult.FormatStructuredResult(&taskresult.StructuredResult{
 		Summary: agentJSON,
 		BaseSHA: "base",
 		HeadSHA: "base",
@@ -5295,7 +5476,7 @@ func TestRepositoryMonitorIssueImplementationRecordRejectsMalformedSuccess(t *te
 	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "malformed-impl", Namespace: "default"}}
 	item := &store.MonitorItem{Number: 44, SnapshotDigest: "sha256:test"}
 	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "implementation-task", Namespace: "default", Annotations: map[string]string{repositoryMonitorIssueAnnotationCommandID: "cmd-impl"}}}
-	raw, err := common.FormatStructuredResult(&common.StructuredResult{
+	raw, err := taskresult.FormatStructuredResult(&taskresult.StructuredResult{
 		Summary: "I changed the files but did not return the required JSON.",
 		Diff:    "diff --git a/README.md b/README.md\n",
 		Files:   []string{"README.md"},
@@ -5313,7 +5494,7 @@ func TestRepositoryMonitorIssueImplementationRecordPreservesBlockedFinalizedStat
 	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "blocked-impl", Namespace: "default"}}
 	item := &store.MonitorItem{Number: 44, SnapshotDigest: "sha256:test"}
 	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "implementation-task", Namespace: "default", Annotations: map[string]string{repositoryMonitorIssueAnnotationCommandID: "cmd-impl"}}}
-	raw, err := common.FormatStructuredResult(&common.StructuredResult{Summary: `{"schemaVersion":"orka.issueImplementation.v1","status":"blocked","summary":"Needs decomposition."}`})
+	raw, err := taskresult.FormatStructuredResult(&taskresult.StructuredResult{Summary: `{"schemaVersion":"orka.issueImplementation.v1","status":"blocked","summary":"Needs decomposition."}`})
 	if err != nil {
 		t.Fatalf("FormatStructuredResult() error = %v", err)
 	}
@@ -5836,7 +6017,7 @@ func TestRepositoryMonitorPRReviewRepairReadinessAutomergeFakeGitHubE2E(t *testi
 		t.Fatalf("repairs = %#v, want queued repair", repairs)
 	}
 	repairTaskName := repairs[0].TaskName
-	repairResult, _ := common.FormatStructuredResult(&common.StructuredResult{Summary: "fixed review finding", HeadSHA: "head88-fixed", PushBranch: "feature-repair", Files: []string{"internal/example.go"}})
+	repairResult, _ := taskresult.FormatStructuredResult(&taskresult.StructuredResult{Summary: "fixed review finding", HeadSHA: "head88-fixed", PushBranch: "feature-repair", Files: []string{"internal/example.go"}})
 	if err := monitorStore.SaveResult(ctx, "default", repairTaskName, repairResult); err != nil {
 		t.Fatalf("SaveResult(repair) error = %v", err)
 	}
@@ -6178,7 +6359,7 @@ func TestRepositoryMonitorAutomergeTransientMergeErrorPropagates(t *testing.T) {
 	}
 }
 
-func repositoryMonitorPatchValidationReason(t *testing.T, reconciler *RepositoryMonitorReconciler, ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, record *store.ActionRecord, task *corev1alpha1.Task, result *common.StructuredResult) string {
+func repositoryMonitorPatchValidationReason(t *testing.T, reconciler *RepositoryMonitorReconciler, ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, record *store.ActionRecord, task *corev1alpha1.Task, result *taskresult.StructuredResult) string {
 	t.Helper()
 	reason, err := reconciler.validateAndSaveIssuePatchArtifacts(ctx, monitor, item, record, task, result)
 	if err != nil {
@@ -6270,19 +6451,19 @@ func TestRepositoryMonitorIssuePatchValidationArtifacts(t *testing.T) {
 	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "impl-task", Namespace: "default"}}
 	record := &store.ActionRecord{ID: "act-impl", CommandEventID: "cmd-impl"}
 	reconciler := &RepositoryMonitorReconciler{Store: monitorStore, ArtifactStore: monitorStore}
-	missingFiles := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/internal/x.go b/internal/x.go\n"}
+	missingFiles := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/internal/x.go b/internal/x.go\n"}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, missingFiles); got != "patch_file_list_missing" {
 		t.Fatalf("missing file list reason = %q, want patch_file_list_missing", got)
 	}
-	denied := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n", Files: []string{".github/workflows/ci.yml"}}
+	denied := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n", Files: []string{".github/workflows/ci.yml"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, denied); got != "patch_path_denied" {
 		t.Fatalf("denied patch reason = %q, want patch_path_denied", got)
 	}
-	manifestMismatch := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/docs/safe.md b/.github/workflows/pwn.yml\n--- a/docs/safe.md\n+++ b/.github/workflows/pwn.yml\n", Files: []string{"docs/safe.md"}}
+	manifestMismatch := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/docs/safe.md b/.github/workflows/pwn.yml\n--- a/docs/safe.md\n+++ b/.github/workflows/pwn.yml\n", Files: []string{"docs/safe.md"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, manifestMismatch); got != "patch_path_manifest_mismatch" {
 		t.Fatalf("forged patch manifest reason = %q, want patch_path_manifest_mismatch", got)
 	}
-	headerLikeHunk := &common.StructuredResult{
+	headerLikeHunk := &taskresult.StructuredResult{
 		BaseSHA: "base",
 		Diff:    "diff --git a/schema.sql b/schema.sql\n--- a/schema.sql\n+++ b/schema.sql\n@@ -1 +1 @@\n--- initialize schema\n+-- initialize schema safely\n",
 		Files:   []string{"schema.sql"},
@@ -6290,40 +6471,40 @@ func TestRepositoryMonitorIssuePatchValidationArtifacts(t *testing.T) {
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, &store.ActionRecord{ID: "act-header-like", CommandEventID: "cmd-header-like"}, &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "impl-header-like", Namespace: "default"}}, headerLikeHunk); got != "" {
 		t.Fatalf("header-like hunk patch reason = %q, want empty", got)
 	}
-	missingGitHeader := &common.StructuredResult{BaseSHA: "base", Diff: "--- a/.github/workflows/pwn.yml\n+++ b/.github/workflows/pwn.yml\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"docs/safe.md"}}
+	missingGitHeader := &taskresult.StructuredResult{BaseSHA: "base", Diff: "--- a/.github/workflows/pwn.yml\n+++ b/.github/workflows/pwn.yml\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"docs/safe.md"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, missingGitHeader); got != "patch_path_invalid" {
 		t.Fatalf("non-git patch reason = %q, want patch_path_invalid", got)
 	}
-	prefixBypass := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git \"x/.github/workflows/pwn.yml\" \"x/.github/workflows/pwn.yml\"\n--- \"x/.github/workflows/pwn.yml\"\n+++ \"x/.github/workflows/pwn.yml\"\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"x/.github/workflows/pwn.yml"}}
+	prefixBypass := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git \"x/.github/workflows/pwn.yml\" \"x/.github/workflows/pwn.yml\"\n--- \"x/.github/workflows/pwn.yml\"\n+++ \"x/.github/workflows/pwn.yml\"\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"x/.github/workflows/pwn.yml"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, prefixBypass); got != "patch_path_invalid" {
 		t.Fatalf("noncanonical prefix reason = %q, want patch_path_invalid", got)
 	}
-	mixedPatch := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/docs/safe.md b/docs/safe.md\n--- a/docs/safe.md\n+++ b/docs/safe.md\n@@ -1 +1 @@\n-old\n+new\n--- a/.github/workflows/pwn.yml\n+++ b/.github/workflows/pwn.yml\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"docs/safe.md"}}
+	mixedPatch := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/docs/safe.md b/docs/safe.md\n--- a/docs/safe.md\n+++ b/docs/safe.md\n@@ -1 +1 @@\n-old\n+new\n--- a/.github/workflows/pwn.yml\n+++ b/.github/workflows/pwn.yml\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"docs/safe.md"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, mixedPatch); got != "patch_path_invalid" {
 		t.Fatalf("mixed patch reason = %q, want patch_path_invalid", got)
 	}
-	leadingMixedPatch := &common.StructuredResult{BaseSHA: "base", Diff: "--- a/.github/workflows/pwn.yml\n+++ b/.github/workflows/pwn.yml\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/docs/safe.md b/docs/safe.md\n--- a/docs/safe.md\n+++ b/docs/safe.md\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"docs/safe.md"}}
+	leadingMixedPatch := &taskresult.StructuredResult{BaseSHA: "base", Diff: "--- a/.github/workflows/pwn.yml\n+++ b/.github/workflows/pwn.yml\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/docs/safe.md b/docs/safe.md\n--- a/docs/safe.md\n+++ b/docs/safe.md\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"docs/safe.md"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, leadingMixedPatch); got != "patch_path_invalid" {
 		t.Fatalf("leading mixed patch reason = %q, want patch_path_invalid", got)
 	}
-	dotPath := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/./.github/workflows/pwn.yml b/./.github/workflows/pwn.yml\n--- a/./.github/workflows/pwn.yml\n+++ b/./.github/workflows/pwn.yml\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"./.github/workflows/pwn.yml"}}
+	dotPath := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/./.github/workflows/pwn.yml b/./.github/workflows/pwn.yml\n--- a/./.github/workflows/pwn.yml\n+++ b/./.github/workflows/pwn.yml\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"./.github/workflows/pwn.yml"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, dotPath); got != "patch_path_invalid" {
 		t.Fatalf("dot path reason = %q, want patch_path_invalid", got)
 	}
 	credentialMarker := "github" + "_pat_" + strings.Repeat("a", 24)
-	secretPatch := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/config.txt b/config.txt\n--- a/config.txt\n+++ b/config.txt\n@@ -0,0 +1 @@\n+++ " + credentialMarker + "\n", Files: []string{"config.txt"}}
+	secretPatch := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/config.txt b/config.txt\n--- a/config.txt\n+++ b/config.txt\n@@ -0,0 +1 @@\n+++ " + credentialMarker + "\n", Files: []string{"config.txt"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, secretPatch); got != "patch_secret_scan_failed" {
 		t.Fatalf("secret patch reason = %q, want patch_secret_scan_failed", got)
 	}
-	modeMismatch := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/.github/workflows/pwn.yml b/.github/workflows/pwn.yml\nold mode 100644\nnew mode 100755\n", Files: []string{"docs/safe.md"}}
+	modeMismatch := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/.github/workflows/pwn.yml b/.github/workflows/pwn.yml\nold mode 100644\nnew mode 100755\n", Files: []string{"docs/safe.md"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, modeMismatch); got != "patch_path_manifest_mismatch" {
 		t.Fatalf("mode-only manifest mismatch reason = %q, want patch_path_manifest_mismatch", got)
 	}
-	renameDenied := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/docs/pwn.yml b/.github/workflows/pwn.yml\nsimilarity index 100%\nrename from docs/pwn.yml\nrename to .github/workflows/pwn.yml\n", Files: []string{"docs/pwn.yml", ".github/workflows/pwn.yml"}}
+	renameDenied := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/docs/pwn.yml b/.github/workflows/pwn.yml\nsimilarity index 100%\nrename from docs/pwn.yml\nrename to .github/workflows/pwn.yml\n", Files: []string{"docs/pwn.yml", ".github/workflows/pwn.yml"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, renameDenied); got != "patch_path_denied" {
 		t.Fatalf("rename destination reason = %q, want patch_path_denied", got)
 	}
-	valid := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/internal/x.go b/internal/x.go\n--- a/internal/x.go\n+++ b/internal/x.go\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"internal/x.go"}}
+	valid := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/internal/x.go b/internal/x.go\n--- a/internal/x.go\n+++ b/internal/x.go\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"internal/x.go"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, valid); got != "" {
 		t.Fatalf("valid patch reason = %q, want empty", got)
 	}
@@ -6354,11 +6535,11 @@ func TestRepositoryMonitorIssuePatchRejectsInjectedRuntimeCredential(t *testing.
 	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "impl-opaque", Namespace: defaultNS, Annotations: map[string]string{labels.AnnotationAgentRuntimeAuthOnly: scheduledRunLabelValue}}, Spec: corev1alpha1.TaskSpec{AgentRef: &corev1alpha1.AgentReference{Name: agent.Name}}}
 	record := &store.ActionRecord{ID: "act-opaque", CommandEventID: "cmd-opaque"}
 	reconciler := &RepositoryMonitorReconciler{Client: cl, Store: monitorStore, ArtifactStore: monitorStore}
-	result := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/config.txt b/config.txt\n--- a/config.txt\n+++ b/config.txt\n@@ -0,0 +1 @@\n+" + opaqueValue + "\n", Files: []string{"config.txt"}}
+	result := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/config.txt b/config.txt\n--- a/config.txt\n+++ b/config.txt\n@@ -0,0 +1 @@\n+" + opaqueValue + "\n", Files: []string{"config.txt"}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, result); got != "patch_secret_scan_failed" {
 		t.Fatalf("opaque credential patch reason = %q, want patch_secret_scan_failed", got)
 	}
-	pathResult := &common.StructuredResult{BaseSHA: "base", Diff: "diff --git a/" + opaqueValue + " b/" + opaqueValue + "\nnew file mode 100644\n", Files: []string{opaqueValue}}
+	pathResult := &taskresult.StructuredResult{BaseSHA: "base", Diff: "diff --git a/" + opaqueValue + " b/" + opaqueValue + "\nnew file mode 100644\n", Files: []string{opaqueValue}}
 	if got := repositoryMonitorPatchValidationReason(t, reconciler, ctx, monitor, item, record, task, pathResult); got != "patch_secret_scan_failed" {
 		t.Fatalf("opaque credential path reason = %q, want patch_secret_scan_failed", got)
 	}
@@ -6409,7 +6590,7 @@ func TestRepositoryMonitorIssueImplementationResultRedactsRuntimeCredentialBefor
 		repositoryMonitorIssueAnnotationRuntimeAuthFields:      workerenv.OpenAIAPIKey,
 	}}, Spec: corev1alpha1.TaskSpec{SecretRef: &corev1alpha1.SecretReference{Name: runtimeConfig.Name}}, Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseSucceeded}}
 	summary, _ := json.Marshal(map[string]any{"schemaVersion": "orka.issueImplementation.v1", "status": "patch_ready", "summary": "leaked " + credential})
-	raw, err := common.FormatStructuredResult(&common.StructuredResult{Summary: string(summary), BaseSHA: "base", Diff: "diff --git a/internal/x.go b/internal/x.go\n--- a/internal/x.go\n+++ b/internal/x.go\n@@ -1 +1 @@\n-old\n+" + credential + "\n", Files: []string{"internal/x.go"}})
+	raw, err := taskresult.FormatStructuredResult(&taskresult.StructuredResult{Summary: string(summary), BaseSHA: "base", Diff: "diff --git a/internal/x.go b/internal/x.go\n--- a/internal/x.go\n+++ b/internal/x.go\n@@ -1 +1 @@\n-old\n+" + credential + "\n", Files: []string{"internal/x.go"}})
 	if err != nil {
 		t.Fatalf("FormatStructuredResult() error = %v", err)
 	}
@@ -6553,7 +6734,7 @@ func TestRepositoryMonitorIssuePatchCredentialLookupErrorRemainsRetryable(t *tes
 	}
 	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "impl-retry", Namespace: defaultNS, Annotations: map[string]string{labels.AnnotationAgentRuntimeAuthOnly: scheduledRunLabelValue}}, Spec: corev1alpha1.TaskSpec{AgentRef: &corev1alpha1.AgentReference{Name: "implementer"}}}
 	diff := "diff --git a/internal/x.go b/internal/x.go\n--- a/internal/x.go\n+++ b/internal/x.go\n@@ -1 +1 @@\n-old\n+new\n"
-	payload, err := common.FormatStructuredResult(&common.StructuredResult{Summary: `{"schemaVersion":"orka.issueImplementation.v1","status":"patch_ready","summary":"safe patch"}`, BaseSHA: "base", Diff: diff, Files: []string{"internal/x.go"}})
+	payload, err := taskresult.FormatStructuredResult(&taskresult.StructuredResult{Summary: `{"schemaVersion":"orka.issueImplementation.v1","status":"patch_ready","summary":"safe patch"}`, BaseSHA: "base", Diff: diff, Files: []string{"internal/x.go"}})
 	if err != nil {
 		t.Fatalf("FormatStructuredResult() error = %v", err)
 	}

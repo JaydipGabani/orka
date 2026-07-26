@@ -31,9 +31,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
-	"github.com/orka-agents/orka/internal/controller"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/llm"
+	sessionmanager "github.com/orka-agents/orka/internal/session"
 	"github.com/orka-agents/orka/internal/store"
 	chattools "github.com/orka-agents/orka/internal/tools"
 	"github.com/orka-agents/orka/internal/tracing"
@@ -109,7 +109,7 @@ type SSEEvent struct {
 type ChatHandler struct {
 	client                    client.Client
 	kubeClient                kubernetes.Interface
-	sessionManager            *controller.SessionManager
+	sessionManager            *sessionmanager.Manager
 	config                    ChatConfig
 	semaphore                 chan struct{}
 	watchNamespace            string
@@ -122,7 +122,7 @@ type ChatHandler struct {
 }
 
 // NewChatHandler creates a new ChatHandler.
-func NewChatHandler(c client.Client, sm *controller.SessionManager, config ChatConfig, watchNamespace string, enforceNS bool, ss store.SessionStore, rs store.ResultStore, resolver *ProviderResolver, kubeClientOpt ...kubernetes.Interface) *ChatHandler {
+func NewChatHandler(c client.Client, sm *sessionmanager.Manager, config ChatConfig, watchNamespace string, enforceNS bool, ss store.SessionStore, rs store.ResultStore, resolver *ProviderResolver, kubeClientOpt ...kubernetes.Interface) *ChatHandler {
 	var kubeClient kubernetes.Interface
 	if len(kubeClientOpt) > 0 {
 		kubeClient = kubeClientOpt[0]

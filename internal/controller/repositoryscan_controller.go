@@ -34,7 +34,7 @@ import (
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/security"
 	"github.com/orka-agents/orka/internal/store"
-	"github.com/orka-agents/orka/workers/common"
+	"github.com/orka-agents/orka/internal/taskresult"
 )
 
 const (
@@ -2683,7 +2683,7 @@ func normalizedPatchDiff(diff string) string {
 	return strings.Join(normalized, "\n")
 }
 
-func (r *RepositoryScanReconciler) verifyPatchTaskArtifacts(ctx context.Context, scan *corev1alpha1.RepositoryScan, task *corev1alpha1.Task, findingID string, sr *common.StructuredResult) (patchVerificationResult, string, error) {
+func (r *RepositoryScanReconciler) verifyPatchTaskArtifacts(ctx context.Context, scan *corev1alpha1.RepositoryScan, task *corev1alpha1.Task, findingID string, sr *taskresult.StructuredResult) (patchVerificationResult, string, error) {
 	if r.ArtifactStore == nil {
 		return patchVerificationResult{}, "artifact store is not configured", nil
 	}
@@ -2809,7 +2809,7 @@ func (r *RepositoryScanReconciler) updatePatchProposalFromSucceededTask(ctx cont
 		return err
 	}
 
-	sr := common.ParseStructuredResult(string(result))
+	sr := taskresult.ParseStructuredResult(string(result))
 	switch {
 	case strings.TrimSpace(sr.PushError) != "":
 		proposal.Status = scanRunPhaseFailed

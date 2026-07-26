@@ -29,7 +29,7 @@ import (
 	"github.com/orka-agents/orka/internal/security"
 	storepkg "github.com/orka-agents/orka/internal/store"
 	sqlitestore "github.com/orka-agents/orka/internal/store/sqlite"
-	"github.com/orka-agents/orka/workers/common"
+	"github.com/orka-agents/orka/internal/taskresult"
 )
 
 const readyReasonScanFailed = "ScanFailed"
@@ -2425,9 +2425,9 @@ func patchTaskForFixture(fixture patchIngestFixture, resultAvailable bool) *core
 	}
 }
 
-func savePatchStructuredResult(t *testing.T, fixture patchIngestFixture, sr *common.StructuredResult) {
+func savePatchStructuredResult(t *testing.T, fixture patchIngestFixture, sr *taskresult.StructuredResult) {
 	t.Helper()
-	result, err := common.FormatStructuredResult(sr)
+	result, err := taskresult.FormatStructuredResult(sr)
 	if err != nil {
 		t.Fatalf("FormatStructuredResult() error = %v", err)
 	}
@@ -2485,7 +2485,7 @@ func TestIngestPatchTaskMarksPatchReadyAfterConfirmedPush(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "ready")
 	diff := "diff --git a/app.py b/app.py"
-	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+	savePatchStructuredResult(t, fixture, &taskresult.StructuredResult{
 		Summary:    "patched successfully",
 		Diff:       diff,
 		Files:      []string{"app.py"},
@@ -2522,7 +2522,7 @@ func TestIngestPatchTaskAcceptsDiffArtifactWithDifferentIndexFormatting(t *testi
 		"+safe()",
 		"",
 	}, "\n")
-	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+	savePatchStructuredResult(t, fixture, &taskresult.StructuredResult{
 		Summary:    "patched successfully",
 		Diff:       actualDiff,
 		Files:      []string{"app.py"},
@@ -2541,7 +2541,7 @@ func TestIngestPatchTaskAcceptsSubPathRelativeChangedFiles(t *testing.T) {
 	fixture := newPatchIngestFixture(t, "subpath")
 	fixture.scan.Spec.SubPath = "services/api"
 	diff := "diff --git a/services/api/app.py b/services/api/app.py"
-	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+	savePatchStructuredResult(t, fixture, &taskresult.StructuredResult{
 		Summary:    "patched successfully",
 		Diff:       diff,
 		Files:      []string{"services/api/app.py"},
@@ -2558,7 +2558,7 @@ func TestIngestPatchTaskAcceptsSubPathRelativeChangedFiles(t *testing.T) {
 func TestIngestPatchTaskRejectsMissingDiffArtifact(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "missing-diff")
-	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+	savePatchStructuredResult(t, fixture, &taskresult.StructuredResult{
 		Summary:    "patched successfully",
 		Diff:       "diff --git a/app.py b/app.py",
 		Files:      []string{"app.py"},
@@ -2574,7 +2574,7 @@ func TestIngestPatchTaskRejectsMissingDiffArtifact(t *testing.T) {
 func TestIngestPatchTaskRejectsMissingDiffArtifactWhenEarlierDirectiveIsSpoofed(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "spoofed-directive")
-	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+	savePatchStructuredResult(t, fixture, &taskresult.StructuredResult{
 		Summary:    "patched successfully",
 		Diff:       "diff --git a/app.py b/app.py",
 		Files:      []string{"app.py"},
@@ -2612,7 +2612,7 @@ func TestIngestPatchTaskRejectsStaleDiffArtifact(t *testing.T) {
 		"+still_unsafe()",
 		"",
 	}, "\n")
-	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+	savePatchStructuredResult(t, fixture, &taskresult.StructuredResult{
 		Summary:    "patched successfully",
 		Diff:       actualDiff,
 		Files:      []string{"app.py"},
@@ -2629,7 +2629,7 @@ func TestIngestPatchTaskRejectsStaleDiffArtifact(t *testing.T) {
 func TestIngestPatchTaskRejectsConfirmedPushWithoutArtifactContract(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "no-artifacts")
-	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+	savePatchStructuredResult(t, fixture, &taskresult.StructuredResult{
 		Summary:    "patched successfully",
 		Diff:       "diff --git a/app.py b/app.py",
 		Files:      []string{"app.py"},
@@ -2648,7 +2648,7 @@ func TestIngestPatchTaskRejectsMismatchedChangedFiles(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "mismatched-files")
 	diff := "diff --git a/app.py b/app.py"
-	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+	savePatchStructuredResult(t, fixture, &taskresult.StructuredResult{
 		Summary:    "patched successfully",
 		Diff:       diff,
 		Files:      []string{"app.py", "extra.py"},
@@ -2665,7 +2665,7 @@ func TestIngestPatchTaskRejectsMismatchedChangedFiles(t *testing.T) {
 func TestIngestPatchTaskFailsSucceededTaskWhenPushFails(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "failed")
-	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+	savePatchStructuredResult(t, fixture, &taskresult.StructuredResult{
 		Summary:   "patch created but push failed",
 		Diff:      "diff --git a/app.py b/app.py",
 		PushError: "git push failed: remote rejected",
@@ -2680,7 +2680,7 @@ func TestIngestPatchTaskFailsSucceededTaskWhenPushFails(t *testing.T) {
 func TestIngestPatchTaskFailsSucceededTaskWithoutConfirmedPushBranch(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "missing-push")
-	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+	savePatchStructuredResult(t, fixture, &taskresult.StructuredResult{
 		Summary: "patch created without confirmed push",
 		Diff:    "diff --git a/app.py b/app.py",
 	})

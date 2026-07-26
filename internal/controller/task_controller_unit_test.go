@@ -7308,8 +7308,15 @@ func TestTaskLifecycleEventKeepsExistingSessionName(t *testing.T) {
 		},
 	}
 	reconciler := newUnitReconciler(scheme, task)
+	db, err := sqlite.NewDB(":memory:")
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sessionStore := sqlite.NewStore(db, ":memory:")
+	reconciler.SessionManager = NewSessionManager(sessionStore)
 	now := time.Now()
-	if err := reconciler.SessionManager.store.CreateSession(context.Background(), &store.SessionRecord{
+	if err := sessionStore.CreateSession(context.Background(), &store.SessionRecord{
 		Namespace:   "default",
 		Name:        "session-a",
 		SessionType: "task",

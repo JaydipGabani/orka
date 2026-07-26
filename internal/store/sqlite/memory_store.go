@@ -38,10 +38,6 @@ const (
 	proposalStatusApplied  = "applied"
 )
 
-type rowScanner interface {
-	Scan(dest ...any) error
-}
-
 // CreateMemory inserts a durable memory record.
 func (s *Store) CreateMemory(ctx context.Context, memory *store.Memory) error {
 	if memory == nil {

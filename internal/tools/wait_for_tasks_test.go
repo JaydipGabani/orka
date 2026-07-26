@@ -21,7 +21,7 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
-	"github.com/orka-agents/orka/workers/common"
+	"github.com/orka-agents/orka/internal/taskresult"
 )
 
 const taskFailRetry = "task-fail-retry"
@@ -300,7 +300,7 @@ func TestWaitForTasksTool_Execute_InvalidTimeout(t *testing.T) {
 
 func TestWaitForTasksTool_Execute_TruncatesLongStructuredSummary(t *testing.T) {
 	longSummary := strings.Repeat("x", maxWaitTaskSummaryChars+128)
-	sr := common.StructuredResult{Version: 1, Summary: longSummary}
+	sr := taskresult.StructuredResult{Version: 1, Summary: longSummary}
 	srJSON, _ := json.Marshal(sr)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -363,7 +363,7 @@ func TestWaitForTasksTool_Execute_MissingNamespace(t *testing.T) {
 
 func TestWaitForTasksTool_Execute_StructuredResult(t *testing.T) {
 	// Create a structured result with diff (which should be stripped)
-	sr := common.StructuredResult{
+	sr := taskresult.StructuredResult{
 		Version:  1,
 		Summary:  "Implemented auth middleware",
 		BaseSHA:  "abc123def",
@@ -854,7 +854,7 @@ func TestWaitForTasksTool_Execute_FallbackToMessage(t *testing.T) {
 }
 
 func TestWaitForTasksTool_Execute_PreservesStructuredData(t *testing.T) {
-	sr := common.StructuredResult{
+	sr := taskresult.StructuredResult{
 		Version: 1,
 		Summary: "structured child output",
 		Data: map[string]any{
@@ -862,7 +862,7 @@ func TestWaitForTasksTool_Execute_PreservesStructuredData(t *testing.T) {
 			"score":    float64(0.98),
 			"nested":   map[string]any{"owner": "ops"},
 		},
-		Artifacts: []common.ArtifactRef{{Filename: "evidence.json", ContentType: "application/json", Size: 42}},
+		Artifacts: []taskresult.ArtifactRef{{Filename: "evidence.json", ContentType: "application/json", Size: 42}},
 	}
 	srJSON, _ := json.Marshal(sr)
 	t.Setenv(envOrkaTaskNamespace, defaultNamespace)
@@ -901,7 +901,7 @@ func TestWaitForTasksTool_Execute_PreservesStructuredData(t *testing.T) {
 }
 
 func TestWaitForTasksTool_Execute_TruncatesOversizedStructuredData(t *testing.T) {
-	sr := common.StructuredResult{
+	sr := taskresult.StructuredResult{
 		Version: 1,
 		Summary: "large data",
 		Data: map[string]any{

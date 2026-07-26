@@ -959,48 +959,46 @@ func repositoryMonitorGitHubPublishFailureReason(err error) string {
 }
 
 func (r *RepositoryMonitorReconciler) listRepositoryMonitorPullRequestFiles(ctx context.Context, owner, repository, token string, number int64) ([]repositoryMonitorPullRequestFileResponse, error) {
-	var files []repositoryMonitorPullRequestFileResponse
-	for page := 1; ; page++ {
-		pageFiles, err := r.fetchRepositoryMonitorPullRequestFilesPage(ctx, owner, repository, token, number, page)
-		if err != nil {
-			return nil, err
-		}
-		files = append(files, pageFiles...)
-		if len(pageFiles) < repositoryMonitorGitHubPerPage {
-			break
-		}
-	}
-	return files, nil
+	return listRepositoryMonitorPullRequestPages[repositoryMonitorPullRequestFileResponse](ctx, r, owner, repository, token, number, "files", "pull request files")
 }
 
-func (r *RepositoryMonitorReconciler) fetchRepositoryMonitorPullRequestFilesPage(ctx context.Context, owner, repository, token string, number int64, page int) ([]repositoryMonitorPullRequestFileResponse, error) {
+func listRepositoryMonitorPullRequestPages[T any](ctx context.Context, r *RepositoryMonitorReconciler, owner, repository, token string, number int64, endpointName, operationName string) ([]T, error) {
 	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
 	if baseURL == "" {
 		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
 	}
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/files?per_page=%d&page=%d", baseURL, url.PathEscape(owner), url.PathEscape(repository), number, repositoryMonitorGitHubPerPage, page)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
+
+	var items []T
+	for page := 1; ; page++ {
+		endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/%s?per_page=%d&page=%d", baseURL, url.PathEscape(owner), url.PathEscape(repository), number, endpointName, repositoryMonitorGitHubPerPage, page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		repositoryMonitorSetGitHubHeaders(req, token)
+		resp, err := repositoryMonitorHTTPClient(r).Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("GitHub %s request failed: %w", operationName, err)
+		}
+		respBody, readErr := func() ([]byte, error) {
+			defer resp.Body.Close() //nolint:errcheck
+			return readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
+		}()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, &repositoryMonitorGitHubAPIError{Operation: operationName + " request", StatusCode: resp.StatusCode, Body: string(respBody)}
+		}
+		var pageItems []T
+		if err := json.Unmarshal(respBody, &pageItems); err != nil {
+			return nil, fmt.Errorf("failed to parse GitHub %s response: %w", operationName, err)
+		}
+		items = append(items, pageItems...)
+		if len(pageItems) < repositoryMonitorGitHubPerPage {
+			return items, nil
+		}
 	}
-	repositoryMonitorSetGitHubHeaders(req, token)
-	resp, err := repositoryMonitorHTTPClient(r).Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("GitHub pull request files request failed: %w", err)
-	}
-	defer resp.Body.Close() //nolint:errcheck
-	respBody, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &repositoryMonitorGitHubAPIError{Operation: "pull request files request", StatusCode: resp.StatusCode, Body: string(respBody)}
-	}
-	var response []repositoryMonitorPullRequestFileResponse
-	if err := json.Unmarshal(respBody, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse GitHub pull request files response: %w", err)
-	}
-	return response, nil
 }
 
 func (r *RepositoryMonitorReconciler) repositoryMonitorGitHubReviewMarkerMatch(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, owner, repository, token, headSHA string) (*repositoryMonitorPullRequestReviewResponse, string, error) {
@@ -1062,48 +1060,7 @@ func repositoryMonitorPublishIDFromMarker(body, markerPrefix string) string {
 }
 
 func (r *RepositoryMonitorReconciler) listRepositoryMonitorPullRequestReviews(ctx context.Context, owner, repository, token string, number int64) ([]repositoryMonitorPullRequestReviewResponse, error) {
-	var reviews []repositoryMonitorPullRequestReviewResponse
-	for page := 1; ; page++ {
-		pageReviews, err := r.fetchRepositoryMonitorPullRequestReviewsPage(ctx, owner, repository, token, number, page)
-		if err != nil {
-			return nil, err
-		}
-		reviews = append(reviews, pageReviews...)
-		if len(pageReviews) < repositoryMonitorGitHubPerPage {
-			break
-		}
-	}
-	return reviews, nil
-}
-
-func (r *RepositoryMonitorReconciler) fetchRepositoryMonitorPullRequestReviewsPage(ctx context.Context, owner, repository, token string, number int64, page int) ([]repositoryMonitorPullRequestReviewResponse, error) {
-	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
-	if baseURL == "" {
-		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
-	}
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/reviews?per_page=%d&page=%d", baseURL, url.PathEscape(owner), url.PathEscape(repository), number, repositoryMonitorGitHubPerPage, page)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	repositoryMonitorSetGitHubHeaders(req, token)
-	resp, err := repositoryMonitorHTTPClient(r).Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("GitHub pull request reviews request failed: %w", err)
-	}
-	defer resp.Body.Close() //nolint:errcheck
-	respBody, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &repositoryMonitorGitHubAPIError{Operation: "pull request reviews request", StatusCode: resp.StatusCode, Body: string(respBody)}
-	}
-	var response []repositoryMonitorPullRequestReviewResponse
-	if err := json.Unmarshal(respBody, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse GitHub pull request reviews response: %w", err)
-	}
-	return response, nil
+	return listRepositoryMonitorPullRequestPages[repositoryMonitorPullRequestReviewResponse](ctx, r, owner, repository, token, number, "reviews", "pull request reviews")
 }
 
 func (r *RepositoryMonitorReconciler) createRepositoryMonitorPullRequestReview(ctx context.Context, owner, repository, token string, number int64, review repositoryMonitorPullRequestReviewRequest) (*repositoryMonitorPullRequestReviewResponse, error) {

@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/orka-agents/orka/internal/taskresult"
 )
 
 const (
@@ -276,14 +278,9 @@ type TurnFailed struct {
 	Retryable bool           `json:"retryable,omitempty"`
 }
 
-// ArtifactRef is safe artifact metadata passed through the harness protocol.
+// ArtifactRef is a compatibility alias for safe structured task artifact metadata.
 // Artifact bytes remain in Orka-managed storage or at an adapter-provided outputRef.
-type ArtifactRef struct {
-	Filename    string `json:"filename"`
-	ContentType string `json:"contentType,omitempty"`
-	Size        int64  `json:"size,omitempty"`
-	Description string `json:"description,omitempty"`
-}
+type ArtifactRef = taskresult.ArtifactRef
 
 type ErrorInfo struct {
 	Code      string `json:"code"`

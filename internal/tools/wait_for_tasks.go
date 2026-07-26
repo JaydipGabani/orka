@@ -22,7 +22,7 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
-	"github.com/orka-agents/orka/workers/common"
+	"github.com/orka-agents/orka/internal/taskresult"
 )
 
 // WaitForTasksTool implements waiting for child tasks to complete
@@ -44,25 +44,25 @@ type WaitForTasksResult struct {
 
 // TaskResultInfo holds individual task result information
 type TaskResultInfo struct {
-	Task            string               `json:"task"`
-	Agent           string               `json:"agent,omitempty"`
-	Phase           string               `json:"phase"`
-	Result          string               `json:"result,omitempty"`
-	Summary         string               `json:"summary,omitempty"`
-	Verdict         string               `json:"verdict,omitempty"`
-	Feedback        string               `json:"feedback,omitempty"`
-	Files           []string             `json:"files,omitempty"`
-	Data            map[string]any       `json:"data,omitempty"`
-	Artifacts       []common.ArtifactRef `json:"artifacts,omitempty"`
-	BaseSHA         string               `json:"baseSHA,omitempty"`
-	HeadSHA         string               `json:"headSHA,omitempty"`
-	PushBranch      string               `json:"pushBranch,omitempty"`
-	WorkspaceRef    string               `json:"workspaceRef,omitempty"`
-	WorkspaceBranch string               `json:"workspaceBranch,omitempty"`
-	Iteration       string               `json:"iteration,omitempty"`
-	FailureDetails  *FailureDetails      `json:"failureDetails,omitempty"`
-	Retried         bool                 `json:"retried,omitempty"`
-	RetryTaskName   string               `json:"retryTaskName,omitempty"`
+	Task            string                   `json:"task"`
+	Agent           string                   `json:"agent,omitempty"`
+	Phase           string                   `json:"phase"`
+	Result          string                   `json:"result,omitempty"`
+	Summary         string                   `json:"summary,omitempty"`
+	Verdict         string                   `json:"verdict,omitempty"`
+	Feedback        string                   `json:"feedback,omitempty"`
+	Files           []string                 `json:"files,omitempty"`
+	Data            map[string]any           `json:"data,omitempty"`
+	Artifacts       []taskresult.ArtifactRef `json:"artifacts,omitempty"`
+	BaseSHA         string                   `json:"baseSHA,omitempty"`
+	HeadSHA         string                   `json:"headSHA,omitempty"`
+	PushBranch      string                   `json:"pushBranch,omitempty"`
+	WorkspaceRef    string                   `json:"workspaceRef,omitempty"`
+	WorkspaceBranch string                   `json:"workspaceBranch,omitempty"`
+	Iteration       string                   `json:"iteration,omitempty"`
+	FailureDetails  *FailureDetails          `json:"failureDetails,omitempty"`
+	Retried         bool                     `json:"retried,omitempty"`
+	RetryTaskName   string                   `json:"retryTaskName,omitempty"`
 }
 
 // FailureDetails provides structured information about a failed task
@@ -211,7 +211,7 @@ func (t *WaitForTasksTool) Execute(ctx context.Context, args json.RawMessage) (s
 				resultStr, fetchErr := fetchTaskResultForNamespace(ctx, ns, taskName)
 				if fetchErr == nil {
 					// Parse structured result and strip diff to avoid context bloat.
-					sr := common.ParseStructuredResult(resultStr)
+					sr := taskresult.ParseStructuredResult(resultStr)
 					summary := truncateWaitTaskSummary(sr.Summary)
 					results[taskName].Summary = summary
 					results[taskName].Verdict = sr.Verdict

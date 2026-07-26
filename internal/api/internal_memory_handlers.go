@@ -7,26 +7,10 @@ MIT License - see LICENSE file for details.
 package api
 
 import (
-	"strings"
-
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/orka-agents/orka/internal/store"
 )
-
-func (h *InternalHandlers) ensureMemoryStore() error {
-	if h.memoryStore == nil {
-		return fiber.NewError(fiber.StatusNotImplemented, "memory store not configured")
-	}
-	return nil
-}
-
-func (h *InternalHandlers) ensureMemoryProposalStore() error {
-	if h.memoryProposalStore == nil {
-		return fiber.NewError(fiber.StatusNotImplemented, "memory proposal store not configured")
-	}
-	return nil
-}
 
 func (h *InternalHandlers) internalNamespace(c fiber.Ctx) (string, error) {
 	namespace := c.Params("namespace")
@@ -45,16 +29,16 @@ func (h *InternalHandlers) ListMemories(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryStore(); err != nil {
+	if err := requireMemoryStore(h.memoryStore); err != nil {
 		return err
 	}
 	filter, err := parseMemoryFilter(c, namespace)
 	if err != nil {
 		return err
 	}
-	memories, err := h.memoryStore.ListMemories(c.Context(), filter)
+	memories, err := listMemories(c.Context(), h.memoryStore, filter)
 	if err != nil {
-		return memoryStoreError("list memories", "memory", err)
+		return err
 	}
 	return c.JSON(memories)
 }
@@ -65,7 +49,7 @@ func (h *InternalHandlers) CreateMemory(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryStore(); err != nil {
+	if err := requireMemoryStore(h.memoryStore); err != nil {
 		return err
 	}
 	var memory store.Memory
@@ -76,11 +60,8 @@ func (h *InternalHandlers) CreateMemory(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "memory namespace mismatch")
 	}
 	memory.Namespace = namespace
-	if strings.TrimSpace(memory.Content) == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "content is required")
-	}
-	if err := h.memoryStore.CreateMemory(c.Context(), &memory); err != nil {
-		return memoryStoreError("create memory", "memory", err)
+	if err := createMemory(c.Context(), h.memoryStore, &memory); err != nil {
+		return err
 	}
 	return c.Status(fiber.StatusCreated).JSON(memory)
 }
@@ -91,12 +72,12 @@ func (h *InternalHandlers) GetMemory(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryStore(); err != nil {
+	if err := requireMemoryStore(h.memoryStore); err != nil {
 		return err
 	}
-	memory, err := h.memoryStore.GetMemory(c.Context(), namespace, c.Params("id"))
+	memory, err := getMemory(c.Context(), h.memoryStore, namespace, c.Params("id"))
 	if err != nil {
-		return memoryStoreError("get memory", "memory", err)
+		return err
 	}
 	return c.JSON(memory)
 }
@@ -107,7 +88,7 @@ func (h *InternalHandlers) UpdateMemory(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryStore(); err != nil {
+	if err := requireMemoryStore(h.memoryStore); err != nil {
 		return err
 	}
 	var req store.Memory
@@ -117,22 +98,9 @@ func (h *InternalHandlers) UpdateMemory(c fiber.Ctx) error {
 	if req.Namespace != "" && req.Namespace != namespace {
 		return fiber.NewError(fiber.StatusBadRequest, "memory namespace mismatch")
 	}
-	memory, err := h.memoryStore.GetMemory(c.Context(), namespace, c.Params("id"))
+	updated, err := updateMemory(c.Context(), h.memoryStore, namespace, c.Params("id"), req)
 	if err != nil {
-		return memoryStoreError("get memory", "memory", err)
-	}
-	applyMemoryUpdate(memory, req)
-	memory.Namespace = namespace
-	memory.ID = c.Params("id")
-	if strings.TrimSpace(memory.Content) == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "content is required")
-	}
-	if err := h.memoryStore.UpdateMemory(c.Context(), memory); err != nil {
-		return memoryStoreError("update memory", "memory", err)
-	}
-	updated, err := h.memoryStore.GetMemory(c.Context(), namespace, c.Params("id"))
-	if err != nil {
-		return memoryStoreError("get memory", "memory", err)
+		return err
 	}
 	return c.JSON(updated)
 }
@@ -143,11 +111,11 @@ func (h *InternalHandlers) DeleteMemory(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryStore(); err != nil {
+	if err := requireMemoryStore(h.memoryStore); err != nil {
 		return err
 	}
-	if err := h.memoryStore.DeleteMemory(c.Context(), namespace, c.Params("id")); err != nil {
-		return memoryStoreError("delete memory", "memory", err)
+	if err := deleteMemory(c.Context(), h.memoryStore, namespace, c.Params("id")); err != nil {
+		return err
 	}
 	return c.SendStatus(fiber.StatusNoContent)
 }
@@ -167,11 +135,11 @@ func (h *InternalHandlers) setMemoryDisabled(c fiber.Ctx, disabled bool) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryStore(); err != nil {
+	if err := requireMemoryStore(h.memoryStore); err != nil {
 		return err
 	}
-	if err := h.memoryStore.SetMemoryDisabled(c.Context(), namespace, c.Params("id"), disabled); err != nil {
-		return memoryStoreError("update memory", "memory", err)
+	if err := setMemoryDisabled(c.Context(), h.memoryStore, namespace, c.Params("id"), disabled); err != nil {
+		return err
 	}
 	return c.SendStatus(fiber.StatusNoContent)
 }
@@ -182,16 +150,16 @@ func (h *InternalHandlers) ListMemoryProposals(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryProposalStore(); err != nil {
+	if err := requireMemoryProposalStore(h.memoryProposalStore); err != nil {
 		return err
 	}
 	filter, err := parseMemoryProposalFilter(c, namespace)
 	if err != nil {
 		return err
 	}
-	proposals, err := h.memoryProposalStore.ListMemoryProposals(c.Context(), filter)
+	proposals, err := listMemoryProposals(c.Context(), h.memoryProposalStore, filter)
 	if err != nil {
-		return memoryStoreError("list memory proposals", "memory proposal", err)
+		return err
 	}
 	return c.JSON(proposals)
 }
@@ -202,7 +170,7 @@ func (h *InternalHandlers) CreateMemoryProposal(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryProposalStore(); err != nil {
+	if err := requireMemoryProposalStore(h.memoryProposalStore); err != nil {
 		return err
 	}
 	var proposal store.MemoryProposal
@@ -213,11 +181,8 @@ func (h *InternalHandlers) CreateMemoryProposal(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "memory proposal namespace mismatch")
 	}
 	proposal.Namespace = namespace
-	if strings.TrimSpace(proposal.Title) == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "title is required")
-	}
-	if err := h.memoryProposalStore.CreateMemoryProposal(c.Context(), &proposal); err != nil {
-		return memoryStoreError("create memory proposal", "memory proposal", err)
+	if err := createMemoryProposal(c.Context(), h.memoryProposalStore, &proposal); err != nil {
+		return err
 	}
 	return c.Status(fiber.StatusCreated).JSON(proposal)
 }
@@ -228,12 +193,12 @@ func (h *InternalHandlers) GetMemoryProposal(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryProposalStore(); err != nil {
+	if err := requireMemoryProposalStore(h.memoryProposalStore); err != nil {
 		return err
 	}
-	proposal, err := h.memoryProposalStore.GetMemoryProposal(c.Context(), namespace, c.Params("id"))
+	proposal, err := getMemoryProposal(c.Context(), h.memoryProposalStore, namespace, c.Params("id"))
 	if err != nil {
-		return memoryStoreError("get memory proposal", "memory proposal", err)
+		return err
 	}
 	return c.JSON(proposal)
 }
@@ -244,7 +209,7 @@ func (h *InternalHandlers) ReviewMemoryProposal(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryProposalStore(); err != nil {
+	if err := requireMemoryProposalStore(h.memoryProposalStore); err != nil {
 		return err
 	}
 	review, err := bindMemoryProposalReview(c, namespace, c.Params("id"))
@@ -259,8 +224,8 @@ func (h *InternalHandlers) ReviewMemoryProposal(c fiber.Ctx) error {
 			review.Reviewer = ui.Username
 		}
 	}
-	if err := h.memoryProposalStore.ReviewMemoryProposal(c.Context(), review); err != nil {
-		return memoryStoreError("review memory proposal", "memory proposal", err)
+	if err := reviewMemoryProposal(c.Context(), h.memoryProposalStore, review); err != nil {
+		return err
 	}
 	return c.SendStatus(fiber.StatusNoContent)
 }
@@ -271,11 +236,11 @@ func (h *InternalHandlers) ArchiveMemoryProposal(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryProposalStore(); err != nil {
+	if err := requireMemoryProposalStore(h.memoryProposalStore); err != nil {
 		return err
 	}
-	if err := h.memoryProposalStore.ArchiveMemoryProposal(c.Context(), namespace, c.Params("id")); err != nil {
-		return memoryStoreError("archive memory proposal", "memory proposal", err)
+	if err := archiveMemoryProposal(c.Context(), h.memoryProposalStore, namespace, c.Params("id")); err != nil {
+		return err
 	}
 	return c.SendStatus(fiber.StatusNoContent)
 }
@@ -286,7 +251,7 @@ func (h *InternalHandlers) ApplyMemoryProposal(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.ensureMemoryProposalStore(); err != nil {
+	if err := requireMemoryProposalStore(h.memoryProposalStore); err != nil {
 		return err
 	}
 	apply, err := bindMemoryProposalApply(c, namespace, c.Params("id"))
@@ -301,9 +266,9 @@ func (h *InternalHandlers) ApplyMemoryProposal(c fiber.Ctx) error {
 			apply.AppliedBy = ui.Username
 		}
 	}
-	memory, err := h.memoryProposalStore.ApplyMemoryProposal(c.Context(), apply)
+	memory, err := applyMemoryProposal(c.Context(), h.memoryProposalStore, apply)
 	if err != nil {
-		return memoryStoreError("apply memory proposal", "memory proposal", err)
+		return err
 	}
 	return c.JSON(memory)
 }

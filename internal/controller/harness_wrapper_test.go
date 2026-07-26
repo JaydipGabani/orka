@@ -26,8 +26,8 @@ import (
 	"github.com/orka-agents/orka/internal/harness/harnesstest"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/taskresult"
 	"github.com/orka-agents/orka/internal/workerenv"
-	"github.com/orka-agents/orka/workers/common"
 	"github.com/orka-agents/orka/workers/harness/cliwrapper"
 )
 
@@ -2071,17 +2071,50 @@ func TestHarnessWrapperCompletedResultBytesPreservesStructuredPayload(t *testing
 	encoded := harnessWrapperCompletedResultBytes(&harness.TurnCompleted{
 		Result: "done",
 		Data:   map[string]any{"incident": "quincy-north", "score": float64(0.9)},
-		Artifacts: []harness.ArtifactRef{{
-			Filename:    "evidence.json",
-			ContentType: "application/json",
-			Size:        42,
-		}},
+		Artifacts: []harness.ArtifactRef{
+			{
+				Filename:    "  evidence.json  ",
+				ContentType: "  application/json  ",
+				Size:        42,
+				Description: "  review evidence  ",
+			},
+			{Filename: "  "},
+		},
 	})
-	parsed := common.ParseStructuredResult(string(encoded))
+	parsed := taskresult.ParseStructuredResult(string(encoded))
 	if parsed.Summary != "done" || parsed.Data["incident"] != "quincy-north" {
 		t.Fatalf("parsed structured result = %#v", parsed)
 	}
-	if len(parsed.Artifacts) != 1 || parsed.Artifacts[0].Filename != "evidence.json" {
+	if len(parsed.Artifacts) != 1 || parsed.Artifacts[0] != (taskresult.ArtifactRef{
+		Filename:    "evidence.json",
+		ContentType: "application/json",
+		Size:        42,
+		Description: "review evidence",
+	}) {
+		t.Fatalf("artifacts = %#v", parsed.Artifacts)
+	}
+}
+
+func TestHarnessWrapperFailedResultBytesPreservesStructuredPayload(t *testing.T) {
+	encoded := harnessWrapperFailedResultBytes(&harness.TurnFailed{
+		Message: "adapter failed",
+		Result:  "  partial result  ",
+		Data:    map[string]any{"retryable": false},
+		Artifacts: []harness.ArtifactRef{{
+			Filename:    "  failure.json  ",
+			ContentType: "  application/json  ",
+			Description: "  failure details  ",
+		}},
+	})
+	parsed := taskresult.ParseStructuredResult(string(encoded))
+	if parsed.Summary != "partial result" || parsed.Data["retryable"] != false {
+		t.Fatalf("parsed structured result = %#v", parsed)
+	}
+	if len(parsed.Artifacts) != 1 || parsed.Artifacts[0] != (taskresult.ArtifactRef{
+		Filename:    "failure.json",
+		ContentType: "application/json",
+		Description: "failure details",
+	}) {
 		t.Fatalf("artifacts = %#v", parsed.Artifacts)
 	}
 }

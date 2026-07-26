@@ -23,9 +23,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/orka-agents/orka/internal/controller"
 	gatewayruntime "github.com/orka-agents/orka/internal/gateway"
 	"github.com/orka-agents/orka/internal/gateway/protocol"
+	sessionmanager "github.com/orka-agents/orka/internal/session"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/uiembed"
 )
@@ -65,7 +65,7 @@ type Server struct {
 	app              *fiber.App
 	client           client.Client
 	config           ServerConfig
-	sessionManager   *controller.SessionManager
+	sessionManager   *sessionmanager.Manager
 	handlers         *Handlers
 	chatHandler      *ChatHandler
 	openaiHandler    *OpenAICompatHandler
@@ -74,7 +74,7 @@ type Server struct {
 }
 
 // NewServer creates a new API server
-func NewServer(c client.Client, sessionManager *controller.SessionManager, config ServerConfig) *Server {
+func NewServer(c client.Client, sessionManager *sessionmanager.Manager, config ServerConfig) *Server {
 	app := fiber.New(fiber.Config{
 		AppName:      "Orka API",
 		BodyLimit:    15 << 20, // 15MB — allows artifact uploads up to 10MB + overhead

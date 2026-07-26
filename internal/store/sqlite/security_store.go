@@ -250,9 +250,7 @@ func (s *Store) UpsertReviewSlice(ctx context.Context, slice *store.ReviewSlice)
 	return err
 }
 
-func scanReviewSlice(scanner interface {
-	Scan(dest ...any) error
-}) (*store.ReviewSlice, error) {
+func scanReviewSlice(scanner rowScanner) (*store.ReviewSlice, error) {
 	var (
 		slice                 store.ReviewSlice
 		entrypointsJSON       string
@@ -618,9 +616,7 @@ func (s *Store) UpsertFinding(ctx context.Context, finding *store.Finding) error
 	return err
 }
 
-func scanFinding(scanner interface {
-	Scan(dest ...any) error
-}) (*store.Finding, error) {
+func scanFinding(scanner rowScanner) (*store.Finding, error) {
 	var (
 		finding      store.Finding
 		evidenceJSON string

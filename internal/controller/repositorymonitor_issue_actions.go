@@ -30,8 +30,8 @@ import (
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/security"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/taskresult"
 	"github.com/orka-agents/orka/internal/workerenv"
-	"github.com/orka-agents/orka/workers/common"
 )
 
 const (
@@ -1310,7 +1310,7 @@ func repositoryMonitorActionRecordFromTask(monitor *corev1alpha1.RepositoryMonit
 	}
 	var body map[string]any
 	_ = json.Unmarshal([]byte(payload), &body)
-	sr := common.ParseStructuredResult(payload)
+	sr := taskresult.ParseStructuredResult(payload)
 	if actionKind == repositoryMonitorIssueActionImplementation && body != nil {
 		body = repositoryMonitorImplementationResultBody(body, sr, item)
 		if data, err := json.Marshal(body); err == nil {
@@ -1364,7 +1364,7 @@ func repositoryMonitorActionRecordFromTask(monitor *corev1alpha1.RepositoryMonit
 	}
 }
 
-func repositoryMonitorImplementationResultBody(envelope map[string]any, sr *common.StructuredResult, item *store.MonitorItem) map[string]any {
+func repositoryMonitorImplementationResultBody(envelope map[string]any, sr *taskresult.StructuredResult, item *store.MonitorItem) map[string]any {
 	body := make(map[string]any, len(envelope))
 	maps.Copy(body, envelope)
 	agentBody := map[string]any{}
@@ -1727,7 +1727,7 @@ func repositoryMonitorPathPatternMatches(pattern, path string) bool {
 }
 
 func (r *RepositoryMonitorReconciler) finishIssueImplementation(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, record *store.ActionRecord, task *corev1alpha1.Task) (string, string, string, error) {
-	sr := common.ParseStructuredResult(record.PayloadJSON)
+	sr := taskresult.ParseStructuredResult(record.PayloadJSON)
 	if strings.TrimSpace(sr.Diff) == "" {
 		if err := r.updateImplementationJobForTask(ctx, monitor, task.Name, func(job *store.ImplementationJob) {
 			job.Phase = repositoryMonitorIssuePhaseBlocked
@@ -1817,7 +1817,7 @@ func (r *RepositoryMonitorReconciler) ensureRepositoryMonitorGitHubMutationStart
 }
 
 func (r *RepositoryMonitorReconciler) finishIssueMutation(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, record *store.ActionRecord, task *corev1alpha1.Task) (string, int, string, error) {
-	sr := common.ParseStructuredResult(record.PayloadJSON)
+	sr := taskresult.ParseStructuredResult(record.PayloadJSON)
 	configuredBranch := repositoryMonitorIssueTaskPushBranch(task)
 	pushMutationID := "ghmut-" + repositoryMonitorShortHash(record.ID+"-push-"+configuredBranch)
 	pushMutation, auditErr := r.ensureRepositoryMonitorGitHubMutationStarted(ctx, monitor, &store.GitHubMutationRecord{ID: pushMutationID, CommandEventID: record.CommandEventID, Operation: "push_branch", TargetKind: repositoryMonitorIssueKind, TargetNumber: item.Number, TargetSHA: item.SnapshotDigest, Reason: "issue_implementation_mutation", GitHubURL: configuredBranch})
@@ -2147,7 +2147,7 @@ func repositoryMonitorUniquePatchPaths(paths []string) []string {
 	return out
 }
 
-func (r *RepositoryMonitorReconciler) validateAndSaveIssuePatchArtifacts(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, record *store.ActionRecord, task *corev1alpha1.Task, sr *common.StructuredResult) (string, error) {
+func (r *RepositoryMonitorReconciler) validateAndSaveIssuePatchArtifacts(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, record *store.ActionRecord, task *corev1alpha1.Task, sr *taskresult.StructuredResult) (string, error) {
 	if r.ArtifactStore == nil {
 		return "artifact_store_missing", nil
 	}

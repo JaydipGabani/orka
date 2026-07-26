@@ -50,7 +50,7 @@ type ToolContext struct {
 	}
 	// MessageStore for inter-agent messaging when tools execute in-process from the controller broker.
 	MessageStore store.MessageStore
-	// SessionDeleter for deleting sessions (controller.SessionManager)
+	// SessionDeleter for deleting sessions
 	SessionDeleter interface {
 		DeleteSession(ctx context.Context, namespace, sessionID string) error
 	}

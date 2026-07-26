@@ -195,7 +195,7 @@ func existingSQLiteTerminalApprovalEvent(
 }
 
 type sqliteExecutionEventQuerier interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
+	queryRower
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
@@ -247,11 +247,7 @@ func (s *Store) latestSQLiteSessionExecutionEventSeq(ctx context.Context, namesp
 	return max(eventSeq, cursorSeq), nil
 }
 
-type sqliteSessionCursorQuerier interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
-func sqliteSessionCursorSeq(ctx context.Context, querier sqliteSessionCursorQuerier, namespace, sessionName string) (int64, error) {
+func sqliteSessionCursorSeq(ctx context.Context, querier queryRower, namespace, sessionName string) (int64, error) {
 	var latest int64
 	err := querier.QueryRowContext(ctx,
 		`SELECT latest_seq
@@ -434,11 +430,7 @@ func (s *Store) DeleteExecutionEvents(ctx context.Context, namespace, streamType
 	return err
 }
 
-type executionEventScanner interface {
-	Scan(dest ...any) error
-}
-
-func scanExecutionEvent(scanner executionEventScanner) (store.ExecutionEvent, error) {
+func scanExecutionEvent(scanner rowScanner) (store.ExecutionEvent, error) {
 	var event store.ExecutionEvent
 	var contentJSON sql.NullString
 	var truncationJSON sql.NullString
@@ -476,7 +468,7 @@ func scanExecutionEvent(scanner executionEventScanner) (store.ExecutionEvent, er
 	return event, nil
 }
 
-func scanSessionExecutionEvent(scanner executionEventScanner) (store.SessionExecutionEvent, error) {
+func scanSessionExecutionEvent(scanner rowScanner) (store.SessionExecutionEvent, error) {
 	var sessionSeq int64
 	var event store.ExecutionEvent
 	var contentJSON sql.NullString

@@ -4,7 +4,7 @@ Copyright (c) 2026.
 MIT License - see LICENSE file for details.
 */
 
-package controller
+package session
 
 import (
 	"context"
@@ -20,24 +20,29 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func setupSessionManager() (*SessionManager, *sqlite.Store) {
+const (
+	testTask  = "test-task"
+	defaultNS = "default"
+)
+
+func setupManager() (*Manager, *sqlite.Store) {
 	db, err := sqlite.NewDB(":memory:")
 	if err != nil {
 		panic(err)
 	}
 	ss := sqlite.NewStore(db, ":memory:")
-	return NewSessionManager(ss), ss
+	return NewManager(ss), ss
 }
 
-func TestNewSessionManager(t *testing.T) {
-	sm, _ := setupSessionManager()
+func TestNewManager(t *testing.T) {
+	sm, _ := setupManager()
 	if sm == nil {
-		t.Fatal("NewSessionManager returned nil")
+		t.Fatal("NewManager returned nil")
 	}
 }
 
-func TestSessionManager_IsLocked_NoSessionRef(t *testing.T) {
-	sm, _ := setupSessionManager()
+func TestManager_IsLocked_NoSessionRef(t *testing.T) {
+	sm, _ := setupManager()
 	task := &corev1alpha1.Task{
 		Spec: corev1alpha1.TaskSpec{
 			SessionRef: nil,
@@ -53,8 +58,8 @@ func TestSessionManager_IsLocked_NoSessionRef(t *testing.T) {
 	}
 }
 
-func TestSessionManager_IsLocked_SessionNotFound(t *testing.T) {
-	sm, _ := setupSessionManager()
+func TestManager_IsLocked_SessionNotFound(t *testing.T) {
+	sm, _ := setupManager()
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testTask,
@@ -76,8 +81,8 @@ func TestSessionManager_IsLocked_SessionNotFound(t *testing.T) {
 	}
 }
 
-func TestSessionManager_IsLocked_NotLocked(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_IsLocked_NotLocked(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	// Create session with no active task
@@ -108,8 +113,8 @@ func TestSessionManager_IsLocked_NotLocked(t *testing.T) {
 	}
 }
 
-func TestSessionManager_IsLocked_LockedByOther(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_IsLocked_LockedByOther(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	// Create session locked by another task
@@ -141,8 +146,8 @@ func TestSessionManager_IsLocked_LockedByOther(t *testing.T) {
 	}
 }
 
-func TestSessionManager_IsLocked_LockedBySelf(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_IsLocked_LockedBySelf(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	// Create session locked by this task
@@ -174,8 +179,8 @@ func TestSessionManager_IsLocked_LockedBySelf(t *testing.T) {
 	}
 }
 
-func TestSessionManager_AcquireLock_NoSessionRef(t *testing.T) {
-	sm, _ := setupSessionManager()
+func TestManager_AcquireLock_NoSessionRef(t *testing.T) {
+	sm, _ := setupManager()
 	task := &corev1alpha1.Task{
 		Spec: corev1alpha1.TaskSpec{
 			SessionRef: nil,
@@ -188,8 +193,8 @@ func TestSessionManager_AcquireLock_NoSessionRef(t *testing.T) {
 	}
 }
 
-func TestSessionManager_AcquireLock_CreateSession(t *testing.T) {
-	sm, _ := setupSessionManager()
+func TestManager_AcquireLock_CreateSession(t *testing.T) {
+	sm, _ := setupManager()
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testTask,
@@ -218,8 +223,8 @@ func TestSessionManager_AcquireLock_CreateSession(t *testing.T) {
 	}
 }
 
-func TestSessionManager_AcquireLock_SessionNotFound_NoCreate(t *testing.T) {
-	sm, _ := setupSessionManager()
+func TestManager_AcquireLock_SessionNotFound_NoCreate(t *testing.T) {
+	sm, _ := setupManager()
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testTask,
@@ -239,8 +244,8 @@ func TestSessionManager_AcquireLock_SessionNotFound_NoCreate(t *testing.T) {
 	}
 }
 
-func TestSessionManager_AcquireLock_AlreadyLockedByOther(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_AcquireLock_AlreadyLockedByOther(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	// Create session locked by another task
@@ -269,8 +274,8 @@ func TestSessionManager_AcquireLock_AlreadyLockedByOther(t *testing.T) {
 	}
 }
 
-func TestSessionManager_ReleaseLock_NoSessionRef(t *testing.T) {
-	sm, _ := setupSessionManager()
+func TestManager_ReleaseLock_NoSessionRef(t *testing.T) {
+	sm, _ := setupManager()
 	task := &corev1alpha1.Task{
 		Spec: corev1alpha1.TaskSpec{
 			SessionRef: nil,
@@ -283,8 +288,8 @@ func TestSessionManager_ReleaseLock_NoSessionRef(t *testing.T) {
 	}
 }
 
-func TestSessionManager_ReleaseLock_SessionNotFound(t *testing.T) {
-	sm, _ := setupSessionManager()
+func TestManager_ReleaseLock_SessionNotFound(t *testing.T) {
+	sm, _ := setupManager()
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testTask,
@@ -303,8 +308,8 @@ func TestSessionManager_ReleaseLock_SessionNotFound(t *testing.T) {
 	}
 }
 
-func TestSessionManager_ReleaseLock_NotOwner(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_ReleaseLock_NotOwner(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	// Create session locked by another task
@@ -339,8 +344,8 @@ func TestSessionManager_ReleaseLock_NotOwner(t *testing.T) {
 	}
 }
 
-func TestSessionManager_LoadTranscript_NoSessionRef(t *testing.T) {
-	sm, _ := setupSessionManager()
+func TestManager_LoadTranscript_NoSessionRef(t *testing.T) {
+	sm, _ := setupManager()
 	task := &corev1alpha1.Task{
 		Spec: corev1alpha1.TaskSpec{
 			SessionRef: nil,
@@ -356,8 +361,8 @@ func TestSessionManager_LoadTranscript_NoSessionRef(t *testing.T) {
 	}
 }
 
-func TestSessionManager_LoadTranscript_SessionNotFound(t *testing.T) {
-	sm, _ := setupSessionManager()
+func TestManager_LoadTranscript_SessionNotFound(t *testing.T) {
+	sm, _ := setupManager()
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testTask,
@@ -379,8 +384,8 @@ func TestSessionManager_LoadTranscript_SessionNotFound(t *testing.T) {
 	}
 }
 
-func TestSessionManager_LoadTranscript_WithMessages(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_LoadTranscript_WithMessages(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	// Create session with messages
@@ -415,8 +420,8 @@ func TestSessionManager_LoadTranscript_WithMessages(t *testing.T) {
 	}
 }
 
-func TestSessionManager_LoadTranscript_MaxMessages(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_LoadTranscript_MaxMessages(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	// Create session with messages
@@ -455,8 +460,8 @@ func TestSessionManager_LoadTranscript_MaxMessages(t *testing.T) {
 	}
 }
 
-func TestSessionManager_GetSession(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_GetSession(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	ss.CreateSession(ctx, &store.SessionRecord{ //nolint:errcheck
@@ -474,54 +479,31 @@ func TestSessionManager_GetSession(t *testing.T) {
 	}
 }
 
-func TestSessionManager_DeleteSession(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_ListSessions(t *testing.T) {
+	manager, sessionStore := setupManager()
 	ctx := context.Background()
 
-	ss.CreateSession(ctx, &store.SessionRecord{ //nolint:errcheck
-		Namespace:   "default",
-		Name:        "test-session",
-		SessionType: "task",
-	})
-
-	err := sm.DeleteSession(ctx, "default", "test-session")
-	if err != nil {
-		t.Fatalf("DeleteSession() error = %v", err)
+	for _, name := range []string{"s1", "s2"} {
+		if err := sessionStore.CreateSession(ctx, &store.SessionRecord{
+			Namespace:   defaultNS,
+			Name:        name,
+			SessionType: "task",
+		}); err != nil {
+			t.Fatalf("CreateSession(%q): %v", name, err)
+		}
 	}
 
-	// Verify session was deleted
-	_, err = sm.GetSession(ctx, "default", "test-session")
-	if err == nil {
-		t.Error("Session should be deleted")
-	}
-}
-
-func TestSessionManager_ListSessions(t *testing.T) {
-	sm, ss := setupSessionManager()
-	ctx := context.Background()
-
-	ss.CreateSession(ctx, &store.SessionRecord{ //nolint:errcheck
-		Namespace:   "default",
-		Name:        "s1",
-		SessionType: "task",
-	})
-	ss.CreateSession(ctx, &store.SessionRecord{ //nolint:errcheck
-		Namespace:   "default",
-		Name:        "s2",
-		SessionType: "task",
-	})
-
-	sessions, err := sm.ListSessions(ctx, "default")
+	sessions, err := manager.ListSessions(ctx, defaultNS)
 	if err != nil {
 		t.Fatalf("ListSessions() error = %v", err)
 	}
 	if len(sessions) != 2 {
-		t.Errorf("ListSessions() returned %d items, want 2", len(sessions))
+		t.Fatalf("ListSessions() returned %d items, want 2", len(sessions))
 	}
 }
 
-func TestSessionManager_AppendMessages_NoSessionRef(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_AppendMessages_NoSessionRef(t *testing.T) {
+	sm, ss := setupManager()
 	task := &corev1alpha1.Task{
 		Spec: corev1alpha1.TaskSpec{
 			SessionRef: nil,
@@ -534,8 +516,8 @@ func TestSessionManager_AppendMessages_NoSessionRef(t *testing.T) {
 	}
 }
 
-func TestSessionManager_AppendMessages_AppendFalse(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_AppendMessages_AppendFalse(t *testing.T) {
+	sm, ss := setupManager()
 	task := &corev1alpha1.Task{
 		Spec: corev1alpha1.TaskSpec{
 			SessionRef: &corev1alpha1.SessionReference{
@@ -551,8 +533,8 @@ func TestSessionManager_AppendMessages_AppendFalse(t *testing.T) {
 	}
 }
 
-func TestSessionManager_AppendMessages_MissingSessionNoops(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_AppendMessages_MissingSessionNoops(t *testing.T) {
+	sm, ss := setupManager()
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testTask,
@@ -573,8 +555,8 @@ func TestSessionManager_AppendMessages_MissingSessionNoops(t *testing.T) {
 	}
 }
 
-func TestSessionManager_AppendMessages_WithPromptAndResult(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_AppendMessages_WithPromptAndResult(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	// Create session
@@ -627,8 +609,8 @@ func TestSessionManager_AppendMessages_WithPromptAndResult(t *testing.T) {
 	}
 }
 
-func TestSessionManager_AppendMessages_PromptIncludedSkipsDuplicateUserMessage(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_AppendMessages_PromptIncludedSkipsDuplicateUserMessage(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 	require.NoError(t, ss.CreateSession(ctx, &store.SessionRecord{
 		Namespace: "default", Name: "prompt-included-session", SessionType: "task",
@@ -661,8 +643,8 @@ func TestSessionManager_AppendMessages_PromptIncludedSkipsDuplicateUserMessage(t
 	}
 }
 
-func TestSessionManager_AppendMessages_NilResultStore(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_AppendMessages_NilResultStore(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	require.NoError(t, ss.CreateSession(ctx, &store.SessionRecord{
@@ -707,8 +689,8 @@ func TestSessionManager_AppendMessages_NilResultStore(t *testing.T) {
 	}
 }
 
-func TestSessionManager_AppendMessages_NoPromptNoResult(t *testing.T) {
-	sm, ss := setupSessionManager()
+func TestManager_AppendMessages_NoPromptNoResult(t *testing.T) {
+	sm, ss := setupManager()
 	ctx := context.Background()
 
 	ss.CreateSession(ctx, &store.SessionRecord{ //nolint:errcheck
@@ -745,7 +727,7 @@ func TestSessionManager_AppendMessages_NoPromptNoResult(t *testing.T) {
 	}
 }
 
-func TestSessionManagerLoadsTranscriptThroughStableMessageID(t *testing.T) {
+func TestManagerLoadsTranscriptThroughStableMessageID(t *testing.T) {
 	db, err := sqlite.NewDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -777,7 +759,7 @@ func TestSessionManagerLoadsTranscriptThroughStableMessageID(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	manager := NewSessionManager(ss)
+	manager := NewManager(ss)
 	manager.SetGatewayEventStore(ss)
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: "default", UID: "task-uid"},

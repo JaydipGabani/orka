@@ -407,7 +407,7 @@ func (s *Store) loadTranscript(
 	return messages, rows.Err()
 }
 
-func scanSessionMessage(row gatewayRowScanner) (store.SessionMessage, error) {
+func scanSessionMessage(row rowScanner) (store.SessionMessage, error) {
 	var msg store.SessionMessage
 	var nameStr, inputJSON, toolCallsJSON, toolCallID sql.NullString
 	var metadataJSON string

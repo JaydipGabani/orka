@@ -18,8 +18,8 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/taskresult"
 	"github.com/orka-agents/orka/internal/workerenv"
-	"github.com/orka-agents/orka/workers/common"
 )
 
 const (
@@ -413,7 +413,7 @@ func (r *RepositoryMonitorReconciler) ingestCompletedRepositoryMonitorRepairTask
 			job.LastError = "repair task result is missing"
 			if r.ResultStore != nil {
 				if raw, err := r.ResultStore.GetResult(ctx, task.Namespace, task.Name); err == nil {
-					sr := common.ParseStructuredResult(string(raw))
+					sr := taskresult.ParseStructuredResult(string(raw))
 					job.PushedSHA = sr.HeadSHA
 					if strings.TrimSpace(sr.PushError) != "" {
 						job.LastError = sr.PushError

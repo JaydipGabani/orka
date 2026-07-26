@@ -21,9 +21,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
-	"github.com/orka-agents/orka/internal/controller"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/llm"
+	sessionmanager "github.com/orka-agents/orka/internal/session"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/tools"
 )
@@ -35,7 +35,7 @@ const taskCreatedMsg = "Task created"
 type ToolExecutor struct {
 	client                    client.Client
 	kubeClient                kubernetes.Interface
-	sessionManager            *controller.SessionManager
+	sessionManager            *sessionmanager.Manager
 	namespace                 string
 	provider                  string
 	providerType              string
@@ -58,7 +58,7 @@ type ToolExecutor struct {
 }
 
 // NewToolExecutor creates a new ToolExecutor.
-func NewToolExecutor(c client.Client, sm *controller.SessionManager, namespace, sessionID, watchNamespace string, enforceNS bool, maxTasks int, toolTimeout time.Duration, rs store.ResultStore, kubeClientOpt ...kubernetes.Interface) *ToolExecutor {
+func NewToolExecutor(c client.Client, sm *sessionmanager.Manager, namespace, sessionID, watchNamespace string, enforceNS bool, maxTasks int, toolTimeout time.Duration, rs store.ResultStore, kubeClientOpt ...kubernetes.Interface) *ToolExecutor {
 	var kubeClient kubernetes.Interface
 	if len(kubeClientOpt) > 0 {
 		kubeClient = kubeClientOpt[0]

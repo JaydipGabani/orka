@@ -350,7 +350,7 @@ func (r *TaskReconciler) executionEventSessionName(ctx context.Context, task *co
 	if sessionName == "" {
 		return ""
 	}
-	if r == nil || r.SessionManager == nil || r.SessionManager.store == nil {
+	if r == nil || r.SessionManager == nil || !r.SessionManager.Configured() {
 		return ""
 	}
 	if _, err := r.SessionManager.GetSession(ctx, task.Namespace, sessionName); err != nil {
