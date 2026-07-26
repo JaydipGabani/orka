@@ -6,10 +6,14 @@ on:
       - main
     paths:
       - "charts/orka/**"
+      - "cmd/main.go"
+      - "scripts/test-helm-context-token-scopes.sh"
       - ".github/workflows/helm-chart.yml"
   pull_request:
     paths:
       - "charts/orka/**"
+      - "cmd/main.go"
+      - "scripts/test-helm-context-token-scopes.sh"
       - ".github/workflows/helm-chart.yml"
   workflow_dispatch:
 
@@ -38,6 +42,9 @@ jobs:
       - name: Lint chart
         run: helm lint charts/orka
 
+      - name: Verify controller scope parity
+        run: bash scripts/test-helm-context-token-scopes.sh
+
       - name: Package chart
         run: |
           mkdir -p .cr-release-packages
@@ -61,6 +68,9 @@ jobs:
 
       - name: Lint chart
         run: helm lint charts/orka
+
+      - name: Verify controller scope parity
+        run: bash scripts/test-helm-context-token-scopes.sh
 
       - name: Package chart
         run: |
