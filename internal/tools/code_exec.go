@@ -12,7 +12,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"os"
 	"os/exec"
 	"regexp"
@@ -89,8 +88,7 @@ type SandboxRunRequest struct {
 	InputHash        string
 }
 
-// SandboxRunResult represents the sandbox execution result. Keep its fields
-// identical to CodeExecResult; conversion helpers rely on direct struct conversion.
+// SandboxRunResult represents the sandbox execution result.
 type SandboxRunResult struct {
 	Output          string `json:"output"`
 	Error           string `json:"error,omitempty"`
@@ -98,29 +96,6 @@ type SandboxRunResult struct {
 	TimedOut        bool   `json:"timed_out,omitempty"`
 	OutputTruncated bool   `json:"output_truncated,omitempty"`
 	ErrorTruncated  bool   `json:"error_truncated,omitempty"`
-}
-
-// CodeExecutor is the legacy execution backend interface. Prefer SandboxClient
-// for new call sites.
-type CodeExecutor interface {
-	Execute(ctx context.Context, req CodeExecutionRequest) CodeExecResult
-}
-
-// CodeExecutionRequest contains a validated code execution request for a backend.
-type CodeExecutionRequest struct {
-	Backend          string
-	Language         string
-	Code             string
-	Timeout          time.Duration
-	WorkDir          string
-	DenyPatterns     []denyPattern
-	OutputLimitBytes int64
-	ResourceAudit    map[string]string
-	Tenant           string
-	Provider         string
-	ProviderType     string
-	RunID            string
-	InputHash        string
 }
 
 // CodeExecTool implements code execution functionality.
@@ -139,17 +114,6 @@ type CodeExecArgs struct {
 	Language string `json:"language"`
 	Code     string `json:"code"`
 	Timeout  int    `json:"timeout,omitempty"` // Timeout in seconds
-}
-
-// CodeExecResult represents the execution result. Keep its fields identical to
-// SandboxRunResult; conversion helpers rely on direct struct conversion.
-type CodeExecResult struct {
-	Output          string `json:"output"`
-	Error           string `json:"error,omitempty"`
-	ExitCode        int    `json:"exit_code"`
-	TimedOut        bool   `json:"timed_out,omitempty"`
-	OutputTruncated bool   `json:"output_truncated,omitempty"`
-	ErrorTruncated  bool   `json:"error_truncated,omitempty"`
 }
 
 // InProcessCodeExecutor runs code on the current worker host with local process hardening.
@@ -199,62 +163,9 @@ func newSandboxClientFromBackend(backend string) (SandboxClient, string) {
 	}
 }
 
-func sandboxRunRequestFromCodeExecutionRequest(req CodeExecutionRequest) SandboxRunRequest {
-	return SandboxRunRequest{
-		Backend:          req.Backend,
-		Language:         req.Language,
-		Code:             req.Code,
-		Timeout:          req.Timeout,
-		WorkDir:          req.WorkDir,
-		DenyPatterns:     append([]denyPattern(nil), req.DenyPatterns...),
-		OutputLimitBytes: req.OutputLimitBytes,
-		ResourceAudit:    cloneCodeExecResourceAudit(req.ResourceAudit),
-		Tenant:           req.Tenant,
-		Provider:         req.Provider,
-		ProviderType:     req.ProviderType,
-		RunID:            req.RunID,
-		InputHash:        req.InputHash,
-	}
-}
-
-func codeExecutionRequestFromSandboxRunRequest(req SandboxRunRequest) CodeExecutionRequest {
-	return CodeExecutionRequest{
-		Backend:          req.Backend,
-		Language:         req.Language,
-		Code:             req.Code,
-		Timeout:          req.Timeout,
-		WorkDir:          req.WorkDir,
-		DenyPatterns:     append([]denyPattern(nil), req.DenyPatterns...),
-		OutputLimitBytes: req.OutputLimitBytes,
-		ResourceAudit:    cloneCodeExecResourceAudit(req.ResourceAudit),
-		Tenant:           req.Tenant,
-		Provider:         req.Provider,
-		ProviderType:     req.ProviderType,
-		RunID:            req.RunID,
-		InputHash:        req.InputHash,
-	}
-}
-
-func sandboxRunResultFromCodeExecResult(result CodeExecResult) SandboxRunResult {
-	return SandboxRunResult(result)
-}
-
-func codeExecResultFromSandboxRunResult(result SandboxRunResult) CodeExecResult {
-	return CodeExecResult(result)
-}
-
-func cloneCodeExecResourceAudit(values map[string]string) map[string]string {
-	if len(values) == 0 {
-		return nil
-	}
-	clone := make(map[string]string, len(values))
-	maps.Copy(clone, values)
-	return clone
-}
-
 const codeExecRequestIdentityVersion = "code_exec_request_identity_v1"
 
-func populateCodeExecRequestIdentity(ctx context.Context, req *CodeExecutionRequest) error {
+func populateCodeExecRequestIdentity(ctx context.Context, req *SandboxRunRequest) error {
 	if req == nil {
 		return nil
 	}
@@ -269,7 +180,7 @@ func populateCodeExecRequestIdentity(ctx context.Context, req *CodeExecutionRequ
 	return nil
 }
 
-func populateCodeExecRequestResourceAudit(req *CodeExecutionRequest) error {
+func populateCodeExecRequestResourceAudit(req *SandboxRunRequest) error {
 	if req == nil {
 		return nil
 	}
@@ -336,7 +247,7 @@ func normalizedCodeExecResourceAudit(values map[string]string) []codeExecResourc
 	return entries
 }
 
-func ensureCodeExecRequestInputHash(req *CodeExecutionRequest) {
+func ensureCodeExecRequestInputHash(req *SandboxRunRequest) {
 	if req == nil {
 		return
 	}
@@ -346,7 +257,7 @@ func ensureCodeExecRequestInputHash(req *CodeExecutionRequest) {
 	}
 }
 
-func codeExecInputHashForRequest(req CodeExecutionRequest) string {
+func codeExecInputHashForRequest(req SandboxRunRequest) string {
 	payload := struct {
 		Version          string                       `json:"version"`
 		Backend          string                       `json:"backend"`
@@ -375,7 +286,7 @@ func codeExecInputHashForRequest(req CodeExecutionRequest) string {
 	return codeExecSHA256HexJSON(payload)
 }
 
-func codeExecRunIDForRequest(ctx context.Context, req CodeExecutionRequest) string {
+func codeExecRunIDForRequest(ctx context.Context, req SandboxRunRequest) string {
 	tc := GetToolContext(ctx)
 	if tc == nil {
 		return ""
@@ -512,24 +423,23 @@ func (t *CodeExecTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	execReq := CodeExecutionRequest{
+	sandboxReq := SandboxRunRequest{
 		Backend:          backend,
 		Language:         lang,
 		Code:             execArgs.Code,
 		Timeout:          timeout,
 		WorkDir:          t.workDir,
-		DenyPatterns:     t.denyPatterns,
+		DenyPatterns:     append([]denyPattern(nil), t.denyPatterns...),
 		OutputLimitBytes: t.codeExecOutputLimitBytes(),
 		Tenant:           tenant,
 		Provider:         provider,
 		ProviderType:     providerType,
 	}
-	if err := populateCodeExecRequestIdentity(ctx, &execReq); err != nil {
+	if err := populateCodeExecRequestIdentity(ctx, &sandboxReq); err != nil {
 		return "", fmt.Errorf("failed to configure code execution identity: %w", err)
 	}
 
-	sandboxReq := sandboxRunRequestFromCodeExecutionRequest(execReq)
-	result := codeExecResultFromSandboxRunResult(sandboxClient.Run(ctx, sandboxReq))
+	result := sandboxClient.Run(ctx, sandboxReq)
 
 	output, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
@@ -554,20 +464,10 @@ func (t *CodeExecTool) codeExecOutputLimitBytes() int64 {
 	return defaultCodeExecOutputLimitBytes
 }
 
-// Run executes a sandbox request with the in-process backend.
+// Run executes the request with the in-process backend.
 func (e *InProcessCodeExecutor) Run(ctx context.Context, req SandboxRunRequest) SandboxRunResult {
-	return sandboxRunResultFromCodeExecResult(e.Execute(ctx, codeExecutionRequestFromSandboxRunRequest(req)))
-}
-
-// Run returns an unsupported-backend sandbox result.
-func (e *unsupportedCodeExecutor) Run(ctx context.Context, req SandboxRunRequest) SandboxRunResult {
-	return sandboxRunResultFromCodeExecResult(e.Execute(ctx, codeExecutionRequestFromSandboxRunRequest(req)))
-}
-
-// Execute runs the request with the in-process backend.
-func (e *InProcessCodeExecutor) Execute(ctx context.Context, req CodeExecutionRequest) CodeExecResult {
 	start := time.Now()
-	result := CodeExecResult{ExitCode: -1}
+	result := SandboxRunResult{ExitCode: -1}
 
 	if req.WorkDir == "" {
 		req.WorkDir = "/tmp/orka-exec"
@@ -582,10 +482,10 @@ func (e *InProcessCodeExecutor) Execute(ctx context.Context, req CodeExecutionRe
 		req.Backend = codeExecBackendInProcess
 	}
 	if err := populateCodeExecRequestResourceAudit(&req); err != nil {
-		return CodeExecResult{Error: fmt.Sprintf("failed to configure code execution resources: %v", err), ExitCode: -1}
+		return SandboxRunResult{Error: fmt.Sprintf("failed to configure code execution resources: %v", err), ExitCode: -1}
 	}
 	if err := os.MkdirAll(req.WorkDir, 0755); err != nil {
-		return CodeExecResult{Error: fmt.Sprintf("failed to create work directory: %v", err), ExitCode: -1}
+		return SandboxRunResult{Error: fmt.Sprintf("failed to create work directory: %v", err), ExitCode: -1}
 	}
 
 	execCtx, cancel := context.WithTimeout(ctx, req.Timeout)
@@ -610,12 +510,12 @@ func (e *InProcessCodeExecutor) Execute(ctx context.Context, req CodeExecutionRe
 	return result
 }
 
-func (e *unsupportedCodeExecutor) Execute(ctx context.Context, req CodeExecutionRequest) CodeExecResult {
+func (e *unsupportedCodeExecutor) Run(ctx context.Context, req SandboxRunRequest) SandboxRunResult {
 	start := time.Now()
 	if req.Backend == "" {
 		req.Backend = e.backend
 	}
-	result := CodeExecResult{
+	result := SandboxRunResult{
 		Error:    fmt.Sprintf("unsupported code_exec backend: %s", e.backend),
 		ExitCode: -1,
 	}
@@ -624,7 +524,7 @@ func (e *unsupportedCodeExecutor) Execute(ctx context.Context, req CodeExecution
 }
 
 // executePython executes Python code.
-func (e *InProcessCodeExecutor) executePython(ctx context.Context, req CodeExecutionRequest) CodeExecResult {
+func (e *InProcessCodeExecutor) executePython(ctx context.Context, req SandboxRunRequest) SandboxRunResult {
 	tmpPath, result, ok := writeCodeExecTempFile(req.WorkDir, "script-*.py", req.Code, 0600)
 	if !ok {
 		return result
@@ -636,7 +536,7 @@ func (e *InProcessCodeExecutor) executePython(ctx context.Context, req CodeExecu
 }
 
 // executeNode executes JavaScript code.
-func (e *InProcessCodeExecutor) executeNode(ctx context.Context, req CodeExecutionRequest) CodeExecResult {
+func (e *InProcessCodeExecutor) executeNode(ctx context.Context, req SandboxRunRequest) SandboxRunResult {
 	tmpPath, result, ok := writeCodeExecTempFile(req.WorkDir, "script-*.js", req.Code, 0600)
 	if !ok {
 		return result
@@ -648,9 +548,9 @@ func (e *InProcessCodeExecutor) executeNode(ctx context.Context, req CodeExecuti
 }
 
 // executeShell executes Bash or POSIX shell code.
-func (e *InProcessCodeExecutor) executeShell(ctx context.Context, req CodeExecutionRequest) CodeExecResult {
+func (e *InProcessCodeExecutor) executeShell(ctx context.Context, req SandboxRunRequest) SandboxRunResult {
 	if msg := checkDenyPatterns(req.Code, req.DenyPatterns); msg != "" {
-		return CodeExecResult{Error: msg, ExitCode: -1}
+		return SandboxRunResult{Error: msg, ExitCode: -1}
 	}
 
 	tmpPath, result, ok := writeCodeExecTempFile(req.WorkDir, "script-*.sh", req.Code, 0700)
@@ -667,26 +567,26 @@ func (e *InProcessCodeExecutor) executeShell(ctx context.Context, req CodeExecut
 	return e.runCommand(ctx, cmd, req.WorkDir, req.OutputLimitBytes)
 }
 
-func writeCodeExecTempFile(workDir, pattern, code string, mode os.FileMode) (string, CodeExecResult, bool) {
+func writeCodeExecTempFile(workDir, pattern, code string, mode os.FileMode) (string, SandboxRunResult, bool) {
 	tmpFile, err := os.CreateTemp(workDir, pattern)
 	if err != nil {
-		return "", CodeExecResult{Error: fmt.Sprintf("failed to create temp script: %v", err), ExitCode: -1}, false
+		return "", SandboxRunResult{Error: fmt.Sprintf("failed to create temp script: %v", err), ExitCode: -1}, false
 	}
 	tmpPath := tmpFile.Name()
 	if _, err := tmpFile.Write([]byte(code)); err != nil {
 		tmpFile.Close()    //nolint:errcheck
 		os.Remove(tmpPath) //nolint:errcheck
-		return "", CodeExecResult{Error: fmt.Sprintf("failed to write script: %v", err), ExitCode: -1}, false
+		return "", SandboxRunResult{Error: fmt.Sprintf("failed to write script: %v", err), ExitCode: -1}, false
 	}
 	if err := tmpFile.Close(); err != nil {
 		os.Remove(tmpPath) //nolint:errcheck
-		return "", CodeExecResult{Error: fmt.Sprintf("failed to close script: %v", err), ExitCode: -1}, false
+		return "", SandboxRunResult{Error: fmt.Sprintf("failed to close script: %v", err), ExitCode: -1}, false
 	}
 	if err := os.Chmod(tmpPath, mode); err != nil {
 		os.Remove(tmpPath) //nolint:errcheck
-		return "", CodeExecResult{Error: fmt.Sprintf("failed to chmod script: %v", err), ExitCode: -1}, false
+		return "", SandboxRunResult{Error: fmt.Sprintf("failed to chmod script: %v", err), ExitCode: -1}, false
 	}
-	return tmpPath, CodeExecResult{}, true
+	return tmpPath, SandboxRunResult{}, true
 }
 
 func checkDenyPatterns(code string, patterns []denyPattern) string {
@@ -699,11 +599,11 @@ func checkDenyPatterns(code string, patterns []denyPattern) string {
 }
 
 // runCommand executes a command and captures output.
-func (t *CodeExecTool) runCommand(cmd *exec.Cmd) CodeExecResult {
+func (t *CodeExecTool) runCommand(cmd *exec.Cmd) SandboxRunResult {
 	return (&InProcessCodeExecutor{}).runCommand(context.Background(), cmd, t.workDir, t.codeExecOutputLimitBytes())
 }
 
-func (e *InProcessCodeExecutor) runCommand(ctx context.Context, cmd *exec.Cmd, workDir string, outputLimitBytes int64) CodeExecResult {
+func (e *InProcessCodeExecutor) runCommand(ctx context.Context, cmd *exec.Cmd, workDir string, outputLimitBytes int64) SandboxRunResult {
 	stdout := newCappedBuffer(outputLimitBytes)
 	stderr := newCappedBuffer(outputLimitBytes)
 	cmd.Stdout = &codeExecOutputWriter{ctx: ctx, dst: stdout}
@@ -717,7 +617,7 @@ func (e *InProcessCodeExecutor) runCommand(ctx context.Context, cmd *exec.Cmd, w
 
 	err := cmd.Run()
 
-	result := CodeExecResult{
+	result := SandboxRunResult{
 		Output:          stdout.String(),
 		ExitCode:        0,
 		OutputTruncated: stdout.Truncated(),
@@ -768,7 +668,7 @@ type codeExecLocalLimits struct {
 	MaxProcesses int64
 }
 
-func codeExecLocalLimitsForRequest(req CodeExecutionRequest) codeExecLocalLimits {
+func codeExecLocalLimitsForRequest(req SandboxRunRequest) codeExecLocalLimits {
 	return codeExecLocalLimitsForScope(codeExecRequestProviderScope(req), req.Tenant)
 }
 
@@ -780,7 +680,7 @@ func codeExecLocalLimitsForScope(provider, tenant string) codeExecLocalLimits {
 	}
 }
 
-func codeExecLocalResourceAuditForRequest(req CodeExecutionRequest) map[string]string {
+func codeExecLocalResourceAuditForRequest(req SandboxRunRequest) map[string]string {
 	return codeExecLocalResourceAuditForScope(codeExecRequestProviderScope(req), req.Tenant)
 }
 
@@ -880,7 +780,7 @@ func codeExecScopeFromContext(ctx context.Context) (tenant, provider, providerTy
 	return tenant, provider, providerType
 }
 
-func codeExecRequestProviderScope(req CodeExecutionRequest) string {
+func codeExecRequestProviderScope(req SandboxRunRequest) string {
 	return codeExecEffectiveProviderScope(req.Provider, req.ProviderType)
 }
 
@@ -981,7 +881,7 @@ func lookupEnvValue(environ []string, name string) (string, bool) {
 	return "", false
 }
 
-func auditCodeExec(ctx context.Context, req CodeExecutionRequest, result CodeExecResult, duration time.Duration) {
+func auditCodeExec(ctx context.Context, req SandboxRunRequest, result SandboxRunResult, duration time.Duration) {
 	codeHash := sha256.Sum256([]byte(req.Code))
 	keysAndValues := []any{
 		"backend", req.Backend,
@@ -1053,7 +953,3 @@ func auditCodeExec(ctx context.Context, req CodeExecutionRequest, result CodeExe
 
 // Ensure CodeExecTool implements Tool.
 var _ Tool = (*CodeExecTool)(nil)
-
-// Ensure executor implementations satisfy CodeExecutor.
-var _ CodeExecutor = (*InProcessCodeExecutor)(nil)
-var _ CodeExecutor = (*unsupportedCodeExecutor)(nil)

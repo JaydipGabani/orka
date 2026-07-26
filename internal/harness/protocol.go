@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/orka-agents/orka/internal/runtimesession"
 	"github.com/orka-agents/orka/internal/taskresult"
 )
 
@@ -23,7 +24,7 @@ const (
 	TurnsPath        = "/v1/turns"
 )
 
-type RuntimeSessionID string
+type RuntimeSessionID = runtimesession.RuntimeSessionID
 type HarnessTurnID string
 
 type ToolExecutionMode string
@@ -55,14 +56,14 @@ const (
 	FrameRuntimeLog         FrameType = "RuntimeLog"
 )
 
-type ProviderKind string
+type ProviderKind = runtimesession.ProviderKind
 
 const (
-	ProviderKindKubernetesService ProviderKind = "kubernetes-service"
-	ProviderKindSidecar           ProviderKind = "sidecar"
-	ProviderKindAgentSandbox      ProviderKind = "agent-sandbox"
-	ProviderKindSubstrate         ProviderKind = "substrate"
-	ProviderKindRemote            ProviderKind = "remote"
+	ProviderKindKubernetesService = runtimesession.ProviderKindKubernetesService
+	ProviderKindSidecar           = runtimesession.ProviderKindSidecar
+	ProviderKindAgentSandbox      = runtimesession.ProviderKindAgentSandbox
+	ProviderKindSubstrate         = runtimesession.ProviderKindSubstrate
+	ProviderKindRemote            = runtimesession.ProviderKindRemote
 )
 
 type HealthStatus string

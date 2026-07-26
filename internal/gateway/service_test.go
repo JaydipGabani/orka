@@ -136,7 +136,7 @@ func newGatewayServiceFixture(t *testing.T) (*Service, *sqlite.Store, *reference
 	config := DefaultConfig()
 	config.AllowInsecureLoopback = true
 	config.PollInterval = time.Millisecond
-	service := NewService(kubeClient, sqliteStore, sqliteStore, sqliteStore, config)
+	service := NewService(kubeClient, sqliteStore, sqliteStore, config)
 	if service == nil {
 		t.Fatal("NewService returned nil")
 	}
@@ -1320,25 +1320,25 @@ func TestGatewayTaskTimeoutUsesRemainingEventLifetime(t *testing.T) {
 	}
 }
 
-type failOnceDeliveryStore struct {
-	store.GatewayDeliveryStore
+type failOnceGatewayStore struct {
+	store.GatewayStore
 	failed bool
 }
 
-func (s *failOnceDeliveryStore) CreateGatewayDelivery(
+func (s *failOnceGatewayStore) CreateGatewayDelivery(
 	ctx context.Context, delivery *store.GatewayDelivery,
 ) (*store.GatewayDelivery, bool, error) {
 	if !s.failed {
 		s.failed = true
 		return nil, false, errors.New("injected delivery write failure")
 	}
-	return s.GatewayDeliveryStore.CreateGatewayDelivery(ctx, delivery)
+	return s.GatewayStore.CreateGatewayDelivery(ctx, delivery)
 }
 
 func TestRejectedEventRetryRepairsMissingDenialDelivery(t *testing.T) {
 	service, sqliteStore, _ := newGatewayServiceFixture(t)
-	flaky := &failOnceDeliveryStore{GatewayDeliveryStore: sqliteStore}
-	service.DeliveryStore = flaky
+	flaky := &failOnceGatewayStore{GatewayStore: sqliteStore}
+	service.Store = flaky
 	ctx := context.Background()
 	body := gatewayEventBody(t, "repair-denial", "intruder")
 	if _, err := service.AdmitEvent(ctx, "default", "chat", "Bearer inbound-token", body); err == nil {
@@ -2205,11 +2205,11 @@ func TestDeliveryWaitsForCurrentOutboundSecretProbe(t *testing.T) {
 	}
 }
 
-type conflictMarkGatewayEventStore struct {
-	store.GatewayEventStore
+type conflictMarkGatewayStore struct {
+	store.GatewayStore
 }
 
-func (s conflictMarkGatewayEventStore) MarkGatewayEventTaskCreated(
+func (s conflictMarkGatewayStore) MarkGatewayEventTaskCreated(
 	context.Context, string, string, string, string, string, time.Time,
 ) error {
 	return store.ErrConflict
@@ -2425,7 +2425,7 @@ func TestDeleteGatewayTaskWithUIDUsesPrecondition(t *testing.T) {
 
 func TestLinkGatewayTaskLeavesTaskAfterClaimLoss(t *testing.T) {
 	service, sqliteStore, _ := newGatewayServiceFixture(t)
-	service.EventStore = conflictMarkGatewayEventStore{GatewayEventStore: sqliteStore}
+	service.Store = conflictMarkGatewayStore{GatewayStore: sqliteStore}
 	ctx := context.Background()
 	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{
 		Name: "claim-loss-task", Namespace: "default", UID: types.UID("claim-loss-uid"),

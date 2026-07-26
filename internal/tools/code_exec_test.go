@@ -79,7 +79,7 @@ func TestCodeExecTool_Description(t *testing.T) {
 }
 
 func TestCodeExecRunIDForRequestRequiresToolIdentity(t *testing.T) {
-	req := CodeExecutionRequest{InputHash: "input-hash"}
+	req := SandboxRunRequest{InputHash: "input-hash"}
 	if got := codeExecRunIDForRequest(context.Background(), req); got != "" {
 		t.Fatalf("run id without ToolContext = %q, want empty", got)
 	}
@@ -162,7 +162,7 @@ func TestCodeExecTool_Execute_Bash(t *testing.T) {
 			}
 
 			if tt.wantOutput != "" {
-				var execResult CodeExecResult
+				var execResult SandboxRunResult
 				if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 					t.Fatalf("failed to unmarshal result: %v", err)
 				}
@@ -216,7 +216,7 @@ func TestCodeExecTool_Execute_Timeout(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestCodeExecTool_Execute_Python(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestCodeExecTool_Execute_JavaScript(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestCodeExecTool_Execute_FailedCommand(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestCodeExecTool_Execute_Stderr(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestCodeExecTool_DenyPatterns_Bash(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Execute() returned error: %v", err)
 			}
-			var execResult CodeExecResult
+			var execResult SandboxRunResult
 			if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 				t.Fatalf("failed to unmarshal: %v", err)
 			}
@@ -431,7 +431,7 @@ func TestCodeExecTool_DenyPatterns_AllowsNormal(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Execute() error = %v", err)
 			}
-			var execResult CodeExecResult
+			var execResult SandboxRunResult
 			if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 				t.Fatalf("failed to unmarshal: %v", err)
 			}
@@ -457,7 +457,7 @@ func TestCodeExecTool_DenyPatterns_NotAppliedToPython(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
@@ -478,7 +478,7 @@ func TestCodeExecTool_Execute_Node(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -498,7 +498,7 @@ func TestCodeExecTool_Execute_Python3Alias(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -518,7 +518,7 @@ func TestCodeExecTool_Execute_ShAlias(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -543,7 +543,7 @@ func TestCodeExecTool_Execute_LocalUnixCPUUlimit(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -565,7 +565,7 @@ func TestCodeExecTool_Execute_MixedCase(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -599,7 +599,7 @@ func TestCodeExecTool_Execute_StdoutAndStderr(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -623,7 +623,7 @@ func TestCodeExecTool_Execute_EnvironmentScrubbed(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -643,7 +643,7 @@ func TestCodeExecTool_Execute_OutputCapsStdoutAndStderr(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -680,7 +680,7 @@ func TestCodeExecTool_Execute_EmptyStdinEOF(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -708,7 +708,7 @@ func TestCodeExecTool_Execute_RealTimeout(t *testing.T) {
 		t.Fatalf("timeout took too long: %v", duration)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -755,7 +755,7 @@ func TestCodeExecTool_BackendSelector(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -814,7 +814,7 @@ func TestCodeExecTool_ExecuteUsesConfiguredExecutorWithoutScopedOverride(t *test
 		t.Fatalf("OutputLimitBytes = %d, want 123", recorder.req.OutputLimitBytes)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -880,7 +880,7 @@ func TestCodeExecTool_ExecuteUsesSandboxClient(t *testing.T) {
 		t.Fatalf("sandbox scope = tenant %q provider %q providerType %q", sandbox.req.Tenant, sandbox.req.Provider, sandbox.req.ProviderType)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -923,7 +923,7 @@ func TestCodeExecTool_ExecuteScopedBackendOverrideBypassesConfiguredExecutor(t *
 		t.Fatalf("configured sandbox client calls = %d, want 0 after scoped backend override", recorder.calls)
 	}
 
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -982,7 +982,7 @@ func TestCodeExecTool_AuditLogRedactsCodeAndOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	var execResult CodeExecResult
+	var execResult SandboxRunResult
 	if err := json.Unmarshal([]byte(result), &execResult); err != nil {
 		t.Fatalf("failed to unmarshal result: %v", err)
 	}
@@ -1039,7 +1039,7 @@ func TestCodeExecTool_BackendSelector_KubernetesAliases(t *testing.T) {
 	}
 }
 
-func TestKubernetesJobCodeExecutor_ExecuteSuccessWithFakeClient(t *testing.T) {
+func TestKubernetesJobCodeExecutor_RunSuccessWithFakeClient(t *testing.T) {
 	setKubernetesCodeExecTestEnv(t)
 	t.Setenv("ORKA_SECRET_TOKEN", "must-not-appear-in-job-env")
 
@@ -1069,7 +1069,7 @@ func TestKubernetesJobCodeExecutor_ExecuteSuccessWithFakeClient(t *testing.T) {
 		randomSuffix: func() string { return successStatusString },
 	}
 
-	result := executor.Execute(ctx, CodeExecutionRequest{
+	result := executor.Run(ctx, SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             code,
@@ -1097,7 +1097,7 @@ func TestKubernetesJobCodeExecutor_ExecuteSuccessWithFakeClient(t *testing.T) {
 	assertFakeKubernetesCodeExecResourcesDeleted(t, fakeClient, namespace, jobName)
 }
 
-func TestKubernetesJobCodeExecutor_ExecutePreservesResultWhenStoreForbidden(t *testing.T) {
+func TestKubernetesJobCodeExecutor_RunPreservesResultWhenStoreForbidden(t *testing.T) {
 	setKubernetesCodeExecTestEnv(t)
 
 	scheme := runtime.NewScheme()
@@ -1139,7 +1139,7 @@ func TestKubernetesJobCodeExecutor_ExecutePreservesResultWhenStoreForbidden(t *t
 		pollInterval: time.Millisecond,
 	}
 
-	result := executor.Execute(ctx, CodeExecutionRequest{
+	result := executor.Run(ctx, SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             "print('finished')",
@@ -1157,7 +1157,7 @@ func TestKubernetesJobCodeExecutor_ExecutePreservesResultWhenStoreForbidden(t *t
 	assertFakeKubernetesCodeExecResourcesDeleted(t, fakeClient, namespace, jobName)
 }
 
-func TestKubernetesJobCodeExecutor_ExecutePreservesResultWhenStoredResultCleanupFails(t *testing.T) {
+func TestKubernetesJobCodeExecutor_RunPreservesResultWhenStoredResultCleanupFails(t *testing.T) {
 	setKubernetesCodeExecTestEnv(t)
 
 	scheme := runtime.NewScheme()
@@ -1199,7 +1199,7 @@ func TestKubernetesJobCodeExecutor_ExecutePreservesResultWhenStoredResultCleanup
 		pollInterval: time.Millisecond,
 	}
 
-	result := executor.Execute(ctx, CodeExecutionRequest{
+	result := executor.Run(ctx, SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             "print('finished')",
@@ -1221,7 +1221,7 @@ func TestKubernetesJobCodeExecutor_ExecutePreservesResultWhenStoredResultCleanup
 	assertFakeKubernetesCodeExecResourcesDeleted(t, fakeClient, namespace, jobName)
 }
 
-func TestKubernetesJobCodeExecutor_ExecuteFailureWithFakeClient(t *testing.T) {
+func TestKubernetesJobCodeExecutor_RunFailureWithFakeClient(t *testing.T) {
 	setKubernetesCodeExecTestEnv(t)
 
 	fakeClient := newKubernetesCodeExecFakeClient(t)
@@ -1249,7 +1249,7 @@ func TestKubernetesJobCodeExecutor_ExecuteFailureWithFakeClient(t *testing.T) {
 		randomSuffix: func() string { return "failure" },
 	}
 
-	result := executor.Execute(ctx, CodeExecutionRequest{
+	result := executor.Run(ctx, SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguageBash,
 		Code:             "echo failure; exit 7",
@@ -1278,7 +1278,7 @@ func TestKubernetesJobCodeExecutor_ExecuteFailureWithFakeClient(t *testing.T) {
 	assertFakeKubernetesCodeExecResourcesDeleted(t, fakeClient, namespace, jobName)
 }
 
-func TestKubernetesJobCodeExecutor_ExecuteTimeoutWithFakeClient(t *testing.T) {
+func TestKubernetesJobCodeExecutor_RunTimeoutWithFakeClient(t *testing.T) {
 	setKubernetesCodeExecTestEnv(t)
 
 	fakeClient := newKubernetesCodeExecFakeClient(t)
@@ -1297,7 +1297,7 @@ func TestKubernetesJobCodeExecutor_ExecuteTimeoutWithFakeClient(t *testing.T) {
 		randomSuffix: func() string { return timeoutField },
 	}
 
-	result := executor.Execute(ctx, CodeExecutionRequest{
+	result := executor.Run(ctx, SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguageNode,
 		Code:             "setTimeout(() => console.log('late'), 1000)",
@@ -1319,7 +1319,7 @@ func TestKubernetesJobCodeExecutor_ExecuteTimeoutWithFakeClient(t *testing.T) {
 	assertFakeKubernetesCodeExecResourcesDeleted(t, fakeClient, namespace, jobName)
 }
 
-func TestKubernetesJobCodeExecutor_ExecuteDoesNotPersistTimeoutResult(t *testing.T) {
+func TestKubernetesJobCodeExecutor_RunDoesNotPersistTimeoutResult(t *testing.T) {
 	setKubernetesCodeExecTestEnv(t)
 
 	fakeClient := newKubernetesCodeExecFakeClient(t)
@@ -1338,7 +1338,7 @@ func TestKubernetesJobCodeExecutor_ExecuteDoesNotPersistTimeoutResult(t *testing
 		pollInterval: time.Millisecond,
 	}
 
-	result := executor.Execute(ctx, CodeExecutionRequest{
+	result := executor.Run(ctx, SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguageNode,
 		Code:             "setTimeout(() => console.log('late'), 1000)",
@@ -1364,7 +1364,7 @@ func TestKubernetesJobCodeExecutor_ExecuteDoesNotPersistTimeoutResult(t *testing
 	assertFakeKubernetesCodeExecResourcesDeleted(t, fakeClient, namespace, jobName)
 }
 
-func TestKubernetesJobCodeExecutor_ExecuteDeadlineExceededWithFakeClient(t *testing.T) {
+func TestKubernetesJobCodeExecutor_RunDeadlineExceededWithFakeClient(t *testing.T) {
 	setKubernetesCodeExecTestEnv(t)
 
 	fakeClient := newKubernetesCodeExecFakeClient(t)
@@ -1391,7 +1391,7 @@ func TestKubernetesJobCodeExecutor_ExecuteDeadlineExceededWithFakeClient(t *test
 		randomSuffix: func() string { return "deadline" },
 	}
 
-	result := executor.Execute(ctx, CodeExecutionRequest{
+	result := executor.Run(ctx, SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguageBash,
 		Code:             "echo timeout output; sleep 20",
@@ -1426,7 +1426,7 @@ func TestKubernetesJobCodeExecutor_BlocksDeniedBashBeforeCreatingJob(t *testing.
 		},
 	}
 
-	result := executor.Execute(context.Background(), CodeExecutionRequest{
+	result := executor.Run(context.Background(), SandboxRunRequest{
 		Backend:      codeExecBackendKubernetes,
 		Language:     codeLanguageBash,
 		Code:         "rm -rf /",
@@ -1450,7 +1450,7 @@ func TestKubernetesJobCodeExecutor_BuildResourcesRuntimeClassName(t *testing.T) 
 	t.Setenv(codeExecKubernetesRuntimeClassNameEnv, "  gvisor  ")
 
 	executor := &KubernetesJobCodeExecutor{randomSuffix: func() string { return "runtime-class" }}
-	resources, err := executor.buildResources(testNamespace, CodeExecutionRequest{
+	resources, err := executor.buildResources(testNamespace, SandboxRunRequest{
 		Language:         codeLanguagePython,
 		Code:             "print('runtime')",
 		Timeout:          time.Second,
@@ -1471,7 +1471,7 @@ func TestKubernetesJobCodeExecutor_BuildResourcesOmitsAppArmorByDefault(t *testi
 	setKubernetesCodeExecTestEnv(t)
 
 	executor := &KubernetesJobCodeExecutor{randomSuffix: func() string { return "apparmor-default" }}
-	resources, err := executor.buildResources(testNamespace, CodeExecutionRequest{
+	resources, err := executor.buildResources(testNamespace, SandboxRunRequest{
 		Language:         codeLanguagePython,
 		Code:             "print('apparmor default')",
 		Timeout:          time.Second,
@@ -1495,7 +1495,7 @@ func TestKubernetesJobCodeExecutor_BuildResourcesAppArmorRuntimeDefaultOptIn(t *
 	t.Setenv(codeExecKubernetesAppArmorProfileEnv, " runtime/default ")
 
 	executor := &KubernetesJobCodeExecutor{randomSuffix: func() string { return "apparmor-runtime" }}
-	resources, err := executor.buildResources(testNamespace, CodeExecutionRequest{
+	resources, err := executor.buildResources(testNamespace, SandboxRunRequest{
 		Language:         codeLanguagePython,
 		Code:             "print('apparmor runtime default')",
 		Timeout:          time.Second,
@@ -1518,7 +1518,7 @@ func TestKubernetesJobCodeExecutor_BuildResourcesUsesRunIdentityAnnotations(t *t
 	setKubernetesCodeExecTestEnv(t)
 
 	rawCode := "print('do not put raw code in annotations: raw-code-secret-123')"
-	req := CodeExecutionRequest{
+	req := SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             rawCode,
@@ -1574,7 +1574,7 @@ func TestKubernetesJobCodeExecutor_CreateResourcesReusesOnlyMatchingRunIdentity(
 	ctx := context.Background()
 	fakeClient := newKubernetesCodeExecFakeClient(t)
 	executor := &KubernetesJobCodeExecutor{}
-	req := CodeExecutionRequest{
+	req := SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             "print('first')",
@@ -1621,7 +1621,7 @@ func TestKubernetesJobCodeExecutor_CreateResourcesReusesOnlyMatchingRunIdentity(
 	}
 }
 
-func TestKubernetesJobCodeExecutor_ExecutePersistsAndReplaysStoredResult(t *testing.T) {
+func TestKubernetesJobCodeExecutor_RunPersistsAndReplaysStoredResult(t *testing.T) {
 	setKubernetesCodeExecTestEnv(t)
 
 	fakeClient := newKubernetesCodeExecFakeClient(t)
@@ -1630,7 +1630,7 @@ func TestKubernetesJobCodeExecutor_ExecutePersistsAndReplaysStoredResult(t *test
 	jobName := codeExecKubernetesJobNameForRunID(runID)
 	podName := "pod-persisted-replay"
 	rawCode := "print('raw-code-secret-456')"
-	req := CodeExecutionRequest{
+	req := SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             rawCode,
@@ -1657,7 +1657,7 @@ func TestKubernetesJobCodeExecutor_ExecutePersistsAndReplaysStoredResult(t *test
 		randomSuffix: func() string { return "should-not-be-used" },
 	}
 
-	first := executor.Execute(ctx, req)
+	first := executor.Run(ctx, req)
 	requireFakeKubernetesCompletion(t, errCh)
 	if first.Error != "persisted stderr\n" || first.ExitCode != 0 || first.Output != "persisted output\n" {
 		t.Fatalf("first result = %+v, want persisted successful result", first)
@@ -1680,7 +1680,7 @@ func TestKubernetesJobCodeExecutor_ExecutePersistsAndReplaysStoredResult(t *test
 
 	replayCtx, replayCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer replayCancel()
-	second := executor.Execute(replayCtx, req)
+	second := executor.Run(replayCtx, req)
 	if second != first {
 		t.Fatalf("replayed result = %+v, want first result %+v", second, first)
 	}
@@ -1693,7 +1693,7 @@ func TestKubernetesJobCodeExecutor_CheckJobReplaysStoredResultWhenJobDisappears(
 	ctx := context.Background()
 	fakeClient := newKubernetesCodeExecFakeClient(t)
 	executor := &KubernetesJobCodeExecutor{}
-	req := CodeExecutionRequest{
+	req := SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             "print('result')",
@@ -1703,7 +1703,7 @@ func TestKubernetesJobCodeExecutor_CheckJobReplaysStoredResultWhenJobDisappears(
 		InputHash:        "missing-job-replay-hash",
 	}
 	jobName := codeExecKubernetesJobNameForRunID(req.RunID)
-	want := CodeExecResult{Output: "cached\n", ExitCode: 0}
+	want := SandboxRunResult{Output: "cached\n", ExitCode: 0}
 	if err := executor.storeResult(ctx, fakeClient, testNamespace, jobName, req, want); err != nil {
 		t.Fatalf("storeResult() error = %v", err)
 	}
@@ -1720,7 +1720,7 @@ func TestKubernetesJobCodeExecutor_CheckJobFailsWhenObservedJobDisappearsWithout
 	ctx := context.Background()
 	fakeClient := newKubernetesCodeExecFakeClient(t)
 	executor := &KubernetesJobCodeExecutor{}
-	req := CodeExecutionRequest{
+	req := SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             "print('result')",
@@ -1743,7 +1743,7 @@ func TestKubernetesJobCodeExecutor_LoadStoredResultRequiresMatchingIdentity(t *t
 	ctx := context.Background()
 	fakeClient := newKubernetesCodeExecFakeClient(t)
 	executor := &KubernetesJobCodeExecutor{}
-	req := CodeExecutionRequest{
+	req := SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             "print('result')",
@@ -1753,7 +1753,7 @@ func TestKubernetesJobCodeExecutor_LoadStoredResultRequiresMatchingIdentity(t *t
 		InputHash:        "stored-identity-hash",
 	}
 	jobName := codeExecKubernetesJobNameForRunID(req.RunID)
-	want := CodeExecResult{Output: "cached\n", ExitCode: 0}
+	want := SandboxRunResult{Output: "cached\n", ExitCode: 0}
 	if err := executor.storeResult(ctx, fakeClient, testNamespace, jobName, req, want); err != nil {
 		t.Fatalf("storeResult() error = %v", err)
 	}
@@ -1765,7 +1765,7 @@ func TestKubernetesJobCodeExecutor_LoadStoredResultRequiresMatchingIdentity(t *t
 
 	mismatched := req
 	mismatched.InputHash = "other-hash"
-	if got, found, err := executor.loadStoredResult(ctx, fakeClient, testNamespace, jobName, mismatched); err != nil || found || got != (CodeExecResult{}) {
+	if got, found, err := executor.loadStoredResult(ctx, fakeClient, testNamespace, jobName, mismatched); err != nil || found || got != (SandboxRunResult{}) {
 		t.Fatalf("mismatched loadStoredResult() = (%+v, %v, %v), want no replay and no error", got, found, err)
 	}
 	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: jobName}, &corev1.ConfigMap{}); err != nil {
@@ -1786,7 +1786,7 @@ func TestKubernetesJobCodeExecutor_LoadStoredResultRequiresMatchingIdentity(t *t
 	if err := fakeClient.Create(ctx, missingVersion); err != nil {
 		t.Fatalf("failed to create missing-version ConfigMap: %v", err)
 	}
-	if got, found, err := executor.loadStoredResult(ctx, fakeClient, testNamespace, missingVersion.Name, req); err != nil || found || got != (CodeExecResult{}) {
+	if got, found, err := executor.loadStoredResult(ctx, fakeClient, testNamespace, missingVersion.Name, req); err != nil || found || got != (SandboxRunResult{}) {
 		t.Fatalf("missing-version loadStoredResult() = (%+v, %v, %v), want no replay and no error", got, found, err)
 	}
 	err = fakeClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: missingVersion.Name}, &corev1.ConfigMap{})
@@ -1832,7 +1832,7 @@ func TestKubernetesJobCodeExecutor_LoadStoredResultRequiresMatchingIdentity(t *t
 			if err := fakeClient.Create(ctx, stored); err != nil {
 				t.Fatalf("failed to create invalid ConfigMap: %v", err)
 			}
-			if got, found, err := executor.loadStoredResult(ctx, fakeClient, testNamespace, stored.Name, req); err != nil || found || got != (CodeExecResult{}) {
+			if got, found, err := executor.loadStoredResult(ctx, fakeClient, testNamespace, stored.Name, req); err != nil || found || got != (SandboxRunResult{}) {
 				t.Fatalf("invalid loadStoredResult() = (%+v, %v, %v), want cache miss and no error", got, found, err)
 			}
 			err := fakeClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: stored.Name}, &corev1.ConfigMap{})
@@ -1849,7 +1849,7 @@ func TestKubernetesJobCodeExecutor_StoreResultReplacesInvalidStoredResult(t *tes
 	ctx := context.Background()
 	fakeClient := newKubernetesCodeExecFakeClient(t)
 	executor := &KubernetesJobCodeExecutor{}
-	req := CodeExecutionRequest{
+	req := SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             "print('result')",
@@ -1879,7 +1879,7 @@ func TestKubernetesJobCodeExecutor_StoreResultReplacesInvalidStoredResult(t *tes
 		t.Fatalf("failed to create invalid stored result: %v", err)
 	}
 
-	want := CodeExecResult{Output: "stored\n", ExitCode: 0}
+	want := SandboxRunResult{Output: "stored\n", ExitCode: 0}
 	if err := executor.storeResult(ctx, fakeClient, testNamespace, jobName, req, want); err != nil {
 		t.Fatalf("storeResult() error = %v", err)
 	}
@@ -1894,7 +1894,7 @@ func TestKubernetesJobCodeExecutor_StoreResultReplacesStaleVersionStoredResult(t
 	ctx := context.Background()
 	fakeClient := newKubernetesCodeExecFakeClient(t)
 	executor := &KubernetesJobCodeExecutor{}
-	req := CodeExecutionRequest{
+	req := SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             "print('result')",
@@ -1918,13 +1918,13 @@ func TestKubernetesJobCodeExecutor_StoreResultReplacesStaleVersionStoredResult(t
 				codeExecKubernetesLabelJob:  jobName,
 			},
 		},
-		Data: map[string]string{codeExecKubernetesResultKey: storedKubernetesCodeExecResultJSON(t, req, CodeExecResult{Output: "stale\n", ExitCode: 0})},
+		Data: map[string]string{codeExecKubernetesResultKey: storedKubernetesCodeExecResultJSON(t, req, SandboxRunResult{Output: "stale\n", ExitCode: 0})},
 	}
 	if err := fakeClient.Create(ctx, stale); err != nil {
 		t.Fatalf("failed to create stale stored result: %v", err)
 	}
 
-	want := CodeExecResult{Output: "stored\n", ExitCode: 0}
+	want := SandboxRunResult{Output: "stored\n", ExitCode: 0}
 	if err := executor.storeResult(ctx, fakeClient, testNamespace, jobName, req, want); err != nil {
 		t.Fatalf("storeResult() error = %v", err)
 	}
@@ -1954,7 +1954,7 @@ func TestKubernetesJobCodeExecutor_StoreResultFailsWhenInvalidStoredResultCannot
 
 	ctx := context.Background()
 	executor := &KubernetesJobCodeExecutor{}
-	req := CodeExecutionRequest{
+	req := SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             "print('result')",
@@ -1984,7 +1984,7 @@ func TestKubernetesJobCodeExecutor_StoreResultFailsWhenInvalidStoredResultCannot
 		t.Fatalf("failed to create invalid stored result: %v", err)
 	}
 
-	err := executor.storeResult(ctx, fakeClient, testNamespace, jobName, req, CodeExecResult{Output: "stored\n", ExitCode: 0})
+	err := executor.storeResult(ctx, fakeClient, testNamespace, jobName, req, SandboxRunResult{Output: "stored\n", ExitCode: 0})
 	if err == nil || !strings.Contains(err.Error(), "did not persist replacement") {
 		t.Fatalf("storeResult() error = %v, want replacement failure", err)
 	}
@@ -1997,7 +1997,7 @@ func TestKubernetesJobCodeExecutor_StoreResultIgnoresCallerCancellation(t *testi
 	cancel()
 	fakeClient := newKubernetesCodeExecFakeClient(t)
 	executor := &KubernetesJobCodeExecutor{}
-	req := CodeExecutionRequest{
+	req := SandboxRunRequest{
 		Backend:          codeExecBackendKubernetes,
 		Language:         codeLanguagePython,
 		Code:             "print('result')",
@@ -2007,7 +2007,7 @@ func TestKubernetesJobCodeExecutor_StoreResultIgnoresCallerCancellation(t *testi
 		InputHash:        "cancelled-store-hash",
 	}
 	jobName := codeExecKubernetesJobNameForRunID(req.RunID)
-	want := CodeExecResult{Output: "still stored\n", ExitCode: 0}
+	want := SandboxRunResult{Output: "still stored\n", ExitCode: 0}
 
 	if err := executor.storeResult(ctx, fakeClient, testNamespace, jobName, req, want); err != nil {
 		t.Fatalf("storeResult() error = %v", err)
@@ -2300,7 +2300,7 @@ func (s fakePodLogStreamer) Stream(_ context.Context, _, podName string, _ *core
 	return io.NopCloser(strings.NewReader(s.logs[podName])), nil
 }
 
-func storedKubernetesCodeExecResultJSON(t *testing.T, req CodeExecutionRequest, result CodeExecResult) string {
+func storedKubernetesCodeExecResultJSON(t *testing.T, req SandboxRunRequest, result SandboxRunResult) string {
 	t.Helper()
 	stored := kubernetesCodeExecStoredResult{
 		Version:   codeExecKubernetesResultVersion,

@@ -1583,6 +1583,111 @@ func taskExecutionWorkspaceReason(task *corev1alpha1.Task) corev1alpha1.Executio
 	return task.Status.ExecutionWorkspace.Reason
 }
 
+func (r *TaskReconciler) syncChildTaskStatuses(ctx context.Context, task *corev1alpha1.Task) {
+	if _, isChild := task.Labels[labels.LabelParentTask]; isChild {
+		return
+	}
+
+	var children corev1alpha1.TaskList
+	if err := r.List(ctx, &children, client.InNamespace(task.Namespace),
+		client.MatchingLabels{labels.LabelParentTask: labels.SelectorValue(task.Name)}); err != nil {
+		return
+	}
+
+	slices.SortFunc(children.Items, func(a, b corev1alpha1.Task) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	log := logf.FromContext(ctx)
+	childStatuses := make([]corev1alpha1.ChildTaskStatus, 0, len(children.Items))
+	for _, child := range children.Items {
+		phase := child.Status.Phase
+		if phase == "" {
+			phase = corev1alpha1.TaskPhasePending
+		}
+		childStatus := corev1alpha1.ChildTaskStatus{
+			Name:  child.Name,
+			Phase: phase,
+		}
+		if child.Spec.AgentRef != nil {
+			childStatus.Agent = child.Spec.AgentRef.Name
+		}
+		if child.Status.ResultRef != nil && child.Status.ResultRef.Available && r.ResultStore != nil {
+			result, err := r.ResultStore.GetResult(ctx, child.Namespace, child.Name)
+			if err != nil {
+				log.Error(err, "failed to get child task result", "child", child.Name)
+				childStatus.Result = "(result fetch error)"
+			} else {
+				childStatus.Result = string(result)
+				if len(childStatus.Result) > 4096 {
+					childStatus.Result = childStatus.Result[:4096] + "\n[truncated]"
+				}
+			}
+		}
+		childStatuses = append(childStatuses, childStatus)
+	}
+
+	if childTaskStatusesEqual(task.Status.ChildTasks, childStatuses) {
+		return
+	}
+	childStatusesCopy := append([]corev1alpha1.ChildTaskStatus(nil), childStatuses...)
+	if err := r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
+		t.Status.ChildTasks = childStatusesCopy
+	}); err != nil {
+		log.Error(err, "failed to update child task status")
+	}
+}
+
+func (r *TaskReconciler) handleRunningJobNotFound(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	if r.isAutonomousTask(ctx, task) {
+		oldJob := task.Status.JobName
+		latest := &corev1alpha1.Task{}
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+		if err := reader.Get(ctx, types.NamespacedName{Name: task.Name, Namespace: task.Namespace}, latest); err != nil {
+			return ctrl.Result{}, err
+		}
+		if latest.Status.JobName != oldJob || latest.Status.Phase != corev1alpha1.TaskPhaseRunning {
+			task.Status = latest.Status
+			log.Info("job not found for stale autonomous task state; requeueing with latest status",
+				"oldJob", oldJob,
+				"latestJob", latest.Status.JobName,
+				"latestPhase", latest.Status.Phase)
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		task = latest
+		if result, handled, err := r.handleAutonomousApprovalState(ctx, task); err != nil || handled {
+			return result, err
+		}
+	}
+	if r.isWithinJobCreationVisibilityGracePeriod(task) {
+		log.Info("job not found shortly after creation, waiting for cache visibility",
+			"job", task.Status.JobName,
+			"startTime", task.Status.StartTime,
+		)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	if r.shouldRetry(task) {
+		log.Info("job not found while task still has retry budget, scheduling retry", "attempt", task.Status.Attempts)
+		return r.retryTask(ctx, task)
+	}
+	log.Info("Job not found, task may have been cleaned up")
+	return r.failTask(ctx, task, "job not found")
+}
+
 // handleRunning handles Tasks in Running phase
 func (r *TaskReconciler) handleRunning(ctx context.Context, task *corev1alpha1.Task) (ctrl.Result, error) { //nolint:gocyclo
 	log := logf.FromContext(ctx)
@@ -1617,59 +1722,8 @@ func (r *TaskReconciler) handleRunning(ctx context.Context, task *corev1alpha1.T
 		return r.failTask(ctx, task, "harness runtime turn identity is missing")
 	}
 
-	// Populate ChildTaskStatus for coordinator tasks
-	if _, isChild := task.Labels[labels.LabelParentTask]; !isChild {
-		var children corev1alpha1.TaskList
-		if err := r.List(ctx, &children, client.InNamespace(task.Namespace),
-			client.MatchingLabels{labels.LabelParentTask: labels.SelectorValue(task.Name)}); err == nil {
-			slices.SortFunc(children.Items, func(a, b corev1alpha1.Task) int {
-				switch {
-				case a.Name < b.Name:
-					return -1
-				case a.Name > b.Name:
-					return 1
-				default:
-					return 0
-				}
-			})
-
-			childStatuses := make([]corev1alpha1.ChildTaskStatus, 0, len(children.Items))
-			for _, child := range children.Items {
-				phase := child.Status.Phase
-				if phase == "" {
-					phase = corev1alpha1.TaskPhasePending
-				}
-				cs := corev1alpha1.ChildTaskStatus{
-					Name:  child.Name,
-					Phase: phase,
-				}
-				if child.Spec.AgentRef != nil {
-					cs.Agent = child.Spec.AgentRef.Name
-				}
-				if child.Status.ResultRef != nil && child.Status.ResultRef.Available && r.ResultStore != nil {
-					result, err := r.ResultStore.GetResult(ctx, child.Namespace, child.Name)
-					if err != nil {
-						log.Error(err, "failed to get child task result", "child", child.Name)
-						cs.Result = "(result fetch error)"
-					} else {
-						cs.Result = string(result)
-						if len(cs.Result) > 4096 {
-							cs.Result = cs.Result[:4096] + "\n[truncated]"
-						}
-					}
-				}
-				childStatuses = append(childStatuses, cs)
-			}
-			if !childTaskStatusesEqual(task.Status.ChildTasks, childStatuses) {
-				childStatusesCopy := append([]corev1alpha1.ChildTaskStatus(nil), childStatuses...)
-				if err := r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
-					t.Status.ChildTasks = childStatusesCopy
-				}); err != nil {
-					log.Error(err, "failed to update child task status")
-				}
-			}
-		}
-	}
+	// Populate ChildTaskStatus for coordinator tasks.
+	r.syncChildTaskStatuses(ctx, task)
 
 	// Get the Job
 	job := &batchv1.Job{}
@@ -1678,42 +1732,7 @@ func (r *TaskReconciler) handleRunning(ctx context.Context, task *corev1alpha1.T
 		Namespace: task.Namespace,
 	}, job); err != nil {
 		if apierrors.IsNotFound(err) {
-			if r.isAutonomousTask(ctx, task) {
-				oldJob := task.Status.JobName
-				latest := &corev1alpha1.Task{}
-				reader := r.APIReader
-				if reader == nil {
-					reader = r.Client
-				}
-				if latestErr := reader.Get(ctx, types.NamespacedName{Name: task.Name, Namespace: task.Namespace}, latest); latestErr != nil {
-					return ctrl.Result{}, latestErr
-				}
-				if latest.Status.JobName != oldJob || latest.Status.Phase != corev1alpha1.TaskPhaseRunning {
-					task.Status = latest.Status
-					log.Info("job not found for stale autonomous task state; requeueing with latest status",
-						"oldJob", oldJob,
-						"latestJob", latest.Status.JobName,
-						"latestPhase", latest.Status.Phase)
-					return ctrl.Result{RequeueAfter: time.Second}, nil
-				}
-				task = latest
-				if result, handled, err := r.handleAutonomousApprovalState(ctx, task); err != nil || handled {
-					return result, err
-				}
-			}
-			if r.isWithinJobCreationVisibilityGracePeriod(task) {
-				log.Info("job not found shortly after creation, waiting for cache visibility",
-					"job", task.Status.JobName,
-					"startTime", task.Status.StartTime,
-				)
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-			}
-			if r.shouldRetry(task) {
-				log.Info("job not found while task still has retry budget, scheduling retry", "attempt", task.Status.Attempts)
-				return r.retryTask(ctx, task)
-			}
-			log.Info("Job not found, task may have been cleaned up")
-			return r.failTask(ctx, task, "job not found")
+			return r.handleRunningJobNotFound(ctx, task)
 		}
 		log.Error(err, "failed to get Job")
 		return ctrl.Result{}, err

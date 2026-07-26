@@ -112,14 +112,13 @@ func (e *HTTPError) Error() string { return e.Message }
 
 // Service owns durable admission, dispatch, terminal projection, and delivery.
 type Service struct {
-	Client        client.Client
-	APIReader     client.Reader
-	EventStore    store.GatewayEventStore
-	DeliveryStore store.GatewayDeliveryStore
-	ResultStore   store.ResultStore
-	HTTPClient    *http.Client
-	Config        Config
-	Owner         string
+	Client      client.Client
+	APIReader   client.Reader
+	Store       store.GatewayStore
+	ResultStore store.ResultStore
+	HTTPClient  *http.Client
+	Config      Config
+	Owner       string
 }
 
 func (s *Service) freshReader() client.Reader {
@@ -132,14 +131,13 @@ func (s *Service) freshReader() client.Reader {
 // NewService creates a gateway processing service.
 func NewService(
 	kubeClient client.Client,
-	events store.GatewayEventStore,
-	deliveries store.GatewayDeliveryStore,
+	gatewayStore store.GatewayStore,
 	results store.ResultStore,
 	config Config,
 ) *Service {
 	config = normalizeConfig(config)
 	return &Service{
-		Client: kubeClient, EventStore: events, DeliveryStore: deliveries, ResultStore: results,
+		Client: kubeClient, Store: gatewayStore, ResultStore: results,
 		Config: config, Owner: newProcessorOwner(),
 	}
 }
@@ -177,7 +175,7 @@ func (s *Service) Start(ctx context.Context) error {
 			}
 		case now := <-maintenanceTicker.C:
 			terminalCutoff := now.Add(-s.Config.TerminalRetention)
-			if _, err := s.DeliveryStore.MaintainGatewayRecords(ctx, s.Config.Namespace, now, terminalCutoff); err != nil {
+			if _, err := s.Store.MaintainGatewayRecords(ctx, s.Config.Namespace, now, terminalCutoff); err != nil {
 				logger.Error(err, "gateway maintenance failed")
 			} else if err := s.cleanupRetainedGatewayTasks(ctx, terminalCutoff); err != nil {
 				logger.Error(err, "gateway Task retention cleanup failed")
@@ -187,7 +185,7 @@ func (s *Service) Start(ctx context.Context) error {
 }
 
 func (s *Service) cleanupRetainedGatewayTasks(ctx context.Context, terminalCutoff time.Time) error {
-	if s == nil || s.Client == nil || s.EventStore == nil {
+	if s == nil || s.Client == nil || s.Store == nil {
 		return nil
 	}
 	requirement, err := k8slabels.NewRequirement(TaskGatewayEventLabel, selection.Exists, nil)
@@ -215,7 +213,7 @@ func (s *Service) cleanupRetainedGatewayTasks(ctx context.Context, terminalCutof
 		}
 		eventFound := false
 		if task.UID != "" {
-			if _, err := s.EventStore.GetGatewayEventForTask(ctx, task.Namespace, task.Name, string(task.UID)); err == nil {
+			if _, err := s.Store.GetGatewayEventForTask(ctx, task.Namespace, task.Name, string(task.UID)); err == nil {
 				eventFound = true
 			} else if !errors.Is(err, store.ErrNotFound) {
 				errs = append(errs, fmt.Errorf("check retained gateway Task %s/%s: %w", task.Namespace, task.Name, err))
@@ -223,7 +221,7 @@ func (s *Service) cleanupRetainedGatewayTasks(ctx context.Context, terminalCutof
 			}
 		}
 		if !eventFound {
-			tombstoned, err := s.EventStore.HasGatewayTaskTombstone(ctx, task.Namespace, task.Name, string(task.UID))
+			tombstoned, err := s.Store.HasGatewayTaskTombstone(ctx, task.Namespace, task.Name, string(task.UID))
 			if err != nil {
 				errs = append(errs, fmt.Errorf("check retained gateway Task tombstone %s/%s: %w", task.Namespace, task.Name, err))
 				continue
@@ -266,7 +264,7 @@ func (s *Service) runDeliveryLoop(ctx context.Context, logger logr.Logger) {
 
 // ProcessOnce performs one bounded core iteration and one delivery attempt for tests.
 func (s *Service) ProcessOnce(ctx context.Context) error {
-	if s == nil || !s.Config.Enabled || s.Client == nil || s.EventStore == nil || s.DeliveryStore == nil {
+	if s == nil || !s.Config.Enabled || s.Client == nil || s.Store == nil {
 		return nil
 	}
 	var errs []error
@@ -330,7 +328,7 @@ func (s *Service) processCoreOnce(ctx context.Context) error {
 // versions or interrupted migrations before maintenance can compact them.
 func (s *Service) RepairExpiredEvents(ctx context.Context) error {
 	now := time.Now().UTC()
-	events, err := s.EventStore.ListGatewayEvents(ctx, store.GatewayEventFilter{
+	events, err := s.Store.ListGatewayEvents(ctx, store.GatewayEventFilter{
 		Namespace: s.Config.Namespace, States: []store.GatewayEventState{store.GatewayEventExpired},
 		MissingDelivery: true, OrderByExpiry: true, SessionHeadOnly: true, Limit: s.Config.BatchSize,
 	})
@@ -340,7 +338,7 @@ func (s *Service) RepairExpiredEvents(ctx context.Context) error {
 	var errs []error
 	for i := range events {
 		if events[i].NamespaceUID == "" || events[i].GatewayUID == "" || events[i].GatewayGeneration <= 0 {
-			if err := s.EventStore.MarkExpiredGatewayEventDeadLettered(
+			if err := s.Store.MarkExpiredGatewayEventDeadLettered(
 				ctx, events[i].Namespace, events[i].ID,
 				"The expired legacy event cannot be safely delivered because immutable identity is unavailable.", now,
 			); err != nil && !errors.Is(err, store.ErrConflict) {
@@ -366,7 +364,7 @@ func (s *Service) RepairExpiredEvents(ctx context.Context) error {
 // ExpireQueuedEvents appends visible expiry errors for admitted work that never reached Task creation.
 func (s *Service) ExpireQueuedEvents(ctx context.Context) error {
 	now := time.Now().UTC()
-	events, err := s.EventStore.ListGatewayEvents(ctx, store.GatewayEventFilter{
+	events, err := s.Store.ListGatewayEvents(ctx, store.GatewayEventFilter{
 		Namespace:     s.Config.Namespace,
 		States:        []store.GatewayEventState{store.GatewayEventAccepted, store.GatewayEventQueued},
 		ExpiresBefore: &now, OrderByExpiry: true, SessionHeadOnly: true, Limit: s.Config.BatchSize,
@@ -387,7 +385,7 @@ func (s *Service) ExpireQueuedEvents(ctx context.Context) error {
 }
 
 func (s *Service) updateQueueMetrics(ctx context.Context) error {
-	stats, err := s.EventStore.GetGatewayQueueStats(ctx, s.Config.Namespace)
+	stats, err := s.Store.GetGatewayQueueStats(ctx, s.Config.Namespace)
 	if err != nil {
 		return err
 	}
@@ -457,7 +455,7 @@ func (s *Service) AdmitEvent(ctx context.Context, namespace, gatewayName, author
 	traceCarrier := orkatracing.InjectContext(ctx)
 	baseEvent.TraceParent = boundedTraceValue(traceCarrier.Get("traceparent"), 256)
 	baseEvent.TraceState = boundedTraceValue(traceCarrier.Get("tracestate"), 1024)
-	if existing, err := s.EventStore.GetGatewayEventDuplicate(ctx, &baseEvent, now); err == nil {
+	if existing, err := s.Store.GetGatewayEventDuplicate(ctx, &baseEvent, now); err == nil {
 		return s.acknowledgeDuplicateEvent(ctx, existing, &baseEvent)
 	} else if errors.Is(err, store.ErrDuplicateMismatch) {
 		return nil, &HTTPError{Code: http.StatusConflict, Message: "externalEventId already identifies a different gateway event"}
@@ -511,7 +509,7 @@ func (s *Service) AdmitEvent(ctx context.Context, namespace, gatewayName, author
 	}
 	baseEvent.SessionName = sessionName
 	baseEvent.TaskName = gatewayTaskName(string(object.UID), eventEnvelope.ExternalEventID, now)
-	record, created, err := s.EventStore.AdmitGatewayEvent(ctx, store.GatewayEventAdmission{
+	record, created, err := s.Store.AdmitGatewayEvent(ctx, store.GatewayEventAdmission{
 		Event: baseEvent, AppendUserMessage: true, PendingLimit: s.Config.PendingPerSession,
 		GatewayRecordLimit:  s.Config.MaxRecordsPerGateway,
 		RejectedRecordLimit: s.Config.MaxRejectedRecordsPerGateway,
@@ -550,7 +548,7 @@ func (s *Service) admitRejectedEvent(
 ) (*protocol.IngressResponse, error) {
 	event.State = store.GatewayEventRejected
 	event.StateMessage = protocol.SanitizeMessage(message, 1024)
-	record, created, err := s.EventStore.AdmitGatewayEvent(ctx, store.GatewayEventAdmission{
+	record, created, err := s.Store.AdmitGatewayEvent(ctx, store.GatewayEventAdmission{
 		Event: event, GatewayRecordLimit: s.Config.MaxRecordsPerGateway,
 		RejectedRecordLimit: s.Config.MaxRejectedRecordsPerGateway,
 	})
@@ -602,7 +600,7 @@ func (s *Service) acknowledgeDuplicateEvent(
 // DispatchOnce claims one FIFO event and creates/links its deterministic Task.
 func (s *Service) DispatchOnce(ctx context.Context) error {
 	now := time.Now().UTC()
-	event, err := s.EventStore.ClaimNextGatewayEvent(ctx, s.Config.Namespace, s.Owner, now, s.Config.ClaimLease)
+	event, err := s.Store.ClaimNextGatewayEvent(ctx, s.Config.Namespace, s.Owner, now, s.Config.ClaimLease)
 	if err != nil {
 		return err
 	}
@@ -631,7 +629,7 @@ func (s *Service) DispatchOnce(ctx context.Context) error {
 		}
 		return nil
 	}
-	renewed, err := s.EventStore.RenewGatewayEventClaim(
+	renewed, err := s.Store.RenewGatewayEventClaim(
 		ctx, event.Namespace, event.ID, s.Owner, freshNow, s.Config.ClaimLease,
 	)
 	if err != nil {
@@ -646,7 +644,7 @@ func (s *Service) DispatchOnce(ctx context.Context) error {
 	}
 	if !capacityAvailable {
 		retryAt := time.Now().UTC().Add(eventBackoff(renewed.AttemptCount))
-		if err := s.EventStore.RetryGatewayEvent(
+		if err := s.Store.RetryGatewayEvent(
 			ctx, renewed.Namespace, renewed.ID, s.Owner, "namespace task limit reached", retryAt,
 		); err != nil {
 			return err
@@ -737,7 +735,7 @@ func (s *Service) reconcileExistingDispatchTask(
 
 	expected := taskForGatewayEvent(event, binding, now)
 	if gatewayTaskMatchesExpected(existing, expected, event, binding) {
-		return true, s.EventStore.MarkGatewayEventTaskCreated(
+		return true, s.Store.MarkGatewayEventTaskCreated(
 			ctx, event.Namespace, event.ID, event.TaskName, string(existing.UID), s.Owner, now,
 		)
 	}
@@ -768,7 +766,7 @@ func (s *Service) handleExpiredDispatchClaim(
 	if binding != nil {
 		expected := taskForGatewayEvent(event, binding, now)
 		if gatewayTaskMatchesExpected(existing, expected, event, binding) {
-			return true, s.EventStore.MarkGatewayEventTaskCreated(
+			return true, s.Store.MarkGatewayEventTaskCreated(
 				ctx, event.Namespace, event.ID, event.TaskName, string(existing.UID), s.Owner, now,
 			)
 		}
@@ -867,7 +865,7 @@ func (s *Service) expireGatewayEvent(
 		replyTarget = strings.TrimSpace(event.ContextID)
 	}
 	if replyTarget == "" {
-		return s.EventStore.ExpireGatewayEvent(ctx, event.Namespace, event.ID, owner, reason, now)
+		return s.Store.ExpireGatewayEvent(ctx, event.Namespace, event.ID, owner, reason, now)
 	}
 	expiresAt := gatewayDeliveryExpiresAt(event.ExpiresAt, now, s.Config)
 	deliveryID := gatewayDeliveryID(event, "expiry")
@@ -881,7 +879,7 @@ func (s *Service) expireGatewayEvent(
 		taskName = event.TaskName
 		metadata["taskName"] = event.TaskName
 	}
-	_, _, err := s.EventStore.ExpireGatewayEventWithDelivery(ctx, store.GatewayExpiryProjection{
+	_, _, err := s.Store.ExpireGatewayEventWithDelivery(ctx, store.GatewayExpiryProjection{
 		EventID: event.ID,
 		Owner:   owner,
 		Reason:  reason,
@@ -1014,13 +1012,13 @@ func (s *Service) linkGatewayTask(
 	linkedTask *corev1alpha1.Task,
 	now time.Time,
 ) error {
-	err := s.EventStore.MarkGatewayEventTaskCreated(
+	err := s.Store.MarkGatewayEventTaskCreated(
 		ctx, event.Namespace, event.ID, event.TaskName, string(linkedTask.UID), s.Owner, now,
 	)
 	if err == nil {
 		return nil
 	}
-	current, getErr := s.EventStore.GetGatewayEvent(ctx, event.Namespace, event.ID)
+	current, getErr := s.Store.GetGatewayEvent(ctx, event.Namespace, event.ID)
 	if getErr == nil && current.State == store.GatewayEventTaskCreated && current.TaskUID == string(linkedTask.UID) {
 		return nil
 	}
@@ -1033,7 +1031,7 @@ func (s *Service) linkGatewayTask(
 // ProjectTerminals fairly rotates TaskCreated events while projecting terminal work.
 func (s *Service) ProjectTerminals(ctx context.Context) error {
 	now := time.Now().UTC()
-	events, err := s.EventStore.ListGatewayEvents(ctx, store.GatewayEventFilter{
+	events, err := s.Store.ListGatewayEvents(ctx, store.GatewayEventFilter{
 		Namespace: s.Config.Namespace,
 		States:    []store.GatewayEventState{store.GatewayEventTaskCreated},
 		DueBefore: &now, OrderByNextAttempt: true, Limit: s.Config.BatchSize,
@@ -1114,7 +1112,7 @@ func (s *Service) projectTerminalEvents(ctx context.Context, events []store.Gate
 }
 
 func (s *Service) deferProjection(ctx context.Context, event *store.GatewayEvent, now time.Time) {
-	_ = s.EventStore.DeferGatewayEventProjection(
+	_ = s.Store.DeferGatewayEventProjection(
 		ctx, event.Namespace, event.ID, now.Add(s.Config.PollInterval),
 	)
 }
@@ -1179,7 +1177,7 @@ func (s *Service) projectTerminal(
 		State:       store.GatewayDeliveryPending, MaxAttempts: s.Config.DeliveryMaxAttempts,
 		NextAttemptAt: now, ExpiresAt: deliveryExpiresAt, CreatedAt: now, UpdatedAt: now,
 	}
-	_, _, err := s.EventStore.ProjectGatewayTerminal(ctx, store.GatewayTerminalProjection{
+	_, _, err := s.Store.ProjectGatewayTerminal(ctx, store.GatewayTerminalProjection{
 		EventID: event.ID,
 		Message: store.SessionMessage{
 			ID: messageID, Role: role, Content: text, SourceType: "gateway-task", SourceRef: task.Name,
@@ -1202,7 +1200,7 @@ func (s *Service) projectTerminal(
 // DeliverOnce claims one due delivery and records the synchronous terminal adapter result.
 func (s *Service) DeliverOnce(ctx context.Context) error {
 	claimAt := time.Now().UTC()
-	delivery, err := s.DeliveryStore.ClaimNextGatewayDelivery(ctx, s.Config.Namespace, s.Owner, claimAt, s.Config.ClaimLease)
+	delivery, err := s.Store.ClaimNextGatewayDelivery(ctx, s.Config.Namespace, s.Owner, claimAt, s.Config.ClaimLease)
 	if err != nil {
 		return err
 	}
@@ -1216,7 +1214,7 @@ func (s *Service) DeliverOnce(ctx context.Context) error {
 	if apierrors.IsNotFound(err) {
 		gatewayDeliveryTotal.WithLabelValues("non_retryable_error").Inc()
 		gatewayDeadLettersTotal.WithLabelValues("delivery").Inc()
-		return s.DeliveryStore.MarkGatewayDeliveryTerminal(
+		return s.Store.MarkGatewayDeliveryTerminal(
 			ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered,
 			"Gateway no longer exists", time.Now().UTC(),
 		)
@@ -1227,7 +1225,7 @@ func (s *Service) DeliverOnce(ctx context.Context) error {
 	if string(object.UID) != delivery.GatewayUID {
 		gatewayDeliveryTotal.WithLabelValues("non_retryable_error").Inc()
 		gatewayDeadLettersTotal.WithLabelValues("delivery").Inc()
-		return s.DeliveryStore.MarkGatewayDeliveryTerminal(
+		return s.Store.MarkGatewayDeliveryTerminal(
 			ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered,
 			"Gateway identity changed", time.Now().UTC(),
 		)
@@ -1235,7 +1233,7 @@ func (s *Service) DeliverOnce(ctx context.Context) error {
 	if delivery.GatewayGeneration <= 0 || object.Generation != delivery.GatewayGeneration {
 		gatewayDeliveryTotal.WithLabelValues("non_retryable_error").Inc()
 		gatewayDeadLettersTotal.WithLabelValues("delivery").Inc()
-		return s.DeliveryStore.MarkGatewayDeliveryTerminal(
+		return s.Store.MarkGatewayDeliveryTerminal(
 			ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered,
 			"Gateway generation changed", time.Now().UTC(),
 		)
@@ -1272,7 +1270,7 @@ func (s *Service) DeliverOnce(ctx context.Context) error {
 	}
 	if err := protocol.ValidateDeliveryRequest(&request); err != nil {
 		gatewayDeliveryTotal.WithLabelValues("invalid").Inc()
-		return s.DeliveryStore.MarkGatewayDeliveryTerminal(ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered, "delivery validation failed", time.Now().UTC())
+		return s.Store.MarkGatewayDeliveryTerminal(ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered, "delivery validation failed", time.Now().UTC())
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -1280,7 +1278,7 @@ func (s *Service) DeliverOnce(ctx context.Context) error {
 	}
 	deliveryWindow := delivery.ExpiresAt.Sub(time.Now().UTC())
 	if deliveryWindow <= 0 {
-		return s.DeliveryStore.MarkGatewayDeliveryTerminal(
+		return s.Store.MarkGatewayDeliveryTerminal(
 			ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryExpired, "delivery expired", time.Now().UTC(),
 		)
 	}
@@ -1318,7 +1316,7 @@ func (s *Service) DeliverOnce(ctx context.Context) error {
 		}
 		gatewayDeliveryTotal.WithLabelValues("non_retryable_error").Inc()
 		gatewayDeadLettersTotal.WithLabelValues("delivery").Inc()
-		return s.DeliveryStore.MarkGatewayDeliveryTerminal(ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered, fmt.Sprintf("adapter returned HTTP %d", response.StatusCode), outcomeAt)
+		return s.Store.MarkGatewayDeliveryTerminal(ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered, fmt.Sprintf("adapter returned HTTP %d", response.StatusCode), outcomeAt)
 	}
 	adapterResult, err := protocol.DecodeDeliveryResponse(responseBody)
 	if err != nil {
@@ -1334,7 +1332,7 @@ func (s *Service) DeliverOnce(ctx context.Context) error {
 	case protocol.DeliveryStatusNonRetryableError:
 		gatewayDeliveryTotal.WithLabelValues("non_retryable_error").Inc()
 		gatewayDeadLettersTotal.WithLabelValues("delivery").Inc()
-		return s.DeliveryStore.MarkGatewayDeliveryTerminal(ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered, adapterResult.Message, outcomeAt)
+		return s.Store.MarkGatewayDeliveryTerminal(ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered, adapterResult.Message, outcomeAt)
 	default:
 		return s.retryOrDeadLetterDelivery(ctx, delivery, "adapter returned an unsupported result", outcomeAt)
 	}
@@ -1353,7 +1351,7 @@ func (s *Service) completeGatewayDelivery(
 	if err := s.markTaskDeliveryCorrelation(ctx, delivery, providerMessageID); err != nil {
 		return err
 	}
-	if err := s.DeliveryStore.MarkGatewayDeliveryDelivered(
+	if err := s.Store.MarkGatewayDeliveryDelivered(
 		ctx, delivery.Namespace, delivery.ID, s.Owner, providerMessageID, outcomeAt,
 	); err != nil {
 		return err
@@ -1376,11 +1374,11 @@ func retryableAdapterHTTPStatus(statusCode int) bool {
 
 // RetryDelivery manually requeues one dead-lettered delivery with a fresh bounded expiry.
 func (s *Service) RetryDelivery(ctx context.Context, namespace, id string) (*store.GatewayDelivery, error) {
-	if s == nil || !s.Config.Enabled || s.DeliveryStore == nil {
+	if s == nil || !s.Config.Enabled || s.Store == nil {
 		return nil, &HTTPError{Code: http.StatusServiceUnavailable, Message: "gateway delivery processing is disabled"}
 	}
 	now := time.Now().UTC()
-	return s.DeliveryStore.RetryGatewayDelivery(ctx, namespace, id, now, now.Add(s.Config.EventExpiry))
+	return s.Store.RetryGatewayDelivery(ctx, namespace, id, now, now.Add(s.Config.EventExpiry))
 }
 
 func (s *Service) resolveBinding(ctx context.Context, namespace, gatewayName string, event *protocol.EventEnvelope) (*gatewayv1alpha1.GatewayBinding, string, error) {
@@ -1643,7 +1641,7 @@ func taskForGatewayEvent(event *store.GatewayEvent, binding *gatewayv1alpha1.Gat
 }
 
 func (s *Service) ensureDenialDelivery(ctx context.Context, event *store.GatewayEvent, reason string) error {
-	if s.DeliveryStore == nil || event == nil {
+	if s.Store == nil || event == nil {
 		return nil
 	}
 	replyTarget := strings.TrimSpace(event.ReplyTarget)
@@ -1659,7 +1657,7 @@ func (s *Service) ensureDenialDelivery(ctx context.Context, event *store.Gateway
 		text = "This message could not be queued. Try again later."
 	}
 	deliveryID := gatewayDeliveryID(event, "denial")
-	_, _, err := s.DeliveryStore.CreateGatewayDelivery(ctx, &store.GatewayDelivery{
+	_, _, err := s.Store.CreateGatewayDelivery(ctx, &store.GatewayDelivery{
 		ID: deliveryID, IdempotencyID: deliveryID, Namespace: event.Namespace, NamespaceUID: event.NamespaceUID,
 		GatewayUID: event.GatewayUID, GatewayGeneration: event.GatewayGeneration,
 		GatewayName: event.GatewayName, BindingName: event.BindingName, EventID: event.ID,
@@ -1678,23 +1676,23 @@ func (s *Service) ensureDenialDelivery(ctx context.Context, event *store.Gateway
 }
 
 func (s *Service) retryEvent(ctx context.Context, event *store.GatewayEvent, reason string, delay time.Duration) {
-	_ = s.EventStore.RetryGatewayEvent(ctx, event.Namespace, event.ID, s.Owner, protocol.SanitizeMessage(reason, 1024), time.Now().UTC().Add(delay))
+	_ = s.Store.RetryGatewayEvent(ctx, event.Namespace, event.ID, s.Owner, protocol.SanitizeMessage(reason, 1024), time.Now().UTC().Add(delay))
 }
 
 func (s *Service) retryOrDeadLetterDelivery(ctx context.Context, delivery *store.GatewayDelivery, reason string, now time.Time) error {
 	reason = protocol.SanitizeMessage(reason, 1024)
 	if delivery.AttemptCount >= delivery.MaxAttempts || !now.Add(deliveryBackoff(delivery.AttemptCount)).Before(delivery.ExpiresAt) {
 		gatewayDeadLettersTotal.WithLabelValues("delivery").Inc()
-		return s.DeliveryStore.MarkGatewayDeliveryTerminal(ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered, reason, now)
+		return s.Store.MarkGatewayDeliveryTerminal(ctx, delivery.Namespace, delivery.ID, s.Owner, store.GatewayDeliveryDeadLettered, reason, now)
 	}
-	return s.DeliveryStore.ScheduleGatewayDeliveryRetry(ctx, delivery.Namespace, delivery.ID, s.Owner, reason, now.Add(deliveryBackoff(delivery.AttemptCount)))
+	return s.Store.ScheduleGatewayDeliveryRetry(ctx, delivery.Namespace, delivery.ID, s.Owner, reason, now.Add(deliveryBackoff(delivery.AttemptCount)))
 }
 
 func (s *Service) markTaskDeliveryCorrelation(ctx context.Context, delivery *store.GatewayDelivery, providerMessageID string) error {
-	if delivery == nil || delivery.TaskName == "" || s.Client == nil || s.EventStore == nil {
+	if delivery == nil || delivery.TaskName == "" || s.Client == nil || s.Store == nil {
 		return nil
 	}
-	event, err := s.EventStore.GetGatewayEvent(ctx, delivery.Namespace, delivery.EventID)
+	event, err := s.Store.GetGatewayEvent(ctx, delivery.Namespace, delivery.EventID)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil
 	}

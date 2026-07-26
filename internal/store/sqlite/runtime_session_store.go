@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orka-agents/orka/internal/harness"
+	"github.com/orka-agents/orka/internal/runtimesession"
 	"github.com/orka-agents/orka/internal/store"
 )
 
@@ -23,10 +23,10 @@ const (
 	maxRuntimeSessionLimit     = 200
 )
 
-var _ harness.RuntimeSessionStore = (*Store)(nil)
+var _ runtimesession.RuntimeSessionStore = (*Store)(nil)
 
 // CreateRuntimeSession persists a new backend-neutral RuntimeSession.
-func (s *Store) CreateRuntimeSession(ctx context.Context, session *harness.RuntimeSession) error {
+func (s *Store) CreateRuntimeSession(ctx context.Context, session *runtimesession.RuntimeSession) error {
 	normalized, err := normalizeRuntimeSessionForCreate(session)
 	if err != nil {
 		return err
@@ -51,7 +51,7 @@ func (s *Store) CreateRuntimeSession(ctx context.Context, session *harness.Runti
 }
 
 // GetRuntimeSession loads a RuntimeSession by namespace and canonical ID.
-func (s *Store) GetRuntimeSession(ctx context.Context, namespace string, id harness.RuntimeSessionID) (*harness.RuntimeSession, error) {
+func (s *Store) GetRuntimeSession(ctx context.Context, namespace string, id runtimesession.RuntimeSessionID) (*runtimesession.RuntimeSession, error) {
 	session, err := getRuntimeSessionTx(ctx, s.db, namespace, id)
 	if err != nil {
 		return nil, err
@@ -60,7 +60,7 @@ func (s *Store) GetRuntimeSession(ctx context.Context, namespace string, id harn
 }
 
 // ListRuntimeSessions returns RuntimeSessions matching filter, ordered by most recent update first.
-func (s *Store) ListRuntimeSessions(ctx context.Context, filter harness.RuntimeSessionFilter) ([]harness.RuntimeSession, string, error) {
+func (s *Store) ListRuntimeSessions(ctx context.Context, filter runtimesession.RuntimeSessionFilter) ([]runtimesession.RuntimeSession, string, error) {
 	filter, limit, offset, err := validateRuntimeSessionFilter(filter)
 	if err != nil {
 		return nil, "", err
@@ -94,7 +94,7 @@ func (s *Store) ListRuntimeSessions(ctx context.Context, filter harness.RuntimeS
 		}
 		clauses = append(clauses, "state IN ("+strings.Join(placeholders, ",")+")")
 	} else if !filter.IncludeDeleted {
-		addClause("state <> ?", string(harness.RuntimeSessionStateDeleted))
+		addClause("state <> ?", string(runtimesession.RuntimeSessionStateDeleted))
 	}
 	if len(filter.CleanupPolicies) > 0 {
 		placeholders := make([]string, 0, len(filter.CleanupPolicies))
@@ -115,7 +115,7 @@ func (s *Store) ListRuntimeSessions(ctx context.Context, filter harness.RuntimeS
 	}
 	defer rows.Close() //nolint:errcheck
 
-	sessions := []harness.RuntimeSession{}
+	sessions := []runtimesession.RuntimeSession{}
 	for rows.Next() {
 		session, err := scanRuntimeSession(rows)
 		if err != nil {
@@ -132,8 +132,8 @@ func (s *Store) ListRuntimeSessions(ctx context.Context, filter harness.RuntimeS
 // TransitionRuntimeSession validates and persists an optimistic RuntimeSession state transition.
 func (s *Store) TransitionRuntimeSession(
 	ctx context.Context,
-	transition harness.RuntimeSessionTransition,
-) (*harness.RuntimeSession, error) {
+	transition runtimesession.RuntimeSessionTransition,
+) (*runtimesession.RuntimeSession, error) {
 	transition, err := normalizeRuntimeSessionTransition(transition)
 	if err != nil {
 		return nil, err
@@ -184,7 +184,7 @@ func (s *Store) TransitionRuntimeSession(
 }
 
 // DeleteRuntimeSession physically prunes a RuntimeSession after it reaches Deleted.
-func (s *Store) DeleteRuntimeSession(ctx context.Context, namespace string, id harness.RuntimeSessionID) error {
+func (s *Store) DeleteRuntimeSession(ctx context.Context, namespace string, id runtimesession.RuntimeSessionID) error {
 	namespace, id, err := normalizeRuntimeSessionKey(namespace, id)
 	if err != nil {
 		return err
@@ -193,7 +193,7 @@ func (s *Store) DeleteRuntimeSession(ctx context.Context, namespace string, id h
 		`DELETE FROM runtime_sessions WHERE namespace = ? AND id = ? AND state = ?`,
 		namespace,
 		string(id),
-		string(harness.RuntimeSessionStateDeleted),
+		string(runtimesession.RuntimeSessionStateDeleted),
 	)
 	if err != nil {
 		return err
@@ -209,21 +209,21 @@ func (s *Store) DeleteRuntimeSession(ctx context.Context, namespace string, id h
 	if err != nil {
 		return err
 	}
-	return store.ValidationErrorf("runtime session %s/%s must be %s before physical deletion (current state: %s)", namespace, id, harness.RuntimeSessionStateDeleted, session.State)
+	return store.ValidationErrorf("runtime session %s/%s must be %s before physical deletion (current state: %s)", namespace, id, runtimesession.RuntimeSessionStateDeleted, session.State)
 }
 
-func getRuntimeSessionTx(ctx context.Context, db queryRower, namespace string, id harness.RuntimeSessionID) (harness.RuntimeSession, error) {
+func getRuntimeSessionTx(ctx context.Context, db queryRower, namespace string, id runtimesession.RuntimeSessionID) (runtimesession.RuntimeSession, error) {
 	namespace, id, err := normalizeRuntimeSessionKey(namespace, id)
 	if err != nil {
-		return harness.RuntimeSession{}, err
+		return runtimesession.RuntimeSession{}, err
 	}
 	row := db.QueryRowContext(ctx, runtimeSessionSelectSQL()+` WHERE namespace = ? AND id = ?`, namespace, strings.TrimSpace(string(id)))
 	session, err := scanRuntimeSession(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return harness.RuntimeSession{}, store.ErrNotFound
+		return runtimesession.RuntimeSession{}, store.ErrNotFound
 	}
 	if err != nil {
-		return harness.RuntimeSession{}, err
+		return runtimesession.RuntimeSession{}, err
 	}
 	return session, nil
 }
@@ -233,8 +233,8 @@ func runtimeSessionSelectSQL() string {
 		idle_timeout_ns, max_lifetime_ns, created_at, updated_at FROM runtime_sessions`
 }
 
-func scanRuntimeSession(scanner rowScanner) (harness.RuntimeSession, error) {
-	var session harness.RuntimeSession
+func scanRuntimeSession(scanner rowScanner) (runtimesession.RuntimeSession, error) {
+	var session runtimesession.RuntimeSession
 	var provider, state, cleanupPolicy string
 	var idleTimeoutNS, maxLifetimeNS int64
 	err := scanner.Scan(
@@ -252,35 +252,35 @@ func scanRuntimeSession(scanner rowScanner) (harness.RuntimeSession, error) {
 		&session.UpdatedAt,
 	)
 	if err != nil {
-		return harness.RuntimeSession{}, err
+		return runtimesession.RuntimeSession{}, err
 	}
-	session.Owner.Provider = harness.ProviderKind(provider)
-	session.State = harness.RuntimeSessionState(state)
-	session.CleanupPolicy = harness.RuntimeCleanupPolicy(cleanupPolicy)
+	session.Owner.Provider = runtimesession.ProviderKind(provider)
+	session.State = runtimesession.RuntimeSessionState(state)
+	session.CleanupPolicy = runtimesession.RuntimeCleanupPolicy(cleanupPolicy)
 	session.IdleTimeout = time.Duration(idleTimeoutNS)
 	session.MaxLifetime = time.Duration(maxLifetimeNS)
 	return session, nil
 }
 
-func normalizeRuntimeSessionForCreate(session *harness.RuntimeSession) (harness.RuntimeSession, error) {
+func normalizeRuntimeSessionForCreate(session *runtimesession.RuntimeSession) (runtimesession.RuntimeSession, error) {
 	if session == nil {
-		return harness.RuntimeSession{}, store.ValidationErrorf("runtime session is required")
+		return runtimesession.RuntimeSession{}, store.ValidationErrorf("runtime session is required")
 	}
 	normalized := *session
-	normalized.ID = harness.RuntimeSessionID(strings.TrimSpace(string(normalized.ID)))
+	normalized.ID = runtimesession.RuntimeSessionID(strings.TrimSpace(string(normalized.ID)))
 	normalized.Owner.Namespace = strings.TrimSpace(normalized.Owner.Namespace)
 	normalized.Owner.SessionName = strings.TrimSpace(normalized.Owner.SessionName)
 	normalized.Owner.ActiveTask = strings.TrimSpace(normalized.Owner.ActiveTask)
 	normalized.Owner.AgentName = strings.TrimSpace(normalized.Owner.AgentName)
-	normalized.Owner.Provider = harness.ProviderKind(strings.TrimSpace(string(normalized.Owner.Provider)))
+	normalized.Owner.Provider = runtimesession.ProviderKind(strings.TrimSpace(string(normalized.Owner.Provider)))
 	if normalized.State == "" {
-		normalized.State = harness.RuntimeSessionStatePending
+		normalized.State = runtimesession.RuntimeSessionStatePending
 	}
 	if normalized.CleanupPolicy == "" {
-		normalized.CleanupPolicy = harness.RuntimeCleanupPolicyDelete
+		normalized.CleanupPolicy = runtimesession.RuntimeCleanupPolicyDelete
 	}
 	if err := normalized.Validate(); err != nil {
-		return harness.RuntimeSession{}, store.ValidationErrorf("invalid runtime session: %v", err)
+		return runtimesession.RuntimeSession{}, store.ValidationErrorf("invalid runtime session: %v", err)
 	}
 	now := time.Now().UTC()
 	if normalized.CreatedAt.IsZero() {
@@ -296,15 +296,15 @@ func normalizeRuntimeSessionForCreate(session *harness.RuntimeSession) (harness.
 	return normalized, nil
 }
 
-func normalizeRuntimeSessionTransition(transition harness.RuntimeSessionTransition) (harness.RuntimeSessionTransition, error) {
+func normalizeRuntimeSessionTransition(transition runtimesession.RuntimeSessionTransition) (runtimesession.RuntimeSessionTransition, error) {
 	namespace, id, err := normalizeRuntimeSessionKey(transition.Namespace, transition.ID)
 	if err != nil {
-		return harness.RuntimeSessionTransition{}, err
+		return runtimesession.RuntimeSessionTransition{}, err
 	}
 	transition.Namespace = namespace
 	transition.ID = id
-	if err := harness.ValidateRuntimeSessionTransition(transition.From, transition.To); err != nil {
-		return harness.RuntimeSessionTransition{}, store.ValidationErrorf("invalid runtime session transition: %v", err)
+	if err := runtimesession.ValidateRuntimeSessionTransition(transition.From, transition.To); err != nil {
+		return runtimesession.RuntimeSessionTransition{}, store.ValidationErrorf("invalid runtime session transition: %v", err)
 	}
 	if transition.UpdatedAt.IsZero() {
 		transition.UpdatedAt = time.Now().UTC()
@@ -314,36 +314,36 @@ func normalizeRuntimeSessionTransition(transition harness.RuntimeSessionTransiti
 	return transition, nil
 }
 
-func validateRuntimeSessionFilter(filter harness.RuntimeSessionFilter) (harness.RuntimeSessionFilter, int, int, error) {
+func validateRuntimeSessionFilter(filter runtimesession.RuntimeSessionFilter) (runtimesession.RuntimeSessionFilter, int, int, error) {
 	filter.Namespace = strings.TrimSpace(filter.Namespace)
 	if filter.Namespace == "" {
-		return harness.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("runtime session namespace is required")
+		return runtimesession.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("runtime session namespace is required")
 	}
 	filter.SessionName = strings.TrimSpace(filter.SessionName)
 	filter.ActiveTask = strings.TrimSpace(filter.ActiveTask)
 	filter.AgentName = strings.TrimSpace(filter.AgentName)
-	filter.Provider = harness.ProviderKind(strings.TrimSpace(string(filter.Provider)))
+	filter.Provider = runtimesession.ProviderKind(strings.TrimSpace(string(filter.Provider)))
 	for _, state := range filter.States {
-		if !harness.IsKnownRuntimeSessionState(state) {
-			return harness.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("unsupported runtime session state %q", state)
+		if !runtimesession.IsKnownRuntimeSessionState(state) {
+			return runtimesession.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("unsupported runtime session state %q", state)
 		}
 	}
 	for _, policy := range filter.CleanupPolicies {
-		if !harness.IsKnownRuntimeCleanupPolicy(policy) {
-			return harness.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("unsupported runtime cleanup policy %q", policy)
+		if !runtimesession.IsKnownRuntimeCleanupPolicy(policy) {
+			return runtimesession.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("unsupported runtime cleanup policy %q", policy)
 		}
 	}
 	offset, err := parseOffsetCursor(filter.Cursor)
 	if err != nil {
-		return harness.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("invalid runtime session cursor: %v", err)
+		return runtimesession.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("invalid runtime session cursor: %v", err)
 	}
 	limit := boundedLimit(filter.Limit, defaultRuntimeSessionLimit, maxRuntimeSessionLimit)
 	return filter, limit, offset, nil
 }
 
-func normalizeRuntimeSessionKey(namespace string, id harness.RuntimeSessionID) (string, harness.RuntimeSessionID, error) {
+func normalizeRuntimeSessionKey(namespace string, id runtimesession.RuntimeSessionID) (string, runtimesession.RuntimeSessionID, error) {
 	namespace = strings.TrimSpace(namespace)
-	id = harness.RuntimeSessionID(strings.TrimSpace(string(id)))
+	id = runtimesession.RuntimeSessionID(strings.TrimSpace(string(id)))
 	if namespace == "" {
 		return "", "", store.ValidationErrorf("runtime session namespace is required")
 	}

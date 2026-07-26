@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useAuthStore } from '@/stores/auth'
+import { api } from '@/lib/api-client'
 import { useUIStore } from '@/stores/ui'
 import { SSEFrameBuffer } from '@/lib/execution-events'
 import type { ExecutionEvent, StreamComplete } from '@/schemas/execution-event'
@@ -108,19 +108,17 @@ export function useExecutionEventStream(
 
   const connect = useCallback(
     async (generation: number): Promise<ConnectDisposition> => {
-      const token = useAuthStore.getState().token
       const controller = new AbortController()
       abortRef.current = controller
 
       const params = new URLSearchParams()
       if (namespace) params.set('namespace', namespace)
       params.set('after', String(lastSeqRef.current))
-      const fullUrl = `${url}?${params.toString()}`
 
       let response: Response
       try {
-        response = await fetch(fullUrl, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        response = await api.fetchResponse(url, {
+          params,
           signal: controller.signal,
         })
       } catch (err) {
@@ -132,11 +130,9 @@ export function useExecutionEventStream(
       }
 
       if (!response.ok) {
-        // 401 => expired/invalid bearer token. Match the shared API client:
-        // clear the token so the app routes the user back through auth, and stop
+        // fetchResponse clears expired/invalid bearer tokens on 401. Stop
         // retrying instead of reconnecting forever with the same bad header.
         if (response.status === 401) {
-          useAuthStore.getState().clearToken()
           if (generation === generationRef.current) {
             setError('unauthorized: please sign in again')
           }

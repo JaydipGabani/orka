@@ -2,7 +2,6 @@ import { useQuery } from '@tanstack/react-query'
 import { ApiError, api } from '@/lib/api-client'
 import { API_BASE_URL } from '@/lib/constants'
 import { listArtifactsResponseSchema } from '@/schemas/artifact'
-import { useAuthStore } from '@/stores/auth'
 import { useUIStore } from '@/stores/ui'
 
 // Relative path for the shared api client (prepends API_BASE_URL itself).
@@ -21,10 +20,7 @@ export function taskArtifactDownloadUrl(taskId: string, filename: string, namesp
 // returns 401; this fetches the blob with the Authorization header and saves it
 // via a transient object URL. Throws on non-OK so callers can surface an error.
 export async function downloadTaskArtifact(taskId: string, filename: string, namespace: string) {
-  const token = useAuthStore.getState().token
-  const res = await fetch(taskArtifactDownloadUrl(taskId, filename, namespace), {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  })
+  const res = await api.fetchResponse(taskArtifactDownloadUrl(taskId, filename, namespace))
   if (!res.ok) throw new ApiError(res.status, `failed to download ${filename}`)
   const blob = await res.blob()
   const url = URL.createObjectURL(blob)

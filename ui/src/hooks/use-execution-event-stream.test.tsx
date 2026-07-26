@@ -68,9 +68,9 @@ describe('useExecutionEventStream', () => {
     expect(calledUrl).toContain('/api/v1/tasks/tk/stream')
     expect(calledUrl).toContain('namespace=default')
     expect(calledUrl).toContain('after=0')
-    expect(fetchSpy.mock.calls[0][1]).toMatchObject({
-      headers: { Authorization: 'Bearer test-token' },
-    })
+    expect(new Headers(fetchSpy.mock.calls[0][1]?.headers).get('Authorization')).toBe(
+      'Bearer test-token',
+    )
 
     conn.push(eventFrame(1))
     conn.push(eventFrame(2))
@@ -216,13 +216,15 @@ describe('useExecutionEventStream', () => {
 
   it('stop halts following and aborts the request', async () => {
     const conn = makeStreamResponse()
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(conn.response)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(conn.response)
     const { result } = renderHook(() =>
       useExecutionEventStream({ url: '/api/v1/tasks/tk/stream', enabled: true }),
     )
     await waitFor(() => expect(result.current.status).toBe('streaming'))
+    const signal = fetchSpy.mock.calls[0][1]?.signal
     act(() => { result.current.stop() })
     await waitFor(() => expect(result.current.isFollowing).toBe(false))
+    expect(signal?.aborted).toBe(true)
   })
 
   it('does not connect when disabled', () => {

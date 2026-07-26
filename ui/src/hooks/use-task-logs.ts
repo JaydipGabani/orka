@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useAuthStore } from '@/stores/auth'
-import { API_BASE_URL } from '@/lib/constants'
+import { api } from '@/lib/api-client'
 import { useUIStore } from '@/stores/ui'
 import type { TaskPhase } from '@/schemas/task'
 
@@ -19,7 +18,6 @@ export function useTaskLogs(taskId: string, enabled = true, taskPhase?: TaskPhas
   const fetchLogs = useCallback(async () => {
     if (!enabled || !taskId) return
 
-    const token = useAuthStore.getState().token
     const namespace = useUIStore.getState().namespace
     const running = isRunningPhase(taskPhase)
 
@@ -35,13 +33,10 @@ export function useTaskLogs(taskId: string, enabled = true, taskPhase?: TaskPhas
         params.set('tailLines', '200')
       }
 
-      const response = await fetch(
-        `${API_BASE_URL}/tasks/${taskId}/logs?${params.toString()}`,
-        {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
-          signal: controller.signal,
-        }
-      )
+      const response = await api.fetchResponse(`/tasks/${taskId}/logs`, {
+        params,
+        signal: controller.signal,
+      })
 
       if (!response.ok) {
         throw new Error(`Failed to fetch logs: ${response.statusText}`)

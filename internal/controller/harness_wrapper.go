@@ -30,6 +30,7 @@ import (
 	"github.com/orka-agents/orka/internal/harness"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/metrics"
+	"github.com/orka-agents/orka/internal/runtimesession"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/taskresult"
 	"github.com/orka-agents/orka/internal/workerenv"
@@ -2505,12 +2506,12 @@ func harnessWrapperTurnIDPrefix(value string) string {
 	return prefix
 }
 
-func harnessWrapperRuntimeSessionIdentity(task *corev1alpha1.Task, agent *corev1alpha1.Agent, runtimeName string) harness.RuntimeSessionIdentity {
-	input := harness.RuntimeSessionIdentityInput{
+func harnessWrapperRuntimeSessionIdentity(task *corev1alpha1.Task, agent *corev1alpha1.Agent, runtimeName string) runtimesession.RuntimeSessionIdentity {
+	input := runtimesession.RuntimeSessionIdentityInput{
 		Namespace:   "default",
 		SessionName: "default",
 		RuntimeName: runtimeName,
-		Provider:    harness.ProviderKindKubernetesService,
+		Provider:    runtimesession.ProviderKindKubernetesService,
 	}
 	if task != nil {
 		input.Namespace = task.Namespace
@@ -2525,10 +2526,10 @@ func harnessWrapperRuntimeSessionIdentity(task *corev1alpha1.Task, agent *corev1
 	if agent != nil {
 		input.AgentName = agent.Name
 	}
-	return harness.ResolveRuntimeSessionIdentity(input)
+	return runtimesession.ResolveRuntimeSessionIdentity(input)
 }
 
-func harnessWrapperRuntimeSessionID(task *corev1alpha1.Task, runtimeName string) harness.RuntimeSessionID {
+func harnessWrapperRuntimeSessionID(task *corev1alpha1.Task, runtimeName string) runtimesession.RuntimeSessionID {
 	return harnessWrapperRuntimeSessionIdentity(task, nil, runtimeName).ID
 }
 

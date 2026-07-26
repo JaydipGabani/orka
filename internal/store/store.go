@@ -114,6 +114,12 @@ type GatewayDeliveryStore interface {
 	MaintainGatewayRecords(ctx context.Context, namespace string, now, terminalCutoff time.Time) (GatewayMaintenanceResult, error)
 }
 
+// GatewayStore owns gateway event and delivery persistence as one atomic backend.
+type GatewayStore interface {
+	GatewayEventStore
+	GatewayDeliveryStore
+}
+
 // MemoryStore handles durable namespace-scoped memory persistence.
 type MemoryStore interface {
 	CreateMemory(ctx context.Context, memory *Memory) error

@@ -1,5 +1,6 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
+import { api } from '@/lib/api-client'
 import { useAuthStore } from '@/stores/auth'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -25,9 +26,7 @@ function LoginPage() {
       if (t) {
         window.location.hash = ''
         setIsValidating(true)
-        fetch('/api/v1/auth/validate', {
-          headers: { 'Authorization': `Bearer ${t}` },
-        }).then(res => {
+        api.fetchResponse('/auth/validate', { authToken: t }).then(res => {
           if (res.ok) {
             setToken(t)
           } else {
@@ -57,9 +56,7 @@ function LoginPage() {
     setError('')
     setIsValidating(true)
     try {
-      const res = await fetch('/api/v1/auth/validate', {
-        headers: { 'Authorization': `Bearer ${trimmed}` },
-      })
+      const res = await api.fetchResponse('/auth/validate', { authToken: trimmed })
       if (res.ok) {
         setToken(trimmed)
       } else {

@@ -678,7 +678,7 @@ func main() {
 		DeliveryMaxAttempts: gatewayDeliveryMaxAttempts, ClaimLease: gatewayClaimLease,
 		PollInterval: gatewayPollInterval, BatchSize: gatewayBatchSize,
 	}
-	gatewayService := gatewayruntime.NewService(mgr.GetClient(), sqliteStore, sqliteStore, sqliteStore, gatewayConfig)
+	gatewayService := gatewayruntime.NewService(mgr.GetClient(), sqliteStore, sqliteStore, gatewayConfig)
 	gatewayService.APIReader = mgr.GetAPIReader()
 	if gatewayEnabled {
 		if err := mgr.Add(gatewayService); err != nil {

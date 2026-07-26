@@ -30,11 +30,9 @@ describe('useTaskLogs', () => {
       expect(result.current.logs.length).toBeGreaterThan(0)
     })
 
-    expect(fetchSpy).toHaveBeenCalledWith(
-      '/api/v1/tasks/my-task/logs?namespace=default',
-      expect.objectContaining({
-        headers: { Authorization: 'Bearer test-token' },
-      })
+    expect(fetchSpy.mock.calls[0][0]).toBe('/api/v1/tasks/my-task/logs?namespace=default')
+    expect(new Headers(fetchSpy.mock.calls[0][1]?.headers).get('Authorization')).toBe(
+      'Bearer test-token',
     )
     expect(result.current.logs).toEqual(['line1', 'line2', 'line3'])
   })
@@ -50,6 +48,19 @@ describe('useTaskLogs', () => {
       expect(result.current.error).toBe('Failed to fetch logs: Internal Server Error')
     })
     expect(result.current.isStreaming).toBe(false)
+  })
+
+  it('clears auth on a 401 without changing the log error text', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(null, { status: 401, statusText: 'Unauthorized' })
+    )
+
+    const { result } = renderHook(() => useTaskLogs('expired-task'))
+
+    await waitFor(() => {
+      expect(result.current.error).toBe('Failed to fetch logs: Unauthorized')
+    })
+    expect(useAuthStore.getState().token).toBeNull()
   })
 
   it('clear function resets logs', async () => {

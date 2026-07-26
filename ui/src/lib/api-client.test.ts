@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { http, HttpResponse } from 'msw'
 import { server } from '@/test/mocks/server'
 
@@ -24,8 +24,65 @@ beforeEach(() => {
   }))
 })
 
+afterEach(() => {
+  vi.restoreAllMocks()
+})
+
 // Import after mock setup
 const { api, ApiError } = await import('./api-client')
+
+
+describe('api.fetchResponse', () => {
+  it('adds the API base, preserves URLSearchParams, and leaves the body unparsed', async () => {
+    let capturedUrl = ''
+    server.use(
+      http.get(`${API}/stream`, ({ request }) => {
+        capturedUrl = request.url
+        return new HttpResponse('raw stream body', {
+          headers: { 'Content-Type': 'text/event-stream' },
+        })
+      })
+    )
+
+    const params = new URLSearchParams()
+    params.set('namespace', '')
+    params.set('after', '0')
+    const response = await api.fetchResponse('/stream', { params })
+
+    const url = new URL(capturedUrl)
+    expect(url.pathname).toBe(`${API}/stream`)
+    expect(url.searchParams.has('namespace')).toBe(true)
+    expect(url.searchParams.get('namespace')).toBe('')
+    expect(url.searchParams.get('after')).toBe('0')
+    expect(await response.text()).toBe('raw stream body')
+  })
+
+  it('does not duplicate the API base for an already-based URL', async () => {
+    let capturedPath = ''
+    server.use(
+      http.get(`${API}/stream`, ({ request }) => {
+        capturedPath = new URL(request.url).pathname
+        return new HttpResponse(null, { status: 204 })
+      })
+    )
+
+    await api.fetchResponse(`${API}/stream`)
+    expect(capturedPath).toBe(`${API}/stream`)
+  })
+
+  it('forwards abort signals unchanged', async () => {
+    const controller = new AbortController()
+    const response = new Response(null, { status: 204 })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response)
+
+    await expect(api.fetchResponse('/stream', { signal: controller.signal })).resolves.toBe(response)
+    expect(fetchSpy).toHaveBeenCalledWith(
+      `${API}/stream`,
+      expect.objectContaining({ signal: controller.signal }),
+    )
+  })
+
+})
 
 describe('api.get', () => {
   it('sends GET with correct URL and Content-Type header', async () => {

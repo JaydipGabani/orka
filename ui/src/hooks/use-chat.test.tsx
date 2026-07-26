@@ -306,8 +306,9 @@ describe('useSendMessage', () => {
 
     const errorMsg = useChatStore.getState().messages.find((m) => m.role === 'error')
     expect(errorMsg).toBeDefined()
-    expect(errorMsg!.content).toContain('401')
+    expect(errorMsg!.content).toBe('Error 401: Unauthorized')
     expect(useChatStore.getState().isStreaming).toBe(false)
+    expect(useAuthStore.getState().token).toBeNull()
   })
 
   it('handles response with no body — adds error message', async () => {
@@ -369,8 +370,7 @@ describe('useSendMessage', () => {
     fetchSpy.mockImplementation((input, init) => {
       const url = typeof input === 'string' ? input : (input as Request).url
       if (url.endsWith('/chat') && init?.method === 'POST') {
-        const headers = init?.headers as Record<string, string> | undefined
-        capturedAuth = headers?.['Authorization'] ?? null
+        capturedAuth = new Headers(init.headers).get('Authorization')
         return Promise.resolve(createSSEResponse([
           { event: 'message', data: JSON.stringify({ content: 'no-auth' }) },
         ]))

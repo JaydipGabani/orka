@@ -1,8 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { useCallback } from 'react'
 import { api } from '@/lib/api-client'
-import { API_BASE_URL } from '@/lib/constants'
-import { useAuthStore } from '@/stores/auth'
 import { useUIStore } from '@/stores/ui'
 import { useChatStore, generateMessageId } from '@/stores/chat'
 import type {
@@ -47,7 +45,6 @@ function parseSSELines(text: string): Array<{ event: string; data: string }> {
 }
 
 export function useSendMessage() {
-  const token = useAuthStore((s) => s.token)
   const namespace = useUIStore((s) => s.namespace)
   const {
     currentSessionId,
@@ -178,12 +175,9 @@ export function useSendMessage() {
       }
 
       try {
-        const response = await fetch(`${API_BASE_URL}/chat`, {
+        const response = await api.fetchResponse('/chat', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         })
 
@@ -259,6 +253,6 @@ export function useSendMessage() {
         setStreaming(false)
       }
     },
-    [token, namespace, currentSessionId, addMessage, setSessionId, setStreaming, setUsageOnLastAssistant],
+    [namespace, currentSessionId, addMessage, setSessionId, setStreaming, setUsageOnLastAssistant],
   )
 }

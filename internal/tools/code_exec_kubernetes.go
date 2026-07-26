@@ -153,10 +153,10 @@ type kubernetesCodeExecLogOutput struct {
 }
 
 type kubernetesCodeExecStoredResult struct {
-	Version   string         `json:"version"`
-	RunID     string         `json:"run_id"`
-	InputHash string         `json:"input_hash"`
-	Result    CodeExecResult `json:"result"`
+	Version   string           `json:"version"`
+	RunID     string           `json:"run_id"`
+	InputHash string           `json:"input_hash"`
+	Result    SandboxRunResult `json:"result"`
 }
 
 type podLogStreamer interface {
@@ -171,15 +171,10 @@ func (s kubeClientPodLogStreamer) Stream(ctx context.Context, namespace, podName
 	return s.client.CoreV1().Pods(namespace).GetLogs(podName, opts).Stream(ctx)
 }
 
-// Run executes a sandbox request with the Kubernetes Job backend.
+// Run executes the request in Kubernetes.
 func (e *KubernetesJobCodeExecutor) Run(ctx context.Context, req SandboxRunRequest) SandboxRunResult {
-	return sandboxRunResultFromCodeExecResult(e.Execute(ctx, codeExecutionRequestFromSandboxRunRequest(req)))
-}
-
-// Execute runs the request in Kubernetes.
-func (e *KubernetesJobCodeExecutor) Execute(ctx context.Context, req CodeExecutionRequest) CodeExecResult {
 	start := time.Now()
-	result := CodeExecResult{ExitCode: -1}
+	result := SandboxRunResult{ExitCode: -1}
 
 	if req.Backend == "" {
 		req.Backend = codeExecBackendKubernetes
@@ -310,11 +305,11 @@ func (e *KubernetesJobCodeExecutor) kubernetesClients(ctx context.Context) (kube
 }
 
 //nolint:unparam // Tests use a fixed namespace while keeping the helper explicit about resource scope.
-func (e *KubernetesJobCodeExecutor) buildResources(namespace string, req CodeExecutionRequest) (*kubernetesCodeExecResources, error) {
+func (e *KubernetesJobCodeExecutor) buildResources(namespace string, req SandboxRunRequest) (*kubernetesCodeExecResources, error) {
 	return e.buildResourcesWithJobName(namespace, req, e.jobNameForRequest(req))
 }
 
-func (e *KubernetesJobCodeExecutor) buildResourcesWithJobName(namespace string, req CodeExecutionRequest, jobName string) (*kubernetesCodeExecResources, error) {
+func (e *KubernetesJobCodeExecutor) buildResourcesWithJobName(namespace string, req SandboxRunRequest, jobName string) (*kubernetesCodeExecResources, error) {
 	image, err := codeExecKubernetesImageForRequest(req)
 	if err != nil {
 		return nil, err
@@ -614,7 +609,7 @@ func validateKubernetesCodeExecReusableObject(expected, existing crclient.Object
 	return nil
 }
 
-func codeExecKubernetesIdentityAnnotations(req CodeExecutionRequest) map[string]string {
+func codeExecKubernetesIdentityAnnotations(req SandboxRunRequest) map[string]string {
 	annotations := map[string]string{}
 	if runID := strings.TrimSpace(req.RunID); runID != "" {
 		annotations[codeExecKubernetesAnnotationRunID] = runID
@@ -637,63 +632,63 @@ func cloneKubernetesCodeExecStringMap(values map[string]string) map[string]strin
 	return clone
 }
 
-func codeExecKubernetesShouldPersistResult(req CodeExecutionRequest) bool {
+func codeExecKubernetesShouldPersistResult(req SandboxRunRequest) bool {
 	return strings.TrimSpace(req.RunID) != "" && strings.TrimSpace(req.InputHash) != ""
 }
 
 // Container exit codes are non-negative; this executor reserves -1 for infrastructure failures.
-func codeExecKubernetesShouldPersistObservedResult(result CodeExecResult) bool {
+func codeExecKubernetesShouldPersistObservedResult(result SandboxRunResult) bool {
 	return !result.TimedOut && result.ExitCode != -1
 }
 
-func (e *KubernetesJobCodeExecutor) loadStoredResult(ctx context.Context, c crclient.Client, namespace, jobName string, req CodeExecutionRequest) (CodeExecResult, bool, error) {
+func (e *KubernetesJobCodeExecutor) loadStoredResult(ctx context.Context, c crclient.Client, namespace, jobName string, req SandboxRunRequest) (SandboxRunResult, bool, error) {
 	if !codeExecKubernetesShouldPersistResult(req) {
-		return CodeExecResult{}, false, nil
+		return SandboxRunResult{}, false, nil
 	}
 	if c == nil {
-		return CodeExecResult{}, false, fmt.Errorf("kubernetes client is not configured")
+		return SandboxRunResult{}, false, fmt.Errorf("kubernetes client is not configured")
 	}
 	if strings.TrimSpace(namespace) == "" || strings.TrimSpace(jobName) == "" {
-		return CodeExecResult{}, false, fmt.Errorf("namespace and job name are required")
+		return SandboxRunResult{}, false, fmt.Errorf("namespace and job name are required")
 	}
 
 	stored := &corev1.ConfigMap{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, stored); err != nil {
 		if apierrors.IsNotFound(err) {
-			return CodeExecResult{}, false, nil
+			return SandboxRunResult{}, false, nil
 		}
-		return CodeExecResult{}, false, err
+		return SandboxRunResult{}, false, err
 	}
 	if !kubernetesCodeExecStoredResultIdentityMatches(stored, req) {
-		return CodeExecResult{}, false, nil
+		return SandboxRunResult{}, false, nil
 	}
 	if !kubernetesCodeExecStoredResultVersionMatches(stored) {
 		_ = c.Delete(ctx, stored)
-		return CodeExecResult{}, false, nil
+		return SandboxRunResult{}, false, nil
 	}
 
 	raw := stored.Data[codeExecKubernetesResultKey]
 	if raw == "" {
 		_ = c.Delete(ctx, stored)
-		return CodeExecResult{}, false, nil
+		return SandboxRunResult{}, false, nil
 	}
 	var storedResult kubernetesCodeExecStoredResult
 	if err := json.Unmarshal([]byte(raw), &storedResult); err != nil {
 		_ = c.Delete(ctx, stored)
-		return CodeExecResult{}, false, nil
+		return SandboxRunResult{}, false, nil
 	}
 	if storedResult.Version != codeExecKubernetesResultVersion {
 		_ = c.Delete(ctx, stored)
-		return CodeExecResult{}, false, nil
+		return SandboxRunResult{}, false, nil
 	}
 	if strings.TrimSpace(storedResult.RunID) != strings.TrimSpace(req.RunID) || strings.TrimSpace(storedResult.InputHash) != strings.TrimSpace(req.InputHash) {
 		_ = c.Delete(ctx, stored)
-		return CodeExecResult{}, false, nil
+		return SandboxRunResult{}, false, nil
 	}
 	return storedResult.Result, true, nil
 }
 
-func (e *KubernetesJobCodeExecutor) storeResult(ctx context.Context, c crclient.Client, namespace, jobName string, req CodeExecutionRequest, result CodeExecResult) error {
+func (e *KubernetesJobCodeExecutor) storeResult(ctx context.Context, c crclient.Client, namespace, jobName string, req SandboxRunRequest, result SandboxRunResult) error {
 	if !codeExecKubernetesShouldPersistResult(req) {
 		return nil
 	}
@@ -764,7 +759,7 @@ func (e *KubernetesJobCodeExecutor) storeResult(ctx context.Context, c crclient.
 	return nil
 }
 
-func (e *KubernetesJobCodeExecutor) retryStoreResultAfterInvalidCache(ctx context.Context, c crclient.Client, namespace, jobName string, req CodeExecutionRequest, configMap *corev1.ConfigMap) (bool, error) {
+func (e *KubernetesJobCodeExecutor) retryStoreResultAfterInvalidCache(ctx context.Context, c crclient.Client, namespace, jobName string, req SandboxRunRequest, configMap *corev1.ConfigMap) (bool, error) {
 	_, found, err := e.loadStoredResult(ctx, c, namespace, jobName, req)
 	if err != nil {
 		return false, err
@@ -840,7 +835,7 @@ func (e *KubernetesJobCodeExecutor) cleanupExpiredStoredResults(ctx context.Cont
 	return errors.Join(deleteErrs...)
 }
 
-func kubernetesCodeExecStoredResultIdentityMatches(stored crclient.Object, req CodeExecutionRequest) bool {
+func kubernetesCodeExecStoredResultIdentityMatches(stored crclient.Object, req SandboxRunRequest) bool {
 	if stored == nil || !codeExecKubernetesShouldPersistResult(req) {
 		return false
 	}
@@ -857,7 +852,7 @@ func kubernetesCodeExecStoredResultVersionMatches(stored crclient.Object) bool {
 	return strings.TrimSpace(annotations[codeExecKubernetesAnnotationResultVersion]) == codeExecKubernetesResultVersion
 }
 
-func (e *KubernetesJobCodeExecutor) jobNameForRequest(req CodeExecutionRequest) string {
+func (e *KubernetesJobCodeExecutor) jobNameForRequest(req SandboxRunRequest) string {
 	runID := strings.TrimSpace(req.RunID)
 	if runID != "" {
 		return codeExecKubernetesJobNameForRunID(runID)
@@ -954,7 +949,7 @@ func codeExecDeadlineSeconds(timeout time.Duration) int64 {
 	return seconds
 }
 
-func codeExecKubernetesImageForRequest(req CodeExecutionRequest) (string, error) {
+func codeExecKubernetesImageForRequest(req SandboxRunRequest) (string, error) {
 	return codeExecKubernetesImageForScope(req.Language, codeExecRequestProviderScope(req), req.Tenant)
 }
 
@@ -1174,7 +1169,7 @@ func formatCodeExecTruncationMessage(limit, omitted int64) string {
 	return fmt.Sprintf("\n[truncated after %d bytes; %d bytes omitted]", limit, omitted)
 }
 
-func codeExecKubernetesResourcesForRequest(req CodeExecutionRequest) (corev1.ResourceRequirements, error) {
+func codeExecKubernetesResourcesForRequest(req SandboxRunRequest) (corev1.ResourceRequirements, error) {
 	return codeExecKubernetesResourcesForScope(codeExecRequestProviderScope(req), req.Tenant)
 }
 
@@ -1208,7 +1203,7 @@ func codeExecKubernetesResourcesForScope(provider, tenant string) (corev1.Resour
 	}, nil
 }
 
-func codeExecKubernetesResourceAuditForRequest(req CodeExecutionRequest) (map[string]string, error) {
+func codeExecKubernetesResourceAuditForRequest(req SandboxRunRequest) (map[string]string, error) {
 	return codeExecKubernetesResourceAuditForScope(codeExecRequestProviderScope(req), req.Tenant)
 }
 
@@ -1225,7 +1220,7 @@ func codeExecKubernetesResourceAuditForScope(provider, tenant string) (map[strin
 	}, nil
 }
 
-func codeExecKubernetesRuntimeClassNameForRequest(req CodeExecutionRequest) string {
+func codeExecKubernetesRuntimeClassNameForRequest(req SandboxRunRequest) string {
 	return codeExecKubernetesRuntimeClassNameForScope(codeExecRequestProviderScope(req), req.Tenant)
 }
 
@@ -1233,7 +1228,7 @@ func codeExecKubernetesRuntimeClassNameForScope(provider, tenant string) string 
 	return codeExecScopedEnv(codeExecKubernetesRuntimeClassNameEnv, provider, tenant, "")
 }
 
-func codeExecKubernetesAppArmorProfileForRequest(req CodeExecutionRequest) (*corev1.AppArmorProfile, error) {
+func codeExecKubernetesAppArmorProfileForRequest(req SandboxRunRequest) (*corev1.AppArmorProfile, error) {
 	return codeExecKubernetesAppArmorProfileForScope(codeExecRequestProviderScope(req), req.Tenant)
 }
 
@@ -1264,7 +1259,7 @@ func codeExecKubernetesAppArmorProfileForScope(provider, tenant string) (*corev1
 	return nil, fmt.Errorf("%s=%q is invalid: expected empty/disabled/none/off, runtime/default, runtime-default, default, unconfined, or localhost/<profile>", sourceEnv, value)
 }
 
-func codeExecKubernetesNetworkPolicyEnabledForRequest(req CodeExecutionRequest) bool {
+func codeExecKubernetesNetworkPolicyEnabledForRequest(req SandboxRunRequest) bool {
 	return codeExecKubernetesNetworkPolicyEnabledForScope(codeExecRequestProviderScope(req), req.Tenant)
 }
 
@@ -1310,7 +1305,7 @@ func defaultCodeExecNamespace() string {
 	return defaultNamespace
 }
 
-func (e *KubernetesJobCodeExecutor) waitForJob(ctx context.Context, clients kubernetesCodeExecClients, jobName string, req CodeExecutionRequest) CodeExecResult {
+func (e *KubernetesJobCodeExecutor) waitForJob(ctx context.Context, clients kubernetesCodeExecClients, jobName string, req SandboxRunRequest) SandboxRunResult {
 	pollInterval := e.pollInterval
 	if pollInterval <= 0 {
 		pollInterval = 500 * time.Millisecond
@@ -1334,32 +1329,32 @@ func (e *KubernetesJobCodeExecutor) waitForJob(ctx context.Context, clients kube
 	}
 }
 
-func (e *KubernetesJobCodeExecutor) checkJob(ctx context.Context, clients kubernetesCodeExecClients, jobName string, req CodeExecutionRequest, jobObserved bool) (CodeExecResult, bool, bool) {
+func (e *KubernetesJobCodeExecutor) checkJob(ctx context.Context, clients kubernetesCodeExecClients, jobName string, req SandboxRunRequest, jobObserved bool) (SandboxRunResult, bool, bool) {
 	outputLimitBytes := req.OutputLimitBytes
 	job := &batchv1.Job{}
 	if err := clients.client.Get(ctx, types.NamespacedName{Namespace: clients.namespace, Name: jobName}, job); err != nil {
 		if ctx.Err() != nil {
-			return CodeExecResult{}, false, false
+			return SandboxRunResult{}, false, false
 		}
 		if apierrors.IsNotFound(err) && codeExecKubernetesShouldPersistResult(req) {
 			stored, found, loadErr := e.loadStoredResult(ctx, clients.client, clients.namespace, jobName, req)
 			if loadErr != nil {
-				return CodeExecResult{Error: fmt.Sprintf("failed to read persisted kubernetes code_exec result: %v", loadErr), ExitCode: -1}, true, false
+				return SandboxRunResult{Error: fmt.Sprintf("failed to read persisted kubernetes code_exec result: %v", loadErr), ExitCode: -1}, true, false
 			}
 			if found {
 				return stored, true, false
 			}
 			if jobObserved {
-				return CodeExecResult{Error: fmt.Sprintf("kubernetes code_exec job %s/%s disappeared before result was persisted", clients.namespace, jobName), ExitCode: -1}, true, false
+				return SandboxRunResult{Error: fmt.Sprintf("kubernetes code_exec job %s/%s disappeared before result was persisted", clients.namespace, jobName), ExitCode: -1}, true, false
 			}
-			return CodeExecResult{}, false, false
+			return SandboxRunResult{}, false, false
 		}
-		return CodeExecResult{Error: fmt.Sprintf("failed to get kubernetes code_exec job: %v", err), ExitCode: -1}, true, false
+		return SandboxRunResult{Error: fmt.Sprintf("failed to get kubernetes code_exec job: %v", err), ExitCode: -1}, true, false
 	}
 
 	if job.Status.Succeeded > 0 || hasJobCondition(job, batchv1.JobComplete) {
 		logs, err := e.readJobLogs(ctx, clients, jobName, outputLimitBytes)
-		result := CodeExecResult{
+		result := SandboxRunResult{
 			Output:          logs.stdout,
 			Error:           logs.stderr,
 			ExitCode:        0,
@@ -1387,7 +1382,7 @@ func (e *KubernetesJobCodeExecutor) checkJob(ctx context.Context, clients kubern
 		if exitCode == 0 {
 			exitCode = 1
 		}
-		result := CodeExecResult{
+		result := SandboxRunResult{
 			Output:          logs.stdout,
 			Error:           logs.stderr,
 			ExitCode:        exitCode,
@@ -1405,14 +1400,14 @@ func (e *KubernetesJobCodeExecutor) checkJob(ctx context.Context, clients kubern
 		return result, true, true
 	}
 
-	return CodeExecResult{}, false, true
+	return SandboxRunResult{}, false, true
 }
 
-func (e *KubernetesJobCodeExecutor) timeoutResult(clients kubernetesCodeExecClients, jobName string, outputLimitBytes int64) CodeExecResult {
+func (e *KubernetesJobCodeExecutor) timeoutResult(clients kubernetesCodeExecClients, jobName string, outputLimitBytes int64) SandboxRunResult {
 	logCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	logs, err := e.readJobLogs(logCtx, clients, jobName, outputLimitBytes)
-	result := CodeExecResult{
+	result := SandboxRunResult{
 		Output:          logs.stdout,
 		Error:           appendCodeExecError(logs.stderr, "execution timed out"),
 		ExitCode:        -1,
@@ -1552,5 +1547,3 @@ func deleteKubernetesCodeExecObject(ctx context.Context, c crclient.Client, obj 
 		return
 	}
 }
-
-var _ CodeExecutor = (*KubernetesJobCodeExecutor)(nil)

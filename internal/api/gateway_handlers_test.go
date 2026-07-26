@@ -307,7 +307,7 @@ func TestRetryGatewayDeliveryRequiresContextTokenReadScope(t *testing.T) {
 	h := NewHandlers(HandlersConfig{
 		ContextTokenAuthorization: cfg,
 		GatewayDeliveryStore:      storeFixture,
-		GatewayService:            gatewayruntime.NewService(nil, nil, storeFixture, nil, gatewayruntime.DefaultConfig()),
+		GatewayService:            gatewayruntime.NewService(nil, storeFixture, nil, gatewayruntime.DefaultConfig()),
 	})
 	app := fiber.New()
 	app.Use(func(c fiber.Ctx) error {
@@ -340,7 +340,7 @@ func TestRetryGatewayDeliveryRequiresKubernetesReadPermission(t *testing.T) {
 			}
 		}),
 		GatewayDeliveryStore: storeFixture,
-		GatewayService:       gatewayruntime.NewService(nil, nil, storeFixture, nil, gatewayruntime.DefaultConfig()),
+		GatewayService:       gatewayruntime.NewService(nil, storeFixture, nil, gatewayruntime.DefaultConfig()),
 	})
 	app := fiber.New()
 	app.Use(tokenReviewUserMiddleware(limitedTokenReviewUser("default")))

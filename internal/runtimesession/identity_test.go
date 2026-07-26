@@ -4,7 +4,7 @@ Copyright (c) 2026.
 MIT License - see LICENSE file for details.
 */
 
-package harness
+package runtimesession
 
 import "testing"
 

@@ -18,7 +18,7 @@ import (
 
 const codeExecWaitDelay = time.Second
 
-func newLimitedCodeExecCommand(ctx context.Context, req CodeExecutionRequest, name string, args ...string) *exec.Cmd {
+func newLimitedCodeExecCommand(ctx context.Context, req SandboxRunRequest, name string, args ...string) *exec.Cmd {
 	limits := codeExecLocalLimitsForRequest(req)
 	limitScript := fmt.Sprintf("ulimit -t %d\nulimit -v %d 2>/dev/null || true\nulimit -u %d 2>/dev/null || true\nexec \"$@\"",
 		limits.CPUSeconds,

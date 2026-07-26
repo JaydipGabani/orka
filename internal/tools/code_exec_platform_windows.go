@@ -13,7 +13,7 @@ import (
 	"os/exec"
 )
 
-func newLimitedCodeExecCommand(ctx context.Context, _ CodeExecutionRequest, name string, args ...string) *exec.Cmd {
+func newLimitedCodeExecCommand(ctx context.Context, _ SandboxRunRequest, name string, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, name, args...)
 }
 

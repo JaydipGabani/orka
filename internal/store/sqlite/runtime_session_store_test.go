@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orka-agents/orka/internal/harness"
+	"github.com/orka-agents/orka/internal/runtimesession"
 	"github.com/orka-agents/orka/internal/store"
 )
 
@@ -68,10 +68,10 @@ func TestRuntimeSessionStoreCreateDefaults(t *testing.T) {
 	if session.ID != "runtime-defaults" || session.Owner.Namespace != runtimeSessionTestNamespace || session.Owner.SessionName != runtimeSessionTestName {
 		t.Fatalf("normalized identity = %#v", session)
 	}
-	if session.State != harness.RuntimeSessionStatePending {
+	if session.State != runtimesession.RuntimeSessionStatePending {
 		t.Fatalf("state = %q, want Pending", session.State)
 	}
-	if session.CleanupPolicy != harness.RuntimeCleanupPolicyDelete {
+	if session.CleanupPolicy != runtimesession.RuntimeCleanupPolicyDelete {
 		t.Fatalf("cleanup policy = %q, want delete", session.CleanupPolicy)
 	}
 	if session.CreatedAt.IsZero() || session.UpdatedAt.IsZero() || !session.UpdatedAt.Equal(session.CreatedAt) {
@@ -130,12 +130,12 @@ func TestRuntimeSessionStoreListFiltersAndCursor(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
 	base := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
-	fixtures := []harness.RuntimeSession{
-		runtimeSessionListFixture("runtime-1", "ns-list", "alpha", runtimeSessionTestTask, runtimeSessionTestAgent, harness.ProviderKindKubernetesService, harness.RuntimeSessionStatePending, harness.RuntimeCleanupPolicyDelete, base.Add(5*time.Minute)),
-		runtimeSessionListFixture("runtime-2", "ns-list", "alpha", "task-b", "agent-b", harness.ProviderKindKubernetesService, harness.RuntimeSessionStateIdle, harness.RuntimeCleanupPolicyRetain, base.Add(4*time.Minute)),
-		runtimeSessionListFixture("runtime-3", "ns-list", "alpha", "", runtimeSessionTestAgent, harness.ProviderKindKubernetesService, harness.RuntimeSessionStateDeleted, harness.RuntimeCleanupPolicyDelete, base.Add(3*time.Minute)),
-		runtimeSessionListFixture("runtime-4", "ns-list", "beta", "task-c", runtimeSessionTestAgent, harness.ProviderKindSidecar, harness.RuntimeSessionStateReady, harness.RuntimeCleanupPolicySuspend, base.Add(2*time.Minute)),
-		runtimeSessionListFixture("runtime-5", "other-ns", "alpha", runtimeSessionTestTask, runtimeSessionTestAgent, harness.ProviderKindKubernetesService, harness.RuntimeSessionStatePending, harness.RuntimeCleanupPolicyDelete, base.Add(time.Minute)),
+	fixtures := []runtimesession.RuntimeSession{
+		runtimeSessionListFixture("runtime-1", "ns-list", "alpha", runtimeSessionTestTask, runtimeSessionTestAgent, runtimesession.ProviderKindKubernetesService, runtimesession.RuntimeSessionStatePending, runtimesession.RuntimeCleanupPolicyDelete, base.Add(5*time.Minute)),
+		runtimeSessionListFixture("runtime-2", "ns-list", "alpha", "task-b", "agent-b", runtimesession.ProviderKindKubernetesService, runtimesession.RuntimeSessionStateIdle, runtimesession.RuntimeCleanupPolicyRetain, base.Add(4*time.Minute)),
+		runtimeSessionListFixture("runtime-3", "ns-list", "alpha", "", runtimeSessionTestAgent, runtimesession.ProviderKindKubernetesService, runtimesession.RuntimeSessionStateDeleted, runtimesession.RuntimeCleanupPolicyDelete, base.Add(3*time.Minute)),
+		runtimeSessionListFixture("runtime-4", "ns-list", "beta", "task-c", runtimeSessionTestAgent, runtimesession.ProviderKindSidecar, runtimesession.RuntimeSessionStateReady, runtimesession.RuntimeCleanupPolicySuspend, base.Add(2*time.Minute)),
+		runtimeSessionListFixture("runtime-5", "other-ns", "alpha", runtimeSessionTestTask, runtimeSessionTestAgent, runtimesession.ProviderKindKubernetesService, runtimesession.RuntimeSessionStatePending, runtimesession.RuntimeCleanupPolicyDelete, base.Add(time.Minute)),
 	}
 	for i := range fixtures {
 		if err := s.CreateRuntimeSession(ctx, &fixtures[i]); err != nil {
@@ -143,32 +143,32 @@ func TestRuntimeSessionStoreListFiltersAndCursor(t *testing.T) {
 		}
 	}
 
-	listed, cursor, err := s.ListRuntimeSessions(ctx, harness.RuntimeSessionFilter{Namespace: "ns-list"})
+	listed, cursor, err := s.ListRuntimeSessions(ctx, runtimesession.RuntimeSessionFilter{Namespace: "ns-list"})
 	if err != nil {
 		t.Fatalf("ListRuntimeSessions default: %v", err)
 	}
-	assertRuntimeSessionIDs(t, listed, []harness.RuntimeSessionID{"runtime-1", "runtime-2", "runtime-4"})
+	assertRuntimeSessionIDs(t, listed, []runtimesession.RuntimeSessionID{"runtime-1", "runtime-2", "runtime-4"})
 	if cursor != "" {
 		t.Fatalf("cursor = %q, want empty", cursor)
 	}
 
-	listed, _, err = s.ListRuntimeSessions(ctx, harness.RuntimeSessionFilter{Namespace: "ns-list", IncludeDeleted: true})
+	listed, _, err = s.ListRuntimeSessions(ctx, runtimesession.RuntimeSessionFilter{Namespace: "ns-list", IncludeDeleted: true})
 	if err != nil {
 		t.Fatalf("ListRuntimeSessions include deleted: %v", err)
 	}
-	assertRuntimeSessionIDs(t, listed, []harness.RuntimeSessionID{"runtime-1", "runtime-2", "runtime-3", "runtime-4"})
+	assertRuntimeSessionIDs(t, listed, []runtimesession.RuntimeSessionID{"runtime-1", "runtime-2", "runtime-3", "runtime-4"})
 
 	filterAssertions := []struct {
 		name   string
-		filter harness.RuntimeSessionFilter
-		want   []harness.RuntimeSessionID
+		filter runtimesession.RuntimeSessionFilter
+		want   []runtimesession.RuntimeSessionID
 	}{
-		{name: "state", filter: harness.RuntimeSessionFilter{States: []harness.RuntimeSessionState{harness.RuntimeSessionStateDeleted}}, want: []harness.RuntimeSessionID{"runtime-3"}},
-		{name: "session", filter: harness.RuntimeSessionFilter{SessionName: "beta"}, want: []harness.RuntimeSessionID{"runtime-4"}},
-		{name: "active task", filter: harness.RuntimeSessionFilter{ActiveTask: "task-b"}, want: []harness.RuntimeSessionID{"runtime-2"}},
-		{name: "agent", filter: harness.RuntimeSessionFilter{AgentName: runtimeSessionTestAgent}, want: []harness.RuntimeSessionID{"runtime-1", "runtime-4"}},
-		{name: "provider", filter: harness.RuntimeSessionFilter{Provider: harness.ProviderKindSidecar}, want: []harness.RuntimeSessionID{"runtime-4"}},
-		{name: "cleanup", filter: harness.RuntimeSessionFilter{CleanupPolicies: []harness.RuntimeCleanupPolicy{harness.RuntimeCleanupPolicyRetain}}, want: []harness.RuntimeSessionID{"runtime-2"}},
+		{name: "state", filter: runtimesession.RuntimeSessionFilter{States: []runtimesession.RuntimeSessionState{runtimesession.RuntimeSessionStateDeleted}}, want: []runtimesession.RuntimeSessionID{"runtime-3"}},
+		{name: "session", filter: runtimesession.RuntimeSessionFilter{SessionName: "beta"}, want: []runtimesession.RuntimeSessionID{"runtime-4"}},
+		{name: "active task", filter: runtimesession.RuntimeSessionFilter{ActiveTask: "task-b"}, want: []runtimesession.RuntimeSessionID{"runtime-2"}},
+		{name: "agent", filter: runtimesession.RuntimeSessionFilter{AgentName: runtimeSessionTestAgent}, want: []runtimesession.RuntimeSessionID{"runtime-1", "runtime-4"}},
+		{name: "provider", filter: runtimesession.RuntimeSessionFilter{Provider: runtimesession.ProviderKindSidecar}, want: []runtimesession.RuntimeSessionID{"runtime-4"}},
+		{name: "cleanup", filter: runtimesession.RuntimeSessionFilter{CleanupPolicies: []runtimesession.RuntimeCleanupPolicy{runtimesession.RuntimeCleanupPolicyRetain}}, want: []runtimesession.RuntimeSessionID{"runtime-2"}},
 	}
 	for _, tt := range filterAssertions {
 		t.Run(tt.name, func(t *testing.T) {
@@ -182,19 +182,19 @@ func TestRuntimeSessionStoreListFiltersAndCursor(t *testing.T) {
 		})
 	}
 
-	page1, cursor, err := s.ListRuntimeSessions(ctx, harness.RuntimeSessionFilter{Namespace: "ns-list", Limit: 2})
+	page1, cursor, err := s.ListRuntimeSessions(ctx, runtimesession.RuntimeSessionFilter{Namespace: "ns-list", Limit: 2})
 	if err != nil {
 		t.Fatalf("ListRuntimeSessions page1: %v", err)
 	}
-	assertRuntimeSessionIDs(t, page1, []harness.RuntimeSessionID{"runtime-1", "runtime-2"})
+	assertRuntimeSessionIDs(t, page1, []runtimesession.RuntimeSessionID{"runtime-1", "runtime-2"})
 	if cursor == "" {
 		t.Fatal("cursor is empty, want second page cursor")
 	}
-	page2, next, err := s.ListRuntimeSessions(ctx, harness.RuntimeSessionFilter{Namespace: "ns-list", Limit: 2, Cursor: cursor})
+	page2, next, err := s.ListRuntimeSessions(ctx, runtimesession.RuntimeSessionFilter{Namespace: "ns-list", Limit: 2, Cursor: cursor})
 	if err != nil {
 		t.Fatalf("ListRuntimeSessions page2: %v", err)
 	}
-	assertRuntimeSessionIDs(t, page2, []harness.RuntimeSessionID{"runtime-4"})
+	assertRuntimeSessionIDs(t, page2, []runtimesession.RuntimeSessionID{"runtime-4"})
 	if next != "" {
 		t.Fatalf("next cursor = %q, want empty", next)
 	}
@@ -209,25 +209,25 @@ func TestRuntimeSessionStoreTransitionValidatesStateMachine(t *testing.T) {
 	}
 
 	transitionAt := time.Date(2026, 6, 24, 11, 0, 0, 0, time.UTC)
-	updated, err := s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{
+	updated, err := s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{
 		Namespace: runtimeSessionTestNamespace,
 		ID:        session.ID,
-		From:      harness.RuntimeSessionStatePending,
-		To:        harness.RuntimeSessionStateBooting,
+		From:      runtimesession.RuntimeSessionStatePending,
+		To:        runtimesession.RuntimeSessionStateBooting,
 		UpdatedAt: transitionAt,
 	})
 	if err != nil {
 		t.Fatalf("TransitionRuntimeSession: %v", err)
 	}
-	if updated.State != harness.RuntimeSessionStateBooting || !updated.UpdatedAt.Equal(transitionAt) {
+	if updated.State != runtimesession.RuntimeSessionStateBooting || !updated.UpdatedAt.Equal(transitionAt) {
 		t.Fatalf("updated session = %#v, want Booting at transition time", updated)
 	}
 
-	_, err = s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{
+	_, err = s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{
 		Namespace: runtimeSessionTestNamespace,
 		ID:        session.ID,
-		From:      harness.RuntimeSessionStateBooting,
-		To:        harness.RuntimeSessionStateTurnRunning,
+		From:      runtimesession.RuntimeSessionStateBooting,
+		To:        runtimesession.RuntimeSessionStateTurnRunning,
 		UpdatedAt: transitionAt.Add(time.Minute),
 	})
 	if !errors.Is(err, store.ErrValidation) {
@@ -237,7 +237,7 @@ func TestRuntimeSessionStoreTransitionValidatesStateMachine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRuntimeSession after invalid transition: %v", err)
 	}
-	if got.State != harness.RuntimeSessionStateBooting || !got.UpdatedAt.Equal(transitionAt) {
+	if got.State != runtimesession.RuntimeSessionStateBooting || !got.UpdatedAt.Equal(transitionAt) {
 		t.Fatalf("session changed after invalid transition: %#v", got)
 	}
 }
@@ -249,20 +249,20 @@ func TestRuntimeSessionStoreTransitionUsesExpectedFromState(t *testing.T) {
 	if err := s.CreateRuntimeSession(ctx, &session); err != nil {
 		t.Fatalf("CreateRuntimeSession: %v", err)
 	}
-	if _, err := s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{
+	if _, err := s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{
 		Namespace: runtimeSessionTestNamespace,
 		ID:        session.ID,
-		From:      harness.RuntimeSessionStatePending,
-		To:        harness.RuntimeSessionStateBooting,
+		From:      runtimesession.RuntimeSessionStatePending,
+		To:        runtimesession.RuntimeSessionStateBooting,
 	}); err != nil {
 		t.Fatalf("initial TransitionRuntimeSession: %v", err)
 	}
 
-	_, err := s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{
+	_, err := s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{
 		Namespace: runtimeSessionTestNamespace,
 		ID:        session.ID,
-		From:      harness.RuntimeSessionStatePending,
-		To:        harness.RuntimeSessionStateFailed,
+		From:      runtimesession.RuntimeSessionStatePending,
+		To:        runtimesession.RuntimeSessionStateFailed,
 	})
 	if !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("stale TransitionRuntimeSession error = %v, want ErrConflict", err)
@@ -271,7 +271,7 @@ func TestRuntimeSessionStoreTransitionUsesExpectedFromState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRuntimeSession: %v", err)
 	}
-	if got.State != harness.RuntimeSessionStateBooting {
+	if got.State != runtimesession.RuntimeSessionStateBooting {
 		t.Fatalf("state = %q, want Booting after stale transition", got.State)
 	}
 }
@@ -280,18 +280,18 @@ func TestRuntimeSessionStoreTransitionCanSetAndClearActiveTask(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
 	session := runtimeSessionFixture("runtime-active-task")
-	session.State = harness.RuntimeSessionStateReady
+	session.State = runtimesession.RuntimeSessionStateReady
 	session.Owner.ActiveTask = ""
 	if err := s.CreateRuntimeSession(ctx, &session); err != nil {
 		t.Fatalf("CreateRuntimeSession: %v", err)
 	}
 
 	activeTask := runtimeSessionTestTask
-	updated, err := s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{
+	updated, err := s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{
 		Namespace:  runtimeSessionTestNamespace,
 		ID:         session.ID,
-		From:       harness.RuntimeSessionStateReady,
-		To:         harness.RuntimeSessionStateTurnRunning,
+		From:       runtimesession.RuntimeSessionStateReady,
+		To:         runtimesession.RuntimeSessionStateTurnRunning,
 		ActiveTask: &activeTask,
 	})
 	if err != nil {
@@ -301,11 +301,11 @@ func TestRuntimeSessionStoreTransitionCanSetAndClearActiveTask(t *testing.T) {
 		t.Fatalf("active task = %q, want runtime task", updated.Owner.ActiveTask)
 	}
 
-	updated, err = s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{
+	updated, err = s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{
 		Namespace: runtimeSessionTestNamespace,
 		ID:        session.ID,
-		From:      harness.RuntimeSessionStateTurnRunning,
-		To:        harness.RuntimeSessionStateIdle,
+		From:      runtimesession.RuntimeSessionStateTurnRunning,
+		To:        runtimesession.RuntimeSessionStateIdle,
 	})
 	if err != nil {
 		t.Fatalf("preserve active task transition: %v", err)
@@ -314,20 +314,20 @@ func TestRuntimeSessionStoreTransitionCanSetAndClearActiveTask(t *testing.T) {
 		t.Fatalf("active task = %q, want preserved runtime task", updated.Owner.ActiveTask)
 	}
 
-	if _, err := s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{
+	if _, err := s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{
 		Namespace: runtimeSessionTestNamespace,
 		ID:        session.ID,
-		From:      harness.RuntimeSessionStateIdle,
-		To:        harness.RuntimeSessionStateTurnRunning,
+		From:      runtimesession.RuntimeSessionStateIdle,
+		To:        runtimesession.RuntimeSessionStateTurnRunning,
 	}); err != nil {
 		t.Fatalf("back to running transition: %v", err)
 	}
 	clearActiveTask := ""
-	updated, err = s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{
+	updated, err = s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{
 		Namespace:  runtimeSessionTestNamespace,
 		ID:         session.ID,
-		From:       harness.RuntimeSessionStateTurnRunning,
-		To:         harness.RuntimeSessionStateIdle,
+		From:       runtimesession.RuntimeSessionStateTurnRunning,
+		To:         runtimesession.RuntimeSessionStateIdle,
 		ActiveTask: &clearActiveTask,
 	})
 	if err != nil {
@@ -348,10 +348,10 @@ func TestRuntimeSessionStoreDeleteRequiresDeletedState(t *testing.T) {
 	if err := s.DeleteRuntimeSession(ctx, runtimeSessionTestNamespace, session.ID); !errors.Is(err, store.ErrValidation) {
 		t.Fatalf("DeleteRuntimeSession active error = %v, want ErrValidation", err)
 	}
-	if _, err := s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{Namespace: runtimeSessionTestNamespace, ID: session.ID, From: harness.RuntimeSessionStatePending, To: harness.RuntimeSessionStateDeleting}); err != nil {
+	if _, err := s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{Namespace: runtimeSessionTestNamespace, ID: session.ID, From: runtimesession.RuntimeSessionStatePending, To: runtimesession.RuntimeSessionStateDeleting}); err != nil {
 		t.Fatalf("transition to deleting: %v", err)
 	}
-	if _, err := s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{Namespace: runtimeSessionTestNamespace, ID: session.ID, From: harness.RuntimeSessionStateDeleting, To: harness.RuntimeSessionStateDeleted}); err != nil {
+	if _, err := s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{Namespace: runtimeSessionTestNamespace, ID: session.ID, From: runtimesession.RuntimeSessionStateDeleting, To: runtimesession.RuntimeSessionStateDeleted}); err != nil {
 		t.Fatalf("transition to deleted: %v", err)
 	}
 	if err := s.DeleteRuntimeSession(ctx, runtimeSessionTestNamespace, session.ID); err != nil {
@@ -424,27 +424,27 @@ func TestRuntimeSessionStoreValidationErrors(t *testing.T) {
 		return err
 	})
 	assertValidationError("list empty namespace", func() error {
-		_, _, err := s.ListRuntimeSessions(ctx, harness.RuntimeSessionFilter{})
+		_, _, err := s.ListRuntimeSessions(ctx, runtimesession.RuntimeSessionFilter{})
 		return err
 	})
 	assertValidationError("list invalid state", func() error {
-		_, _, err := s.ListRuntimeSessions(ctx, harness.RuntimeSessionFilter{Namespace: runtimeSessionTestNamespace, States: []harness.RuntimeSessionState{"Mystery"}})
+		_, _, err := s.ListRuntimeSessions(ctx, runtimesession.RuntimeSessionFilter{Namespace: runtimeSessionTestNamespace, States: []runtimesession.RuntimeSessionState{"Mystery"}})
 		return err
 	})
 	assertValidationError("list invalid cleanup policy", func() error {
-		_, _, err := s.ListRuntimeSessions(ctx, harness.RuntimeSessionFilter{Namespace: runtimeSessionTestNamespace, CleanupPolicies: []harness.RuntimeCleanupPolicy{"archive"}})
+		_, _, err := s.ListRuntimeSessions(ctx, runtimesession.RuntimeSessionFilter{Namespace: runtimeSessionTestNamespace, CleanupPolicies: []runtimesession.RuntimeCleanupPolicy{"archive"}})
 		return err
 	})
 	assertValidationError("list invalid cursor", func() error {
-		_, _, err := s.ListRuntimeSessions(ctx, harness.RuntimeSessionFilter{Namespace: runtimeSessionTestNamespace, Cursor: "not-an-offset"})
+		_, _, err := s.ListRuntimeSessions(ctx, runtimesession.RuntimeSessionFilter{Namespace: runtimeSessionTestNamespace, Cursor: "not-an-offset"})
 		return err
 	})
 	assertValidationError("transition empty namespace", func() error {
-		_, err := s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{ID: "runtime", From: harness.RuntimeSessionStatePending, To: harness.RuntimeSessionStateBooting})
+		_, err := s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{ID: "runtime", From: runtimesession.RuntimeSessionStatePending, To: runtimesession.RuntimeSessionStateBooting})
 		return err
 	})
 	assertValidationError("transition invalid state", func() error {
-		_, err := s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{Namespace: runtimeSessionTestNamespace, ID: "runtime", From: "Mystery", To: harness.RuntimeSessionStateBooting})
+		_, err := s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{Namespace: runtimeSessionTestNamespace, ID: "runtime", From: "Mystery", To: runtimesession.RuntimeSessionStateBooting})
 		return err
 	})
 	assertValidationError("delete empty namespace", func() error { return s.DeleteRuntimeSession(ctx, "", "runtime") })
@@ -452,7 +452,7 @@ func TestRuntimeSessionStoreValidationErrors(t *testing.T) {
 	if _, err := s.GetRuntimeSession(ctx, runtimeSessionTestNamespace, "missing"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("GetRuntimeSession missing error = %v, want ErrNotFound", err)
 	}
-	if _, err := s.TransitionRuntimeSession(ctx, harness.RuntimeSessionTransition{Namespace: runtimeSessionTestNamespace, ID: "missing", From: harness.RuntimeSessionStatePending, To: harness.RuntimeSessionStateBooting}); !errors.Is(err, store.ErrNotFound) {
+	if _, err := s.TransitionRuntimeSession(ctx, runtimesession.RuntimeSessionTransition{Namespace: runtimeSessionTestNamespace, ID: "missing", From: runtimesession.RuntimeSessionStatePending, To: runtimesession.RuntimeSessionStateBooting}); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("TransitionRuntimeSession missing error = %v, want ErrNotFound", err)
 	}
 	if err := s.DeleteRuntimeSession(ctx, runtimeSessionTestNamespace, "missing"); !errors.Is(err, store.ErrNotFound) {
@@ -460,32 +460,32 @@ func TestRuntimeSessionStoreValidationErrors(t *testing.T) {
 	}
 }
 
-func runtimeSessionFixture(id harness.RuntimeSessionID) harness.RuntimeSession {
-	return harness.RuntimeSession{
+func runtimeSessionFixture(id runtimesession.RuntimeSessionID) runtimesession.RuntimeSession {
+	return runtimesession.RuntimeSession{
 		ID: id,
-		Owner: harness.RuntimeSessionOwner{
+		Owner: runtimesession.RuntimeSessionOwner{
 			Namespace:   runtimeSessionTestNamespace,
 			SessionName: runtimeSessionTestName,
 			ActiveTask:  runtimeSessionTestTask,
 			AgentName:   runtimeSessionTestAgent,
-			Provider:    harness.ProviderKindKubernetesService,
+			Provider:    runtimesession.ProviderKindKubernetesService,
 		},
-		State:         harness.RuntimeSessionStatePending,
-		CleanupPolicy: harness.RuntimeCleanupPolicyDelete,
+		State:         runtimesession.RuntimeSessionStatePending,
+		CleanupPolicy: runtimesession.RuntimeCleanupPolicyDelete,
 	}
 }
 
 func runtimeSessionListFixture(
-	id harness.RuntimeSessionID,
+	id runtimesession.RuntimeSessionID,
 	namespace string,
 	sessionName string,
 	activeTask string,
 	agentName string,
-	provider harness.ProviderKind,
-	state harness.RuntimeSessionState,
-	cleanupPolicy harness.RuntimeCleanupPolicy,
+	provider runtimesession.ProviderKind,
+	state runtimesession.RuntimeSessionState,
+	cleanupPolicy runtimesession.RuntimeCleanupPolicy,
 	updatedAt time.Time,
-) harness.RuntimeSession {
+) runtimesession.RuntimeSession {
 	session := runtimeSessionFixture(id)
 	session.Owner.Namespace = namespace
 	session.Owner.SessionName = sessionName
@@ -499,7 +499,7 @@ func runtimeSessionListFixture(
 	return session
 }
 
-func assertRuntimeSessionEqual(t *testing.T, got, want harness.RuntimeSession) {
+func assertRuntimeSessionEqual(t *testing.T, got, want runtimesession.RuntimeSession) {
 	t.Helper()
 	if got.ID != want.ID || got.Owner != want.Owner || got.State != want.State || got.CleanupPolicy != want.CleanupPolicy {
 		t.Fatalf("session identity/state = %#v, want %#v", got, want)
@@ -512,7 +512,7 @@ func assertRuntimeSessionEqual(t *testing.T, got, want harness.RuntimeSession) {
 	}
 }
 
-func assertRuntimeSessionIDs(t *testing.T, got []harness.RuntimeSession, want []harness.RuntimeSessionID) {
+func assertRuntimeSessionIDs(t *testing.T, got []runtimesession.RuntimeSession, want []runtimesession.RuntimeSessionID) {
 	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("got %d sessions (%#v), want %d ids (%#v)", len(got), got, len(want), want)
@@ -524,8 +524,8 @@ func assertRuntimeSessionIDs(t *testing.T, got []harness.RuntimeSession, want []
 	}
 }
 
-func runtimeSessionIDs(sessions []harness.RuntimeSession) []harness.RuntimeSessionID {
-	ids := make([]harness.RuntimeSessionID, 0, len(sessions))
+func runtimeSessionIDs(sessions []runtimesession.RuntimeSession) []runtimesession.RuntimeSessionID {
+	ids := make([]runtimesession.RuntimeSessionID, 0, len(sessions))
 	for _, session := range sessions {
 		ids = append(ids, session.ID)
 	}
