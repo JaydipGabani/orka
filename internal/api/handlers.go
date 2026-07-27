@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	gatewayruntime "github.com/orka-agents/orka/internal/gateway"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/tools"
@@ -104,6 +105,10 @@ type Handlers struct {
 	securityStore             store.SecurityStore
 	repositoryMonitorStore    store.RepositoryMonitorStore
 	executionEventStore       store.ExecutionEventStore
+	gatewayEventStore         store.GatewayEventStore
+	gatewayDeliveryStore      store.GatewayDeliveryStore
+	gatewayService            *gatewayruntime.Service
+	gatewayIngressLimiter     *gatewayIngressLimiter
 	eventStreamPollInterval   time.Duration
 	eventStreamHeartbeatEvery time.Duration
 }
@@ -126,6 +131,9 @@ type HandlersConfig struct {
 	SecurityStore             store.SecurityStore
 	RepositoryMonitorStore    store.RepositoryMonitorStore
 	ExecutionEventStore       store.ExecutionEventStore
+	GatewayEventStore         store.GatewayEventStore
+	GatewayDeliveryStore      store.GatewayDeliveryStore
+	GatewayService            *gatewayruntime.Service
 }
 
 // NewHandlers creates a new Handlers instance
@@ -151,6 +159,10 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		securityStore:             cfg.SecurityStore,
 		repositoryMonitorStore:    cfg.RepositoryMonitorStore,
 		executionEventStore:       cfg.ExecutionEventStore,
+		gatewayEventStore:         cfg.GatewayEventStore,
+		gatewayDeliveryStore:      cfg.GatewayDeliveryStore,
+		gatewayService:            cfg.GatewayService,
+		gatewayIngressLimiter:     newGatewayIngressLimiter(),
 		eventStreamPollInterval:   defaultEventStreamPollInterval,
 		eventStreamHeartbeatEvery: defaultEventStreamHeartbeatEvery,
 	}
@@ -568,21 +580,29 @@ func (h *Handlers) ListTasks(c fiber.Ctx) error {
 	if err := listReader.List(ctx, taskList, opts); err != nil {
 		return paginationListError("tasks", err)
 	}
-	filteredList := false
-	if h.contextTokenAuthorization.Enabled() {
-		filtered := taskList.Items[:0]
-		for i := range taskList.Items {
-			allowed, err := h.contextTokenAllowsLoadedTask(c, "listTasks", &taskList.Items[i])
+	filtered := taskList.Items[:0]
+	gatewayAuthorizations := map[gatewayTaskAuthorizationKey]bool{}
+	for i := range taskList.Items {
+		task := &taskList.Items[i]
+		allowed := true
+		if h.contextTokenAuthorization.Enabled() {
+			allowed, err = h.contextTokenAllowsLoadedTask(c, "listTasks", task)
 			if err != nil {
 				return err
 			}
-			if allowed {
-				filtered = append(filtered, taskList.Items[i])
+		}
+		if allowed {
+			allowed, err = h.taskAccess().gatewayTaskReadableCached(c, "listTasks", task, gatewayAuthorizations)
+			if err != nil {
+				return err
 			}
 		}
-		filteredList = len(filtered) != len(taskList.Items)
-		taskList.Items = filtered
+		if allowed {
+			filtered = append(filtered, *task)
+		}
 	}
+	filteredList := len(filtered) != len(taskList.Items)
+	taskList.Items = filtered
 	remainingItemCount := taskList.RemainingItemCount
 	if filteredList {
 		remainingItemCount = nil
@@ -661,6 +681,9 @@ func (h *Handlers) DeleteTask(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get task: %v", err))
 	}
 	if err := h.authorizeContextTokenLoadedTask(c, "deleteTask", task); err != nil {
+		return err
+	}
+	if err := h.taskAccess().authorizeGatewayTaskOperate(c, "deleteTask", task); err != nil {
 		return err
 	}
 
@@ -982,6 +1005,9 @@ func (h *Handlers) ListSessions(c fiber.Ctx) error {
 
 	items := make([]fiber.Map, 0, len(sessions))
 	for _, s := range sessions {
+		if s.SessionType == store.SessionTypeGateway {
+			continue
+		}
 		items = append(items, fiber.Map{
 			"id":           s.Name,
 			"name":         s.Name,
@@ -1016,12 +1042,25 @@ func (h *Handlers) GetSession(c fiber.Ctx) error {
 	}
 
 	ctx := c.Context()
+	sessionType, err := transcriptSessionType(ctx, h.sessionStore, namespace, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "session not found")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get session type: %v", err))
+	}
+	if sessionType == store.SessionTypeGateway {
+		return fiber.NewError(fiber.StatusNotFound, "session not found")
+	}
 	session, err := h.sessionStore.GetSession(ctx, namespace, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "session not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get session: %v", err))
+	}
+	if session.SessionType == store.SessionTypeGateway {
+		return fiber.NewError(fiber.StatusNotFound, "session not found")
 	}
 
 	// Build JSONL transcript from messages for backward compatibility
@@ -1064,8 +1103,11 @@ func (h *Handlers) DeleteSession(c fiber.Ctx) error {
 
 	ctx := c.Context()
 	if err := h.sessionStore.DeleteSession(ctx, namespace, id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrGatewayOwnedSession) {
 			return fiber.NewError(fiber.StatusNotFound, "session not found")
+		}
+		if errors.Is(err, store.ErrConflict) {
+			return fiber.NewError(fiber.StatusConflict, "session has pending gateway events")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to delete session: %v", err))
 	}
@@ -1689,19 +1731,28 @@ func (h *Handlers) GetTaskChildren(c fiber.Ctx) error {
 	); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list child tasks: %v", err))
 	}
-	if h.contextTokenAuthorization.Enabled() {
-		filtered := taskList.Items[:0]
-		for i := range taskList.Items {
-			allowed, err := h.contextTokenAllowsLoadedTaskWithIdentity(c, "getTaskChildren", &taskList.Items[i], false)
+	filtered := taskList.Items[:0]
+	gatewayAuthorizations := map[gatewayTaskAuthorizationKey]bool{}
+	for i := range taskList.Items {
+		child := &taskList.Items[i]
+		allowed := true
+		if h.contextTokenAuthorization.Enabled() {
+			allowed, err = h.contextTokenAllowsLoadedTaskWithIdentity(c, "getTaskChildren", child, false)
 			if err != nil {
 				return err
 			}
-			if allowed {
-				filtered = append(filtered, taskList.Items[i])
+		}
+		if allowed {
+			allowed, err = h.taskAccess().gatewayTaskReadableCached(c, "getTaskChildren", child, gatewayAuthorizations)
+			if err != nil {
+				return err
 			}
 		}
-		taskList.Items = filtered
+		if allowed {
+			filtered = append(filtered, *child)
+		}
 	}
+	taskList.Items = filtered
 
 	return c.JSON(ListResponse{
 		Items:    taskList.Items,

@@ -31,14 +31,18 @@ const (
 )
 
 type internalCallerAuthorizer struct {
-	k8sClient client.Client
+	k8sReader client.Reader
 }
 
 func (h *InternalHandlers) internalCallerAuthorizer() internalCallerAuthorizer {
 	if h == nil {
 		return internalCallerAuthorizer{}
 	}
-	return internalCallerAuthorizer{k8sClient: h.k8sClient}
+	reader := h.apiReader
+	if reader == nil {
+		reader = h.k8sClient
+	}
+	return internalCallerAuthorizer{k8sReader: reader}
 }
 
 // verifyNamespace checks that the authenticated caller's ServiceAccount namespace
@@ -83,11 +87,11 @@ func (a internalCallerAuthorizer) verifyTaskCaller(
 	namespace string,
 	taskName string,
 ) (*corev1alpha1.Task, error) {
-	if a.k8sClient == nil {
+	if a.k8sReader == nil {
 		return nil, fiber.NewError(fiber.StatusUnauthorized, "task caller authorization unavailable")
 	}
 	task := &corev1alpha1.Task{}
-	if err := a.k8sClient.Get(c.Context(), types.NamespacedName{Namespace: namespace, Name: taskName}, task); err != nil {
+	if err := a.k8sReader.Get(c.Context(), types.NamespacedName{Namespace: namespace, Name: taskName}, task); err != nil {
 		return nil, fiber.NewError(fiber.StatusForbidden, "caller is not authorized for this task")
 	}
 	userInfo := GetUserInfo(c)
@@ -119,11 +123,11 @@ func (a internalCallerAuthorizer) verifyHarnessWrapperArtifactUpload(
 	namespace string,
 	taskName string,
 ) error {
-	if a.k8sClient == nil {
+	if a.k8sReader == nil {
 		return fiber.NewError(fiber.StatusForbidden, "task caller authorization unavailable")
 	}
 	task := &corev1alpha1.Task{}
-	if err := a.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: taskName}, task); err != nil {
+	if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: taskName}, task); err != nil {
 		return fiber.NewError(fiber.StatusForbidden, "target task not found")
 	}
 	return a.verifyHarnessWrapperTask(ctx, userInfo, task)
@@ -192,11 +196,11 @@ func (a internalCallerAuthorizer) verifyExecutionEventStreamWriter(
 	streamType string,
 	streamID string,
 ) (*corev1alpha1.Task, error) {
-	if a.k8sClient == nil || streamType != events.ExecutionEventStreamTypeTask {
+	if a.k8sReader == nil || streamType != events.ExecutionEventStreamTypeTask {
 		return nil, nil
 	}
 	task := &corev1alpha1.Task{}
-	if err := a.k8sClient.Get(c.Context(), types.NamespacedName{Namespace: namespace, Name: streamID}, task); err != nil {
+	if err := a.k8sReader.Get(c.Context(), types.NamespacedName{Namespace: namespace, Name: streamID}, task); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, fiber.NewError(fiber.StatusForbidden, "caller is not the current worker for this task")
 		}
@@ -222,6 +226,9 @@ func (a internalCallerAuthorizer) verifyTaskWorker(ctx context.Context, userInfo
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(task.Status.JobName) == "" {
+		return fiber.NewError(fiber.StatusForbidden, "task has no active worker job")
+	}
 	if task.UID == "" || callerTask.UID != task.UID {
 		return fiber.NewError(fiber.StatusForbidden, "caller is not the current worker for this task")
 	}
@@ -233,7 +240,7 @@ func (a internalCallerAuthorizer) resolveTaskWorker(
 	userInfo *UserInfo,
 	namespace string,
 ) (*corev1alpha1.Task, error) {
-	if a.k8sClient == nil || userInfo == nil {
+	if a.k8sReader == nil || userInfo == nil {
 		return nil, fiber.NewError(fiber.StatusUnauthorized, "authentication required")
 	}
 	if err := verifyTokenReviewServiceAccount(userInfo, namespace); err != nil {
@@ -246,7 +253,7 @@ func (a internalCallerAuthorizer) resolveTaskWorker(
 	}
 
 	pod := &corev1.Pod{}
-	if err := a.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, pod); err != nil {
+	if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, pod); err != nil {
 		return nil, fiber.NewError(fiber.StatusForbidden, "caller pod not found")
 	}
 	if pod.UID == "" || string(pod.UID) != podUID {
@@ -261,7 +268,7 @@ func (a internalCallerAuthorizer) resolveTaskWorker(
 			continue
 		}
 		job := &batchv1.Job{}
-		if err := a.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: owner.Name}, job); err != nil {
+		if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: owner.Name}, job); err != nil {
 			continue
 		}
 		if job.UID == "" || owner.UID != job.UID {
@@ -275,7 +282,7 @@ func (a internalCallerAuthorizer) resolveTaskWorker(
 				continue
 			}
 			task := &corev1alpha1.Task{}
-			if err := a.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobOwner.Name}, task); err != nil {
+			if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobOwner.Name}, task); err != nil {
 				continue
 			}
 			if task.UID == "" || jobOwner.UID != task.UID {
@@ -378,7 +385,7 @@ func (a internalCallerAuthorizer) resolveSessionCallerTask(
 		}
 		return task, nil
 	}
-	if a.k8sClient == nil {
+	if a.k8sReader == nil {
 		return nil, fiber.NewError(fiber.StatusUnauthorized, "task caller authorization unavailable")
 	}
 	if err := verifyHarnessWrapperIdentity(userInfo); err != nil {
@@ -392,7 +399,7 @@ func (a internalCallerAuthorizer) resolveSessionCallerTask(
 	}
 
 	tasks := &corev1alpha1.TaskList{}
-	if err := a.k8sClient.List(c.Context(), tasks, client.InNamespace(namespace)); err != nil {
+	if err := a.k8sReader.List(c.Context(), tasks, client.InNamespace(namespace)); err != nil {
 		return nil, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list tasks: %v", err))
 	}
 	candidates := make([]*corev1alpha1.Task, 0, 1)
@@ -423,11 +430,11 @@ func (a internalCallerAuthorizer) coordinationTreeSessionNames(
 	ctx context.Context,
 	callerTask *corev1alpha1.Task,
 ) (map[string]struct{}, error) {
-	if a.k8sClient == nil || callerTask == nil || callerTask.UID == "" {
+	if a.k8sReader == nil || callerTask == nil || callerTask.UID == "" {
 		return nil, fiber.NewError(fiber.StatusForbidden, "caller task identity required")
 	}
 	tasks := &corev1alpha1.TaskList{}
-	if err := a.k8sClient.List(ctx, tasks, client.InNamespace(callerTask.Namespace)); err != nil {
+	if err := a.k8sReader.List(ctx, tasks, client.InNamespace(callerTask.Namespace)); err != nil {
 		return nil, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list tasks: %v", err))
 	}
 	tasksByName := make(map[string]*corev1alpha1.Task, len(tasks.Items))
@@ -527,7 +534,7 @@ func (a internalCallerAuthorizer) verifyMessageSender(
 		return nil
 	}
 	target := &corev1alpha1.Task{}
-	if err := a.k8sClient.Get(c.Context(), types.NamespacedName{Namespace: namespace, Name: toTask}, target); err != nil {
+	if err := a.k8sReader.Get(c.Context(), types.NamespacedName{Namespace: namespace, Name: toTask}, target); err != nil {
 		return fiber.NewError(fiber.StatusForbidden, "message target is outside caller coordination scope")
 	}
 	if target.UID == "" || !target.DeletionTimestamp.IsZero() {
@@ -577,7 +584,7 @@ func (a internalCallerAuthorizer) verifiedCoordinationParent(
 		return nil, fiber.NewError(fiber.StatusForbidden, "message parent is outside caller coordination scope")
 	}
 	parent := &corev1alpha1.Task{}
-	if err := a.k8sClient.Get(ctx, types.NamespacedName{Namespace: callerTask.Namespace, Name: parentName}, parent); err != nil {
+	if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: callerTask.Namespace, Name: parentName}, parent); err != nil {
 		return nil, fiber.NewError(fiber.StatusForbidden, "message parent is outside caller coordination scope")
 	}
 	if parent.UID == "" || parent.UID != parentUID || !parent.DeletionTimestamp.IsZero() {

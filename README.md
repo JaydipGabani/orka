@@ -51,16 +51,17 @@ One `helm install`, one LLM secret, and you're chatting with an orchestrator tha
 ## Features
 
 - 🤖 **AI Agents** — Anthropic, OpenAI, or Azure OpenAI with tools, skills, and session persistence
-- 🛠️ **Agent Runtimes** — Delegate repo-backed coding tasks to Codex CLI, Claude Code CLI, or GitHub Copilot CLI
+- 🛠️ **Agent Runtimes** — Delegate repo-backed coding tasks to Codex CLI, Claude Code CLI, GitHub Copilot CLI, or OpenCode CLI
 - 🔁 **Autonomous Task Loops** — Coordinators can iterate on long-running goals until complete, canceled, or at an iteration limit
 - 🔀 **Multi-Agent Coordination** — Coordinators delegate to specialists with depth and concurrency controls
 - 💬 **Interactive Chat** — Agentic orchestrator with SSE streaming that creates and manages agents and tasks for you
+- 🌐 **Generic Gateways** — Versioned, authenticated ingress and idempotent outbound delivery for external messaging and event systems
 - 🧠 **Durable Memory** — Namespace-scoped recall, transcript search, and reviewable memory proposals that can be applied
 - 🛡️ **Repository Security Scanning** — Scheduled and incremental repository scans with threat models, validated findings, patch generation, and remediation PRs
 - 🔎 **Repository Monitors** — Durable GitHub PR review queues with scheduled and webhook-triggered review runs
 - 🧰 **Agent Sandbox Workspaces** — Experimental durable, reusable coding workspaces through `agent-sandbox`
 - 🖥️ **Web Dashboard** — Built-in React UI embedded in the controller binary — zero extra deployments
-- 📦 **Declarative CRDs** — Task, Agent, Tool, Provider, Skill, RepositoryScan, and RepositoryMonitor custom resources for GitOps workflows
+- 📦 **Declarative CRDs** — Task, Agent, AgentRuntime, Tool, Provider, Skill, RepositoryScan, RepositoryMonitor, and SubstrateActorPool custom resources for GitOps workflows
 - ⏰ **Scheduled Tasks** — Cron-based recurring execution with concurrency policies
 - 🔌 **REST & OpenAI-Compatible API** — Full CRUD + `/openai/v1/chat/completions` endpoint for Continue, Cursor, and any OpenAI-compatible client
 - 🔐 **Kubernetes, OIDC & Kontxt TxToken Auth** — ServiceAccount tokens by default, with optional OIDC and scoped `kontxt` transaction-token flows
@@ -78,121 +79,35 @@ helm install orka charts/orka \
   --create-namespace
 ```
 
-### Upgrade
+A fresh install creates all twelve cluster-scoped Orka CRDs. Use `--skip-crds`
+only when one designated platform or release owner already manages compatible
+Orka CRDs for the cluster.
 
-Helm installs files under `crds/` only on a fresh install; an ordinary
-`helm upgrade` does not create or update them. Package the target chart once,
-run its guarded CRD migration, and use that exact archive for the release
-upgrade:
+> [!IMPORTANT]
+> Helm does not create or update files from `crds/` during `helm upgrade`.
+> Apply the CRDs from the exact target chart before
+> **every** upgrade, including an upgrade from the previous chart that installed
+> zero CRDs. Helm retains CRDs
+> on uninstall. See the [Helm CRD lifecycle guide](charts/orka/README.md).
 
-```bash
-TARGET_CONTEXT="replace-with-context"
-
-(
-  set -euo pipefail
-
-  WORK_DIR="$(mktemp -d)"
-  KEEP_WORK_DIR=false
-  cleanup_work_dir() {
-    status=$?
-    trap - EXIT
-    if [[ "$KEEP_WORK_DIR" == true ]]; then
-      echo "Target chart and work files preserved at $WORK_DIR" >&2
-    else
-      rm -rf "$WORK_DIR"
-    fi
-    exit "$status"
-  }
-  trap cleanup_work_dir EXIT
-
-  helm package charts/orka --destination "$WORK_DIR"
-  TARGET_CHARTS=("$WORK_DIR"/orka-*.tgz)
-  test "${#TARGET_CHARTS[@]}" -eq 1
-  TARGET_CHART="${TARGET_CHARTS[0]}"
-  test -f "$TARGET_CHART"
-
-  KEEP_WORK_DIR=true
-  scripts/helm-chart.sh upgrade-crds \
-    --chart "$TARGET_CHART" \
-    --kube-context "$TARGET_CONTEXT" \
-    --release orka \
-    --namespace orka-system
-
-  helm upgrade orka "$TARGET_CHART" \
-    --namespace orka-system \
-    --kube-context "$TARGET_CONTEXT" \
-    --wait
-  KEEP_WORK_DIR=false
-)
-```
-
-The helper requires `jq`, rejects `HELM_KUBE*` endpoint or credential overrides,
-reads Helm release storage through the explicit kubectl context, requires the
-latest release status to be `deployed` or `failed`, and server-preflights all nine
-exact patch/create operations before mutation. It rechecks Helm state before and
-after mutation, then verifies target generation, accepted names, and served API
-discovery for every CRD. If
-mutation or verification fails, partial changes and recovery artifacts are left
-in place with a unique migration marker; automatic schema
-rollback is intentionally avoided because it can invalidate custom resources or
-alter field ownership. CRDs are cluster-scoped, shared by all Orka releases, and
-retained on uninstall. Users without a source checkout should follow the
-[validated portable workflow](charts/orka/README.md#validated-portable-workflow),
-which uses a separately trusted migrator and treats the target archive as data
-only.
-
-#### Reinstall with retained CRDs
-
-If the prior Helm release was uninstalled but any Orka CRDs remain, migrate them
-**before** installing the replacement release. The missing-release mode is an
-explicit opt-in and refuses a cluster with neither a release nor existing Orka
-CRDs:
+For the promoted raw installer, pre-create the harness-wrapper authentication
+Secret before applying the manifest; the token is intentionally not committed:
 
 ```bash
-TARGET_CONTEXT="replace-with-context"
+set -euo pipefail
 
-(
-  set -euo pipefail
+kubectl create namespace orka-system --dry-run=client -o yaml | kubectl apply -f -
+if ! kubectl -n orka-system get secret harness-wrapper-auth >/dev/null 2>&1; then
+  openssl rand -hex 32 | \
+    kubectl -n orka-system create secret generic harness-wrapper-auth \
+      --from-file=token=/dev/stdin
+fi
 
-  TARGET_CONTEXT="${TARGET_CONTEXT:?set TARGET_CONTEXT}"
-
-  WORK_DIR="$(mktemp -d)"
-  KEEP_WORK_DIR=false
-  cleanup_work_dir() {
-    status=$?
-    trap - EXIT
-    if [[ "$KEEP_WORK_DIR" == true ]]; then
-      echo "Target chart and work files preserved at $WORK_DIR" >&2
-    else
-      rm -rf "$WORK_DIR"
-    fi
-    exit "$status"
-  }
-  trap cleanup_work_dir EXIT
-
-  helm package charts/orka --destination "$WORK_DIR"
-  TARGET_CHARTS=("$WORK_DIR"/orka-*.tgz)
-  test "${#TARGET_CHARTS[@]}" -eq 1
-  TARGET_CHART="${TARGET_CHARTS[0]}"
-  test -f "$TARGET_CHART"
-
-  KEEP_WORK_DIR=true
-  scripts/helm-chart.sh upgrade-crds \
-    --chart "$TARGET_CHART" \
-    --kube-context "$TARGET_CONTEXT" \
-    --release orka \
-    --namespace orka-system \
-    --allow-missing-release
-
-  helm install orka "$TARGET_CHART" \
-    --skip-crds \
-    --namespace orka-system \
-    --create-namespace \
-    --kube-context "$TARGET_CONTEXT" \
-    --wait
-  KEEP_WORK_DIR=false
-)
+kubectl apply -f deploy/orka.yaml
 ```
+
+See [`config/harness-wrapper/README.md`](config/harness-wrapper/README.md) for
+the canonical installer prerequisite.
 
 ### Set Up a Provider
 
@@ -236,7 +151,7 @@ The built-in orchestrator creates agents, runs tasks, monitors progress, and ret
 | [Configuration](website/docs/concepts/configuration.md)                       | CRD reference, Helm values, controller flags, metrics |
 | [Observability](website/docs/guides/observability.md)                        | OpenTelemetry traces, GenAI metrics, and task trace guidance |
 | [Agent Runtimes](website/docs/concepts/agent-runtimes.md)                     | Built-in CLI runtimes and bring-your-own remote AgentRuntime backends |
-| [CLI Harness Wrapper](website/docs/guides/cli-harness-wrapper.md)                  | Harness protocol wrapper for Codex, Claude, and Copilot CLI runtimes |
+| [CLI Harness Wrapper](website/docs/guides/cli-harness-wrapper.md)                  | Harness protocol wrapper for Codex, Claude, Copilot, and OpenCode CLI runtimes |
 | [Agent Sandbox](website/docs/concepts/agent-sandbox.md)                       | Experimental upstream `agent-sandbox` workspace execution for agent runtimes |
 | [Interactive Chat](website/docs/guides/chat.md)                             | Chat endpoint, tools, and SSE streaming               |
 | [Multi-Agent Coordination](website/docs/guides/multi-agent-coordination.md) | Coordinator agents and task delegation                |
@@ -245,6 +160,8 @@ The built-in orchestrator creates agents, runs tasks, monitors progress, and ret
 | [API Reference](website/docs/reference/api-reference.md)                       | REST API endpoints and usage examples                 |
 | [OpenAI Compatibility](website/docs/reference/openai-compat.md)                | OpenAI-compatible chat completions API                |
 | [Anthropic Compatibility](website/docs/reference/anthropic-compat.md)          | Anthropic-compatible Messages API                     |
+| [Gateway API](website/docs/reference/gateway-api.md)                           | Generic Gateway resources, ingress, delivery, and operator APIs |
+| [Operating Gateways](website/docs/operations/gateways.md)                      | Gateway readiness, TLS, recovery, upgrades, and operations |
 | [Web Dashboard](website/docs/guides/ui.md)                                  | Frontend architecture and pages                       |
 | [Security](website/docs/concepts/security.md)                                 | Security model and hardening                          |
 | [Kontxt Quickstart](website/docs/guides/kontxt-quickstart.md)               | Use OIDC identity to call Orka without long-lived tokens |
@@ -252,5 +169,5 @@ The built-in orchestrator creates agents, runs tasks, monitors progress, and ret
 | [Repository Security Scanning](website/docs/guides/repository-security-scanning.md) | Repository scan workflow, threat models, findings, and remediation |
 | [Repository Monitors](website/docs/guides/repository-monitors.md) | Durable GitHub pull request monitor runs, review tasks, and dashboard state |
 | [GitHub Label Triggers](website/docs/guides/github-label-triggers.md) | Trigger Orka agent tasks from GitHub labels such as `agent:implement` and `agent:review` |
-| [Development](website/docs/development/development.md)                           | Building, testing, and contributing                   |
+| [Development](website/docs/development/development.md)                           | Building, generated charts, releases, and contributing |
 | [Testing](website/docs/development/testing.md)                                   | Test structure, patterns, and commands                |

@@ -19,6 +19,37 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
+check_docker_ready() {
+  if ! docker info >/dev/null 2>&1; then
+    die "Docker daemon is not reachable; start Docker before running live kind-based GitHub label trigger E2E"
+  fi
+}
+
+parse_args() {
+  while (( $# > 0 )); do
+    case "$1" in
+      --preflight-only)
+        preflight_only=1
+        shift
+        ;;
+      -h|--help)
+        cat <<EOF_HELP
+Usage: $0 [--preflight-only]
+
+Runs the live GitHub label trigger E2E against a local kind cluster.
+
+Options:
+  --preflight-only  Validate local prerequisites and configuration, then exit before cluster changes.
+EOF_HELP
+        exit 0
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+}
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
@@ -39,6 +70,7 @@ label_name="agent:implement"
 webhook_secret=""
 api_pf_pid=""
 task_name=""
+preflight_only=0
 work_dir=""
 api_pf_log=""
 manager_kustomization="${repo_root}/config/manager/kustomization.yaml"
@@ -167,6 +199,7 @@ preflight() {
   require_cmd curl
   require_cmd jq
   require_cmd python3
+  check_docker_ready
 
   if [[ ! "${target_number}" =~ ^[0-9]+$ || "${target_number}" -le 0 ]]; then
     die "GITHUB_LABEL_TRIGGER_TARGET_NUMBER must be a positive integer"
@@ -579,11 +612,19 @@ run_e2e() {
 
 main() {
   if [[ "${1:-}" != "${e2e_kind_scoped_arg}" ]]; then
+    parse_args "$@"
     preflight
-    run_under_e2e_kind_helper "$@"
+    if (( preflight_only )); then
+      local repo_full repo_html repo_clone
+      IFS=$'\t' read -r repo_full repo_html repo_clone < <(normalize_repo_url "${target_repo_url}")
+      log "Live GitHub label trigger E2E preflight passed for ${repo_full}"
+      return 0
+    fi
+    run_under_e2e_kind_helper
   fi
   shift
-  run_e2e "$@"
+  parse_args "$@"
+  run_e2e
 }
 
 main "$@"

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,12 +46,14 @@ const (
 // InternalHandlers contains handlers for internal worker endpoints.
 type InternalHandlers struct {
 	k8sClient           client.Client
+	apiReader           client.Reader
 	resultStore         store.ResultStore
 	sessionStore        store.SessionStore
 	planStore           store.PlanStore
 	messageStore        store.MessageStore
 	artifactStore       store.ArtifactStore
 	executionEventStore store.ExecutionEventStore
+	gatewayEventStore   store.GatewayEventStore
 	memoryStore         store.MemoryStore
 	memoryProposalStore store.MemoryProposalStore
 }
@@ -58,9 +61,11 @@ type InternalHandlers struct {
 // InternalHandlersConfig holds optional configuration for internal handlers.
 type InternalHandlersConfig struct {
 	Client              client.Client
+	APIReader           client.Reader
 	MemoryStore         store.MemoryStore
 	MemoryProposalStore store.MemoryProposalStore
 	ExecutionEventStore store.ExecutionEventStore
+	GatewayEventStore   store.GatewayEventStore
 }
 
 // NewInternalHandlers creates a new InternalHandlers instance.
@@ -74,9 +79,11 @@ func NewInternalHandlers(rs store.ResultStore, ss store.SessionStore, ps store.P
 	}
 	if len(configs) > 0 {
 		h.k8sClient = configs[0].Client
+		h.apiReader = configs[0].APIReader
 		h.memoryStore = configs[0].MemoryStore
 		h.memoryProposalStore = configs[0].MemoryProposalStore
 		h.executionEventStore = configs[0].ExecutionEventStore
+		h.gatewayEventStore = configs[0].GatewayEventStore
 	}
 	return h
 }
@@ -246,22 +253,83 @@ func (h *InternalHandlers) UploadArtifact(c fiber.Ctx) error {
 // Returns the session transcript as JSONL (one JSON object per line).
 func (h *InternalHandlers) GetSessionTranscript(c fiber.Ctx) error {
 	namespace := c.Params("namespace")
-	name := c.Params("name")
+	name, err := url.PathUnescape(c.Params("name"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "session name is invalid")
+	}
 
 	if namespace == "" || name == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "namespace and name are required")
-	}
-
-	if _, err := h.internalCallerAuthorizer().authorizedSessionNames(c, namespace, name, ""); err != nil {
-		return err
 	}
 
 	if h.sessionStore == nil {
 		return fiber.NewError(fiber.StatusNotImplemented, "session storage not enabled")
 	}
 
+	authorizer := h.internalCallerAuthorizer()
+	taskName := strings.TrimSpace(c.Query("taskName", ""))
+	var task *corev1alpha1.Task
+	if taskName != "" {
+		task, err = authorizer.verifyTaskCaller(c, namespace, taskName)
+		if err != nil {
+			return err
+		}
+	} else {
+		if _, err := authorizer.authorizedSessionNames(c, namespace, name, ""); err != nil {
+			return err
+		}
+	}
+
 	ctx := c.Context()
-	messages, err := h.sessionStore.LoadTranscript(ctx, namespace, name, 0)
+	sessionType, err := transcriptSessionType(ctx, h.sessionStore, namespace, name)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "session not found")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to load session transcript policy")
+	}
+	if sessionType == store.SessionTypeGateway && task == nil {
+		return fiber.NewError(fiber.StatusForbidden, "gateway session transcript requires authenticated task identity")
+	}
+	maxMessages := 0
+	throughMessageID := ""
+	if task != nil {
+		gatewayOwned := false
+		if h.gatewayEventStore != nil {
+			event, eventErr := h.gatewayEventStore.GetGatewayEventForTask(ctx, namespace, task.Name, string(task.UID))
+			switch {
+			case eventErr == nil:
+				gatewayOwned = true
+				if event.SessionName != name {
+					return fiber.NewError(fiber.StatusForbidden, "task does not own this gateway session")
+				}
+				maxMessages = store.GatewayTranscriptMessageLimit
+				throughMessageID = store.GatewayUserMessageID(event.ID)
+			case errors.Is(eventErr, store.ErrNotFound):
+			default:
+				return fiber.NewError(fiber.StatusInternalServerError, "failed to load gateway transcript ownership")
+			}
+		} else if sessionType == store.SessionTypeGateway {
+			return fiber.NewError(fiber.StatusInternalServerError, "gateway transcript ownership lookup is unavailable")
+		}
+		if !gatewayOwned {
+			if sessionType == store.SessionTypeGateway {
+				return fiber.NewError(fiber.StatusForbidden, "task does not own this gateway session")
+			}
+			if task.Spec.SessionRef == nil || task.Spec.SessionRef.Name != name {
+				return fiber.NewError(fiber.StatusForbidden, "task does not reference this session")
+			}
+			maxMessages = int(task.Spec.SessionRef.MaxMessages)
+			throughMessageID = task.Spec.SessionRef.ThroughMessageID
+		}
+	}
+
+	var messages []store.SessionMessage
+	if throughMessageID != "" {
+		messages, err = h.sessionStore.LoadTranscriptThrough(ctx, namespace, name, throughMessageID, maxMessages)
+	} else {
+		messages, err = h.sessionStore.LoadTranscript(ctx, namespace, name, maxMessages)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "session not found")
@@ -281,6 +349,21 @@ func (h *InternalHandlers) GetSessionTranscript(c fiber.Ctx) error {
 	}
 
 	return c.SendString(sb.String())
+}
+
+type transcriptSessionTypeReader interface {
+	GetSessionType(ctx context.Context, namespace, name string) (string, error)
+}
+
+func transcriptSessionType(ctx context.Context, sessionStore store.SessionStore, namespace, name string) (string, error) {
+	if reader, ok := sessionStore.(transcriptSessionTypeReader); ok {
+		return reader.GetSessionType(ctx, namespace, name)
+	}
+	session, err := sessionStore.GetSession(ctx, namespace, name)
+	if err != nil {
+		return "", err
+	}
+	return session.SessionType, nil
 }
 
 // SearchTranscript handles GET /internal/v1/sessions/{namespace}/search.

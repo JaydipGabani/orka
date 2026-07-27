@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -19,6 +20,7 @@ func TestCodexAdapterBuildsLegacyCompatibleArgs(t *testing.T) {
 	t.Setenv(workerenv.MaxTurns, "12")
 	t.Setenv(workerenv.OpenAIBaseURL, "https://example.invalid/v1")
 	t.Setenv(workerenv.AllowedTools, "web_search")
+	t.Setenv(codexReasoningEffortEnv, "high")
 
 	adapter := NewCodexAdapter(CodexAdapterConfig{Path: "/fake/codex", WorkDir: t.TempDir()})
 	spec, err := adapter.BuildCommand(context.Background(), TurnContext{Prompt: "do work"})
@@ -36,6 +38,7 @@ func TestCodexAdapterBuildsLegacyCompatibleArgs(t *testing.T) {
 		"--config approval_policy=never",
 		"--sandbox workspace-write",
 		"--model gpt-test",
+		"--config model_reasoning_effort=high",
 		"--config openai_base_url=https://example.invalid/v1",
 		"--config web_search=live",
 	} {
@@ -48,6 +51,117 @@ func TestCodexAdapterBuildsLegacyCompatibleArgs(t *testing.T) {
 	}
 	if !containsEnv(spec.Env, "HOME=/home/worker") {
 		t.Fatalf("env = %#v, want HOME", spec.Env)
+	}
+}
+
+func TestCodexAdapterForcesHardenedReadOnlyCommand(t *testing.T) {
+	t.Setenv(workerenv.AllowBash, "true")
+	t.Setenv(workerenv.CodexSandboxMode, "danger-full-access")
+	home := t.TempDir()
+	adapter := NewCodexAdapter(CodexAdapterConfig{Path: "/fake/codex", WorkDir: t.TempDir()})
+	spec, err := adapter.BuildCommand(context.Background(), TurnContext{
+		HomeDir:  home,
+		Metadata: map[string]string{"allowBash": "false", "readOnly": "true", "reasoningEffort": "high"},
+		Env: []string{
+			"HOME=" + home,
+			workerenv.AgentReadOnly + "=true",
+			"NODE_OPTIONS=--require=/workspace/payload.cjs",
+			"CODEX_HOME=/workspace/.codex",
+			"PATH=/workspace/bin",
+			"HTTP_PROXY=https://attacker.invalid",
+			"UNTRUSTED_CHILD_VALUE=present",
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildCommand: %v", err)
+	}
+	defer removeTempFiles(spec.TempFiles)
+	joined := strings.Join(spec.Args, " ")
+	for _, want := range []string{
+		"--sandbox read-only",
+		"--config use_legacy_landlock=true",
+		"--ignore-user-config",
+		"--ignore-rules",
+		"--disable hooks",
+		"--disable shell_snapshot",
+		"--disable apps",
+		"--disable plugins",
+		"--config project_doc_max_bytes=0",
+		"--config model_reasoning_effort=high",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("args = %q, missing %q", joined, want)
+		}
+	}
+	for _, name := range []string{"NODE_OPTIONS", "ZDOTDIR", "BASH_ENV", "LD_PRELOAD", "LD_AUDIT", "GIT_CONFIG_COUNT"} {
+		if !slices.Contains(spec.UnsetEnv, name) {
+			t.Fatalf("UnsetEnv = %#v, missing %s", spec.UnsetEnv, name)
+		}
+	}
+	codexHome := filepath.Join(home, ".codex")
+	if !containsEnv(spec.Env, "CODEX_HOME="+codexHome) {
+		t.Fatalf("env = %#v, want trusted read-only CODEX_HOME", spec.Env)
+	}
+	if stat, err := os.Stat(codexHome); err != nil || !stat.IsDir() {
+		t.Fatalf("read-only CODEX_HOME stat = %#v, %v, want existing directory", stat, err)
+	}
+	if !spec.ClearEnv {
+		t.Fatal("ClearEnv = false, want read-only Codex to drop inherited wrapper environment")
+	}
+	if !containsEnv(spec.Env, "PATH="+wrapperSafeCommandPath) {
+		t.Fatalf("env = %#v, want fixed read-only PATH", spec.Env)
+	}
+	for _, unwanted := range []string{"NODE_OPTIONS=", "HTTP_PROXY=", "UNTRUSTED_CHILD_VALUE=", "PATH=/workspace"} {
+		if strings.Contains(strings.Join(spec.Env, "\n"), unwanted) {
+			t.Fatalf("env = %#v, retained untrusted read-only value %q", spec.Env, unwanted)
+		}
+	}
+}
+
+func TestCodexAdapterReadOnlyRequiresWrapperManagedHome(t *testing.T) {
+	t.Setenv(workerenv.AllowBash, "true")
+	adapter := NewCodexAdapter(CodexAdapterConfig{})
+	_, err := adapter.BuildCommand(context.Background(), TurnContext{Metadata: map[string]string{"readOnly": "true"}})
+	if err == nil || !strings.Contains(err.Error(), "wrapper-managed home") {
+		t.Fatalf("BuildCommand error = %v, want trusted home requirement", err)
+	}
+}
+
+func TestCodexAdapterDoesNotTrustReadOnlyEnvWithoutMetadata(t *testing.T) {
+	t.Setenv(workerenv.AllowBash, "false")
+	adapter := NewCodexAdapter(CodexAdapterConfig{})
+	_, err := adapter.BuildCommand(context.Background(), TurnContext{Env: []string{workerenv.AgentReadOnly + "=true"}})
+	if err == nil || !strings.Contains(err.Error(), workerenv.AllowBash) {
+		t.Fatalf("BuildCommand error = %v, want trusted metadata requirement", err)
+	}
+}
+
+func TestCodexAdapterRejectsInvalidReasoningEffort(t *testing.T) {
+	t.Setenv(workerenv.AllowBash, "true")
+	t.Setenv(codexReasoningEffortEnv, "maximum")
+	adapter := NewCodexAdapter(CodexAdapterConfig{})
+	_, err := adapter.BuildCommand(context.Background(), TurnContext{})
+	if err == nil || !strings.Contains(err.Error(), codexReasoningEffortEnv) {
+		t.Fatalf("BuildCommand error = %v, want reasoning effort validation", err)
+	}
+}
+
+func TestCodexAdapterUsesTrustedReasoningMetadata(t *testing.T) {
+	t.Setenv(workerenv.AllowBash, "true")
+	t.Setenv(codexReasoningEffortEnv, "low")
+	adapter := NewCodexAdapter(CodexAdapterConfig{Path: "/fake/codex", WorkDir: t.TempDir()})
+	spec, err := adapter.BuildCommand(context.Background(), TurnContext{
+		Metadata: map[string]string{"reasoningEffort": "high"},
+		Env:      []string{codexReasoningEffortEnv + "=xhigh"},
+	})
+	if err != nil {
+		t.Fatalf("BuildCommand: %v", err)
+	}
+	defer removeTempFiles(spec.TempFiles)
+	joined := strings.Join(spec.Args, " ")
+	if !strings.Contains(joined, "model_reasoning_effort=high") ||
+		strings.Contains(joined, "model_reasoning_effort=xhigh") {
+		t.Fatalf("args = %q, want controller metadata to override task env and wrapper default", joined)
 	}
 }
 
@@ -127,6 +241,178 @@ printf 'progress for %s' "$prompt"
 	}
 	if !strings.Contains(last.Completed.Result, "last message: codex prompt") {
 		t.Fatalf("completed result = %q, want fake codex result", last.Completed.Result)
+	}
+}
+
+func TestCodexAdapterRunsLargePromptThroughStdinWithoutPromptEnv(t *testing.T) {
+	dir := t.TempDir()
+	stdinCapture := filepath.Join(dir, "codex-stdin.txt")
+	envCapture := filepath.Join(dir, "codex-prompt-env.txt")
+	fakeCodex := filepath.Join(dir, "codex-large-prompt.sh")
+	if err := os.WriteFile(fakeCodex, []byte(`#!/bin/sh
+set -eu
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--output-last-message" ]; then out="$arg"; fi
+  prev="$arg"
+done
+if [ "${ORKA_PROMPT+x}" = "x" ]; then
+  printf 'set' > "$CODEX_PROMPT_ENV_CAPTURE"
+  exit 64
+fi
+printf 'unset' > "$CODEX_PROMPT_ENV_CAPTURE"
+if [ "${CODEX_INHERITED_ENV:-}" != "inherited-value" ]; then exit 65; fi
+if [ "${CODEX_SPEC_ENV:-}" != "spec-value" ]; then exit 66; fi
+cat > "$CODEX_STDIN_CAPTURE"
+printf 'large prompt received' > "$out"
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(workerenv.AllowBash, "true")
+	t.Setenv(workerenv.Prompt, "inherited-parent-value")
+	t.Setenv("CODEX_INHERITED_ENV", "inherited-value")
+	cfg := DefaultConfig()
+	cfg.AllowUnauthenticated = true
+	cfg.Runtime = RuntimeCodex
+	cfg.WorkDir = dir
+	cfg.CommandEnv = []string{
+		"CODEX_STDIN_CAPTURE=" + stdinCapture,
+		"CODEX_PROMPT_ENV_CAPTURE=" + envCapture,
+		"CODEX_SPEC_ENV=spec-value",
+	}
+	adapter := NewCodexAdapter(CodexAdapterConfig{Path: fakeCodex, WorkDir: dir})
+	baseURL, cleanup := startWrapperServerWithConfig(t, cfg, adapter)
+	defer cleanup()
+	client, err := harness.NewClient(baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	largePrompt := "begin\n" + strings.Repeat("0123456789abcdef", 10*1024) + "\nend"
+	if len(largePrompt) <= 128*1024 {
+		t.Fatalf("large prompt length = %d, want more than 128 KiB", len(largePrompt))
+	}
+	request := validWrapperStartTurnRequest()
+	request.Input.Prompt = largePrompt
+	if _, err := client.StartTurn(context.Background(), request); err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	frames := collectWrapperFrames(t, client, request.TurnID, 0)
+	last := frames[len(frames)-1]
+	if last.Type != harness.FrameTurnCompleted || last.Completed == nil {
+		t.Fatalf("last frame = %#v, want completed", last)
+	}
+	if last.Completed.Result != "large prompt received" {
+		t.Fatalf("completed result = %q, want fake codex result", last.Completed.Result)
+	}
+	capturedStdin, err := os.ReadFile(stdinCapture)
+	if err != nil {
+		t.Fatalf("read fake Codex stdin capture: %v", err)
+	}
+	if got := string(capturedStdin); got != largePrompt {
+		t.Fatalf("fake Codex stdin length = %d, want exact %d-byte prompt", len(got), len(largePrompt))
+	}
+	capturedEnv, err := os.ReadFile(envCapture)
+	if err != nil {
+		t.Fatalf("read fake Codex prompt env capture: %v", err)
+	}
+	if got := string(capturedEnv); got != "unset" {
+		t.Fatalf("fake Codex ORKA_PROMPT state = %q, want unset", got)
+	}
+}
+
+func TestCodexAdapterSecurityArtifactFollowUpUsesStdinWithoutPromptEnv(t *testing.T) {
+	dir := t.TempDir()
+	invocationMarker := filepath.Join(dir, "codex-invoked")
+	followUpStdinCapture := filepath.Join(dir, "codex-follow-up-stdin.txt")
+	followUpEnvCapture := filepath.Join(dir, "codex-follow-up-prompt-env.txt")
+	fakeCodex := filepath.Join(dir, "codex-security-follow-up.sh")
+	if err := os.WriteFile(fakeCodex, []byte(`#!/bin/sh
+set -eu
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--output-last-message" ]; then out="$arg"; fi
+  prev="$arg"
+done
+if [ -e "$CODEX_INVOCATION_MARKER" ]; then
+  if [ "${ORKA_PROMPT+x}" = "x" ]; then
+    printf 'set' > "$CODEX_FOLLOW_UP_ENV_CAPTURE"
+    exit 64
+  fi
+  printf 'unset' > "$CODEX_FOLLOW_UP_ENV_CAPTURE"
+  cat > "$CODEX_FOLLOW_UP_STDIN_CAPTURE"
+  mkdir -p "$ORKA_ARTIFACTS_DIR"
+  printf '# threat model\n' > "$ORKA_ARTIFACTS_DIR/security-threat-model.md"
+  printf 'SECURITY_ARTIFACTS_WRITTEN' > "$out"
+else
+  if [ "${ORKA_PROMPT+x}" = "x" ]; then
+    printf 'initial-set' > "$CODEX_FOLLOW_UP_ENV_CAPTURE"
+    exit 63
+  fi
+  : > "$CODEX_INVOCATION_MARKER"
+  cat > /dev/null
+  : > "$out"
+fi
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(workerenv.AllowBash, "true")
+	t.Setenv(workerenv.Prompt, "inherited-parent-value")
+	cfg := DefaultConfig()
+	cfg.AllowUnauthenticated = true
+	cfg.Runtime = RuntimeCodex
+	cfg.WorkDir = dir
+	cfg.CommandEnv = []string{
+		"CODEX_INVOCATION_MARKER=" + invocationMarker,
+		"CODEX_FOLLOW_UP_STDIN_CAPTURE=" + followUpStdinCapture,
+		"CODEX_FOLLOW_UP_ENV_CAPTURE=" + followUpEnvCapture,
+	}
+	adapter := NewCodexAdapter(CodexAdapterConfig{Path: fakeCodex, WorkDir: dir})
+	baseURL, cleanup := startWrapperServerWithConfig(t, cfg, adapter)
+	defer cleanup()
+	client, err := harness.NewClient(baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validWrapperStartTurnRequest()
+	request.Input.Prompt = "REQUIRED_SECURITY_ARTIFACTS: security-threat-model.md\nreview the repository"
+	if _, err := client.StartTurn(context.Background(), request); err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	frames := collectWrapperFrames(t, client, request.TurnID, 0)
+	last := frames[len(frames)-1]
+	if last.Type != harness.FrameTurnCompleted || last.Completed == nil {
+		t.Fatalf("last frame = %#v, want completed", last)
+	}
+	if !strings.Contains(last.Completed.Result, "SECURITY_ARTIFACTS_WRITTEN") {
+		t.Fatalf("completed result = %q, want follow-up result", last.Completed.Result)
+	}
+	expectedFollowUp := strings.Join([]string{
+		"Before responding, finish the task by writing the missing required security artifacts.",
+		"Write them under .orka-artifacts/.",
+		"Missing files:",
+		"- .orka-artifacts/security-threat-model.md",
+		"Do not inspect more repository files unless absolutely necessary.",
+		"Reuse the analysis already completed in this run.",
+		"Use shell redirection or heredocs so the files are definitely persisted on disk.",
+		"security-threat-model.md must be non-empty markdown grounded in the repository.",
+		"After writing the files, reply with only: SECURITY_ARTIFACTS_WRITTEN",
+		"",
+	}, "\n")
+	capturedFollowUp, err := os.ReadFile(followUpStdinCapture)
+	if err != nil {
+		t.Fatalf("read fake Codex follow-up stdin capture: %v", err)
+	}
+	if got := string(capturedFollowUp); got != expectedFollowUp {
+		t.Fatalf("fake Codex follow-up stdin = %q, want %q", got, expectedFollowUp)
+	}
+	capturedEnv, err := os.ReadFile(followUpEnvCapture)
+	if err != nil {
+		t.Fatalf("read fake Codex follow-up prompt env capture: %v", err)
+	}
+	if got := string(capturedEnv); got != "unset" {
+		t.Fatalf("fake Codex follow-up ORKA_PROMPT state = %q, want unset", got)
 	}
 }
 
@@ -247,6 +533,28 @@ func TestCodexAdapterIgnoresTurnEnvOpenAIBaseURL(t *testing.T) {
 	}
 	if !containsEnv(spec.Env, workerenv.OpenAIBaseURL+"=https://operator.example.invalid/v1") {
 		t.Fatalf("env = %#v, want operator base URL", spec.Env)
+	}
+}
+
+func TestCodexAdapterRuntimeAuthOnlyPrefersProtectedTurnBaseURL(t *testing.T) {
+	t.Setenv(workerenv.AllowBash, "true")
+	t.Setenv(workerenv.OpenAIBaseURL, "https://operator.example.invalid/v1")
+	adapter := NewCodexAdapter(CodexAdapterConfig{Path: "/fake/codex", WorkDir: t.TempDir()})
+	spec, err := adapter.BuildCommand(context.Background(), TurnContext{
+		Prompt:   "do work",
+		Metadata: map[string]string{"runtimeAuthOnly": "true"},
+		Env:      []string{workerenv.OpenAIBaseURL + "=http://127.0.0.1:4321/v1"},
+	})
+	if err != nil {
+		t.Fatalf("BuildCommand: %v", err)
+	}
+	defer removeTempFiles(spec.TempFiles)
+	joined := strings.Join(spec.Args, " ")
+	if !strings.Contains(joined, "openai_base_url=http://127.0.0.1:4321/v1") {
+		t.Fatalf("args = %q, want protected turn base URL", joined)
+	}
+	if !containsEnv(spec.Env, workerenv.OpenAIBaseURL+"=http://127.0.0.1:4321/v1") {
+		t.Fatalf("env = %#v, want protected turn base URL", spec.Env)
 	}
 }
 

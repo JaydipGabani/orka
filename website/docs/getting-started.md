@@ -41,127 +41,25 @@ helm install orka charts/orka \
   --create-namespace
 ```
 
-### Upgrading with Helm
+A normal fresh install creates Orka's twelve cluster-scoped CRDs before the
+controller resources. Use `--skip-crds` only when one designated platform or
+release owner already manages compatible Orka CRDs for the cluster; all other
+Orka releases should use that flag.
 
-Helm installs chart files under `crds/` only during a fresh install. It does not
-create or update those CRDs during `helm upgrade`, including when an older Orka
-release was installed from a chart that did not contain CRDs.
+:::important[CRDs before every upgrade]
+Helm does not create or update files from `crds/` during `helm upgrade`.
+Apply the CRDs from the exact target chart before **every** upgrade. This also
+applies when upgrading from a chart that installed no CRDs. Helm retains CRDs
+and Orka custom resources on uninstall.
+:::
 
-Package the exact target chart once, migrate its nine CRDs first, and use the
-same explicit context and archive for the release upgrade:
-
-```bash
-TARGET_CONTEXT="replace-with-context"
-
-(
-  set -euo pipefail
-
-  WORK_DIR="$(mktemp -d)"
-  KEEP_WORK_DIR=false
-  cleanup_work_dir() {
-    status=$?
-    trap - EXIT
-    if [[ "$KEEP_WORK_DIR" == true ]]; then
-      echo "Target chart and work files preserved at $WORK_DIR" >&2
-    else
-      rm -rf "$WORK_DIR"
-    fi
-    exit "$status"
-  }
-  trap cleanup_work_dir EXIT
-
-  helm package charts/orka --destination "$WORK_DIR"
-  TARGET_CHARTS=("$WORK_DIR"/orka-*.tgz)
-  test "${#TARGET_CHARTS[@]}" -eq 1
-  TARGET_CHART="${TARGET_CHARTS[0]}"
-  test -f "$TARGET_CHART"
-
-  KEEP_WORK_DIR=true
-  scripts/helm-chart.sh upgrade-crds \
-    --chart "$TARGET_CHART" \
-    --kube-context "$TARGET_CONTEXT" \
-    --release orka \
-    --namespace orka-system
-
-  helm upgrade orka "$TARGET_CHART" \
-    --namespace orka-system \
-    --kube-context "$TARGET_CONTEXT" \
-    --wait
-  KEEP_WORK_DIR=false
-)
-```
-
-The `jq`-based helper rejects `HELM_KUBE*` endpoint or credential overrides,
-reads Helm release storage through the explicit kubectl context, requires a
-`deployed` or `failed` latest release, and server-preflights all nine exact
-patch/create operations before mutation. It rechecks Helm state before and after
-mutation, then verifies target generation, accepted names, and served API
-discovery for every CRD. On failure partial changes
-are retained with recovery artifacts and a unique migration marker; automatic
-schema rollback is intentionally avoided because it can invalidate custom
-resources or alter field ownership. For a remote chart, pull one exact
-`--version` and follow the [validated portable workflow](https://github.com/orka-agents/orka/blob/main/charts/orka/README.md#validated-portable-workflow),
-which uses a separately trusted migrator and treats the target archive as data
-only.
-Orka CRDs are cluster-scoped, shared by every release, and retained on uninstall;
-deleting a CRD manually also deletes all custom resources of that kind.
-
-#### Reinstalling when CRDs were retained
-
-When the old Helm release is gone but Orka CRDs remain, run the migration before
-the replacement install. Add `--allow-missing-release` to the helper invocation,
-then install the same archive with `--skip-crds`:
-
-```bash
-TARGET_CONTEXT="replace-with-context"
-
-(
-  set -euo pipefail
-
-  TARGET_CONTEXT="${TARGET_CONTEXT:?set TARGET_CONTEXT}"
-
-  WORK_DIR="$(mktemp -d)"
-  KEEP_WORK_DIR=false
-  cleanup_work_dir() {
-    status=$?
-    trap - EXIT
-    if [[ "$KEEP_WORK_DIR" == true ]]; then
-      echo "Target chart and work files preserved at $WORK_DIR" >&2
-    else
-      rm -rf "$WORK_DIR"
-    fi
-    exit "$status"
-  }
-  trap cleanup_work_dir EXIT
-
-  helm package charts/orka --destination "$WORK_DIR"
-  TARGET_CHARTS=("$WORK_DIR"/orka-*.tgz)
-  test "${#TARGET_CHARTS[@]}" -eq 1
-  TARGET_CHART="${TARGET_CHARTS[0]}"
-  test -f "$TARGET_CHART"
-
-  KEEP_WORK_DIR=true
-  scripts/helm-chart.sh upgrade-crds \
-    --chart "$TARGET_CHART" \
-    --kube-context "$TARGET_CONTEXT" \
-    --release orka \
-    --namespace orka-system \
-    --allow-missing-release
-
-  helm install orka "$TARGET_CHART" \
-    --skip-crds \
-    --namespace orka-system \
-    --create-namespace \
-    --kube-context "$TARGET_CONTEXT" \
-    --wait
-  KEEP_WORK_DIR=false
-)
-```
-
-The opt-in mode requires at least one existing Orka CRD and still performs the
-same exact-set validation, server preflight, confirmation, and verification.
+Follow the complete commands and ownership guidance in
+[`charts/orka/README.md`](https://github.com/orka-agents/orka/blob/main/charts/orka/README.md).
 
 ### Using kubectl
+
+The development target creates the required harness-wrapper authentication
+Secret without replacing an existing value:
 
 ```bash
 # Install CRDs
@@ -169,6 +67,22 @@ make install
 
 # Deploy controller
 make deploy IMG=ghcr.io/orka-agents/orka:latest
+```
+
+When applying the promoted installer directly, pre-create that Secret because
+raw manifests cannot safely contain a shared bearer token:
+
+```bash
+set -euo pipefail
+
+kubectl create namespace orka-system --dry-run=client -o yaml | kubectl apply -f -
+if ! kubectl -n orka-system get secret harness-wrapper-auth >/dev/null 2>&1; then
+  openssl rand -hex 32 | \
+    kubectl -n orka-system create secret generic harness-wrapper-auth \
+      --from-file=token=/dev/stdin
+fi
+
+kubectl apply -f deploy/orka.yaml
 ```
 
 ## Quick Start
@@ -258,7 +172,7 @@ orka task download <task-name> [filename] -o <path>
 
 ## Agent Runtimes Quick Start
 
-Agent runtimes let you run tasks via Codex CLI, Claude Code CLI, or GitHub Copilot CLI with full autonomous coding capabilities.
+Agent runtimes let you run tasks via Codex CLI, Claude Code CLI, GitHub Copilot CLI, or OpenCode CLI with full autonomous coding capabilities.
 
 ### 1. Create Credentials
 
@@ -407,7 +321,7 @@ The CLI supports token extraction from bearer tokens, token files, exec-based au
 
 **Guides & reference**
 
-- [Agent Runtimes](concepts/agent-runtimes.md) — Codex CLI, Claude Code CLI, and Copilot CLI configuration
+- [Agent Runtimes](concepts/agent-runtimes.md) — Codex CLI, Claude Code CLI, Copilot CLI, and OpenCode CLI configuration
 - [Interactive Chat](guides/chat.md) — Chat endpoint with tool execution
 - [Multi-Agent Coordination](guides/multi-agent-coordination.md) — Coordinator agents and delegation
 - [OpenAI Compatibility](reference/openai-compat.md) — Use any OpenAI-compatible client via `/openai/v1/`

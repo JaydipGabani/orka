@@ -97,18 +97,18 @@ type policyRemovingResultStore struct {
 
 type staleSameNameLockRaceStore struct {
 	store.SessionStore
+	isLockedCalls    int
+	acquireLockCalls int
 }
 
-func (s staleSameNameLockRaceStore) IsTaskLocked(context.Context, string, string, string, string) (bool, error) {
+func (s *staleSameNameLockRaceStore) IsLocked(context.Context, string, string, string, string) (bool, error) {
+	s.isLockedCalls++
 	return false, nil
 }
 
-func (s staleSameNameLockRaceStore) AcquireTaskLock(context.Context, string, string, string, string) error {
+func (s *staleSameNameLockRaceStore) AcquireLock(context.Context, string, string, string, string) error {
+	s.acquireLockCalls++
 	return store.ErrConflict
-}
-
-func (s staleSameNameLockRaceStore) ReleaseTaskLock(ctx context.Context, namespace, name, taskName, _ string) error {
-	return s.ReleaseLock(ctx, namespace, name, taskName)
 }
 
 func (s *policyRemovingResultStore) DeleteResult(ctx context.Context, namespace, taskName string) error {
@@ -475,7 +475,8 @@ func TestAcquireSessionLockDoesNotAcceptSameNameDifferentUIDAfterRace(t *testing
 	}); err != nil {
 		t.Fatalf("CreateSession() error = %v", err)
 	}
-	r.SessionManager = NewSessionManager(staleSameNameLockRaceStore{SessionStore: baseStore})
+	raceStore := &staleSameNameLockRaceStore{SessionStore: baseStore}
+	r.SessionManager = NewSessionManager(raceStore)
 
 	result, err, done := r.acquireSessionLock(context.Background(), task)
 	if err != nil {
@@ -483,6 +484,9 @@ func TestAcquireSessionLockDoesNotAcceptSameNameDifferentUIDAfterRace(t *testing
 	}
 	if !done || result.RequeueAfter == 0 {
 		t.Fatalf("same-name different-UID lock was accepted: result=%#v done=%t", result, done)
+	}
+	if raceStore.isLockedCalls != 1 || raceStore.acquireLockCalls != 1 {
+		t.Fatalf("race injection calls = IsLocked:%d AcquireLock:%d, want 1 each", raceStore.isLockedCalls, raceStore.acquireLockCalls)
 	}
 }
 

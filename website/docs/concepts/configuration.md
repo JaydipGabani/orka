@@ -290,7 +290,7 @@ spec:
 | `validation.mode` | string | No | Validation mode included in review task input. Defaults to `changed`; allowed values are `off`, `changed`, and `full`. |
 | `validation.commands` | list | No | Validation commands included in review task input for the reviewer. |
 
-`targets.issues`, `targets.commits`, `review.requireGreenCI`, repair, and automerge fields are present for the broader monitor API shape, but the current controller rejects issue/commit targets and `review.requireGreenCI`; repair and automerge are not active workflows in this implementation slice. Review tasks check out the exact PR head and receive generated read-only context files under `/workspace/.git/orka/`: `pr-review.md`, `pr-review.files`, and `pr-review.diff`. GitHub publishing, when enabled, happens later in the controller from the structured review result; the LLM never receives the GitHub mutation token and cannot choose the GitHub event.
+`targets.issues`, durable `orka:*` label commands, issue triage/research/planning/implementation, PR review/repair, `review.requireGreenCI`, and optional head-bound automerge are active RepositoryMonitor workflows. `targets.commits` remain rejected until commit inventory is implemented. Review tasks check out the exact PR head and receive generated read-only context files under `/workspace/.git/orka/`: `pr-review.md`, `pr-review.files`, and `pr-review.diff`. GitHub publishing, branch pushes, PR creation, label consumption, and automerge attempts are controller-owned and audited through mutation records; read-only agents never receive the GitHub mutation token.
 
 **Status fields:**
 
@@ -701,12 +701,24 @@ Key configuration values for the Helm chart:
 | `workers.ai.image.repository` | `ghcr.io/orka-agents/orka/ai-worker` | AI worker image |
 | `workers.general.image.repository` | `ghcr.io/orka-agents/orka/general-worker` | General worker image |
 | `service.type` | `ClusterIP` | Service type |
-| `crds.install` | `true` | Install CRDs |
-| `crds.keep` | `true` | Keep CRDs on uninstall |
 | `monitoring.enabled` | `false` | Enable Prometheus ServiceMonitor |
 | `client.create` | `true` | Create client ServiceAccount for API access |
 | `client.name` | `orka-client` | Client ServiceAccount name |
 | `client.namespace` | `""` | Client ServiceAccount namespace override. Empty defaults to `controller.watchNamespace` when namespace isolation is enforced and `watchNamespace` is set, otherwise the release namespace. |
+
+### Helm CRD lifecycle
+
+CRD behavior is not controlled through chart values. A fresh install creates
+the twelve CRDs unless `--skip-crds` is used. Because CRDs are cluster-scoped,
+designate one lifecycle owner and use `--skip-crds` for other Orka releases.
+
+Helm does not update CRDs during `helm upgrade`. Apply the CRDs from the exact
+target chart before upgrading the controller. Helm retains CRDs and Orka custom
+resources on uninstall.
+
+See the
+[Helm CRD lifecycle guide](https://github.com/orka-agents/orka/blob/main/charts/orka/README.md)
+for the CRD-first upgrade and replacement-install commands.
 
 Context-token flags can also be configured through Helm under
 `controller.contextToken`. For example:
@@ -726,6 +738,8 @@ controller:
       monitorRead: orka:monitors:read
       monitorWrite: orka:monitors:write
       monitorOperate: orka:monitors:operate
+      gatewayRead: orka:gateways:read
+      gatewayOperate: orka:gateways:operate
     tts:
       url: https://tts.example.com
       audience: orka-workers
@@ -742,7 +756,9 @@ The Helm keys mirror the controller flags: for example,
 `controller.contextToken.scopes.secretRead` renders
 `--context-token-secret-read-scopes`,
 `controller.contextToken.scopes.monitorRead` renders
-`--context-token-monitor-read-scopes`, and
+`--context-token-monitor-read-scopes`,
+`controller.contextToken.scopes.gatewayRead` renders
+`--context-token-gateway-read-scopes`, and
 `controller.contextToken.tts.toolTokenTTL` renders
 `--context-token-tool-token-ttl`.
 
@@ -753,6 +769,17 @@ See [charts/orka/values.yaml](https://github.com/orka-agents/orka/blob/main/char
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--api-port` | `8080` | REST API server port |
+| `--gateway-enabled` | `true` | Enable generic gateway reconciliation and ingress |
+| `--gateway-pending-per-session` | `100` | Maximum pending gateway events per Session |
+| `--gateway-max-records-per-gateway` | `1000` | Maximum retained accepted/dead-letter event records per Gateway before ingress is throttled |
+| `--gateway-max-rejected-records-per-gateway` | `250` | Separate audit budget for rejected events so unauthorized traffic cannot consume operational capacity |
+| `--gateway-event-expiry` | `24h` | Queue and delivery retry expiry |
+| `--gateway-terminal-retention` | `720h` | Terminal event and delivery retention |
+| `--gateway-delivery-timeout` | `15s` | One synchronous adapter delivery timeout |
+| `--gateway-delivery-max-attempts` | `10` | Delivery attempts before dead-lettering |
+| `--gateway-claim-lease` | `1m` | Event and delivery claim lease |
+| `--gateway-poll-interval` | `500ms` | Dispatcher and delivery poll interval |
+| `--gateway-batch-size` | `25` | Maximum gateway records processed per iteration |
 | `--watch-namespace` | `""` | Namespace to watch (empty = all) |
 | `--enforce-namespace-isolation` | `false` | Restrict users to their ServiceAccount's namespace |
 | `--max-tasks-per-namespace` | `0` | Max active tasks per namespace (0 = unlimited) |
@@ -797,6 +824,8 @@ See [charts/orka/values.yaml](https://github.com/orka-agents/orka/blob/main/char
 | `--context-token-monitor-operate-scopes` | `ORKA_CONTEXT_TOKEN_MONITOR_OPERATE_SCOPES` env or `""` | Comma-separated scopes authorizing repository monitor manual runs. Defaults to `orka:monitors:operate` |
 | `--context-token-skill-read-scopes` | `ORKA_CONTEXT_TOKEN_SKILL_READ_SCOPES` env or `""` | Comma-separated scopes authorizing Skill reads. Defaults to `orka:skills:read` |
 | `--context-token-skill-write-scopes` | `ORKA_CONTEXT_TOKEN_SKILL_WRITE_SCOPES` env or `""` | Comma-separated scopes authorizing Skill writes. Defaults to `orka:skills:write` |
+| `--context-token-gateway-read-scopes` | `ORKA_CONTEXT_TOKEN_GATEWAY_READ_SCOPES` env or `""` | Comma-separated scopes authorizing gateway resource and ledger reads. Defaults to `orka:gateways:read` |
+| `--context-token-gateway-operate-scopes` | `ORKA_CONTEXT_TOKEN_GATEWAY_OPERATE_SCOPES` env or `""` | Comma-separated scopes authorizing dead-lettered delivery retries. Defaults to `orka:gateways:operate` |
 | `--context-token-tts-url` | `ORKA_CONTEXT_TOKEN_TTS_URL` env or `""` | kontxt TTS base URL for optional token exchange/replacement |
 | `--context-token-tts-audience` | `ORKA_CONTEXT_TOKEN_TTS_AUDIENCE` env or `""` | Audience requested from kontxt TTS exchanges |
 | `--context-token-tts-timeout` | `ORKA_CONTEXT_TOKEN_TTS_TIMEOUT` env or `""` | Timeout for kontxt TTS exchanges. Defaults to `5s` when TTS is enabled |
@@ -808,12 +837,14 @@ See [charts/orka/values.yaml](https://github.com/orka-agents/orka/blob/main/char
 | `--context-token-tool-token-ttl` | `ORKA_CONTEXT_TOKEN_TOOL_TOKEN_TTL` env or `""` | Requested TTL for outbound tool TxTokens. Defaults to `2m` when TTS is enabled |
 | `--task-provenance-admission-enabled` | `ORKA_TASK_PROVENANCE_ADMISSION_ENABLED` env or `false` | Enable validating admission that rejects untrusted direct Kubernetes Task writes to Orka-managed provenance fields (`spec.requestedBy`, `spec.transaction`, and transaction metadata labels/annotations) |
 | `--task-provenance-admission-trusted-users` | `ORKA_TASK_PROVENANCE_ADMISSION_TRUSTED_USERS` env or controller ServiceAccount usernames | Comma-separated Kubernetes usernames trusted to set Orka-managed Task provenance fields |
-| `--task-provenance-admission-trusted-service-accounts` | `ORKA_TASK_PROVENANCE_ADMISSION_TRUSTED_SERVICE_ACCOUNTS` env or `orka-ai-worker` | Comma-separated ServiceAccount names trusted in the target Task namespace to set Orka-managed Task provenance fields for child Task creation |
+| `--task-provenance-admission-trusted-service-accounts` | `ORKA_TASK_PROVENANCE_ADMISSION_TRUSTED_SERVICE_ACCOUNTS` env or configured AI/vendor worker ServiceAccounts | Comma-separated ServiceAccount names trusted in the target Task namespace to set Orka-managed Task provenance fields for child Task creation. Explicit values override the worker ServiceAccount defaults. |
 | `--ai-worker-image` | `ghcr.io/orka-agents/orka/ai-worker:latest` | AI worker container image |
+| `--general-worker-image` | `ghcr.io/orka-agents/orka/general-worker:latest` | General worker container image |
+| `--ai-worker-service-account-name` | `orka-ai-worker` | ServiceAccount name for AI worker Jobs and dynamically ensured worker RBAC |
+| `--vendor-worker-service-account-name` | `orka-vendor-worker` | ServiceAccount name for vendor/agent worker Jobs and dynamically ensured worker RBAC |
+| `--container-worker-service-account-name` | `orka-container-worker` | ServiceAccount name for container worker Jobs and dynamically ensured worker RBAC |
 | `ORKA_HARNESS_WRAPPER_ENDPOINT` | unset | Required controller environment variable for agent Tasks; points at the CLI harness wrapper HTTP endpoint. |
 | `ORKA_HARNESS_WRAPPER_BEARER_TOKEN_FILE` | unset | Optional controller token file for authenticated wrapper endpoints. |
-
-| `--general-worker-image` | `ghcr.io/orka-agents/orka/general-worker:latest` | General worker container image |
 | `--store-backend` | `sqlite` | Storage backend (sqlite) |
 | `--store-path` | `/data/orka.db` | Path to SQLite database file |
 | `--chat-enabled` | `true` | Enable the chat endpoint |

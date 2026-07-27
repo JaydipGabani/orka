@@ -328,6 +328,9 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 	// Load session history only after reserving its revision for this turn.
 	messages, err := ch.loadChatSession(ctx, namespace, sessionID)
 	if err != nil {
+		if errors.Is(err, store.ErrGatewayOwnedSession) {
+			return fiber.NewError(fiber.StatusNotFound, "chat session not found")
+		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to load chat session: %v", err))
 	}
 	persistedCount := len(messages)
@@ -1029,6 +1032,13 @@ func setUsageSpanAttributes(span trace.Span, usage ChatUsage) {
 
 // loadChatSession loads chat session messages from the session store.
 func (ch *ChatHandler) loadChatSession(ctx context.Context, namespace, sessionID string) ([]llm.Message, error) {
+	sessionType, err := transcriptSessionType(ctx, ch.sessionStore, namespace, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if sessionType == store.SessionTypeGateway {
+		return nil, store.ErrGatewayOwnedSession
+	}
 	messages, err := ch.sessionStore.LoadTranscript(ctx, namespace, sessionID, 0)
 	if err != nil {
 		return nil, err
@@ -1140,16 +1150,22 @@ func (ch *ChatHandler) HandleCancelChat(c fiber.Ctx) error {
 	}
 
 	ctx := c.Context()
-	_, err = ch.sessionStore.GetSession(ctx, namespace, sessionID)
+	sessionType, err := transcriptSessionType(ctx, ch.sessionStore, namespace, sessionID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "chat session not found")
 		}
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get session: %v", err))
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get session type: %v", err))
+	}
+	if sessionType == store.SessionTypeGateway {
+		return fiber.NewError(fiber.StatusNotFound, "chat session not found")
 	}
 
 	// Delete the session to cancel it
 	if err := ch.sessionStore.DeleteSession(ctx, namespace, sessionID); err != nil {
+		if errors.Is(err, store.ErrGatewayOwnedSession) {
+			return fiber.NewError(fiber.StatusNotFound, "chat session not found")
+		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to cancel session: %v", err))
 	}
 

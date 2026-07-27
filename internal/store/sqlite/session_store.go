@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,10 +58,23 @@ func (s *Store) GetSession(ctx context.Context, namespace, name string) (*store.
 	return session, nil
 }
 
+// GetSessionType returns the stored Session type without loading transcript messages.
+func (s *Store) GetSessionType(ctx context.Context, namespace, name string) (string, error) {
+	var sessionType string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT session_type FROM sessions WHERE namespace = ? AND name = ?`,
+		namespace, name,
+	).Scan(&sessionType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", store.ErrNotFound
+	}
+	return sessionType, err
+}
+
 // ListSessions returns metadata for all sessions in a namespace.
 func (s *Store) ListSessions(ctx context.Context, namespace string) ([]store.SessionMetadata, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT name, session_type, message_count, input_tokens, output_tokens, created_at, updated_at, active_task
+		`SELECT name, session_type, message_count, input_tokens, output_tokens, created_at, updated_at, active_task, active_task_uid
 		 FROM sessions WHERE namespace = ?`,
 		namespace,
 	)
@@ -71,7 +86,7 @@ func (s *Store) ListSessions(ctx context.Context, namespace string) ([]store.Ses
 	var sessions []store.SessionMetadata
 	for rows.Next() {
 		var m store.SessionMetadata
-		if err := rows.Scan(&m.Name, &m.SessionType, &m.MessageCount, &m.InputTokens, &m.OutputTokens, &m.CreatedAt, &m.UpdatedAt, &m.ActiveTask); err != nil {
+		if err := rows.Scan(&m.Name, &m.SessionType, &m.MessageCount, &m.InputTokens, &m.OutputTokens, &m.CreatedAt, &m.UpdatedAt, &m.ActiveTask, &m.ActiveTaskUID); err != nil {
 			return nil, err
 		}
 		sessions = append(sessions, m)
@@ -86,8 +101,43 @@ func (s *Store) DeleteSession(ctx context.Context, namespace, name string) error
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE namespace = ? AND name = ?`, namespace, name); err != nil {
+	var sessionType string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT session_type FROM sessions WHERE namespace = ? AND name = ?`,
+		namespace, name,
+	).Scan(&sessionType); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
+	}
+	var pendingGatewayEvents int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM gateway_events
+		WHERE namespace = ? AND session_name = ? AND state IN (?, ?, ?, ?)`,
+		namespace, name, store.GatewayEventAccepted, store.GatewayEventQueued,
+		store.GatewayEventDispatching, store.GatewayEventTaskCreated,
+	).Scan(&pendingGatewayEvents); err != nil {
+		return err
+	}
+	if pendingGatewayEvents > 0 {
+		if sessionType == store.SessionTypeGateway {
+			return errors.Join(store.ErrConflict, store.ErrGatewayOwnedSession)
+		}
+		return store.ErrConflict
+	}
+	if sessionType == store.SessionTypeGateway {
+		return store.ErrGatewayOwnedSession
+	}
+	deleteResult, err := tx.ExecContext(ctx,
+		`DELETE FROM sessions WHERE namespace = ? AND name = ? AND session_type <> ?`,
+		namespace, name, store.SessionTypeGateway,
+	)
+	if err != nil {
+		return err
+	}
+	deleted, err := deleteResult.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if sessionType != "" && deleted == 0 {
+		return store.ErrConflict
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE execution_events SET session_name = '', session_seq = 0 WHERE namespace = ? AND session_name = ?`,
@@ -104,32 +154,32 @@ func (s *Store) DeleteSession(ctx context.Context, namespace, name string) error
 
 // AcquireLock atomically sets the active_task for a session.
 // Returns store.ErrNotFound if the session does not exist, or an error if already locked.
-func (s *Store) AcquireLock(ctx context.Context, namespace, name, taskName string) error {
-	return s.AcquireTaskLock(ctx, namespace, name, taskName, "")
-}
-
-// AcquireTaskLock atomically records the immutable Task identity as lock owner.
-func (s *Store) AcquireTaskLock(ctx context.Context, namespace, name, taskName, taskUID string) error {
-	// Check if session exists
-	var count int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM sessions WHERE namespace = ? AND name = ?`,
-		namespace, name,
-	).Scan(&count)
+func (s *Store) AcquireLock(ctx context.Context, namespace, name, taskName, taskUID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if count == 0 {
-		return store.ErrNotFound
-	}
+	defer tx.Rollback() //nolint:errcheck
 
-	// Chat reservations and task locks are separate domains: tasks created by a
-	// chat turn must still be able to run while that turn waits for them.
-	result, err := s.db.ExecContext(ctx,
-		`UPDATE sessions SET active_task = ?, active_task_uid = ?
-		 WHERE namespace = ? AND name = ?
-		 AND (active_task = '' OR (active_task = ? AND active_task_uid = ''))`,
-		taskName, taskUID, namespace, name, taskName,
+	// The gateway ownership predicate must be evaluated by the same write
+	// statement that acquires the Session lock. Otherwise a terminal transition
+	// can commit after a separate authorization read and before this UPDATE,
+	// allowing the completed Task to re-acquire a stale lock.
+	result, err := tx.ExecContext(ctx,
+		`WITH latest_gateway_event AS (
+			SELECT state, task_uid FROM gateway_events
+			WHERE namespace = ? AND session_name = ? AND task_name = ?
+			ORDER BY created_at DESC, id DESC LIMIT 1
+		)
+		UPDATE sessions SET active_task = ?, active_task_uid = ?
+		 WHERE namespace = ? AND name = ? AND (active_task = '' OR
+		   (active_task = ? AND (active_task_uid = '' OR active_task_uid = ?)))
+		 AND (owner_type <> ? OR EXISTS (
+			SELECT 1 FROM latest_gateway_event WHERE state = ? AND task_uid = ?
+		 ))`,
+		namespace, name, taskName,
+		taskName, taskUID, namespace, name, taskName, taskUID,
+		gatewaySessionOwnerType, store.GatewayEventTaskCreated, taskUID,
 	)
 	if err != nil {
 		return err
@@ -139,10 +189,63 @@ func (s *Store) AcquireTaskLock(ctx context.Context, namespace, name, taskName, 
 	if err != nil {
 		return err
 	}
-	if rows == 0 {
+	if rows == 1 {
+		return tx.Commit()
+	}
+	return classifyAcquireLockFailure(ctx, tx, namespace, name, taskName, taskUID)
+}
+
+func classifyAcquireLockFailure(
+	ctx context.Context,
+	tx *sql.Tx,
+	namespace, name, taskName, taskUID string,
+) error {
+	var ownerType string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_type FROM sessions WHERE namespace = ? AND name = ?`,
+		namespace, name).Scan(&ownerType); errors.Is(err, sql.ErrNoRows) {
+		return store.ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if ownerType != gatewaySessionOwnerType {
 		return fmt.Errorf("%w: session %s/%s is already locked", store.ErrConflict, namespace, name)
 	}
-	return nil
+	if taskUID == "" {
+		return store.ValidationErrorf("gateway-owned session %s/%s requires an admitted Task identity", namespace, name)
+	}
+
+	var eventState store.GatewayEventState
+	var storedTaskUID string
+	err := tx.QueryRowContext(ctx, `SELECT state, task_uid FROM gateway_events
+		WHERE namespace = ? AND session_name = ? AND task_name = ?
+		ORDER BY created_at DESC, id DESC LIMIT 1`,
+		namespace, name, taskName,
+	).Scan(&eventState, &storedTaskUID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.ValidationErrorf(
+			"task %s/%s is not the admitted owner of gateway session %s/%s",
+			namespace, taskName, namespace, name,
+		)
+	}
+	if err != nil {
+		return err
+	}
+	if eventState == store.GatewayEventDispatching && storedTaskUID == "" {
+		return fmt.Errorf("%w: gateway Task ownership linkage is pending", store.ErrNotReady)
+	}
+	if eventState != store.GatewayEventTaskCreated || storedTaskUID != taskUID {
+		return store.ValidationErrorf(
+			"task %s/%s is not the admitted owner of gateway session %s/%s",
+			namespace, taskName, namespace, name,
+		)
+	}
+	return fmt.Errorf("%w: session %s/%s is already locked", store.ErrConflict, namespace, name)
+}
+
+// AcquireTaskLock records the immutable Task identity as lock owner.
+// It is retained for retry-aware callers that use the stronger optional store seam.
+func (s *Store) AcquireTaskLock(ctx context.Context, namespace, name, taskName, taskUID string) error {
+	return s.AcquireLock(ctx, namespace, name, taskName, taskUID)
 }
 
 // AcquireChatTurn creates the chat session when needed and atomically reserves
@@ -154,6 +257,9 @@ func (s *Store) AcquireChatTurn(ctx context.Context, session *store.SessionRecor
 	}
 	if session.Namespace == "" || session.Name == "" || turnID == "" {
 		return store.ValidationErrorf("session namespace, name, and turn ID are required")
+	}
+	if session.SessionType == store.SessionTypeGateway {
+		return store.ValidationErrorf("gateway sessions cannot be reserved by chat turns")
 	}
 	now := time.Now()
 	if !expiresAt.After(now) {
@@ -171,8 +277,9 @@ func (s *Store) AcquireChatTurn(ctx context.Context, session *store.SessionRecor
 	defer tx.Rollback() //nolint:errcheck
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO sessions (namespace, name, session_type, active_task, message_count, input_tokens, output_tokens, cancelled, created_at, updated_at)
-		 VALUES (?, ?, ?, '', 0, 0, 0, ?, ?, ?)
+		`INSERT INTO sessions
+		 (namespace, name, session_type, active_task, active_task_uid, message_count, input_tokens, output_tokens, cancelled, created_at, updated_at)
+		 VALUES (?, ?, ?, '', '', 0, 0, 0, ?, ?, ?)
 		 ON CONFLICT(namespace, name) DO NOTHING`,
 		session.Namespace, session.Name, session.SessionType, session.Cancelled, createdAt, now,
 	); err != nil {
@@ -181,9 +288,9 @@ func (s *Store) AcquireChatTurn(ctx context.Context, session *store.SessionRecor
 
 	result, err := tx.ExecContext(ctx,
 		`UPDATE sessions SET chat_turn_id = ?, chat_turn_expires_at = ?, updated_at = ?
-		 WHERE namespace = ? AND name = ? AND active_task = ''
+		 WHERE namespace = ? AND name = ? AND owner_type <> ? AND active_task = ''
 		 AND (chat_turn_id = '' OR chat_turn_expires_at IS NULL OR chat_turn_expires_at <= ?)`,
-		turnID, expiresAt, now, session.Namespace, session.Name, now,
+		turnID, expiresAt, now, session.Namespace, session.Name, gatewaySessionOwnerType, now,
 	)
 	if err != nil {
 		return err
@@ -207,16 +314,18 @@ func (s *Store) ReleaseChatTurn(ctx context.Context, namespace, name, turnID str
 	return err
 }
 
-// ReleaseLock clears the active_task if it matches the given task name.
-func (s *Store) ReleaseLock(ctx context.Context, namespace, name, taskName string) error {
+// ReleaseLock clears the lock only for the exact Task incarnation.
+func (s *Store) ReleaseLock(ctx context.Context, namespace, name, taskName, taskUID string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE sessions SET active_task = '', active_task_uid = '' WHERE namespace = ? AND name = ? AND active_task = ?`,
-		namespace, name, taskName,
+		`UPDATE sessions SET active_task = '', active_task_uid = ''
+		 WHERE namespace = ? AND name = ? AND active_task = ? AND active_task_uid = ?`,
+		namespace, name, taskName, taskUID,
 	)
 	return err
 }
 
-// ReleaseTaskLock releases a task lock only for the same immutable Task UID.
+// ReleaseTaskLock releases a task lock for the same immutable Task UID and
+// adopts same-name legacy locks that predate UID fencing.
 func (s *Store) ReleaseTaskLock(ctx context.Context, namespace, name, taskName, taskUID string) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE sessions SET active_task = '', active_task_uid = ''
@@ -227,26 +336,8 @@ func (s *Store) ReleaseTaskLock(ctx context.Context, namespace, name, taskName, 
 	return err
 }
 
-// IsLocked returns true if the session is locked by a task other than currentTask.
-func (s *Store) IsLocked(ctx context.Context, namespace, name, currentTask string) (bool, error) {
-	var activeTask string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT active_task FROM sessions WHERE namespace = ? AND name = ?`,
-		namespace, name,
-	).Scan(&activeTask)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, store.ErrNotFound
-	}
-	if err != nil {
-		return false, err
-	}
-	return activeTask != "" && activeTask != currentTask, nil
-}
-
-// IsTaskLocked returns true unless the lock is unowned, belongs to the exact
-// immutable Task identity, or is a same-name legacy lock whose UID can be
-// atomically backfilled by AcquireTaskLock.
-func (s *Store) IsTaskLocked(ctx context.Context, namespace, name, taskName, taskUID string) (bool, error) {
+// IsLocked returns true if the session is locked by another Task incarnation.
+func (s *Store) IsLocked(ctx context.Context, namespace, name, currentTask, currentTaskUID string) (bool, error) {
 	var activeTask, activeTaskUID string
 	err := s.db.QueryRowContext(ctx,
 		`SELECT active_task, active_task_uid FROM sessions WHERE namespace = ? AND name = ?`,
@@ -261,16 +352,18 @@ func (s *Store) IsTaskLocked(ctx context.Context, namespace, name, taskName, tas
 	if activeTask == "" {
 		return false, nil
 	}
-	if activeTask != taskName {
-		return true, nil
-	}
-	if activeTaskUID == "" {
-		return false, nil
-	}
-	return activeTaskUID != taskUID, nil
+	return activeTask != currentTask || (activeTaskUID != "" && activeTaskUID != currentTaskUID), nil
 }
 
-// AppendMessages inserts messages into a session's transcript and updates the session metadata.
+// IsTaskLocked applies immutable Task identity fencing while accepting a
+// same-name legacy lock whose UID can be atomically adopted by AcquireTaskLock.
+func (s *Store) IsTaskLocked(ctx context.Context, namespace, name, taskName, taskUID string) (bool, error) {
+	return s.IsLocked(ctx, namespace, name, taskName, taskUID)
+}
+
+// AppendMessages inserts messages into a session's logical transcript and updates session metadata.
+// Stable message IDs make retries idempotent; even-numbered logical orders leave a gap for
+// gateway terminal projections that arrive after later user messages were durably admitted.
 func (s *Store) AppendMessages(ctx context.Context, namespace, name string, messages []store.SessionMessage) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -278,18 +371,29 @@ func (s *Store) AppendMessages(ctx context.Context, namespace, name string, mess
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if err := insertSessionMessages(ctx, tx, namespace, name, messages); err != nil {
+	var ownerType string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_type FROM sessions WHERE namespace = ? AND name = ?`,
+		namespace, name).Scan(&ownerType); errors.Is(err, sql.ErrNoRows) {
+		return store.ErrNotFound
+	} else if err != nil {
 		return err
 	}
+	if ownerType == gatewaySessionOwnerType {
+		return store.ErrConflict
+	}
 
-	_, err = tx.ExecContext(ctx,
-		`UPDATE sessions SET message_count = message_count + ?, updated_at = CURRENT_TIMESTAMP WHERE namespace = ? AND name = ?`,
-		len(messages), namespace, name,
-	)
+	inserted, err := insertSessionMessages(ctx, tx, namespace, name, messages)
 	if err != nil {
 		return err
 	}
-
+	if inserted > 0 {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE sessions SET message_count = message_count + ?, updated_at = CURRENT_TIMESTAMP WHERE namespace = ? AND name = ?`,
+			inserted, namespace, name,
+		); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -303,15 +407,18 @@ func (s *Store) FinalizeTaskSession(ctx context.Context, namespace, name, taskNa
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	var activeTask, activeTaskUID string
+	var activeTask, activeTaskUID, ownerType string
 	if err := tx.QueryRowContext(ctx,
-		`SELECT active_task, active_task_uid FROM sessions WHERE namespace = ? AND name = ?`,
+		`SELECT active_task, active_task_uid, owner_type FROM sessions WHERE namespace = ? AND name = ?`,
 		namespace, name,
-	).Scan(&activeTask, &activeTaskUID); err != nil {
+	).Scan(&activeTask, &activeTaskUID, &ownerType); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 		return err
+	}
+	if ownerType == gatewaySessionOwnerType {
+		return store.ErrConflict
 	}
 	if activeTask != taskName || activeTaskUID != taskUID {
 		if activeTask != taskName || activeTaskUID != "" || taskUID == "" {
@@ -333,14 +440,16 @@ func (s *Store) FinalizeTaskSession(ctx context.Context, namespace, name, taskNa
 			return store.ErrConflict
 		}
 	}
-	if err := insertSessionMessages(ctx, tx, namespace, name, messages); err != nil {
+
+	inserted, err := insertSessionMessages(ctx, tx, namespace, name, messages)
+	if err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx,
 		`UPDATE sessions
 		 SET active_task = '', active_task_uid = '', message_count = message_count + ?, updated_at = CURRENT_TIMESTAMP
 		 WHERE namespace = ? AND name = ? AND active_task = ? AND active_task_uid = ?`,
-		len(messages), namespace, name, taskName, taskUID,
+		inserted, namespace, name, taskName, taskUID,
 	)
 	if err != nil {
 		return err
@@ -372,6 +481,9 @@ func (s *Store) CommitSessionTurn(
 	if session.Namespace == "" || session.Name == "" {
 		return store.ValidationErrorf("session namespace and name are required")
 	}
+	if session.SessionType == store.SessionTypeGateway {
+		return store.ValidationErrorf("gateway sessions cannot be committed by chat turns")
+	}
 	if expectedMessageCount < 0 {
 		return store.ValidationErrorf("expected message count must not be negative")
 	}
@@ -399,26 +511,31 @@ func (s *Store) CommitSessionTurn(
 	defer tx.Rollback() //nolint:errcheck
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO sessions (namespace, name, session_type, active_task, message_count, input_tokens, output_tokens, cancelled, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
+		`INSERT INTO sessions
+		 (namespace, name, session_type, active_task, active_task_uid, message_count, input_tokens, output_tokens, cancelled, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
 		 ON CONFLICT(namespace, name) DO NOTHING`,
-		session.Namespace, session.Name, session.SessionType, session.ActiveTask,
+		session.Namespace, session.Name, session.SessionType, session.ActiveTask, session.ActiveTaskUID,
 		session.Cancelled, createdAt, updatedAt,
 	); err != nil {
 		return err
 	}
 
 	var currentMessageCount int
-	var activeTurn string
+	var activeTurn, ownerType string
 	var activeTurnExpiresAt sql.NullTime
 	if err := tx.QueryRowContext(ctx,
-		`SELECT message_count, chat_turn_id, chat_turn_expires_at FROM sessions WHERE namespace = ? AND name = ?`,
+		`SELECT message_count, chat_turn_id, chat_turn_expires_at, owner_type
+		 FROM sessions WHERE namespace = ? AND name = ?`,
 		session.Namespace, session.Name,
-	).Scan(&currentMessageCount, &activeTurn, &activeTurnExpiresAt); err != nil {
+	).Scan(&currentMessageCount, &activeTurn, &activeTurnExpiresAt, &ownerType); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return store.ErrNotFound
 		}
 		return err
+	}
+	if ownerType == gatewaySessionOwnerType {
+		return store.ErrConflict
 	}
 	if activeTurn != turnID {
 		return fmt.Errorf("%w: chat turn no longer owns session", store.ErrConflict)
@@ -430,16 +547,20 @@ func (s *Store) CommitSessionTurn(
 		return fmt.Errorf("%w: session message count is %d, expected %d", store.ErrConflict, currentMessageCount, expectedMessageCount)
 	}
 
-	if err := insertSessionMessages(ctx, tx, session.Namespace, session.Name, messages); err != nil {
+	inserted, err := insertSessionMessages(ctx, tx, session.Namespace, session.Name, messages)
+	if err != nil {
 		return err
 	}
-
+	tokenInputIncrement, tokenOutputIncrement := 0, 0
+	if inserted > 0 {
+		tokenInputIncrement, tokenOutputIncrement = inputTokens, outputTokens
+	}
 	result, err := tx.ExecContext(ctx,
 		`UPDATE sessions
 		 SET message_count = message_count + ?, "input_tokens" = "input_tokens" + ?, "output_tokens" = "output_tokens" + ?, updated_at = ?
 		 WHERE namespace = ? AND name = ? AND message_count = ? AND chat_turn_id = ?
 		 AND (chat_turn_id = '' OR chat_turn_expires_at > ?)`,
-		len(messages), inputTokens, outputTokens, now,
+		inserted, tokenInputIncrement, tokenOutputIncrement, now,
 		session.Namespace, session.Name, expectedMessageCount, turnID, now,
 	)
 	if err != nil {
@@ -452,62 +573,125 @@ func (s *Store) CommitSessionTurn(
 	if rows != 1 {
 		return fmt.Errorf("%w: session changed while committing turn", store.ErrConflict)
 	}
-
 	return tx.Commit()
 }
 
-func insertSessionMessages(ctx context.Context, tx *sql.Tx, namespace, name string, messages []store.SessionMessage) error {
+func insertSessionMessages(
+	ctx context.Context,
+	tx *sql.Tx,
+	namespace, name string,
+	messages []store.SessionMessage,
+) (int, error) {
 	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO session_messages (namespace, session_name, role, content, name, input, tool_calls, tool_call_id, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO session_messages
+		 (namespace, session_name, message_id, sort_order, role, content, name, input, tool_calls, tool_call_id,
+		  source_type, source_ref, metadata_json, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(namespace, session_name, message_id) WHERE message_id <> '' DO NOTHING`,
 	)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer stmt.Close() //nolint:errcheck
 
+	inserted := 0
 	for _, msg := range messages {
-		var inputJSON, toolCallsJSON *string
-		if msg.Input != nil {
-			b, err := json.Marshal(msg.Input)
-			if err != nil {
-				return fmt.Errorf("failed to marshal input: %w", err)
-			}
-			s := string(b)
-			inputJSON = &s
+		inputJSON, toolCallsJSON, metadataJSON, err := encodeSessionMessagePayload(msg)
+		if err != nil {
+			return 0, err
 		}
-		if msg.ToolCalls != nil {
-			b, err := json.Marshal(msg.ToolCalls)
-			if err != nil {
-				return fmt.Errorf("failed to marshal tool_calls: %w", err)
-			}
-			s := string(b)
-			toolCallsJSON = &s
-		}
-
 		ts := msg.Timestamp
 		if ts.IsZero() {
-			ts = time.Now()
+			ts = time.Now().UTC()
 		}
-
-		if _, err := stmt.ExecContext(ctx, namespace, name, msg.Role, msg.Content, nilIfEmpty(msg.Name), inputJSON, toolCallsJSON, nilIfEmpty(msg.ToolCallID), ts); err != nil {
-			return err
+		messageID := msg.ID
+		if messageID == "" {
+			messageID, err = newSessionMessageID()
+			if err != nil {
+				return 0, err
+			}
 		}
+		logicalOrder := msg.Order
+		if logicalOrder <= 0 {
+			logicalOrder, err = nextSessionMessageOrderTx(ctx, tx, namespace, name)
+			if err != nil {
+				return 0, err
+			}
+		}
+		result, err := stmt.ExecContext(ctx,
+			namespace, name, messageID, logicalOrder, msg.Role, msg.Content, nilIfEmpty(msg.Name), inputJSON,
+			toolCallsJSON, nilIfEmpty(msg.ToolCallID), msg.SourceType, msg.SourceRef, metadataJSON, ts,
+		)
+		if err != nil {
+			return 0, err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if rows == 0 {
+			matches, matchErr := sessionMessageMatchesTx(
+				ctx, tx, namespace, name, messageID, logicalOrder, msg.Order > 0, msg, inputJSON, toolCallsJSON, metadataJSON,
+			)
+			if matchErr != nil {
+				return 0, matchErr
+			}
+			if !matches {
+				return 0, store.ErrDuplicateMismatch
+			}
+		}
+		inserted += int(rows)
 	}
-	return nil
+	return inserted, nil
 }
 
-// LoadTranscript retrieves session messages ordered by ID. If maxMessages > 0, limits results.
+// LoadTranscript retrieves messages in logical conversation order.
 func (s *Store) LoadTranscript(ctx context.Context, namespace, name string, maxMessages int) ([]store.SessionMessage, error) {
-	query := `SELECT role, content, name, input, tool_calls, tool_call_id, created_at
-		 FROM session_messages WHERE namespace = ? AND session_name = ? ORDER BY id`
-	args := []any{namespace, name}
+	return s.loadTranscript(ctx, namespace, name, 0, maxMessages)
+}
 
-	if maxMessages > 0 {
-		query += ` LIMIT ?`
-		args = append(args, maxMessages)
+// LoadTranscriptThrough retrieves logical history through one stable message ID.
+func (s *Store) LoadTranscriptThrough(
+	ctx context.Context,
+	namespace, name, throughMessageID string,
+	maxMessages int,
+) ([]store.SessionMessage, error) {
+	var throughOrder int64
+	if err := s.db.QueryRowContext(ctx, `SELECT sort_order FROM session_messages
+		WHERE namespace = ? AND session_name = ? AND message_id = ?`,
+		namespace, name, throughMessageID,
+	).Scan(&throughOrder); errors.Is(err, sql.ErrNoRows) {
+		return nil, store.ErrNotFound
+	} else if err != nil {
+		return nil, err
 	}
+	return s.loadTranscript(ctx, namespace, name, throughOrder, maxMessages)
+}
 
+func (s *Store) loadTranscript(
+	ctx context.Context,
+	namespace, name string,
+	throughOrder int64,
+	maxMessages int,
+) ([]store.SessionMessage, error) {
+	baseColumns := `message_id, sort_order, role, content, name, input, tool_calls, tool_call_id,
+		 source_type, source_ref, metadata_json, created_at`
+	where := `namespace = ? AND session_name = ?`
+	args := []any{namespace, name}
+	if throughOrder > 0 {
+		where += ` AND sort_order <= ?`
+		args = append(args, throughOrder)
+	}
+	var query string
+	if maxMessages > 0 {
+		query = `SELECT ` + baseColumns + ` FROM (
+			SELECT id, ` + baseColumns + ` FROM session_messages WHERE ` + where + `
+			ORDER BY sort_order DESC, id DESC LIMIT ?
+		) ORDER BY sort_order, id`
+		args = append(args, maxMessages)
+	} else {
+		query = `SELECT ` + baseColumns + ` FROM session_messages WHERE ` + where + ` ORDER BY sort_order, id`
+	}
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -516,29 +700,123 @@ func (s *Store) LoadTranscript(ctx context.Context, namespace, name string, maxM
 
 	var messages []store.SessionMessage
 	for rows.Next() {
-		var msg store.SessionMessage
-		var nameStr, inputJSON, toolCallsJSON, toolCallID sql.NullString
-		if err := rows.Scan(&msg.Role, &msg.Content, &nameStr, &inputJSON, &toolCallsJSON, &toolCallID, &msg.Timestamp); err != nil {
+		message, err := scanSessionMessage(rows)
+		if err != nil {
 			return nil, err
 		}
-
-		msg.Name = nameStr.String
-		msg.ToolCallID = toolCallID.String
-
-		if inputJSON.Valid && inputJSON.String != "" {
-			if err := json.Unmarshal([]byte(inputJSON.String), &msg.Input); err != nil {
-				return nil, fmt.Errorf("failed to unmarshal input: %w", err)
-			}
-		}
-		if toolCallsJSON.Valid && toolCallsJSON.String != "" {
-			if err := json.Unmarshal([]byte(toolCallsJSON.String), &msg.ToolCalls); err != nil {
-				return nil, fmt.Errorf("failed to unmarshal tool_calls: %w", err)
-			}
-		}
-
-		messages = append(messages, msg)
+		messages = append(messages, message)
 	}
 	return messages, rows.Err()
+}
+
+func scanSessionMessage(row gatewayRowScanner) (store.SessionMessage, error) {
+	var msg store.SessionMessage
+	var nameStr, inputJSON, toolCallsJSON, toolCallID sql.NullString
+	var metadataJSON string
+	if err := row.Scan(
+		&msg.ID, &msg.Order, &msg.Role, &msg.Content, &nameStr, &inputJSON, &toolCallsJSON, &toolCallID,
+		&msg.SourceType, &msg.SourceRef, &metadataJSON, &msg.Timestamp,
+	); err != nil {
+		return msg, err
+	}
+	msg.Name = nameStr.String
+	msg.ToolCallID = toolCallID.String
+	if inputJSON.Valid && inputJSON.String != "" {
+		if err := json.Unmarshal([]byte(inputJSON.String), &msg.Input); err != nil {
+			return msg, fmt.Errorf("failed to unmarshal input: %w", err)
+		}
+	}
+	if toolCallsJSON.Valid && toolCallsJSON.String != "" {
+		if err := json.Unmarshal([]byte(toolCallsJSON.String), &msg.ToolCalls); err != nil {
+			return msg, fmt.Errorf("failed to unmarshal tool_calls: %w", err)
+		}
+	}
+	if metadataJSON != "" && metadataJSON != "{}" {
+		if err := json.Unmarshal([]byte(metadataJSON), &msg.Metadata); err != nil {
+			return msg, fmt.Errorf("failed to unmarshal message metadata: %w", err)
+		}
+	}
+	return msg, nil
+}
+
+func newSessionMessageID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate session message ID: %w", err)
+	}
+	return "local:" + hex.EncodeToString(value[:]), nil
+}
+
+func sessionMessageMatchesTx(
+	ctx context.Context, tx *sql.Tx, namespace, name, messageID string, logicalOrder int64, compareOrder bool,
+	msg store.SessionMessage, inputJSON, toolCallsJSON *string, metadataJSON string,
+) (bool, error) {
+	var storedOrder int64
+	var storedTimestamp time.Time
+	var storedRole, storedContent, storedSourceType, storedSourceRef, storedMetadata string
+	var storedName, storedInput, storedToolCalls, storedToolCallID sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT sort_order, role, content, name, input, tool_calls, tool_call_id,
+		source_type, source_ref, metadata_json, created_at FROM session_messages
+		WHERE namespace = ? AND session_name = ? AND message_id = ?`, namespace, name, messageID).Scan(
+		&storedOrder, &storedRole, &storedContent, &storedName, &storedInput, &storedToolCalls, &storedToolCallID,
+		&storedSourceType, &storedSourceRef, &storedMetadata, &storedTimestamp,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, store.ErrConflict
+	}
+	if err != nil {
+		return false, err
+	}
+	return (!compareOrder || storedOrder == logicalOrder) && storedRole == msg.Role && storedContent == msg.Content &&
+		nullableStringMatches(storedName, nilIfEmpty(msg.Name)) && nullableStringMatches(storedInput, inputJSON) &&
+		nullableStringMatches(storedToolCalls, toolCallsJSON) && nullableStringMatches(storedToolCallID, nilIfEmpty(msg.ToolCallID)) &&
+		storedSourceType == msg.SourceType && storedSourceRef == msg.SourceRef && storedMetadata == metadataJSON &&
+		(msg.Timestamp.IsZero() || storedTimestamp.Equal(msg.Timestamp)), nil
+}
+
+func nullableStringMatches(stored sql.NullString, expected *string) bool {
+	if expected == nil {
+		return !stored.Valid
+	}
+	return stored.Valid && stored.String == *expected
+}
+
+func encodeSessionMessagePayload(msg store.SessionMessage) (*string, *string, string, error) {
+	var inputJSON, toolCallsJSON *string
+	if msg.Input != nil {
+		data, err := json.Marshal(msg.Input)
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("failed to marshal input: %w", err)
+		}
+		encoded := string(data)
+		inputJSON = &encoded
+	}
+	if msg.ToolCalls != nil {
+		data, err := json.Marshal(msg.ToolCalls)
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("failed to marshal tool_calls: %w", err)
+		}
+		encoded := string(data)
+		toolCallsJSON = &encoded
+	}
+	metadataJSON := "{}"
+	if len(msg.Metadata) > 0 {
+		data, err := json.Marshal(msg.Metadata)
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("failed to marshal message metadata: %w", err)
+		}
+		metadataJSON = string(data)
+	}
+	return inputJSON, toolCallsJSON, metadataJSON, nil
+}
+
+func nextSessionMessageOrderTx(ctx context.Context, tx *sql.Tx, namespace, name string) (int64, error) {
+	var current int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sort_order), 0) FROM session_messages
+		WHERE namespace = ? AND session_name = ?`, namespace, name).Scan(&current); err != nil {
+		return 0, err
+	}
+	return current + 2, nil
 }
 
 // UpdateTokenCounts atomically increments the token counters for a session.
