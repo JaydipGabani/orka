@@ -214,6 +214,15 @@ func (m *SessionManager) FinalizeTask(ctx context.Context, task *corev1alpha1.Ta
 	if task == nil || task.Spec.SessionRef == nil {
 		return nil
 	}
+	if _, ok, err := m.gatewayEventForTask(ctx, task); err != nil {
+		return err
+	} else if ok {
+		// Gateway terminal projection owns the canonical assistant message and
+		// releases the session lock atomically with event/outbox completion.
+		// Generic finalization must remain a no-op even when an invalid session
+		// policy is the reason this admitted Gateway Task is being failed.
+		return nil
+	}
 	session, err := m.store.GetSession(ctx, task.Namespace, task.Spec.SessionRef.Name)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {

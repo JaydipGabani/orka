@@ -68,6 +68,92 @@ func TestNewSessionManager(t *testing.T) {
 	}
 }
 
+func TestSessionManager_FinalizeTaskLeavesGatewayProjectionToGatewayService(t *testing.T) {
+	db, err := sqlite.NewDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ss := sqlite.NewStore(db, ":memory:")
+	ctx := context.Background()
+	now := time.Now().UTC()
+	event := store.GatewayEvent{
+		ID: "gateway-finalize-event", Namespace: "default", NamespaceUID: "namespace-uid",
+		GatewayUID: "gateway-uid", GatewayGeneration: 1, GatewayName: "chat",
+		BindingName: "room", BindingUID: "binding-uid", ExternalEventID: "gateway-finalize-external",
+		ProtocolVersion: "orka.gateway.v1", EventType: "text", AccountID: "acct", ContextID: "room",
+		SenderID: "sender", Text: "current", ReplyTarget: "room", SessionName: "gateway-finalize-session",
+		TaskName:   "gateway-finalize-task",
+		ReceivedAt: now, NextAttemptAt: now, ExpiresAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now,
+	}
+	if _, _, err := ss.AdmitGatewayEvent(ctx, store.GatewayEventAdmission{
+		Event: event, AppendUserMessage: true, PendingLimit: 100,
+	}); err != nil {
+		t.Fatalf("AdmitGatewayEvent() error = %v", err)
+	}
+	claimed, err := ss.ClaimNextGatewayEvent(ctx, event.Namespace, "dispatcher", now, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimNextGatewayEvent() error = %v", err)
+	}
+	const taskUID = "gateway-finalize-task-uid"
+	if err := ss.MarkGatewayEventTaskCreated(
+		ctx, event.Namespace, event.ID, claimed.TaskName, taskUID, "dispatcher", now,
+	); err != nil {
+		t.Fatalf("MarkGatewayEventTaskCreated() error = %v", err)
+	}
+
+	manager := NewSessionManager(ss)
+	manager.SetGatewayEventStore(ss)
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: claimed.TaskName, Namespace: event.Namespace, UID: types.UID(taskUID)},
+		Spec: corev1alpha1.TaskSpec{SessionRef: &corev1alpha1.SessionReference{
+			Name: event.SessionName, Create: false, Append: false,
+			MaxMessages:      store.GatewayTranscriptMessageLimit,
+			ThroughMessageID: store.GatewayUserMessageID(event.ID), PromptIncluded: true,
+		}},
+		Status: corev1alpha1.TaskStatus{ResultRef: &corev1alpha1.ResultReference{Available: true}},
+	}
+	resultStore := &sessionManagerResultReadStore{err: errors.New("gateway result should be projected by the Gateway service")}
+	if err := manager.FinalizeTask(ctx, task, resultStore); err != nil {
+		t.Fatalf("FinalizeTask() error = %v", err)
+	}
+	if resultStore.reads != 0 {
+		t.Fatalf("FinalizeTask() read the result %d times, want Gateway service ownership", resultStore.reads)
+	}
+	session, err := ss.GetSession(ctx, event.Namespace, event.SessionName)
+	if err != nil {
+		t.Fatalf("GetSession() error = %v", err)
+	}
+	if session.ActiveTask != task.Name || session.ActiveTaskUID != string(task.UID) {
+		t.Fatalf("gateway session lock = (%q, %q), want Gateway service to retain (%q, %q)",
+			session.ActiveTask, session.ActiveTaskUID, task.Name, task.UID)
+	}
+
+	// A malformed Gateway session policy can be the reason the controller is
+	// terminalizing the admitted task. Finalization must still defer to the
+	// Gateway projection rather than revalidating the bad policy and deadlocking
+	// the Task in its durable terminal-transition claim.
+	task.Spec.SessionRef = &corev1alpha1.SessionReference{
+		Name: event.SessionName, Create: true, Append: true, MaxMessages: 1,
+	}
+	task.Status.ResultRef = nil
+	resultStore.reads = 0
+	if err := manager.FinalizeTask(ctx, task, resultStore); err != nil {
+		t.Fatalf("FinalizeTask() with invalid Gateway policy error = %v", err)
+	}
+	if resultStore.reads != 0 {
+		t.Fatalf("invalid-policy FinalizeTask() read the result %d times, want Gateway service ownership", resultStore.reads)
+	}
+	session, err = ss.GetSession(ctx, event.Namespace, event.SessionName)
+	if err != nil {
+		t.Fatalf("GetSession() after invalid-policy finalization error = %v", err)
+	}
+	if session.ActiveTask != task.Name || session.ActiveTaskUID != string(task.UID) {
+		t.Fatalf("invalid-policy gateway session lock = (%q, %q), want Gateway service to retain (%q, %q)",
+			session.ActiveTask, session.ActiveTaskUID, task.Name, task.UID)
+	}
+}
+
 func TestSessionManager_FinalizeTaskDeletedSessionSkipsResultRead(t *testing.T) {
 	sm, _ := setupSessionManager()
 	readErr := errors.New("result should not be read for a deleted session")
