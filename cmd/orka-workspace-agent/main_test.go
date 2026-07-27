@@ -17,6 +17,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/orka-agents/orka/internal/workspace/daemonprotocol"
 )
 
 const testBootstrapHandoffToken = "secret"
@@ -378,6 +380,79 @@ func TestWorkspaceAgentAllowsOnlyHandoffTokenBootstrap(t *testing.T) {
 	}
 	if strings.TrimSpace(string(data)) != testBootstrapHandoffToken {
 		t.Fatalf("token file = %q, want %s", string(data), testBootstrapHandoffToken)
+	}
+}
+
+func TestWorkspaceAgentSerializesBootstrapMutationWithFileAuthentication(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "handoff-token")
+	t.Setenv(envHandoffTokenFile, tokenFile)
+	t.Setenv(envBootstrapToken, "bootstrap-secret")
+	server := newWorkspaceAgentServer()
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan struct{})
+	secondDone := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseFirst)
+		}
+	}()
+
+	handler := server.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer bootstrap-secret" {
+			close(firstEntered)
+			<-releaseFirst
+			if err := os.WriteFile(tokenFile, []byte("minted-secret"), 0o600); err != nil {
+				t.Errorf("write minted token: %v", err)
+				http.Error(w, "write failed", http.StatusInternalServerError)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	body, err := json.Marshal(uploadRequest{Files: []uploadFile{{
+		Path: tokenFile,
+		Data: []byte("minted-secret"),
+		Mode: 0o600,
+	}}})
+	if err != nil {
+		t.Fatalf("marshal upload: %v", err)
+	}
+	firstReq := httptest.NewRequest(http.MethodPut, daemonprotocol.FilesPath, bytes.NewReader(body))
+	firstReq.Header.Set("Authorization", "Bearer bootstrap-secret")
+	firstResp := httptest.NewRecorder()
+	go func() {
+		handler(firstResp, firstReq)
+		close(firstDone)
+	}()
+	<-firstEntered
+
+	secondReq := httptest.NewRequest(http.MethodPut, daemonprotocol.FilesPath, bytes.NewReader(body))
+	secondReq.Header.Set("Authorization", "Bearer minted-secret")
+	secondResp := httptest.NewRecorder()
+	go func() {
+		handler(secondResp, secondReq)
+		close(secondDone)
+	}()
+
+	select {
+	case <-secondDone:
+		t.Fatal("second file request authenticated before bootstrap mutation completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseFirst)
+	released = true
+	<-firstDone
+	<-secondDone
+	if firstResp.Code != http.StatusNoContent {
+		t.Fatalf("first status = %d, want %d: %s", firstResp.Code, http.StatusNoContent, firstResp.Body.String())
+	}
+	if secondResp.Code != http.StatusNoContent {
+		t.Fatalf("second status = %d, want %d: %s", secondResp.Code, http.StatusNoContent, secondResp.Body.String())
 	}
 }
 

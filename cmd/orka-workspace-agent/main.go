@@ -79,6 +79,7 @@ type workspaceAgentServer struct {
 
 	mu         sync.Mutex
 	executions map[string]execResponse
+	filesMu    sync.Mutex
 }
 
 func newWorkspaceAgentServer() *workspaceAgentServer {
@@ -110,6 +111,14 @@ func (s *workspaceAgentServer) routes() http.Handler {
 
 func (s *workspaceAgentServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Serialize file-upload authentication with the mutation itself. A
+		// bootstrap request can rotate the credential, and a reconciliation
+		// request must not observe the old credential while that write is still
+		// in flight or overtake it with a later rotation.
+		if r.Method == http.MethodPut && r.URL.Path == daemonprotocol.FilesPath {
+			s.filesMu.Lock()
+			defer s.filesMu.Unlock()
+		}
 		token, err := handoffToken()
 		if err != nil {
 			if handoffBootstrapAllowedForTokenError(err) {

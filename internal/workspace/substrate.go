@@ -201,8 +201,9 @@ type SubstrateWorkspaceExecutor struct {
 }
 
 type substrateHandoffState struct {
-	gate      chan struct{}
-	authValue string
+	gate              chan struct{}
+	authValue         string
+	fallbackAuthValue string
 }
 
 func newSubstrateHandoffState(authValue string) *substrateHandoffState {
@@ -443,9 +444,7 @@ func (e *SubstrateWorkspaceExecutor) WaitReady(ctx context.Context, req WaitRead
 					ResumeLatency: resumeLatency,
 				}, nil
 			}
-			daemonErr := e.withActorHandoffToken(ctx, actorID, func(authToken string) error {
-				return e.workspaceDaemonClient().Health(ctx, e.workspaceDaemonActorRequest(actorID, authToken))
-			})
+			daemonErr := e.workspaceDaemonClient().Health(ctx, e.workspaceDaemonActorRequest(actorID, ""))
 			if err := e.workspaceDaemonError(daemonErr); err == nil {
 				readyAt := e.now()
 				resumeLatency := max(readyAt.Sub(resumeStartedAt), 0)
@@ -607,6 +606,23 @@ func (e *SubstrateWorkspaceExecutor) Upload(ctx context.Context, req UploadReque
 		if err != nil {
 			return nil, err
 		}
+		if handoffState.fallbackAuthValue != "" {
+			// Retry the unresolved rotation with its original minted token before
+			// minting another credential. File-request serialization in the daemon
+			// makes rejection/success ordering conclusive for this replay.
+			replaceSubstrateHandoffUploadToken(files, handoffState.authValue)
+			reconciled, err := e.reconcileSubstrateHandoffUpload(
+				ctx,
+				actorID,
+				bootstrapToken,
+				handoffState,
+				daemonprotocol.UploadRequest{Files: files},
+			)
+			if err != nil {
+				return nil, e.workspaceDaemonError(err)
+			}
+			return &UploadResult{Ref: req.Ref, Artifacts: daemonArtifactsToWorkspace(reconciled.Artifacts)}, nil
+		}
 		mintedToken, err := e.mintSessionIdentityHandoffToken(ctx, req.Ref)
 		if err != nil {
 			return nil, err
@@ -614,12 +630,41 @@ func (e *SubstrateWorkspaceExecutor) Upload(ctx context.Context, req UploadReque
 		if mintedToken != "" {
 			replaceSubstrateHandoffUploadToken(files, mintedToken)
 		}
-		resp, err = e.workspaceDaemonClient().Upload(ctx, e.workspaceDaemonActorRequest(actorID, bootstrapToken), daemonprotocol.UploadRequest{Files: files})
+		previousAuthValue := handoffState.authValue
+		uploadRequest := daemonprotocol.UploadRequest{Files: files}
+		resp, err = e.workspaceDaemonClient().Upload(
+			ctx,
+			e.workspaceDaemonActorRequest(actorID, bootstrapToken),
+			uploadRequest,
+		)
+		if mintedToken != "" {
+			if err == nil {
+				handoffState.authValue = mintedToken
+				handoffState.fallbackAuthValue = ""
+			} else if substrateBootstrapHandoffMayHaveApplied(err) {
+				// A lost or malformed success response is ambiguous: retain both
+				// credentials, then replay the idempotent upload under whichever
+				// credential the daemon currently accepts. Every successful replay
+				// writes the minted token, so both sides converge on one value.
+				handoffState.authValue = mintedToken
+				handoffState.fallbackAuthValue = distinctSubstrateHandoffToken(previousAuthValue, mintedToken)
+				reconciled, reconcileErr := e.reconcileSubstrateHandoffUpload(
+					ctx,
+					actorID,
+					bootstrapToken,
+					handoffState,
+					uploadRequest,
+				)
+				if reconcileErr == nil {
+					resp = reconciled
+					err = nil
+				} else {
+					err = reconcileErr
+				}
+			}
+		}
 		if err != nil {
 			return nil, e.workspaceDaemonError(err)
-		}
-		if mintedToken != "" {
-			handoffState.authValue = mintedToken
 		}
 	} else {
 		err := e.withActorHandoffToken(ctx, actorID, func(authToken string) error {
@@ -635,6 +680,93 @@ func (e *SubstrateWorkspaceExecutor) Upload(ctx context.Context, req UploadReque
 		}
 	}
 	return &UploadResult{Ref: req.Ref, Artifacts: daemonArtifactsToWorkspace(resp.Artifacts)}, nil
+}
+
+func substrateBootstrapHandoffMayHaveApplied(err error) bool {
+	if err == nil {
+		return true
+	}
+	var daemonErr *daemonprotocol.Error
+	if !errors.As(err, &daemonErr) {
+		return true
+	}
+	switch daemonErr.Reason {
+	case daemonprotocol.ErrorReasonRequestFailed, daemonprotocol.ErrorReasonDecodeResponse:
+		return true
+	case daemonprotocol.ErrorReasonStatus:
+		return daemonErr.StatusCode >= http.StatusInternalServerError
+	default:
+		return false
+	}
+}
+
+func distinctSubstrateHandoffToken(value, other string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == strings.TrimSpace(other) {
+		return ""
+	}
+	return value
+}
+
+type substrateHandoffAuthEvidence uint8
+
+const (
+	substrateHandoffAuthUnknown substrateHandoffAuthEvidence = iota
+	substrateHandoffAuthAccepted
+	substrateHandoffAuthRejected
+)
+
+func substrateHandoffAuthResult(err error) substrateHandoffAuthEvidence {
+	if err == nil {
+		return substrateHandoffAuthAccepted
+	}
+	var daemonErr *daemonprotocol.Error
+	if errors.As(err, &daemonErr) && daemonErr.Reason == daemonprotocol.ErrorReasonStatus &&
+		(daemonErr.StatusCode == http.StatusUnauthorized || daemonErr.StatusCode == http.StatusForbidden) {
+		return substrateHandoffAuthRejected
+	}
+	// Router, actor, and handler failures can all surface as other status codes;
+	// without an authenticated-response proof they do not identify which token
+	// the daemon accepted.
+	return substrateHandoffAuthUnknown
+}
+
+func (e *SubstrateWorkspaceExecutor) reconcileSubstrateHandoffUpload(
+	ctx context.Context,
+	actorID, bootstrapToken string,
+	state *substrateHandoffState,
+	request daemonprotocol.UploadRequest,
+) (*daemonprotocol.UploadResponse, error) {
+	type authCandidate struct {
+		token string
+	}
+	candidates := []authCandidate{{token: state.authValue}}
+	if fallback := distinctSubstrateHandoffToken(state.fallbackAuthValue, state.authValue); fallback != "" {
+		candidates = append(candidates, authCandidate{token: fallback})
+	}
+	if bootstrap := distinctSubstrateHandoffToken(bootstrapToken, state.authValue); bootstrap != "" &&
+		bootstrap != strings.TrimSpace(state.fallbackAuthValue) {
+		candidates = append(candidates, authCandidate{token: bootstrap})
+	}
+
+	var authErrs []error
+	for _, candidate := range candidates {
+		resp, err := e.workspaceDaemonClient().Upload(
+			ctx,
+			e.workspaceDaemonActorRequest(actorID, candidate.token),
+			request,
+		)
+		switch substrateHandoffAuthResult(err) {
+		case substrateHandoffAuthAccepted:
+			state.fallbackAuthValue = ""
+			return resp, nil
+		case substrateHandoffAuthRejected:
+			authErrs = append(authErrs, err)
+		case substrateHandoffAuthUnknown:
+			return nil, err
+		}
+	}
+	return nil, errors.Join(authErrs...)
 }
 
 func (e *SubstrateWorkspaceExecutor) mintSessionIdentityHandoffToken(ctx context.Context, ref WorkspaceRef) (string, error) {
@@ -1066,6 +1198,9 @@ func (e *SubstrateWorkspaceExecutor) restoreHandoffToken(ctx context.Context, ac
 			}},
 		},
 	)
+	if err == nil {
+		handoffState.fallbackAuthValue = ""
+	}
 	return e.workspaceDaemonError(err)
 }
 
@@ -1089,7 +1224,32 @@ func (e *SubstrateWorkspaceExecutor) withActorHandoffToken(ctx context.Context, 
 		return err
 	}
 	defer state.release()
-	return fn(state.authValue)
+
+	err := fn(state.authValue)
+	switch substrateHandoffAuthResult(err) {
+	case substrateHandoffAuthAccepted:
+		state.fallbackAuthValue = ""
+		return err
+	case substrateHandoffAuthUnknown:
+		return err
+	}
+
+	fallback := distinctSubstrateHandoffToken(state.fallbackAuthValue, state.authValue)
+	if fallback == "" {
+		return err
+	}
+	fallbackErr := fn(fallback)
+	switch substrateHandoffAuthResult(fallbackErr) {
+	case substrateHandoffAuthAccepted:
+		// The fallback authenticated this operation, but retain the minted
+		// candidate until a later request or bootstrap replay confirms which
+		// token won the original ambiguous handoff race.
+		return fallbackErr
+	case substrateHandoffAuthRejected, substrateHandoffAuthUnknown:
+		return fallbackErr
+	default:
+		return fallbackErr
+	}
 }
 
 func (e *SubstrateWorkspaceExecutor) workspaceDaemonClient() daemonprotocol.Client {
