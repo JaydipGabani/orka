@@ -272,6 +272,67 @@ describe('useTaskListAll', () => {
     await waitFor(() => expect(result.current.data?.items[0]?.metadata.name).toBe('late-running'))
     expect(seen).toEqual([null, 'next-page'])
   })
+
+  it('rejects continuation cursor cycles instead of looping forever', async () => {
+    const seen: (string | null)[] = []
+    server.use(
+      http.get('/api/v1/tasks', ({ request }) => {
+        const token = new URL(request.url).searchParams.get('continue')
+        seen.push(token)
+        if (!token) {
+          return HttpResponse.json({
+            items: [],
+            metadata: { continue: 'cursor-a' },
+          })
+        }
+        if (token === 'cursor-a') {
+          return HttpResponse.json({
+            items: [],
+            metadata: { continue: 'cursor-b' },
+          })
+        }
+        return HttpResponse.json({
+          items: [],
+          metadata: { continue: 'cursor-a' },
+        })
+      }),
+    )
+
+    const { result } = renderHook(() => useTaskListAll('100', false), {
+      wrapper: createWrapper(),
+    })
+
+    await waitFor(() => expect(result.current.isError).toBe(true))
+    expect(result.current.error).toEqual(
+      new Error('Task list pagination continuation cycle detected'),
+    )
+    expect(seen).toEqual([null, 'cursor-a', 'cursor-b'])
+  })
+
+  it('rejects pagination that exceeds the automatic page limit', async () => {
+    let pageCount = 0
+    server.use(
+      http.get('/api/v1/tasks', () => {
+        pageCount += 1
+        return HttpResponse.json({
+          items: [],
+          metadata: { continue: `cursor-${pageCount}` },
+        })
+      }),
+    )
+
+    const { result } = renderHook(() => useTaskListAll('100', false), {
+      wrapper: createWrapper(),
+    })
+
+    await waitFor(() => expect(result.current.isError).toBe(true), {
+      timeout: 15_000,
+    })
+    expect(result.current.error).toEqual(
+      new Error('Task list pagination page limit (1000) reached'),
+    )
+    expect(pageCount).toBe(1000)
+  })
 })
 
 describe('useTask', () => {

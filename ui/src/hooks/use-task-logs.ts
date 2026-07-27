@@ -4,6 +4,13 @@ import { API_BASE_URL } from '@/lib/constants'
 import { useUIStore } from '@/stores/ui'
 import type { TaskPhase } from '@/schemas/task'
 
+const taskLogRequestIdleTimeoutMs = 30_000
+
+interface InFlightLogRequest {
+  controller: AbortController
+  timeoutId: ReturnType<typeof setTimeout> | null
+}
+
 function isRunningPhase(phase?: TaskPhase): boolean {
   return phase === 'Running' || phase === 'Pending'
 }
@@ -14,8 +21,7 @@ export function useTaskLogs(taskId: string, enabled = true, taskPhase?: TaskPhas
   const [isStreaming, setIsStreaming] = useState(false)
   const [isLive, setIsLive] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const abortRef = useRef<AbortController | null>(null)
-  const inFlightRef = useRef<AbortController | null>(null)
+  const inFlightRef = useRef<InFlightLogRequest | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const fetchLogs = useCallback(async () => {
@@ -28,8 +34,22 @@ export function useTaskLogs(taskId: string, enabled = true, taskPhase?: TaskPhas
     const token = useAuthStore.getState().token
     const running = isRunningPhase(taskPhase)
     const controller = new AbortController()
-    abortRef.current = controller
-    inFlightRef.current = controller
+    const request: InFlightLogRequest = { controller, timeoutId: null }
+    const armIdleTimeout = () => {
+      if (request.timeoutId !== null) clearTimeout(request.timeoutId)
+      request.timeoutId = setTimeout(() => {
+        request.timeoutId = null
+        if (inFlightRef.current !== request) return
+
+        inFlightRef.current = null
+        controller.abort()
+        setError('Log request timed out')
+        setIsStreaming(false)
+      }, taskLogRequestIdleTimeoutMs)
+    }
+
+    inFlightRef.current = request
+    armIdleTimeout()
 
     try {
       setIsStreaming(true)
@@ -49,6 +69,7 @@ export function useTaskLogs(taskId: string, enabled = true, taskPhase?: TaskPhas
       )
 
       if (controller.signal.aborted) return
+      armIdleTimeout()
 
       if (!response.ok) {
         throw new Error(`Failed to fetch logs: ${response.statusText}`)
@@ -81,6 +102,7 @@ export function useTaskLogs(taskId: string, enabled = true, taskPhase?: TaskPhas
             const { done, value } = await reader.read()
             if (done) break
 
+            armIdleTimeout()
             buffer += decoder.decode(value, { stream: true })
             const lines = buffer.split('\n')
             buffer = lines.pop() || ''
@@ -113,11 +135,12 @@ export function useTaskLogs(taskId: string, enabled = true, taskPhase?: TaskPhas
         setError(err.message)
       }
     } finally {
-      if (inFlightRef.current === controller) {
+      if (request.timeoutId !== null) {
+        clearTimeout(request.timeoutId)
+        request.timeoutId = null
+      }
+      if (inFlightRef.current === request) {
         inFlightRef.current = null
-        if (abortRef.current === controller) {
-          abortRef.current = null
-        }
         setIsStreaming(false)
       }
     }
@@ -137,13 +160,14 @@ export function useTaskLogs(taskId: string, enabled = true, taskPhase?: TaskPhas
     }
 
     return () => {
-      const controller = abortRef.current
-      if (controller) {
-        abortRef.current = null
-        if (inFlightRef.current === controller) {
-          inFlightRef.current = null
+      const request = inFlightRef.current
+      if (request) {
+        inFlightRef.current = null
+        if (request.timeoutId !== null) {
+          clearTimeout(request.timeoutId)
+          request.timeoutId = null
         }
-        controller.abort()
+        request.controller.abort()
       }
       if (pollRef.current) {
         clearInterval(pollRef.current)

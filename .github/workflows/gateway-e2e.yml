@@ -101,4 +101,5 @@ jobs:
           make test-e2e \
             KIND_CLUSTER="${KIND_CLUSTER}" \
             E2E_GO_TEST_TIMEOUT="${E2E_GO_TEST_TIMEOUT}" \
-            E2E_GINKGO_FOCUS="Gateway live E2E"
+            E2E_GINKGO_FOCUS="Gateway live E2E" \
+            E2E_GINKGO_FAIL_ON_EMPTY=1

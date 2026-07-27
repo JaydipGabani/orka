@@ -117,6 +117,52 @@ describe('useTaskLogs', () => {
     expect(result.current.isLive).toBe(false)
   })
 
+  it('times out a stalled request so manual refetch can recover', async () => {
+    vi.useFakeTimers()
+
+    const signals: AbortSignal[] = []
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockImplementationOnce((_input, init) => {
+        signals.push(init?.signal as AbortSignal)
+        return new Promise<Response>(() => {})
+      })
+      .mockImplementationOnce((_input, init) => {
+        signals.push(init?.signal as AbortSignal)
+        const response = new Response(JSON.stringify({ logs: 'recovered-line' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+        Object.defineProperty(response, 'body', { value: null })
+        return Promise.resolve(response)
+      })
+
+    const { result, unmount } = renderHook(() =>
+      useTaskLogs('stalled-task', true, 'Succeeded'),
+    )
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(result.current.isStreaming).toBe(true)
+    expect(signals[0].aborted).toBe(false)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+
+    expect(signals[0].aborted).toBe(true)
+    expect(result.current.isStreaming).toBe(false)
+    expect(result.current.error).toBe('Log request timed out')
+
+    await act(async () => {
+      await result.current.refetch()
+    })
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    expect(signals[1].aborted).toBe(false)
+    expect(result.current.logs).toEqual(['recovered-line'])
+    expect(result.current.error).toBeNull()
+    unmount()
+  })
+
   it('keeps one slow running-task log request in flight until it completes', async () => {
     vi.useFakeTimers()
 

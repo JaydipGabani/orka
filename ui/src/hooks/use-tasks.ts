@@ -8,6 +8,8 @@ interface ListResponse<T> {
   metadata: { continue?: string; remainingItemCount?: number }
 }
 
+const maxTaskListPages = 1000
+
 function fetchTaskListPage(namespace: string, limit: string, continueToken?: string) {
   const params: Record<string, string> = { namespace, limit }
   if (continueToken) params.continue = continueToken
@@ -66,15 +68,36 @@ export function useTaskListAll(pageLimit = '100', refetchInterval: number | fals
     queryKey: ['tasks', 'all', namespace, pageLimit],
     queryFn: async () => {
       const items: Task[] = []
+      const seenContinueTokens = new Set<string>()
       let metadata: ListResponse<Task>['metadata'] = {}
       let continueToken: string | undefined
-      do {
+
+      for (let pageNumber = 1; pageNumber <= maxTaskListPages; pageNumber += 1) {
         const page = await fetchTaskListPage(namespace, pageLimit, continueToken)
         items.push(...page.items)
         metadata = page.metadata ?? {}
-        continueToken = metadata.continue
-      } while (continueToken)
-      return { items, metadata }
+
+        const nextContinueToken = metadata.continue
+        if (!nextContinueToken) {
+          return { items, metadata }
+        }
+        if (nextContinueToken === continueToken) {
+          throw new Error('Task list pagination continuation did not advance')
+        }
+        if (seenContinueTokens.has(nextContinueToken)) {
+          throw new Error('Task list pagination continuation cycle detected')
+        }
+        if (pageNumber === maxTaskListPages) {
+          throw new Error(
+            `Task list pagination page limit (${maxTaskListPages}) reached`,
+          )
+        }
+
+        seenContinueTokens.add(nextContinueToken)
+        continueToken = nextContinueToken
+      }
+
+      throw new Error('Task list pagination terminated unexpectedly')
     },
     refetchInterval,
   })
