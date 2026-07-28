@@ -85,7 +85,9 @@ func TestRunExecCleansUpUnixDescendantAfterLeaderExit(t *testing.T) {
 
 func TestKillExecProcessGroupReportsCompletedProcess(t *testing.T) {
 	cmd := exec.CommandContext(context.Background(), "/bin/sh", "-c", "exit 0")
-	configureExecCommand(cmd)
+	if err := configureExecCommand(cmd); err != nil {
+		t.Fatalf("configureExecCommand() error = %v", err)
+	}
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("run completed command: %v", err)
 	}

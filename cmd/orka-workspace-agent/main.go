@@ -111,11 +111,14 @@ func (s *workspaceAgentServer) routes() http.Handler {
 
 func (s *workspaceAgentServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Serialize file-upload authentication with the mutation itself. A
-		// bootstrap request can rotate the credential, and a reconciliation
-		// request must not observe the old credential while that write is still
-		// in flight or overtake it with a later rotation.
-		if r.Method == http.MethodPut && r.URL.Path == daemonprotocol.FilesPath {
+		// Serialize file-upload and scrub authentication with their mutations. A
+		// bootstrap request can rotate the credential, and reconciliation must not
+		// observe the old credential while that write is still in flight. Scrub
+		// must also run after any accepted upload so it cannot delete the handoff
+		// token before the upload recreates it.
+		serializeFileMutation := r.Method == http.MethodPut && r.URL.Path == daemonprotocol.FilesPath
+		serializeScrub := r.Method == http.MethodPost && r.URL.Path == daemonprotocol.ScrubPath
+		if serializeFileMutation || serializeScrub {
 			s.filesMu.Lock()
 			defer s.filesMu.Unlock()
 		}
@@ -356,7 +359,7 @@ func (s *workspaceAgentServer) runExec(
 	defer cancel()
 	startedAt := time.Now().UTC()
 	cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...)
-	configureExecCommand(cmd)
+	configureErr := configureExecCommand(cmd)
 	cmd.Dir = normalized.workDir
 	cmd.Env = mergeEnv(commandBaseEnv(os.Environ()), req.Env)
 	if len(req.Stdin) > 0 {
@@ -366,7 +369,10 @@ func (s *workspaceAgentServer) runExec(
 	stderr := &boundedBuffer{limit: normalized.maxOutput}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	err := cmd.Run()
+	err := configureErr
+	if err == nil {
+		err = runExecCommand(cmd)
+	}
 	cleanupExecDescendants(cmd)
 	finishedAt := time.Now().UTC()
 	exitCode := 0

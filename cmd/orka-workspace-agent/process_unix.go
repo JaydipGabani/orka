@@ -15,12 +15,15 @@ import (
 	"syscall"
 )
 
-func applyExecPlatformCancellation(cmd *exec.Cmd) {
+func applyExecPlatformCancellation(cmd *exec.Cmd) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		return killExecProcessGroup(cmd)
 	}
+	return nil
 }
+
+func runExecCommand(cmd *exec.Cmd) error { return cmd.Run() }
 
 func cleanupExecDescendants(cmd *exec.Cmd) {
 	_ = killExecProcessGroup(cmd)

@@ -13,7 +13,10 @@ import (
 
 const workspaceExecWaitDelay = time.Second
 
-func configureExecCommand(cmd *exec.Cmd) {
-	applyExecPlatformCancellation(cmd)
+func configureExecCommand(cmd *exec.Cmd) error {
+	if err := applyExecPlatformCancellation(cmd); err != nil {
+		return err
+	}
 	cmd.WaitDelay = workspaceExecWaitDelay
+	return nil
 }

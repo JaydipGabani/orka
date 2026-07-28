@@ -456,6 +456,92 @@ func TestWorkspaceAgentSerializesBootstrapMutationWithFileAuthentication(t *test
 	}
 }
 
+func TestWorkspaceAgentSerializesScrubAfterFileMutation(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "handoff-token")
+	if err := os.WriteFile(tokenFile, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("write initial token: %v", err)
+	}
+	t.Setenv(envHandoffToken, "")
+	t.Setenv(envHandoffTokenFile, tokenFile)
+	server := newWorkspaceAgentServer()
+
+	uploadEntered := make(chan struct{})
+	releaseUpload := make(chan struct{})
+	uploadDone := make(chan struct{})
+	scrubDone := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseUpload)
+		}
+	}()
+
+	handler := server.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == daemonprotocol.FilesPath:
+			close(uploadEntered)
+			<-releaseUpload
+			if err := os.WriteFile(tokenFile, []byte("secret"), 0o600); err != nil {
+				t.Errorf("write handoff token: %v", err)
+				http.Error(w, "write failed", http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == daemonprotocol.ScrubPath:
+			if err := os.Remove(tokenFile); err != nil && !os.IsNotExist(err) {
+				t.Errorf("remove handoff token: %v", err)
+				http.Error(w, "scrub failed", http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	uploadReq := httptest.NewRequest(http.MethodPut, daemonprotocol.FilesPath, bytes.NewReader([]byte(`{"files":[]}`)))
+	uploadReq.Header.Set("Authorization", "Bearer secret")
+	uploadResp := httptest.NewRecorder()
+	go func() {
+		handler(uploadResp, uploadReq)
+		close(uploadDone)
+	}()
+	<-uploadEntered
+
+	scrubReq := httptest.NewRequest(http.MethodPost, daemonprotocol.ScrubPath, bytes.NewReader([]byte(`{"paths":[]}`)))
+	scrubReq.Header.Set("Authorization", "Bearer secret")
+	scrubResp := httptest.NewRecorder()
+	go func() {
+		handler(scrubResp, scrubReq)
+		close(scrubDone)
+	}()
+
+	scrubCompletedBeforeUpload := false
+	select {
+	case <-scrubDone:
+		scrubCompletedBeforeUpload = true
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseUpload)
+	released = true
+	<-uploadDone
+	<-scrubDone
+
+	if scrubCompletedBeforeUpload {
+		t.Fatal("scrub completed before the in-flight file mutation")
+	}
+	if uploadResp.Code != http.StatusNoContent {
+		t.Fatalf("upload status = %d, want %d: %s", uploadResp.Code, http.StatusNoContent, uploadResp.Body.String())
+	}
+	if scrubResp.Code != http.StatusNoContent {
+		t.Fatalf("scrub status = %d, want %d: %s", scrubResp.Code, http.StatusNoContent, scrubResp.Body.String())
+	}
+	if _, err := os.Stat(tokenFile); !os.IsNotExist(err) {
+		t.Fatalf("handoff token exists after serialized scrub: %v", err)
+	}
+}
+
 func TestWorkspaceAgentBootstrapDefaultUploadHonorsConfiguredTokenFile(t *testing.T) {
 	dir := t.TempDir()
 	previousAllowedRoots := allowedRoots

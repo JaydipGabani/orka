@@ -7,10 +7,10 @@ MIT License - see LICENSE file for details.
 package client
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1038,15 +1038,38 @@ func (c *Client) StreamTaskLogs(ctx context.Context, name string, opts StreamLog
 		w = io.Discard
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if after, ok := strings.CutPrefix(line, "data: "); ok {
-			fmt.Fprintln(w, after) //nolint:errcheck
+	reader := NewSSEReader(resp.Body)
+	for {
+		event, ok := reader.Next()
+		if !ok {
+			break
+		}
+		if event.Event == "error" {
+			return taskLogStreamError(event.Data)
+		}
+		if _, err := fmt.Fprintln(w, event.Data); err != nil {
+			return fmt.Errorf("failed to write task logs: %w", err)
 		}
 	}
-	return scanner.Err()
+	if err := reader.Err(); err != nil {
+		return fmt.Errorf("failed to read task logs: %w", err)
+	}
+	return nil
+}
+
+func taskLogStreamError(data string) error {
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err == nil {
+		if message := strings.TrimSpace(payload.Error); message != "" {
+			return fmt.Errorf("task log stream error: %s", message)
+		}
+	}
+	if message := strings.TrimSpace(data); message != "" {
+		return fmt.Errorf("task log stream error: %s", message)
+	}
+	return errors.New("task log stream error")
 }
 
 // GetTaskResult gets the result of a task.

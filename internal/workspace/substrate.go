@@ -662,6 +662,15 @@ func (e *SubstrateWorkspaceExecutor) Upload(ctx context.Context, req UploadReque
 					err = reconcileErr
 				}
 			}
+		} else if err != nil && substrateBootstrapHandoffMayHaveApplied(err) {
+			// Without SessionIdentity there is no new credential candidate to
+			// track. Replay the idempotent upload with the existing handoff
+			// credential; success proves the ambiguous bootstrap write applied.
+			resp, err = e.workspaceDaemonClient().Upload(
+				ctx,
+				e.workspaceDaemonActorRequest(actorID, handoffState.authValue),
+				uploadRequest,
+			)
 		}
 		if err != nil {
 			return nil, e.workspaceDaemonError(err)

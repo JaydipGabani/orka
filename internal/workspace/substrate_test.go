@@ -697,6 +697,123 @@ func TestSubstrateBootstrapHandoffUploadUsesMintedSessionIdentity(t *testing.T) 
 	}
 }
 
+func TestSubstrateAmbiguousBootstrapHandoffErrorReconcilesExistingHandoffToken(t *testing.T) {
+	tests := []struct {
+		name                   string
+		writeAmbiguousResponse func(http.ResponseWriter) error
+	}{
+		{
+			name: "malformed response",
+			writeAmbiguousResponse: func(w http.ResponseWriter) error {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte("{"))
+				return err
+			},
+		},
+		{
+			name: "server error after apply",
+			writeAmbiguousResponse: func(w http.ResponseWriter) error {
+				http.Error(w, "response unavailable", http.StatusServiceUnavailable)
+				return nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stateMu sync.Mutex
+			activeToken := ""
+			uploadCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPut && r.URL.Path == substrateTestFilesPath:
+					stateMu.Lock()
+					uploadCalls++
+					call := uploadCalls
+					stateMu.Unlock()
+					wantBearer := substrateTestBootstrapBearer
+					if call > 1 {
+						wantBearer = substrateTestBearer
+					}
+					if got := r.Header.Get("Authorization"); got != wantBearer {
+						t.Errorf("upload %d Authorization = %q, want %q", call, got, wantBearer)
+					}
+					var req substrateUploadRequest
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Files) != 1 {
+						http.Error(w, "bad request", http.StatusBadRequest)
+						return
+					}
+					if got := string(req.Files[0].Data); got != substrateTestToken {
+						t.Errorf("upload %d handoff token = %q, want %q", call, got, substrateTestToken)
+					}
+					stateMu.Lock()
+					activeToken = string(req.Files[0].Data)
+					stateMu.Unlock()
+					if call == 1 {
+						if err := tt.writeAmbiguousResponse(w); err != nil {
+							t.Errorf("write ambiguous response: %v", err)
+						}
+						return
+					}
+					_ = json.NewEncoder(w).Encode(substrateUploadResponse{})
+				case r.Method == http.MethodPost && r.URL.Path == substrateTestExecPath:
+					stateMu.Lock()
+					wantToken := activeToken
+					stateMu.Unlock()
+					if got := r.Header.Get("Authorization"); got != "Bearer "+wantToken {
+						http.Error(w, "stale local token", http.StatusUnauthorized)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(substrateExecResponse{ExitCode: 0})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			executor := &SubstrateWorkspaceExecutor{
+				httpClient:     server.Client(),
+				routerURL:      server.URL,
+				actorDNSSuffix: "actors.test",
+				handoffToken:   substrateTestToken,
+				bootstrapToken: "bootstrap-token",
+			}
+
+			_, err := executor.Upload(t.Context(), UploadRequest{
+				Ref:              WorkspaceRef{ID: "actor-1"},
+				BootstrapHandoff: true,
+				Artifacts: []UploadArtifact{{
+					Path: substrateHandoffTokenUploadPath,
+					Data: []byte(substrateTestToken),
+					Mode: 0o600,
+				}},
+				Timeout: time.Second,
+			})
+			if err != nil {
+				t.Fatalf("Upload() error = %v, want existing-token reconciliation", err)
+			}
+			stateMu.Lock()
+			gotUploadCalls := uploadCalls
+			remoteToken := activeToken
+			stateMu.Unlock()
+			if gotUploadCalls != 2 {
+				t.Fatalf("daemon upload calls = %d, want initial request plus one reconciliation", gotUploadCalls)
+			}
+			if remoteToken != substrateTestToken {
+				t.Fatalf("daemon actor token = %q, want existing handoff token %q", remoteToken, substrateTestToken)
+			}
+			if _, err := executor.Exec(t.Context(), ExecRequest{
+				Ref:     WorkspaceRef{ID: "actor-1"},
+				Command: []string{"true"},
+				Timeout: time.Second,
+			}); err != nil {
+				t.Fatalf("Exec() after reconciled bootstrap response error = %v", err)
+			}
+		})
+	}
+}
+
 func TestSubstrateAmbiguousBootstrapHandoffErrorReconcilesMintedSessionIdentity(t *testing.T) {
 	tests := []struct {
 		name                   string

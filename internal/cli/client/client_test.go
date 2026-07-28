@@ -1578,7 +1578,7 @@ func TestClient_LongStreamsRemainUsablePastResponseHeaderTimeout(t *testing.T) {
 		},
 		{
 			name:         "task logs",
-			responseBody: "data: delayed log\n",
+			responseBody: "data: delayed log\n\n",
 			want:         "delayed log\n",
 			readStream: func(ctx context.Context, c *Client) (string, error) {
 				var output bytes.Buffer
@@ -1686,23 +1686,36 @@ func TestGetChatConfig(t *testing.T) {
 
 func TestStreamTaskLogs(t *testing.T) {
 	tests := []struct {
-		name    string
-		status  int
-		body    string
-		wantOut string
-		wantErr bool
+		name            string
+		status          int
+		body            string
+		wantOut         string
+		wantErrContains string
 	}{
 		{
 			name:    "success",
 			status:  http.StatusOK,
-			body:    "data: line1\ndata: line2\n",
+			body:    "event: log\ndata: line1\n\nevent: log\ndata: line2\n\n",
 			wantOut: "line1\nline2\n",
 		},
 		{
-			name:    "server error",
-			status:  http.StatusInternalServerError,
-			body:    "error",
-			wantErr: true,
+			name:    "multiline data",
+			status:  http.StatusOK,
+			body:    "event: log\ndata: line1\ndata: line2\n\n",
+			wantOut: "line1\nline2\n",
+		},
+		{
+			name:            "stream error event",
+			status:          http.StatusOK,
+			body:            "event: log\ndata: before-error\n\nevent: error\ndata: {\"error\":\"failed to read task logs: unexpected EOF\"}\n\n",
+			wantOut:         "before-error\n",
+			wantErrContains: "failed to read task logs: unexpected EOF",
+		},
+		{
+			name:            "server error",
+			status:          http.StatusInternalServerError,
+			body:            "error",
+			wantErrContains: "API error (HTTP 500)",
 		},
 	}
 	for _, tt := range tests {
@@ -1719,11 +1732,65 @@ func TestStreamTaskLogs(t *testing.T) {
 				Namespace: "ns1",
 				Writer:    &buf,
 			})
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
+			if tt.wantErrContains == "" {
+				if err != nil {
+					t.Fatalf("StreamTaskLogs() error = %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantErrContains) {
+				t.Fatalf("StreamTaskLogs() error = %v, want containing %q", err, tt.wantErrContains)
 			}
-			if !tt.wantErr && buf.String() != tt.wantOut {
+			if buf.String() != tt.wantOut {
 				t.Errorf("output = %q, want %q", buf.String(), tt.wantOut)
+			}
+		})
+	}
+}
+
+func TestStreamTaskLogs_ScannerLimit(t *testing.T) {
+	const maxServerLogLineBytes = 1024 * 1024
+
+	tests := []struct {
+		name            string
+		dataBytes       int
+		wantErrContains string
+	}{
+		{
+			name:      "accepts server maximum log line",
+			dataBytes: maxServerLogLineBytes,
+		},
+		{
+			name:            "rejects oversized SSE line",
+			dataBytes:       maxServerLogLineBytes + 1,
+			wantErrContains: "SSE line exceeds",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := strings.Repeat("x", tt.dataBytes)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprintf(w, "event: log\ndata: %s\n\n", data) //nolint:errcheck
+			}))
+			defer srv.Close()
+
+			var output bytes.Buffer
+			c := New(srv.URL, "")
+			err := c.StreamTaskLogs(t.Context(), "t1", StreamLogsOptions{Writer: &output})
+			if tt.wantErrContains == "" {
+				if err != nil {
+					t.Fatalf("StreamTaskLogs() error = %v", err)
+				}
+				if got := output.Len(); got != tt.dataBytes+1 {
+					t.Fatalf("output length = %d, want %d", got, tt.dataBytes+1)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrContains) {
+				t.Fatalf("StreamTaskLogs() error = %v, want containing %q", err, tt.wantErrContains)
+			}
+			if output.Len() != 0 {
+				t.Fatalf("output length = %d, want 0", output.Len())
 			}
 		})
 	}
