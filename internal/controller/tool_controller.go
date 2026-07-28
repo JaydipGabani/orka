@@ -75,10 +75,11 @@ type ToolReconciler struct {
 	SkipSSRFValidation bool
 
 	// SubstrateEnabled enables durable MCP tool actors.
-	SubstrateEnabled          bool
-	SubstrateConfig           SubstrateConfig
-	EnforceNamespaceIsolation bool
-	OutboundAccessTrust       outboundaccess.TrustConfig
+	SubstrateEnabled            bool
+	SubstrateConfig             SubstrateConfig
+	EnforceNamespaceIsolation   bool
+	WorkspaceProviderAPIEnabled bool
+	OutboundAccessTrust         outboundaccess.TrustConfig
 
 	// SubstrateExecutorFactory is injectable for tests.
 	SubstrateExecutorFactory func(SubstrateConfig) (workspace.WorkspaceExecutor, error)
@@ -145,14 +146,24 @@ func (r *ToolReconciler) validateTool(ctx context.Context, tool *corev1alpha1.To
 	if tool.Spec.MCP != nil && tool.Spec.MCP.SubstrateActor != nil {
 		return r.validateSubstrateMCPTool(ctx, tool)
 	}
+	if tool.Spec.MCP != nil && tool.Spec.MCP.Workspace != nil {
+		if !r.WorkspaceProviderAPIEnabled {
+			return fmt.Errorf("mcp.workspace requires the workspace provider API")
+		}
+		return fmt.Errorf("mcp.workspace requires controller-first Tool workspace integration")
+	}
 	if tool.Spec.HTTP == nil {
 		return fmt.Errorf("http is required unless mcp.substrateActor is set")
 	}
+	return r.validateToolHTTPURL(tool.Spec.HTTP.URL)
+}
+
+func (r *ToolReconciler) validateToolHTTPURL(rawURL string) error {
 	// Validate URL
-	if tool.Spec.HTTP.URL == "" {
+	if rawURL == "" {
 		return fmt.Errorf("http.url is required")
 	}
-	parsedURL, err := url.Parse(tool.Spec.HTTP.URL)
+	parsedURL, err := url.Parse(rawURL)
 	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
 		return fmt.Errorf("invalid http.url")
 	}
