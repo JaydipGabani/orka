@@ -78,6 +78,16 @@ func TestValidateTool(t *testing.T) {
 			},
 		},
 		{
+			name: "valid non-credential token-like query parameters",
+			tool: &corev1alpha1.Tool{
+				ObjectMeta: metav1.ObjectMeta{Name: "token-like-query", Namespace: "default"},
+				Spec: corev1alpha1.ToolSpec{
+					Description: "A tool",
+					HTTP:        &corev1alpha1.HTTPExecution{URL: "http://example.com/api?max_tokens=10&tokenizer=model&pagination-token=next"},
+				},
+			},
+		},
+		{
 			name: "missing URL",
 			tool: &corev1alpha1.Tool{
 				ObjectMeta: metav1.ObjectMeta{Name: "t2", Namespace: "default"},
@@ -100,6 +110,42 @@ func TestValidateTool(t *testing.T) {
 			},
 			wantErr:   true,
 			errSubstr: "invalid http.url",
+		},
+		{
+			name: "credential query parameter",
+			tool: &corev1alpha1.Tool{
+				ObjectMeta: metav1.ObjectMeta{Name: "credential-query", Namespace: "default"},
+				Spec: corev1alpha1.ToolSpec{
+					Description: "A tool",
+					HTTP:        &corev1alpha1.HTTPExecution{URL: "http://example.com/api?api-key=value"},
+				},
+			},
+			wantErr:   true,
+			errSubstr: "credential query parameters",
+		},
+		{
+			name: "signed URL query parameter",
+			tool: &corev1alpha1.Tool{
+				ObjectMeta: metav1.ObjectMeta{Name: "signed-query", Namespace: "default"},
+				Spec: corev1alpha1.ToolSpec{
+					Description: "A tool",
+					HTTP:        &corev1alpha1.HTTPExecution{URL: "http://example.com/api?sig=credential"},
+				},
+			},
+			wantErr:   true,
+			errSubstr: "credential query parameters",
+		},
+		{
+			name: "malformed credential query parameter",
+			tool: &corev1alpha1.Tool{
+				ObjectMeta: metav1.ObjectMeta{Name: "malformed-query", Namespace: "default"},
+				Spec: corev1alpha1.ToolSpec{
+					Description: "A tool",
+					HTTP:        &corev1alpha1.HTTPExecution{URL: "http://example.com/api?safe=value;api-key=secret"},
+				},
+			},
+			wantErr:   true,
+			errSubstr: "invalid http.url query",
 		},
 		{
 			name: "missing description",

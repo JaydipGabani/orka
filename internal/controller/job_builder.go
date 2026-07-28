@@ -92,24 +92,28 @@ const (
 // JobBuilder builds Kubernetes Jobs for Tasks
 type JobBuilder struct {
 	client.Client
-	AIWorkerImage                     string
-	GeneralWorkerImage                string
-	InitImage                         string
-	AIWorkerServiceAccountName        string
-	VendorWorkerServiceAccountName    string
-	ContainerWorkerServiceAccountName string
-	ControllerURL                     string // e.g. http://orka-controller.orka-system.svc:8080
-	ContextTokenTTSURL                string
-	ContextTokenTTSAudience           string
-	ContextTokenTTSTimeout            string
-	ContextTokenTTSTokenSource        string
-	ContextTokenSubjectTokenType      string
-	ContextTokenChildScope            string
-	ContextTokenOutboundScope         string
-	ContextTokenChildTokenTTL         string
-	ContextTokenToolTokenTTL          string
-	EnableTelemetry                   bool
-	directSecrets                     directRuntimeSecretPolicy
+	AIWorkerImage                              string
+	GeneralWorkerImage                         string
+	InitImage                                  string
+	AIWorkerServiceAccountName                 string
+	VendorWorkerServiceAccountName             string
+	ContainerWorkerServiceAccountName          string
+	ControllerURL                              string // e.g. http://orka-controller.orka-system.svc:8080
+	ContextTokenTTSEndpoint                    string
+	ContextTokenTTSAudience                    string
+	ContextTokenTTSTimeout                     string
+	ContextTokenTTSTokenSource                 string
+	ContextTokenSubjectTokenType               string
+	ContextTokenChildScope                     string
+	ContextTokenOutboundScope                  string
+	ContextTokenChildTokenTTL                  string
+	ContextTokenToolTokenTTL                   string
+	EnforceTransactionCredentialAuth           bool
+	TransactionCredentialReadScopes            []string
+	OutboundAccessTrustedGatewayServices       string
+	OutboundAccessTrustedTokenEndpointServices string
+	EnableTelemetry                            bool
+	directSecrets                              directRuntimeSecretPolicy
 }
 
 type directRuntimeSecretPolicy struct {
@@ -148,7 +152,7 @@ func (b *JobBuilder) workerServiceAccountForTask(task *corev1alpha1.Task) string
 		return workerServiceAccountName(b.ContainerWorkerServiceAccountName, ContainerWorkerServiceAccount)
 	}
 	if taskRequestsRuntimeAuthOnly(task) {
-		return ContainerWorkerServiceAccount
+		return workerServiceAccountName(b.ContainerWorkerServiceAccountName, ContainerWorkerServiceAccount)
 	}
 
 	switch task.Spec.Type {
@@ -637,7 +641,16 @@ func (b *JobBuilder) buildEnvVarsWithOptions(ctx context.Context, task *corev1al
 	envVars = setControllerEnvValue(envVars, workerenv.AutonomousMode, "")
 	envVars = setControllerEnvValue(envVars, workerenv.ResolvedApprovals, "")
 	envVars = setControllerEnvValue(envVars, workerenv.ApprovalRequiredTools, "")
-	envVars = addTransactionEnvVars(envVars, task.Spec.Transaction)
+	envVars = setTransactionCredentialAuthorizationEnv(
+		envVars,
+		task.Spec.Transaction,
+		b.EnforceTransactionCredentialAuth,
+	)
+	envVars = addTransactionEnvVars(
+		envVars,
+		task.Spec.Transaction,
+		b.TransactionCredentialReadScopes,
+	)
 
 	// Add prior task env vars for iterative coordination
 	if task.Spec.PriorTaskRef != nil {
@@ -893,7 +906,11 @@ func isReservedTraceContextEnv(name string) bool {
 	}
 }
 
-func addTransactionEnvVars(envVars []corev1.EnvVar, tx *corev1alpha1.TaskTransaction) []corev1.EnvVar {
+func addTransactionEnvVars(
+	envVars []corev1.EnvVar,
+	tx *corev1alpha1.TaskTransaction,
+	credentialReadScopes []string,
+) []corev1.EnvVar {
 	if tx == nil {
 		return envVars
 	}
@@ -906,7 +923,25 @@ func addTransactionEnvVars(envVars []corev1.EnvVar, tx *corev1alpha1.TaskTransac
 	envVars = setControllerEnv(envVars, workerenv.TransactionScopes, workerenv.JoinCSV(tx.Scopes))
 	envVars = setControllerEnv(envVars, workerenv.TransactionContextDigest, tx.ContextDigest)
 	envVars = setControllerEnv(envVars, workerenv.TransactionRequesterContextDigest, tx.RequesterContextDigest)
+	envVars = setControllerEnv(envVars, workerenv.TransactionCredentialSecret, tx.Context["secret"])
+	envVars = setControllerEnv(
+		envVars,
+		workerenv.TransactionCredentialReadScopes,
+		workerenv.JoinCSV(credentialReadScopes),
+	)
 	return envVars
+}
+
+func setTransactionCredentialAuthorizationEnv(
+	envVars []corev1.EnvVar,
+	tx *corev1alpha1.TaskTransaction,
+	enforced bool,
+) []corev1.EnvVar {
+	return setControllerEnvValue(
+		envVars,
+		workerenv.TransactionCredentialAuthorizationEnforced,
+		strconv.FormatBool(tx != nil && enforced),
+	)
 }
 
 // aiConfig holds resolved AI configuration from provider, agent, and task.
@@ -1151,8 +1186,10 @@ func (b *JobBuilder) addTransactionTokenSecret(job *batchv1.Job, task *corev1alp
 	injectTTS := b.shouldInjectContextTokenTTS(task, secretName)
 	for i := range job.Spec.Template.Spec.Containers {
 		container := &job.Spec.Template.Spec.Containers[i]
+		container.Env = setControllerEnv(container.Env, workerenv.OutboundAccessTrustedGatewayServices, b.OutboundAccessTrustedGatewayServices)
+		container.Env = setControllerEnv(container.Env, workerenv.OutboundAccessTrustedTokenEndpointServices, b.OutboundAccessTrustedTokenEndpointServices)
 		if injectTTS {
-			container.Env = setControllerEnv(container.Env, workerenv.ContextTokenTTSURL, b.ContextTokenTTSURL)
+			container.Env = setControllerEnv(container.Env, workerenv.ContextTokenTTSEndpoint, b.ContextTokenTTSEndpoint)
 			container.Env = setControllerEnv(container.Env, workerenv.ContextTokenTTSAudience, b.ContextTokenTTSAudience)
 			container.Env = setControllerEnv(container.Env, workerenv.ContextTokenTTSTimeout, b.ContextTokenTTSTimeout)
 			container.Env = setControllerEnv(container.Env, workerenv.ContextTokenTTSTokenSource, b.ContextTokenTTSTokenSource)
@@ -1212,7 +1249,7 @@ func (b *JobBuilder) addTransactionTokenSecret(job *batchv1.Job, task *corev1alp
 }
 
 func (b *JobBuilder) shouldInjectContextTokenTTS(task *corev1alpha1.Task, secretName string) bool {
-	if b.ContextTokenTTSURL == "" {
+	if b.ContextTokenTTSEndpoint == "" {
 		return false
 	}
 	if secretName != "" {
@@ -1226,7 +1263,7 @@ func (b *JobBuilder) shouldInjectContextTokenTTS(task *corev1alpha1.Task, secret
 
 func contextTokenTTSEnvNames() []string {
 	return []string{
-		workerenv.ContextTokenTTSURL,
+		workerenv.ContextTokenTTSEndpoint,
 		workerenv.ContextTokenTTSAudience,
 		workerenv.ContextTokenTTSTimeout,
 		workerenv.ContextTokenTTSTokenSource,

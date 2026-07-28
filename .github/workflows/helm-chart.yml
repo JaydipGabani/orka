@@ -168,6 +168,11 @@ jobs:
             grep -Eq "resources: \\[.*\"${resource}/status\"" "${secondary_rbac}"
             grep -Eq "resources: \\[.*\"${resource}/finalizers\"" "${secondary_rbac}"
           done
+          test "$(grep -Fc 'resources: ["serviceaccounts/token"]' manifest_staging/charts/orka/templates/rbac.yaml)" -eq 1
+          if grep -Fq 'ai-worker-tokenrequest' manifest_staging/charts/orka/templates/rbac.yaml; then
+            echo "AI workers must not receive an unrestricted TokenRequest ClusterRole." >&2
+            exit 1
+          fi
 
           mkdir -p cr-release-packages
           helm package manifest_staging/charts/orka --destination cr-release-packages
@@ -177,7 +182,7 @@ jobs:
             echo "Expected exactly one packaged Orka chart, found ${#chart_packages[@]}." >&2
             exit 1
           fi
-          test "$(helm show crds "${chart_packages[0]}" | grep -c '^kind: CustomResourceDefinition$')" -eq 12
+          test "$(helm show crds "${chart_packages[0]}" | grep -c '^kind: CustomResourceDefinition$')" -eq 13
 
       - name: Install kind
         run: |
@@ -214,6 +219,7 @@ jobs:
           gatewaybindings.gateway.orka.ai
           gatewayclasses.gateway.orka.ai
           gateways.gateway.orka.ai
+          outboundaccesspolicies.core.orka.ai
           providers.core.orka.ai
           repositorymonitors.core.orka.ai
           repositoryscans.core.orka.ai
