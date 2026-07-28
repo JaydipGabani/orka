@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"os"
 	"slices"
 	"strconv"
@@ -1144,6 +1145,14 @@ func (r *TaskReconciler) continueHarnessBrokeredToolCall(
 		}
 		return fmt.Errorf("brokered tool call failed: %w", err)
 	}
+	// Persist continuation intent before the remote side effect. If this write
+	// fails, the tool result is replayable locally and /continue has not run; if
+	// /continue later has an ambiguous outcome, the marker keeps clean EOFs in the
+	// polling path until a terminal frame arrives.
+	continuationAlreadyPending := harnessWrapperBrokeredContinuationPending(task)
+	if err := r.patchHarnessWrapperBrokeredContinuationPending(ctx, task, true); err != nil {
+		return err
+	}
 	continueCtx, cancel := context.WithTimeout(ctx, harnessWrapperBrokeredToolTimeout)
 	defer cancel()
 	_, err = client.ContinueTurn(continueCtx, harness.ContinueTurnRequest{
@@ -1157,12 +1166,111 @@ func (r *TaskReconciler) continueHarnessBrokeredToolCall(
 		ToolResults:      []harness.ToolCallResult{result},
 	})
 	if err != nil {
+		if harnessContinuationMarkerShouldClear(continuationAlreadyPending, err) {
+			if clearErr := r.patchHarnessWrapperBrokeredContinuationPending(ctx, task, false); clearErr != nil {
+				return fmt.Errorf("clear brokered continuation marker after rejection: %w", clearErr)
+			}
+		}
 		return fmt.Errorf("continue brokered tool call %q: %w", frame.ToolCallID, err)
 	}
 	if err := r.clearHarnessBrokeredApprovalWaiting(ctx, task, frame.ToolName); err != nil {
 		return err
 	}
 	return nil
+}
+
+func harnessContinuationMarkerShouldClear(wasPending bool, err error) bool {
+	return !wasPending && !harnessMutationMayHaveBeenAccepted(err)
+}
+
+func harnessMutationMayHaveBeenAccepted(err error) bool {
+	if err == nil {
+		return false
+	}
+	var clientErr harness.ClientError
+	if !errors.As(err, &clientErr) {
+		return legacyMutationMayHaveBeenAccepted(err)
+	}
+	return clientErr.RemoteAccepted || clientErr.RemoteAcceptanceUnknown ||
+		clientErr.StatusCode >= http.StatusInternalServerError ||
+		clientErr.StatusCode == http.StatusRequestTimeout || clientErr.StatusCode == http.StatusTooManyRequests ||
+		(clientErr.StatusCode >= http.StatusOK && clientErr.StatusCode < http.StatusMultipleChoices)
+}
+
+func legacyMutationMayHaveBeenAccepted(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status, _, ok := legacyMutationResponse(err); ok {
+		return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests ||
+			status >= http.StatusInternalServerError ||
+			(status >= http.StatusOK && status < http.StatusMultipleChoices)
+	}
+	if message, ok := legacyMutationMessage(err); ok {
+		return !strings.Contains(strings.ToLower(message), "harness did not accept")
+	}
+	return true
+}
+
+func legacyMutationMessage(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	message := err.Error()
+	marker := " failed:"
+	markerIndex := strings.Index(message, marker)
+	if markerIndex < 0 {
+		return "", false
+	}
+	operation := strings.TrimSpace(message[:markerIndex])
+	operation = strings.TrimSpace(strings.TrimPrefix(operation, "harness "))
+	switch operation {
+	case "post", "start_turn", "continue_turn":
+		return strings.TrimSpace(message[markerIndex+len(marker):]), true
+	default:
+		return "", false
+	}
+}
+
+func legacyMutationResponse(err error) (int, string, bool) {
+	if err == nil {
+		return 0, "", false
+	}
+	message := err.Error()
+	marker := " failed ("
+	markerIndex := strings.Index(message, marker)
+	if markerIndex < 0 {
+		return 0, "", false
+	}
+	operation := strings.TrimSpace(message[:markerIndex])
+	operation = strings.TrimSpace(strings.TrimPrefix(operation, "harness "))
+	switch operation {
+	case "post", "start_turn", "continue_turn":
+	default:
+		return 0, "", false
+	}
+	statusStart := markerIndex + len(marker)
+	if statusStart+4 > len(message) || message[statusStart+3] != ')' {
+		return 0, "", false
+	}
+	status, parseErr := strconv.Atoi(message[statusStart : statusStart+3])
+	if parseErr != nil || status < 100 || status > 599 {
+		return 0, "", false
+	}
+	remainder := strings.TrimSpace(message[statusStart+4:])
+	remainder = strings.TrimSpace(strings.TrimPrefix(remainder, ":"))
+	var envelope struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal([]byte(remainder), &envelope) == nil {
+		if envelope.Error != "" {
+			remainder = envelope.Error
+		} else if envelope.Message != "" {
+			remainder = envelope.Message
+		}
+	}
+	return status, remainder, true
 }
 
 func brokeredToolError(code string, err error) *harness.ErrorInfo {
