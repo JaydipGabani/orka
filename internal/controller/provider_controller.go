@@ -8,6 +8,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -25,8 +26,9 @@ import (
 )
 
 const (
-	reasonValidationSucceeded = "ValidationSucceeded"
-	reasonValidationFailed    = "ValidationFailed"
+	reasonValidationSucceeded                = "ValidationSucceeded"
+	reasonValidationFailed                   = "ValidationFailed"
+	providerDependencyValidationRequeueAfter = 5 * time.Minute
 )
 
 // ProviderReconciler reconciles a Provider object
@@ -160,7 +162,7 @@ func (r *ProviderReconciler) updateStatus(ctx context.Context, provider *corev1a
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: providerDependencyValidationRequeueAfter}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager

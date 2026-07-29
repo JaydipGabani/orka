@@ -330,8 +330,12 @@ func TestProviderReconcileSkipsUnchangedStatusUpdate(t *testing.T) {
 	reconciler := &ProviderReconciler{Client: countingClient, Scheme: scheme}
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: provider.Name, Namespace: provider.Namespace}}
 
-	if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+	firstResult, err := reconciler.Reconcile(context.Background(), req)
+	if err != nil {
 		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if firstResult.RequeueAfter != providerDependencyValidationRequeueAfter {
+		t.Fatalf("first Reconcile() RequeueAfter = %v, want %v", firstResult.RequeueAfter, providerDependencyValidationRequeueAfter)
 	}
 	if countingClient.statusUpdateCount != 1 {
 		t.Fatalf("status updates after first reconcile = %d, want 1", countingClient.statusUpdateCount)
@@ -344,8 +348,12 @@ func TestProviderReconcileSkipsUnchangedStatusUpdate(t *testing.T) {
 		t.Fatal("LastValidated = nil after successful validation")
 	}
 
-	if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+	secondResult, err := reconciler.Reconcile(context.Background(), req)
+	if err != nil {
 		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if secondResult.RequeueAfter != providerDependencyValidationRequeueAfter {
+		t.Fatalf("second Reconcile() RequeueAfter = %v, want %v", secondResult.RequeueAfter, providerDependencyValidationRequeueAfter)
 	}
 	if countingClient.statusUpdateCount != 1 {
 		t.Fatalf("status updates after second reconcile = %d, want no additional update", countingClient.statusUpdateCount)
@@ -356,6 +364,63 @@ func TestProviderReconcileSkipsUnchangedStatusUpdate(t *testing.T) {
 	}
 	if second.Status.LastValidated == nil || !second.Status.LastValidated.Equal(first.Status.LastValidated) {
 		t.Fatalf("LastValidated changed across no-op reconcile: first=%v second=%v", first.Status.LastValidated, second.Status.LastValidated)
+	}
+}
+
+func TestProviderPeriodicRevalidationDetectsDeletedSecret(t *testing.T) {
+	scheme := newProviderScheme()
+	provider := &corev1alpha1.Provider{
+		ObjectMeta: metav1.ObjectMeta{Name: "periodic-provider", Namespace: "default"},
+		Spec: corev1alpha1.ProviderSpec{
+			Type:      corev1alpha1.ProviderTypeOpenAI,
+			SecretRef: corev1alpha1.ProviderSecretRef{Name: "periodic-provider-secret"},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: provider.Spec.SecretRef.Name, Namespace: provider.Namespace},
+		Data:       map[string][]byte{"api-key": []byte("test")},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.Provider{}).
+		WithObjects(provider, secret).
+		Build()
+	reconciler := &ProviderReconciler{Client: cl, Scheme: scheme}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: provider.Name, Namespace: provider.Namespace}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != providerDependencyValidationRequeueAfter {
+		t.Fatalf("first Reconcile() RequeueAfter = %v, want %v", result.RequeueAfter, providerDependencyValidationRequeueAfter)
+	}
+	current := &corev1alpha1.Provider{}
+	if err := cl.Get(context.Background(), req.NamespacedName, current); err != nil {
+		t.Fatalf("Get Provider after validation: %v", err)
+	}
+	if !current.Status.Ready {
+		t.Fatal("Provider Ready = false before Secret deletion")
+	}
+	if err := cl.Delete(context.Background(), secret); err != nil {
+		t.Fatalf("Delete Secret: %v", err)
+	}
+
+	result, err = reconciler.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("periodic Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != providerDependencyValidationRequeueAfter {
+		t.Fatalf("periodic Reconcile() RequeueAfter = %v, want %v", result.RequeueAfter, providerDependencyValidationRequeueAfter)
+	}
+	if err := cl.Get(context.Background(), req.NamespacedName, current); err != nil {
+		t.Fatalf("Get Provider after Secret deletion: %v", err)
+	}
+	if current.Status.Ready {
+		t.Fatal("Provider Ready remained true after referenced Secret deletion")
+	}
+	if !contains(current.Status.Message, "referenced secret not found") {
+		t.Fatalf("Provider status message = %q, want missing Secret validation", current.Status.Message)
 	}
 }
 

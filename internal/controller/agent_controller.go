@@ -36,11 +36,12 @@ type AgentReconciler struct {
 }
 
 const (
-	agentReasoningEffortLow    = "low"
-	agentReasoningEffortMedium = "medium"
-	agentReasoningEffortHigh   = "high"
-	agentReasoningEffortXHigh  = "xhigh"
-	agentReasoningEffortMax    = "max"
+	agentReasoningEffortLow               = "low"
+	agentReasoningEffortMedium            = "medium"
+	agentReasoningEffortHigh              = "high"
+	agentReasoningEffortXHigh             = "xhigh"
+	agentReasoningEffortMax               = "max"
+	agentDependencyValidationRequeueAfter = 5 * time.Minute
 )
 
 // +kubebuilder:rbac:groups=core.orka.ai,resources=agents,verbs=get;list;watch;create;update;patch;delete
@@ -362,22 +363,23 @@ func (r *AgentReconciler) updateStatus(ctx context.Context, agent *corev1alpha1.
 		return ctrl.Result{}, err
 	}
 
-	// Schedule requeue for TTL check if agent has TTL.
+	requeueAfter := agentDependencyValidationRequeueAfter
+	// TTL checks may need a sooner reconcile than dependency validation.
 	if agent.Spec.TTLAfterLastTask != nil {
 		if activeTasks == 0 && agent.Status.LastUsed != nil {
 			ttl := agent.Spec.TTLAfterLastTask.Duration
 			elapsed := time.Since(agent.Status.LastUsed.Time)
-			if remaining := ttl - elapsed; remaining > 0 {
-				return ctrl.Result{RequeueAfter: remaining}, nil
+			if remaining := ttl - elapsed; remaining > 0 && remaining < requeueAfter {
+				requeueAfter = remaining
 			}
 		} else if activeTasks > 0 {
 			// Tasks still running; requeue to re-check after they finish.
 			// The Task watch will also trigger reconciliation on completion.
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			requeueAfter = 30 * time.Second
 		}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // checkTTLExpiry deletes the agent if its TTL has expired and no tasks are active.

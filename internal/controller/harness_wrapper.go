@@ -66,6 +66,7 @@ const (
 	harnessWrapperContractAnno                = "orka.ai/harness-wrapper-contract-version"
 	harnessWrapperOutputFetchRetriesAnno      = "orka.ai/harness-wrapper-output-fetch-retries"
 	harnessWrapperCancelDependencyRetriesAnno = "orka.ai/harness-wrapper-cancel-dependency-retries"
+	harnessWrapperCancelAcknowledgedAnno      = "orka.ai/harness-wrapper-cancel-acknowledged"
 	harnessWrapperAuthRetriesAnno             = "orka.ai/harness-wrapper-auth-retries"
 	harnessWrapperBrokeredContinuationAnno    = "orka.ai/harness-wrapper-brokered-continuation-pending"
 	harnessWrapperMaxOutputFetchRetries       = 3
@@ -964,6 +965,28 @@ func (r *TaskReconciler) waitForHarnessWrapperAuthRetry(ctx context.Context, tas
 	return true, nil
 }
 
+func harnessWrapperCancelAcknowledged(task *corev1alpha1.Task) bool {
+	if !taskHasPlannedHarnessWrapperTurn(task) {
+		return false
+	}
+	return strings.TrimSpace(task.Annotations[harnessWrapperCancelAcknowledgedAnno]) ==
+		strings.TrimSpace(task.Annotations[harnessWrapperTurnIDAnnotation])
+}
+
+func (r *TaskReconciler) patchHarnessWrapperCancelAcknowledged(ctx context.Context, task *corev1alpha1.Task) error {
+	if harnessWrapperCancelAcknowledged(task) {
+		return nil
+	}
+	patch := ctrlclient.MergeFrom(task.DeepCopy())
+	if task.Annotations == nil {
+		task.Annotations = map[string]string{}
+	}
+	task.Annotations[harnessWrapperCancelAcknowledgedAnno] =
+		strings.TrimSpace(task.Annotations[harnessWrapperTurnIDAnnotation])
+	delete(task.Annotations, harnessWrapperCancelDependencyRetriesAnno)
+	return r.Patch(ctx, task, patch)
+}
+
 func harnessWrapperCancelDependencyRetries(task *corev1alpha1.Task) int {
 	if task == nil || task.Annotations == nil {
 		return 0
@@ -1039,6 +1062,7 @@ func (r *TaskReconciler) patchHarnessWrapperPlannedTurn(
 	task.Annotations[harnessWrapperStartedAnno] = "false"
 	task.Annotations[harnessWrapperPlannedAtAnno] = time.Now().UTC().Format(time.RFC3339Nano)
 	delete(task.Annotations, harnessWrapperBrokeredContinuationAnno)
+	delete(task.Annotations, harnessWrapperCancelAcknowledgedAnno)
 	if runtimeRefName := strings.TrimSpace(request.Metadata["runtimeRef"]); runtimeRefName != "" {
 		task.Annotations[harnessWrapperRuntimeRefAnno] = runtimeRefName
 	} else {
@@ -1497,6 +1521,7 @@ func (r *TaskReconciler) clearHarnessWrapperTurnState(ctx context.Context, task 
 		clearDeprecatedHarnessRuntimeAnnotations(task.Annotations)
 		delete(task.Annotations, harnessWrapperOutputFetchRetriesAnno)
 		delete(task.Annotations, harnessWrapperCancelDependencyRetriesAnno)
+		delete(task.Annotations, harnessWrapperCancelAcknowledgedAnno)
 		delete(task.Annotations, harnessWrapperAuthRetriesAnno)
 		delete(task.Annotations, harnessWrapperBrokeredContinuationAnno)
 	}

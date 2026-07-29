@@ -3744,6 +3744,183 @@ func TestHandleDeletionRetriesExternalRuntimeCancellationFailure(t *testing.T) {
 	if controllerutil.ContainsFinalizer(persisted, labels.TaskFinalizer) {
 		t.Fatal("Task finalizer retained after external runtime cancellation succeeded")
 	}
+	if !harnessWrapperCancelAcknowledged(persisted) {
+		t.Fatal("external runtime cancellation acknowledgement was not persisted")
+	}
+	if got := cancelCalls.Load(); got != 2 {
+		t.Fatalf("CancelTurn calls = %d, want 2", got)
+	}
+}
+
+func TestHandleDeletionPersistsCancellationBeforeLaterCleanupRetry(t *testing.T) {
+	var cancelCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		cancelCalls.Add(1)
+		var request harness.CancelTurnRequest
+		if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+			harness.WriteError(w, http.StatusBadRequest, "invalid cancellation request")
+			return
+		}
+		harness.WriteJSON(w, http.StatusAccepted, harness.CancelTurnResponse{
+			Version:          harness.ProtocolVersion,
+			Accepted:         true,
+			RuntimeSessionID: request.RuntimeSessionID,
+			TurnID:           request.TurnID,
+			CorrelationID:    request.CorrelationID,
+		})
+	}))
+	defer server.Close()
+
+	scheme := newTestScheme()
+	runtimeRef, secret := harnessWrapperReadyAgentRuntime("default", server.URL)
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "del-cancel-ack",
+			Namespace:  "default",
+			UID:        "del-cancel-ack-uid",
+			Finalizers: []string{labels.TaskFinalizer},
+		},
+		Status: corev1alpha1.TaskStatus{HarnessRuntime: &corev1alpha1.HarnessRuntimeStatus{
+			RuntimeRefName:         runtimeRef.Name,
+			RuntimeName:            runtimeRef.Name,
+			ContractVersion:        string(runtimeRef.Spec.ContractVersion),
+			Endpoint:               runtimeRef.Spec.Deployment.Endpoint,
+			RuntimeGeneration:      runtimeRef.Generation,
+			AuthRefName:            secret.Name,
+			AuthRefField:           "token",
+			AuthRefResourceVersion: secret.ResourceVersion,
+		}},
+	}
+	task.Annotations = map[string]string{
+		harnessWrapperTurnIDAnnotation:  string(harnessWrapperTurnID(task, 1)),
+		harnessWrapperRuntimeAnnotation: "cancel-ack-runtime-session",
+		harnessWrapperCorrelationIDAnno: string(task.UID),
+		harnessWrapperRuntimeRefAnno:    runtimeRef.Name,
+		harnessWrapperContractAnno:      harness.ProtocolVersion,
+		harnessWrapperStartedAnno:       scheduledRunLabelValue,
+		harnessWrapperLastFrameSeqAnno:  "0",
+	}
+	r := newUnitReconciler(scheme, task, runtimeRef, secret)
+	backing := r.ResultStore.(*sqlite.Store)
+	cleanupErr := errors.New("injected cleanup failure after cancellation")
+	r.ResultStore = &failOnceTaskCleanupStore{
+		ResultStore:   backing,
+		ArtifactStore: backing,
+		PlanStore:     backing,
+		MessageStore:  backing,
+		failOperation: "result",
+		failErr:       cleanupErr,
+	}
+
+	if _, err := r.handleDeletion(context.Background(), task); !errors.Is(err, cleanupErr) {
+		t.Fatalf("first handleDeletion() error = %v, want %v", err, cleanupErr)
+	}
+	persisted := &corev1alpha1.Task{}
+	key := client.ObjectKeyFromObject(task)
+	if err := r.Get(context.Background(), key, persisted); err != nil {
+		t.Fatalf("Get Task after cleanup failure: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(persisted, labels.TaskFinalizer) {
+		t.Fatal("Task finalizer removed after later cleanup failure")
+	}
+	if !harnessWrapperCancelAcknowledged(persisted) {
+		t.Fatal("successful cancellation acknowledgement was not persisted before cleanup returned")
+	}
+
+	if err := r.Delete(context.Background(), runtimeRef); err != nil {
+		t.Fatalf("Delete AgentRuntime: %v", err)
+	}
+	if err := r.Delete(context.Background(), secret); err != nil {
+		t.Fatalf("Delete runtime auth Secret: %v", err)
+	}
+	if _, err := r.handleDeletion(context.Background(), persisted); err != nil {
+		t.Fatalf("second handleDeletion() error = %v", err)
+	}
+	if err := r.Get(context.Background(), key, persisted); err != nil {
+		t.Fatalf("Get Task after cleanup retry: %v", err)
+	}
+	if controllerutil.ContainsFinalizer(persisted, labels.TaskFinalizer) {
+		t.Fatal("Task finalizer retained after acknowledged cancellation and cleanup retry")
+	}
+	if got := cancelCalls.Load(); got != 1 {
+		t.Fatalf("CancelTurn calls = %d, want one durable acknowledgement", got)
+	}
+}
+
+func TestHandleDeletionRetriesBuiltInHarnessCancellationFailure(t *testing.T) {
+	var failCancellation atomic.Bool
+	failCancellation.Store(true)
+	var cancelCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		cancelCalls.Add(1)
+		var request harness.CancelTurnRequest
+		if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+			harness.WriteError(w, http.StatusBadRequest, "invalid cancellation request")
+			return
+		}
+		if failCancellation.Load() {
+			harness.WriteError(w, http.StatusServiceUnavailable, "wrapper temporarily unavailable")
+			return
+		}
+		harness.WriteJSON(w, http.StatusAccepted, harness.CancelTurnResponse{
+			Version:          harness.ProtocolVersion,
+			Accepted:         true,
+			RuntimeSessionID: request.RuntimeSessionID,
+			TurnID:           request.TurnID,
+			CorrelationID:    request.CorrelationID,
+		})
+	}))
+	defer server.Close()
+	t.Setenv(harnessWrapperEndpointEnv, server.URL)
+	t.Setenv(harnessWrapperAuthValueEnv, "test-wrapper-token")
+	t.Setenv(harnessWrapperAuthValueFileEnv, "")
+
+	scheme := newTestScheme()
+	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{
+		Name:       "del-built-in-runtime",
+		Namespace:  "default",
+		UID:        "del-built-in-runtime-uid",
+		Finalizers: []string{labels.TaskFinalizer},
+	}}
+	task.Annotations = map[string]string{
+		harnessWrapperTurnIDAnnotation:  string(harnessWrapperTurnID(task, 1)),
+		harnessWrapperRuntimeAnnotation: "built-in-runtime-session",
+		harnessWrapperCorrelationIDAnno: string(task.UID),
+		harnessWrapperContractAnno:      harness.ProtocolVersion,
+		harnessWrapperStartedAnno:       scheduledRunLabelValue,
+		harnessWrapperLastFrameSeqAnno:  "0",
+	}
+	r := newUnitReconciler(scheme, task)
+
+	result, err := r.handleDeletion(context.Background(), task)
+	if err != nil {
+		t.Fatalf("handleDeletion() cancellation failure error = %v", err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Fatalf("RequeueAfter = %v, want 30s after built-in cancellation failure", result.RequeueAfter)
+	}
+	persisted := &corev1alpha1.Task{}
+	key := client.ObjectKeyFromObject(task)
+	if err := r.Get(context.Background(), key, persisted); err != nil {
+		t.Fatalf("Get Task after cancellation failure: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(persisted, labels.TaskFinalizer) {
+		t.Fatal("Task finalizer removed after built-in harness cancellation failure")
+	}
+
+	failCancellation.Store(false)
+	if _, err := r.handleDeletion(context.Background(), persisted); err != nil {
+		t.Fatalf("handleDeletion() cancellation retry error = %v", err)
+	}
+	if err := r.Get(context.Background(), key, persisted); err != nil {
+		t.Fatalf("Get Task after cancellation success: %v", err)
+	}
+	if controllerutil.ContainsFinalizer(persisted, labels.TaskFinalizer) {
+		t.Fatal("Task finalizer retained after built-in harness cancellation succeeded")
+	}
+	if !harnessWrapperCancelAcknowledged(persisted) {
+		t.Fatal("built-in harness cancellation acknowledgement was not persisted")
+	}
 	if got := cancelCalls.Load(); got != 2 {
 		t.Fatalf("CancelTurn calls = %d, want 2", got)
 	}

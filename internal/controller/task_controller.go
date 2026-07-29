@@ -468,16 +468,6 @@ func executionEventTypeForTaskPhase(phase corev1alpha1.TaskPhase) string {
 	}
 }
 
-func taskHasExternalAgentRuntimeTurn(task *corev1alpha1.Task) bool {
-	if !taskHasPlannedHarnessWrapperTurn(task) {
-		return false
-	}
-	if task.Status.HarnessRuntime != nil && strings.TrimSpace(task.Status.HarnessRuntime.RuntimeRefName) != "" {
-		return true
-	}
-	return strings.TrimSpace(task.Annotations[harnessWrapperRuntimeRefAnno]) != ""
-}
-
 // handleDeletion handles Task cleanup when deleted
 func (r *TaskReconciler) handleDeletion(ctx context.Context, task *corev1alpha1.Task) (ctrl.Result, error) { //nolint:unparam // Result is always nil but kept for interface consistency
 	log := logf.FromContext(ctx)
@@ -534,39 +524,33 @@ func (r *TaskReconciler) handleDeletion(ctx context.Context, task *corev1alpha1.
 		runtimeCancellationPending = true
 		setRequeueAfter(delay)
 	}
-	externalRuntimeTurn := taskHasExternalAgentRuntimeTurn(task)
 
 	// A successful harness-v1 CancelTurn response is the execution-authority
-	// fence: conforming runtimes cancel the turn context before acknowledging it.
-	// Errors leave external-runtime quiescence unconfirmed and must be retried.
-	if cancelErr := r.cancelHarnessWrapperTurn(ctx, task, "task deleted"); cancelErr != nil {
-		if isAgentRuntimeDependencyNotReady(cancelErr) {
-			shouldWait, waitErr := r.waitForHarnessCancelDependency(ctx, task)
-			if waitErr != nil {
-				appendCleanupErr("recording deleted harness runtime cancellation retry", waitErr)
-				markRuntimeCancellationPending(time.Second)
-			} else if shouldWait {
-				log.Info("waiting to cancel deleted harness runtime turn", "error", cancelErr)
-				markRuntimeCancellationPending(time.Second)
-			} else if externalRuntimeTurn {
-				// Remote runtime turns have no local Job to prove quiescence. Keep the
-				// finalizer and retry slowly until cancellation succeeds or the runtime
-				// confirms that the turn is already gone.
-				log.Error(cancelErr, "failed to cancel deleted external runtime turn after dependency retries; retaining finalizer")
-				markRuntimeCancellationPending(30 * time.Second)
+	// fence. Persist that acknowledgement before later fallible cleanup so retries
+	// never need the runtime endpoint or auth Secret after quiescence is confirmed.
+	if taskHasPlannedHarnessWrapperTurn(task) && !harnessWrapperCancelAcknowledged(task) {
+		if cancelErr := r.cancelHarnessWrapperTurn(ctx, task, "task deleted"); cancelErr != nil {
+			if isAgentRuntimeDependencyNotReady(cancelErr) {
+				shouldWait, waitErr := r.waitForHarnessCancelDependency(ctx, task)
+				if waitErr != nil {
+					appendCleanupErr("recording deleted harness runtime cancellation retry", waitErr)
+					markRuntimeCancellationPending(time.Second)
+				} else if shouldWait {
+					log.Info("waiting to cancel deleted harness runtime turn", "error", cancelErr)
+					markRuntimeCancellationPending(time.Second)
+				} else {
+					log.Error(cancelErr, "failed to cancel deleted harness runtime turn after dependency retries; retaining finalizer")
+					markRuntimeCancellationPending(30 * time.Second)
+				}
 			} else {
-				log.Error(cancelErr, "failed to cancel deleted harness runtime turn after dependency retries")
+				// Any unconfirmed started or planned harness turn can remain active,
+				// including built-in runtimes whose wrapper Job is not retained in status.
+				log.Error(cancelErr, "failed to cancel deleted harness runtime turn; retaining finalizer")
+				markRuntimeCancellationPending(30 * time.Second)
 			}
-		} else if externalRuntimeTurn {
-			// Any unconfirmed external-runtime cancellation can leave the remote turn
-			// active, including transport and transient HTTP failures. Fail closed so
-			// session/workspace authority and the Task finalizer remain until retry.
-			log.Error(cancelErr, "failed to cancel deleted external runtime turn; retaining finalizer")
-			markRuntimeCancellationPending(30 * time.Second)
-		} else {
-			// Preserve the existing bounded best-effort cancellation policy for the
-			// local v1 harness while still deleting its Job and workspace authority.
-			log.Error(cancelErr, "failed to cancel deleted harness runtime turn")
+		} else if ackErr := r.patchHarnessWrapperCancelAcknowledged(ctx, task); ackErr != nil {
+			appendCleanupErr("recording deleted harness runtime cancellation acknowledgement", ackErr)
+			markRuntimeCancellationPending(time.Second)
 		}
 	}
 
