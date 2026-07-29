@@ -47,6 +47,59 @@ type chatMockProvider struct {
 	streamErr    error
 }
 
+type cancellableChatProvider struct {
+	name     string
+	started  chan struct{}
+	stopped  chan error
+	response *llm.CompletionResponse
+}
+
+func (p *cancellableChatProvider) Complete(ctx context.Context, _ *llm.CompletionRequest) (*llm.CompletionResponse, error) {
+	err := p.waitForCancellation(ctx)
+	return p.response, err
+}
+
+func (p *cancellableChatProvider) waitForCancellation(ctx context.Context) error {
+	select {
+	case p.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	select {
+	case p.stopped <- ctx.Err():
+	default:
+	}
+	return ctx.Err()
+}
+
+func (p *cancellableChatProvider) Stream(ctx context.Context, _ *llm.CompletionRequest) (<-chan llm.StreamChunk, error) {
+	chunks := make(chan llm.StreamChunk, 1)
+	go func() {
+		defer close(chunks)
+		chunks <- llm.StreamChunk{Error: p.waitForCancellation(ctx)}
+	}()
+	return chunks, nil
+}
+
+func (p *cancellableChatProvider) Name() string { return p.name }
+
+type blockingDeleteSessionStore struct {
+	store.SessionStore
+	store.SessionTurnCommitter
+	deleteStarted chan struct{}
+	allowDelete   chan struct{}
+}
+
+func (s *blockingDeleteSessionStore) DeleteSession(ctx context.Context, namespace, name string) error {
+	close(s.deleteStarted)
+	select {
+	case <-s.allowDelete:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.SessionStore.DeleteSession(ctx, namespace, name)
+}
+
 func (m *chatMockProvider) Complete(_ context.Context, _ *llm.CompletionRequest) (*llm.CompletionResponse, error) {
 	if m.err != nil {
 		return nil, m.err
@@ -91,11 +144,11 @@ type observingChatTurnCommitter struct {
 
 func (*observingChatTurnCommitter) AcquireChatTurn(
 	context.Context, *store.SessionRecord, string, time.Time,
-) error {
-	return nil
+) (bool, error) {
+	return false, nil
 }
 
-func (*observingChatTurnCommitter) ReleaseChatTurn(context.Context, string, string, string) error {
+func (*observingChatTurnCommitter) ReleaseChatTurn(context.Context, string, string, string, bool) error {
 	return nil
 }
 
@@ -174,9 +227,9 @@ func newTestChatHandler(t *testing.T, c client.Client, ss store.SessionStore, rs
 
 func reserveTestChatTurn(t *testing.T, ch *ChatHandler, sessionID string) string {
 	t.Helper()
-	turnID, _, err := ch.reserveChatTurn(context.Background(), defaultNamespace, sessionID)
+	turnID, _, created, err := ch.reserveChatTurn(context.Background(), defaultNamespace, sessionID)
 	require.NoError(t, err)
-	t.Cleanup(func() { ch.releaseChatTurn(defaultNamespace, sessionID, turnID) })
+	t.Cleanup(func() { ch.releaseChatTurn(defaultNamespace, sessionID, turnID, created) })
 	return turnID
 }
 
@@ -393,6 +446,168 @@ func TestHandleCancelChat(t *testing.T) {
 		_, err = ss.GetSession(ctx, "default", "test-session")
 		assert.True(t, errors.Is(err, store.ErrNotFound))
 	})
+}
+
+func TestHandleCancelChatStopsActiveSSETurnBeforeSuccess(t *testing.T) {
+	const (
+		providerType = "cancel-active-sse-provider"
+		sessionID    = "cancel-active-sse"
+	)
+	provider := &cancellableChatProvider{
+		name:    providerType,
+		started: make(chan struct{}, 1),
+		stopped: make(chan error, 1),
+	}
+	llm.RegisterProvider(providerType, func(llm.ProviderConfig) (llm.Provider, error) {
+		return provider, nil
+	})
+	objects := providerCRD(defaultNamespace, defaultNamespace, providerType, "test-model")
+	fakeClient := fake.NewClientBuilder().WithScheme(newTestScheme()).WithRuntimeObjects(objects...).Build()
+	baseSessionStore := newTestSessionStore(t)
+	committer, ok := baseSessionStore.(store.SessionTurnCommitter)
+	require.True(t, ok)
+	ss := &blockingDeleteSessionStore{
+		SessionStore:         baseSessionStore,
+		SessionTurnCommitter: committer,
+		deleteStarted:        make(chan struct{}),
+		allowDelete:          make(chan struct{}),
+	}
+	rs := newTestResultStore(t)
+	cfg := DefaultChatConfig()
+	cfg.Provider = defaultNamespace
+	ch := newTestChatHandler(t, fakeClient, ss, rs, cfg)
+
+	app := fiber.New(fiber.Config{ErrorHandler: customErrorHandler})
+	app.Post("/api/v1/chat", ch.HandleChat)
+	app.Delete("/api/v1/chat/:sessionId", ch.HandleCancelChat)
+
+	type postResult struct {
+		resp *http.Response
+		err  error
+	}
+	postDone := make(chan postResult, 1)
+	deleteDone := make(chan postResult, 1)
+	body, err := json.Marshal(ChatRequest{
+		Message: "wait until cancelled", SessionID: sessionID, Namespace: defaultNamespace,
+	})
+	require.NoError(t, err)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+		resp, testErr := app.Test(req)
+		postDone <- postResult{resp: resp, err: testErr}
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-ss.allowDelete:
+		default:
+			close(ss.allowDelete)
+		}
+		done, active := ch.startSessionCancellation(defaultNamespace, sessionID)
+		defer ch.finishSessionCancellation(defaultNamespace, sessionID)
+		if active {
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+			}
+		}
+	})
+
+	select {
+	case <-provider.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider did not start the SSE turn")
+	}
+
+	go func() {
+		resp, testErr := app.Test(httptest.NewRequest(http.MethodDelete, "/api/v1/chat/"+sessionID, nil))
+		deleteDone <- postResult{resp: resp, err: testErr}
+	}()
+
+	select {
+	case stoppedErr := <-provider.stopped:
+		require.ErrorIs(t, stoppedErr, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("DELETE did not cancel the provider context")
+	}
+	select {
+	case <-ss.deleteStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("DELETE did not reach durable session deletion")
+	}
+
+	replacementReq := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(body))
+	replacementReq.Header.Set("Content-Type", "application/json")
+	replacementReq.Header.Set("Accept", "application/json")
+	replacementResp, err := app.Test(replacementReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusConflict, replacementResp.StatusCode)
+	select {
+	case <-provider.started:
+		t.Fatal("replacement provider work started while session deletion was in progress")
+	default:
+	}
+	close(ss.allowDelete)
+
+	select {
+	case result := <-deleteDone:
+		require.NoError(t, result.err)
+		require.Equal(t, http.StatusNoContent, result.resp.StatusCode)
+	case <-time.After(5 * time.Second):
+		t.Fatal("DELETE did not finish after session deletion was released")
+	}
+
+	select {
+	case result := <-postDone:
+		require.NoError(t, result.err)
+		require.Equal(t, http.StatusOK, result.resp.StatusCode)
+	case <-time.After(5 * time.Second):
+		t.Fatal("SSE request did not stop after session cancellation")
+	}
+	_, err = baseSessionStore.GetSession(context.Background(), defaultNamespace, sessionID)
+	require.ErrorIs(t, err, store.ErrNotFound)
+}
+
+func TestHandleChatRemovesNewEmptySessionAfterProviderFailure(t *testing.T) {
+	const (
+		providerType = "failed-new-session-provider"
+		sessionID    = "failed-new-session"
+	)
+	provider := &chatMockProvider{name: providerType, err: &llm.ProviderError{
+		Provider: providerType, Message: "invalid provider request", StatusCode: http.StatusBadRequest,
+	}}
+	llm.RegisterProvider(providerType, func(llm.ProviderConfig) (llm.Provider, error) {
+		return provider, nil
+	})
+	objects := providerCRD(defaultNamespace, defaultNamespace, providerType, "test-model")
+	fakeClient := fake.NewClientBuilder().WithScheme(newTestScheme()).WithRuntimeObjects(objects...).Build()
+	ss := newTestSessionStore(t)
+	rs := newTestResultStore(t)
+	cfg := DefaultChatConfig()
+	cfg.Provider = defaultNamespace
+	ch := newTestChatHandler(t, fakeClient, ss, rs, cfg)
+	app := fiber.New(fiber.Config{ErrorHandler: customErrorHandler})
+	app.Post("/api/v1/chat", ch.HandleChat)
+
+	body, err := json.Marshal(ChatRequest{
+		Message: "this provider will fail", SessionID: sessionID, Namespace: defaultNamespace,
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+
+	_, err = ss.GetSession(context.Background(), defaultNamespace, sessionID)
+	require.ErrorIs(t, err, store.ErrNotFound)
+	sessions, err := ss.ListSessions(context.Background(), defaultNamespace)
+	require.NoError(t, err)
+	for _, session := range sessions {
+		assert.NotEqual(t, sessionID, session.Name, "failed new turn remained visible in session inventory")
+	}
 }
 
 // --- loadChatSession ---
@@ -1511,11 +1726,12 @@ func TestHandleChatRejectsConcurrentSessionTurnBeforeProviderInvocation(t *testi
 	committer, ok := ss.(store.SessionTurnCommitter)
 	require.True(t, ok)
 	now := time.Now().UTC()
-	require.NoError(t, committer.AcquireChatTurn(context.Background(), &store.SessionRecord{
+	_, err := committer.AcquireChatTurn(context.Background(), &store.SessionRecord{
 		Namespace: testDefaultNamespace, Name: "busy-chat", SessionType: "chat", CreatedAt: now, UpdatedAt: now,
-	}, "held-turn", now.Add(time.Minute)))
+	}, "held-turn", now.Add(time.Minute))
+	require.NoError(t, err)
 	t.Cleanup(func() {
-		_ = committer.ReleaseChatTurn(context.Background(), testDefaultNamespace, "busy-chat", "held-turn")
+		_ = committer.ReleaseChatTurn(context.Background(), testDefaultNamespace, "busy-chat", "held-turn", false)
 	})
 
 	rs := newTestResultStore(t)

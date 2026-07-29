@@ -204,12 +204,24 @@ func (s *Store) AcquireLock(ctx context.Context, namespace, name, taskName, task
 	}
 
 	// Try to acquire the exact Task incarnation. Empty stored UIDs are adopted only for
-	// compatibility with locks created before the fencing column existed.
+	// compatibility with locks created before the fencing column existed. A live chat
+	// turn owns the same transcript boundary and therefore excludes Task locks; an
+	// expired chat lease is cleared as part of the successful lock acquisition.
+	now := time.Now().UTC()
 	result, err := s.db.ExecContext(ctx,
-		`UPDATE sessions SET active_task = ?, active_task_uid = ?
+		`UPDATE sessions SET active_task = ?, active_task_uid = ?,
+		   chat_turn_id = CASE
+		     WHEN chat_turn_id <> '' AND (chat_turn_expires_at IS NULL OR chat_turn_expires_at <= ?) THEN ''
+		     ELSE chat_turn_id
+		   END,
+		   chat_turn_expires_at = CASE
+		     WHEN chat_turn_id <> '' AND (chat_turn_expires_at IS NULL OR chat_turn_expires_at <= ?) THEN NULL
+		     ELSE chat_turn_expires_at
+		   END
 		 WHERE namespace = ? AND name = ? AND (active_task = '' OR
-		   (active_task = ? AND (active_task_uid = '' OR active_task_uid = ?)))`,
-		taskName, taskUID, namespace, name, taskName, taskUID,
+		   (active_task = ? AND (active_task_uid = '' OR active_task_uid = ?)))
+		 AND (chat_turn_id = '' OR chat_turn_expires_at IS NULL OR chat_turn_expires_at <= ?)`,
+		taskName, taskUID, now, now, namespace, name, taskName, taskUID, now,
 	)
 	if err != nil {
 		return err
@@ -220,7 +232,7 @@ func (s *Store) AcquireLock(ctx context.Context, namespace, name, taskName, task
 		return err
 	}
 	if rows == 0 {
-		return fmt.Errorf("session %s/%s is already locked", namespace, name)
+		return fmt.Errorf("session %s/%s is already locked or has an active chat turn", namespace, name)
 	}
 	return nil
 }
@@ -233,17 +245,17 @@ func (s *Store) AcquireChatTurn(
 	session *store.SessionRecord,
 	turnID string,
 	expiresAt time.Time,
-) error {
+) (bool, error) {
 	if session == nil {
-		return store.ValidationErrorf("session is required")
+		return false, store.ValidationErrorf("session is required")
 	}
 	if session.Namespace == "" || session.Name == "" || session.SessionType == "" || turnID == "" {
-		return store.ValidationErrorf("session namespace, name, type, and turn ID are required")
+		return false, store.ValidationErrorf("session namespace, name, type, and turn ID are required")
 	}
 	now := time.Now().UTC()
 	expiresAt = expiresAt.UTC()
 	if !expiresAt.After(now) {
-		return store.ValidationErrorf("chat turn expiration must be in the future")
+		return false, store.ValidationErrorf("chat turn expiration must be in the future")
 	}
 	createdAt := session.CreatedAt.UTC()
 	if createdAt.IsZero() {
@@ -252,19 +264,25 @@ func (s *Store) AcquireChatTurn(
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if _, err := tx.ExecContext(ctx,
+	insertResult, err := tx.ExecContext(ctx,
 		`INSERT INTO sessions
 		 (namespace, name, session_type, active_task, active_task_uid, message_count, input_tokens, output_tokens, cancelled, created_at, updated_at)
 		 VALUES (?, ?, ?, '', '', 0, 0, 0, ?, ?, ?)
 		 ON CONFLICT(namespace, name) DO NOTHING`,
 		session.Namespace, session.Name, session.SessionType, session.Cancelled, createdAt, now,
-	); err != nil {
-		return err
+	)
+	if err != nil {
+		return false, err
 	}
+	createdRows, err := insertResult.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	created := createdRows == 1
 
 	var sessionType, ownerType, activeTask, activeTurn string
 	var activeTurnExpiresAt sql.NullTime
@@ -274,18 +292,18 @@ func (s *Store) AcquireChatTurn(
 		session.Namespace, session.Name,
 	).Scan(&sessionType, &ownerType, &activeTask, &activeTurn, &activeTurnExpiresAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return store.ErrNotFound
+			return false, store.ErrNotFound
 		}
-		return err
+		return false, err
 	}
 	if sessionType == store.SessionTypeGateway || ownerType == gatewaySessionOwnerType {
-		return store.ErrGatewayOwnedSession
+		return false, store.ErrGatewayOwnedSession
 	}
 	if activeTask != "" {
-		return fmt.Errorf("%w: chat session %s/%s has an active Task", store.ErrConflict, session.Namespace, session.Name)
+		return false, fmt.Errorf("%w: chat session %s/%s has an active Task", store.ErrConflict, session.Namespace, session.Name)
 	}
 	if activeTurn != "" && activeTurnExpiresAt.Valid && activeTurnExpiresAt.Time.After(now) {
-		return fmt.Errorf("%w: chat session %s/%s already has an active turn", store.ErrConflict, session.Namespace, session.Name)
+		return false, fmt.Errorf("%w: chat session %s/%s already has an active turn", store.ErrConflict, session.Namespace, session.Name)
 	}
 
 	result, err := tx.ExecContext(ctx,
@@ -297,22 +315,54 @@ func (s *Store) AcquireChatTurn(
 		store.SessionTypeGateway, gatewaySessionOwnerType, now,
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 	updated, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if updated != 1 {
-		return fmt.Errorf("%w: chat session %s/%s already has an active turn", store.ErrConflict, session.Namespace, session.Name)
+		return false, fmt.Errorf("%w: chat session %s/%s already has an active turn", store.ErrConflict, session.Namespace, session.Name)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return created, nil
 }
 
 // ReleaseChatTurn clears a reservation only when it is still owned by turnID.
-func (s *Store) ReleaseChatTurn(ctx context.Context, namespace, name, turnID string) error {
+// If this reservation created the Session, failed turns remove that row only
+// while it is still empty and otherwise untouched.
+func (s *Store) ReleaseChatTurn(
+	ctx context.Context,
+	namespace, name, turnID string,
+	deleteEmptyCreatedSession bool,
+) error {
 	if turnID == "" {
 		return nil
+	}
+	if deleteEmptyCreatedSession {
+		result, err := s.db.ExecContext(ctx,
+			`DELETE FROM sessions
+			 WHERE namespace = ? AND name = ? AND chat_turn_id = ?
+			   AND session_type = ? AND owner_type <> ? AND active_task = ''
+			   AND message_count = 0 AND input_tokens = 0 AND output_tokens = 0
+			   AND NOT EXISTS (
+			     SELECT 1 FROM session_messages
+			     WHERE namespace = ? AND session_name = ?
+			   )`,
+			namespace, name, turnID, store.SessionTypeChat, gatewaySessionOwnerType, namespace, name,
+		)
+		if err != nil {
+			return err
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if deleted == 1 {
+			return nil
+		}
 	}
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE sessions SET chat_turn_id = '', chat_turn_expires_at = NULL
@@ -356,14 +406,14 @@ func (s *Store) CommitSessionTurn(
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	var sessionType, ownerType, activeTurn string
+	var sessionType, ownerType, activeTask, activeTurn string
 	var activeTurnExpiresAt sql.NullTime
 	var currentMessageCount int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT session_type, owner_type, message_count, chat_turn_id, chat_turn_expires_at
+		`SELECT session_type, owner_type, active_task, message_count, chat_turn_id, chat_turn_expires_at
 		 FROM sessions WHERE namespace = ? AND name = ?`,
 		session.Namespace, session.Name,
-	).Scan(&sessionType, &ownerType, &currentMessageCount, &activeTurn, &activeTurnExpiresAt); err != nil {
+	).Scan(&sessionType, &ownerType, &activeTask, &currentMessageCount, &activeTurn, &activeTurnExpiresAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return store.ErrNotFound
 		}
@@ -371,6 +421,9 @@ func (s *Store) CommitSessionTurn(
 	}
 	if sessionType == store.SessionTypeGateway || ownerType == gatewaySessionOwnerType {
 		return store.ErrGatewayOwnedSession
+	}
+	if activeTask != "" {
+		return fmt.Errorf("%w: chat session has an active Task", store.ErrConflict)
 	}
 	if activeTurn != turnID {
 		return fmt.Errorf("%w: chat turn no longer owns session", store.ErrConflict)
@@ -395,7 +448,8 @@ func (s *Store) CommitSessionTurn(
 	result, err := tx.ExecContext(ctx,
 		`UPDATE sessions
 		 SET message_count = message_count + ?, input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, updated_at = ?
-		 WHERE namespace = ? AND name = ? AND message_count = ? AND chat_turn_id = ? AND chat_turn_expires_at > ?`,
+		 WHERE namespace = ? AND name = ? AND active_task = ''
+		   AND message_count = ? AND chat_turn_id = ? AND chat_turn_expires_at > ?`,
 		inserted, inputTokens, outputTokens, now,
 		session.Namespace, session.Name, expectedMessageCount, turnID, now,
 	)
@@ -425,16 +479,21 @@ func (s *Store) ReleaseLock(ctx context.Context, namespace, name, taskName, task
 
 // IsLocked returns true if the session is locked by another Task incarnation.
 func (s *Store) IsLocked(ctx context.Context, namespace, name, currentTask, currentTaskUID string) (bool, error) {
-	var activeTask, activeTaskUID string
+	var activeTask, activeTaskUID, activeTurn string
+	var activeTurnExpiresAt sql.NullTime
 	err := s.db.QueryRowContext(ctx,
-		`SELECT active_task, active_task_uid FROM sessions WHERE namespace = ? AND name = ?`,
+		`SELECT active_task, active_task_uid, chat_turn_id, chat_turn_expires_at
+		 FROM sessions WHERE namespace = ? AND name = ?`,
 		namespace, name,
-	).Scan(&activeTask, &activeTaskUID)
+	).Scan(&activeTask, &activeTaskUID, &activeTurn, &activeTurnExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, store.ErrNotFound
 	}
 	if err != nil {
 		return false, err
+	}
+	if activeTurn != "" && activeTurnExpiresAt.Valid && activeTurnExpiresAt.Time.After(time.Now().UTC()) {
+		return true, nil
 	}
 	if activeTask == "" {
 		return false, nil

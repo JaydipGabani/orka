@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -45,6 +47,12 @@ var chatLog = logf.Log.WithName("chat-handler")
 const (
 	defaultNamespace      = "default"
 	chatDurabilityTimeout = 10 * time.Second
+)
+
+const (
+	chatStreamUnclaimed uint32 = iota
+	chatStreamOwned
+	chatStreamFinalized
 )
 
 // ChatConfig holds configuration for the chat handler.
@@ -123,6 +131,41 @@ type ChatHandler struct {
 	contextTokenAuthorization ContextTokenAuthorizationConfig
 	cooldownTracker           *llm.CooldownTracker
 	resolver                  *ProviderResolver
+	activeChatTurnsMu         sync.Mutex
+	activeChatTurns           map[chatTurnKey]*activeChatTurn
+}
+
+type chatTurnKey struct {
+	namespace string
+	sessionID string
+}
+
+type activeChatTurn struct {
+	turnID     string
+	cancel     context.CancelFunc
+	done       chan struct{}
+	expiresAt  time.Time
+	cancellers int
+}
+
+type chatStreamRequest struct {
+	parentCtx      context.Context
+	turnCancelCtx  context.Context
+	turnDeadline   time.Time
+	finalizeTurn   func()
+	provider       llm.Provider
+	messages       []llm.Message
+	systemPrompt   string
+	tools          []llm.Tool
+	executor       *ToolExecutor
+	sessionID      string
+	namespace      string
+	model          string
+	temperature    float64
+	maxTokens      int
+	persistedCount int
+	turnID         string
+	span           trace.Span
 }
 
 // NewChatHandler creates a new ChatHandler.
@@ -144,6 +187,7 @@ func NewChatHandler(c client.Client, sm *controller.SessionManager, config ChatC
 		resultStore:               rs,
 		cooldownTracker:           llm.NewCooldownTracker(),
 		resolver:                  resolver,
+		activeChatTurns:           make(map[chatTurnKey]*activeChatTurn),
 	}
 	if committer, ok := ss.(store.SessionTurnCommitter); ok {
 		handler.sessionTurnCommitter = committer
@@ -263,13 +307,19 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, "failed to build system prompt")
 	}
 
-	turnID, turnDeadline, err := ch.reserveChatTurn(ctx, namespace, sessionID)
+	turnID, turnDeadline, sessionCreated, turnCancelCtx, err := ch.beginChatTurn(ctx, namespace, sessionID)
 	if err != nil {
 		return err
 	}
+	stopTurnCancellation := context.AfterFunc(turnCancelCtx, cancel)
+	defer stopTurnCancellation()
+	finalizeTurn := sync.OnceFunc(func() {
+		ch.releaseChatTurn(namespace, sessionID, turnID, sessionCreated)
+		ch.finishActiveChatTurn(namespace, sessionID, turnID)
+	})
 	defer func() {
 		if !sseMode {
-			ch.releaseChatTurn(namespace, sessionID, turnID)
+			finalizeTurn()
 		}
 	}()
 
@@ -383,49 +433,87 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 		})
 	}
 
-	// SSE mode
+	streamErr := ch.sendChatStream(c, chatStreamRequest{
+		parentCtx:      ctx,
+		turnCancelCtx:  turnCancelCtx,
+		turnDeadline:   turnDeadline,
+		finalizeTurn:   finalizeTurn,
+		provider:       provider,
+		messages:       messages,
+		systemPrompt:   systemPrompt,
+		tools:          tools,
+		executor:       executor,
+		sessionID:      sessionID,
+		namespace:      namespace,
+		model:          model,
+		temperature:    temperature,
+		maxTokens:      maxTokens,
+		persistedCount: persistedCount,
+		turnID:         turnID,
+		span:           span,
+	})
+	if streamErr == nil {
+		sseMode = true
+	}
+	return streamErr
+}
+
+func (ch *ChatHandler) sendChatStream(c fiber.Ctx, req chatStreamRequest) error {
 	c.Set("Content-Type", "text/event-stream")
 	c.Set("Cache-Control", "no-cache")
 	c.Set("Connection", "keep-alive")
 	c.Set("X-Accel-Buffering", "no")
 
-	// Capture values for the streaming closure (ctx from outer scope is cancelled
-	// when HandleChat returns, so we create a new context inside the callback)
-	sseProvider := provider
-	sseMessages := messages
-	sseSystemPrompt := systemPrompt
-	sseTools := tools
-	sseExecutor := executor
+	// SendStreamWriter outlives the handler, so capture only trace and baggage
+	// state from the recyclable Fiber request context.
 	sseParentCtx := baggage.ContextWithBaggage(
-		trace.ContextWithSpanContext(context.Background(), span.SpanContext()),
-		baggage.FromContext(ctx),
+		trace.ContextWithSpanContext(context.Background(), req.span.SpanContext()),
+		baggage.FromContext(req.parentCtx),
 	)
+	var streamOwnership atomic.Uint32
+	finalizeStream := sync.OnceFunc(func() {
+		req.finalizeTurn()
+		req.span.End()
+		<-ch.semaphore
+	})
+	stopUnclaimedCancellation := context.AfterFunc(req.turnCancelCtx, func() {
+		if streamOwnership.CompareAndSwap(chatStreamUnclaimed, chatStreamFinalized) {
+			finalizeStream()
+		}
+	})
+	streamWatchdog := time.AfterFunc(max(time.Until(req.turnDeadline), time.Duration(0)), func() {
+		if streamOwnership.CompareAndSwap(chatStreamUnclaimed, chatStreamFinalized) {
+			finalizeStream()
+		}
+	})
 
 	streamErr := c.SendStreamWriter(func(w *bufio.Writer) {
-		defer span.End()
-		defer func() { <-ch.semaphore }()
-		defer ch.releaseChatTurn(namespace, sessionID, turnID)
-		// SendStreamWriter outlives the handler, so use a background context
-		// seeded with the originating chat span context rather than Fiber's
-		// recycled request context.
-		sseCtx, sseCancel := context.WithDeadline(sseParentCtx, turnDeadline)
+		if !streamOwnership.CompareAndSwap(chatStreamUnclaimed, chatStreamOwned) {
+			return
+		}
+		stopUnclaimedCancellation()
+		streamWatchdog.Stop()
+		defer finalizeStream()
+
+		sseCtx, sseCancel := context.WithDeadline(sseParentCtx, req.turnDeadline)
+		stopSSECancellation := context.AfterFunc(req.turnCancelCtx, sseCancel)
+		defer stopSSECancellation()
 		defer sseCancel()
 
 		emitSSE := func(event, data string) {
 			_ = writeSSE(w, event, data)
 		}
-
-		// Emit status event
 		statusData, _ := json.Marshal(map[string]string{
-			"sessionId": sessionID,
-			"provider":  sseProvider.Name(),
-			"model":     model,
+			"sessionId": req.sessionID,
+			"provider":  req.provider.Name(),
+			"model":     req.model,
 		})
 		emitSSE("status", string(statusData))
 
 		content, usage, _, err := ch.runToolLoop(
-			sseCtx, sseProvider, sseMessages, sseSystemPrompt, sseTools, sseExecutor,
-			sessionID, namespace, model, temperature, maxTokens, persistedCount, emitSSE, turnID,
+			sseCtx, req.provider, req.messages, req.systemPrompt, req.tools, req.executor,
+			req.sessionID, req.namespace, req.model, req.temperature, req.maxTokens,
+			req.persistedCount, emitSSE, req.turnID,
 		)
 		if err != nil {
 			errData, _ := json.Marshal(map[string]string{"error": err.Error()})
@@ -434,23 +522,55 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 		}
 
 		_ = content // content already emitted via SSE
-
-		// Emit done event
 		doneData, _ := json.Marshal(map[string]any{"usage": usage})
 		emitSSE("done", string(doneData))
 	})
-	if streamErr == nil {
-		sseMode = true
+	if streamErr != nil {
+		stopUnclaimedCancellation()
+		streamWatchdog.Stop()
 	}
 	return streamErr
+}
+
+func (ch *ChatHandler) beginChatTurn(
+	ctx context.Context,
+	namespace, sessionID string,
+) (string, time.Time, bool, context.Context, error) {
+	key := chatTurnKey{namespace: namespace, sessionID: sessionID}
+	ch.activeChatTurnsMu.Lock()
+	defer ch.activeChatTurnsMu.Unlock()
+	if ch.activeChatTurns == nil {
+		ch.activeChatTurns = make(map[chatTurnKey]*activeChatTurn)
+	}
+	if active := ch.activeChatTurns[key]; active != nil {
+		if active.turnID == "" || active.cancellers > 0 || active.expiresAt.After(time.Now().UTC()) {
+			return "", time.Time{}, false, nil, fiber.NewError(fiber.StatusConflict, "chat session is busy")
+		}
+		delete(ch.activeChatTurns, key)
+		active.cancel()
+		close(active.done)
+	}
+
+	turnID, turnDeadline, sessionCreated, err := ch.reserveChatTurn(ctx, namespace, sessionID)
+	if err != nil {
+		return "", time.Time{}, false, nil, err
+	}
+	turnCancelCtx, cancel := context.WithCancel(context.Background())
+	ch.activeChatTurns[key] = &activeChatTurn{
+		turnID:    turnID,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		expiresAt: turnDeadline.Add(chatDurabilityTimeout),
+	}
+	return turnID, turnDeadline, sessionCreated, turnCancelCtx, nil
 }
 
 func (ch *ChatHandler) reserveChatTurn(
 	ctx context.Context,
 	namespace, sessionID string,
-) (string, time.Time, error) {
+) (string, time.Time, bool, error) {
 	if ch.sessionTurnCommitter == nil {
-		return "", time.Time{}, fiber.NewError(
+		return "", time.Time{}, false, fiber.NewError(
 			fiber.StatusInternalServerError,
 			"session store does not support atomic chat turns",
 		)
@@ -463,36 +583,104 @@ func (ch *ChatHandler) reserveChatTurn(
 	turnID := fmt.Sprintf("chat-turn-%s", generateChatID())
 	now := time.Now().UTC()
 	turnDeadline := now.Add(turnLifetime)
-	err := ch.sessionTurnCommitter.AcquireChatTurn(ctx, &store.SessionRecord{
+	created, err := ch.sessionTurnCommitter.AcquireChatTurn(ctx, &store.SessionRecord{
 		Namespace:   namespace,
 		Name:        sessionID,
-		SessionType: "chat",
+		SessionType: store.SessionTypeChat,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}, turnID, turnDeadline.Add(chatDurabilityTimeout))
 	if errors.Is(err, store.ErrGatewayOwnedSession) {
-		return "", time.Time{}, fiber.NewError(fiber.StatusNotFound, "chat session not found")
+		return "", time.Time{}, false, fiber.NewError(fiber.StatusNotFound, "chat session not found")
 	}
 	if errors.Is(err, store.ErrConflict) {
-		return "", time.Time{}, fiber.NewError(fiber.StatusConflict, "chat session is busy")
+		return "", time.Time{}, false, fiber.NewError(fiber.StatusConflict, "chat session is busy")
 	}
 	if err != nil {
-		return "", time.Time{}, fiber.NewError(
+		return "", time.Time{}, false, fiber.NewError(
 			fiber.StatusInternalServerError,
 			fmt.Sprintf("failed to reserve chat session: %v", err),
 		)
 	}
-	return turnID, turnDeadline, nil
+	return turnID, turnDeadline, created, nil
 }
 
-func (ch *ChatHandler) releaseChatTurn(namespace, sessionID, turnID string) {
+func (ch *ChatHandler) releaseChatTurn(namespace, sessionID, turnID string, deleteEmptyCreatedSession bool) {
 	if ch.sessionTurnCommitter == nil || turnID == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), chatDurabilityTimeout)
 	defer cancel()
-	if err := ch.sessionTurnCommitter.ReleaseChatTurn(ctx, namespace, sessionID, turnID); err != nil {
+	if err := ch.sessionTurnCommitter.ReleaseChatTurn(
+		ctx,
+		namespace,
+		sessionID,
+		turnID,
+		deleteEmptyCreatedSession,
+	); err != nil {
 		chatLog.Error(err, "failed to release chat turn", "namespace", namespace, "sessionId", sessionID)
+	}
+}
+
+func (ch *ChatHandler) finishActiveChatTurn(namespace, sessionID, turnID string) {
+	key := chatTurnKey{namespace: namespace, sessionID: sessionID}
+
+	ch.activeChatTurnsMu.Lock()
+	active := ch.activeChatTurns[key]
+	if active == nil || active.turnID != turnID {
+		ch.activeChatTurnsMu.Unlock()
+		return
+	}
+	cancel := active.cancel
+	done := active.done
+	if active.cancellers > 0 {
+		active.turnID = ""
+		active.cancel = nil
+		active.done = nil
+	} else {
+		delete(ch.activeChatTurns, key)
+	}
+	ch.activeChatTurnsMu.Unlock()
+
+	cancel()
+	close(done)
+}
+
+func (ch *ChatHandler) startSessionCancellation(namespace, sessionID string) (<-chan struct{}, bool) {
+	key := chatTurnKey{namespace: namespace, sessionID: sessionID}
+
+	ch.activeChatTurnsMu.Lock()
+	if ch.activeChatTurns == nil {
+		ch.activeChatTurns = make(map[chatTurnKey]*activeChatTurn)
+	}
+	active := ch.activeChatTurns[key]
+	if active == nil {
+		active = &activeChatTurn{}
+		ch.activeChatTurns[key] = active
+	}
+	active.cancellers++
+	cancel := active.cancel
+	done := active.done
+	hasActiveTurn := active.turnID != ""
+	ch.activeChatTurnsMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return done, hasActiveTurn
+}
+
+func (ch *ChatHandler) finishSessionCancellation(namespace, sessionID string) {
+	key := chatTurnKey{namespace: namespace, sessionID: sessionID}
+
+	ch.activeChatTurnsMu.Lock()
+	defer ch.activeChatTurnsMu.Unlock()
+	active := ch.activeChatTurns[key]
+	if active == nil || active.cancellers == 0 {
+		return
+	}
+	active.cancellers--
+	if active.cancellers == 0 && active.turnID == "" {
+		delete(ch.activeChatTurns, key)
 	}
 }
 
@@ -993,6 +1181,17 @@ func (ch *ChatHandler) HandleCancelChat(c fiber.Ctx) error {
 	}
 	if sessionType == store.SessionTypeGateway {
 		return fiber.NewError(fiber.StatusNotFound, "chat session not found")
+	}
+	done, active := ch.startSessionCancellation(namespace, sessionID)
+	defer ch.finishSessionCancellation(namespace, sessionID)
+	if active {
+		waitCtx, waitCancel := context.WithTimeout(c.Context(), chatDurabilityTimeout)
+		defer waitCancel()
+		select {
+		case <-done:
+		case <-waitCtx.Done():
+			return fiber.NewError(fiber.StatusGatewayTimeout, "timed out waiting for active chat turn to stop")
+		}
 	}
 
 	// Delete the session to cancel it

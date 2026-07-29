@@ -85,8 +85,8 @@ type SessionStore interface {
 // transcript messages with token usage. The expected message count fences the
 // session revision observed after acquiring the turn lease.
 type SessionTurnCommitter interface {
-	AcquireChatTurn(ctx context.Context, session *SessionRecord, turnID string, expiresAt time.Time) error
-	ReleaseChatTurn(ctx context.Context, namespace, name, turnID string) error
+	AcquireChatTurn(ctx context.Context, session *SessionRecord, turnID string, expiresAt time.Time) (created bool, err error)
+	ReleaseChatTurn(ctx context.Context, namespace, name, turnID string, deleteEmptyCreatedSession bool) error
 	CommitSessionTurn(
 		ctx context.Context,
 		session *SessionRecord,
