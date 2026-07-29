@@ -8,18 +8,15 @@ package api
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"slices"
 	"sort"
 
 	"github.com/gofiber/fiber/v3"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
@@ -31,18 +28,14 @@ const (
 	maxToolCursorHistorySize = 64
 )
 
-// toolListCursor is traversal state, not an authorization credential. Every
-// request resolves its namespace and re-applies item authorization before data
-// is returned. The cursor only combines the built-in offset with Kubernetes'
-// opaque continuation token and detects non-progress/cycles.
+// toolListCursor contains only logical current-inventory traversal state.
+// It never carries a Kubernetes resourceVersion or continuation token, so
+// callers cannot use it to select historical API-server snapshots.
 type toolListCursor struct {
-	Version         int      `json:"v"`
-	Namespace       string   `json:"n"`
-	BuiltinOffset   int      `json:"b"`
-	Continue        string   `json:"c,omitempty"`
-	History         []string `json:"h,omitempty"`
-	ResourceVersion string   `json:"r,omitempty"`
-	CustomAvailable bool     `json:"a,omitempty"`
+	Version   int    `json:"v"`
+	Namespace string `json:"n"`
+	Offset    int    `json:"o"`
+	Snapshot  string `json:"s"`
 }
 
 func (h *Handlers) allowedBuiltinTools(c fiber.Ctx) ([]fiber.Map, error) {
@@ -135,7 +128,7 @@ func (h *Handlers) unpaginatedToolListAll(
 	if err := h.apiReader.List(c.Context(), toolList, &client.ListOptions{Namespace: namespace}); err != nil {
 		return ListResponse{}, paginationListError("tools", err)
 	}
-	customItems, _, err := customToolListItems(c, h.contextTokenAuthorization, toolList.Items)
+	customItems, err := customToolListItems(c, h.contextTokenAuthorization, toolList.Items)
 	if err != nil {
 		return ListResponse{}, err
 	}
@@ -143,7 +136,7 @@ func (h *Handlers) unpaginatedToolListAll(
 	return ListResponse{Items: items, Metadata: ListMeta{}}, nil
 }
 
-func decodeToolListCursor(raw, namespace string, builtinCount int) (toolListCursor, error) {
+func decodeToolListCursor(raw, namespace string, itemCount int) (toolListCursor, error) {
 	cursor := toolListCursor{Version: toolListCursorVersion, Namespace: namespace}
 	if raw == "" {
 		return cursor, nil
@@ -164,9 +157,7 @@ func decodeToolListCursor(raw, namespace string, builtinCount int) (toolListCurs
 		return toolListCursor{}, fmt.Errorf("invalid tools continue cursor: trailing payload")
 	}
 	if cursor.Version != toolListCursorVersion || cursor.Namespace != namespace ||
-		cursor.BuiltinOffset < 0 || cursor.BuiltinOffset > builtinCount ||
-		len(cursor.History) > maxToolCursorHistorySize ||
-		(cursor.Continue != "" && (cursor.BuiltinOffset != builtinCount || cursor.ResourceVersion == "" || !cursor.CustomAvailable)) {
+		cursor.Offset < 0 || (itemCount >= 0 && cursor.Offset > itemCount) || cursor.Snapshot == "" {
 		return toolListCursor{}, fmt.Errorf("invalid tools continue cursor: cursor does not match this request")
 	}
 	return cursor, nil
@@ -183,147 +174,84 @@ func encodeToolListCursor(cursor toolListCursor) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(data), nil
 }
 
-func advanceToolListCursor(cursor toolListCursor, nextContinue string) (toolListCursor, error) {
-	if nextContinue == "" {
-		cursor.Continue = ""
-		return cursor, nil
+func toolListSnapshot(items []fiber.Map) (string, error) {
+	payload, err := json.Marshal(items)
+	if err != nil {
+		return "", fmt.Errorf("encode tool list snapshot: %w", err)
 	}
-	if nextContinue == cursor.Continue {
-		return toolListCursor{}, fmt.Errorf("tools continue cursor did not advance")
-	}
-	digest := hashToolContinuation(nextContinue)
-	if slices.Contains(cursor.History, digest) {
-		return toolListCursor{}, fmt.Errorf("tools continue cursor cycle detected")
-	}
-	if len(cursor.History) >= maxToolCursorHistorySize {
-		cursor.History = append(cursor.History[1:], digest)
-	} else {
-		cursor.History = append(cursor.History, digest)
-	}
-	cursor.Continue = nextContinue
-	return cursor, nil
+	sum := sha256.Sum256(payload)
+	return base64.RawURLEncoding.EncodeToString(sum[:]), nil
 }
 
-func hashToolContinuation(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return base64.RawURLEncoding.EncodeToString(sum[:16])
-}
-
-func (h *Handlers) kubernetesToolListPage(
+func (h *Handlers) logicalToolListPage(
 	c fiber.Ctx,
 	namespace string,
 	pageSize int64,
 	builtins []fiber.Map,
-	cursor toolListCursor,
-	items []fiber.Map,
+	rawCursor string,
 ) (ListResponse, error) {
-	for cursor.BuiltinOffset < len(builtins) && int64(len(items)) < pageSize {
-		items = append(items, builtins[cursor.BuiltinOffset])
-		cursor.BuiltinOffset++
+	cursor, err := decodeToolListCursor(rawCursor, namespace, -1)
+	if err != nil {
+		return ListResponse{}, fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
-
-	if int64(len(items)) == pageSize {
-		if cursor.ResourceVersion == "" {
-			resourceVersion, available, err := h.probeCustomToolSnapshot(c.Context(), namespace)
-			if err != nil {
-				return ListResponse{}, err
-			}
-			cursor.ResourceVersion = resourceVersion
-			cursor.CustomAvailable = available
-		}
-		if cursor.BuiltinOffset >= len(builtins) && !cursor.CustomAvailable {
-			return ListResponse{Items: items, Metadata: ListMeta{}}, nil
-		}
-		continuation, err := encodeToolListCursor(cursor)
-		if err != nil {
-			return ListResponse{}, fiber.NewError(fiber.StatusInternalServerError, err.Error())
-		}
-		return ListResponse{Items: items, Metadata: ListMeta{Continue: continuation}}, nil
-	}
-	if cursor.ResourceVersion != "" && !cursor.CustomAvailable {
-		return ListResponse{Items: items, Metadata: ListMeta{}}, nil
-	}
-
 	toolList := &corev1alpha1.ToolList{}
-	opts := &client.ListOptions{
-		Namespace: namespace,
-		Limit:     pageSize - int64(len(items)),
-		Continue:  cursor.Continue,
-	}
-	if cursor.Continue == "" && cursor.ResourceVersion != "" {
-		opts.Raw = &metav1.ListOptions{
-			ResourceVersion:      cursor.ResourceVersion,
-			ResourceVersionMatch: metav1.ResourceVersionMatchExact,
-		}
-	}
-	if err := h.apiReader.List(c.Context(), toolList, opts); err != nil {
+	if err := h.apiReader.List(c.Context(), toolList, &client.ListOptions{Namespace: namespace}); err != nil {
 		return ListResponse{}, paginationListError("tools", err)
 	}
-	customItems, filtered, err := customToolListItems(c, h.contextTokenAuthorization, toolList.Items)
+	sort.Slice(toolList.Items, func(i, j int) bool { return toolList.Items[i].Name < toolList.Items[j].Name })
+	customItems, err := customToolListItems(c, h.contextTokenAuthorization, toolList.Items)
 	if err != nil {
 		return ListResponse{}, err
 	}
-	items = append(items, customItems...)
+	items := append(append([]fiber.Map(nil), builtins...), customItems...)
+	snapshot, err := toolListSnapshot(items)
+	if err != nil {
+		return ListResponse{}, fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	if rawCursor == "" {
+		cursor.Snapshot = snapshot
+	} else if cursor.Snapshot != snapshot {
+		return ListResponse{}, fiber.NewError(fiber.StatusGone, "tools continue cursor expired; restart the list")
+	}
+	if cursor.Offset > len(items) {
+		return ListResponse{}, fiber.NewError(fiber.StatusBadRequest, "invalid tools continue cursor: cursor does not match this request")
+	}
+
+	end := min(len(items), cursor.Offset+int(pageSize))
+	pageItems := append(make([]fiber.Map, 0, end-cursor.Offset), items[cursor.Offset:end]...)
 	metadata := ListMeta{}
-	if !filtered {
-		remaining := int64(len(builtins) - cursor.BuiltinOffset)
-		if toolList.RemainingItemCount != nil {
-			remaining += *toolList.RemainingItemCount
-			metadata.RemainingItemCount = &remaining
+	if end < len(items) {
+		next := toolListCursor{
+			Version: toolListCursorVersion, Namespace: namespace, Offset: end, Snapshot: snapshot,
 		}
+		metadata.Continue, err = encodeToolListCursor(next)
+		if err != nil {
+			return ListResponse{}, fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		remaining := int64(len(items) - end)
+		metadata.RemainingItemCount = &remaining
 	}
-	if toolList.Continue == "" {
-		return ListResponse{Items: items, Metadata: metadata}, nil
-	}
-	if toolList.ResourceVersion == "" {
-		return ListResponse{}, fiber.NewError(fiber.StatusInternalServerError, "tool list response omitted resourceVersion")
-	}
-
-	cursor.BuiltinOffset = len(builtins)
-	cursor.ResourceVersion = toolList.ResourceVersion
-	cursor.CustomAvailable = true
-	cursor, err = advanceToolListCursor(cursor, toolList.Continue)
-	if err != nil {
-		return ListResponse{}, fiber.NewError(fiber.StatusInternalServerError, err.Error())
-	}
-	metadata.Continue, err = encodeToolListCursor(cursor)
-	if err != nil {
-		return ListResponse{}, fiber.NewError(fiber.StatusInternalServerError, err.Error())
-	}
-	return ListResponse{Items: items, Metadata: metadata}, nil
-}
-
-func (h *Handlers) probeCustomToolSnapshot(ctx context.Context, namespace string) (string, bool, error) {
-	probe := &corev1alpha1.ToolList{}
-	if err := h.apiReader.List(ctx, probe, &client.ListOptions{Namespace: namespace, Limit: 1}); err != nil {
-		return "", false, paginationListError("tools", err)
-	}
-	if probe.ResourceVersion == "" {
-		return "", false, fiber.NewError(fiber.StatusInternalServerError, "tool list response omitted resourceVersion")
-	}
-	return probe.ResourceVersion, len(probe.Items) > 0 || probe.Continue != "", nil
+	return ListResponse{Items: pageItems, Metadata: metadata}, nil
 }
 
 func customToolListItems(
 	c fiber.Ctx,
 	authz ContextTokenAuthorizationConfig,
 	tools []corev1alpha1.Tool,
-) ([]fiber.Map, bool, error) {
+) ([]fiber.Map, error) {
 	items := make([]fiber.Map, 0, len(tools))
-	filtered := false
 	for i := range tools {
 		tool := &tools[i]
 		allowed, err := contextTokenAllowsToolMetadata(c, authz, "listTools", tool.Name)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		if !allowed {
-			filtered = true
 			continue
 		}
 		items = append(items, customToolListItem(tool))
 	}
-	return items, filtered, nil
+	return items, nil
 }
 
 func customToolListItem(tool *corev1alpha1.Tool) fiber.Map {

@@ -1970,11 +1970,11 @@ func TestHandlers_ListTasks(t *testing.T) {
 	}
 }
 
-func TestHandlers_ListTasks_WithPagination(t *testing.T) {
+func TestHandlers_ListTasks_WithExplicitPagination(t *testing.T) {
 	handlers, app := setupTestHandlers()
 	app.Get("/tasks", handlers.ListTasks)
 
-	req := httptest.NewRequest(http.MethodGet, "/tasks?limit=10", nil)
+	req := httptest.NewRequest(http.MethodGet, "/tasks?limit=10&paginate=true", nil)
 	resp, err := app.Test(req)
 	if err != nil {
 		t.Fatalf("Test request failed: %v", err)

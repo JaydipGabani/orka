@@ -33,12 +33,6 @@ import (
 
 const cacheUnsupportedContinue = "continue-not-supported"
 
-const (
-	testToolCursorA         = "cursor-a"
-	testToolCursorB         = "cursor-b"
-	testToolResourceVersion = "cycle-resource-version"
-)
-
 type recordedListCall struct {
 	Kind            string
 	Namespace       string
@@ -106,15 +100,19 @@ type paginationTestCursor struct {
 }
 
 type paginatedAPIReader struct {
-	mu     sync.Mutex
-	tasks  []corev1alpha1.Task
-	agents []corev1alpha1.Agent
-	skills []corev1alpha1.Skill
-	tools  []corev1alpha1.Tool
-	calls  []recordedListCall
+	mu        sync.Mutex
+	getReader client.Reader
+	tasks     []corev1alpha1.Task
+	agents    []corev1alpha1.Agent
+	skills    []corev1alpha1.Skill
+	tools     []corev1alpha1.Tool
+	calls     []recordedListCall
 }
 
-func (r *paginatedAPIReader) Get(_ context.Context, key client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+func (r *paginatedAPIReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if r.getReader != nil {
+		return r.getReader.Get(ctx, key, obj, opts...)
+	}
 	return apierrors.NewNotFound(schema.GroupResource{Group: corev1alpha1.GroupVersion.Group, Resource: "test"}, key.Name)
 }
 
@@ -295,11 +293,11 @@ func TestHandlers_ListTasks_CachePaginationReproducesUnsupportedContinuation(t *
 	handlers := NewHandlers(HandlersConfig{Client: cacheClient})
 	app := newListTestApp(handlers)
 
-	first, status := listPage[corev1alpha1.Task](t, app, "/tasks?limit=1")
+	first, status := listPage[corev1alpha1.Task](t, app, "/tasks?limit=1&paginate=true")
 	require.Equal(t, http.StatusOK, status)
 	require.Equal(t, cacheUnsupportedContinue, first.Metadata.Continue)
 
-	_, status = listPage[corev1alpha1.Task](t, app, pathWithContinue("/tasks?limit=1", first.Metadata.Continue))
+	_, status = listPage[corev1alpha1.Task](t, app, pathWithContinue("/tasks?limit=1&paginate=true", first.Metadata.Continue))
 	require.Equal(t, http.StatusInternalServerError, status)
 }
 
@@ -318,7 +316,7 @@ func TestHandlers_ListTasks_APIReaderExposesUISecondPage(t *testing.T) {
 	handlers := NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader})
 	app := newListTestApp(handlers)
 
-	first, status := listPage[corev1alpha1.Task](t, app, "/tasks?limit=25")
+	first, status := listPage[corev1alpha1.Task](t, app, "/tasks?limit=25&paginate=true")
 	require.Equal(t, http.StatusOK, status)
 	require.Len(t, first.Items, 25)
 	require.NotEmpty(t, first.Metadata.Continue)
@@ -326,7 +324,7 @@ func TestHandlers_ListTasks_APIReaderExposesUISecondPage(t *testing.T) {
 	require.NotNil(t, first.Metadata.RemainingItemCount)
 	require.EqualValues(t, 1, *first.Metadata.RemainingItemCount)
 
-	second, status := listPage[corev1alpha1.Task](t, app, pathWithContinue("/tasks?limit=25", first.Metadata.Continue))
+	second, status := listPage[corev1alpha1.Task](t, app, pathWithContinue("/tasks?limit=25&paginate=true", first.Metadata.Continue))
 	require.Equal(t, http.StatusOK, status)
 	require.Len(t, second.Items, 1)
 	require.Equal(t, "task-26", second.Items[0].Name)
@@ -335,6 +333,88 @@ func TestHandlers_ListTasks_APIReaderExposesUISecondPage(t *testing.T) {
 	require.Equal(t, []recordedListCall{
 		{Kind: "tasks", Namespace: "default", Limit: 25},
 		{Kind: "tasks", Namespace: "default", Limit: 25, Continue: first.Metadata.Continue},
+	}, apiReader.snapshotCalls())
+}
+
+func TestHandlers_ListTasks_LimitOnlyReturnsCompleteInventory(t *testing.T) {
+	tasks := make([]corev1alpha1.Task, 26)
+	objects := make([]client.Object, 0, len(tasks))
+	for i := range tasks {
+		tasks[i].ObjectMeta = metav1.ObjectMeta{
+			Name:      fmt.Sprintf("task-%02d", i+1),
+			Namespace: "default",
+		}
+		objects = append(objects, &tasks[i])
+	}
+	cacheClient, cacheCalls := newCachePaginationClient(t, objects...)
+	apiReader := &paginatedAPIReader{tasks: tasks}
+	app := newListTestApp(NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader}))
+
+	page, status := listPage[corev1alpha1.Task](t, app, "/tasks?limit=25")
+	require.Equal(t, http.StatusOK, status)
+	require.Len(t, page.Items, 26)
+	require.Empty(t, page.Metadata.Continue)
+	require.Nil(t, page.Metadata.RemainingItemCount)
+	require.Empty(t, cacheCalls.snapshot())
+	require.Equal(t, []recordedListCall{{Kind: "tasks", Namespace: "default"}}, apiReader.snapshotCalls())
+}
+
+func TestHandlers_ListTasks_RequiresExplicitPaginationOptIn(t *testing.T) {
+	cacheClient, cacheCalls := newCachePaginationClient(t)
+	apiReader := &paginatedAPIReader{}
+	app := newListTestApp(NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader}))
+
+	for _, path := range []string{
+		"/tasks?limit=1&continue=opaque",
+		"/tasks?limit=1&paginate=maybe",
+		"/tasks?limit=0&paginate=true",
+	} {
+		_, status := listPage[corev1alpha1.Task](t, app, path)
+		require.Equal(t, http.StatusBadRequest, status, "path %q", path)
+	}
+	require.Empty(t, cacheCalls.snapshot())
+	require.Empty(t, apiReader.snapshotCalls())
+}
+
+func TestHandlers_ListTasks_GatewayFilteredCallerReceivesCompleteLogicalList(t *testing.T) {
+	hiddenGatewayTask := gatewayTaskAccessFixture()
+	visibleTasks := []corev1alpha1.Task{
+		{ObjectMeta: metav1.ObjectMeta{Name: "visible-task-1", Namespace: "default"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "visible-task-2", Namespace: "default"}},
+	}
+	tasks := []corev1alpha1.Task{*hiddenGatewayTask, visibleTasks[0], visibleTasks[1]}
+	objects := []client.Object{hiddenGatewayTask, &visibleTasks[0], &visibleTasks[1]}
+	cacheClient, cacheCalls := newCachePaginationClient(t, objects...)
+	apiReader := &paginatedAPIReader{
+		getReader: newGatewayIdentityClient(t, "namespace-uid", "gateway-uid"),
+		tasks:     tasks,
+	}
+	handlers := NewHandlers(HandlersConfig{
+		Client:     cacheClient,
+		APIReader:  apiReader,
+		KubeClient: denyingSubjectAccessReviewClient(t, nil, nil),
+	})
+	app := fiber.New(fiber.Config{ErrorHandler: customErrorHandler})
+	app.Use(tokenReviewUserMiddleware(limitedTokenReviewUser("default")))
+	app.Get("/tasks", handlers.ListTasks)
+
+	path := "/tasks?namespace=default&limit=1&paginate=true"
+	page, status := listPage[corev1alpha1.Task](t, app, path)
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, []string{"visible-task-1"}, []string{page.Items[0].Name})
+	require.NotEmpty(t, page.Metadata.Continue)
+	require.NotNil(t, page.Metadata.RemainingItemCount)
+	require.EqualValues(t, 1, *page.Metadata.RemainingItemCount)
+
+	second, status := listPage[corev1alpha1.Task](t, app, pathWithContinue(path, page.Metadata.Continue))
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, []string{"visible-task-2"}, []string{second.Items[0].Name})
+	require.Empty(t, second.Metadata.Continue)
+	require.Nil(t, second.Metadata.RemainingItemCount)
+	require.Empty(t, cacheCalls.snapshot())
+	require.Equal(t, []recordedListCall{
+		{Kind: "tasks", Namespace: "default"},
+		{Kind: "tasks", Namespace: "default"},
 	}, apiReader.snapshotCalls())
 }
 
@@ -531,18 +611,11 @@ func TestHandlers_ListTools_CombinedPaginationHonorsLimitAndAllContinuations(t *
 			for _, call := range calls {
 				require.Equal(t, "tools", call.Kind)
 				require.Equal(t, "default", call.Namespace)
-			}
-			require.EqualValues(t, 1, calls[0].Limit)
-			require.Empty(t, calls[0].Continue)
-			require.Empty(t, calls[0].ResourceVersion)
-			require.EqualValues(t, limit, calls[1].Limit)
-			require.Empty(t, calls[1].Continue)
-			require.Equal(t, "test-resource-version", calls[1].ResourceVersion)
-			for _, call := range calls[2:] {
-				require.EqualValues(t, limit, call.Limit)
-				require.NotEmpty(t, call.Continue)
+				require.Zero(t, call.Limit)
+				require.Empty(t, call.Continue)
 				require.Empty(t, call.ResourceVersion)
 			}
+
 		})
 	}
 }
@@ -554,6 +627,21 @@ func TestHandlers_ListTools_RejectsMalformedCombinedCursor(t *testing.T) {
 	app := newListTestApp(handlers)
 
 	_, status := listPage[toolListTestItem](t, app, "/tools?limit=1&continue=not-a-combined-cursor")
+	require.Equal(t, http.StatusBadRequest, status)
+	require.Empty(t, apiReader.snapshotCalls())
+}
+
+func TestHandlers_ListTools_RejectsCallerControlledResourceVersion(t *testing.T) {
+	cacheClient, _ := newCachePaginationClient(t)
+	apiReader := &paginatedAPIReader{}
+	app := newListTestApp(NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader}))
+	forged := base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil,
+		`{"v":%d,"n":"default","b":%d,"r":"caller-selected"}`,
+		toolListCursorVersion,
+		len(builtinToolsList),
+	))
+
+	_, status := listPage[toolListTestItem](t, app, pathWithContinue("/tools?limit=1", forged))
 	require.Equal(t, http.StatusBadRequest, status)
 	require.Empty(t, apiReader.snapshotCalls())
 }
@@ -640,7 +728,7 @@ func TestHandlers_DirectListContinuationErrorsKeepKubernetesStatus(t *testing.T)
 		name string
 		path string
 	}{
-		{name: "tasks", path: "/tasks?limit=1"},
+		{name: "tasks", path: "/tasks?limit=1&paginate=true"},
 		{name: "agents", path: "/agents?limit=1"},
 		{name: "skills", path: "/skills?limit=1"},
 	}
@@ -673,127 +761,37 @@ func TestHandlers_DirectListContinuationErrorsKeepKubernetesStatus(t *testing.T)
 	}
 }
 
-type expiringToolReader struct {
-	calls int
-}
-
-func (r *expiringToolReader) Get(_ context.Context, key client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
-	return apierrors.NewNotFound(schema.GroupResource{Group: corev1alpha1.GroupVersion.Group, Resource: "tools"}, key.Name)
-}
-
-func (r *expiringToolReader) List(_ context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	r.calls++
-	if r.calls == 2 {
-		return apierrors.NewResourceExpired("expired")
-	}
-	if r.calls != 1 {
-		return fmt.Errorf("unexpected list call %d", r.calls)
-	}
-	listOpts := client.ListOptions{}
-	listOpts.ApplyOptions(opts)
-	if listOpts.Continue != "" || listResourceVersion(listOpts) != "" {
-		return fmt.Errorf("unexpected probe options: continue=%q resourceVersion=%q", listOpts.Continue, listResourceVersion(listOpts))
-	}
-	toolList := list.(*corev1alpha1.ToolList)
-	toolList.Items = []corev1alpha1.Tool{{ObjectMeta: metav1.ObjectMeta{Name: "custom", Namespace: "default"}}}
-	toolList.ResourceVersion = "expiring-resource-version"
-	return nil
-}
-
-func TestHandlers_ListTools_ReturnsGoneForExpiredKubernetesContinuation(t *testing.T) {
+func TestHandlers_ListTools_ReturnsGoneWhenSnapshotChanges(t *testing.T) {
 	cacheClient, _ := newCachePaginationClient(t)
-	handlers := NewHandlers(HandlersConfig{
-		Client:    cacheClient,
-		APIReader: &expiringToolReader{},
-	})
+	apiReader := &paginatedAPIReader{tools: []corev1alpha1.Tool{{
+		ObjectMeta: metav1.ObjectMeta{Name: "custom-1", Namespace: "default"},
+	}}}
+	handlers := NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader})
 	app := newListTestApp(handlers)
 
 	first, status := listPage[toolListTestItem](t, app, "/tools?limit=6")
 	require.Equal(t, http.StatusOK, status)
 	require.NotEmpty(t, first.Metadata.Continue)
-
+	apiReader.mu.Lock()
+	apiReader.tools = append(apiReader.tools, corev1alpha1.Tool{ObjectMeta: metav1.ObjectMeta{Name: "custom-2", Namespace: "default"}})
+	apiReader.mu.Unlock()
 	_, status = listPage[toolListTestItem](t, app, pathWithContinue("/tools?limit=6", first.Metadata.Continue))
 	require.Equal(t, http.StatusGone, status)
 }
 
-type cyclingToolReader struct {
-	mu    sync.Mutex
-	calls int
-}
-
-func (r *cyclingToolReader) Get(_ context.Context, key client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
-	return apierrors.NewNotFound(schema.GroupResource{Group: corev1alpha1.GroupVersion.Group, Resource: "tools"}, key.Name)
-}
-
-func (r *cyclingToolReader) List(_ context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	listOpts := client.ListOptions{}
-	listOpts.ApplyOptions(opts)
-	toolList, ok := list.(*corev1alpha1.ToolList)
-	if !ok {
-		return fmt.Errorf("unsupported list type %T", list)
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.calls++
-	var next string
-	switch r.calls {
-	case 1:
-		if listOpts.Continue != "" || listResourceVersion(listOpts) != "" {
-			return fmt.Errorf("unexpected probe options")
-		}
-		toolList.Items = []corev1alpha1.Tool{{
-			ObjectMeta: metav1.ObjectMeta{Name: "probe-tool", Namespace: "default"},
-		}}
-		toolList.ResourceVersion = testToolResourceVersion
-		return nil
-	case 2:
-		if listOpts.Continue != "" || listResourceVersion(listOpts) != testToolResourceVersion {
-			return fmt.Errorf("unexpected snapshot-start options")
-		}
-		next = testToolCursorA
-	case 3:
-		if listOpts.Continue != testToolCursorA {
-			return fmt.Errorf("continue = %q, want cursor-a", listOpts.Continue)
-		}
-		next = testToolCursorB
-	case 4:
-		if listOpts.Continue != testToolCursorB {
-			return fmt.Errorf("continue = %q, want cursor-b", listOpts.Continue)
-		}
-		next = testToolCursorA
-	default:
-		return fmt.Errorf("unexpected list call %d", r.calls)
-	}
-	toolList.Items = []corev1alpha1.Tool{{
-		ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("custom-%d", r.calls), Namespace: "default"},
-	}}
-	toolList.Continue = next
-	toolList.ResourceVersion = testToolResourceVersion
-	return nil
-}
-
-func TestHandlers_ListTools_StopsCombinedContinuationCycle(t *testing.T) {
+func TestHandlers_ListTools_AllowsRetryingTheSameCursor(t *testing.T) {
 	cacheClient, _ := newCachePaginationClient(t)
-	apiReader := &cyclingToolReader{}
+	apiReader := &paginatedAPIReader{tools: []corev1alpha1.Tool{{ObjectMeta: metav1.ObjectMeta{Name: "custom", Namespace: "default"}}}}
 	handlers := NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader})
 	app := newListTestApp(handlers)
-
-	path := "/tools?limit=6"
-	first, status := listPage[toolListTestItem](t, app, path)
+	first, status := listPage[toolListTestItem](t, app, "/tools?limit=1")
 	require.Equal(t, http.StatusOK, status)
-	require.NotEmpty(t, first.Metadata.Continue)
-
-	second, status := listPage[toolListTestItem](t, app, pathWithContinue(path, first.Metadata.Continue))
+	path := pathWithContinue("/tools?limit=1", first.Metadata.Continue)
+	second, status := listPage[toolListTestItem](t, app, path)
 	require.Equal(t, http.StatusOK, status)
-	require.NotEmpty(t, second.Metadata.Continue)
-
-	third, status := listPage[toolListTestItem](t, app, pathWithContinue(path, second.Metadata.Continue))
+	retried, status := listPage[toolListTestItem](t, app, path)
 	require.Equal(t, http.StatusOK, status)
-	require.NotEmpty(t, third.Metadata.Continue)
-
-	_, status = listPage[toolListTestItem](t, app, pathWithContinue(path, third.Metadata.Continue))
-	require.Equal(t, http.StatusInternalServerError, status)
+	require.Equal(t, second, retried)
 }
 
 func TestHandlers_ListTasks_ContextTokenUsesAuthoritativeReaderForDependencies(t *testing.T) {
@@ -859,7 +857,7 @@ func TestHandlers_ListTasks_ContextTokenReturnsCompleteAuthorizedLogicalList(t *
 	require.Nil(t, page.Metadata.RemainingItemCount)
 	require.Equal(t, []recordedListCall{{Kind: "tasks", Namespace: "default"}}, apiReader.snapshotCalls())
 
-	_, status = listPage[corev1alpha1.Task](t, app, "/tasks?limit=1&continue=opaque")
+	_, status = listPage[corev1alpha1.Task](t, app, "/tasks?limit=1&paginate=true&continue=opaque")
 	require.Equal(t, http.StatusBadRequest, status)
 }
 
@@ -913,9 +911,16 @@ func TestHandlers_ListTools_AllowsMoreThanCursorHistoryWindow(t *testing.T) {
 
 	path := "/tools?limit=1"
 	count := 0
+	seenNames := map[string]struct{}{}
 	for page := 0; page < len(builtinToolsList)+len(tools)+1; page++ {
 		response, status := listPage[toolListTestItem](t, app, path)
 		require.Equal(t, http.StatusOK, status)
+		for _, item := range response.Items {
+			if _, duplicate := seenNames[item.Name]; duplicate {
+				t.Fatalf("duplicate tool %q on page %d", item.Name, page)
+			}
+			seenNames[item.Name] = struct{}{}
+		}
 		count += len(response.Items)
 		if response.Metadata.Continue == "" {
 			break
