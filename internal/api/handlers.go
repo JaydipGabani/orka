@@ -553,8 +553,15 @@ func (h *Handlers) ListTasks(c fiber.Ctx) error {
 	}
 
 	filteredContextList := h.contextTokenAuthorization.enforcing() && isContextTokenRequest(c)
-	logicalPagination := paginationRequested && !filteredContextList &&
-		(h.contextTokenAuthorization.Enabled() || h.gatewayEventStore != nil || h.clientset != nil)
+	broadGatewayRead := false
+	logicalPagination := false
+	if paginationRequested && !filteredContextList {
+		broadGatewayRead, err = h.taskAccess().hasBroadGatewayRead(c, "listTasks", namespace)
+		if err != nil {
+			return err
+		}
+		logicalPagination = !broadGatewayRead
+	}
 
 	// Raw Kubernetes continuations describe the unfiltered inventory. Callers
 	// whose context or gateway authorization can hide Tasks receive one complete
@@ -590,7 +597,7 @@ func (h *Handlers) ListTasks(c fiber.Ctx) error {
 	}
 
 	gatewayAuthorizations := map[gatewayTaskAuthorizationKey]bool{}
-	filtered, filteredList, err := h.filterTaskList(c, taskList.Items, listReader, gatewayAuthorizations)
+	filtered, filteredList, err := h.filterTaskList(c, taskList.Items, listReader, gatewayAuthorizations, broadGatewayRead)
 	if err != nil {
 		return err
 	}
@@ -600,7 +607,11 @@ func (h *Handlers) ListTasks(c fiber.Ctx) error {
 		if err != nil {
 			return fiber.NewError(fiber.StatusBadRequest, err.Error())
 		}
-		returnPage, err := logicalTaskListPage(namespace, pagination.Limit, continueToken, filtered)
+		pageSize, err := paginationLimitInt(pagination.Limit)
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		}
+		returnPage, err := logicalTaskListPage(namespace, pageSize, continueToken, filtered)
 		if err != nil {
 			return err
 		}
@@ -624,6 +635,7 @@ func (h *Handlers) filterTaskList(
 	tasks []corev1alpha1.Task,
 	listReader client.Reader,
 	gatewayAuthorizations map[gatewayTaskAuthorizationKey]bool,
+	skipGatewayAuthorization bool,
 ) ([]corev1alpha1.Task, bool, error) {
 	filtered := make([]corev1alpha1.Task, 0, len(tasks))
 	for i := range tasks {
@@ -636,7 +648,7 @@ func (h *Handlers) filterTaskList(
 				return nil, false, err
 			}
 		}
-		if allowed {
+		if allowed && !skipGatewayAuthorization {
 			allowed, err = h.taskAccess().gatewayTaskReadableCached(c, "listTasks", task, gatewayAuthorizations)
 			if err != nil {
 				return nil, false, err
@@ -1058,8 +1070,12 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 
+	pageSize, err := paginationLimitInt(pagination.Limit)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
 	response, err := h.logicalToolListPage(
-		c, namespace, pagination.Limit, builtins, pagination.Continue,
+		c, namespace, pageSize, builtins, pagination.Continue,
 	)
 	if err != nil {
 		return err
