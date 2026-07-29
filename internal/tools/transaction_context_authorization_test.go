@@ -162,6 +162,29 @@ func TestValidateChildTaskAgainstParentTransactionRejectsEnabledBashOutsideAllow
 	}
 }
 
+func TestValidateChildTaskAgainstParentTransactionDoesNotRequireImplicitAgentCoordination(t *testing.T) {
+	agent := researcherAgent()
+	agent.Spec.Coordination = &corev1alpha1.CoordinationConfig{Enabled: true, Autonomous: true}
+	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
+		Type:                corev1alpha1.AgentRuntimeCodex,
+		DefaultAllowedTools: []string{"Read"},
+		DefaultAllowBash:    new(false),
+	}
+	child := childTaskForResearcherAgent()
+	child.Spec.Type = corev1alpha1.TaskTypeAgent
+	child.Labels = map[string]string{labels.LabelParentTask: "parent-task"}
+	parent := parentTask()
+	parent.Spec.Transaction.Context = map[string]string{
+		"namespace":     defaultNamespace,
+		"allowedAgents": `["researcher"]`,
+		"allowedTools":  `["Read"]`,
+	}
+
+	if err := validateChildTaskAgainstParentTransaction(context.Background(), newFakeClient(agent), parent, child, testResearcherAgentName); err != nil {
+		t.Fatalf("validateChildTaskAgainstParentTransaction() error = %v", err)
+	}
+}
+
 func TestChildTransactionEffectiveAIToolsSkipsDisabledCoordinationInjection(t *testing.T) {
 	agent := researcherAgent()
 	agent.Spec.Coordination = &corev1alpha1.CoordinationConfig{Enabled: true, Autonomous: true}

@@ -91,12 +91,26 @@ func CoordinationToolNames() []string {
 	return append([]string(nil), registeredCoordinationToolNames...)
 }
 
+// RegistersCoordinationTools reports whether the AI worker registers Orka's
+// coordination tool implementations for task. Disabling implicit injection only
+// narrows the selected tool list; AI child identity still enables the registry
+// so explicitly selected coordination tools remain platform-provided.
+func RegistersCoordinationTools(task *corev1alpha1.Task, agent *corev1alpha1.Agent) bool {
+	if !usesAIWorkerToolRegistry(task) {
+		return false
+	}
+	if agent != nil && agent.Spec.Coordination != nil && agent.Spec.Coordination.Enabled {
+		return true
+	}
+	return task != nil && labels.ParentTaskName(task.Labels, task.Annotations) != ""
+}
+
 // IsImplicitTool reports whether name is injected by Orka rather than selected
 // explicitly by an Agent or Task. Authorization uses it to distinguish platform
 // tools from Tool CR references without broadening implicit capabilities.
 func IsImplicitTool(task *corev1alpha1.Task, agent *corev1alpha1.Agent, name string) bool {
 	name = strings.TrimSpace(name)
-	if name == "" || (task != nil && task.Spec.Type == corev1alpha1.TaskTypeContainer) {
+	if name == "" || !usesAIWorkerToolRegistry(task) {
 		return false
 	}
 	disableImplicitTools := task != nil && task.Annotations[labels.AnnotationDisableCoordinationToolInject] == "true"
@@ -115,6 +129,10 @@ func IsImplicitTool(task *corev1alpha1.Task, agent *corev1alpha1.Agent, name str
 
 func containsTool(tools []string, name string) bool {
 	return slices.Contains(tools, name)
+}
+
+func usesAIWorkerToolRegistry(task *corev1alpha1.Task) bool {
+	return task == nil || task.Spec.Type == "" || task.Spec.Type == corev1alpha1.TaskTypeAI
 }
 
 // Resolve returns the ordered, de-duplicated configured and implicit tool set
@@ -158,14 +176,14 @@ func Resolve(task *corev1alpha1.Task, agent *corev1alpha1.Agent) []string {
 	}
 
 	disableImplicitTools := task != nil && task.Annotations[labels.AnnotationDisableCoordinationToolInject] == "true"
-	if agent != nil && agent.Spec.Coordination != nil && agent.Spec.Coordination.Enabled && !disableImplicitTools {
+	if usesAIWorkerToolRegistry(task) && agent != nil && agent.Spec.Coordination != nil && agent.Spec.Coordination.Enabled && !disableImplicitTools {
 		appendTools(implicitCoordinationToolNames)
 		if agent.Spec.Coordination.Autonomous {
 			appendTool("request_approval")
 		}
 	}
 
-	if task != nil && labels.ParentTaskName(task.Labels, task.Annotations) != "" && !disableImplicitTools {
+	if usesAIWorkerToolRegistry(task) && task != nil && labels.ParentTaskName(task.Labels, task.Annotations) != "" && !disableImplicitTools {
 		appendTools(childMessagingToolNames)
 	}
 

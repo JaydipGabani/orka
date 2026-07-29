@@ -53,10 +53,16 @@ func TestResolve(t *testing.T) {
 			want: []string{"send_message", "check_messages", "recall_memory", "remember", "propose_memory", "search_transcript"},
 		},
 		{
-			name:  "agent task retains configured brokered tools without AI memory tools",
-			task:  &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, AI: &corev1alpha1.AISpec{Tools: []string{"brokered"}}}},
-			agent: &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Tools: []corev1alpha1.ToolReference{{Name: "agent_tool"}}}},
-			want:  []string{"agent_tool", "brokered"},
+			name: "agent child retains configured tools without AI worker implicit tools",
+			task: &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labels.LabelParentTask: "parent"}},
+				Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, AI: &corev1alpha1.AISpec{Tools: []string{"brokered"}}},
+			},
+			agent: &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
+				Tools:        []corev1alpha1.ToolReference{{Name: "agent_tool"}},
+				Coordination: &corev1alpha1.CoordinationConfig{Enabled: true, Autonomous: true},
+			}},
+			want: []string{"agent_tool", "brokered"},
 		},
 		{
 			name: "container task has no AI tools",
@@ -86,6 +92,62 @@ func TestResolve(t *testing.T) {
 			got := Resolve(tt.task, tt.agent)
 			if !slices.Equal(got, tt.want) {
 				t.Fatalf("Resolve() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRegistersCoordinationTools(t *testing.T) {
+	tests := []struct {
+		name  string
+		task  *corev1alpha1.Task
+		agent *corev1alpha1.Agent
+		want  bool
+	}{
+		{
+			name:  "coordinator agent",
+			task:  aiToolTask(nil, nil, nil),
+			agent: &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Coordination: &corev1alpha1.CoordinationConfig{Enabled: true}}},
+			want:  true,
+		},
+		{
+			name: "child with implicit injection disabled",
+			task: aiToolTask(
+				map[string]string{labels.LabelParentTask: "parent"},
+				map[string]string{labels.AnnotationDisableCoordinationToolInject: "true"},
+				[]string{"send_message"},
+			),
+			want: true,
+		},
+		{
+			name: "child identified by annotation",
+			task: aiToolTask(nil, map[string]string{
+				labels.AnnotationParentTaskName:                "long-parent-name",
+				labels.AnnotationDisableCoordinationToolInject: "true",
+			}, []string{"list_pull_requests"}),
+			want: true,
+		},
+		{name: "standalone task", task: aiToolTask(nil, nil, []string{"send_message"})},
+		{
+			name: "agent child",
+			task: &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labels.LabelParentTask: "parent"}},
+				Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent},
+			},
+		},
+		{
+			name: "container child",
+			task: &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labels.LabelParentTask: "parent"}},
+				Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeContainer},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RegistersCoordinationTools(tt.task, tt.agent); got != tt.want {
+				t.Fatalf("RegistersCoordinationTools() = %t, want %t", got, tt.want)
 			}
 		})
 	}
