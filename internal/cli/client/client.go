@@ -668,8 +668,13 @@ func (c *Client) ListTasksPage(ctx context.Context, opts ListTasksOptions) (*Lis
 	}
 	if opts.All {
 		q.Set("limit", "0")
-	} else if opts.Limit > 0 {
-		q.Set("limit", strconv.Itoa(opts.Limit))
+	} else {
+		if opts.Limit > 0 {
+			q.Set("limit", strconv.Itoa(opts.Limit))
+		}
+		if opts.Limit > 0 || opts.Continue != "" {
+			q.Set("paginate", "true")
+		}
 	}
 	if opts.Continue != "" {
 		q.Set("continue", opts.Continue)
