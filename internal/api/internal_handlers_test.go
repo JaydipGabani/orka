@@ -877,6 +877,49 @@ func TestGetSessionTranscript(t *testing.T) {
 	})
 }
 
+type countingTranscriptSearchStore struct {
+	store.SessionStore
+	calls   int
+	filters []store.TranscriptSearchFilter
+}
+
+func (s *countingTranscriptSearchStore) SearchTranscript(
+	ctx context.Context,
+	filter store.TranscriptSearchFilter,
+) ([]store.TranscriptSearchResult, error) {
+	s.calls++
+	s.filters = append(s.filters, filter)
+	return s.SessionStore.SearchTranscript(ctx, filter)
+}
+
+func TestSearchAuthorizedTranscriptResultsUsesSingleBoundedQuery(t *testing.T) {
+	db, err := sqlite.NewDB(":memory:")
+	require.NoError(t, err)
+	dataStore := sqlite.NewStore(db, ":memory:")
+	for _, sessionName := range []string{"session-a", "session-b", "excluded"} {
+		require.NoError(t, dataStore.CreateSession(t.Context(), &store.SessionRecord{
+			Namespace: "default", Name: sessionName, SessionType: "task",
+		}))
+		require.NoError(t, dataStore.AppendMessages(t.Context(), "default", sessionName, []store.SessionMessage{{
+			Role: "assistant", Content: "shared needle in " + sessionName,
+		}}))
+	}
+
+	capture := &countingTranscriptSearchStore{SessionStore: dataStore}
+	results, err := searchAuthorizedTranscriptResults(t.Context(), capture, store.TranscriptSearchFilter{
+		Namespace: "default", Query: "needle", ExcludeSessionName: "excluded", Limit: 10,
+	}, map[string]struct{}{
+		"session-a": {}, "session-b": {}, "excluded": {},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, capture.calls)
+	require.Len(t, capture.filters, 1)
+	require.Equal(t, []string{"session-a", "session-b"}, capture.filters[0].SessionNames)
+	require.Empty(t, capture.filters[0].ExcludeSessionName)
+	require.Len(t, results, 2)
+	require.ElementsMatch(t, []string{"session-a", "session-b"}, []string{results[0].SessionName, results[1].SessionName})
+}
+
 func TestSearchTranscript(t *testing.T) {
 	h, app, ss := setupTestInternalHandlers()
 	app.Get("/internal/v1/sessions/:namespace/search", h.SearchTranscript)

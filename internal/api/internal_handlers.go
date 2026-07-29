@@ -271,10 +271,7 @@ func (h *InternalHandlers) GetSessionTranscript(c fiber.Ctx) error {
 	}
 
 	ctx := c.Context()
-	allowedSessions, err := authorizer.coordinationTreeSessionNames(ctx, callerTask)
-	if err != nil {
-		return err
-	}
+	callerOwnsSession := callerTask.Spec.SessionRef != nil && callerTask.Spec.SessionRef.Name == name
 	gatewayOwned := false
 	var gatewayEvent *store.GatewayEvent
 	if h.gatewayEventStore != nil {
@@ -286,13 +283,12 @@ func (h *InternalHandlers) GetSessionTranscript(c fiber.Ctx) error {
 			if strings.TrimSpace(event.SessionName) == "" || event.SessionName != name {
 				return fiber.NewError(fiber.StatusForbidden, "task does not own this gateway session")
 			}
-			allowedSessions = map[string]struct{}{event.SessionName: {}}
 		case errors.Is(eventErr, store.ErrNotFound):
 		default:
 			return fiber.NewError(fiber.StatusInternalServerError, "failed to load gateway transcript ownership")
 		}
 	}
-	if _, ok := allowedSessions[name]; !ok {
+	if !gatewayOwned && !callerOwnsSession {
 		return fiber.NewError(fiber.StatusForbidden, "caller is not authorized for this session")
 	}
 
@@ -493,28 +489,13 @@ func searchAuthorizedTranscriptResults(
 	}
 	sort.Strings(sessionNames)
 
-	results := make([]store.TranscriptSearchResult, 0, limit)
-	for _, sessionName := range sessionNames {
-		sessionFilter := filter
-		sessionFilter.SessionName = sessionName
-		sessionFilter.ExcludeSessionName = ""
-		sessionFilter.Limit = limit
-		sessionResults, err := sessionStore.SearchTranscript(ctx, sessionFilter)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, sessionResults...)
+	if len(sessionNames) == 0 {
+		return []store.TranscriptSearchResult{}, nil
 	}
-	sort.SliceStable(results, func(i, j int) bool {
-		if results[i].CreatedAt.Equal(results[j].CreatedAt) {
-			return results[i].MessageID > results[j].MessageID
-		}
-		return results[i].CreatedAt.After(results[j].CreatedAt)
-	})
-	if len(results) > limit {
-		results = results[:limit]
-	}
-	return results, nil
+	filter.SessionNames = sessionNames
+	filter.ExcludeSessionName = ""
+	filter.Limit = limit
+	return sessionStore.SearchTranscript(ctx, filter)
 }
 
 func parseOptionalNonNegativeQueryInt(raw, name string) (int, error) {

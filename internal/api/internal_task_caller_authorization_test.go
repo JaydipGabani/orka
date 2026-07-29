@@ -145,6 +145,18 @@ func TestInternalTaskScopedHandlersRequireActiveOwningWorker(t *testing.T) { //n
 		require.Equal(t, request.successStatus, resp.StatusCode, "%s %s", request.method, request.path)
 	}
 
+	peerTranscript := doTaskScopedInternalRequest(t, active, taskScopedRequest{
+		method: http.MethodGet,
+		path:   "/internal/v1/sessions/default/session-peer-a/transcript",
+	})
+	require.Equal(t, http.StatusForbidden, peerTranscript.StatusCode)
+	peerSearch := doTaskScopedInternalRequest(t, active, taskScopedRequest{
+		method:        http.MethodGet,
+		path:          "/internal/v1/sessions/default/search?query=history&sessionName=session-peer-a",
+		successStatus: http.StatusOK,
+	})
+	require.Equal(t, http.StatusOK, peerSearch.StatusCode)
+
 	crossTask := newTaskScopedInternalApp(h, internalCallerAuthWorkerUser("task-b-pod", "task-b-pod-uid"))
 	assertTaskScopedRequestsDenied(t, crossTask, "task-a", "session-a", "peer-a", http.StatusForbidden)
 
