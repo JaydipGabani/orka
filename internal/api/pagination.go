@@ -105,7 +105,14 @@ func parseTaskPaginationParams(c fiber.Ctx) (taskPaginationParams, error) {
 	return params, nil
 }
 
-const taskListCursorVersion = 1
+func paginationLimitInt(limit int64) (int, error) {
+	if limit < 1 || limit > int64(MaxLimit) {
+		return 0, fmt.Errorf("pagination limit %d is out of range", limit)
+	}
+	return int(limit), nil
+}
+
+const taskListCursorVersion = 2
 
 type taskListCursor struct {
 	Version   int    `json:"v"`
@@ -146,7 +153,23 @@ func decodeTaskListCursor(raw, namespace string) (taskListCursor, error) {
 }
 
 func taskListSnapshot(tasks []corev1alpha1.Task) (string, error) {
-	data, err := json.Marshal(tasks)
+	type stableTask struct {
+		Namespace   string                `json:"namespace"`
+		Name        string                `json:"name"`
+		UID         string                `json:"uid"`
+		Generation  int64                 `json:"generation"`
+		Labels      map[string]string     `json:"labels,omitempty"`
+		Annotations map[string]string     `json:"annotations,omitempty"`
+		Spec        corev1alpha1.TaskSpec `json:"spec"`
+	}
+	stable := make([]stableTask, 0, len(tasks))
+	for i := range tasks {
+		stable = append(stable, stableTask{
+			Namespace: tasks[i].Namespace, Name: tasks[i].Name, UID: string(tasks[i].UID),
+			Generation: tasks[i].Generation, Labels: tasks[i].Labels, Annotations: tasks[i].Annotations, Spec: tasks[i].Spec,
+		})
+	}
+	data, err := json.Marshal(stable)
 	if err != nil {
 		return "", fmt.Errorf("encode task list snapshot: %w", err)
 	}
@@ -154,7 +177,7 @@ func taskListSnapshot(tasks []corev1alpha1.Task) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(sum[:]), nil
 }
 
-func logicalTaskListPage(namespace string, pageSize int64, rawCursor string, tasks []corev1alpha1.Task) (ListResponse, error) {
+func logicalTaskListPage(namespace string, pageSize int, rawCursor string, tasks []corev1alpha1.Task) (ListResponse, error) {
 	tasks = append([]corev1alpha1.Task(nil), tasks...)
 	sort.Slice(tasks, func(i, j int) bool {
 		if tasks[i].Namespace == tasks[j].Namespace {
@@ -181,7 +204,7 @@ func logicalTaskListPage(namespace string, pageSize int64, rawCursor string, tas
 	if cursor.Offset > len(tasks) {
 		return ListResponse{}, fiber.NewError(fiber.StatusBadRequest, "invalid tasks continue cursor: cursor does not match this request")
 	}
-	end := min(len(tasks), cursor.Offset+int(pageSize))
+	end := min(len(tasks), cursor.Offset+pageSize)
 	items := append(make([]corev1alpha1.Task, 0, end-cursor.Offset), tasks[cursor.Offset:end]...)
 	metadata := ListMeta{}
 	if end < len(tasks) {
