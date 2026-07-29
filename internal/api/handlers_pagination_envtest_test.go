@@ -96,43 +96,62 @@ func TestHandlers_ListTasks_UsesManagerAPIReaderForRealKubernetesContinuation(t 
 	})
 	app := newListTestApp(handlers)
 
-	first, status := listPage[corev1alpha1.Task](t, app, "/tasks?limit=1")
+	first, status := listPage[corev1alpha1.Task](t, app, "/tasks?limit=1&paginate=true")
 	require.Equal(t, http.StatusOK, status)
 	require.Len(t, first.Items, 1)
 	require.NotEmpty(t, first.Metadata.Continue)
 	require.NotEqual(t, cacheUnsupportedContinue, first.Metadata.Continue)
 
-	second, status := listPage[corev1alpha1.Task](t, app, pathWithContinue("/tasks?limit=1", first.Metadata.Continue))
+	second, status := listPage[corev1alpha1.Task](t, app, pathWithContinue("/tasks?limit=1&paginate=true", first.Metadata.Continue))
 	require.Equal(t, http.StatusOK, status)
 	require.Len(t, second.Items, 1)
 	require.NotEqual(t, first.Items[0].Name, second.Items[0].Name)
 	require.Empty(t, second.Metadata.Continue)
 
+	const toolPagePath = "/tools?limit=1"
 	createEnvtestTool(t, directClient, "snapshot-tool-1")
-	toolPath := "/tools?limit=1"
+	createEnvtestTool(t, directClient, "snapshot-tool-2")
+	toolPath := toolPagePath
 	toolPage, status := listPage[toolListTestItem](t, app, toolPath)
 	require.Equal(t, http.StatusOK, status)
-	require.NotEmpty(t, toolPage.Metadata.Continue)
-	createEnvtestTool(t, directClient, "snapshot-tool-2")
+	for {
+		customPage := false
+		for _, tool := range toolPage.Items {
+			customPage = customPage || !tool.Builtin
+		}
+		if customPage && toolPage.Metadata.Continue != "" {
+			break
+		}
+		require.NotEmpty(t, toolPage.Metadata.Continue)
+		toolPath = pathWithContinue(toolPagePath, toolPage.Metadata.Continue)
+		toolPage, status = listPage[toolListTestItem](t, app, toolPath)
+		require.Equal(t, http.StatusOK, status)
+	}
 
-	toolNames := make([]string, 0, len(builtinToolsList)+1)
-	for pageNumber := 1; pageNumber <= 20; pageNumber++ {
+	createEnvtestTool(t, directClient, "snapshot-tool-3")
+	_, status = listPage[toolListTestItem](t, app, pathWithContinue(toolPagePath, toolPage.Metadata.Continue))
+	require.Equal(t, http.StatusGone, status)
+
+	toolPath = toolPagePath
+	toolNames := make([]string, 0, len(builtinToolsList)+3)
+	for pageNumber := 0; pageNumber < len(builtinToolsList)+4; pageNumber++ {
+		toolPage, status = listPage[toolListTestItem](t, app, toolPath)
+		require.Equal(t, http.StatusOK, status)
 		for _, tool := range toolPage.Items {
 			toolNames = append(toolNames, tool.Name)
 		}
 		if toolPage.Metadata.Continue == "" {
 			break
 		}
-		toolPath = pathWithContinue("/tools?limit=1", toolPage.Metadata.Continue)
-		toolPage, status = listPage[toolListTestItem](t, app, toolPath)
-		require.Equal(t, http.StatusOK, status)
+		toolPath = pathWithContinue(toolPagePath, toolPage.Metadata.Continue)
 	}
-	wantToolNames := make([]string, 0, len(builtinToolsList)+1)
+	wantToolNames := make([]string, 0, len(builtinToolsList)+3)
 	for _, tool := range builtinToolsList {
 		wantToolNames = append(wantToolNames, tool["name"].(string))
 	}
-	wantToolNames = append(wantToolNames, "snapshot-tool-1")
+	wantToolNames = append(wantToolNames, "snapshot-tool-1", "snapshot-tool-2", "snapshot-tool-3")
 	require.Equal(t, wantToolNames, toolNames)
+
 }
 
 func createEnvtestTool(t *testing.T, c client.Client, name string) {
