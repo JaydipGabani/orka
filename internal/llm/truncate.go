@@ -25,7 +25,10 @@ type CompletionRequestSize struct {
 	EstimatedTokens int
 }
 
-const currentUserTaskTruncationMarker = "\n\n[Current user task truncated for context recovery.]\n\n"
+const (
+	currentUserTaskTruncationMarker = "\n\n[Current user task truncated for context recovery.]\n\n"
+	minimalRecoveryTruncationNote   = "[Earlier messages truncated for context recovery.]"
+)
 
 // EstimateCompletionRequestSize estimates the complete serialized request,
 // including system prompts, tool schemas, messages, and tool-call arguments.
@@ -82,8 +85,7 @@ func TruncateCompletionRequest(req *CompletionRequest, tokenBudget int) (*Comple
 			break
 		}
 		kept[drop] = false
-		truncated.Messages = messagesFromKeptBlocks(blocks, kept)
-		size, err = EstimateCompletionRequestSize(truncated)
+		truncated.Messages, size, err = recoveryMessagesWithinBudget(truncated, blocks, kept, tokenBudget)
 		if err != nil {
 			return nil, err
 		}
@@ -97,6 +99,41 @@ func TruncateCompletionRequest(req *CompletionRequest, tokenBudget int) (*Comple
 		return nil, err
 	}
 	return truncated, nil
+}
+
+func recoveryMessagesWithinBudget(
+	req *CompletionRequest,
+	blocks []messageBlock,
+	kept []bool,
+	tokenBudget int,
+) ([]Message, CompletionRequestSize, error) {
+	keptMessages := messagesFromKeptBlocks(blocks, kept)
+	dropped := make([]messageBlock, 0)
+	for i, block := range blocks {
+		if !kept[i] {
+			dropped = append(dropped, block)
+		}
+	}
+	if len(dropped) == 0 {
+		req.Messages = keptMessages
+		size, err := EstimateCompletionRequestSize(req)
+		return keptMessages, size, err
+	}
+
+	withNote := func(content string) ([]Message, CompletionRequestSize, error) {
+		messages := make([]Message, 0, len(keptMessages)+1)
+		messages = append(messages, Message{Role: "system", Content: content})
+		messages = append(messages, keptMessages...)
+		req.Messages = messages
+		size, err := EstimateCompletionRequestSize(req)
+		return messages, size, err
+	}
+
+	messages, size, err := withNote(extractDroppedSummary(dropped))
+	if err != nil || size.EstimatedTokens <= tokenBudget {
+		return messages, size, err
+	}
+	return withNote(minimalRecoveryTruncationNote)
 }
 
 func messagesFromKeptBlocks(blocks []messageBlock, kept []bool) []Message {

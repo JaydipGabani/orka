@@ -7,7 +7,10 @@ import (
 	"testing"
 )
 
-const testRoleUser = "user"
+const (
+	testRoleUser   = "user"
+	testRoleSystem = "system"
+)
 
 func Test_estimateTokens(t *testing.T) {
 	tests := []struct {
@@ -269,8 +272,8 @@ func TestTruncateCompletionRequestDropsOversizedOldHistoryBeforeCurrentTask(t *t
 	if len(truncated.Messages) == 0 {
 		t.Fatal("TruncateCompletionRequest() dropped every message")
 	}
-	if truncated.Messages[0].Role != testRoleUser {
-		t.Fatalf("first retained message = %#v, want a user turn", truncated.Messages[0])
+	if truncated.Messages[0].Role != testRoleSystem || !strings.Contains(truncated.Messages[0].Content, "truncated") {
+		t.Fatalf("first retained message = %#v, want a truncation note", truncated.Messages[0])
 	}
 	if got := truncated.Messages[len(truncated.Messages)-1]; got.Role != testRoleUser || got.Content != currentTask {
 		t.Fatalf("newest message = %#v, want preserved current task", got)
@@ -318,20 +321,23 @@ func TestTruncateCompletionRequestKeepsAssistantToolResultBlocksAtomic(t *testin
 		t.Fatalf("EstimateCompletionRequestSize() error = %v", err)
 	}
 
-	truncated, err := TruncateCompletionRequest(req, wantSize.EstimatedTokens)
+	truncated, err := TruncateCompletionRequest(req, wantSize.EstimatedTokens+100)
 	if err != nil {
 		t.Fatalf("TruncateCompletionRequest() error = %v", err)
 	}
-	if len(truncated.Messages) != len(wantMessages) {
-		t.Fatalf("messages = %#v, want current task plus newest complete tool block", truncated.Messages)
+	if len(truncated.Messages) != len(wantMessages)+1 {
+		t.Fatalf("messages = %#v, want truncation note plus current task and newest complete tool block", truncated.Messages)
 	}
-	if truncated.Messages[0].Content != currentTask {
-		t.Fatalf("current task = %q, want %q", truncated.Messages[0].Content, currentTask)
+	if truncated.Messages[0].Role != testRoleSystem || !strings.Contains(truncated.Messages[0].Content, "truncated") {
+		t.Fatalf("truncation note = %#v", truncated.Messages[0])
 	}
-	if got := truncated.Messages[1].ToolCalls; len(got) != 1 || got[0].ID != "new-call" {
+	if truncated.Messages[1].Content != currentTask {
+		t.Fatalf("current task = %q, want %q", truncated.Messages[1].Content, currentTask)
+	}
+	if got := truncated.Messages[2].ToolCalls; len(got) != 1 || got[0].ID != "new-call" {
 		t.Fatalf("assistant tool calls = %#v, want new-call", got)
 	}
-	if got := truncated.Messages[2]; got.Role != "tool" || got.ToolCallID != "new-call" {
+	if got := truncated.Messages[3]; got.Role != "tool" || got.ToolCallID != "new-call" {
 		t.Fatalf("tool result = %#v, want matching new-call result", got)
 	}
 	for _, message := range truncated.Messages {
@@ -456,7 +462,7 @@ func TestTruncateMessages(t *testing.T) {
 			t.Error("first message should be preserved")
 		}
 		// Should have a truncation note
-		if result[1].Role != "system" {
+		if result[1].Role != testRoleSystem {
 			t.Error("expected truncation note to have system role")
 		}
 		if !strings.Contains(result[1].Content, "truncated") {
@@ -491,7 +497,7 @@ func TestTruncateMessages(t *testing.T) {
 		if len(result) < 2 {
 			t.Fatalf("expected at least 2 messages, got %d", len(result))
 		}
-		if result[1].Role != "system" {
+		if result[1].Role != testRoleSystem {
 			t.Error("expected system role for truncation note")
 		}
 		if !strings.Contains(result[1].Content, "truncated") {

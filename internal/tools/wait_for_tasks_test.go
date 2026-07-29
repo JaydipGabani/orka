@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -415,6 +416,78 @@ func TestWaitForTasksTool_Execute_RetriesNotFoundCacheMissUntilRecovery(t *testi
 	}
 	if len(got.Results) != 1 || got.Results[0].Phase != taskPhaseSucceededString {
 		t.Fatalf("Results = %#v, want eventually visible task to succeed", got.Results)
+	}
+	if got.Results[0].Result != "" {
+		t.Fatalf("Result = %q, want stale NotFound error cleared after recovery", got.Results[0].Result)
+	}
+}
+
+func TestWaitForTasksTool_Execute_PersistentNotFoundStopsAfterGrace(t *testing.T) {
+	t.Setenv(envOrkaTaskNamespace, testNamespace)
+	getCalls := 0
+	fakeClient := newFakeClientWithInterceptorFuncs(interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, key client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+			getCalls++
+			return apierrors.NewNotFound(
+				apischema.GroupResource{Group: corev1alpha1.GroupVersion.Group, Resource: "tasks"}, key.Name,
+			)
+		},
+	})
+	tool := NewWaitForTasksTool(fakeClient)
+	tool.pollInterval = time.Millisecond
+	tool.notFoundGrace = 3 * time.Millisecond
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"tasks":["missing-task"],"timeout":"1m"}`))
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var got WaitForTasksResult
+	if err := json.Unmarshal([]byte(result), &got); err != nil {
+		t.Fatalf("failed to unmarshal result: %v", err)
+	}
+	if !got.Completed {
+		t.Fatalf("Completed = false after NotFound grace, result = %#v", got)
+	}
+	if getCalls < 2 || getCalls > 20 {
+		t.Fatalf("Get calls = %d, want bounded NotFound retries", getCalls)
+	}
+	if len(got.Results) != 1 || got.Results[0].Phase != taskPhaseErrorString {
+		t.Fatalf("Results = %#v, want terminal Error result", got.Results)
+	}
+}
+
+func TestWaitForTasksTool_Execute_TransientErrorClearsAfterRecovery(t *testing.T) {
+	t.Setenv(envOrkaTaskNamespace, testNamespace)
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "recovered-task", Namespace: testNamespace},
+		Status:     corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseSucceeded},
+	}
+	getCalls := 0
+	fakeClient := newFakeClientWithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			getCalls++
+			if getCalls == 1 {
+				return errors.New("temporary read failure")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}, task)
+	tool := NewWaitForTasksTool(fakeClient)
+	tool.pollInterval = time.Millisecond
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"tasks":["recovered-task"],"timeout":"100ms"}`))
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var got WaitForTasksResult
+	if err := json.Unmarshal([]byte(result), &got); err != nil {
+		t.Fatalf("failed to unmarshal result: %v", err)
+	}
+	if !got.Completed || len(got.Results) != 1 || got.Results[0].Phase != taskPhaseSucceededString {
+		t.Fatalf("result = %#v, want recovered success", got)
+	}
+	if got.Results[0].Result != "" {
+		t.Fatalf("Result = %q, want transient read error cleared", got.Results[0].Result)
 	}
 }
 

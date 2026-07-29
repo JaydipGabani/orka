@@ -53,6 +53,21 @@ func TestUpdateAgentTool_Parameters(t *testing.T) {
 			t.Errorf("missing %s property", key)
 		}
 	}
+	modelSchema, ok := props[modelField].(map[string]any)
+	if !ok {
+		t.Fatal("model schema is not an object")
+	}
+	modelProps, ok := modelSchema[jsonSchemaPropertiesField].(map[string]any)
+	if !ok {
+		t.Fatal("model schema properties are missing")
+	}
+	temperature, ok := modelProps["temperature"].(map[string]any)
+	if !ok {
+		t.Fatal("temperature schema is missing")
+	}
+	if temperature[jsonSchemaMinimumField] != float64(0) || temperature[jsonSchemaMaximumField] != float64(2) {
+		t.Fatalf("temperature bounds = %#v, want [0,2]", temperature)
+	}
 }
 
 func TestUpdateAgentTool_Execute(t *testing.T) {
@@ -307,6 +322,8 @@ func TestUpdateAgentTool_Execute_RejectsUnsupportedModelTypes(t *testing.T) {
 		{name: "provider must be string", model: map[string]any{"provider": true}},
 		{name: "name must be string", model: map[string]any{nameField: 42}},
 		{name: "temperature must be number", model: map[string]any{"temperature": "warm"}},
+		{name: "temperature below minimum", model: map[string]any{"temperature": -0.1}},
+		{name: "temperature above maximum", model: map[string]any{"temperature": 2.1}},
 	}
 
 	for _, tt := range tests {
