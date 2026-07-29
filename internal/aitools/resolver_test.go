@@ -91,6 +91,55 @@ func TestResolve(t *testing.T) {
 	}
 }
 
+func TestRegistersCoordinationTools(t *testing.T) {
+	tests := []struct {
+		name  string
+		task  *corev1alpha1.Task
+		agent *corev1alpha1.Agent
+		want  bool
+	}{
+		{
+			name:  "coordinator agent",
+			task:  aiToolTask(nil, nil, nil),
+			agent: &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Coordination: &corev1alpha1.CoordinationConfig{Enabled: true}}},
+			want:  true,
+		},
+		{
+			name: "child with implicit injection disabled",
+			task: aiToolTask(
+				map[string]string{labels.LabelParentTask: "parent"},
+				map[string]string{labels.AnnotationDisableCoordinationToolInject: "true"},
+				[]string{"send_message"},
+			),
+			want: true,
+		},
+		{
+			name: "child identified by annotation",
+			task: aiToolTask(nil, map[string]string{
+				labels.AnnotationParentTaskName:                "long-parent-name",
+				labels.AnnotationDisableCoordinationToolInject: "true",
+			}, []string{"list_pull_requests"}),
+			want: true,
+		},
+		{name: "standalone task", task: aiToolTask(nil, nil, []string{"send_message"})},
+		{
+			name: "container child",
+			task: &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labels.LabelParentTask: "parent"}},
+				Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeContainer},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RegistersCoordinationTools(tt.task, tt.agent); got != tt.want {
+				t.Fatalf("RegistersCoordinationTools() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsImplicitTool(t *testing.T) {
 	child := aiToolTask(map[string]string{labels.LabelParentTask: "parent"}, nil, nil)
 	if !IsImplicitTool(child, nil, "send_message") {

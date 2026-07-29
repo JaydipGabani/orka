@@ -1588,15 +1588,15 @@ func contextTokenTaskToolFailures(token *ContextToken, authzCtx contextTokenTask
 }
 
 func contextTokenPlatformAIToolName(authzCtx contextTokenTaskCreateAuthorizationContext, name string) bool {
+	task := contextTokenTaskCreateAIToolTask(authzCtx.Request)
 	if slices.Contains(aitools.MemoryToolNames(), name) {
 		return true
 	}
-	if aitools.IsImplicitTool(contextTokenTaskCreateAIToolTask(authzCtx.Request), authzCtx.Agent, name) {
+	if aitools.IsImplicitTool(task, authzCtx.Agent, name) {
 		return true
 	}
 	if slices.Contains(toolspkg.CoordinationToolNames(), name) {
-		coordinationEnabled := authzCtx.Agent != nil && authzCtx.Agent.Spec.Coordination != nil && authzCtx.Agent.Spec.Coordination.Enabled
-		return coordinationEnabled || slices.Contains(toolspkg.ChatToolNames(), name)
+		return aitools.RegistersCoordinationTools(task, authzCtx.Agent) || slices.Contains(toolspkg.ChatToolNames(), name)
 	}
 	_, builtin := toolspkg.DefaultRegistry.Get(name)
 	return builtin

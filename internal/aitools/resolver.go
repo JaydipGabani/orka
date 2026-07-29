@@ -91,6 +91,20 @@ func CoordinationToolNames() []string {
 	return append([]string(nil), registeredCoordinationToolNames...)
 }
 
+// RegistersCoordinationTools reports whether the AI worker registers Orka's
+// coordination tool implementations for task. Disabling implicit injection only
+// narrows the selected tool list; child identity still enables the registry so
+// explicitly selected coordination tools remain platform-provided.
+func RegistersCoordinationTools(task *corev1alpha1.Task, agent *corev1alpha1.Agent) bool {
+	if task != nil && task.Spec.Type == corev1alpha1.TaskTypeContainer {
+		return false
+	}
+	if agent != nil && agent.Spec.Coordination != nil && agent.Spec.Coordination.Enabled {
+		return true
+	}
+	return task != nil && labels.ParentTaskName(task.Labels, task.Annotations) != ""
+}
+
 // IsImplicitTool reports whether name is injected by Orka rather than selected
 // explicitly by an Agent or Task. Authorization uses it to distinguish platform
 // tools from Tool CR references without broadening implicit capabilities.

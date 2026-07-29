@@ -1070,18 +1070,20 @@ func (b *JobBuilder) addAIEnvVars(ctx context.Context, //nolint:gocyclo
 	}.EnvVars()...)
 
 	cfg.tools = aitools.Resolve(task, agent)
-	isChildTask := labels.ParentTaskName(task.Labels, task.Annotations) != ""
+	coordinationConfigured := agent != nil && agent.Spec.Coordination != nil && agent.Spec.Coordination.Enabled
 
 	if len(cfg.tools) > 0 {
 		envVars = setControllerEnvValue(envVars, workerenv.AITools, strings.Join(cfg.tools, ","))
 	}
 
-	if agent != nil && agent.Spec.Coordination != nil && agent.Spec.Coordination.Enabled {
+	if coordinationConfigured {
 		envVars = b.addCoordinationEnvVars(envVars, task, agent)
 	}
 
-	// Enable coordination in worker for child tasks so messaging tools are registered
-	if isChildTask && (agent == nil || agent.Spec.Coordination == nil || !agent.Spec.Coordination.Enabled) {
+	// Child identity enables the coordination registry even when implicit tool
+	// injection is disabled, so explicitly selected coordination tools resolve to
+	// the platform implementations rather than Tool CRs.
+	if aitools.RegistersCoordinationTools(task, agent) && !coordinationConfigured {
 		envVars = append(envVars, corev1.EnvVar{Name: workerenv.CoordinationEnabled, Value: scheduledRunLabelValue})
 	}
 
