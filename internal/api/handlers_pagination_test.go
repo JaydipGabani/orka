@@ -372,17 +372,36 @@ func TestHandlers_ListAgents_APIReaderExposesCLI101stAgent(t *testing.T) {
 	handlers := NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader})
 	app := newListTestApp(handlers)
 
-	first, status := listPage[corev1alpha1.Agent](t, app, "/agents")
+	first, status := listPage[corev1alpha1.Agent](t, app, "/agents?limit=100")
 	require.Equal(t, http.StatusOK, status)
 	require.Len(t, first.Items, 100)
 	require.NotEmpty(t, first.Metadata.Continue)
 
-	second, status := listPage[corev1alpha1.Agent](t, app, pathWithContinue("/agents", first.Metadata.Continue))
+	second, status := listPage[corev1alpha1.Agent](t, app, pathWithContinue("/agents?limit=100", first.Metadata.Continue))
 	require.Equal(t, http.StatusOK, status)
 	require.Len(t, second.Items, 1)
 	require.Equal(t, "agent-101", second.Items[0].Name)
 	require.Empty(t, cacheCalls.snapshot())
 	require.Len(t, apiReader.snapshotCalls(), 2)
+}
+
+func TestHandlers_ListAgents_OmittedPaginationReturnsCompleteInventory(t *testing.T) {
+	agents := make([]corev1alpha1.Agent, 101)
+	objects := make([]client.Object, 0, len(agents))
+	for i := range agents {
+		agents[i].ObjectMeta = metav1.ObjectMeta{Name: fmt.Sprintf("agent-%03d", i+1), Namespace: "default"}
+		objects = append(objects, &agents[i])
+	}
+	cacheClient, cacheCalls := newCachePaginationClient(t, objects...)
+	apiReader := &paginatedAPIReader{agents: agents}
+	app := newListTestApp(NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader}))
+
+	page, status := listPage[corev1alpha1.Agent](t, app, "/agents")
+	require.Equal(t, http.StatusOK, status)
+	require.Len(t, page.Items, 101)
+	require.Empty(t, page.Metadata.Continue)
+	require.Empty(t, cacheCalls.snapshot())
+	require.Equal(t, []recordedListCall{{Kind: "agents", Namespace: "default"}}, apiReader.snapshotCalls())
 }
 
 type skillListTestItem struct {
@@ -413,9 +432,47 @@ func TestHandlers_ListSkills_UsesAPIReaderContinuation(t *testing.T) {
 	require.Len(t, apiReader.snapshotCalls(), 2)
 }
 
+func TestHandlers_ListSkills_OmittedPaginationReturnsCompleteInventory(t *testing.T) {
+	skills := make([]corev1alpha1.Skill, 101)
+	objects := make([]client.Object, 0, len(skills))
+	for i := range skills {
+		skills[i].ObjectMeta = metav1.ObjectMeta{Name: fmt.Sprintf("skill-%03d", i+1), Namespace: "default"}
+		objects = append(objects, &skills[i])
+	}
+	cacheClient, cacheCalls := newCachePaginationClient(t, objects...)
+	apiReader := &paginatedAPIReader{skills: skills}
+	app := newListTestApp(NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader}))
+
+	page, status := listPage[skillListTestItem](t, app, "/skills")
+	require.Equal(t, http.StatusOK, status)
+	require.Len(t, page.Items, 101)
+	require.Empty(t, page.Metadata.Continue)
+	require.Empty(t, cacheCalls.snapshot())
+	require.Equal(t, []recordedListCall{{Kind: "skills", Namespace: "default"}}, apiReader.snapshotCalls())
+}
+
 type toolListTestItem struct {
 	Name    string `json:"name"`
 	Builtin bool   `json:"builtin"`
+}
+
+func TestHandlers_ListTools_OmittedPaginationReturnsCompleteInventory(t *testing.T) {
+	customTools := make([]corev1alpha1.Tool, 101)
+	objects := make([]client.Object, 0, len(customTools))
+	for i := range customTools {
+		customTools[i].ObjectMeta = metav1.ObjectMeta{Name: fmt.Sprintf("custom-%03d", i+1), Namespace: "default"}
+		objects = append(objects, &customTools[i])
+	}
+	cacheClient, cacheCalls := newCachePaginationClient(t, objects...)
+	apiReader := &paginatedAPIReader{tools: customTools}
+	app := newListTestApp(NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader}))
+
+	page, status := listPage[toolListTestItem](t, app, "/tools")
+	require.Equal(t, http.StatusOK, status)
+	require.Len(t, page.Items, len(builtinToolsList)+len(customTools))
+	require.Empty(t, page.Metadata.Continue)
+	require.Empty(t, cacheCalls.snapshot())
+	require.Equal(t, []recordedListCall{{Kind: "tools", Namespace: "default"}}, apiReader.snapshotCalls())
 }
 
 func TestHandlers_ListTools_CombinedPaginationHonorsLimitAndAllContinuations(t *testing.T) {
@@ -737,6 +794,42 @@ func TestHandlers_ListTools_StopsCombinedContinuationCycle(t *testing.T) {
 
 	_, status = listPage[toolListTestItem](t, app, pathWithContinue(path, third.Metadata.Continue))
 	require.Equal(t, http.StatusInternalServerError, status)
+}
+
+func TestHandlers_ListTasks_ContextTokenUsesAuthoritativeReaderForDependencies(t *testing.T) {
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-task", Namespace: "default"},
+		Spec: corev1alpha1.TaskSpec{
+			Type:     corev1alpha1.TaskTypeAI,
+			AgentRef: &corev1alpha1.AgentReference{Name: "current-agent"},
+		},
+	}
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "current-agent", Namespace: "default"},
+		Spec:       corev1alpha1.AgentSpec{Tools: []corev1alpha1.ToolReference{{Name: "web_search"}}},
+	}
+	cacheClient, _ := newCachePaginationClient(t, task)
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(task, agent).Build()
+	authz, err := NewContextTokenAuthorizationConfig(ContextTokenAuthorizationConfigOptions{Mode: ContextTokenAuthorizationModeEnforce})
+	require.NoError(t, err)
+	handlers := NewHandlers(HandlersConfig{Client: cacheClient, APIReader: apiReader, ContextTokenAuthorization: authz})
+	app := fiber.New(fiber.Config{ErrorHandler: customErrorHandler})
+	app.Use(func(c fiber.Ctx) error {
+		userInfo := contextScopedTestUser(ContextTokenScopeTaskList)
+		userInfo.ContextToken.TransactionContext = map[string]any{
+			"allowedAgents": []string{"current-agent"},
+			"allowedTools":  []string{"recall_memory", "remember", "propose_memory", "search_transcript"},
+		}
+		c.Locals(UserInfoContextKey, userInfo)
+		return c.Next()
+	})
+	app.Get("/tasks", handlers.ListTasks)
+
+	page, status := listPage[corev1alpha1.Task](t, app, "/tasks?limit=1")
+	require.Equal(t, http.StatusOK, status)
+	require.Empty(t, page.Items, "authoritative Agent tools must remain part of authorization")
 }
 
 func TestHandlers_ListTasks_ContextTokenReturnsCompleteAuthorizedLogicalList(t *testing.T) {
