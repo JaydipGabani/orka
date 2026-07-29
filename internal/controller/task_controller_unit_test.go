@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,6 +46,7 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/events"
+	"github.com/orka-agents/orka/internal/harness"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/outboundaccess"
 	"github.com/orka-agents/orka/internal/store"
@@ -3348,8 +3350,8 @@ func TestHandleDeletionRetainsFinalizerUntilDurableStoreCleanupSucceeds(t *testi
 			if err != nil {
 				t.Fatalf("GetSession() error = %v", err)
 			}
-			if session.ActiveTask != "" || session.ActiveTaskUID != "" {
-				t.Fatalf("session lock after durable cleanup failure = %q/%q, want released", session.ActiveTask, session.ActiveTaskUID)
+			if session.ActiveTask != task.Name || session.ActiveTaskUID != string(task.UID) {
+				t.Fatalf("session lock after pending Job deletion = %q/%q, want %q/%q", session.ActiveTask, session.ActiveTaskUID, task.Name, task.UID)
 			}
 
 			if _, err := r.handleDeletion(context.Background(), persisted); err != nil {
@@ -3360,6 +3362,13 @@ func TestHandleDeletionRetainsFinalizerUntilDurableStoreCleanupSucceeds(t *testi
 			}
 			if controllerutil.ContainsFinalizer(persisted, labels.TaskFinalizer) {
 				t.Fatal("Task finalizer retained after durable cleanup succeeded")
+			}
+			session, err = backing.GetSession(context.Background(), task.Namespace, sessionName)
+			if err != nil {
+				t.Fatalf("GetSession() after Job deletion error = %v", err)
+			}
+			if session.ActiveTask != "" || session.ActiveTaskUID != "" {
+				t.Fatalf("session lock after Job deletion = %q/%q, want released", session.ActiveTask, session.ActiveTaskUID)
 			}
 		})
 	}
@@ -3382,12 +3391,22 @@ func TestHandleDeletionRetainsFinalizerWhenSessionLockReleaseFails(t *testing.T)
 	backing := r.ResultStore.(*sqlite.Store)
 	r.SessionManager = NewSessionManager(failingReleaseLockStore{SessionStore: backing, err: lockErr})
 
-	if _, err := r.handleDeletion(context.Background(), task); !errors.Is(err, lockErr) {
-		t.Fatalf("handleDeletion() error = %v, want %v", err, lockErr)
+	result, err := r.handleDeletion(context.Background(), task)
+	if err != nil {
+		t.Fatalf("first handleDeletion() error = %v", err)
+	}
+	if result.RequeueAfter != 2*time.Second {
+		t.Fatalf("first handleDeletion() RequeueAfter = %v, want 2s while Job deletion settles", result.RequeueAfter)
 	}
 	persisted := &corev1alpha1.Task{}
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(task), persisted); err != nil {
-		t.Fatalf("Get Task: %v", err)
+		t.Fatalf("Get Task after Job deletion: %v", err)
+	}
+	if _, err := r.handleDeletion(context.Background(), persisted); !errors.Is(err, lockErr) {
+		t.Fatalf("second handleDeletion() error = %v, want %v", err, lockErr)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(task), persisted); err != nil {
+		t.Fatalf("Get Task after session lock failure: %v", err)
 	}
 	if !controllerutil.ContainsFinalizer(persisted, labels.TaskFinalizer) {
 		t.Fatal("Task finalizer removed after session lock release failure")
@@ -3545,6 +3564,188 @@ func TestHandleDeletion_WithJobName(t *testing.T) {
 	_, err := r.handleDeletion(context.Background(), task)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestHandleDeletionWaitsForOrdinaryJobDisappearance(t *testing.T) {
+	scheme := newTestScheme()
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "del-ordinary-job",
+			Namespace:  "default",
+			UID:        "del-ordinary-job-uid",
+			Finalizers: []string{labels.TaskFinalizer},
+		},
+		Status: corev1alpha1.TaskStatus{JobName: "del-ordinary-job-worker"},
+	}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: task.Status.JobName, Namespace: task.Namespace}}
+	r := newUnitReconciler(scheme, task, job)
+	base, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatalf("test client = %T, want client.WithWatch", r.Client)
+	}
+	var deleteCalls int
+	var propagationPolicies []metav1.DeletionPropagation
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if _, ok := obj.(*batchv1.Job); !ok {
+				return c.Delete(ctx, obj, opts...)
+			}
+			deleteOptions := (&client.DeleteOptions{}).ApplyOptions(opts)
+			if deleteOptions.PropagationPolicy != nil {
+				propagationPolicies = append(propagationPolicies, *deleteOptions.PropagationPolicy)
+			}
+			deleteCalls++
+			if deleteCalls == 1 {
+				// Model foreground deletion while a dependent worker Pod still exists.
+				return nil
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+
+	if err := r.ResultStore.SaveResult(context.Background(), task.Namespace, task.Name, []byte("initial")); err != nil {
+		t.Fatalf("SaveResult() error = %v", err)
+	}
+	key := client.ObjectKeyFromObject(task)
+	for reconcileNumber := 1; reconcileNumber <= 2; reconcileNumber++ {
+		result, err := r.handleDeletion(context.Background(), task)
+		if err != nil {
+			t.Fatalf("handleDeletion() reconcile %d error = %v", reconcileNumber, err)
+		}
+		if result.RequeueAfter != 2*time.Second {
+			t.Fatalf("handleDeletion() reconcile %d RequeueAfter = %v, want 2s", reconcileNumber, result.RequeueAfter)
+		}
+		if err := r.Get(context.Background(), key, task); err != nil {
+			t.Fatalf("Get Task after reconcile %d: %v", reconcileNumber, err)
+		}
+		if !controllerutil.ContainsFinalizer(task, labels.TaskFinalizer) {
+			t.Fatalf("Task finalizer removed before Job disappearance on reconcile %d", reconcileNumber)
+		}
+		if reconcileNumber == 1 {
+			if err := r.ResultStore.SaveResult(context.Background(), task.Namespace, task.Name, []byte("late worker result")); err != nil {
+				t.Fatalf("SaveResult() after first cleanup error = %v", err)
+			}
+		}
+	}
+
+	result, err := r.handleDeletion(context.Background(), task)
+	if err != nil {
+		t.Fatalf("handleDeletion() after Job disappeared error = %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("handleDeletion() after Job disappeared RequeueAfter = %v, want zero", result.RequeueAfter)
+	}
+	if err := r.Get(context.Background(), key, task); err != nil {
+		t.Fatalf("Get Task after final cleanup: %v", err)
+	}
+	if controllerutil.ContainsFinalizer(task, labels.TaskFinalizer) {
+		t.Fatal("Task finalizer retained after Job disappearance and final durable cleanup")
+	}
+	if _, err := r.ResultStore.GetResult(context.Background(), task.Namespace, task.Name); err == nil {
+		t.Fatal("late worker result survived the final cleanup pass")
+	}
+	if deleteCalls != 2 {
+		t.Fatalf("Job delete calls = %d, want 2", deleteCalls)
+	}
+	for i, policy := range propagationPolicies {
+		if policy != metav1.DeletePropagationForeground {
+			t.Fatalf("Job delete propagation policy %d = %q, want Foreground", i+1, policy)
+		}
+	}
+}
+
+func TestHandleDeletionRetriesExternalRuntimeCancellationFailure(t *testing.T) {
+	var failCancellation atomic.Bool
+	failCancellation.Store(true)
+	var cancelCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		cancelCalls.Add(1)
+		var request harness.CancelTurnRequest
+		if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+			harness.WriteError(w, http.StatusBadRequest, "invalid cancellation request")
+			return
+		}
+		if failCancellation.Load() {
+			harness.WriteError(w, http.StatusServiceUnavailable, "runtime temporarily unavailable")
+			return
+		}
+		harness.WriteJSON(w, http.StatusAccepted, harness.CancelTurnResponse{
+			Version:          harness.ProtocolVersion,
+			Accepted:         true,
+			RuntimeSessionID: request.RuntimeSessionID,
+			TurnID:           request.TurnID,
+			CorrelationID:    request.CorrelationID,
+		})
+	}))
+	defer server.Close()
+
+	scheme := newTestScheme()
+	runtimeRef, secret := harnessWrapperReadyAgentRuntime("default", server.URL)
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "del-external-runtime",
+			Namespace:  "default",
+			UID:        "del-external-runtime-uid",
+			Finalizers: []string{labels.TaskFinalizer},
+		},
+		Status: corev1alpha1.TaskStatus{
+			HarnessRuntime: &corev1alpha1.HarnessRuntimeStatus{
+				RuntimeRefName:         runtimeRef.Name,
+				RuntimeName:            runtimeRef.Name,
+				ContractVersion:        string(runtimeRef.Spec.ContractVersion),
+				Endpoint:               runtimeRef.Spec.Deployment.Endpoint,
+				RuntimeGeneration:      runtimeRef.Generation,
+				AuthRefName:            secret.Name,
+				AuthRefField:           "token",
+				AuthRefResourceVersion: secret.ResourceVersion,
+			},
+		},
+	}
+	task.Annotations = map[string]string{
+		harnessWrapperTurnIDAnnotation:       string(harnessWrapperTurnID(task, 1)),
+		harnessWrapperRuntimeAnnotation:      "external-runtime-session",
+		harnessWrapperCorrelationIDAnno:      string(task.UID),
+		harnessWrapperRuntimeRefAnno:         runtimeRef.Name,
+		harnessWrapperContractAnno:           harness.ProtocolVersion,
+		harnessWrapperStartedAnno:            scheduledRunLabelValue,
+		harnessWrapperLastFrameSeqAnno:       "0",
+		harnessWrapperOutputFetchRetriesAnno: "0",
+	}
+	r := newUnitReconciler(scheme, task, runtimeRef, secret)
+
+	result, err := r.handleDeletion(context.Background(), task)
+	if err != nil {
+		t.Fatalf("handleDeletion() transport failure error = %v", err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Fatalf("RequeueAfter = %v, want 30s after external cancellation failure", result.RequeueAfter)
+	}
+	persisted := &corev1alpha1.Task{}
+	key := client.ObjectKeyFromObject(task)
+	if err := r.Get(context.Background(), key, persisted); err != nil {
+		t.Fatalf("Get Task after cancellation failure: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(persisted, labels.TaskFinalizer) {
+		t.Fatal("Task finalizer removed after unconfirmed external runtime cancellation")
+	}
+
+	failCancellation.Store(false)
+	result, err = r.handleDeletion(context.Background(), persisted)
+	if err != nil {
+		t.Fatalf("handleDeletion() cancellation retry error = %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("RequeueAfter = %v, want zero after cancellation succeeds", result.RequeueAfter)
+	}
+	if err := r.Get(context.Background(), key, persisted); err != nil {
+		t.Fatalf("Get Task after cancellation success: %v", err)
+	}
+	if controllerutil.ContainsFinalizer(persisted, labels.TaskFinalizer) {
+		t.Fatal("Task finalizer retained after external runtime cancellation succeeded")
+	}
+	if got := cancelCalls.Load(); got != 2 {
+		t.Fatalf("CancelTurn calls = %d, want 2", got)
 	}
 }
 
@@ -5320,18 +5521,48 @@ func TestHandleScheduled_WithTimeZone(t *testing.T) {
 	}
 }
 
-func TestHandleScheduledSkippedOccurrenceAdvancesCursor(t *testing.T) {
+type countingIntervalSchedule struct {
+	interval time.Duration
+	calls    int
+}
+
+func (s *countingIntervalSchedule) Next(t time.Time) time.Time {
+	s.calls++
+	return t.Add(s.interval)
+}
+
+func TestCoalesceOverdueScheduleBoundsCatchUp(t *testing.T) {
+	now := time.Now().UTC()
+	schedule := &countingIntervalSchedule{interval: time.Minute}
+	firstDue := now.Add(-time.Duration(maxSkippedScheduleCatchUpSteps+100) * time.Minute)
+
+	lastConsumed, next := coalesceOverdueSchedule(schedule, firstDue, now)
+
+	if !lastConsumed.Equal(now) {
+		t.Fatalf("last consumed = %s, want bounded cursor %s", lastConsumed, now)
+	}
+	if !next.Equal(now.Add(time.Minute)) {
+		t.Fatalf("next = %s, want %s", next, now.Add(time.Minute))
+	}
+	if schedule.calls != maxSkippedScheduleCatchUpSteps+1 {
+		t.Fatalf("schedule.Next calls = %d, want bounded %d", schedule.calls, maxSkippedScheduleCatchUpSteps+1)
+	}
+}
+
+func TestHandleScheduledSkippedOccurrenceCoalescesBacklog(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		deadline    int64
 		activeChild bool
+		suspended   bool
 	}{
-		{name: "missed deadline", deadline: 1},
+		{name: "missed deadline", deadline: 0},
 		{name: "forbid concurrent", deadline: 600, activeChild: true},
+		{name: "suspended", deadline: 600, suspended: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := newTestScheme()
-			initialCursor := time.Now().UTC().Truncate(time.Minute).Add(-3 * time.Minute)
+			initialCursor := time.Now().UTC().Truncate(time.Minute).Add(-48 * time.Hour)
 			lastSchedule := metav1.NewTime(initialCursor)
 			task := &corev1alpha1.Task{
 				ObjectMeta: metav1.ObjectMeta{
@@ -5350,6 +5581,9 @@ func TestHandleScheduledSkippedOccurrenceAdvancesCursor(t *testing.T) {
 					LastScheduleTime: &lastSchedule,
 				},
 			}
+			if tc.suspended {
+				task.Spec.Suspend = new(true)
+			}
 			objects := []client.Object{task}
 			if tc.activeChild {
 				objects = append(objects, &corev1alpha1.Task{
@@ -5365,22 +5599,209 @@ func TestHandleScheduledSkippedOccurrenceAdvancesCursor(t *testing.T) {
 			}
 			r := newUnitReconciler(scheme, objects...)
 			key := types.NamespacedName{Namespace: task.Namespace, Name: task.Name}
+			before := time.Now().UTC()
 
-			for reconcileNumber := 1; reconcileNumber <= 2; reconcileNumber++ {
-				result, err := r.handleScheduled(context.Background(), task)
-				if err != nil {
-					t.Fatalf("handleScheduled() reconcile %d error = %v", reconcileNumber, err)
-				}
-				if result.RequeueAfter <= 0 {
-					t.Fatalf("handleScheduled() reconcile %d RequeueAfter = %v, want positive", reconcileNumber, result.RequeueAfter)
-				}
-				if err := r.Get(context.Background(), key, task); err != nil {
-					t.Fatalf("Get Task after reconcile %d: %v", reconcileNumber, err)
-				}
-				wantCursor := initialCursor.Add(time.Duration(reconcileNumber) * time.Minute)
-				if task.Status.LastScheduleTime == nil || !task.Status.LastScheduleTime.Time.Equal(wantCursor) {
-					t.Fatalf("LastScheduleTime after reconcile %d = %v, want %s", reconcileNumber, task.Status.LastScheduleTime, wantCursor.Format(time.RFC3339))
-				}
+			result, err := r.handleScheduled(context.Background(), task)
+			if err != nil {
+				t.Fatalf("handleScheduled() error = %v", err)
+			}
+			if result.RequeueAfter <= 0 {
+				t.Fatalf("handleScheduled() RequeueAfter = %v, want positive", result.RequeueAfter)
+			}
+			if err := r.Get(context.Background(), key, task); err != nil {
+				t.Fatalf("Get Task after backlog coalescing: %v", err)
+			}
+			if task.Status.LastScheduleTime == nil || task.Status.NextScheduleTime == nil {
+				t.Fatalf("schedule status = last %v next %v, want both set", task.Status.LastScheduleTime, task.Status.NextScheduleTime)
+			}
+			if age := before.Sub(task.Status.LastScheduleTime.Time); age < -time.Second || age > time.Minute+time.Second {
+				t.Fatalf("LastScheduleTime age = %v at %s, want latest minutely occurrence near %s", age, task.Status.LastScheduleTime.Time, before)
+			}
+			parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+			schedule, err := parser.Parse(task.Spec.Schedule)
+			if err != nil {
+				t.Fatalf("parse schedule: %v", err)
+			}
+			wantNext := schedule.Next(task.Status.LastScheduleTime.Time)
+			if !task.Status.NextScheduleTime.Time.Equal(wantNext) {
+				t.Fatalf("NextScheduleTime = %s, want %s from coalesced cursor", task.Status.NextScheduleTime.Time, wantNext)
+			}
+			coalescedCursor := task.Status.LastScheduleTime.DeepCopy()
+			if tc.suspended && !taskHasScheduleSuspensionMarker(task) {
+				t.Fatal("suspended Task did not persist the schedule suspension marker")
+			}
+
+			if _, err := r.handleScheduled(context.Background(), task); err != nil {
+				t.Fatalf("second handleScheduled() error = %v", err)
+			}
+			if err := r.Get(context.Background(), key, task); err != nil {
+				t.Fatalf("Get Task after second reconcile: %v", err)
+			}
+			if task.Status.LastScheduleTime == nil || !task.Status.LastScheduleTime.Equal(coalescedCursor) {
+				t.Fatalf("LastScheduleTime after immediate second reconcile = %v, want unchanged %v", task.Status.LastScheduleTime, coalescedCursor)
+			}
+		})
+	}
+}
+
+func TestHandleScheduledResumeCoalescesTicksThatBecameDueWhileSuspended(t *testing.T) {
+	scheme := newTestScheme()
+	initialCursor := time.Now().UTC().Truncate(time.Minute).Add(-2 * time.Minute)
+	lastSchedule := metav1.NewTime(initialCursor)
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "sched-resume-coalesce",
+			Namespace:         "default",
+			UID:               "sched-resume-coalesce-uid",
+			CreationTimestamp: metav1.NewTime(initialCursor.Add(-time.Hour)),
+			Annotations: map[string]string{
+				scheduleSuspendedMarkerAnnotation: scheduledRunLabelValue,
+			},
+		},
+		Spec: corev1alpha1.TaskSpec{
+			Type:                    corev1alpha1.TaskTypeContainer,
+			Image:                   "busybox:latest",
+			Schedule:                "* * * * *",
+			StartingDeadlineSeconds: new(int64(600)),
+		},
+		Status: corev1alpha1.TaskStatus{
+			Phase:            corev1alpha1.TaskPhaseScheduled,
+			LastScheduleTime: &lastSchedule,
+		},
+	}
+	r := newUnitReconciler(scheme, task)
+	before := time.Now().UTC()
+
+	result, err := r.handleScheduled(context.Background(), task)
+	if err != nil {
+		t.Fatalf("handleScheduled() error = %v", err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("RequeueAfter = %v, want positive after resumed backlog coalescing", result.RequeueAfter)
+	}
+	key := client.ObjectKeyFromObject(task)
+	if err := r.Get(context.Background(), key, task); err != nil {
+		t.Fatalf("Get resumed Task: %v", err)
+	}
+	if taskHasScheduleSuspensionMarker(task) {
+		t.Fatal("schedule suspension marker remained after resumed backlog was consumed")
+	}
+	if task.Status.LastScheduleTime == nil || task.Status.NextScheduleTime == nil {
+		t.Fatalf("schedule status = last %v next %v, want resumed cursor and future schedule", task.Status.LastScheduleTime, task.Status.NextScheduleTime)
+	}
+	if age := before.Sub(task.Status.LastScheduleTime.Time); age < -time.Second || age > time.Minute+time.Second {
+		t.Fatalf("resumed LastScheduleTime age = %v, want latest occurrence consumed", age)
+	}
+	children := &corev1alpha1.TaskList{}
+	if err := r.List(context.Background(), children,
+		client.InNamespace(task.Namespace),
+		client.MatchingLabels{labels.LabelParentTask: labels.SelectorValue(task.Name)},
+	); err != nil {
+		t.Fatalf("list scheduled children: %v", err)
+	}
+	if len(children.Items) != 0 {
+		t.Fatalf("scheduled children after resume = %d, want no replay of suspended ticks", len(children.Items))
+	}
+}
+
+func TestHandleScheduledMissedDeadlineRunsMostRecentEligibleOccurrence(t *testing.T) {
+	scheme := newTestScheme()
+	deadlineSeconds := int64(120)
+	initialCursor := time.Now().UTC().Truncate(time.Minute).Add(-10 * time.Minute)
+	lastSchedule := metav1.NewTime(initialCursor)
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "sched-latest-eligible",
+			Namespace:         "default",
+			UID:               "sched-latest-eligible-uid",
+			CreationTimestamp: metav1.NewTime(initialCursor.Add(-time.Hour)),
+		},
+		Spec: corev1alpha1.TaskSpec{
+			Type:                    corev1alpha1.TaskTypeContainer,
+			Image:                   "busybox:latest",
+			Schedule:                "* * * * *",
+			StartingDeadlineSeconds: &deadlineSeconds,
+		},
+		Status: corev1alpha1.TaskStatus{
+			Phase:            corev1alpha1.TaskPhaseScheduled,
+			LastScheduleTime: &lastSchedule,
+		},
+	}
+	r := newUnitReconciler(scheme, task)
+	before := time.Now().UTC()
+
+	result, err := r.handleScheduled(context.Background(), task)
+	if err != nil {
+		t.Fatalf("handleScheduled() error = %v", err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("RequeueAfter = %v, want positive", result.RequeueAfter)
+	}
+	if task.Status.LastScheduleTime == nil {
+		t.Fatal("LastScheduleTime = nil, want most recent eligible occurrence")
+	}
+	if age := before.Sub(task.Status.LastScheduleTime.Time); age < -time.Minute || age > time.Duration(deadlineSeconds)*time.Second {
+		t.Fatalf("selected occurrence age = %v, want within %ds starting deadline", age, deadlineSeconds)
+	}
+	if !task.Status.LastScheduleTime.After(initialCursor.Add(time.Minute)) {
+		t.Fatalf("LastScheduleTime = %s, want backlog coalesced beyond first expired occurrence", task.Status.LastScheduleTime.Time)
+	}
+
+	children := &corev1alpha1.TaskList{}
+	if err := r.List(context.Background(), children,
+		client.InNamespace(task.Namespace),
+		client.MatchingLabels{labels.LabelParentTask: labels.SelectorValue(task.Name)},
+	); err != nil {
+		t.Fatalf("list scheduled children: %v", err)
+	}
+	if len(children.Items) != 1 {
+		t.Fatalf("scheduled children = %d, want one most recent eligible run", len(children.Items))
+	}
+	wantChildName := fmt.Sprintf("%s-%d", task.Name, task.Status.LastScheduleTime.Unix())
+	if children.Items[0].Name != wantChildName {
+		t.Fatalf("scheduled child = %q, want %q", children.Items[0].Name, wantChildName)
+	}
+}
+
+func TestHandleScheduledSuspendedInvalidScheduleMetadataDoesNotFail(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		schedule string
+		timeZone *string
+	}{
+		{name: "invalid spec timezone", schedule: "* * * * *", timeZone: new("Invalid/TimeZone")},
+		{name: "malformed inline timezone", schedule: "TZ=UTC"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newTestScheme()
+			task := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "sched-suspended-invalid-" + strings.ReplaceAll(tc.name, " ", "-"),
+					Namespace:         "default",
+					CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+				},
+				Spec: corev1alpha1.TaskSpec{
+					Type:     corev1alpha1.TaskTypeContainer,
+					Schedule: tc.schedule,
+					TimeZone: tc.timeZone,
+					Suspend:  new(true),
+				},
+				Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseScheduled},
+			}
+			r := newUnitReconciler(scheme, task)
+
+			result, err := r.handleScheduled(context.Background(), task)
+			if err != nil {
+				t.Fatalf("handleScheduled() error = %v", err)
+			}
+			if result.RequeueAfter != time.Minute {
+				t.Fatalf("RequeueAfter = %v, want 1m while suspended", result.RequeueAfter)
+			}
+			if task.Status.Phase != corev1alpha1.TaskPhaseScheduled {
+				t.Fatalf("phase = %s, want Scheduled while suspended", task.Status.Phase)
+			}
+			if !taskHasScheduleSuspensionMarker(task) {
+				t.Fatal("suspended Task did not retain its schedule suspension marker")
 			}
 		})
 	}
@@ -5391,9 +5812,11 @@ func TestHandleScheduledSkippedOccurrencePropagatesStatusUpdateError(t *testing.
 		name        string
 		deadline    int64
 		activeChild bool
+		suspended   bool
 	}{
 		{name: "missed deadline", deadline: 1},
 		{name: "forbid concurrent", deadline: 600, activeChild: true},
+		{name: "suspended", deadline: 600, suspended: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := newTestScheme()
@@ -5415,6 +5838,9 @@ func TestHandleScheduledSkippedOccurrencePropagatesStatusUpdateError(t *testing.
 					Phase:            corev1alpha1.TaskPhaseScheduled,
 					LastScheduleTime: &lastSchedule,
 				},
+			}
+			if tc.suspended {
+				task.Spec.Suspend = new(true)
 			}
 			objects := []client.Object{task}
 			if tc.activeChild {
