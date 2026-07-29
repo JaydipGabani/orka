@@ -1201,10 +1201,14 @@ func executeAgentLoopWithEvents(
 			requestTools = nil
 		}
 		stepCtx, stepSpan := startAgentStepSpan(ctx, iteration, provider, model, requestTools, baseToolCtx)
+		requestSystemPrompt := systemPrompt
+		if finalAnswerRetry {
+			requestSystemPrompt = appendSystemInstruction(requestSystemPrompt, finalAnswerRetryPrompt)
+		}
 		req := &llm.CompletionRequest{
 			Model:        model,
 			Messages:     messages,
-			SystemPrompt: systemPrompt,
+			SystemPrompt: requestSystemPrompt,
 			MaxTokens:    4096,
 			Tools:        requestTools,
 		}
@@ -1283,7 +1287,6 @@ func executeAgentLoopWithEvents(
 			blankFinalRetried = true
 			finalAnswerRetry = true
 			iterationLimit++
-			messages = append(messages, llm.Message{Role: "user", Content: finalAnswerRetryPrompt})
 			stepSpan.End()
 			continue
 		case completionDecisionToolCalls:
@@ -1427,6 +1430,13 @@ func executeAgentLoopWithEvents(
 	}
 
 	return "", fmt.Errorf("max iterations reached without completion")
+}
+
+func appendSystemInstruction(systemPrompt, instruction string) string {
+	if systemPrompt == "" {
+		return instruction
+	}
+	return systemPrompt + "\n\n" + instruction
 }
 
 func retryCompletionAfterContextOverflow(

@@ -185,3 +185,109 @@ func TestExecuteAgentLoopContextOverflowAccountsForToolSchemasAndArguments(t *te
 		t.Fatal("retry unexpectedly removed fixed system prompt or tool schemas")
 	}
 }
+
+func TestExecuteAgentLoopFinalAnswerContextRecoveryPreservesRealTaskAndEvidence(t *testing.T) {
+	const (
+		realTask       = "CURRENT-REAL-TASK-SENTINEL: explain the gathered evidence"
+		recentEvidence = "RECENT-EVIDENCE-SENTINEL: the deployment is healthy"
+		baseSystem     = "BASE-SYSTEM-SENTINEL"
+	)
+	provider := &mockProvider{
+		responses: []*llm.CompletionResponse{
+			{Content: " \n", StopReason: "end_turn"},
+			{Content: "recovered final answer", StopReason: "end_turn"},
+		},
+		errs: []error{
+			nil,
+			&llm.ProviderError{StatusCode: 400, Message: "context length exceeded"},
+			nil,
+		},
+	}
+	messages := []llm.Message{
+		{Role: roleUser, Content: "OLD-HISTORY-SENTINEL:" + strings.Repeat(" old history", 1200)},
+		{Role: "assistant", Content: "old answer"},
+		{Role: roleUser, Content: realTask},
+		{
+			Role: "assistant",
+			ToolCalls: []llm.ToolCall{{
+				ID:        "evidence-call",
+				Name:      "inspect",
+				Arguments: json.RawMessage(`{"target":"deployment"}`),
+			}},
+		},
+		{Role: "tool", ToolCallID: "evidence-call", Name: "inspect", Content: recentEvidence},
+	}
+
+	result, err := executeAgentLoop(
+		context.Background(), provider, messages,
+		baseSystem, "model", []llm.Tool{{Name: "inspect"}}, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("executeAgentLoop() error = %v", err)
+	}
+	if result != "recovered final answer" {
+		t.Fatalf("result = %q, want recovered final answer", result)
+	}
+	if len(provider.requests) != 3 {
+		t.Fatalf(
+			"provider calls = %d, want blank response, overflowing final retry, and recovered retry",
+			len(provider.requests),
+		)
+	}
+
+	finalRetry := provider.requests[1]
+	recoveredRetry := provider.requests[2]
+	wantSystemPrompt := appendSystemInstruction(baseSystem, finalAnswerRetryPrompt)
+	if finalRetry.SystemPrompt != wantSystemPrompt || recoveredRetry.SystemPrompt != wantSystemPrompt {
+		t.Fatalf(
+			"final retry system prompts = %q and %q, want %q",
+			finalRetry.SystemPrompt, recoveredRetry.SystemPrompt, wantSystemPrompt,
+		)
+	}
+	if len(finalRetry.Tools) != 0 || len(recoveredRetry.Tools) != 0 {
+		t.Fatalf(
+			"final answer retries unexpectedly advertised tools: before=%#v after=%#v",
+			finalRetry.Tools, recoveredRetry.Tools,
+		)
+	}
+
+	before, err := llm.EstimateCompletionRequestSize(finalRetry)
+	if err != nil {
+		t.Fatalf("estimate overflowing final retry: %v", err)
+	}
+	after, err := llm.EstimateCompletionRequestSize(recoveredRetry)
+	if err != nil {
+		t.Fatalf("estimate recovered final retry: %v", err)
+	}
+	if after.SerializedBytes >= before.SerializedBytes {
+		t.Fatalf(
+			"recovered retry bytes = %d, overflowing retry bytes = %d; retry did not shrink",
+			after.SerializedBytes, before.SerializedBytes,
+		)
+	}
+
+	var (
+		keptRealTask       bool
+		keptRecentEvidence bool
+		keptOldHistory     bool
+		syntheticUser      bool
+	)
+	for _, message := range recoveredRetry.Messages {
+		keptRealTask = keptRealTask || message.Role == roleUser && message.Content == realTask
+		keptRecentEvidence = keptRecentEvidence || strings.Contains(message.Content, recentEvidence)
+		keptOldHistory = keptOldHistory || strings.Contains(message.Content, "OLD-HISTORY-SENTINEL")
+		syntheticUser = syntheticUser || message.Role == roleUser && message.Content == finalAnswerRetryPrompt
+	}
+	if !keptRealTask {
+		t.Fatalf("context recovery dropped the real user task: %#v", recoveredRetry.Messages)
+	}
+	if !keptRecentEvidence {
+		t.Fatalf("context recovery dropped recent task evidence: %#v", recoveredRetry.Messages)
+	}
+	if keptOldHistory {
+		t.Fatalf("context recovery retained oversized old history: %#v", recoveredRetry.Messages)
+	}
+	if syntheticUser {
+		t.Fatalf("synthetic final-answer instruction was serialized as a user task: %#v", recoveredRetry.Messages)
+	}
+}
