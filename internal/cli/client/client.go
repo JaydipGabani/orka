@@ -7,18 +7,27 @@ MIT License - see LICENSE file for details.
 package client
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/orka-agents/orka/internal/labels"
+)
+
+const (
+	defaultResponseHeaderTimeout = 30 * time.Second
+	maxErrorResponseBodyBytes    = 64 << 10
+	maxResponseBodyDrainBytes    = 64 << 10
+	responseBodyDrainTimeout     = 100 * time.Millisecond
 )
 
 // Client is an HTTP client for the Orka API.
@@ -32,20 +41,45 @@ type Client struct {
 
 // New creates a new Orka API client.
 func New(baseURL, token string) *Client {
-	return &Client{
-		BaseURL:    baseURL,
-		Token:      token,
-		HTTPClient: http.DefaultClient,
-	}
+	return newClient(baseURL, token, "", defaultResponseHeaderTimeout)
 }
 
 // NewWithNamespace creates a new Orka API client with a default namespace.
 func NewWithNamespace(baseURL, token, namespace string) *Client {
+	return newClient(baseURL, token, namespace, defaultResponseHeaderTimeout)
+}
+
+func newClient(baseURL, token, namespace string, responseHeaderTimeout time.Duration) *Client {
 	return &Client{
 		BaseURL:    baseURL,
 		Token:      token,
 		Namespace:  namespace,
-		HTTPClient: http.DefaultClient,
+		HTTPClient: newHTTPClient(responseHeaderTimeout),
+	}
+}
+
+// newHTTPClient bounds connection setup and response headers without an overall
+// client timeout, so SSE and log bodies can remain open for their full lifetime.
+func newHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
+	transport := cloneDefaultHTTPTransport()
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	return &http.Client{Transport: transport}
+}
+
+func cloneDefaultHTTPTransport() *http.Transport {
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		return transport.Clone()
+	}
+
+	const defaultDialTimeout = 30 * time.Second
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: defaultDialTimeout, KeepAlive: defaultDialTimeout}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
 	}
 }
 
@@ -835,7 +869,10 @@ func (c *Client) StreamTaskLogs(ctx context.Context, name string, opts StreamLog
 	}
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -851,27 +888,65 @@ func (c *Client) StreamTaskLogs(ctx context.Context, name string, opts StreamLog
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readTaskLogErrorResponse(resp.Body, cancel)
 		return fmt.Errorf("API error (HTTP %d): %s", resp.StatusCode, string(body))
 	}
+	defer resp.Body.Close() //nolint:errcheck
 
 	w := opts.Writer
 	if w == nil {
 		w = io.Discard
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if after, ok := strings.CutPrefix(line, "data: "); ok {
-			fmt.Fprintln(w, after) //nolint:errcheck
+	reader := NewSSEReader(resp.Body)
+	for {
+		event, ok := reader.Next()
+		if !ok {
+			break
+		}
+		if event.Event == "error" {
+			return taskLogStreamError(event.Data)
+		}
+		if _, err := fmt.Fprintln(w, event.Data); err != nil {
+			return fmt.Errorf("failed to write task logs: %w", err)
 		}
 	}
-	return scanner.Err()
+	if err := reader.Err(); err != nil {
+		return fmt.Errorf("failed to read task logs: %w", err)
+	}
+	return nil
+}
+
+func readTaskLogErrorResponse(body io.ReadCloser, cancel context.CancelFunc) []byte {
+	if body == nil {
+		cancel()
+		return nil
+	}
+
+	timer := time.AfterFunc(responseBodyDrainTimeout, cancel)
+	data, _ := io.ReadAll(io.LimitReader(body, maxErrorResponseBodyBytes))
+	_, _ = io.CopyN(io.Discard, body, maxResponseBodyDrainBytes)
+	_ = timer.Stop()
+	cancel()
+	_ = body.Close()
+	return data
+}
+
+func taskLogStreamError(data string) error {
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err == nil {
+		if message := strings.TrimSpace(payload.Error); message != "" {
+			return fmt.Errorf("task log stream error: %s", message)
+		}
+	}
+	if message := strings.TrimSpace(data); message != "" {
+		return fmt.Errorf("task log stream error: %s", message)
+	}
+	return errors.New("task log stream error")
 }
 
 // GetTaskResult gets the result of a task.
