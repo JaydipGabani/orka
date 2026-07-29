@@ -928,8 +928,15 @@ func (ch *ChatHandler) saveChatSession(
 	if ch.sessionTurnCommitter == nil {
 		return fmt.Errorf("session store does not support atomic chat turns")
 	}
+
+	// The provider and tool loop remain bound to the request/turn context, but
+	// once a final response exists its atomic persistence owns the durability
+	// handoff. Detach cancellation here and bound the commit to the same grace
+	// window added to the chat-turn lease.
+	durabilityCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), chatDurabilityTimeout)
+	defer cancel()
 	return ch.sessionTurnCommitter.CommitSessionTurn(
-		ctx,
+		durabilityCtx,
 		&store.SessionRecord{
 			Namespace:   namespace,
 			Name:        sessionID,

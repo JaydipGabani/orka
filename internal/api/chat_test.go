@@ -38,12 +38,13 @@ import (
 
 // chatMockProvider implements llm.Provider for testing.
 type chatMockProvider struct {
-	name      string
-	responses []*llm.CompletionResponse
-	callCount int
-	err       error
-	streamCh  chan llm.StreamChunk
-	streamErr error
+	name         string
+	responses    []*llm.CompletionResponse
+	callCount    int
+	err          error
+	beforeReturn func()
+	streamCh     chan llm.StreamChunk
+	streamErr    error
 }
 
 func (m *chatMockProvider) Complete(_ context.Context, _ *llm.CompletionRequest) (*llm.CompletionResponse, error) {
@@ -52,10 +53,14 @@ func (m *chatMockProvider) Complete(_ context.Context, _ *llm.CompletionRequest)
 	}
 	idx := m.callCount
 	m.callCount++
+	resp := &llm.CompletionResponse{Content: "default response"}
 	if idx < len(m.responses) {
-		return m.responses[idx], nil
+		resp = m.responses[idx]
 	}
-	return &llm.CompletionResponse{Content: "default response"}, nil
+	if m.beforeReturn != nil {
+		m.beforeReturn()
+	}
+	return resp, nil
 }
 
 func (m *chatMockProvider) Stream(_ context.Context, _ *llm.CompletionRequest) (<-chan llm.StreamChunk, error) {
@@ -70,6 +75,39 @@ func (m *chatMockProvider) Name() string {
 		return m.name
 	}
 	return "mock-provider"
+}
+
+type observingChatTurnCommitter struct {
+	commit func(
+		context.Context,
+		*store.SessionRecord,
+		string,
+		int,
+		[]store.SessionMessage,
+		int,
+		int,
+	) error
+}
+
+func (*observingChatTurnCommitter) AcquireChatTurn(
+	context.Context, *store.SessionRecord, string, time.Time,
+) error {
+	return nil
+}
+
+func (*observingChatTurnCommitter) ReleaseChatTurn(context.Context, string, string, string) error {
+	return nil
+}
+
+func (c *observingChatTurnCommitter) CommitSessionTurn(
+	ctx context.Context,
+	session *store.SessionRecord,
+	turnID string,
+	expectedMessageCount int,
+	messages []store.SessionMessage,
+	inputTokens, outputTokens int,
+) error {
+	return c.commit(ctx, session, turnID, expectedMessageCount, messages, inputTokens, outputTokens)
 }
 
 func newTestScheme() *runtime.Scheme {
@@ -496,6 +534,61 @@ func TestSaveChatSession(t *testing.T) {
 		}
 		err := ch.saveChatSession(ctx, "default", "noop-session", messages, 1, ChatUsage{}, turnID)
 		require.NoError(t, err)
+	})
+
+	t.Run("uses a detached bounded context for the atomic commit", func(t *testing.T) {
+		type durabilityContextKey struct{}
+		const contextValue = "chat-trace-value"
+
+		for _, tt := range []struct {
+			name       string
+			newContext func(context.Context) (context.Context, context.CancelFunc)
+			wantErr    error
+		}{
+			{
+				name: "parent canceled",
+				newContext: func(parent context.Context) (context.Context, context.CancelFunc) {
+					ctx, cancel := context.WithCancel(parent)
+					cancel()
+					return ctx, cancel
+				},
+				wantErr: context.Canceled,
+			},
+			{
+				name: "parent deadline expired",
+				newContext: func(parent context.Context) (context.Context, context.CancelFunc) {
+					return context.WithDeadline(parent, time.Now().Add(-time.Second))
+				},
+				wantErr: context.DeadlineExceeded,
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				parent, parentCancel := tt.newContext(context.WithValue(
+					context.Background(), durabilityContextKey{}, contextValue,
+				))
+				defer parentCancel()
+				require.ErrorIs(t, parent.Err(), tt.wantErr)
+
+				started := time.Now()
+				committer := &observingChatTurnCommitter{
+					commit: func(commitCtx context.Context, _ *store.SessionRecord, _ string, _ int, _ []store.SessionMessage, _, _ int) error {
+						require.NoError(t, commitCtx.Err())
+						require.Equal(t, contextValue, commitCtx.Value(durabilityContextKey{}))
+						deadline, ok := commitCtx.Deadline()
+						require.True(t, ok)
+						assert.WithinDuration(t, started.Add(chatDurabilityTimeout), deadline, time.Second)
+						return nil
+					},
+				}
+				testHandler := &ChatHandler{sessionTurnCommitter: committer}
+				err := testHandler.saveChatSession(
+					parent, "default", "durable-session",
+					[]llm.Message{{Role: "assistant", Content: "completed"}},
+					0, ChatUsage{InputTokens: 3, OutputTokens: 5}, "durable-turn",
+				)
+				require.NoError(t, err)
+			})
+		}
 	})
 }
 
@@ -945,6 +1038,44 @@ func TestRunToolLoop(t *testing.T) {
 		)
 		require.ErrorIs(t, err, context.Canceled)
 		assert.Empty(t, content)
+		assert.Zero(t, provider.callCount)
+		stored, loadErr := ss.LoadTranscript(context.Background(), "default", "test-sess3", 0)
+		require.NoError(t, loadErr)
+		assert.Empty(t, stored)
+	})
+
+	t.Run("commits a completed response when cancellation races the final handoff", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		ss := newTestSessionStore(t)
+		rs := newTestResultStore(t)
+		ch := newTestChatHandler(t, fakeClient, ss, rs, DefaultChatConfig())
+
+		ctx, cancel := context.WithCancel(context.Background())
+		provider := &chatMockProvider{
+			responses: []*llm.CompletionResponse{
+				{Content: "completed near deadline", InputTokens: 8, OutputTokens: 13},
+			},
+			beforeReturn: cancel,
+		}
+
+		messages := []llm.Message{{Role: "user", Content: "finish this turn"}}
+		turnID := reserveTestChatTurn(t, ch, "durability-handoff-session")
+		content, usage, _, err := ch.runToolLoop(
+			ctx, provider, messages, "system prompt",
+			nil, NewToolExecutor(fakeClient, nil, "default", "durability-handoff-session", "", false, 5, 60*time.Second, rs),
+			"durability-handoff-session", "default", "test-model", 0.7, 4096, 0, nil, turnID,
+		)
+		require.ErrorIs(t, ctx.Err(), context.Canceled)
+		require.NoError(t, err)
+		assert.Equal(t, "completed near deadline", content)
+		assert.Equal(t, 8, usage.InputTokens)
+		assert.Equal(t, 13, usage.OutputTokens)
+
+		stored, loadErr := ss.LoadTranscript(context.Background(), "default", "durability-handoff-session", 0)
+		require.NoError(t, loadErr)
+		require.Len(t, stored, 2)
+		assert.Equal(t, "finish this turn", stored[0].Content)
+		assert.Equal(t, "completed near deadline", stored[1].Content)
 	})
 
 	t.Run("respects max iterations", func(t *testing.T) {
