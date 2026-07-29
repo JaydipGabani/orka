@@ -61,6 +61,15 @@ func TestUpdateAgentTool_Parameters(t *testing.T) {
 	if !ok {
 		t.Fatal("model schema properties are missing")
 	}
+	provider, ok := modelProps["provider"].(map[string]any)
+	if !ok {
+		t.Fatal("provider schema is missing")
+	}
+	providerEnum, ok := provider[jsonSchemaEnumField].([]any)
+	if !ok || len(providerEnum) != 2 ||
+		providerEnum[0] != providerAnthropic || providerEnum[1] != providerOpenAI {
+		t.Fatalf("provider enum = %#v, want [anthropic openai]", provider[jsonSchemaEnumField])
+	}
 	temperature, ok := modelProps["temperature"].(map[string]any)
 	if !ok {
 		t.Fatal("temperature schema is missing")
@@ -320,6 +329,9 @@ func TestUpdateAgentTool_Execute_RejectsUnsupportedModelTypes(t *testing.T) {
 	}{
 		{name: "model must be object or legacy string", model: []any{"openai", testGPT4OModel}},
 		{name: "provider must be string", model: map[string]any{"provider": true}},
+		{name: "object provider must not be empty", model: map[string]any{"provider": ""}},
+		{name: "object provider must be supported", model: map[string]any{"provider": "anthorpic"}},
+		{name: "legacy provider must be supported", model: "anthorpic/claude-sonnet"},
 		{name: "name must be string", model: map[string]any{nameField: 42}},
 		{name: "temperature must be number", model: map[string]any{"temperature": "warm"}},
 		{name: "temperature below minimum", model: map[string]any{"temperature": -0.1}},

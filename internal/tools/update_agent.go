@@ -29,7 +29,18 @@ func (t *UpdateAgentTool) Description() string {
 
 func (t *UpdateAgentTool) Parameters() json.RawMessage {
 	return mustMarshalSchema(map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaPropertiesField: map[string]any{nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: agentNameDescription}, namespaceField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: namespaceDescription}, systemPromptField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "System prompt for the agent"}, toolsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeArray, itemsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}, jsonSchemaDescriptionField: "Tool names to attach"}, modelField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaPropertiesField: map[string]any{
-		"provider": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model provider (e.g. anthropic, openai)"}, nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model name"}, "temperature": map[string]any{jsonSchemaTypeField: "number", jsonSchemaDescriptionField: "Sampling temperature", jsonSchemaMinimumField: 0, jsonSchemaMaximumField: 2},
+		"provider": map[string]any{
+			jsonSchemaTypeField:        jsonSchemaTypeString,
+			jsonSchemaEnumField:        []string{providerAnthropic, providerOpenAI},
+			jsonSchemaDescriptionField: "Model provider (anthropic or openai)",
+		},
+		nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model name"},
+		"temperature": map[string]any{
+			jsonSchemaTypeField:        "number",
+			jsonSchemaDescriptionField: "Sampling temperature",
+			jsonSchemaMinimumField:     0,
+			jsonSchemaMaximumField:     2,
+		},
 	},
 	},
 	}, jsonSchemaRequiredField: []string{nameField},
@@ -109,6 +120,9 @@ func applyAgentModelUpdate(agent *corev1alpha1.Agent, value any) error {
 			if !ok {
 				return fmt.Errorf("model.provider must be a string")
 			}
+			if err := validateAgentModelProvider(providerValue); err != nil {
+				return err
+			}
 			provider = &providerValue
 		}
 
@@ -155,6 +169,11 @@ func applyAgentModelUpdate(agent *corev1alpha1.Agent, value any) error {
 			return nil
 		}
 		provider, name := splitModelString(model)
+		if provider != "" {
+			if err := validateAgentModelProvider(provider); err != nil {
+				return err
+			}
+		}
 		if agent.Spec.Model == nil {
 			agent.Spec.Model = &corev1alpha1.ModelConfig{}
 		}
@@ -166,5 +185,17 @@ func applyAgentModelUpdate(agent *corev1alpha1.Agent, value any) error {
 
 	default:
 		return fmt.Errorf("model must be an object or legacy provider/name string")
+	}
+}
+
+func validateAgentModelProvider(provider string) error {
+	switch provider {
+	case providerAnthropic, providerOpenAI:
+		return nil
+	default:
+		return fmt.Errorf(
+			"model.provider must be one of %q or %q",
+			providerAnthropic, providerOpenAI,
+		)
 	}
 }

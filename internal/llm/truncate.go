@@ -28,6 +28,8 @@ type CompletionRequestSize struct {
 const (
 	currentUserTaskTruncationMarker = "\n\n[Current user task truncated for context recovery.]\n\n"
 	minimalRecoveryTruncationNote   = "[Earlier messages truncated for context recovery.]"
+	recoveryRoleAssistant           = "assistant"
+	recoveryRoleTool                = "tool"
 )
 
 // EstimateCompletionRequestSize estimates the complete serialized request,
@@ -44,8 +46,9 @@ func EstimateCompletionRequestSize(req *CompletionRequest) (CompletionRequestSiz
 }
 
 // TruncateCompletionRequest returns a copy of req reduced toward tokenBudget.
-// The newest user message is mandatory; if it alone is oversized, its middle
-// is replaced with an explicit recovery marker while preserving both ends.
+// The newest user message and newest complete post-task tool exchange are
+// recovery anchors. If fixed request overhead makes the target impossible, the
+// user task is still reduced with an explicit marker while preserving both ends.
 func TruncateCompletionRequest(req *CompletionRequest, tokenBudget int) (*CompletionRequest, error) {
 	if req == nil {
 		return nil, fmt.Errorf("completion request is nil")
@@ -68,7 +71,9 @@ func TruncateCompletionRequest(req *CompletionRequest, tokenBudget int) (*Comple
 		return truncated, nil
 	}
 
-	blocks, mandatoryBlock := groupRecoveryMessageBlocks(truncated.Messages, currentUserIndex)
+	blocks, mandatoryBlock, newestEvidenceBlock := groupRecoveryMessageBlocks(
+		truncated.Messages, currentUserIndex,
+	)
 	kept := make([]bool, len(blocks))
 	for i := range kept {
 		kept[i] = true
@@ -76,7 +81,7 @@ func TruncateCompletionRequest(req *CompletionRequest, tokenBudget int) (*Comple
 	for size.EstimatedTokens > tokenBudget {
 		drop := -1
 		for i := range blocks {
-			if kept[i] && i != mandatoryBlock {
+			if kept[i] && i != mandatoryBlock && i != newestEvidenceBlock {
 				drop = i
 				break
 			}
@@ -95,8 +100,45 @@ func TruncateCompletionRequest(req *CompletionRequest, tokenBudget int) (*Comple
 	}
 
 	currentUserIndex = newestUserMessageIndex(truncated.Messages)
-	if _, err := truncateCurrentUserPrompt(truncated, currentUserIndex, tokenBudget); err != nil {
+	if err := truncateCurrentUserPrompt(
+		truncated, currentUserIndex, tokenBudget, newestEvidenceBlock >= 0,
+	); err != nil {
 		return nil, err
+	}
+	if newestEvidenceBlock < 0 {
+		return truncated, nil
+	}
+
+	anchoredSize, err := EstimateCompletionRequestSize(truncated)
+	if err != nil || anchoredSize.EstimatedTokens <= tokenBudget {
+		return truncated, err
+	}
+	anchoredMessages := append([]Message(nil), truncated.Messages...)
+
+	// The newest evidence block is protected through task truncation. Drop it only
+	// when doing so makes the requested budget attainable; if fixed overhead still
+	// prevents fitting, restore the evidence and return the smaller best-effort request.
+	kept[newestEvidenceBlock] = false
+	truncated.Messages, size, err = recoveryMessagesWithinBudget(
+		truncated, blocks, kept, tokenBudget,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if size.EstimatedTokens > tokenBudget {
+		currentUserIndex = newestUserMessageIndex(truncated.Messages)
+		if err := truncateCurrentUserPrompt(
+			truncated, currentUserIndex, tokenBudget, false,
+		); err != nil {
+			return nil, err
+		}
+		size, err = EstimateCompletionRequestSize(truncated)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if size.EstimatedTokens > tokenBudget {
+		truncated.Messages = anchoredMessages
 	}
 	return truncated, nil
 }
@@ -146,7 +188,10 @@ func messagesFromKeptBlocks(blocks []messageBlock, kept []bool) []Message {
 	return messages
 }
 
-func groupRecoveryMessageBlocks(messages []Message, currentUserIndex int) ([]messageBlock, int) {
+// groupRecoveryMessageBlocks keeps the current user task and the newest complete
+// post-task tool exchange as recovery anchors. Older and incomplete blocks remain
+// eligible for atomic removal.
+func groupRecoveryMessageBlocks(messages []Message, currentUserIndex int) ([]messageBlock, int, int) {
 	blocks := make([]messageBlock, 0)
 	for i := 0; i < currentUserIndex; {
 		start := i
@@ -159,8 +204,46 @@ func groupRecoveryMessageBlocks(messages []Message, currentUserIndex int) ([]mes
 
 	mandatoryBlock := len(blocks)
 	blocks = append(blocks, messageBlock{messages: []Message{messages[currentUserIndex]}})
-	blocks = append(blocks, groupMessageBlocks(messages[currentUserIndex+1:])...)
-	return blocks, mandatoryBlock
+	postTaskBlocks := groupMessageBlocks(messages[currentUserIndex+1:])
+	newestEvidenceBlock := -1
+	for i := len(postTaskBlocks) - 1; i >= 0; i-- {
+		if completeAssistantToolBlock(postTaskBlocks[i]) {
+			newestEvidenceBlock = len(blocks) + i
+			break
+		}
+	}
+	blocks = append(blocks, postTaskBlocks...)
+	return blocks, mandatoryBlock, newestEvidenceBlock
+}
+
+func completeAssistantToolBlock(block messageBlock) bool {
+	if len(block.messages) < 2 {
+		return false
+	}
+	assistant := block.messages[0]
+	if assistant.Role != recoveryRoleAssistant || len(assistant.ToolCalls) == 0 {
+		return false
+	}
+
+	pending := make(map[string]int, len(assistant.ToolCalls))
+	for _, call := range assistant.ToolCalls {
+		if call.ID == "" {
+			return false
+		}
+		pending[call.ID]++
+	}
+	for _, result := range block.messages[1:] {
+		if result.Role != recoveryRoleTool || pending[result.ToolCallID] == 0 {
+			return false
+		}
+		pending[result.ToolCallID]--
+	}
+	for _, remaining := range pending {
+		if remaining != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func cloneCompletionRequest(req *CompletionRequest) (*CompletionRequest, error) {
@@ -184,11 +267,20 @@ func newestUserMessageIndex(messages []Message) int {
 	return -1
 }
 
-func truncateCurrentUserPrompt(req *CompletionRequest, messageIndex, tokenBudget int) (bool, error) {
+func truncateCurrentUserPrompt(
+	req *CompletionRequest,
+	messageIndex int,
+	tokenBudget int,
+	bestEffort bool,
+) error {
 	original := req.Messages[messageIndex].Content
 	originalRunes := []rune(original)
 	if len(originalRunes) < 3 {
-		return false, nil
+		return nil
+	}
+	originalSize, err := EstimateCompletionRequestSize(req)
+	if err != nil {
+		return err
 	}
 
 	setContent := func(content string) (CompletionRequestSize, error) {
@@ -200,11 +292,17 @@ func truncateCurrentUserPrompt(req *CompletionRequest, messageIndex, tokenBudget
 	bestContent := balancedTruncatedCurrentTask(originalRunes, minimumRetainedRunes)
 	bestSize, err := setContent(bestContent)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if bestSize.EstimatedTokens > tokenBudget {
+		// Fixed request overhead can make the target impossible. When recent
+		// evidence is anchored, keep the smallest bounded task if it still shrinks
+		// the request rather than discarding that evidence.
+		if bestEffort && bestSize.SerializedBytes < originalSize.SerializedBytes {
+			return nil
+		}
 		req.Messages[messageIndex].Content = original
-		return false, nil
+		return nil
 	}
 
 	for low, high := minimumRetainedRunes, len(originalRunes)-1; low <= high; {
@@ -212,7 +310,7 @@ func truncateCurrentUserPrompt(req *CompletionRequest, messageIndex, tokenBudget
 		content := balancedTruncatedCurrentTask(originalRunes, mid)
 		size, sizeErr := setContent(content)
 		if sizeErr != nil {
-			return false, sizeErr
+			return sizeErr
 		}
 		if size.EstimatedTokens <= tokenBudget {
 			bestContent = content
@@ -223,7 +321,7 @@ func truncateCurrentUserPrompt(req *CompletionRequest, messageIndex, tokenBudget
 	}
 
 	req.Messages[messageIndex].Content = bestContent
-	return true, nil
+	return nil
 }
 
 func balancedTruncatedCurrentTask(original []rune, retained int) string {
