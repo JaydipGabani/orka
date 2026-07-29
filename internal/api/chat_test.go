@@ -134,6 +134,14 @@ func newTestChatHandler(t *testing.T, c client.Client, ss store.SessionStore, rs
 	return NewChatHandler(c, nil, cfg, "", false, ss, rs, resolver)
 }
 
+func reserveTestChatTurn(t *testing.T, ch *ChatHandler, sessionID string) string {
+	t.Helper()
+	turnID, _, err := ch.reserveChatTurn(context.Background(), defaultNamespace, sessionID)
+	require.NoError(t, err)
+	t.Cleanup(func() { ch.releaseChatTurn(defaultNamespace, sessionID, turnID) })
+	return turnID
+}
+
 // providerCRD creates a Provider CRD + matching Secret for tests.
 func providerCRD(name, namespace, providerType, model string) []runtime.Object { //nolint:unparam
 	return []runtime.Object{
@@ -423,22 +431,31 @@ func TestSaveChatSession(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("creates session if not exists and appends messages", func(t *testing.T) {
+		turnID := reserveTestChatTurn(t, ch, "new-session")
 		messages := []llm.Message{
 			{Role: "user", Content: "hello"},
 			{Role: "assistant", Content: "hi"},
 		}
-		err := ch.saveChatSession(ctx, "default", "new-session", messages, 0, ChatUsage{})
+		err := ch.saveChatSession(ctx, "default", "new-session", messages, 0, ChatUsage{
+			InputTokens: 10, OutputTokens: 20,
+		}, turnID)
 		require.NoError(t, err)
 
 		// Verify session was created
 		sess, err := ss.GetSession(ctx, "default", "new-session")
 		require.NoError(t, err)
 		assert.Equal(t, "chat", sess.SessionType)
+		assert.Equal(t, 10, sess.InputTokens)
+		assert.Equal(t, 20, sess.OutputTokens)
 
 		// Verify messages were stored
 		stored, err := ss.LoadTranscript(ctx, "default", "new-session", 0)
 		require.NoError(t, err)
 		assert.Len(t, stored, 2)
+		assert.NotEmpty(t, stored[0].ID)
+		assert.NotEmpty(t, stored[1].ID)
+		assert.Equal(t, int64(2), stored[0].Order)
+		assert.Equal(t, int64(4), stored[1].Order)
 	})
 
 	t.Run("only appends new messages (skips persisted)", func(t *testing.T) {
@@ -457,13 +474,14 @@ func TestSaveChatSession(t *testing.T) {
 			{Role: "user", Content: "old message", Timestamp: now},
 		})
 		require.NoError(t, err)
+		turnID := reserveTestChatTurn(t, ch, "partial-session")
 
 		messages := []llm.Message{
 			{Role: "user", Content: "old message"},
 			{Role: "assistant", Content: "new response"},
 		}
 		// persistedCount=1 means skip first message
-		err = ch.saveChatSession(ctx, "default", "partial-session", messages, 1, ChatUsage{})
+		err = ch.saveChatSession(ctx, "default", "partial-session", messages, 1, ChatUsage{}, turnID)
 		require.NoError(t, err)
 
 		stored, err := ss.LoadTranscript(ctx, "default", "partial-session", 0)
@@ -472,10 +490,11 @@ func TestSaveChatSession(t *testing.T) {
 	})
 
 	t.Run("no new messages is a no-op", func(t *testing.T) {
+		turnID := reserveTestChatTurn(t, ch, "noop-session")
 		messages := []llm.Message{
 			{Role: "user", Content: "already saved"},
 		}
-		err := ch.saveChatSession(ctx, "default", "noop-session", messages, 1, ChatUsage{})
+		err := ch.saveChatSession(ctx, "default", "noop-session", messages, 1, ChatUsage{}, turnID)
 		require.NoError(t, err)
 	})
 }
@@ -849,10 +868,11 @@ func TestRunToolLoop(t *testing.T) {
 		}
 
 		messages := []llm.Message{{Role: "user", Content: "hello"}}
+		turnID := reserveTestChatTurn(t, ch, "test-sess")
 		content, usage, toolCalls, err := ch.runToolLoop(
 			context.Background(), provider, messages, "system prompt",
 			nil, NewToolExecutor(fakeClient, nil, "default", "test-sess", "", false, 5, 60*time.Second, rs),
-			"test-sess", "default", "test-model", 0.7, 4096, 0, nil,
+			"test-sess", "default", "test-model", 0.7, 4096, 0, nil, turnID,
 		)
 		require.NoError(t, err)
 		assert.Equal(t, "Hello, I'm here to help!", content)
@@ -888,10 +908,11 @@ func TestRunToolLoop(t *testing.T) {
 
 		messages := []llm.Message{{Role: "user", Content: "list tasks"}}
 		exec := NewToolExecutor(fakeClient, nil, "default", "test-sess2", "", false, 5, 60*time.Second, rs)
+		turnID := reserveTestChatTurn(t, ch, "test-sess2")
 		content, usage, toolCalls, err := ch.runToolLoop(
 			context.Background(), provider, messages, "system prompt",
 			exec.registry.ToLLMTools(chattools.ChatToolNames()), exec,
-			"test-sess2", "default", "test-model", 0.7, 4096, 0, nil,
+			"test-sess2", "default", "test-model", 0.7, 4096, 0, nil, turnID,
 		)
 		require.NoError(t, err)
 		assert.Equal(t, "Done!", content)
@@ -916,13 +937,14 @@ func TestRunToolLoop(t *testing.T) {
 		}
 
 		messages := []llm.Message{{Role: "user", Content: "hello"}}
+		turnID := reserveTestChatTurn(t, ch, "test-sess3")
 		content, _, _, err := ch.runToolLoop(
 			ctx, provider, messages, "system prompt",
 			nil, NewToolExecutor(fakeClient, nil, "default", "test-sess3", "", false, 5, 60*time.Second, rs),
-			"test-sess3", "default", "test-model", 0.7, 4096, 0, nil,
+			"test-sess3", "default", "test-model", 0.7, 4096, 0, nil, turnID,
 		)
-		require.NoError(t, err)
-		assert.Contains(t, content, "ran out of time")
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Empty(t, content)
 	})
 
 	t.Run("respects max iterations", func(t *testing.T) {
@@ -947,10 +969,11 @@ func TestRunToolLoop(t *testing.T) {
 
 		messages := []llm.Message{{Role: "user", Content: "do things"}}
 		exec2 := NewToolExecutor(fakeClient, nil, "default", "max-iter-sess", "", false, 5, 60*time.Second, rs)
+		turnID := reserveTestChatTurn(t, ch, "max-iter-sess")
 		content, usage, _, err := ch.runToolLoop(
 			context.Background(), provider, messages, "system prompt",
 			exec2.registry.ToLLMTools(chattools.ChatToolNames()), exec2,
-			"max-iter-sess", "default", "test-model", 0.7, 4096, 0, nil,
+			"max-iter-sess", "default", "test-model", 0.7, 4096, 0, nil, turnID,
 		)
 		require.NoError(t, err)
 		assert.NotEmpty(t, content)
@@ -968,10 +991,11 @@ func TestRunToolLoop(t *testing.T) {
 		}
 
 		messages := []llm.Message{{Role: "user", Content: "hello"}}
+		turnID := reserveTestChatTurn(t, ch, "err-sess")
 		_, _, _, err := ch.runToolLoop(
 			context.Background(), provider, messages, "system prompt",
 			nil, NewToolExecutor(fakeClient, nil, "default", "err-sess", "", false, 5, 60*time.Second, rs),
-			"err-sess", "default", "test-model", 0.7, 4096, 0, nil,
+			"err-sess", "default", "test-model", 0.7, 4096, 0, nil, turnID,
 		)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "LLM completion failed")
@@ -1001,10 +1025,11 @@ func TestRunToolLoop(t *testing.T) {
 
 		messages := []llm.Message{{Role: "user", Content: "do it"}}
 		exec3 := NewToolExecutor(fakeClient, nil, "default", "sse-sess", "", false, 5, 60*time.Second, rs)
+		turnID := reserveTestChatTurn(t, ch, "sse-sess")
 		content, _, _, err := ch.runToolLoop(
 			context.Background(), provider, messages, "system prompt",
 			exec3.registry.ToLLMTools(chattools.ChatToolNames()), exec3,
-			"sse-sess", "default", "test-model", 0.7, 4096, 0, emitSSE,
+			"sse-sess", "default", "test-model", 0.7, 4096, 0, emitSSE, turnID,
 		)
 		require.NoError(t, err)
 		assert.Equal(t, "All done!", content)
@@ -1157,6 +1182,15 @@ func TestHandleChat(t *testing.T) {
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&chatResp))
 		assert.NotEmpty(t, chatResp.SessionID)
 		assert.NotEmpty(t, chatResp.Message)
+		session, err := ss.GetSession(context.Background(), "default", chatResp.SessionID)
+		require.NoError(t, err)
+		require.Len(t, session.Messages, 2)
+		assert.Equal(t, 10, session.InputTokens)
+		assert.Equal(t, 20, session.OutputTokens)
+		assert.NotEmpty(t, session.Messages[0].ID)
+		assert.NotEmpty(t, session.Messages[1].ID)
+		assert.Equal(t, int64(2), session.Messages[0].Order)
+		assert.Equal(t, int64(4), session.Messages[1].Order)
 	})
 
 	t.Run("SSE mode returns event stream", func(t *testing.T) {
@@ -1232,6 +1266,18 @@ func TestHandleChat(t *testing.T) {
 		var chatResp ChatResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&chatResp))
 		assert.Equal(t, "my-session-123", chatResp.SessionID)
+
+		secondBody, _ := json.Marshal(ChatRequest{Message: "again", SessionID: "my-session-123"})
+		secondReq := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(secondBody))
+		secondReq.Header.Set("Content-Type", "application/json")
+		secondReq.Header.Set("Accept", "application/json")
+		secondResp, err := app.Test(secondReq)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, secondResp.StatusCode)
+		session, err := ss.GetSession(context.Background(), "default", "my-session-123")
+		require.NoError(t, err)
+		require.Len(t, session.Messages, 4)
+		assert.Equal(t, int64(8), session.Messages[3].Order)
 	})
 
 	t.Run("SSE streaming mode", func(t *testing.T) {
@@ -1319,6 +1365,44 @@ func TestHandleChatHidesGatewaySessionBeforeProviderInvocation(t *testing.T) {
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	require.Zero(t, mock.callCount)
+}
+
+func TestHandleChatRejectsConcurrentSessionTurnBeforeProviderInvocation(t *testing.T) {
+	const providerType = "chat-turn-reservation-test"
+	mock := &chatMockProvider{name: providerType}
+	llm.RegisterProvider(providerType, func(llm.ProviderConfig) (llm.Provider, error) {
+		return mock, nil
+	})
+	objects := providerCRD(testDefaultNamespace, testDefaultNamespace, providerType, "test-model")
+	fakeClient := fake.NewClientBuilder().WithScheme(newTestScheme()).WithRuntimeObjects(objects...).Build()
+	ss := newTestSessionStore(t)
+	committer, ok := ss.(store.SessionTurnCommitter)
+	require.True(t, ok)
+	now := time.Now().UTC()
+	require.NoError(t, committer.AcquireChatTurn(context.Background(), &store.SessionRecord{
+		Namespace: testDefaultNamespace, Name: "busy-chat", SessionType: "chat", CreatedAt: now, UpdatedAt: now,
+	}, "held-turn", now.Add(time.Minute)))
+	t.Cleanup(func() {
+		_ = committer.ReleaseChatTurn(context.Background(), testDefaultNamespace, "busy-chat", "held-turn")
+	})
+
+	rs := newTestResultStore(t)
+	cfg := DefaultChatConfig()
+	cfg.Provider = testDefaultNamespace
+	ch := newTestChatHandler(t, fakeClient, ss, rs, cfg)
+	app := fiber.New(fiber.Config{ErrorHandler: customErrorHandler})
+	app.Post("/api/v1/chat", ch.HandleChat)
+	body, err := json.Marshal(ChatRequest{
+		Message: "second turn", SessionID: "busy-chat", Namespace: testDefaultNamespace,
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusConflict, resp.StatusCode)
 	require.Zero(t, mock.callCount)
 }
 

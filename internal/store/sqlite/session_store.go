@@ -13,6 +13,11 @@ import (
 	"github.com/orka-agents/orka/internal/store"
 )
 
+var (
+	_ store.SessionStore         = (*Store)(nil)
+	_ store.SessionTurnCommitter = (*Store)(nil)
+)
+
 // CreateSession inserts a new session record.
 func (s *Store) CreateSession(ctx context.Context, session *store.SessionRecord) error {
 	_, err := s.db.ExecContext(ctx,
@@ -220,6 +225,193 @@ func (s *Store) AcquireLock(ctx context.Context, namespace, name, taskName, task
 	return nil
 }
 
+// AcquireChatTurn creates a chat Session when needed and reserves its current
+// transcript revision for one turn. Expired reservations may be reclaimed, but
+// Task locks and Gateway-owned Sessions are never taken over by chat.
+func (s *Store) AcquireChatTurn(
+	ctx context.Context,
+	session *store.SessionRecord,
+	turnID string,
+	expiresAt time.Time,
+) error {
+	if session == nil {
+		return store.ValidationErrorf("session is required")
+	}
+	if session.Namespace == "" || session.Name == "" || session.SessionType == "" || turnID == "" {
+		return store.ValidationErrorf("session namespace, name, type, and turn ID are required")
+	}
+	now := time.Now().UTC()
+	expiresAt = expiresAt.UTC()
+	if !expiresAt.After(now) {
+		return store.ValidationErrorf("chat turn expiration must be in the future")
+	}
+	createdAt := session.CreatedAt.UTC()
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO sessions
+		 (namespace, name, session_type, active_task, active_task_uid, message_count, input_tokens, output_tokens, cancelled, created_at, updated_at)
+		 VALUES (?, ?, ?, '', '', 0, 0, 0, ?, ?, ?)
+		 ON CONFLICT(namespace, name) DO NOTHING`,
+		session.Namespace, session.Name, session.SessionType, session.Cancelled, createdAt, now,
+	); err != nil {
+		return err
+	}
+
+	var sessionType, ownerType, activeTask, activeTurn string
+	var activeTurnExpiresAt sql.NullTime
+	if err := tx.QueryRowContext(ctx,
+		`SELECT session_type, owner_type, active_task, chat_turn_id, chat_turn_expires_at
+		 FROM sessions WHERE namespace = ? AND name = ?`,
+		session.Namespace, session.Name,
+	).Scan(&sessionType, &ownerType, &activeTask, &activeTurn, &activeTurnExpiresAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return store.ErrNotFound
+		}
+		return err
+	}
+	if sessionType == store.SessionTypeGateway || ownerType == gatewaySessionOwnerType {
+		return store.ErrGatewayOwnedSession
+	}
+	if activeTask != "" {
+		return fmt.Errorf("%w: chat session %s/%s has an active Task", store.ErrConflict, session.Namespace, session.Name)
+	}
+	if activeTurn != "" && activeTurnExpiresAt.Valid && activeTurnExpiresAt.Time.After(now) {
+		return fmt.Errorf("%w: chat session %s/%s already has an active turn", store.ErrConflict, session.Namespace, session.Name)
+	}
+
+	result, err := tx.ExecContext(ctx,
+		`UPDATE sessions SET chat_turn_id = ?, chat_turn_expires_at = ?, updated_at = ?
+		 WHERE namespace = ? AND name = ? AND active_task = ''
+		 AND session_type <> ? AND owner_type <> ?
+		 AND (chat_turn_id = '' OR chat_turn_expires_at IS NULL OR chat_turn_expires_at <= ?)`,
+		turnID, expiresAt, now, session.Namespace, session.Name,
+		store.SessionTypeGateway, gatewaySessionOwnerType, now,
+	)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return fmt.Errorf("%w: chat session %s/%s already has an active turn", store.ErrConflict, session.Namespace, session.Name)
+	}
+	return tx.Commit()
+}
+
+// ReleaseChatTurn clears a reservation only when it is still owned by turnID.
+func (s *Store) ReleaseChatTurn(ctx context.Context, namespace, name, turnID string) error {
+	if turnID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET chat_turn_id = '', chat_turn_expires_at = NULL
+		 WHERE namespace = ? AND name = ? AND chat_turn_id = ?`,
+		namespace, name, turnID,
+	)
+	return err
+}
+
+// CommitSessionTurn atomically appends one chat turn's messages and token
+// usage. The reservation owner, lease, and observed message count fence the
+// commit against concurrent or recovered turns.
+func (s *Store) CommitSessionTurn(
+	ctx context.Context,
+	session *store.SessionRecord,
+	turnID string,
+	expectedMessageCount int,
+	messages []store.SessionMessage,
+	inputTokens, outputTokens int,
+) error {
+	if session == nil {
+		return store.ValidationErrorf("session is required")
+	}
+	if session.Namespace == "" || session.Name == "" || turnID == "" {
+		return store.ValidationErrorf("session namespace, name, and turn ID are required")
+	}
+	if expectedMessageCount < 0 {
+		return store.ValidationErrorf("expected message count must not be negative")
+	}
+	if inputTokens < 0 || outputTokens < 0 {
+		return store.ValidationErrorf("token increments must not be negative")
+	}
+	if len(messages) == 0 && (inputTokens != 0 || outputTokens != 0) {
+		return store.ValidationErrorf("token increments require transcript messages")
+	}
+
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var sessionType, ownerType, activeTurn string
+	var activeTurnExpiresAt sql.NullTime
+	var currentMessageCount int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT session_type, owner_type, message_count, chat_turn_id, chat_turn_expires_at
+		 FROM sessions WHERE namespace = ? AND name = ?`,
+		session.Namespace, session.Name,
+	).Scan(&sessionType, &ownerType, &currentMessageCount, &activeTurn, &activeTurnExpiresAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return store.ErrNotFound
+		}
+		return err
+	}
+	if sessionType == store.SessionTypeGateway || ownerType == gatewaySessionOwnerType {
+		return store.ErrGatewayOwnedSession
+	}
+	if activeTurn != turnID {
+		return fmt.Errorf("%w: chat turn no longer owns session", store.ErrConflict)
+	}
+	if !activeTurnExpiresAt.Valid || !activeTurnExpiresAt.Time.After(now) {
+		return fmt.Errorf("%w: chat turn reservation expired", store.ErrConflict)
+	}
+	if currentMessageCount != expectedMessageCount {
+		return fmt.Errorf(
+			"%w: session message count is %d, expected %d",
+			store.ErrConflict, currentMessageCount, expectedMessageCount,
+		)
+	}
+
+	inserted, err := insertSessionMessagesTx(ctx, tx, session.Namespace, session.Name, messages)
+	if err != nil {
+		return err
+	}
+	if inserted != len(messages) {
+		return fmt.Errorf("%w: chat turn messages were already present", store.ErrConflict)
+	}
+	result, err := tx.ExecContext(ctx,
+		`UPDATE sessions
+		 SET message_count = message_count + ?, input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, updated_at = ?
+		 WHERE namespace = ? AND name = ? AND message_count = ? AND chat_turn_id = ? AND chat_turn_expires_at > ?`,
+		inserted, inputTokens, outputTokens, now,
+		session.Namespace, session.Name, expectedMessageCount, turnID, now,
+	)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return fmt.Errorf("%w: session changed while committing turn", store.ErrConflict)
+	}
+	return tx.Commit()
+}
+
 // ReleaseLock clears the lock only for the exact Task incarnation.
 func (s *Store) ReleaseLock(ctx context.Context, namespace, name, taskName, taskUID string) error {
 	_, err := s.db.ExecContext(ctx,
@@ -271,67 +463,10 @@ func (s *Store) AppendMessages(ctx context.Context, namespace, name string, mess
 		return store.ErrConflict
 	}
 
-	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO session_messages
-		 (namespace, session_name, message_id, sort_order, role, content, name, input, tool_calls, tool_call_id,
-		  source_type, source_ref, metadata_json, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(namespace, session_name, message_id) WHERE message_id <> '' DO NOTHING`,
-	)
+	inserted, err := insertSessionMessagesTx(ctx, tx, namespace, name, messages)
 	if err != nil {
 		return err
 	}
-	defer stmt.Close() //nolint:errcheck
-
-	inserted := 0
-	for _, msg := range messages {
-		inputJSON, toolCallsJSON, metadataJSON, err := encodeSessionMessagePayload(msg)
-		if err != nil {
-			return err
-		}
-		ts := msg.Timestamp
-		if ts.IsZero() {
-			ts = time.Now().UTC()
-		}
-		messageID := msg.ID
-		if messageID == "" {
-			messageID, err = newSessionMessageID()
-			if err != nil {
-				return err
-			}
-		}
-		logicalOrder := msg.Order
-		if logicalOrder <= 0 {
-			logicalOrder, err = nextSessionMessageOrderTx(ctx, tx, namespace, name)
-			if err != nil {
-				return err
-			}
-		}
-		result, err := stmt.ExecContext(ctx,
-			namespace, name, messageID, logicalOrder, msg.Role, msg.Content, nilIfEmpty(msg.Name), inputJSON,
-			toolCallsJSON, nilIfEmpty(msg.ToolCallID), msg.SourceType, msg.SourceRef, metadataJSON, ts,
-		)
-		if err != nil {
-			return err
-		}
-		rows, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if rows == 0 {
-			matches, matchErr := sessionMessageMatchesTx(
-				ctx, tx, namespace, name, messageID, logicalOrder, msg.Order > 0, msg, inputJSON, toolCallsJSON, metadataJSON,
-			)
-			if matchErr != nil {
-				return matchErr
-			}
-			if !matches {
-				return store.ErrDuplicateMismatch
-			}
-		}
-		inserted += int(rows)
-	}
-
 	if inserted > 0 {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE sessions SET message_count = message_count + ?, updated_at = CURRENT_TIMESTAMP WHERE namespace = ? AND name = ?`,
@@ -341,6 +476,75 @@ func (s *Store) AppendMessages(ctx context.Context, namespace, name string, mess
 		}
 	}
 	return tx.Commit()
+}
+
+func insertSessionMessagesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	namespace, name string,
+	messages []store.SessionMessage,
+) (int, error) {
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO session_messages
+		 (namespace, session_name, message_id, sort_order, role, content, name, input, tool_calls, tool_call_id,
+		  source_type, source_ref, metadata_json, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(namespace, session_name, message_id) WHERE message_id <> '' DO NOTHING`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close() //nolint:errcheck
+
+	inserted := 0
+	for _, msg := range messages {
+		inputJSON, toolCallsJSON, metadataJSON, err := encodeSessionMessagePayload(msg)
+		if err != nil {
+			return 0, err
+		}
+		ts := msg.Timestamp
+		if ts.IsZero() {
+			ts = time.Now().UTC()
+		}
+		messageID := msg.ID
+		if messageID == "" {
+			messageID, err = newSessionMessageID()
+			if err != nil {
+				return 0, err
+			}
+		}
+		logicalOrder := msg.Order
+		if logicalOrder <= 0 {
+			logicalOrder, err = nextSessionMessageOrderTx(ctx, tx, namespace, name)
+			if err != nil {
+				return 0, err
+			}
+		}
+		result, err := stmt.ExecContext(ctx,
+			namespace, name, messageID, logicalOrder, msg.Role, msg.Content, nilIfEmpty(msg.Name), inputJSON,
+			toolCallsJSON, nilIfEmpty(msg.ToolCallID), msg.SourceType, msg.SourceRef, metadataJSON, ts,
+		)
+		if err != nil {
+			return 0, err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if rows == 0 {
+			matches, matchErr := sessionMessageMatchesTx(
+				ctx, tx, namespace, name, messageID, logicalOrder, msg.Order > 0, msg, inputJSON, toolCallsJSON, metadataJSON,
+			)
+			if matchErr != nil {
+				return 0, matchErr
+			}
+			if !matches {
+				return 0, store.ErrDuplicateMismatch
+			}
+		}
+		inserted += int(rows)
+	}
+	return inserted, nil
 }
 
 // LoadTranscript retrieves messages in logical conversation order.
