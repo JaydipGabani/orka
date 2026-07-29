@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -178,6 +179,7 @@ func (t *WaitForTasksTool) Execute(ctx context.Context, args json.RawMessage) (s
 			if err != nil {
 				results[taskName].Phase = taskPhaseErrorString
 				results[taskName].Result = fmt.Sprintf("error: %v", err)
+				allTerminal = allTerminal && isPermanentWaitForTasksGetError(err)
 				continue
 			}
 
@@ -287,6 +289,15 @@ func (t *WaitForTasksTool) Execute(ctx context.Context, args json.RawMessage) (s
 	}
 
 	return string(data), nil
+}
+
+func isPermanentWaitForTasksGetError(err error) bool {
+	// NotFound remains retryable because cache-backed controller-runtime clients
+	// can briefly miss a Task that was just created through the same client.
+	return apierrors.IsForbidden(err) ||
+		apierrors.IsUnauthorized(err) ||
+		apierrors.IsBadRequest(err) ||
+		apierrors.IsInvalid(err)
 }
 
 func fetchTaskResultForNamespace(ctx context.Context, namespace, taskName string) (string, error) {
