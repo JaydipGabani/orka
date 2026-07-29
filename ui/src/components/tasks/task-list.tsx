@@ -28,6 +28,7 @@ export function TaskList() {
     isFetchingNextPage,
     isFetchNextPageError,
     refetch,
+    paginationError,
   } = useTaskList()
   const deleteTask = useDeleteTask()
 
@@ -125,9 +126,17 @@ export function TaskList() {
             )}
           </TableBody>
         </Table>
-        {(hasNextPage || isFetchNextPageError) && (
+        {(hasNextPage || isFetchNextPageError || paginationError) && (
           <div className="flex flex-col items-center justify-between gap-3 border-t p-3 sm:flex-row">
-            {isFetchNextPageError ? (
+            {paginationError ? (
+              <p
+                role="alert"
+                aria-label="Task inventory is incomplete"
+                className="text-sm text-destructive"
+              >
+                Task inventory is incomplete. {paginationError.message}.
+              </p>
+            ) : isFetchNextPageError ? (
               <p
                 role="alert"
                 aria-label="Failed to load more tasks"
@@ -136,21 +145,23 @@ export function TaskList() {
                 Failed to load more tasks. Try again.
               </p>
             ) : null}
-            <Button
-              variant="outline"
-              size="sm"
-              className="sm:ml-auto"
-              onClick={() => void fetchNextPage()}
-              disabled={isFetching}
-            >
-              {isFetchingNextPage
-                ? 'Loading more tasks…'
-                : isFetching
-                  ? 'Refreshing tasks…'
-                  : isFetchNextPageError
-                    ? 'Retry loading more tasks'
-                    : 'Load more tasks'}
-            </Button>
+            {!paginationError && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="sm:ml-auto"
+                onClick={() => void fetchNextPage()}
+                disabled={isFetching}
+              >
+                {isFetchingNextPage
+                  ? 'Loading more tasks…'
+                  : isFetching
+                    ? 'Refreshing tasks…'
+                    : isFetchNextPageError
+                      ? 'Retry loading more tasks'
+                      : 'Load more tasks'}
+              </Button>
+            )}
           </div>
         )}
       </div>

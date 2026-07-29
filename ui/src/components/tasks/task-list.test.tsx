@@ -219,6 +219,40 @@ describe('TaskList', () => {
     expect(secondPageCalls).toBe(2)
   })
 
+  it('keeps loaded rows visible and surfaces invalid pagination as incomplete', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.get('/api/v1/tasks', ({ request }) => {
+        const cursor = new URL(request.url).searchParams.get('continue')
+        if (!cursor) {
+          return HttpResponse.json({
+            items: [makeTask('task-1')],
+            metadata: { continue: 'same-cursor' },
+          })
+        }
+        return HttpResponse.json({
+          items: [makeTask('task-2')],
+          metadata: { continue: 'same-cursor' },
+        })
+      }),
+    )
+
+    render(<TaskList />)
+
+    expect(await screen.findByText('task-1')).toBeInTheDocument()
+    await user.click(
+      screen.getByRole('button', { name: /load more tasks/i }),
+    )
+
+    expect(await screen.findByText('task-2')).toBeInTheDocument()
+    expect(
+      screen.getByRole('alert', { name: /task inventory is incomplete/i }),
+    ).toHaveTextContent(/continuation did not advance/i)
+    expect(
+      screen.queryByRole('button', { name: /load more tasks/i }),
+    ).not.toBeInTheDocument()
+  })
+
   it('disables load more while the loaded pages refresh in the background', async () => {
     const user = userEvent.setup()
     const queryClient = new QueryClient({

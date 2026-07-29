@@ -51,7 +51,7 @@ describe('useTaskList', () => {
     expect(result.current.data).toEqual({ items: [], metadata: {} })
   })
 
-  it('stops when a continuation cursor does not advance', async () => {
+  it('surfaces an error when a continuation cursor does not advance', async () => {
     const seen: (string | null)[] = []
     server.use(
       http.get('/api/v1/tasks', ({ request }) => {
@@ -90,6 +90,9 @@ describe('useTaskList', () => {
       ]),
     )
     expect(result.current.hasNextPage).toBe(false)
+    expect(result.current.paginationError?.message).toBe(
+      'Task list pagination continuation did not advance',
+    )
 
     await act(async () => {
       await result.current.fetchNextPage()
@@ -97,7 +100,7 @@ describe('useTaskList', () => {
     expect(seen).toEqual([null, 'same-cursor'])
   })
 
-  it('stops before following a continuation cursor cycle', async () => {
+  it('surfaces an error before following a continuation cursor cycle', async () => {
     const seen: (string | null)[] = []
     server.use(
       http.get('/api/v1/tasks', ({ request }) => {
@@ -140,6 +143,9 @@ describe('useTaskList', () => {
     })
     await waitFor(() => expect(result.current.data?.items).toHaveLength(3))
     expect(result.current.hasNextPage).toBe(false)
+    expect(result.current.paginationError?.message).toBe(
+      'Task list pagination continuation cycle detected',
+    )
 
     await act(async () => {
       await result.current.fetchNextPage()
@@ -327,8 +333,8 @@ describe('useTaskListAll', () => {
     })
 
     await waitFor(() => expect(result.current.isError).toBe(true))
-    expect(result.current.error).toEqual(
-      new Error('Task list pagination continuation did not advance'),
+    expect(result.current.error?.message).toBe(
+      'Task list pagination continuation did not advance',
     )
     expect(seen).toEqual([null, 'same-cursor'])
   })
@@ -363,8 +369,8 @@ describe('useTaskListAll', () => {
     })
 
     await waitFor(() => expect(result.current.isError).toBe(true))
-    expect(result.current.error).toEqual(
-      new Error('Task list pagination continuation cycle detected'),
+    expect(result.current.error?.message).toBe(
+      'Task list pagination continuation cycle detected',
     )
     expect(seen).toEqual([null, 'cursor-a', 'cursor-b'])
   })
@@ -388,8 +394,8 @@ describe('useTaskListAll', () => {
     await waitFor(() => expect(result.current.isError).toBe(true), {
       timeout: 15_000,
     })
-    expect(result.current.error).toEqual(
-      new Error('Task list pagination page limit (1000) reached'),
+    expect(result.current.error?.message).toBe(
+      'Task list pagination page limit (1000) reached',
     )
     expect(pageCount).toBe(1000)
   })
