@@ -1072,6 +1072,20 @@ func TestContextTokenTaskCreateEffectiveAIToolsIncludesChildMessaging(t *testing
 	require.Contains(t, got, "check_messages")
 }
 
+func TestContextTokenTaskCreateEffectiveAIToolsExcludesImplicitAgentCoordination(t *testing.T) {
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
+		Tools:        []corev1alpha1.ToolReference{{Name: "agent_tool"}},
+		Coordination: &corev1alpha1.CoordinationConfig{Enabled: true, Autonomous: true},
+	}}
+	req := CreateTaskRequest{
+		Type:     corev1alpha1.TaskTypeAgent,
+		Metadata: MetadataRequest{Labels: map[string]string{labels.LabelParentTask: "parent-task"}},
+		AI:       &corev1alpha1.AISpec{Tools: []string{"brokered_tool"}},
+	}
+
+	require.Equal(t, []string{"agent_tool", "brokered_tool"}, contextTokenTaskCreateEffectiveAITools(req, agent))
+}
+
 func TestContextTokenTaskCreateEffectiveAIToolsMatchesSharedResolver(t *testing.T) {
 	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
 		Tools:        []corev1alpha1.ToolReference{{Name: "agent_tool"}},

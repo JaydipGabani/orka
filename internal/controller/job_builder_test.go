@@ -2874,6 +2874,34 @@ func TestJobBuilder_buildEnvVars_KeepsEmptyResolvedApprovalsEnvOverride(t *testi
 	}
 }
 
+func TestJobBuilder_buildEnvVars_ChildAgentDoesNotEnableAIWorkerCoordination(t *testing.T) {
+	builder := setupJobBuilder()
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testTask,
+			Namespace: defaultNS,
+			Labels:    map[string]string{labels.LabelParentTask: "parent-task"},
+		},
+		Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "Do work"},
+	}
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
+		Runtime:      &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeCodex, DefaultAllowedTools: []string{"Read"}},
+		Coordination: &corev1alpha1.CoordinationConfig{Enabled: true, Autonomous: true},
+	}}
+
+	envVars := builder.buildEnvVars(context.Background(), task, agent, nil)
+	for _, name := range []string{workerenv.AITools, workerenv.CoordinationEnabled} {
+		env, found := findEnvVar(envVars, name)
+		if !found || env.Value != "" {
+			t.Fatalf("%s = %#v, found=%t; want explicit empty AI-worker value", name, env, found)
+		}
+	}
+	allowedTools, found := findEnvVar(envVars, workerenv.AllowedTools)
+	if !found || allowedTools.Value != "Read" {
+		t.Fatalf("%s = %#v, found=%t; want explicit runtime tools", workerenv.AllowedTools, allowedTools, found)
+	}
+}
+
 func TestJobBuilder_buildEnvVars_AutonomousCoordinationIncludesRequestApprovalTool(t *testing.T) {
 	builder := setupJobBuilder()
 	task := &corev1alpha1.Task{
