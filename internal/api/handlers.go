@@ -1186,7 +1186,7 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	response, err := h.kubernetesToolListPage(
-		c, namespace, int(pagination.Limit), builtins, cursor, nil,
+		c, namespace, pagination.Limit, builtins, cursor, nil,
 	)
 	if err != nil {
 		return err
