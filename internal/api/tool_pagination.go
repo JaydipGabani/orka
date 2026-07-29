@@ -186,7 +186,7 @@ func toolListSnapshot(items []fiber.Map) (string, error) {
 func (h *Handlers) logicalToolListPage(
 	c fiber.Ctx,
 	namespace string,
-	pageSize int64,
+	pageSize int,
 	builtins []fiber.Map,
 	rawCursor string,
 ) (ListResponse, error) {
@@ -217,7 +217,7 @@ func (h *Handlers) logicalToolListPage(
 		return ListResponse{}, fiber.NewError(fiber.StatusBadRequest, "invalid tools continue cursor: cursor does not match this request")
 	}
 
-	end := min(len(items), cursor.Offset+int(pageSize))
+	end := min(len(items), cursor.Offset+pageSize)
 	pageItems := append(make([]fiber.Map, 0, end-cursor.Offset), items[cursor.Offset:end]...)
 	metadata := ListMeta{}
 	if end < len(items) {
