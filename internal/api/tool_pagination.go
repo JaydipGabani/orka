@@ -195,17 +195,17 @@ func hashToolContinuation(value string) string {
 func (h *Handlers) kubernetesToolListPage(
 	c fiber.Ctx,
 	namespace string,
-	pageSize int,
+	pageSize int64,
 	builtins []fiber.Map,
 	cursor toolListCursor,
 	items []fiber.Map,
 ) (ListResponse, error) {
-	for cursor.BuiltinOffset < len(builtins) && len(items) < pageSize {
+	for cursor.BuiltinOffset < len(builtins) && int64(len(items)) < pageSize {
 		items = append(items, builtins[cursor.BuiltinOffset])
 		cursor.BuiltinOffset++
 	}
 
-	if len(items) == pageSize {
+	if int64(len(items)) == pageSize {
 		if cursor.ResourceVersion == "" {
 			resourceVersion, available, err := h.probeCustomToolSnapshot(c.Context(), namespace)
 			if err != nil {
@@ -230,7 +230,7 @@ func (h *Handlers) kubernetesToolListPage(
 	toolList := &corev1alpha1.ToolList{}
 	opts := &client.ListOptions{
 		Namespace: namespace,
-		Limit:     int64(pageSize - len(items)),
+		Limit:     pageSize - int64(len(items)),
 		Continue:  cursor.Continue,
 	}
 	if cursor.Continue == "" && cursor.ResourceVersion != "" {
