@@ -52,6 +52,10 @@ func ParsePagination(limitStr, continueToken string) (*Pagination, error) {
 	return p, nil
 }
 
+func queryArgumentPresent(c fiber.Ctx, name string) bool {
+	return c.Request().URI().QueryArgs().Has(name)
+}
+
 func paginationListError(resource string, err error) error {
 	if apierrors.IsResourceExpired(err) {
 		return fiber.NewError(fiber.StatusGone, fmt.Sprintf("%s continue cursor expired; restart the list", resource))

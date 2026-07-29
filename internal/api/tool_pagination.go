@@ -126,6 +126,23 @@ func (h *Handlers) filteredToolListAll(
 	return ListResponse{Items: items, Metadata: ListMeta{}}, nil
 }
 
+func (h *Handlers) unpaginatedToolListAll(
+	c fiber.Ctx,
+	namespace string,
+	builtins []fiber.Map,
+) (ListResponse, error) {
+	toolList := &corev1alpha1.ToolList{}
+	if err := h.apiReader.List(c.Context(), toolList, &client.ListOptions{Namespace: namespace}); err != nil {
+		return ListResponse{}, paginationListError("tools", err)
+	}
+	customItems, _, err := customToolListItems(c, h.contextTokenAuthorization, toolList.Items)
+	if err != nil {
+		return ListResponse{}, err
+	}
+	items := append(append([]fiber.Map(nil), builtins...), customItems...)
+	return ListResponse{Items: items, Metadata: ListMeta{}}, nil
+}
+
 func decodeToolListCursor(raw, namespace string, builtinCount int) (toolListCursor, error) {
 	cursor := toolListCursor{Version: toolListCursorVersion, Namespace: namespace}
 	if raw == "" {
