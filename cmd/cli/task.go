@@ -202,12 +202,13 @@ func newTaskListCmd() *cobra.Command {
 		Short:   "List tasks",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c := newClientFromCmd(cmd)
+			ctx := cmd.Context()
 			var tasks []client.TaskSummary
 			if status != "" || transactionID != "" {
 				var truncated bool
 				var err error
 				tasks, truncated, err = listFilteredTasks(
-					context.Background(),
+					ctx,
 					c,
 					c.Namespace,
 					limit,
@@ -229,7 +230,7 @@ func newTaskListCmd() *cobra.Command {
 				}
 			} else {
 				var err error
-				tasks, err = c.ListTasks(context.Background(), client.ListTasksOptions{
+				tasks, err = c.ListTasks(ctx, client.ListTasksOptions{
 					Namespace: c.Namespace,
 					Limit:     limit,
 					Continue:  continueToken,
