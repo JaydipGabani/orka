@@ -24,7 +24,7 @@ interface TaskListPaginationState {
 class TaskListPaginationError extends Error {}
 
 function fetchTaskListPage(namespace: string, limit: string, cursor?: string) {
-  const params: Record<string, string> = { namespace, limit }
+  const params: Record<string, string> = { namespace, limit, paginate: 'true' }
   if (cursor) params.continue = cursor
   return api.get<ListResponse<Task>>('/tasks', params)
 }
