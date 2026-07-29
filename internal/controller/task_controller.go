@@ -472,96 +472,117 @@ func executionEventTypeForTaskPhase(phase corev1alpha1.TaskPhase) string {
 func (r *TaskReconciler) handleDeletion(ctx context.Context, task *corev1alpha1.Task) (ctrl.Result, error) { //nolint:unparam // Result is always nil but kept for interface consistency
 	log := logf.FromContext(ctx)
 
-	if controllerutil.ContainsFinalizer(task, labels.TaskFinalizer) {
-		// Clean up result data from store
-		if r.ResultStore != nil {
-			if err := r.ResultStore.DeleteResult(ctx, task.Namespace, task.Name); err != nil {
-				log.Error(err, "failed to delete result from store", "task", task.Name)
-				// Continue with finalizer removal anyway
-			}
-		}
-
-		// Clean up artifacts
-		if r.ArtifactStore != nil {
-			if err := r.ArtifactStore.DeleteArtifacts(ctx, task.Namespace, task.Name); err != nil {
-				log.Error(err, "failed to delete artifacts", "task", task.Name)
-			}
-		}
-
-		// Clean up plan state if any
-		if r.PlanStore != nil {
-			if err := r.PlanStore.DeletePlan(ctx, task.Namespace, task.Name); err != nil {
-				log.Error(err, "failed to delete plan state", "task", task.Name)
-				// Continue with finalizer removal anyway
-			}
-		}
-
-		// Clean up inter-agent messages
-		if r.MessageStore != nil {
-			if err := r.MessageStore.DeleteTaskMessages(ctx, task.Namespace, task.Name); err != nil {
-				log.Error(err, "failed to delete task messages", "task", task.Name)
-			}
-			// If this is a coordinator, clean up all children's messages
-			if err := r.MessageStore.DeleteParentMessages(ctx, task.Namespace, task.Name); err != nil {
-				log.Error(err, "failed to delete parent messages", "task", task.Name)
-			}
-		}
-
-		// Clean up execution timeline events before allowing a future task with the
-		// same namespace/name to expose stale history.
-		if r.ExecutionEventStore != nil {
-			if err := r.ExecutionEventStore.DeleteExecutionEvents(ctx, task.Namespace, store.ExecutionEventStreamTypeTask, task.Name); err != nil {
-				log.Error(err, "failed to delete execution events", "task", task.Name)
-				return ctrl.Result{}, err
-			}
-		}
-
-		if cancelErr := r.cancelHarnessWrapperTurn(ctx, task, "task deleted"); cancelErr != nil {
-			if isAgentRuntimeDependencyNotReady(cancelErr) {
-				if shouldWait, waitErr := r.waitForHarnessCancelDependency(ctx, task); waitErr != nil {
-					return ctrl.Result{}, waitErr
-				} else if shouldWait {
-					log.Info("waiting to cancel deleted harness runtime turn", "error", cancelErr)
-					return ctrl.Result{RequeueAfter: time.Second}, nil
-				}
-			}
-			log.Error(cancelErr, "failed to cancel deleted harness runtime turn")
-		}
-
-		waitingForJob, err := r.cleanupDeletedTaskJob(ctx, task)
-		if err != nil {
-			log.Error(err, "failed to delete Job")
+	if !controllerutil.ContainsFinalizer(task, labels.TaskFinalizer) {
+		if err := r.cleanupTrustedServiceReadBindingsAfterTaskRemoval(ctx, task.Namespace); err != nil {
+			log.Error(err, "failed to clean up trusted Service RBAC after Task removal")
 			return ctrl.Result{}, err
 		}
-		if waitingForJob {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-		releasedPoolLeases, err := r.releaseSubstratePoolActorLeasesAfterTerminalCleanup(ctx, task)
-		if err != nil {
-			log.Error(err, "failed to release substrate pool actor leases")
-			return ctrl.Result{}, err
-		}
-		if !releasedPoolLeases {
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-		}
+		return ctrl.Result{}, nil
+	}
 
-		// Release session lock if held
-		if task.Spec.SessionRef != nil {
-			if err := r.SessionManager.ReleaseLock(ctx, task); err != nil {
-				log.Error(err, "failed to release session lock")
-				// Continue with finalizer removal anyway
-			}
+	var cleanupErrs []error
+	appendCleanupErr := func(operation string, err error) {
+		if err == nil {
+			return
 		}
+		log.Error(err, operation, "task", task.Name)
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("%s: %w", operation, err))
+	}
 
-		// Remove finalizer
-		controllerutil.RemoveFinalizer(task, labels.TaskFinalizer)
-		if err := r.Update(ctx, task); err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "failed to remove finalizer")
-			return ctrl.Result{}, err
+	// Durable stores are retried until every cleanup succeeds. Their failures do
+	// not prevent the controller from first revoking execution authority below.
+	if r.ResultStore != nil {
+		appendCleanupErr("deleting result from store", r.ResultStore.DeleteResult(ctx, task.Namespace, task.Name))
+	}
+	if r.ArtifactStore != nil {
+		appendCleanupErr("deleting artifacts", r.ArtifactStore.DeleteArtifacts(ctx, task.Namespace, task.Name))
+	}
+	if r.PlanStore != nil {
+		appendCleanupErr("deleting plan state", r.PlanStore.DeletePlan(ctx, task.Namespace, task.Name))
+	}
+	if r.MessageStore != nil {
+		appendCleanupErr("deleting task messages", r.MessageStore.DeleteTaskMessages(ctx, task.Namespace, task.Name))
+		appendCleanupErr("deleting parent messages", r.MessageStore.DeleteParentMessages(ctx, task.Namespace, task.Name))
+	}
+	if r.ExecutionEventStore != nil {
+		appendCleanupErr(
+			"deleting execution events",
+			r.ExecutionEventStore.DeleteExecutionEvents(ctx, task.Namespace, store.ExecutionEventStreamTypeTask, task.Name),
+		)
+	}
+
+	var requeueAfter time.Duration
+	setRequeueAfter := func(delay time.Duration) {
+		if requeueAfter == 0 || delay < requeueAfter {
+			requeueAfter = delay
 		}
 	}
-	if err := r.cleanupTrustedServiceReadBindingsAfterTaskRemoval(ctx, task.Namespace); err != nil {
-		log.Error(err, "failed to clean up trusted Service RBAC after Task removal")
+	quiescenceBlocked := false
+	runtimeCancellationPending := false
+
+	if cancelErr := r.cancelHarnessWrapperTurn(ctx, task, "task deleted"); cancelErr != nil {
+		if isAgentRuntimeDependencyNotReady(cancelErr) {
+			shouldWait, waitErr := r.waitForHarnessCancelDependency(ctx, task)
+			if waitErr != nil {
+				appendCleanupErr("recording deleted harness runtime cancellation retry", waitErr)
+				quiescenceBlocked = true
+				runtimeCancellationPending = true
+			} else if shouldWait {
+				log.Info("waiting to cancel deleted harness runtime turn", "error", cancelErr)
+				quiescenceBlocked = true
+				runtimeCancellationPending = true
+				setRequeueAfter(time.Second)
+			} else {
+				log.Error(cancelErr, "failed to cancel deleted harness runtime turn after dependency retries")
+			}
+		} else {
+			// Preserve the existing bounded best-effort cancellation policy for the
+			// v1 harness while still deleting the Job and workspace authority.
+			log.Error(cancelErr, "failed to cancel deleted harness runtime turn")
+		}
+	}
+
+	waitingForJob, jobCleanupErr := r.cleanupDeletedTaskJob(ctx, task)
+	if jobCleanupErr != nil {
+		appendCleanupErr("deleting Task Job", jobCleanupErr)
+		quiescenceBlocked = true
+	} else if waitingForJob {
+		quiescenceBlocked = true
+		setRequeueAfter(2 * time.Second)
+	} else if !runtimeCancellationPending {
+		releasedPoolLeases, leaseCleanupErr := r.releaseSubstratePoolActorLeasesAfterTerminalCleanup(ctx, task)
+		if leaseCleanupErr != nil {
+			appendCleanupErr("releasing substrate pool actor leases", leaseCleanupErr)
+			quiescenceBlocked = true
+		} else if !releasedPoolLeases {
+			quiescenceBlocked = true
+			setRequeueAfter(30 * time.Second)
+		}
+	}
+
+	// Do not release session ownership while a runtime, Job, or pooled workspace
+	// may still be active. Once quiesced, lock release is durable cleanup too.
+	if !quiescenceBlocked && task.Spec.SessionRef != nil {
+		appendCleanupErr("releasing session lock", r.SessionManager.ReleaseLock(ctx, task))
+	}
+
+	// Cross-namespace read grants are execution authority. Revoke them before
+	// allowing finalizer removal, and retry any failure while the Task remains.
+	appendCleanupErr(
+		"cleaning up trusted Service RBAC after Task removal",
+		r.cleanupTrustedServiceReadBindingsAfterTaskRemoval(ctx, task.Namespace),
+	)
+
+	if err := errors.Join(cleanupErrs...); err != nil {
+		return ctrl.Result{}, err
+	}
+	if quiescenceBlocked {
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	controllerutil.RemoveFinalizer(task, labels.TaskFinalizer)
+	if err := r.Update(ctx, task); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "failed to remove finalizer")
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
@@ -3204,13 +3225,18 @@ func (r *TaskReconciler) handleScheduled(ctx context.Context, task *corev1alpha1
 	if now.Sub(scheduledTime) > time.Duration(deadlineSeconds)*time.Second {
 		log.Info("Missed schedule beyond deadline, skipping", "scheduledTime", scheduledTime, "deadline", deadlineSeconds)
 		r.Recorder.Eventf(task, "Warning", "MissedSchedule", "Missed scheduled run at %s (deadline %ds exceeded)", scheduledTime.Format(time.RFC3339), deadlineSeconds)
-		// Advance to next schedule time
+		// Consume the missed occurrence so a later reconcile cannot select it again.
 		next := sched.Next(now)
+		lastSchedule := metav1.NewTime(scheduledTime)
 		nextSchedule := metav1.NewTime(next)
+		lastScheduleCopy := lastSchedule
 		nextScheduleCopy := nextSchedule
-		_ = r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
+		if err := r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
+			t.Status.LastScheduleTime = &lastScheduleCopy
 			t.Status.NextScheduleTime = &nextScheduleCopy
-		})
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{RequeueAfter: time.Until(next)}, nil
 	}
 
@@ -3225,12 +3251,18 @@ func (r *TaskReconciler) handleScheduled(ctx context.Context, task *corev1alpha1
 		for i := range childList.Items {
 			if taskPhaseCountsTowardConcurrency(childList.Items[i].Status.Phase) {
 				log.Info("Concurrency policy Forbid: active child task exists, skipping", "activeChild", childList.Items[i].Name)
+				// Consume this occurrence while the earlier child remains active.
 				next := sched.Next(now)
+				lastSchedule := metav1.NewTime(scheduledTime)
 				nextSchedule := metav1.NewTime(next)
+				lastScheduleCopy := lastSchedule
 				nextScheduleCopy := nextSchedule
-				_ = r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
+				if err := r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
+					t.Status.LastScheduleTime = &lastScheduleCopy
 					t.Status.NextScheduleTime = &nextScheduleCopy
-				})
+				}); err != nil {
+					return ctrl.Result{}, err
+				}
 				return ctrl.Result{RequeueAfter: time.Until(next)}, nil
 			}
 		}

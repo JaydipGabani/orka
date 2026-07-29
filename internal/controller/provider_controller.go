@@ -10,10 +10,13 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -112,34 +115,48 @@ func (e *ValidationError) Error() string {
 // updateStatus updates the provider status
 func (r *ProviderReconciler) updateStatus(ctx context.Context, provider *corev1alpha1.Provider, ready bool, message string) (ctrl.Result, error) {
 	now := metav1.Now()
+	observedGeneration := provider.Generation
 
-	provider.Status.Ready = ready
-	provider.Status.Message = message
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		current := &corev1alpha1.Provider{}
+		if err := r.Get(ctx, types.NamespacedName{Name: provider.Name, Namespace: provider.Namespace}, current); err != nil {
+			return err
+		}
 
-	if ready {
-		provider.Status.LastValidated = &now
-	}
+		desired := current.Status.DeepCopy()
+		desired.Ready = ready
+		desired.Message = message
+		condition := metav1.Condition{
+			Type:               "Ready",
+			LastTransitionTime: now,
+			ObservedGeneration: observedGeneration,
+		}
+		if ready {
+			condition.Status = metav1.ConditionTrue
+			condition.Reason = reasonValidationSucceeded
+			condition.Message = message
+		} else {
+			condition.Status = metav1.ConditionFalse
+			condition.Reason = reasonValidationFailed
+			condition.Message = message
+		}
+		meta.SetStatusCondition(&desired.Conditions, condition)
 
-	// Update condition
-	condition := metav1.Condition{
-		Type:               "Ready",
-		LastTransitionTime: now,
-		ObservedGeneration: provider.Generation,
-	}
-
-	if ready {
-		condition.Status = metav1.ConditionTrue
-		condition.Reason = reasonValidationSucceeded
-		condition.Message = message
-	} else {
-		condition.Status = metav1.ConditionFalse
-		condition.Reason = reasonValidationFailed
-		condition.Message = message
-	}
-
-	meta.SetStatusCondition(&provider.Status.Conditions, condition)
-
-	if err := r.Status().Update(ctx, provider); err != nil {
+		semanticChange := !apiequality.Semantic.DeepEqual(current.Status, *desired)
+		if !semanticChange && (!ready || current.Status.LastValidated != nil) {
+			provider.Status = *current.Status.DeepCopy()
+			return nil
+		}
+		if ready {
+			desired.LastValidated = &now
+		}
+		current.Status = *desired
+		if err := r.Status().Update(ctx, current); err != nil {
+			return err
+		}
+		provider.Status = *current.Status.DeepCopy()
+		return nil
+	}); err != nil {
 		return ctrl.Result{}, err
 	}
 

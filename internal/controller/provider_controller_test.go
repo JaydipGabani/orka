@@ -307,6 +307,78 @@ func TestProviderReconcile_NotFound(t *testing.T) {
 	}
 }
 
+func TestProviderReconcileSkipsUnchangedStatusUpdate(t *testing.T) {
+	scheme := newProviderScheme()
+	provider := &corev1alpha1.Provider{
+		ObjectMeta: metav1.ObjectMeta{Name: "stable-provider", Namespace: "default"},
+		Spec: corev1alpha1.ProviderSpec{
+			Type:      corev1alpha1.ProviderTypeOpenAI,
+			SecretRef: corev1alpha1.ProviderSecretRef{Name: "stable-provider-secret"},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: provider.Spec.SecretRef.Name, Namespace: provider.Namespace},
+		Data:       map[string][]byte{"api-key": []byte("test")},
+	}
+	countingClient := &statusUpdateCountingClient{
+		Client: fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&corev1alpha1.Provider{}).
+			WithObjects(provider, secret).
+			Build(),
+	}
+	reconciler := &ProviderReconciler{Client: countingClient, Scheme: scheme}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: provider.Name, Namespace: provider.Namespace}}
+
+	if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if countingClient.statusUpdateCount != 1 {
+		t.Fatalf("status updates after first reconcile = %d, want 1", countingClient.statusUpdateCount)
+	}
+	first := &corev1alpha1.Provider{}
+	if err := countingClient.Get(context.Background(), req.NamespacedName, first); err != nil {
+		t.Fatalf("Get Provider after first reconcile: %v", err)
+	}
+	if first.Status.LastValidated == nil {
+		t.Fatal("LastValidated = nil after successful validation")
+	}
+
+	if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if countingClient.statusUpdateCount != 1 {
+		t.Fatalf("status updates after second reconcile = %d, want no additional update", countingClient.statusUpdateCount)
+	}
+	second := &corev1alpha1.Provider{}
+	if err := countingClient.Get(context.Background(), req.NamespacedName, second); err != nil {
+		t.Fatalf("Get Provider after second reconcile: %v", err)
+	}
+	if second.Status.LastValidated == nil || !second.Status.LastValidated.Equal(first.Status.LastValidated) {
+		t.Fatalf("LastValidated changed across no-op reconcile: first=%v second=%v", first.Status.LastValidated, second.Status.LastValidated)
+	}
+}
+
+func TestProviderUpdateStatusRetriesConflict(t *testing.T) {
+	scheme := newProviderScheme()
+	provider := &corev1alpha1.Provider{ObjectMeta: metav1.ObjectMeta{Name: "conflict-provider", Namespace: "default"}}
+	countingClient := &statusUpdateCountingClient{
+		Client:             fake.NewClientBuilder().WithScheme(scheme).WithObjects(provider).WithStatusSubresource(provider).Build(),
+		conflictsRemaining: 1,
+	}
+	reconciler := &ProviderReconciler{Client: countingClient, Scheme: scheme}
+
+	if _, err := reconciler.updateStatus(context.Background(), provider, true, "valid"); err != nil {
+		t.Fatalf("updateStatus() error = %v", err)
+	}
+	if countingClient.statusUpdateCount != 2 {
+		t.Fatalf("status update attempts = %d, want 2", countingClient.statusUpdateCount)
+	}
+	if !provider.Status.Ready || provider.Status.LastValidated == nil {
+		t.Fatalf("Provider status = %#v, want ready with LastValidated", provider.Status)
+	}
+}
+
 // ---------- updateStatus ----------
 
 func TestProviderUpdateStatus(t *testing.T) {
