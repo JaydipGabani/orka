@@ -22,6 +22,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -52,30 +54,31 @@ func clearDeprecatedHarnessRuntimeAnnotations(annotations map[string]string) {
 }
 
 const (
-	harnessWrapperEndpointEnv                 = "ORKA_HARNESS_WRAPPER_ENDPOINT"
-	harnessWrapperAuthValueEnv                = "ORKA_HARNESS_WRAPPER_BEARER_TOKEN"
-	harnessWrapperAuthValueFileEnv            = "ORKA_HARNESS_WRAPPER_BEARER_TOKEN_FILE"
-	harnessWrapperTurnIDAnnotation            = "orka.ai/harness-wrapper-turn-id"
-	harnessWrapperRuntimeAnnotation           = "orka.ai/harness-wrapper-runtime-session-id"
-	harnessWrapperCorrelationIDAnno           = "orka.ai/harness-wrapper-correlation-id"
-	harnessWrapperLastFrameSeqAnno            = "orka.ai/harness-wrapper-last-frame-seq"
-	harnessWrapperStartedAnno                 = "orka.ai/harness-wrapper-started"
-	harnessWrapperPlannedAtAnno               = "orka.ai/harness-wrapper-planned-at"
-	harnessWrapperMetadataAnno                = "orka.ai/harness-wrapper-metadata"
-	harnessWrapperRuntimeRefAnno              = "orka.ai/harness-wrapper-runtime-ref"
-	harnessWrapperContractAnno                = "orka.ai/harness-wrapper-contract-version"
-	harnessWrapperOutputFetchRetriesAnno      = "orka.ai/harness-wrapper-output-fetch-retries"
-	harnessWrapperCancelDependencyRetriesAnno = "orka.ai/harness-wrapper-cancel-dependency-retries"
-	harnessWrapperCancelAcknowledgedAnno      = "orka.ai/harness-wrapper-cancel-acknowledged"
-	harnessWrapperAuthRetriesAnno             = "orka.ai/harness-wrapper-auth-retries"
-	harnessWrapperBrokeredContinuationAnno    = "orka.ai/harness-wrapper-brokered-continuation-pending"
-	harnessWrapperMaxOutputFetchRetries       = 3
-	harnessWrapperMaxCancelDependencyRetries  = 3
-	harnessWrapperMaxAuthRetries              = 3
-	harnessWrapperSkillsFilesMeta             = "skillsFiles"
-	harnessWrapperStreamPollTimeout           = 2 * time.Second
-	harnessWrapperNoTimeoutDuration           = time.Hour * 24 * 365 * 100
-	harnessWrapperRuntimeGeneric              = "generic"
+	harnessWrapperEndpointEnv                  = "ORKA_HARNESS_WRAPPER_ENDPOINT"
+	harnessWrapperAuthValueEnv                 = "ORKA_HARNESS_WRAPPER_BEARER_TOKEN"
+	harnessWrapperAuthValueFileEnv             = "ORKA_HARNESS_WRAPPER_BEARER_TOKEN_FILE"
+	harnessWrapperTurnIDAnnotation             = "orka.ai/harness-wrapper-turn-id"
+	harnessWrapperRuntimeAnnotation            = "orka.ai/harness-wrapper-runtime-session-id"
+	harnessWrapperCorrelationIDAnno            = "orka.ai/harness-wrapper-correlation-id"
+	harnessWrapperLastFrameSeqAnno             = "orka.ai/harness-wrapper-last-frame-seq"
+	harnessWrapperStartedAnno                  = "orka.ai/harness-wrapper-started"
+	harnessWrapperPlannedAtAnno                = "orka.ai/harness-wrapper-planned-at"
+	harnessWrapperMetadataAnno                 = "orka.ai/harness-wrapper-metadata"
+	harnessWrapperRuntimeRefAnno               = "orka.ai/harness-wrapper-runtime-ref"
+	harnessWrapperContractAnno                 = "orka.ai/harness-wrapper-contract-version"
+	harnessWrapperOutputFetchRetriesAnno       = "orka.ai/harness-wrapper-output-fetch-retries"
+	harnessWrapperCancelDependencyRetriesAnno  = "orka.ai/harness-wrapper-cancel-dependency-retries"
+	harnessWrapperLegacyCancelAcknowledgedAnno = "orka.ai/harness-wrapper-cancel-acknowledged"
+	harnessWrapperAuthRetriesAnno              = "orka.ai/harness-wrapper-auth-retries"
+	harnessWrapperBrokeredContinuationAnno     = "orka.ai/harness-wrapper-brokered-continuation-pending"
+	harnessWrapperMaxOutputFetchRetries        = 3
+	harnessWrapperMaxCancelDependencyRetries   = 3
+	harnessWrapperMaxAuthRetries               = 3
+	harnessWrapperSkillsFilesMeta              = "skillsFiles"
+	harnessWrapperStreamPollTimeout            = 2 * time.Second
+	harnessWrapperNoTimeoutDuration            = time.Hour * 24 * 365 * 100
+	harnessWrapperRuntimeGeneric               = "generic"
+	harnessWrapperCancelAcknowledgedCondition  = "HarnessCancellationAcknowledged"
 )
 
 func taskHasHarnessWrapperTurn(task *corev1alpha1.Task) bool {
@@ -969,7 +972,16 @@ func harnessWrapperCancelAcknowledged(task *corev1alpha1.Task) bool {
 	if !taskHasPlannedHarnessWrapperTurn(task) {
 		return false
 	}
-	return strings.TrimSpace(task.Annotations[harnessWrapperCancelAcknowledgedAnno]) ==
+	condition := meta.FindStatusCondition(task.Status.Conditions, harnessWrapperCancelAcknowledgedCondition)
+	return condition != nil && condition.Status == metav1.ConditionTrue &&
+		condition.Message == strings.TrimSpace(task.Annotations[harnessWrapperTurnIDAnnotation])
+}
+
+func harnessWrapperLegacyCancelAcknowledged(task *corev1alpha1.Task) bool {
+	if !taskHasPlannedHarnessWrapperTurn(task) || task.Annotations == nil {
+		return false
+	}
+	return strings.TrimSpace(task.Annotations[harnessWrapperLegacyCancelAcknowledgedAnno]) ==
 		strings.TrimSpace(task.Annotations[harnessWrapperTurnIDAnnotation])
 }
 
@@ -977,13 +989,32 @@ func (r *TaskReconciler) patchHarnessWrapperCancelAcknowledged(ctx context.Conte
 	if harnessWrapperCancelAcknowledged(task) {
 		return nil
 	}
-	patch := ctrlclient.MergeFrom(task.DeepCopy())
-	if task.Annotations == nil {
-		task.Annotations = map[string]string{}
+	expectedTurnID := strings.TrimSpace(task.Annotations[harnessWrapperTurnIDAnnotation])
+	key := types.NamespacedName{Name: task.Name, Namespace: task.Namespace}
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		current := &corev1alpha1.Task{}
+		if err := r.Get(ctx, key, current); err != nil {
+			return err
+		}
+		turnID := strings.TrimSpace(current.Annotations[harnessWrapperTurnIDAnnotation])
+		if turnID == "" || turnID != expectedTurnID {
+			return fmt.Errorf("harness turn identity changed while recording cancellation acknowledgement")
+		}
+		meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
+			Type: harnessWrapperCancelAcknowledgedCondition, Status: metav1.ConditionTrue,
+			Reason: "CancelTurnAcknowledged", Message: turnID, ObservedGeneration: current.Generation,
+		})
+		if err := r.Status().Update(ctx, current); err != nil {
+			return err
+		}
+		task.Status = *current.Status.DeepCopy()
+		return nil
+	}); err != nil {
+		return err
 	}
-	task.Annotations[harnessWrapperCancelAcknowledgedAnno] =
-		strings.TrimSpace(task.Annotations[harnessWrapperTurnIDAnnotation])
+	patch := ctrlclient.MergeFrom(task.DeepCopy())
 	delete(task.Annotations, harnessWrapperCancelDependencyRetriesAnno)
+	delete(task.Annotations, harnessWrapperLegacyCancelAcknowledgedAnno)
 	return r.Patch(ctx, task, patch)
 }
 
@@ -1062,7 +1093,7 @@ func (r *TaskReconciler) patchHarnessWrapperPlannedTurn(
 	task.Annotations[harnessWrapperStartedAnno] = "false"
 	task.Annotations[harnessWrapperPlannedAtAnno] = time.Now().UTC().Format(time.RFC3339Nano)
 	delete(task.Annotations, harnessWrapperBrokeredContinuationAnno)
-	delete(task.Annotations, harnessWrapperCancelAcknowledgedAnno)
+	delete(task.Annotations, harnessWrapperLegacyCancelAcknowledgedAnno)
 	if runtimeRefName := strings.TrimSpace(request.Metadata["runtimeRef"]); runtimeRefName != "" {
 		task.Annotations[harnessWrapperRuntimeRefAnno] = runtimeRefName
 	} else {
@@ -1087,7 +1118,12 @@ func (r *TaskReconciler) patchHarnessWrapperPlannedTurn(
 		return err
 	}
 	task.Annotations[harnessWrapperMetadataAnno] = string(metadata)
-	return r.Patch(ctx, task, patch)
+	if err := r.Patch(ctx, task, patch); err != nil {
+		return err
+	}
+	return r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
+		meta.RemoveStatusCondition(&t.Status.Conditions, harnessWrapperCancelAcknowledgedCondition)
+	})
 }
 
 func (r *TaskReconciler) patchHarnessWrapperStarted(ctx context.Context, task *corev1alpha1.Task) error {
@@ -1521,7 +1557,7 @@ func (r *TaskReconciler) clearHarnessWrapperTurnState(ctx context.Context, task 
 		clearDeprecatedHarnessRuntimeAnnotations(task.Annotations)
 		delete(task.Annotations, harnessWrapperOutputFetchRetriesAnno)
 		delete(task.Annotations, harnessWrapperCancelDependencyRetriesAnno)
-		delete(task.Annotations, harnessWrapperCancelAcknowledgedAnno)
+		delete(task.Annotations, harnessWrapperLegacyCancelAcknowledgedAnno)
 		delete(task.Annotations, harnessWrapperAuthRetriesAnno)
 		delete(task.Annotations, harnessWrapperBrokeredContinuationAnno)
 	}
@@ -1530,6 +1566,7 @@ func (r *TaskReconciler) clearHarnessWrapperTurnState(ctx context.Context, task 
 	}
 	return r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
 		t.Status.HarnessRuntime = nil
+		meta.RemoveStatusCondition(&t.Status.Conditions, harnessWrapperCancelAcknowledgedCondition)
 	})
 }
 
@@ -1587,7 +1624,7 @@ func (r *TaskReconciler) cancelHarnessWrapperTurn(ctx context.Context, task *cor
 		return nil
 	}
 	if !harnessWrapperTurnAnnotationsMatchTaskAttempt(task, harnessWrapperCurrentAttempt(task)) {
-		return nil
+		return fmt.Errorf("planned harness turn identity does not match persisted task attempt")
 	}
 	target, err := r.resolveHarnessRuntimeTarget(ctx, task, nil)
 	if err != nil {

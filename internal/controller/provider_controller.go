@@ -8,11 +8,12 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,6 +32,8 @@ const (
 	providerDependencyValidationRequeueAfter = 5 * time.Minute
 )
 
+var errProviderGenerationChanged = errors.New("provider generation changed during validation")
+
 // ProviderReconciler reconciles a Provider object
 type ProviderReconciler struct {
 	client.Client
@@ -48,7 +51,7 @@ func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Fetch the Provider
 	provider := &corev1alpha1.Provider{}
 	if err := r.Get(ctx, req.NamespacedName, provider); err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -76,7 +79,7 @@ func (r *ProviderReconciler) validateProvider(ctx context.Context, provider *cor
 	}
 
 	if err := r.Get(ctx, secretKey, secret); err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			return &ValidationError{Message: "referenced secret not found: " + provider.Spec.SecretRef.Name}
 		}
 		return err
@@ -124,6 +127,9 @@ func (r *ProviderReconciler) updateStatus(ctx context.Context, provider *corev1a
 		if err := r.Get(ctx, types.NamespacedName{Name: provider.Name, Namespace: provider.Namespace}, current); err != nil {
 			return err
 		}
+		if current.Generation != observedGeneration {
+			return errProviderGenerationChanged
+		}
 
 		desired := current.Status.DeepCopy()
 		desired.Ready = ready
@@ -144,13 +150,15 @@ func (r *ProviderReconciler) updateStatus(ctx context.Context, provider *corev1a
 		}
 		meta.SetStatusCondition(&desired.Conditions, condition)
 
+		refreshLastValidated := ready && (current.Status.LastValidated == nil ||
+			now.Sub(current.Status.LastValidated.Time) >= providerDependencyValidationRequeueAfter/2)
+		if refreshLastValidated {
+			desired.LastValidated = &now
+		}
 		semanticChange := !apiequality.Semantic.DeepEqual(current.Status, *desired)
-		if !semanticChange && (!ready || current.Status.LastValidated != nil) {
+		if !semanticChange {
 			provider.Status = *current.Status.DeepCopy()
 			return nil
-		}
-		if ready {
-			desired.LastValidated = &now
 		}
 		current.Status = *desired
 		if err := r.Status().Update(ctx, current); err != nil {
@@ -159,6 +167,9 @@ func (r *ProviderReconciler) updateStatus(ctx context.Context, provider *corev1a
 		provider.Status = *current.Status.DeepCopy()
 		return nil
 	}); err != nil {
+		if errors.Is(err, errProviderGenerationChanged) {
+			return ctrl.Result{Requeue: true}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
