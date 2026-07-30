@@ -13,7 +13,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -24,6 +26,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	gatewayruntime "github.com/orka-agents/orka/internal/gateway"
@@ -848,13 +851,18 @@ func (h *Handlers) GetTaskLogs(c fiber.Ctx) error {
 
 		streamNamespace := strings.Clone(namespace)
 		streamPodName := strings.Clone(podName)
+		streamLog := logf.FromContext(streamCtx)
 		streamErr := c.SendStreamWriter(func(w *bufio.Writer) {
 			defer func() {
 				streamCancel()
 				_ = stream.Close()
 			}()
 			if err := streamTaskLogsSSE(streamCtx, w, stream, heartbeatEvery); err != nil {
-				log.Error(err, "failed to relay task log stream", "namespace", streamNamespace, "pod", streamPodName)
+				if taskLogClientDisconnected(err) {
+					streamLog.V(1).Info("task log client disconnected", "namespace", streamNamespace, "pod", streamPodName)
+				} else {
+					streamLog.Error(err, "failed to relay task log stream", "namespace", streamNamespace, "pod", streamPodName)
+				}
 			}
 		})
 		if streamErr != nil {
@@ -892,6 +900,25 @@ type taskLogScanResult struct {
 	err  error
 }
 
+type taskLogDownstreamError struct{ err error }
+
+func (e taskLogDownstreamError) Error() string { return e.err.Error() }
+func (e taskLogDownstreamError) Unwrap() error { return e.err }
+
+func taskLogClientDisconnected(err error) bool {
+	var downstream taskLogDownstreamError
+	if !errors.As(err, &downstream) {
+		return false
+	}
+	err = downstream.err
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "broken pipe") || strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "closed connection") || strings.Contains(message, "connection closed")
+}
+
 func streamTaskLogsSSE(
 	ctx context.Context,
 	w *bufio.Writer,
@@ -918,14 +945,14 @@ func streamTaskLogsSSE(
 				return result.err
 			}
 			if err := writeTaskLogLineSSE(w, result.line); err != nil {
-				return err
+				return taskLogDownstreamError{err: err}
 			}
 		case <-heartbeat.C:
 			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
-				return fmt.Errorf("write task log heartbeat: %w", err)
+				return taskLogDownstreamError{err: fmt.Errorf("write task log heartbeat: %w", err)}
 			}
 			if err := w.Flush(); err != nil {
-				return fmt.Errorf("flush task log heartbeat: %w", err)
+				return taskLogDownstreamError{err: fmt.Errorf("flush task log heartbeat: %w", err)}
 			}
 		}
 	}
