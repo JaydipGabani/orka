@@ -229,8 +229,7 @@ func newTaskListCmd() *cobra.Command {
 					warnFilteredTaskOutputLimited(limit)
 				}
 			} else {
-				var err error
-				tasks, err = c.ListTasks(ctx, client.ListTasksOptions{
+				page, err := c.ListTasksPage(ctx, client.ListTasksOptions{
 					Namespace: c.Namespace,
 					Limit:     limit,
 					Continue:  continueToken,
@@ -238,8 +237,11 @@ func newTaskListCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
+				tasks = page.Items
+				warnListContinuation(cmd, "task", map[string]any{
+					"metadata": map[string]any{"continue": page.Continue},
+				})
 			}
-
 			format, err := outputFormat(cmd)
 			if err != nil {
 				return err
