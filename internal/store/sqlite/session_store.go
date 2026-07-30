@@ -101,12 +101,15 @@ func (s *Store) DeleteSession(ctx context.Context, namespace, name string) error
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var sessionType string
+	var sessionType, chatTurnID string
 	if err := tx.QueryRowContext(ctx,
-		`SELECT session_type FROM sessions WHERE namespace = ? AND name = ?`,
+		`SELECT session_type, chat_turn_id FROM sessions WHERE namespace = ? AND name = ?`,
 		namespace, name,
-	).Scan(&sessionType); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	).Scan(&sessionType, &chatTurnID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
+	}
+	if chatTurnID != "" {
+		return store.ErrConflict
 	}
 	var pendingGatewayEvents int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM gateway_events
