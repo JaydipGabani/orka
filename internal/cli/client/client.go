@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -62,26 +61,77 @@ func newClient(baseURL, token, namespace string, responseHeaderTimeout time.Dura
 // newHTTPClient bounds connection setup and response headers without an overall
 // client timeout, so SSE and log bodies can remain open for their full lifetime.
 func newHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
-	transport := cloneDefaultHTTPTransport()
-	transport.ResponseHeaderTimeout = responseHeaderTimeout
-	return &http.Client{Transport: transport}
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		clone := transport.Clone()
+		clone.ResponseHeaderTimeout = responseHeaderTimeout
+		return &http.Client{Transport: clone}
+	}
+	// Preserve arbitrary auth, mTLS, tracing, and proxy wrappers while bounding
+	// the wait for response headers. The derived request context remains alive
+	// until the response body closes so long-lived streams are unaffected.
+	return &http.Client{Transport: headerTimeoutRoundTripper{
+		base: http.DefaultTransport, timeout: responseHeaderTimeout,
+	}}
 }
 
-func cloneDefaultHTTPTransport() *http.Transport {
-	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
-		return transport.Clone()
-	}
+type headerTimeoutRoundTripper struct {
+	base    http.RoundTripper
+	timeout time.Duration
+}
 
-	const defaultDialTimeout = 30 * time.Second
-	return &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: defaultDialTimeout, KeepAlive: defaultDialTimeout}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: time.Second,
+type roundTripResult struct {
+	response *http.Response
+	err      error
+}
+
+func (t headerTimeoutRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.timeout <= 0 {
+		return t.base.RoundTrip(req)
 	}
+	ctx, cancel := context.WithCancel(req.Context())
+	result := make(chan roundTripResult, 1)
+	go func() {
+		response, err := t.base.RoundTrip(req.Clone(ctx))
+		result <- roundTripResult{response: response, err: err}
+	}()
+	closeAbandonedResponse := func() {
+		go func() {
+			completed := <-result
+			if completed.response != nil && completed.response.Body != nil {
+				_ = completed.response.Body.Close()
+			}
+		}()
+	}
+	timer := time.NewTimer(t.timeout)
+	defer timer.Stop()
+	select {
+	case completed := <-result:
+		if completed.err != nil || completed.response == nil || completed.response.Body == nil {
+			cancel()
+			return completed.response, completed.err
+		}
+		completed.response.Body = cancelOnCloseBody{ReadCloser: completed.response.Body, cancel: cancel}
+		return completed.response, nil
+	case <-timer.C:
+		cancel()
+		closeAbandonedResponse()
+		return nil, context.DeadlineExceeded
+	case <-req.Context().Done():
+		cancel()
+		closeAbandonedResponse()
+		return nil, req.Context().Err()
+	}
+}
+
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // ListOptions contains options for list operations.
