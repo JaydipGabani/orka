@@ -529,13 +529,7 @@ func (r *TaskReconciler) handleDeletion(ctx context.Context, task *corev1alpha1.
 	// fence. Persist that acknowledgement before later fallible cleanup so retries
 	// never need the runtime endpoint or auth Secret after quiescence is confirmed.
 	if taskHasPlannedHarnessWrapperTurn(task) && !harnessWrapperCancelAcknowledged(task) {
-		legacyAcknowledged := harnessWrapperLegacyCancelAcknowledged(task)
-		if cancelErr := func() error {
-			if legacyAcknowledged {
-				return nil
-			}
-			return r.cancelHarnessWrapperTurn(ctx, task, "task deleted")
-		}(); cancelErr != nil {
+		if cancelErr := r.cancelHarnessWrapperTurn(ctx, task, "task deleted"); cancelErr != nil {
 			if isAgentRuntimeDependencyNotReady(cancelErr) {
 				shouldWait, waitErr := r.waitForHarnessCancelDependency(ctx, task)
 				if waitErr != nil {

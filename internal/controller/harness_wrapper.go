@@ -977,14 +977,6 @@ func harnessWrapperCancelAcknowledged(task *corev1alpha1.Task) bool {
 		condition.Message == strings.TrimSpace(task.Annotations[harnessWrapperTurnIDAnnotation])
 }
 
-func harnessWrapperLegacyCancelAcknowledged(task *corev1alpha1.Task) bool {
-	if !taskHasPlannedHarnessWrapperTurn(task) || task.Annotations == nil {
-		return false
-	}
-	return strings.TrimSpace(task.Annotations[harnessWrapperLegacyCancelAcknowledgedAnno]) ==
-		strings.TrimSpace(task.Annotations[harnessWrapperTurnIDAnnotation])
-}
-
 func (r *TaskReconciler) patchHarnessWrapperCancelAcknowledged(ctx context.Context, task *corev1alpha1.Task) error {
 	if harnessWrapperCancelAcknowledged(task) {
 		return nil
