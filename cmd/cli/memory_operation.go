@@ -22,26 +22,66 @@ func newMemoryOperationCmd() *cobra.Command {
 
 func newMemoryOperationListCmd() *cobra.Command {
 	var state string
+	var cursor, continueToken string
 	var limit int
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List memory operations",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			cursorValue := strings.TrimSpace(cursor)
+			continueValue := strings.TrimSpace(continueToken)
+			if cmd.Flags().Changed("cursor") && cmd.Flags().Changed("continue") && cursorValue != continueValue {
+				return fmt.Errorf("--cursor and --continue must match when both are set")
+			}
+			if cursorValue == "" {
+				cursorValue = continueValue
+			}
 			query := map[string]string{"limit": strconv.Itoa(limit)}
 			if strings.TrimSpace(state) != "" {
 				query["state"] = strings.TrimSpace(state)
+			}
+			if cursorValue != "" {
+				query["cursor"] = cursorValue
 			}
 			result, err := newClientFromCmd(cmd).DoJSON(cmd.Context(), http.MethodGet, "/api/v1/memory-operations", query, nil)
 			if err != nil {
 				return err
 			}
-			return printStructured(cmd, result)
+			return printMemoryOperationList(cmd, result)
 		},
 	}
 	cmd.Flags().StringVar(&state, "state", "", "Filter by operation state")
+	cmd.Flags().StringVar(&cursor, "cursor", "", "Cursor token for the next page")
+	cmd.Flags().StringVar(&continueToken, "continue", "", "Continue/cursor token for the next page")
 	cmd.Flags().IntVar(&limit, "limit", 100, "Maximum number of operations")
 	addOutputFlag(cmd, outputTable)
 	return cmd
+}
+
+func printMemoryOperationList(cmd *cobra.Command, result any) error {
+	format, err := outputFormat(cmd)
+	if err != nil {
+		return err
+	}
+	if err := printStructured(cmd, result); err != nil {
+		return err
+	}
+	if format != outputTable {
+		return nil
+	}
+	response, ok := result.(map[string]any)
+	if !ok {
+		return nil
+	}
+	next := strings.TrimSpace(nestedString(response, "metadata", "continue"))
+	if next != "" {
+		fmt.Fprintf( //nolint:errcheck
+			cmd.OutOrStdout(),
+			"Continue with --cursor %s (reuse the same filters and --limit).\n",
+			next,
+		)
+	}
+	return nil
 }
 
 func newMemoryOperationGetCmd() *cobra.Command {

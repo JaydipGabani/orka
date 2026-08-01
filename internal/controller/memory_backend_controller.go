@@ -541,13 +541,12 @@ func (r *MemoryBackendReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if probeTimeout <= 0 {
 		probeTimeout = defaultMemoryBackendProbeTimeout
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-	defer cancel()
 	prober := r.OMSProber
 	if prober == nil {
 		prober = &OMSHTTPProber{Policy: r.EndpointPolicy}
 	}
-	storeProbe, err := prober.ResolveStore(probeCtx, MemoryBackendStoreProbeTarget{
+	storeProbeCtx, cancelStoreProbe := context.WithTimeout(ctx, probeTimeout)
+	storeProbe, err := prober.ResolveStore(storeProbeCtx, MemoryBackendStoreProbeTarget{
 		Endpoint:              resolution.BaseURL,
 		EndpointIdentity:      resolution.Identity,
 		EndpointDigest:        resolution.EndpointDigest,
@@ -562,6 +561,7 @@ func (r *MemoryBackendReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		StoreName:             backend.Spec.Store.Name,
 		Timeout:               probeTimeout,
 	})
+	cancelStoreProbe()
 	if err != nil {
 		reason, message := memoryBackendProbeFailure(err)
 		status.Reason = reason
@@ -703,7 +703,8 @@ func (r *MemoryBackendReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return r.publishMemoryBackendStatus(ctx, backend, status, conditions, now, defaultMemoryBackendRequeueInterval)
 		}
 		probeTarget = memoryBackendProbeTargetFromFreshCandidate(freshRoute, validationCandidate, r.ClusterIdentity, probeTimeout)
-		fence, fenceErr := prober.AdvanceRoutingFence(probeCtx, MemoryBackendRoutingFenceTarget{
+		fenceCtx, cancelFence := context.WithTimeout(ctx, probeTimeout)
+		fence, fenceErr := prober.AdvanceRoutingFence(fenceCtx, MemoryBackendRoutingFenceTarget{
 			Endpoint: probeTarget.Endpoint, EndpointIdentity: probeTarget.EndpointIdentity,
 			EndpointDigest: probeTarget.EndpointDigest, ResolvedAddressDigest: probeTarget.ResolvedAddressDigest,
 			ResolvedAddresses: probeTarget.ResolvedAddresses, ExpectedServerCertificateDigest: validationCandidate.ServerCertificateDigest,
@@ -712,6 +713,7 @@ func (r *MemoryBackendReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			StoreUUID: probeTarget.StoreUUID, AuthorityEpoch: probeTarget.AuthorityEpoch,
 			RoutingEpoch: probeTarget.RoutingEpoch, Timeout: probeTarget.Timeout,
 		})
+		cancelFence()
 		if fenceErr != nil || fence.MaximumRoutingEpoch != prepared.RoutingEpoch ||
 			fence.ServerCertificateDigest != validationCandidate.ServerCertificateDigest {
 			if fenceErr != nil {
@@ -728,7 +730,9 @@ func (r *MemoryBackendReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	var probe MemoryBackendProbeResult
 	if requested == corev1alpha1.MemoryBackendLifecycleStaged {
-		probe, err = prober.ProbeCapabilities(probeCtx, probeTarget)
+		capabilitiesCtx, cancelCapabilities := context.WithTimeout(ctx, probeTimeout)
+		probe, err = prober.ProbeCapabilities(capabilitiesCtx, probeTarget)
+		cancelCapabilities()
 	} else {
 		err = r.BindingCoordinator.RecordMemoryBackendOwnershipClaimAttempt(ctx, MemoryBackendOwnershipClaimAttemptSnapshot{
 			Namespace: backend.Namespace, NamespaceUID: string(namespace.UID), BackendUID: string(backend.UID),
@@ -749,7 +753,9 @@ func (r *MemoryBackendReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return r.publishMemoryBackendStatus(ctx, backend, status, conditions, now, defaultMemoryBackendRequeueInterval)
 		}
 		probeTarget = memoryBackendProbeTargetFromFreshCandidate(freshRoute, validationCandidate, r.ClusterIdentity, probeTimeout)
-		probe, err = prober.ProbeBinding(probeCtx, probeTarget)
+		bindingCtx, cancelBinding := context.WithTimeout(ctx, probeTimeout)
+		probe, err = prober.ProbeBinding(bindingCtx, probeTarget)
+		cancelBinding()
 	}
 	if err != nil {
 		reason, message := memoryBackendProbeFailure(err)

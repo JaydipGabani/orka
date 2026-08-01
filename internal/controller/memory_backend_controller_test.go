@@ -36,13 +36,14 @@ import (
 )
 
 const (
-	testMemoryNamespaceUID = types.UID("namespace-uid-1")
-	testMemoryBackendUID   = types.UID("backend-uid-1")
-	testMemoryClusterID    = "cluster-a"
-	testMemoryStoreUUID    = "d57d1746-81e9-4f6b-9745-9c7b4f53488d"
-	testCoordinatorBinding = "coordinator.binding"
-	testProberFence        = "prober.fence"
-	testProbeToken         = "probe-token"
+	testMemoryNamespaceUID           = types.UID("namespace-uid-1")
+	testMemoryBackendUID             = types.UID("backend-uid-1")
+	testMemoryClusterID              = "cluster-a"
+	testMemoryStoreUUID              = "d57d1746-81e9-4f6b-9745-9c7b4f53488d"
+	testCoordinatorBinding           = "coordinator.binding"
+	testProberFence                  = "prober.fence"
+	testProbeToken                   = "probe-token"
+	testMemoryBackendActivatedReason = "Activated"
 )
 
 type memoryStaticResolver map[string][]netip.Addr
@@ -61,33 +62,52 @@ func (d *memoryRedirectDialer) DialContext(ctx context.Context, network, address
 	return (&net.Dialer{}).DialContext(ctx, network, d.target)
 }
 
-type fakeMemoryBackendProber struct {
-	storeResult  MemoryBackendStoreProbeResult
-	storeErr     error
-	storeCalls   int
-	storeTarget  MemoryBackendStoreProbeTarget
-	result       MemoryBackendProbeResult
+type memoryBackendProbeParentContextKey struct{}
+
+type memoryBackendProbeObservation struct {
+	deadline     time.Time
+	remaining    time.Duration
+	parentMarker string
 	err          error
-	calls        int
-	target       MemoryBackendProbeTarget
-	fenceResult  MemoryBackendRoutingFenceResult
-	fenceErr     error
-	fenceCalls   int
-	fenceTarget  MemoryBackendRoutingFenceTarget
-	fenceTargets []MemoryBackendRoutingFenceTarget
-	events       *[]string
+}
+
+type fakeMemoryBackendProber struct {
+	storeResult            MemoryBackendStoreProbeResult
+	storeErr               error
+	storeCalls             int
+	storeTarget            MemoryBackendStoreProbeTarget
+	storeObservations      []memoryBackendProbeObservation
+	result                 MemoryBackendProbeResult
+	err                    error
+	calls                  int
+	target                 MemoryBackendProbeTarget
+	capabilityObservations []memoryBackendProbeObservation
+	bindingObservations    []memoryBackendProbeObservation
+	fenceResult            MemoryBackendRoutingFenceResult
+	fenceErr               error
+	fenceCalls             int
+	fenceTarget            MemoryBackendRoutingFenceTarget
+	fenceTargets           []MemoryBackendRoutingFenceTarget
+	fenceObservations      []memoryBackendProbeObservation
+	afterStore             func(int)
+	events                 *[]string
 }
 
 func (p *fakeMemoryBackendProber) AdvanceRoutingFence(
-	_ context.Context,
+	ctx context.Context,
 	target MemoryBackendRoutingFenceTarget,
 ) (MemoryBackendRoutingFenceResult, error) {
 	if p.events != nil {
 		*p.events = append(*p.events, testProberFence)
 	}
 	p.fenceCalls++
+	observation := observeMemoryBackendProbeContext(ctx)
+	p.fenceObservations = append(p.fenceObservations, observation)
 	p.fenceTarget = target
 	p.fenceTargets = append(p.fenceTargets, target)
+	if observation.err != nil {
+		return MemoryBackendRoutingFenceResult{}, observation.err
+	}
 	result := p.fenceResult
 	if result.MaximumRoutingEpoch == 0 {
 		result.MaximumRoutingEpoch = target.RoutingEpoch
@@ -99,44 +119,62 @@ func (p *fakeMemoryBackendProber) AdvanceRoutingFence(
 }
 
 func (p *fakeMemoryBackendProber) ResolveStore(
-	_ context.Context,
+	ctx context.Context,
 	target MemoryBackendStoreProbeTarget,
 ) (MemoryBackendStoreProbeResult, error) {
 	if p.events != nil {
 		*p.events = append(*p.events, "prober.store")
 	}
 	p.storeCalls++
+	observation := observeMemoryBackendProbeContext(ctx)
+	p.storeObservations = append(p.storeObservations, observation)
 	p.storeTarget = target
+	if observation.err != nil {
+		return MemoryBackendStoreProbeResult{}, observation.err
+	}
 	result := p.storeResult
 	if result.StoreUUID == "" {
 		result = validMemoryBackendStoreProbeResult()
+	}
+	if p.afterStore != nil {
+		p.afterStore(p.storeCalls)
 	}
 	return result, p.storeErr
 }
 
 func (p *fakeMemoryBackendProber) ProbeCapabilities(
-	_ context.Context,
+	ctx context.Context,
 	target MemoryBackendProbeTarget,
 ) (MemoryBackendProbeResult, error) {
 	if p.events != nil {
 		*p.events = append(*p.events, "prober.capabilities")
 	}
 	p.calls++
+	observation := observeMemoryBackendProbeContext(ctx)
+	p.capabilityObservations = append(p.capabilityObservations, observation)
 	p.target = target
+	if observation.err != nil {
+		return MemoryBackendProbeResult{}, observation.err
+	}
 	result := p.result
 	result.OwnershipClaimIdentity = ""
 	return result, p.err
 }
 
 func (p *fakeMemoryBackendProber) ProbeBinding(
-	_ context.Context,
+	ctx context.Context,
 	target MemoryBackendProbeTarget,
 ) (MemoryBackendProbeResult, error) {
 	if p.events != nil {
 		*p.events = append(*p.events, "prober.binding")
 	}
 	p.calls++
+	observation := observeMemoryBackendProbeContext(ctx)
+	p.bindingObservations = append(p.bindingObservations, observation)
 	p.target = target
+	if observation.err != nil {
+		return MemoryBackendProbeResult{}, observation.err
+	}
 	return p.result, p.err
 }
 
@@ -272,6 +310,132 @@ func TestMemoryBackendReconcilerStagedValidatesWithoutCutover(t *testing.T) {
 	}
 }
 
+func TestMemoryBackendReconcilerStagedUsesFreshTimeoutForEachOMSProbe(t *testing.T) {
+	const probeTimeout = 5 * time.Second
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	backend, namespace, secret := memoryBackendTestObjects(t, corev1alpha1.MemoryBackendLifecycleStaged)
+	prober := &fakeMemoryBackendProber{result: validMemoryBackendProbeResult(now.Add(10 * time.Minute))}
+	reconciler, kubeClient := newMemoryBackendReconciler(t, now, prober, &fakeMemoryBackendCoordinator{}, backend, namespace, secret)
+	reconciler.ProbeTimeout = probeTimeout
+	parentMarker := "staged-validation"
+	parentCtx := context.WithValue(context.Background(), memoryBackendProbeParentContextKey{}, parentMarker)
+
+	reconcileMemoryBackendAfterFinalizer(t, reconciler, backend.Namespace, parentCtx)
+
+	updated := getMemoryBackend(t, kubeClient, backend.Namespace)
+	if !updated.Status.Ready {
+		t.Fatalf("staged status = %+v", updated.Status)
+	}
+	if len(prober.storeObservations) != 1 || len(prober.capabilityObservations) != 1 {
+		t.Fatalf("probe observations store=%d capabilities=%d",
+			len(prober.storeObservations), len(prober.capabilityObservations))
+	}
+	requireFreshMemoryBackendProbeObservations(t, probeTimeout, parentMarker,
+		prober.storeObservations[0], prober.capabilityObservations[0])
+}
+
+func TestMemoryBackendReconcilerFreshProbeTimeoutsPreserveParentCancellation(t *testing.T) {
+	tests := []struct {
+		name                 string
+		lifecycle            corev1alpha1.MemoryBackendLifecycleState
+		remoteFence          bool
+		cancelBeforeProbe    bool
+		cancelAfterStoreCall int
+		observations         func(*fakeMemoryBackendProber) []memoryBackendProbeObservation
+	}{
+		{
+			name:              "initial store resolution",
+			lifecycle:         corev1alpha1.MemoryBackendLifecycleStaged,
+			cancelBeforeProbe: true,
+			observations: func(prober *fakeMemoryBackendProber) []memoryBackendProbeObservation {
+				return prober.storeObservations
+			},
+		},
+		{
+			name:                 "staged capabilities",
+			lifecycle:            corev1alpha1.MemoryBackendLifecycleStaged,
+			cancelAfterStoreCall: 1,
+			observations: func(prober *fakeMemoryBackendProber) []memoryBackendProbeObservation {
+				return prober.capabilityObservations
+			},
+		},
+		{
+			name:                 "activation routing fence",
+			lifecycle:            corev1alpha1.MemoryBackendLifecycleActive,
+			remoteFence:          true,
+			cancelAfterStoreCall: 2,
+			observations: func(prober *fakeMemoryBackendProber) []memoryBackendProbeObservation {
+				return prober.fenceObservations
+			},
+		},
+		{
+			name:                 "activation binding",
+			lifecycle:            corev1alpha1.MemoryBackendLifecycleActive,
+			remoteFence:          true,
+			cancelAfterStoreCall: 3,
+			observations: func(prober *fakeMemoryBackendProber) []memoryBackendProbeObservation {
+				return prober.bindingObservations
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+			backend, namespace, secret := memoryBackendTestObjects(t, tt.lifecycle)
+			parentMarker := "cancel-" + tt.name
+			parentCtx, cancelParent := context.WithCancel(
+				context.WithValue(context.Background(), memoryBackendProbeParentContextKey{}, parentMarker),
+			)
+			defer cancelParent()
+			prober := &fakeMemoryBackendProber{result: validMemoryBackendProbeResult(now.Add(10 * time.Minute))}
+			if tt.cancelAfterStoreCall > 0 {
+				prober.afterStore = func(call int) {
+					if call == tt.cancelAfterStoreCall {
+						cancelParent()
+					}
+				}
+			}
+			coordinator := &fakeMemoryBackendCoordinator{}
+			if tt.lifecycle == corev1alpha1.MemoryBackendLifecycleActive {
+				coordinator.prepareResult = MemoryBackendValidationBinding{
+					AuthorityEpoch: 3, RoutingEpoch: 7, RemoteFenceRequired: tt.remoteFence,
+				}
+				coordinator.bindingResult = MemoryBackendBindingResult{
+					EffectiveLifecycleState: corev1alpha1.MemoryBackendEffectiveLifecycleActive,
+					AuthorityEpoch:          3,
+					RoutingEpoch:            7,
+					Ready:                   true,
+					Reason:                  testMemoryBackendActivatedReason,
+				}
+			}
+			reconciler, _ := newMemoryBackendReconciler(t, now, prober, coordinator, backend, namespace, secret)
+			reconciler.ProbeTimeout = 5 * time.Second
+			request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: backend.Namespace, Name: backend.Name}}
+			if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+				t.Fatalf("initial Reconcile() error = %v", err)
+			}
+			if tt.cancelBeforeProbe {
+				cancelParent()
+			}
+			if _, err := reconciler.Reconcile(parentCtx, request); err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled Reconcile() error = %v", err)
+			}
+
+			observations := tt.observations(prober)
+			if len(observations) != 1 {
+				t.Fatalf("canceled probe observations = %#v", observations)
+			}
+			if !errors.Is(observations[0].err, context.Canceled) {
+				t.Fatalf("canceled probe error = %v, want context.Canceled", observations[0].err)
+			}
+			if observations[0].parentMarker != parentMarker {
+				t.Fatalf("canceled probe parent marker = %q, want %q", observations[0].parentMarker, parentMarker)
+			}
+		})
+	}
+}
+
 func TestMemoryBackendReconcilerActiveRequiresDurableBindingCoordinator(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	backend, namespace, secret := memoryBackendTestObjects(t, corev1alpha1.MemoryBackendLifecycleActive)
@@ -300,7 +464,7 @@ func TestMemoryBackendReconcilerActivePublishesDurableEpochs(t *testing.T) {
 			AuthorityEpoch:          3,
 			RoutingEpoch:            7,
 			Ready:                   true,
-			Reason:                  "Activated",
+			Reason:                  testMemoryBackendActivatedReason,
 			Message:                 "durable activation completed",
 		}}
 	reconciler, kubeClient := newMemoryBackendReconciler(t, now, prober, coordinator, backend, namespace, secret)
@@ -335,6 +499,43 @@ func TestMemoryBackendReconcilerActivePublishesDurableEpochs(t *testing.T) {
 	if !slices.Equal(events, wantEvents) {
 		t.Fatalf("ownership claim ordering = %v, want %v", events, wantEvents)
 	}
+}
+
+func TestMemoryBackendReconcilerActiveUsesFreshTimeoutForStoreFenceAndBindingProbes(t *testing.T) {
+	const probeTimeout = 5 * time.Second
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	backend, namespace, secret := memoryBackendTestObjects(t, corev1alpha1.MemoryBackendLifecycleActive)
+	prober := &fakeMemoryBackendProber{result: validMemoryBackendProbeResult(now.Add(10 * time.Minute))}
+	coordinator := &fakeMemoryBackendCoordinator{
+		prepareResult: MemoryBackendValidationBinding{
+			AuthorityEpoch: 3, RoutingEpoch: 7, RemoteFenceRequired: true,
+		},
+		bindingResult: MemoryBackendBindingResult{
+			EffectiveLifecycleState: corev1alpha1.MemoryBackendEffectiveLifecycleActive,
+			AuthorityEpoch:          3,
+			RoutingEpoch:            7,
+			Ready:                   true,
+			Reason:                  testMemoryBackendActivatedReason,
+		},
+	}
+	reconciler, kubeClient := newMemoryBackendReconciler(t, now, prober, coordinator, backend, namespace, secret)
+	reconciler.ProbeTimeout = probeTimeout
+	parentMarker := "active-validation"
+	parentCtx := context.WithValue(context.Background(), memoryBackendProbeParentContextKey{}, parentMarker)
+
+	reconcileMemoryBackendAfterFinalizer(t, reconciler, backend.Namespace, parentCtx)
+
+	updated := getMemoryBackend(t, kubeClient, backend.Namespace)
+	if !updated.Status.Ready {
+		t.Fatalf("active status = %+v", updated.Status)
+	}
+	if len(prober.storeObservations) != 4 || len(prober.fenceObservations) != 1 || len(prober.bindingObservations) != 1 {
+		t.Fatalf("probe observations store=%d fence=%d binding=%d",
+			len(prober.storeObservations), len(prober.fenceObservations), len(prober.bindingObservations))
+	}
+	observations := append([]memoryBackendProbeObservation(nil), prober.storeObservations...)
+	observations = append(observations, prober.fenceObservations[0], prober.bindingObservations[0])
+	requireFreshMemoryBackendProbeObservations(t, probeTimeout, parentMarker, observations...)
 }
 
 func TestMemoryBackendRetiresStaleCandidateUsingPersistedRoute(t *testing.T) {
@@ -1122,6 +1323,62 @@ func seedActivatedMemoryBackendStatus(
 		ResolvedAddressDigest:   resolution.ResolvedAddressDigest,
 		ServerCertificateDigest: validMemoryBackendStoreProbeResult().ServerCertificateDigest,
 		StoreUUID:               testMemoryStoreUUID, OwnershipClaimIdentity: "claim-1",
+	}
+}
+
+func observeMemoryBackendProbeContext(ctx context.Context) memoryBackendProbeObservation {
+	deadline, _ := ctx.Deadline()
+	remaining := time.Duration(0)
+	if !deadline.IsZero() {
+		remaining = time.Until(deadline)
+	}
+	parentMarker, _ := ctx.Value(memoryBackendProbeParentContextKey{}).(string)
+	return memoryBackendProbeObservation{
+		deadline: deadline, remaining: remaining, parentMarker: parentMarker, err: ctx.Err(),
+	}
+}
+
+func requireFreshMemoryBackendProbeObservations(
+	t *testing.T,
+	probeTimeout time.Duration,
+	parentMarker string,
+	observations ...memoryBackendProbeObservation,
+) {
+	t.Helper()
+	for i, observation := range observations {
+		if observation.err != nil {
+			t.Fatalf("probe %d context error = %v", i, observation.err)
+		}
+		if observation.deadline.IsZero() {
+			t.Fatalf("probe %d has no timeout deadline", i)
+		}
+		if observation.remaining <= probeTimeout/2 || observation.remaining > probeTimeout {
+			t.Fatalf("probe %d remaining timeout = %s, want a fresh %s budget", i, observation.remaining, probeTimeout)
+		}
+		if observation.parentMarker != parentMarker {
+			t.Fatalf("probe %d parent marker = %q, want %q", i, observation.parentMarker, parentMarker)
+		}
+		for j := range i {
+			if observation.deadline.Equal(observations[j].deadline) {
+				t.Fatalf("outbound OMS probes %d and %d reused the same timeout deadline", j, i)
+			}
+		}
+	}
+}
+
+func reconcileMemoryBackendAfterFinalizer(
+	t *testing.T,
+	reconciler *MemoryBackendReconciler,
+	namespace string,
+	ctx context.Context,
+) {
+	t.Helper()
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: corev1alpha1.MemoryBackendDefaultName}}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("finalizer Reconcile() error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatalf("validation Reconcile() error = %v", err)
 	}
 }
 

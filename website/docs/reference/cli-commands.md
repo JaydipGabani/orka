@@ -2179,10 +2179,12 @@ Usage:
   orka memory operation list [flags]
 
 Flags:
-  -h, --help            help for list
-      --limit int       Maximum number of operations (default 100)
-  -o, --output string   Output format: table, json, yaml (default "table")
-      --state string    Filter by operation state
+      --continue string   Continue/cursor token for the next page
+      --cursor string     Cursor token for the next page
+  -h, --help              help for list
+      --limit int         Maximum number of operations (default 100)
+  -o, --output string     Output format: table, json, yaml (default "table")
+      --state string      Filter by operation state
 
 Global Flags:
       --kubeconfig string       Path to kubeconfig file
