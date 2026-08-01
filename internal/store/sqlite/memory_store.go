@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -367,6 +369,113 @@ func applyLegacyMemoryAuditGovernance(
 	}
 	memory.Trust = store.MemoryTrust(latestTrust)
 	return nil
+}
+
+// SetLegacyMemoryTrustWithAudit atomically binds a trust transition to the
+// exact reviewed legacy content, provenance, and governance revision.
+//
+//nolint:gocyclo // The transaction validates each content, governance, CAS, audit, and rollback boundary explicitly.
+func (s *Store) SetLegacyMemoryTrustWithAudit(
+	ctx context.Context,
+	expected *store.Memory,
+	namespaceUID string,
+	trust store.MemoryTrust,
+	actor, reason, requestID string,
+	now time.Time,
+) (*store.Memory, error) {
+	if expected == nil {
+		return nil, store.ValidationErrorf("expected legacy memory is required")
+	}
+	namespace := strings.TrimSpace(expected.Namespace)
+	id := strings.TrimSpace(expected.ID)
+	namespaceUID = strings.TrimSpace(namespaceUID)
+	actor = strings.TrimSpace(actor)
+	reason = strings.TrimSpace(reason)
+	if namespace == "" || id == "" || namespaceUID == "" || actor == "" || reason == "" ||
+		!validMemoryTrust(trust) || expected.GovernanceRevision <= 0 {
+		return nil, store.ValidationErrorf(
+			"legacy memory, namespace uid, trust, actor, reason, and governance revision are required",
+		)
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	expectedTagsJSON, err := marshalTags(expected.Tags)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Acquire the SQLite write lock through an exact no-op CAS before reading
+	// audit-derived governance. A concurrent content update or trust transition
+	// must therefore finish first or make this reviewed snapshot stale.
+	result, err := tx.ExecContext(ctx, `UPDATE memories SET updated_at = updated_at
+		WHERE namespace = ? AND id = ? AND session_name = ? AND agent_name = ? AND task_name = ? AND parent_task = ?
+			AND source = ? AND source_proposal_id = ? AND content = ? AND tags_json = ?
+			AND disabled = ? AND deleted = ?`,
+		namespace, id, expected.SessionName, expected.AgentName, expected.TaskName, expected.ParentTask,
+		expected.Source, expected.SourceProposalID, expected.Content, expectedTagsJSON, expected.Disabled, expected.Deleted,
+	)
+	if err != nil {
+		return nil, mapLegacyMemoryFenceError(err)
+	}
+	if err := ensureMemoryRowsAffectedConflict(result, "legacy memory changed after trust review"); err != nil {
+		return nil, err
+	}
+
+	current, err := scanMemory(tx.QueryRowContext(ctx,
+		selectMemorySQL()+` WHERE m.namespace = ? AND m.id = ?`, namespace, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := applyLegacyMemoryAuditGovernance(ctx, tx, namespaceUID, current); err != nil {
+		return nil, err
+	}
+	if current.Trust != expected.Trust || current.GovernanceRevision != expected.GovernanceRevision ||
+		current.SourceProposalID != expected.SourceProposalID ||
+		current.Disabled != expected.Disabled || current.Deleted != expected.Deleted ||
+		legacyMemoryProvenanceChanged(current, expected) {
+		return nil, fmt.Errorf("%w: legacy memory changed after trust review", store.ErrConflict)
+	}
+	if current.Trust == trust {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return current, nil
+	}
+
+	digest := sha256.Sum256([]byte(current.Content))
+	if err := insertMemoryAudit(ctx, tx, store.MemoryAuditRecord{
+		Namespace: current.Namespace, NamespaceUID: namespaceUID, Actor: actor,
+		Action: "memory.trust", Reason: reason,
+		PreviousState: string(current.Trust), NewState: string(trust),
+		MemoryID: current.ID, ContentDigest: "sha256:" + hex.EncodeToString(digest[:]),
+		RequestID: requestID, CreatedAt: now,
+	}); err != nil {
+		return nil, err
+	}
+	updated, err := scanMemory(tx.QueryRowContext(ctx,
+		selectMemorySQL()+` WHERE m.namespace = ? AND m.id = ?`, namespace, id))
+	if err != nil {
+		return nil, err
+	}
+	if err := applyLegacyMemoryAuditGovernance(ctx, tx, namespaceUID, updated); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 // DeleteMemory soft-deletes a memory by ID within a namespace.

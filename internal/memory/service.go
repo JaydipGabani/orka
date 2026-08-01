@@ -70,6 +70,17 @@ type legacyMemoryUpdateGovernanceStore interface {
 	) (*store.Memory, error)
 }
 
+type legacyMemoryTrustGovernanceStore interface {
+	SetLegacyMemoryTrustWithAudit(
+		ctx context.Context,
+		expected *store.Memory,
+		namespaceUID string,
+		trust store.MemoryTrust,
+		actor, reason, requestID string,
+		now time.Time,
+	) (*store.Memory, error)
+}
+
 type legacyMemoryProposalGovernanceStore interface {
 	ApplyLegacyMemoryProposalWithAudit(
 		ctx context.Context,
@@ -236,7 +247,7 @@ func (s *Service) listRemoteMemoriesPage(
 				break
 			}
 		}
-		hydrated, hydrateErr := s.hydrateRemoteListEntries(ctx, authority, candidates)
+		hydrated, hydrateErr := s.hydrateRemoteListEntries(ctx, authority, candidates, filter.IncludeDisabled)
 		if hydrateErr != nil {
 			return nil, hydrateErr
 		}
@@ -274,6 +285,7 @@ func (s *Service) hydrateRemoteListEntries(
 	ctx context.Context,
 	authority *ResolvedAuthority,
 	entries []store.RemoteMemoryCatalogEntry,
+	allowDisabled bool,
 ) ([]store.Memory, error) {
 	if len(entries) == 0 {
 		return nil, nil
@@ -293,7 +305,7 @@ func (s *Service) hydrateRemoteListEntries(
 		go func() {
 			defer workers.Done()
 			for i := range jobs {
-				memories[i], errs[i] = s.hydrate(ctx, authority, &entries[i])
+				memories[i], errs[i] = s.hydrate(ctx, authority, &entries[i], allowDisabled)
 			}
 		}()
 	}
@@ -432,7 +444,7 @@ func (s *Service) GetMemory(ctx context.Context, namespace, id string) (*store.M
 	if err := requireRemoteRead(fresh); err != nil {
 		return nil, err
 	}
-	return s.hydrate(ctx, fresh, entry)
+	return s.hydrate(ctx, fresh, entry, true)
 }
 
 // CreateMemory preserves synchronous legacy behavior and durably admits remote work.
@@ -493,6 +505,9 @@ func (s *Service) CreateMemory(
 		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory mutation")
 	}
 	payload, _ := json.Marshal(envelope)
+	if err := validateRemoteMutationLimits(authority, envelope.State, payload); err != nil {
+		return nil, err
+	}
 	catalog := store.RemoteMemoryCatalogEntry{
 		ID: memoryID, Namespace: namespace, NamespaceUID: authority.NamespaceUID,
 		ClusterID: authority.Binding.ClusterID, BackendUID: authority.Binding.BackendUID,
@@ -560,7 +575,7 @@ func (s *Service) UpdateMemory(
 		return nil, apierror.New(http.StatusConflict, ReasonOperationInProgress,
 			"memory content materialization is still in progress")
 	}
-	current, err := s.hydrate(ctx, authority, entry)
+	current, err := s.hydrate(ctx, authority, entry, true)
 	if err != nil {
 		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "verified current memory content is unavailable")
 	}
@@ -606,6 +621,9 @@ func (s *Service) UpdateMemory(
 		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory mutation")
 	}
 	payload, _ := json.Marshal(envelope)
+	if err := validateRemoteMutationLimits(authority, envelope.State, payload); err != nil {
+		return nil, err
+	}
 	updatedEntry := *entry
 	updatedEntry.DesiredGeneration = desired
 	updatedEntry.PendingOperationID = operationID
@@ -787,17 +805,18 @@ func (s *Service) SetMemoryTrust(
 		if actor == "" {
 			actor = "memory-operator"
 		}
-		if err := s.Governed.AppendMemoryAudit(ctx, store.MemoryAuditRecord{
-			Namespace: namespace, NamespaceUID: authority.NamespaceUID, Actor: actor,
-			Action: legacyMemoryTrustAuditAction, Reason: request.Reason,
-			PreviousState: string(memory.Trust), NewState: string(request.Trust),
-			MemoryID: id, RequestID: trustContext.RequestID, CreatedAt: s.now(),
-		}); err != nil {
-			return nil, mapStoreError(err)
+		governedLegacy, ok := s.Legacy.(legacyMemoryTrustGovernanceStore)
+		if !ok {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+				"legacy memory governance does not support atomic trust changes")
 		}
-		memory.Trust = request.Trust
-		memory.GovernanceRevision++
-		return memory, nil
+		updated, trustErr := governedLegacy.SetLegacyMemoryTrustWithAudit(
+			ctx, memory, authority.NamespaceUID, request.Trust, actor, request.Reason, trustContext.RequestID, s.now(),
+		)
+		if trustErr != nil {
+			return nil, mapStoreError(trustErr)
+		}
+		return updated, nil
 	}
 	if trustContext.AuthorizeRemote != nil {
 		if err := trustContext.AuthorizeRemote(); err != nil {
@@ -1020,7 +1039,7 @@ func (s *Service) materializeOrQueue(
 		if !entryMatchesAuthority(entry, authority.Binding) {
 			return nil, identityError()
 		}
-		memory, err := s.hydrate(ctx, authority, entry)
+		memory, err := s.hydrate(ctx, authority, entry, true)
 		if err != nil {
 			return nil, err
 		}
@@ -1038,11 +1057,16 @@ func (s *Service) hydrate(
 	ctx context.Context,
 	authority *ResolvedAuthority,
 	entry *store.RemoteMemoryCatalogEntry,
+	allowDisabled bool,
 ) (*store.Memory, error) {
 	if entry == nil {
 		return nil, store.ErrNotFound
 	}
-	if entry.Disabled || entry.Deleted || entry.MaterializationState == store.MemoryMaterializationDeleted ||
+	if entry.Disabled && !allowDisabled {
+		memory := remoteEntryToMemory(entry, "")
+		return &memory, nil
+	}
+	if entry.Deleted || entry.MaterializationState == store.MemoryMaterializationDeleted ||
 		entry.MaterializationState == store.MemoryMaterializationOrphaned {
 		memory := remoteEntryToMemory(entry, "")
 		return &memory, nil
@@ -1109,7 +1133,7 @@ func (s *Service) normalizeContent(content string, tags []string) (string, []str
 		return "", nil, apierror.New(http.StatusBadRequest, "", "content is required")
 	}
 	limit := s.ContentLimit
-	if limit <= 0 || limit > 256<<10 {
+	if limit <= 0 || limit > protocol.MaxContentBytes {
 		limit = defaultMemoryContentBytes
 	}
 	if len([]byte(content)) > limit {
@@ -1120,6 +1144,35 @@ func (s *Service) normalizeContent(content string, tags []string) (string, []str
 		return "", nil, apierror.New(http.StatusBadRequest, "", "invalid memory tags")
 	}
 	return content, normalized, nil
+}
+
+func validateRemoteMutationLimits(
+	authority *ResolvedAuthority,
+	state *protocol.MutationState,
+	payload []byte,
+) error {
+	if authority == nil || authority.Backend == nil || authority.Backend.Status.ObservedCapabilities == nil {
+		return nil
+	}
+	limits := authority.Backend.Status.ObservedCapabilities.Limits
+	exceeds := limits.MaxRequestBytes > 0 && int64(len(payload)) > limits.MaxRequestBytes
+	if state != nil {
+		exceeds = exceeds || limits.MaxContentBytes > 0 && int64(len(state.Content)) > limits.MaxContentBytes ||
+			limits.MaxTags > 0 && len(state.Tags) > int(limits.MaxTags) ||
+			limits.MaxMetadataEntries > 0 && len(state.Metadata) > int(limits.MaxMetadataEntries)
+		for _, tag := range state.Tags {
+			exceeds = exceeds || limits.MaxTagBytes > 0 && len(tag) > int(limits.MaxTagBytes)
+		}
+		for key, value := range state.Metadata {
+			exceeds = exceeds || limits.MaxMetadataKeyBytes > 0 && len(key) > int(limits.MaxMetadataKeyBytes) ||
+				limits.MaxMetadataValueBytes > 0 && len(value) > int(limits.MaxMetadataValueBytes)
+		}
+	}
+	if exceeds {
+		return apierror.New(http.StatusRequestEntityTooLarge, "",
+			"memory mutation exceeds the active backend's advertised limits")
+	}
+	return nil
 }
 
 func (s *Service) resolve(ctx context.Context, namespace string, fresh bool) (*ResolvedAuthority, error) {
@@ -2418,6 +2471,9 @@ func (s *Service) ApplyMemoryProposal(
 		return nil, apierror.New(http.StatusBadRequest, "", "invalid proposal memory mutation")
 	}
 	payload, _ := json.Marshal(envelope)
+	if err := validateRemoteMutationLimits(authority, envelope.State, payload); err != nil {
+		return nil, err
+	}
 	catalog := store.RemoteMemoryCatalogEntry{
 		ID: memoryID, Namespace: namespace, NamespaceUID: authority.NamespaceUID,
 		ClusterID: authority.Binding.ClusterID, BackendUID: authority.Binding.BackendUID,

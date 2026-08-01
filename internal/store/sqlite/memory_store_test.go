@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -414,6 +416,68 @@ func TestUpdateLegacyMemoryWithAuditRollsBackWhenDemotionAuditFails(t *testing.T
 	}
 	if len(audits) != 1 || audits[0].NewState != string(store.MemoryTrustTrusted) {
 		t.Fatalf("atomic rollback audits = %+v", audits)
+	}
+}
+
+func TestSetLegacyMemoryTrustWithAuditBindsReviewedSnapshot(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 10, 30, 0, 0, time.UTC)
+	namespaceUID := "ns-legacy-trust-cas-uid"
+	memory := &store.Memory{Namespace: "ns-legacy-trust-cas", Source: "manual", Content: "reviewed version"}
+	if err := s.CreateMemory(ctx, memory); err != nil {
+		t.Fatal(err)
+	}
+	reviewed, err := s.GetMemory(ctx, memory.Namespace, memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewed.GovernanceRevision = 1
+
+	replacement := *reviewed
+	replacement.Content = "replacement version"
+	updated, err := s.UpdateLegacyMemoryWithAudit(
+		ctx, &replacement, namespaceUID, "editor", "content changed", "request-update", now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetLegacyMemoryTrustWithAudit(
+		ctx, reviewed, namespaceUID, store.MemoryTrustTrusted, "reviewer", "review stale content", "request-stale", now.Add(time.Second),
+	); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("stale SetLegacyMemoryTrustWithAudit() error = %v, want ErrConflict", err)
+	}
+	audits, err := s.ListMemoryAudit(ctx, store.MemoryAuditFilter{NamespaceUID: namespaceUID, MemoryID: memory.ID, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 0 {
+		t.Fatalf("stale trust promotion wrote audits: %+v", audits)
+	}
+
+	trusted, err := s.SetLegacyMemoryTrustWithAudit(
+		ctx, updated, namespaceUID, store.MemoryTrustTrusted, "reviewer", "review replacement", "request-trusted", now.Add(2*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trusted.Content != updated.Content || trusted.Trust != store.MemoryTrustTrusted || trusted.GovernanceRevision != 2 {
+		t.Fatalf("trusted legacy memory = %+v", trusted)
+	}
+	if _, err := s.SetLegacyMemoryTrustWithAudit(
+		ctx, updated, namespaceUID, store.MemoryTrustReviewed, "reviewer", "stale governance revision", "request-stale-revision", now.Add(3*time.Second),
+	); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("stale governance SetLegacyMemoryTrustWithAudit() error = %v, want ErrConflict", err)
+	}
+	audits, err = s.ListMemoryAudit(ctx, store.MemoryAuditFilter{NamespaceUID: namespaceUID, MemoryID: memory.ID, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(updated.Content))
+	wantDigest := "sha256:" + hex.EncodeToString(digest[:])
+	if len(audits) != 1 || audits[0].PreviousState != string(store.MemoryTrustUntrusted) ||
+		audits[0].NewState != string(store.MemoryTrustTrusted) || audits[0].ContentDigest != wantDigest {
+		t.Fatalf("atomic trust audits = %+v, want content-bound transition", audits)
 	}
 }
 

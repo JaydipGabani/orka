@@ -442,6 +442,163 @@ func TestRemoteUpdateRejectsPendingMaterializationBeforeProviderHydration(t *tes
 	})
 }
 
+func TestRemoteDisabledMemoryHydratesForExplicitInspection(t *testing.T) {
+	now := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entry, record := remoteSearchFixture(binding, "mem-disabled", now, "disabled guidance", store.MemoryTrustReviewed)
+	entry.Disabled = true
+	service, adapter, activeBinding, _ := remoteSearchService(t, []store.RemoteMemoryCatalogEntry{entry}, []protocol.MemoryRecord{record})
+
+	listed, err := service.ListMemories(context.Background(), store.MemoryFilter{Namespace: activeBinding.Namespace, Limit: 10})
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("default ListMemories() = %#v, %v; want disabled memory suppressed", listed, err)
+	}
+	if calls, _ := adapter.getStats(); calls != 0 {
+		t.Fatalf("default list hydrated disabled memory with %d Get calls", calls)
+	}
+
+	got, err := service.GetMemory(context.Background(), activeBinding.Namespace, entry.ID)
+	if err != nil || got == nil || !got.Disabled || got.Content != record.Content || !got.ContentAvailable {
+		t.Fatalf("GetMemory() = %#v, %v; want verified disabled content", got, err)
+	}
+	listed, err = service.ListMemories(context.Background(), store.MemoryFilter{
+		Namespace: activeBinding.Namespace, IncludeDisabled: true, Limit: 10,
+	})
+	if err != nil || len(listed) != 1 || !listed[0].Disabled || listed[0].Content != record.Content || !listed[0].ContentAvailable {
+		t.Fatalf("includeDisabled ListMemories() = %#v, %v; want verified disabled content", listed, err)
+	}
+	if calls, _ := adapter.getStats(); calls != 2 {
+		t.Fatalf("explicit disabled inspection Get calls = %d, want 2", calls)
+	}
+}
+
+func TestRemoteMutationAdmissionHonorsAdvertisedLimits(t *testing.T) {
+	const (
+		actor            = "alice"
+		createRoute      = "createMemory"
+		updateRoute      = "updateMemory"
+		oversizedContent = "large"
+		contentAtLimit   = "four"
+		proposalType     = "memory"
+		acceptedStatus   = "accepted"
+	)
+	storeImpl := newMemoryTestStore(t)
+	now := time.Date(2026, 8, 1, 10, 15, 0, 0, time.UTC)
+	binding := activateServiceTestBinding(t, storeImpl, now)
+	backend := &corev1alpha1.MemoryBackend{}
+	backend.Status.EffectiveLifecycleState = corev1alpha1.MemoryBackendEffectiveLifecycleActive
+	backend.Status.Ready = true
+	backend.Status.ObservedCapabilities = &corev1alpha1.MemoryBackendObservedCapabilities{
+		Limits: corev1alpha1.MemoryBackendCapabilityLimits{MaxContentBytes: 4},
+	}
+	adapter := &countingGetAdapter{}
+	authority := &ResolvedAuthority{
+		Namespace: binding.Namespace, NamespaceUID: binding.NamespaceUID, Binding: &binding, Backend: backend, Adapter: adapter,
+	}
+	resolver := staticAuthorityResolver{authority: authority}
+	service := &Service{
+		Legacy: storeImpl, Proposals: storeImpl, Governed: storeImpl, Resolver: resolver, ContentLimit: protocol.MaxContentBytes,
+		Dispatcher: &Dispatcher{Store: storeImpl, Resolver: resolver, LeaseOwner: "content-limit-test", Now: func() time.Time { return now.Add(time.Minute) }},
+		Now:        func() time.Time { return now.Add(time.Minute) },
+	}
+	assertTooLarge := func(result *MutationResult, err error) {
+		t.Helper()
+		var structured *apierror.Error
+		if result != nil || !errors.As(err, &structured) || structured.Status != http.StatusRequestEntityTooLarge {
+			t.Fatalf("mutation = %#v, %v; want advertised-limit rejection", result, err)
+		}
+	}
+	operationCount := func() int {
+		t.Helper()
+		operations, err := storeImpl.ListMemoryOperations(context.Background(), store.MemoryOperationFilter{
+			NamespaceUID: binding.NamespaceUID, Limit: 20,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(operations)
+	}
+
+	rejectCreate := func(key string, request CreateRequest) {
+		t.Helper()
+		result, err := service.CreateMemory(context.Background(), binding.Namespace, request, MutationContext{
+			Actor: actor, Principal: actor, Route: createRoute, IdempotencyKey: key,
+		})
+		assertTooLarge(result, err)
+		if count := operationCount(); count != 0 {
+			t.Fatalf("advertised-limit create %q admitted %d operations", key, count)
+		}
+	}
+	limits := &backend.Status.ObservedCapabilities.Limits
+	rejectCreate("create-content-too-large", CreateRequest{Content: oversizedContent})
+
+	limits.MaxContentBytes = 100
+	limits.MaxTags = 1
+	rejectCreate("create-too-many-tags", CreateRequest{Content: contentAtLimit, Tags: []string{"one", "two"}})
+	limits.MaxTags = 0
+	limits.MaxTagBytes = 3
+	rejectCreate("create-tag-too-large", CreateRequest{Content: contentAtLimit, Tags: []string{"four"}})
+	limits.MaxTagBytes = 0
+	limits.MaxMetadataEntries = 1
+	rejectCreate("create-too-much-metadata", CreateRequest{Content: contentAtLimit, SessionName: "session"})
+	limits.MaxMetadataEntries = 0
+	limits.MaxMetadataKeyBytes = 5
+	rejectCreate("create-metadata-key-too-large", CreateRequest{Content: contentAtLimit})
+	limits.MaxMetadataKeyBytes = 0
+	limits.MaxMetadataValueBytes = 2
+	rejectCreate("create-metadata-value-too-large", CreateRequest{Content: contentAtLimit})
+	limits.MaxMetadataValueBytes = 0
+	limits.MaxRequestBytes = 1
+	rejectCreate("create-request-too-large", CreateRequest{Content: contentAtLimit})
+	limits.MaxRequestBytes = 0
+	limits.MaxContentBytes = 4
+
+	created, err := service.CreateMemory(context.Background(), binding.Namespace, CreateRequest{Content: contentAtLimit}, MutationContext{
+		Actor: actor, Principal: actor, Route: createRoute, IdempotencyKey: "create-within-limit",
+	})
+	if err != nil || created.Memory == nil {
+		t.Fatalf("within-limit CreateMemory() = %#v, %v", created, err)
+	}
+	baselineOperations := operationCount()
+	tooLargeUpdate := oversizedContent
+	result, err := service.UpdateMemory(context.Background(), binding.Namespace, created.Memory.ID, UpdateRequest{Content: &tooLargeUpdate}, MutationContext{
+		Actor: actor, Principal: actor, Route: updateRoute, IdempotencyKey: "update-too-large",
+	})
+	assertTooLarge(result, err)
+	if count := operationCount(); count != baselineOperations {
+		t.Fatalf("oversized update changed operation count from %d to %d", baselineOperations, count)
+	}
+
+	proposal := &store.MemoryProposal{
+		Namespace: binding.Namespace, Type: proposalType, Title: "oversized proposal", Content: oversizedContent,
+	}
+	if err := storeImpl.CreateMemoryProposal(context.Background(), proposal); err != nil {
+		t.Fatal(err)
+	}
+	if err := storeImpl.ReviewMemoryProposal(context.Background(), store.MemoryProposalReview{
+		Namespace: binding.Namespace, ID: proposal.ID, Status: acceptedStatus, Reviewer: actor,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err = service.ApplyMemoryProposal(context.Background(), binding.Namespace, proposal.ID, actor, MutationContext{
+		Actor: actor, Principal: actor, Route: "applyMemoryProposal", IdempotencyKey: "proposal-too-large",
+	})
+	assertTooLarge(result, err)
+	if count := operationCount(); count != baselineOperations {
+		t.Fatalf("oversized proposal changed operation count from %d to %d", baselineOperations, count)
+	}
+	persisted, err := storeImpl.GetMemoryProposal(context.Background(), binding.Namespace, proposal.ID)
+	if err != nil || persisted.Status != acceptedStatus || persisted.ApplyOperationID != "" {
+		t.Fatalf("oversized proposal state = %#v, %v; want unchanged accepted proposal", persisted, err)
+	}
+}
+
 func TestRemoteMutationAdmissionPublicLocationIncludesEncodedNamespace(t *testing.T) {
 	binding := &store.MemoryBackendBinding{
 		ClusterID: "cluster-a", BackendUID: "backend-a", AuthorityEpoch: 1, RoutingEpoch: 1,
