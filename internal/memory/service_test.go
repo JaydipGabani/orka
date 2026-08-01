@@ -24,6 +24,22 @@ func (r staticAuthorityResolver) ResolveLocal(context.Context, string) (*Resolve
 	return r.authority, nil
 }
 
+type transientLegacySearchResolver struct {
+	authority         *ResolvedAuthority
+	resolveCalls      int
+	resolveLocalCalls int
+}
+
+func (r *transientLegacySearchResolver) Resolve(context.Context, string) (*ResolvedAuthority, error) {
+	r.resolveCalls++
+	return r.authority, nil
+}
+
+func (r *transientLegacySearchResolver) ResolveLocal(context.Context, string) (*ResolvedAuthority, error) {
+	r.resolveLocalCalls++
+	return nil, errors.New("transient local resolver failure")
+}
+
 func TestServiceLegacyCreatePreservesSynchronousBehavior(t *testing.T) {
 	storeImpl := newMemoryTestStore(t)
 	service := &Service{Legacy: storeImpl, Proposals: storeImpl}
@@ -275,6 +291,63 @@ func TestServiceLegacyProposalReplayReturnsGovernanceOverlay(t *testing.T) {
 	}
 	if replayed.Memory.Trust != store.MemoryTrustTrusted || replayed.Memory.GovernanceRevision != 2 {
 		t.Fatalf("replayed proposal memory = %#v", replayed.Memory)
+	}
+}
+
+func TestServiceLegacySearchReusesResolvedAuthorityWhenLocalResolverFails(t *testing.T) {
+	ctx := context.Background()
+	storeImpl := newMemoryTestStore(t)
+	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
+	service := &Service{
+		Legacy: storeImpl, Proposals: storeImpl, Governed: storeImpl,
+		Resolver: staticAuthorityResolver{authority: authority},
+	}
+	proposal := &store.MemoryProposal{
+		Namespace: authority.Namespace, Type: "memory", Title: "demoted proposal guidance",
+		Content: "Never return this demoted proposal memory from default search.",
+	}
+	if err := storeImpl.CreateMemoryProposal(ctx, proposal); err != nil {
+		t.Fatal(err)
+	}
+	if err := storeImpl.ReviewMemoryProposal(ctx, store.MemoryProposalReview{
+		Namespace: authority.Namespace, ID: proposal.ID, Status: "accepted", Reviewer: "alice",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := service.ApplyMemoryProposal(ctx, authority.Namespace, proposal.ID, "alice", MutationContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	demoted, err := service.SetMemoryTrust(ctx, authority.Namespace, applied.Memory.ID, TrustRequest{
+		Trust: store.MemoryTrustUntrusted, Reason: "proposal no longer approved",
+	}, TrustContext{Actor: "alice", RequestID: "request-demote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if demoted.Trust != store.MemoryTrustUntrusted {
+		t.Fatalf("demoted memory trust = %q, want untrusted", demoted.Trust)
+	}
+	raw, err := storeImpl.GetMemory(ctx, authority.Namespace, applied.Memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw.Trust != store.MemoryTrustReviewed {
+		t.Fatalf("raw proposal memory trust = %q, want reviewed so the audit overlay is required", raw.Trust)
+	}
+
+	resolver := &transientLegacySearchResolver{authority: authority}
+	service.Resolver = resolver
+	response, err := service.Search(ctx, authority.Namespace, SearchRequest{
+		Query: "demoted proposal memory", Limit: 10,
+	}, SearchContext{})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(response.Items) != 0 {
+		t.Fatalf("Search() returned demoted proposal memory: %#v", response.Items)
+	}
+	if resolver.resolveCalls != 1 || resolver.resolveLocalCalls != 0 {
+		t.Fatalf("resolver calls fresh/local = %d/%d, want 1/0", resolver.resolveCalls, resolver.resolveLocalCalls)
 	}
 }
 

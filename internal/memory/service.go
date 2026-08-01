@@ -1568,7 +1568,7 @@ func (s *Service) search(
 		return nil, err
 	}
 	if !authority.Remote() {
-		return s.searchLegacy(ctx, namespace, request, mode)
+		return s.searchLegacy(ctx, authority, namespace, request, mode)
 	}
 	if err := requireRemoteRead(authority); err != nil {
 		return nil, err
@@ -1883,6 +1883,7 @@ func (s *Service) appendRemoteSearchTombstones(
 
 func (s *Service) searchLegacy(
 	ctx context.Context,
+	authority *ResolvedAuthority,
 	namespace string,
 	request SearchRequest,
 	mode string,
@@ -1933,7 +1934,6 @@ func (s *Service) searchLegacy(
 			}
 		}
 	}
-	authority, _ := s.resolve(ctx, namespace, false)
 	items := make([]SearchHit, 0, min(len(memories), target))
 	for _, memory := range memories {
 		if overlayErr := s.applyLegacyGovernance(ctx, authority, &memory); overlayErr != nil {
