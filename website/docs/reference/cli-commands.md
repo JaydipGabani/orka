@@ -1713,6 +1713,8 @@ Usage:
 
 Flags:
       --agentName string     Filter by agentName
+      --continue string      Continue/cursor token for the next page
+      --cursor string        Cursor token for the next page
   -h, --help                 help for list
       --ids string           Filter by ids
       --include-deleted      Include deleted memories

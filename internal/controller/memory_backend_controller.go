@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -1302,6 +1303,25 @@ func (r *MemoryBackendReconciler) reconcileMemoryBackendDeletion(
 	return ctrl.Result{}, nil
 }
 
+func memoryBackendPrimaryWatchPredicate() predicate.Predicate {
+	generationChanged := predicate.GenerationChangedPredicate{}
+	return predicate.Funcs{
+		UpdateFunc: func(updateEvent event.UpdateEvent) bool {
+			if updateEvent.ObjectOld == nil || updateEvent.ObjectNew == nil {
+				return false
+			}
+			if generationChanged.Update(updateEvent) {
+				return true
+			}
+			oldDeletionTimestamp := updateEvent.ObjectOld.GetDeletionTimestamp()
+			newDeletionTimestamp := updateEvent.ObjectNew.GetDeletionTimestamp()
+			oldDeleting := oldDeletionTimestamp != nil && !oldDeletionTimestamp.IsZero()
+			newDeleting := newDeletionTimestamp != nil && !newDeletionTimestamp.IsZero()
+			return oldDeleting != newDeleting
+		},
+	}
+}
+
 // SetupWithManager registers fixed-name, Secret-reference, and Namespace watches.
 func (r *MemoryBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.APIReader == nil {
@@ -1326,7 +1346,7 @@ func (r *MemoryBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("index MemoryBackend Secret references: %w", err)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&corev1alpha1.MemoryBackend{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		For(&corev1alpha1.MemoryBackend{}, builder.WithPredicates(memoryBackendPrimaryWatchPredicate())).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.memoryBackendsForSecret)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.memoryBackendForNamespace)).
 		Named("memorybackend").

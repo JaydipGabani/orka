@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
@@ -110,9 +111,13 @@ func (h *Handlers) cleanupTaskAfterTransactionTokenSetupFailure(ctx context.Cont
 	if h == nil || h.client == nil || task == nil || task.Name == "" {
 		return nil
 	}
+	if task.UID == "" {
+		return errors.New("created task UID is required for transaction token cleanup")
+	}
+	uid := task.UID
 	if err := h.client.Delete(ctx, &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{
 		Name: task.Name, Namespace: task.Namespace,
-	}}); err != nil && !apierrors.IsNotFound(err) {
+	}}, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("deleting task after transaction token setup failure: %w", err)
 	}
 	return nil

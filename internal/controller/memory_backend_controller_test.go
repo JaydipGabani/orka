@@ -28,6 +28,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/endpointpolicy"
@@ -987,6 +989,60 @@ func TestMemoryBackendDeletionForceOrphanRemovedBypassesUnavailableRemote(t *tes
 	}
 	if prober.fenceCalls != 0 {
 		t.Fatalf("force-orphan deletion unexpectedly contacted remote adapter %d times", prober.fenceCalls)
+	}
+}
+
+func TestMemoryBackendPrimaryWatchPredicate(t *testing.T) {
+	watchPredicate := memoryBackendPrimaryWatchPredicate()
+	base := &corev1alpha1.MemoryBackend{ObjectMeta: metav1.ObjectMeta{
+		Name: corev1alpha1.MemoryBackendDefaultName, Namespace: "memory-test", Generation: 7,
+	}}
+	generationChanged := base.DeepCopy()
+	generationChanged.Generation++
+	metadataOnly := base.DeepCopy()
+	metadataOnly.ResourceVersion = "2"
+	metadataOnly.Annotations = map[string]string{"example.com/changed": "updated"}
+	statusOnly := base.DeepCopy()
+	statusOnly.Status.Ready = true
+	deleting := base.DeepCopy()
+	deletedAt := metav1.NewTime(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC))
+	deleting.DeletionTimestamp = &deletedAt
+	stillDeleting := deleting.DeepCopy()
+	stillDeleting.ResourceVersion = "3"
+	deletionCleared := deleting.DeepCopy()
+	deletionCleared.DeletionTimestamp = nil
+	deletionUpdate := event.UpdateEvent{ObjectOld: base, ObjectNew: deleting}
+	if (predicate.GenerationChangedPredicate{}).Update(deletionUpdate) {
+		t.Fatal("GenerationChangedPredicate unexpectedly accepted a deletionTimestamp-only update")
+	}
+
+	tests := []struct {
+		name string
+		old  client.Object
+		new  client.Object
+		want bool
+	}{
+		{name: "generation changed", old: base, new: generationChanged, want: true},
+		{name: "deletion timestamp set without generation change", old: base, new: deleting, want: true},
+		{name: "deletion timestamp cleared defensively", old: deleting, new: deletionCleared, want: true},
+		{name: "metadata only", old: base, new: metadataOnly, want: false},
+		{name: "status only", old: base, new: statusOnly, want: false},
+		{name: "unchanged deletion timestamp", old: deleting, new: stillDeleting, want: false},
+		{name: "missing old object", new: base, want: false},
+		{name: "missing new object", old: base, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := watchPredicate.Update(event.UpdateEvent{ObjectOld: tt.old, ObjectNew: tt.new}); got != tt.want {
+				t.Fatalf("Update() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+	if !watchPredicate.Create(event.CreateEvent{Object: base}) {
+		t.Fatal("Create() = false, want true")
+	}
+	if !watchPredicate.Delete(event.DeleteEvent{Object: base}) {
+		t.Fatal("Delete() = false, want true")
 	}
 }
 

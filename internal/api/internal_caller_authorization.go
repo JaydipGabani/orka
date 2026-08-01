@@ -88,17 +88,21 @@ func (a internalCallerAuthorizer) verifyNamespace(c fiber.Ctx, namespace string)
 }
 
 func (a internalCallerAuthorizer) verifyMemoryNamespace(c fiber.Ctx, namespace string) error {
+	userInfo := GetUserInfo(c)
+	if centralHarnessWrapperCaller(userInfo) {
+		task, err := a.currentHarnessWrapperMemoryTask(c.Context(), userInfo, namespace)
+		if err != nil {
+			return err
+		}
+		c.Locals(internalMemoryTaskLocalKey, task)
+		return nil
+	}
 	if err := a.verifyNamespace(c, namespace); err != nil {
 		return err
 	}
-	userInfo := GetUserInfo(c)
 	if userInfo == nil || userInfo.AuthType != AuthTypeTokenReview ||
 		serviceAccountNameFromUsername(userInfo.Username) == "" {
 		return fiber.NewError(fiber.StatusForbidden, "internal memory caller must be a Kubernetes workload identity")
-	}
-	if serviceAccountNameFromUsername(userInfo.Username) == expectedHarnessWrapperServiceAccountName() &&
-		parseServiceAccountNamespace(userInfo.Username) == currentPodNamespace() {
-		return nil
 	}
 	task, err := a.currentTaskWorker(c.Context(), userInfo, namespace)
 	if err != nil {
@@ -106,6 +110,73 @@ func (a internalCallerAuthorizer) verifyMemoryNamespace(c fiber.Ctx, namespace s
 	}
 	c.Locals(internalMemoryTaskLocalKey, task)
 	return nil
+}
+
+func centralHarnessWrapperCaller(userInfo *UserInfo) bool {
+	if userInfo == nil || userInfo.AuthType != AuthTypeTokenReview ||
+		serviceAccountNameFromUsername(userInfo.Username) != expectedHarnessWrapperServiceAccountName() {
+		return false
+	}
+	controlNamespace := currentPodNamespace()
+	usernameNamespace := parseServiceAccountNamespace(userInfo.Username)
+	callerNamespace := strings.TrimSpace(userInfo.Namespace)
+	return controlNamespace != "" && usernameNamespace == controlNamespace &&
+		(callerNamespace == "" || callerNamespace == controlNamespace)
+}
+
+func (a internalCallerAuthorizer) currentHarnessWrapperMemoryTask(
+	ctx context.Context,
+	userInfo *UserInfo,
+	namespace string,
+) (*corev1alpha1.Task, error) {
+	if a.k8sReader == nil || userInfo == nil || userInfo.ContextToken == nil {
+		return nil, fiber.NewError(fiber.StatusForbidden, "task-scoped Txn-Token is required")
+	}
+	token := userInfo.ContextToken
+	tokenNamespace, ok := contextString(token.TransactionContext, "namespace")
+	if !ok || tokenNamespace != namespace {
+		return nil, fiber.NewError(fiber.StatusForbidden, "namespace does not match the task-scoped Txn-Token")
+	}
+	taskName := internalMemoryTokenTaskName(token, namespace)
+	if taskName == "" {
+		return nil, fiber.NewError(fiber.StatusForbidden, "task name is missing from the Txn-Token context")
+	}
+	taskUID, ok := contextString(token.TransactionContext, "taskUID")
+	if !ok || strings.TrimSpace(taskUID) == "" {
+		return nil, fiber.NewError(fiber.StatusForbidden, "task UID is missing from the Txn-Token context")
+	}
+	task := &corev1alpha1.Task{}
+	if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: taskName}, task); err != nil {
+		return nil, fiber.NewError(fiber.StatusForbidden, "task identity could not be verified")
+	}
+	if task.Namespace != namespace || task.Name != taskName || string(task.UID) != taskUID ||
+		task.Spec.Type != corev1alpha1.TaskTypeAgent || strings.TrimSpace(task.Status.JobName) != "" ||
+		task.Status.HarnessRuntime == nil || strings.TrimSpace(task.Status.HarnessRuntime.RuntimeRefName) == "" ||
+		!task.DeletionTimestamp.IsZero() || isTerminalInternalTaskPhase(task.Status.Phase) ||
+		!harnessWrapperArtifactUploadAuthorized(task) {
+		return nil, fiber.NewError(fiber.StatusForbidden, "task identity is not an active runtimeRef harness task")
+	}
+	return task, nil
+}
+
+func internalMemoryTokenTaskName(token *ContextToken, namespace string) string {
+	if token == nil {
+		return ""
+	}
+	if taskName, ok := contextString(token.TransactionContext, "taskName"); ok {
+		return strings.TrimSpace(taskName)
+	}
+	taskRef, ok := contextString(token.TransactionContext, "task")
+	if !ok {
+		return ""
+	}
+	if after, found := strings.CutPrefix(taskRef, namespace+"/"); found {
+		return strings.TrimSpace(after)
+	}
+	if !strings.Contains(taskRef, "/") {
+		return strings.TrimSpace(taskRef)
+	}
+	return ""
 }
 
 func (a internalCallerAuthorizer) currentTaskWorker(

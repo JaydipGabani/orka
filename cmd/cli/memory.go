@@ -45,11 +45,20 @@ func addMemoryFilterFlags(
 func newMemoryListCmd() *cobra.Command {
 	values := map[string]*string{}
 	var includeDisabled, includeDeleted bool
+	var cursor, continueToken string
 	var limit int
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List memories",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			cursorValue := strings.TrimSpace(cursor)
+			continueValue := strings.TrimSpace(continueToken)
+			if cmd.Flags().Changed("cursor") && cmd.Flags().Changed("continue") && cursorValue != continueValue {
+				return fmt.Errorf("--cursor and --continue must match when both are set")
+			}
+			if cursorValue == "" {
+				cursorValue = continueValue
+			}
 			q := map[string]string{"limit": fmt.Sprintf("%d", limit)}
 			for _, key := range sortedKeys(ptrStringMap(values)) {
 				if v := strings.TrimSpace(*values[key]); v != "" {
@@ -62,17 +71,48 @@ func newMemoryListCmd() *cobra.Command {
 			if includeDeleted {
 				q["includeDeleted"] = cliQueryTrue
 			}
+			if cursorValue != "" {
+				q["cursor"] = cursorValue
+			}
 			c := newClientFromCmd(cmd)
 			result, err := c.DoJSON(context.Background(), http.MethodGet, "/api/v1/memories", q, nil)
 			if err != nil {
 				return err
 			}
-			return printStructured(cmd, result)
+			return printMemoryList(cmd, result)
 		},
 	}
 	addOutputFlag(cmd, outputTable)
 	addMemoryFilterFlags(cmd, values, &includeDisabled, &includeDeleted, &limit)
+	cmd.Flags().StringVar(&cursor, "cursor", "", "Cursor token for the next page")
+	cmd.Flags().StringVar(&continueToken, "continue", "", "Continue/cursor token for the next page")
 	return cmd
+}
+
+func printMemoryList(cmd *cobra.Command, result any) error {
+	format, err := outputFormat(cmd)
+	if err != nil {
+		return err
+	}
+	if err := printStructured(cmd, result); err != nil {
+		return err
+	}
+	if format != outputTable {
+		return nil
+	}
+	response, ok := result.(map[string]any)
+	if !ok {
+		return nil
+	}
+	next := strings.TrimSpace(nestedString(response, "metadata", "continue"))
+	if next != "" {
+		fmt.Fprintf( //nolint:errcheck
+			cmd.OutOrStdout(),
+			"Continue with --cursor %s (reuse the same filters and --limit).\n",
+			next,
+		)
+	}
+	return nil
 }
 
 func ptrStringMap(in map[string]*string) map[string]string {

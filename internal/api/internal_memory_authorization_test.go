@@ -10,7 +10,10 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
+	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/store"
 )
 
@@ -276,33 +279,95 @@ func TestInternalMemorySearchAndOperationReadsRequireTaskScopedTxnScopes(t *test
 	}
 }
 
-func TestHarnessWrapperInternalMemoryAccessStillRequiresTaskTxnToken(t *testing.T) {
-	t.Setenv("POD_NAMESPACE", "default")
+func TestHarnessWrapperCrossNamespaceMemoryAccessRequiresBoundRuntimeRefTaskToken(t *testing.T) {
+	const (
+		controlNamespace = "orka-system"
+		targetNamespace  = "team-runtime"
+		runtimeTaskName  = "runtime-task"
+		runtimeTaskUID   = "runtime-task-uid"
+		runtimeTurnID    = "turn-1"
+	)
+	t.Setenv("POD_NAMESPACE", controlNamespace)
 	t.Setenv(harnessWrapperServiceAccountEnv, "agent-harness-wrapper")
 
 	h, app, _, user := setupTestInternalMemoryHandlers(t)
 	app.Get("/internal/v1/memories/:namespace", h.ListMemories)
-	user.Username = "system:serviceaccount:default:agent-harness-wrapper"
-	user.Namespace = "default"
-	user.Extra = nil
-	user.ContextToken = nil
-
-	require.Equal(t, http.StatusForbidden,
-		testInternalMemoryRequest(t, app, http.MethodGet, "/internal/v1/memories/default", "").StatusCode)
-
-	user.ContextToken = &ContextToken{
-		Scopes: []string{ContextTokenScopeMemoryRead},
-		TransactionContext: map[string]any{
-			"namespace": "default",
-			"taskName":  "other-task",
+	runtimeTask := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: targetNamespace, Name: runtimeTaskName, UID: types.UID(runtimeTaskUID),
+			Annotations: map[string]string{
+				harnessWrapperTurnIDAnnotation:  runtimeTurnID,
+				harnessWrapperRuntimeAnnotation: "runtime-session-1",
+				harnessWrapperStartedAnnotation: queryTrue,
+			},
+		},
+		Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent},
+		Status: corev1alpha1.TaskStatus{
+			Phase: corev1alpha1.TaskPhaseRunning,
+			HarnessRuntime: &corev1alpha1.HarnessRuntimeStatus{
+				RuntimeRefName: "remote-runtime",
+			},
 		},
 	}
-	require.Equal(t, http.StatusForbidden,
-		testInternalMemoryRequest(t, app, http.MethodGet, "/internal/v1/memories/default", "").StatusCode)
+	require.NoError(t, h.k8sClient.Create(context.Background(), runtimeTask))
+	nonRuntimeTask := runtimeTask.DeepCopy()
+	nonRuntimeTask.Name = "job-backed-task"
+	nonRuntimeTask.UID = types.UID("job-backed-task-uid")
+	nonRuntimeTask.ResourceVersion = ""
+	nonRuntimeTask.Status.HarnessRuntime = nil
+	nonRuntimeTask.Status.JobName = "job-backed-task-job"
+	require.NoError(t, h.k8sClient.Create(context.Background(), nonRuntimeTask))
 
-	user.ContextToken = internalMemoryTaskToken(ContextTokenScopeMemoryRead)
+	user.AuthType = AuthTypeTokenReview
+	user.Username = "system:serviceaccount:" + controlNamespace + ":agent-harness-wrapper"
+	user.Namespace = controlNamespace
+	user.Extra = nil
+	target := "/internal/v1/memories/" + targetNamespace
+	taskToken := func(namespace, name, uid string) *ContextToken {
+		return &ContextToken{
+			Scopes: []string{ContextTokenScopeMemoryRead},
+			TransactionContext: map[string]any{
+				"namespace": namespace,
+				"taskName":  name,
+				"taskUID":   uid,
+			},
+		}
+	}
+
+	user.ContextToken = nil
+	require.Equal(t, http.StatusForbidden,
+		testInternalMemoryRequest(t, app, http.MethodGet, target, "").StatusCode)
+
+	wrongScopeToken := taskToken(targetNamespace, runtimeTaskName, runtimeTaskUID)
+	wrongScopeToken.Scopes = []string{ContextTokenScopeMemoryWrite}
+	for name, token := range map[string]*ContextToken{
+		"wrong scope":     wrongScopeToken,
+		"wrong namespace": taskToken("other-team", runtimeTaskName, runtimeTaskUID),
+		"wrong task name": taskToken(targetNamespace, "other-task", runtimeTaskUID),
+		"wrong task uid":  taskToken(targetNamespace, runtimeTaskName, "other-uid"),
+		"non-runtime task": taskToken(
+			targetNamespace, nonRuntimeTask.Name, string(nonRuntimeTask.UID),
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			user.ContextToken = token
+			require.Equal(t, http.StatusForbidden,
+				testInternalMemoryRequest(t, app, http.MethodGet, target, "").StatusCode)
+		})
+	}
+
+	user.ContextToken = taskToken(targetNamespace, runtimeTaskName, runtimeTaskUID)
 	require.Equal(t, http.StatusOK,
-		testInternalMemoryRequest(t, app, http.MethodGet, "/internal/v1/memories/default", "").StatusCode)
+		testInternalMemoryRequest(t, app, http.MethodGet, target, "").StatusCode)
+
+	user.Username = "system:serviceaccount:" + controlNamespace + ":other-service-account"
+	require.Equal(t, http.StatusForbidden,
+		testInternalMemoryRequest(t, app, http.MethodGet, target, "").StatusCode)
+
+	user.Username = "system:serviceaccount:" + targetNamespace + ":agent-harness-wrapper"
+	user.Namespace = targetNamespace
+	require.Equal(t, http.StatusForbidden,
+		testInternalMemoryRequest(t, app, http.MethodGet, target, "").StatusCode)
 }
 
 func TestInternalMemoryAuthorizationOffPreservesVerifiedWorkloadCompatibility(t *testing.T) {
