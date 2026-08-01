@@ -58,9 +58,54 @@ type Server struct {
 	maxSnapshotRecords          int
 	clock                       func() time.Time
 	enableConformanceFailpoints bool
-	stateMu                     sync.Mutex
+	stateLocks                  scopedMutex
 	closeOnce                   sync.Once
 	closeErr                    error
+}
+
+// scopedMutex serializes split-phase SQLite/provider transitions within one
+// authority without coupling independent tenants to the same provider call.
+type scopedMutex struct {
+	mu      sync.Mutex
+	entries map[string]*scopedMutexEntry
+}
+
+type scopedMutexEntry struct {
+	mu    sync.Mutex
+	users int
+}
+
+func (m *scopedMutex) lock(key string) func() {
+	m.mu.Lock()
+	if m.entries == nil {
+		m.entries = make(map[string]*scopedMutexEntry)
+	}
+	entry := m.entries[key]
+	if entry == nil {
+		entry = &scopedMutexEntry{}
+		m.entries[key] = entry
+	}
+	entry.users++
+	m.mu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		m.mu.Lock()
+		entry.users--
+		if entry.users == 0 && m.entries[key] == entry {
+			delete(m.entries, key)
+		}
+		m.mu.Unlock()
+	}
+}
+
+func storeResolutionLockKey(binding protocol.StoreResolutionBinding, storeName string) string {
+	return "store\x00" + binding.TenantID + "\x00" + storeName
+}
+
+func bindingStateLockKey(binding protocol.Binding) string {
+	return "binding\x00" + protocol.ClaimScopeDigest(binding)
 }
 
 // Open opens and migrates the control database and acquires the single-active
@@ -210,9 +255,9 @@ func (s *Server) handleStoreResolve(w http.ResponseWriter, r *http.Request) {
 		s.writeProviderError(w, nil, err, "store resolution unavailable")
 		return
 	}
-	s.stateMu.Lock()
+	unlock := s.stateLocks.lock(storeResolutionLockKey(request.Binding, request.StoreName))
 	storeUUID, err := s.db.resolveStore(r.Context(), request.Binding, request.StoreName, resolved, s.now())
-	s.stateMu.Unlock()
+	unlock()
 	if err != nil {
 		if errors.Is(err, errIdentityConflict) {
 			s.writeError(w, http.StatusConflict, nil, protocol.ErrorCodeIdentityConflict, "store mapping identity changed", false, 0)
@@ -308,9 +353,9 @@ func (s *Server) handleOwnershipClaim(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, nil, protocol.ErrorCodeInvalidRequest, "invalid ownership claim", false, 0)
 		return
 	}
-	s.stateMu.Lock()
+	unlock := s.stateLocks.lock(bindingStateLockKey(request.Binding))
 	decision, err := s.db.claimOwnership(r.Context(), s.content, request.Binding, s.now())
-	s.stateMu.Unlock()
+	unlock()
 	if err != nil {
 		s.writeError(w, http.StatusServiceUnavailable, &request.Binding, protocol.ErrorCodeInternal, "ownership state unavailable", true, 1)
 		return
@@ -337,9 +382,9 @@ func (s *Server) handleRoutingFence(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, nil, protocol.ErrorCodeInvalidRequest, "invalid routing fence request", false, 0)
 		return
 	}
-	s.stateMu.Lock()
+	unlock := s.stateLocks.lock(bindingStateLockKey(request.Binding))
 	decision, err := s.db.advanceRoutingFence(r.Context(), s.content, request.Binding, s.now())
-	s.stateMu.Unlock()
+	unlock()
 	if err != nil {
 		if errors.Is(err, errRoutingFenceBlocked) {
 			s.writeError(w, http.StatusServiceUnavailable, &request.Binding, protocol.ErrorCodeInternal,
@@ -376,11 +421,11 @@ func (s *Server) handleMutation(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, &request.Binding, protocol.ErrorCodeInvalidRequest, "conformance failpoint is not enabled", false, 0)
 		return
 	}
-	s.stateMu.Lock()
+	unlock := s.stateLocks.lock(bindingStateLockKey(request.Binding))
 	receipt, err := s.db.applyMutationWithFailpoint(
 		r.Context(), s.content, request, s.now(), failpoint == conformanceProviderCommitGap,
 	)
-	s.stateMu.Unlock()
+	unlock()
 	if errors.Is(err, errConformanceProviderCommitGap) {
 		w.Header().Set(conformanceFailpointHeader, conformanceProviderCommitGap)
 		s.writeError(w, http.StatusServiceUnavailable, &request.Binding, protocol.ErrorCodeInternal,
@@ -404,9 +449,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, nil, protocol.ErrorCodeInvalidRequest, "invalid exact-get request", false, 0)
 		return
 	}
-	s.stateMu.Lock()
+	unlock := s.stateLocks.lock(bindingStateLockKey(request.Binding))
 	record, found, err := s.db.lookupRecord(r.Context(), s.content, request.Binding, request.UpsertKey)
-	s.stateMu.Unlock()
+	unlock()
 	if err != nil {
 		s.writeProviderError(w, &request.Binding, err, "exact get unavailable")
 		return
@@ -451,13 +496,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var page searchPage
-	s.stateMu.Lock()
+	unlock := s.stateLocks.lock(bindingStateLockKey(request.Binding))
 	if request.PageToken == "" {
 		page, err = s.db.createSnapshot(r.Context(), s.content, request, s.now(), s.now, s.snapshotTTL, s.maxSnapshotRecords)
 	} else {
 		page, err = s.db.readSnapshotPage(r.Context(), s.content, request, s.now())
 	}
-	s.stateMu.Unlock()
+	unlock()
 	if err != nil {
 		s.writeSearchError(w, request.Binding, err)
 		return

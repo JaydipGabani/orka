@@ -1,7 +1,9 @@
 package kd6adapter
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -63,6 +65,32 @@ type blockingSnapshotStore struct {
 	release chan struct{}
 	calls   atomic.Int64
 	expires time.Time
+}
+
+type blockingTenantGetStore struct {
+	ContentStore
+	blockedTenant      string
+	independentTenant  string
+	blockedEntered     chan struct{}
+	independentEntered chan struct{}
+	release            chan struct{}
+	blockedOnce        sync.Once
+	independentOnce    sync.Once
+}
+
+func (s *blockingTenantGetStore) Get(ctx context.Context, request ContentGetRequest) (*ContentRecord, error) {
+	switch request.TenantID {
+	case s.blockedTenant:
+		s.blockedOnce.Do(func() { close(s.blockedEntered) })
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	case s.independentTenant:
+		s.independentOnce.Do(func() { close(s.independentEntered) })
+	}
+	return s.ContentStore.Get(ctx, request)
 }
 
 func (s *blockingSnapshotStore) StartSearch(ctx context.Context, _ ContentSearchRequest) (ContentSearchSnapshot, error) {
@@ -139,6 +167,117 @@ func TestRoutingFenceRejectsActiveProviderDispatch(t *testing.T) {
 	decision, err = adapter.db.advanceRoutingFence(context.Background(), blocked, fenced, now.Add(time.Second))
 	if err != nil || decision.result != protocol.ResultApplied || decision.maxRouting != fenced.RoutingEpoch {
 		t.Fatalf("settled fence decision = %+v, err = %v", decision, err)
+	}
+}
+
+func TestBlockedGetDoesNotBlockIndependentTenant(t *testing.T) {
+	baseStore, _, closeProvider := newKD6ProviderStore(t)
+	defer closeProvider()
+	store := &blockingTenantGetStore{
+		ContentStore: baseStore, blockedEntered: make(chan struct{}), independentEntered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	adapter, blockedBinding := openKD6ControlTestServer(
+		t, store, filepath.Join(t.TempDir(), "control.db"), time.Now,
+	)
+	defer adapter.Close() //nolint:errcheck
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(store.release) }) }
+	defer release()
+
+	independentBinding := blockedBinding
+	independentBinding.NamespaceUID = "independent-namespace-uid"
+	independentBinding.BackendUID = "independent-backend-uid"
+	independentBinding.TenantID = protocol.DeriveTenantID(independentBinding.ClusterID, independentBinding.NamespaceUID)
+	independentBinding.StoreUUID = ""
+	resolved, err := store.ResolveStore(context.Background(), ResolveStoreRequest{
+		TenantID: independentBinding.TenantID, StoreName: testOMSStoreName, ProviderStoreID: fakeProviderStoreID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeUUID, err := adapter.db.resolveStore(context.Background(), protocol.StoreResolutionBinding{
+		ClusterID: independentBinding.ClusterID, NamespaceUID: independentBinding.NamespaceUID,
+		BackendUID: independentBinding.BackendUID, TenantID: independentBinding.TenantID,
+	}, testOMSStoreName, resolved, adapter.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	independentBinding.StoreUUID = storeUUID
+	decision, err := adapter.db.claimOwnership(context.Background(), store, independentBinding, adapter.now())
+	if err != nil || decision.result != protocol.ResultApplied {
+		t.Fatalf("independent ownership claim = %+v, err = %v", decision, err)
+	}
+	store.blockedTenant = blockedBinding.TenantID
+	store.independentTenant = independentBinding.TenantID
+
+	for index, binding := range []protocol.Binding{blockedBinding, independentBinding} {
+		mutation := newKD6TestMutation(t, binding, fmt.Sprintf("mop-get-concurrency-%d", index),
+			fmt.Sprintf("mem-get-concurrency-%d", index), fmt.Sprintf("content-%d", index))
+		receipt, applyErr := adapter.db.applyMutation(context.Background(), store, &mutation, adapter.now())
+		if applyErr != nil || receipt.Result != protocol.ResultApplied {
+			t.Fatalf("seed mutation %d receipt = %+v, err = %v", index, receipt, applyErr)
+		}
+	}
+
+	type handlerResponse struct {
+		body   []byte
+		status int
+	}
+	handler := http.HandlerFunc(adapter.handleGet)
+	startGet := func(binding protocol.Binding, memoryID string) <-chan handlerResponse {
+		t.Helper()
+		body, marshalErr := json.Marshal(protocol.GetRequest{
+			ProtocolVersion: protocol.Version, Binding: binding,
+			UpsertKey: protocol.CanonicalUpsertKey(binding, memoryID),
+		})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		request := httptest.NewRequest(http.MethodPost, protocol.PathRecordsGet, bytes.NewReader(body))
+		request.Header.Set("Content-Type", kd6TestJSONMediaType)
+		result := make(chan handlerResponse, 1)
+		go func() {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			result <- handlerResponse{body: append([]byte(nil), recorder.Body.Bytes()...), status: recorder.Code}
+		}()
+		return result
+	}
+
+	blockedResult := startGet(blockedBinding, "mem-get-concurrency-0")
+	select {
+	case <-store.blockedEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked tenant get did not reach the provider")
+	}
+	independentResult := startGet(independentBinding, "mem-get-concurrency-1")
+	select {
+	case <-store.independentEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("independent tenant get was blocked behind another tenant's provider request")
+	}
+	select {
+	case response := <-independentResult:
+		if response.status != http.StatusOK {
+			t.Fatalf("independent tenant get status = %d: %s", response.status, response.body)
+		}
+		decoded, decodeErr := protocol.DecodeGetResponse(response.body)
+		if decodeErr != nil || !decoded.Found {
+			t.Fatalf("independent tenant get response = %#v, err = %v", decoded, decodeErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("independent tenant get did not complete")
+	}
+
+	release()
+	select {
+	case response := <-blockedResult:
+		if response.status != http.StatusOK {
+			t.Fatalf("released tenant get status = %d: %s", response.status, response.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("released tenant get did not complete")
 	}
 }
 
