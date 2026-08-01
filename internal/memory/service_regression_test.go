@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -118,6 +119,13 @@ type pagedSearchAdapter struct {
 	getCalls    int
 	pageSizes   []int
 	queries     []string
+	actualModes []string
+
+	getMu         sync.Mutex
+	activeGets    int
+	maxActiveGets int
+	getStarted    chan<- struct{}
+	releaseGets   <-chan struct{}
 }
 
 func newPagedSearchAdapter(binding protocol.Binding, records []protocol.MemoryRecord) *pagedSearchAdapter {
@@ -129,6 +137,7 @@ func newPagedSearchAdapter(binding protocol.Binding, records []protocol.MemoryRe
 }
 
 func (a *pagedSearchAdapter) Search(_ context.Context, request protocol.SearchRequest) (*protocol.SearchResponse, error) {
+	call := a.searchCalls
 	a.searchCalls++
 	a.pageSizes = append(a.pageSizes, request.PageSize)
 	a.queries = append(a.queries, request.Query)
@@ -150,6 +159,9 @@ func (a *pagedSearchAdapter) Search(_ context.Context, request protocol.SearchRe
 	if actualMode == protocol.SearchModeAuto {
 		actualMode = protocol.SearchModeKeyword
 	}
+	if call < len(a.actualModes) {
+		actualMode = a.actualModes[call]
+	}
 	return &protocol.SearchResponse{
 		ProtocolVersion: protocol.Version, Binding: request.Binding,
 		RequestedMode: request.Mode, ActualMode: actualMode, Records: records,
@@ -157,14 +169,74 @@ func (a *pagedSearchAdapter) Search(_ context.Context, request protocol.SearchRe
 	}, nil
 }
 
-func (a *pagedSearchAdapter) Get(_ context.Context, request protocol.GetRequest) (*protocol.GetResponse, error) {
+func (a *pagedSearchAdapter) Get(ctx context.Context, request protocol.GetRequest) (*protocol.GetResponse, error) {
+	a.getMu.Lock()
 	a.getCalls++
+	a.activeGets++
+	a.maxActiveGets = max(a.maxActiveGets, a.activeGets)
 	record, ok := a.byUpsertKey[request.UpsertKey]
+	started := a.getStarted
+	release := a.releaseGets
+	a.getMu.Unlock()
+	defer func() {
+		a.getMu.Lock()
+		a.activeGets--
+		a.getMu.Unlock()
+	}()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if !ok {
 		return &protocol.GetResponse{ProtocolVersion: protocol.Version, Binding: request.Binding, Found: false}, nil
 	}
 	copy := record
 	return &protocol.GetResponse{ProtocolVersion: protocol.Version, Binding: request.Binding, Found: true, Record: &copy}, nil
+}
+
+func (a *pagedSearchAdapter) getStats() (calls, maxActive int) {
+	a.getMu.Lock()
+	defer a.getMu.Unlock()
+	return a.getCalls, a.maxActiveGets
+}
+
+type recordingMaterializationStore struct {
+	*governedSearchStore
+	mu     sync.Mutex
+	issues []store.RemoteMemoryMaterializationIssue
+}
+
+func (s *recordingMaterializationStore) MarkRemoteMemoryMaterializationIssue(
+	_ context.Context,
+	issue store.RemoteMemoryMaterializationIssue,
+) (*store.RemoteMemoryCatalogEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.issues = append(s.issues, issue)
+	entry, ok := s.byID[issue.ID]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	entry.MaterializationState = issue.State
+	s.byID[issue.ID] = entry
+	copy := entry
+	return &copy, nil
+}
+
+func (s *recordingMaterializationStore) recordedIssues() []store.RemoteMemoryMaterializationIssue {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]store.RemoteMemoryMaterializationIssue(nil), s.issues...)
 }
 
 func remoteSearchFixture(
@@ -239,6 +311,23 @@ func remoteSearchService(
 	}
 	service := &Service{Governed: governed, Resolver: staticAuthorityResolver{authority: authority}}
 	return service, adapter, binding, governed
+}
+
+func TestRemoteMutationAdmissionPublicLocationIncludesEncodedNamespace(t *testing.T) {
+	binding := &store.MemoryBackendBinding{
+		ClusterID: "cluster-a", BackendUID: "backend-a", AuthorityEpoch: 1, RoutingEpoch: 1,
+	}
+	authority := &ResolvedAuthority{
+		Namespace: "team blue/child", NamespaceUID: "namespace-a", Binding: binding,
+	}
+	admission := (&Service{}).mutationAdmission(
+		MutationContext{LocationBase: "/api/v1/memory-operations/"}, authority,
+		"memory-a", "operation-a", "", "request-digest", protocol.MutationEnvelope{}, nil, time.Now(),
+	)
+	const want = "/api/v1/memory-operations/operation-a?namespace=team+blue%2Fchild"
+	if admission.Location != want {
+		t.Fatalf("mutation location = %q, want %q", admission.Location, want)
+	}
 }
 
 func TestRemoteSearchRequiresAuthorizationAtEgress(t *testing.T) {
@@ -346,6 +435,101 @@ func TestRemoteCatalogFiltersBeforeLimitAcrossPages(t *testing.T) {
 	}
 }
 
+func TestRemoteCatalogHydratesConcurrentlyWithinFixedBoundAndPreservesOrder(t *testing.T) {
+	now := time.Date(2026, 7, 29, 1, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	count := maxRemoteListHydrationConcurrency + 3
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, count)
+	records := make([]protocol.MemoryRecord, 0, count)
+	for i := range count {
+		entry, record := remoteSearchFixture(binding, fmt.Sprintf("mem-%02d", i), now.Add(-time.Duration(i)*time.Second), "content", store.MemoryTrustReviewed)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	service, adapter, activeBinding, _ := remoteSearchService(t, entries, records)
+	started := make(chan struct{}, count)
+	release := make(chan struct{})
+	adapter.getStarted = started
+	adapter.releaseGets = release
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
+
+	type listResult struct {
+		memories []store.Memory
+		err      error
+	}
+	done := make(chan listResult, 1)
+	go func() {
+		memories, err := service.ListMemories(context.Background(), store.MemoryFilter{
+			Namespace: activeBinding.Namespace, Limit: count,
+		})
+		done <- listResult{memories: memories, err: err}
+	}()
+	for range maxRemoteListHydrationConcurrency {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("remote list hydration did not reach the fixed concurrency bound")
+		}
+	}
+	releaseAll()
+	var listed listResult
+	select {
+	case listed = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote list hydration did not complete")
+	}
+	if listed.err != nil || len(listed.memories) != count {
+		t.Fatalf("ListMemories() = %#v, err=%v", listed.memories, listed.err)
+	}
+	for i := range listed.memories {
+		if listed.memories[i].ID != entries[i].ID {
+			t.Fatalf("memory[%d] = %q, want deterministic %q", i, listed.memories[i].ID, entries[i].ID)
+		}
+	}
+	getCalls, maxActive := adapter.getStats()
+	if getCalls != count || maxActive != maxRemoteListHydrationConcurrency {
+		t.Fatalf("Get calls=%d max active=%d, want %d and %d", getCalls, maxActive, count, maxRemoteListHydrationConcurrency)
+	}
+}
+
+func TestRemoteCatalogConcurrentHydrationStillRejectsDivergence(t *testing.T) {
+	now := time.Date(2026, 7, 29, 1, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	firstEntry, firstRecord := remoteSearchFixture(binding, "mem-1", now, "first", store.MemoryTrustReviewed)
+	secondEntry, secondRecord := remoteSearchFixture(binding, "mem-2", now.Add(-time.Second), "second", store.MemoryTrustReviewed)
+	secondRecord.Content = "tampered"
+	service, _, activeBinding, governed := remoteSearchService(t,
+		[]store.RemoteMemoryCatalogEntry{firstEntry, secondEntry}, []protocol.MemoryRecord{firstRecord, secondRecord})
+	recordingStore := &recordingMaterializationStore{governedSearchStore: governed}
+	service.Governed = recordingStore
+
+	memories, err := service.ListMemories(context.Background(), store.MemoryFilter{
+		Namespace: activeBinding.Namespace, Limit: 2,
+	})
+	var structured *apierror.Error
+	if memories != nil || !errors.As(err, &structured) || structured.Status != http.StatusConflict || structured.Reason != ReasonDiverged {
+		t.Fatalf("ListMemories() = (%#v, %#v), want fail-closed divergence", memories, err)
+	}
+	issues := recordingStore.recordedIssues()
+	if len(issues) != 1 || issues[0].ID != secondEntry.ID || issues[0].State != store.MemoryMaterializationDiverged {
+		t.Fatalf("materialization issues = %#v", issues)
+	}
+}
+
 func TestRemoteSearchCursorPreservesUnconsumedProviderRecords(t *testing.T) {
 	now := time.Date(2026, 7, 29, 1, 0, 0, 0, time.UTC)
 	binding := store.MemoryBackendBinding{
@@ -387,6 +571,39 @@ func TestRemoteSearchCursorPreservesUnconsumedProviderRecords(t *testing.T) {
 	}
 	if len(adapter.pageSizes) != 2 || adapter.pageSizes[0] != adapter.pageSizes[1] {
 		t.Fatalf("provider page sizes = %#v, want stable snapshot page size", adapter.pageSizes)
+	}
+}
+
+func TestRemoteSearchRejectsResolvedModeChangeAcrossPages(t *testing.T) {
+	now := time.Date(2026, 7, 29, 1, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	firstEntry, firstRecord := remoteSearchFixture(binding, "mem-1", now, "needle", store.MemoryTrustReviewed)
+	secondEntry, secondRecord := remoteSearchFixture(binding, "mem-2", now.Add(-time.Second), "needle", store.MemoryTrustReviewed)
+	service, adapter, activeBinding, _ := remoteSearchService(t,
+		[]store.RemoteMemoryCatalogEntry{firstEntry, secondEntry}, []protocol.MemoryRecord{firstRecord, secondRecord})
+	adapter.actualModes = []string{protocol.SearchModeKeyword, protocol.SearchModeSemantic}
+
+	first, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Mode: protocol.SearchModeAuto, Limit: 1,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || first.Cursor == "" || first.ActualMode != protocol.SearchModeKeyword {
+		t.Fatalf("first Search() = %#v, err=%v", first, err)
+	}
+	_, err = service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Mode: protocol.SearchModeAuto, Limit: 1, Cursor: first.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable || structured.Reason != ReasonBackendUnavailable {
+		t.Fatalf("second Search() error = %#v, want changed-mode rejection", err)
+	}
+	if adapter.searchCalls != 2 {
+		t.Fatalf("search calls = %d, want 2", adapter.searchCalls)
 	}
 }
 

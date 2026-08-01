@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,6 +33,7 @@ const (
 	maxRemoteSearchPages              = 20
 	maxRemoteListCandidates           = 1000
 	maxRemoteListPages                = 20
+	maxRemoteListHydrationConcurrency = 8
 	remoteListCursorTTL               = 5 * time.Minute
 	maxRemoteListCursorBytes          = 4 << 10
 	legacyMemoryDisableAuditAction    = "memory.disable"
@@ -207,6 +210,8 @@ func (s *Service) listRemoteMemoriesPage(
 		}
 		pages++
 		processed := 0
+		remaining := limit - len(result)
+		candidates := make([]store.RemoteMemoryCatalogEntry, 0, min(remaining, len(entries)))
 		for i := range entries {
 			entry := &entries[i]
 			processed++
@@ -217,15 +222,16 @@ func (s *Service) listRemoteMemoriesPage(
 			if !entryMatchesAuthority(entry, authority.Binding) || !memoryEntryMatchesFilter(entry, filter) {
 				continue
 			}
-			memory, hydrateErr := s.hydrate(ctx, authority, entry)
-			if hydrateErr != nil {
-				return nil, hydrateErr
-			}
-			result = append(result, *memory)
-			if len(result) == limit {
+			candidates = append(candidates, *entry)
+			if len(candidates) == remaining {
 				break
 			}
 		}
+		hydrated, hydrateErr := s.hydrateRemoteListEntries(ctx, authority, candidates)
+		if hydrateErr != nil {
+			return nil, hydrateErr
+		}
+		result = append(result, hydrated...)
 		if processed == len(entries) && len(entries) < pageSize {
 			exhausted = true
 			break
@@ -253,6 +259,49 @@ func (s *Service) listRemoteMemoriesPage(
 		}
 	}
 	return &ListPage{Items: result, Cursor: nextCursor, Exhausted: exhausted, Complete: true, Paginated: true}, nil
+}
+
+func (s *Service) hydrateRemoteListEntries(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	entries []store.RemoteMemoryCatalogEntry,
+) ([]store.Memory, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	memories := make([]*store.Memory, len(entries))
+	errs := make([]error, len(entries))
+	jobs := make(chan int, len(entries))
+	for i := range entries {
+		jobs <- i
+	}
+	close(jobs)
+
+	workerCount := min(maxRemoteListHydrationConcurrency, len(entries))
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for i := range jobs {
+				memories[i], errs[i] = s.hydrate(ctx, authority, &entries[i])
+			}
+		}()
+	}
+	workers.Wait()
+
+	result := make([]store.Memory, 0, len(entries))
+	for i := range entries {
+		if errs[i] != nil {
+			return nil, errs[i]
+		}
+		if memories[i] == nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+				"memory backend hydration returned no record")
+		}
+		result = append(result, *memories[i])
+	}
+	return result, nil
 }
 
 func remoteListQueryDigest(filter store.MemoryFilter) string {
@@ -874,7 +923,13 @@ func (s *Service) mutationAdmission(
 	if locationBase == "" {
 		locationBase = "/api/v1/memory-operations/"
 	}
-	location := strings.TrimRight(locationBase, "/") + "/" + operationID
+	trimmedLocationBase := strings.TrimRight(locationBase, "/")
+	location := trimmedLocationBase + "/" + operationID
+	if trimmedLocationBase == "/api/v1/memory-operations" {
+		query := url.Values{}
+		query.Set("namespace", authority.Namespace)
+		location += "?" + query.Encode()
+	}
 	return store.MemoryMutationAdmission{
 		Namespace: authority.Namespace, NamespaceUID: authority.NamespaceUID,
 		ClusterID: authority.Binding.ClusterID, BackendUID: authority.Binding.BackendUID,
@@ -1463,6 +1518,10 @@ func (s *Service) search(
 		}
 		if len(response.Records) > cursorState.PageSize {
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search backend exceeded the requested page bound")
+		}
+		if cursorState.ActualMode != "" && response.ActualMode != cursorState.ActualMode {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+				"memory search backend changed the resolved mode across pages")
 		}
 		actualMode = response.ActualMode
 		cursorState.ActualMode = response.ActualMode
