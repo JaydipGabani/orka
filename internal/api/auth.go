@@ -199,8 +199,12 @@ func NewAuthMiddleware(c client.Client, configs ...AuthConfig) fiber.Handler {
 			return fiber.NewError(fiber.StatusUnauthorized, "invalid token")
 		}
 
-		// Store user info in context
+		// Store user info and the verified request-local credential in context.
+		// The raw credential is never copied into UserInfo or persisted on a Task.
 		ctx.Locals(UserInfoContextKey, userInfo)
+		if ok {
+			ctx.Locals(contextTokenCredentialLocalKey, contextToken)
+		}
 
 		return ctx.Next()
 	}

@@ -27,6 +27,11 @@ const (
 	SubjectTokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token"
 	// ResponseTokenType is the token_type returned by a transaction-token service.
 	ResponseTokenType = "N_A"
+
+	// TokenSecretKey stores a task-bound transaction token in an owner-referenced Secret.
+	TokenSecretKey = "token"
+	// SubjectSecretKey stores the verified caller token only while post-create task binding is pending.
+	SubjectSecretKey = "subject-token"
 )
 
 // RequiredClaims are mandatory in every transaction token accepted by Orka.

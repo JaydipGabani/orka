@@ -702,13 +702,37 @@ func (r *TaskReconciler) handleTransactionTokenPending(ctx context.Context, task
 
 	elapsed := now.Sub(since)
 	if elapsed >= taskTransactionTokenPendingTimeout {
-		msg := fmt.Sprintf("delegated transaction token setup timed out after %s", taskTransactionTokenPendingTimeout)
+		if cleanupErr := r.cleanupOwnedTaskTransactionTokenSecret(ctx, task); cleanupErr != nil {
+			return ctrl.Result{}, cleanupErr
+		}
+		msg := fmt.Sprintf("transaction token setup timed out after %s", taskTransactionTokenPendingTimeout)
 		r.Recorder.Event(task, corev1.EventTypeWarning, "TransactionTokenPendingTimeout", msg)
 		return r.failTask(ctx, task, msg)
 	}
 
+	ready, fatal, setupErr := r.reconcilePendingTaskTransactionToken(ctx, task)
+	if setupErr != nil {
+		if !fatal {
+			return ctrl.Result{}, setupErr
+		}
+		log.Info("task-scoped transaction token setup failed; failing closed")
+		if cleanupErr := r.cleanupOwnedTaskTransactionTokenSecret(ctx, task); cleanupErr != nil {
+			return ctrl.Result{}, cleanupErr
+		}
+		msg := "task-scoped transaction token setup failed"
+		r.Recorder.Event(task, corev1.EventTypeWarning, "TransactionTokenSetupFailed", msg)
+		return r.failTask(ctx, task, msg)
+	}
+	if ready {
+		if err := r.clearPendingTaskTransactionToken(ctx, task); err != nil {
+			return ctrl.Result{}, err
+		}
+		log.Info("task-scoped transaction token setup completed")
+		return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
+	}
+
 	requeueAfter := min(taskTransactionTokenPendingTimeout-elapsed, time.Second)
-	log.Info("task is waiting for delegated transaction token setup", "pendingSince", since)
+	log.Info("task is waiting for transaction token setup", "pendingSince", since)
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 

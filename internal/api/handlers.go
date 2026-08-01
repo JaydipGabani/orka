@@ -526,11 +526,27 @@ func (h *Handlers) CreateTask(c fiber.Ctx) error {
 		return err
 	}
 
+	directTransactionToken, err := h.prepareDirectTaskTransactionToken(c, task)
+	if err != nil {
+		return err
+	}
+
 	if err := h.client.Create(ctx, task); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return fiber.NewError(fiber.StatusConflict, "task already exists")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create task: %v", err))
+	}
+
+	if directTransactionToken != "" {
+		if err := h.persistDirectTaskTransactionTokenSubject(ctx, task, directTransactionToken); err != nil {
+			log.Error(err, "failed to stage task transaction token setup", "namespace", task.Namespace, "task", task.Name)
+			if cleanupErr := h.cleanupTaskAfterTransactionTokenSetupFailure(ctx, task); cleanupErr != nil {
+				log.Error(cleanupErr, "failed to clean up task after transaction token setup failure",
+					"namespace", task.Namespace, "task", task.Name)
+			}
+			return fiber.NewError(fiber.StatusServiceUnavailable, "failed to provision task-scoped transaction token")
+		}
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(task)
