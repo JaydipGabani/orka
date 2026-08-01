@@ -600,6 +600,10 @@ func ValidateSearchRequest(request *SearchRequest) error {
 }
 
 func ValidateSearchResponse(response *SearchResponse) error {
+	return validateSearchResponseAt(response, time.Now())
+}
+
+func validateSearchResponseAt(response *SearchResponse, now time.Time) error {
 	if response == nil {
 		return errors.New("search response is required")
 	}
@@ -638,6 +642,9 @@ func ValidateSearchResponse(response *SearchResponse) error {
 	}
 	if response.SnapshotExpiresAt.IsZero() {
 		return errors.New("snapshotExpiresAt is required")
+	}
+	if !response.Exhausted && !response.SnapshotExpiresAt.After(now) {
+		return errors.New("snapshotExpiresAt must be in the future for a continuation")
 	}
 	return nil
 }

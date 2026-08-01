@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
 )
 
 func FuzzDecodeMutationEnvelope(f *testing.F) {
@@ -117,6 +118,38 @@ func FuzzValidateJSONNullabilityRejectsTypedNulls(f *testing.F) {
 		var target fixture
 		if err := ValidateJSONNullability(body, &target); err == nil {
 			t.Fatalf("accepted typed null: %s", body)
+		}
+	})
+}
+
+func FuzzValidateSearchResponseSnapshotExpiry(f *testing.F) {
+	f.Add(int64(-1), false)
+	f.Add(int64(0), false)
+	f.Add(int64(1), false)
+	f.Add(int64(-time.Minute), true)
+	f.Fuzz(func(t *testing.T, offsetNanos int64, exhausted bool) {
+		now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+		response := validSearchResponseForTest(now, exhausted)
+		response.SnapshotExpiresAt = now.Add(time.Duration(offsetNanos))
+
+		err := validateSearchResponseAt(&response, now)
+		wantErr := !exhausted && offsetNanos <= 0
+		if (err != nil) != wantErr {
+			t.Fatalf("validateSearchResponseAt() error = %v, offset=%s exhausted=%v wantErr=%v",
+				err, time.Duration(offsetNanos), exhausted, wantErr)
+		}
+		if err != nil || exhausted {
+			return
+		}
+
+		localExpiry := now.Add(5 * time.Minute)
+		continuationExpiry, ok := response.ContinuationExpiresAt(localExpiry)
+		if !ok {
+			t.Fatal("ContinuationExpiresAt() hid a validated nonterminal continuation")
+		}
+		if continuationExpiry.After(localExpiry) || continuationExpiry.After(response.SnapshotExpiresAt) {
+			t.Fatalf("ContinuationExpiresAt() exceeded a bound: got=%v local=%v snapshot=%v",
+				continuationExpiry, localExpiry, response.SnapshotExpiresAt)
 		}
 	})
 }

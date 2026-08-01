@@ -238,6 +238,87 @@ func TestCapabilitiesRequireAllWritableSemanticsAndFiniteLimits(t *testing.T) {
 	}
 }
 
+func TestSearchResponseRequiresFutureSnapshotForContinuation(t *testing.T) {
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		exhausted bool
+		offset    time.Duration
+		wantErr   bool
+	}{
+		{name: "expired continuation", offset: -time.Nanosecond, wantErr: true},
+		{name: "expiry equal to validation time", offset: 0, wantErr: true},
+		{name: "strictly future continuation", offset: time.Nanosecond},
+		{name: "terminal page may report elapsed snapshot", exhausted: true, offset: -time.Minute},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := validSearchResponseForTest(now, test.exhausted)
+			response.SnapshotExpiresAt = now.Add(test.offset)
+			err := validateSearchResponseAt(&response, now)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateSearchResponseAt() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestDecodeSearchResponseRejectsExpiredContinuationSnapshot(t *testing.T) {
+	now := time.Now().UTC()
+	response := validSearchResponseForTest(now, false)
+	response.SnapshotExpiresAt = now.Add(-time.Second)
+	body, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeSearchResponse(body); err == nil {
+		t.Fatal("DecodeSearchResponse() accepted an expired continuation snapshot")
+	}
+
+	response.SnapshotExpiresAt = time.Now().UTC().Add(time.Hour)
+	body, err = json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeSearchResponse(body); err != nil {
+		t.Fatalf("DecodeSearchResponse() rejected a future continuation snapshot: %v", err)
+	}
+}
+
+func TestSearchResponseContinuationExpiresAtCapsLocalDeadline(t *testing.T) {
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	response := validSearchResponseForTest(now, false)
+	response.SnapshotExpiresAt = now.Add(2 * time.Minute)
+
+	tests := []struct {
+		name  string
+		local time.Time
+		want  time.Time
+	}{
+		{name: "provider only", want: response.SnapshotExpiresAt},
+		{name: "shorter local deadline", local: now.Add(time.Minute), want: now.Add(time.Minute)},
+		{name: "equal deadline", local: response.SnapshotExpiresAt, want: response.SnapshotExpiresAt},
+		{name: "provider caps longer deadline", local: now.Add(5 * time.Minute), want: response.SnapshotExpiresAt},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := response.ContinuationExpiresAt(test.local)
+			if !ok {
+				t.Fatal("ContinuationExpiresAt() did not expose a nonterminal continuation")
+			}
+			if !got.Equal(test.want) {
+				t.Fatalf("ContinuationExpiresAt() = %v, want %v", got, test.want)
+			}
+		})
+	}
+
+	response.Exhausted = true
+	response.NextPageToken = ""
+	if expiry, ok := response.ContinuationExpiresAt(now.Add(time.Minute)); ok || !expiry.IsZero() {
+		t.Fatalf("ContinuationExpiresAt() exposed terminal response expiry %v", expiry)
+	}
+}
+
 func TestSearchResponseRejectsNonzeroKeywordScore(t *testing.T) {
 	binding := testBinding()
 	content := "keyword result"
@@ -349,6 +430,18 @@ func TestSearchResponseRequiresExplicitExhaustionMarker(t *testing.T) {
 	response.Exhausted = true
 	if err := ValidateSearchResponse(&response); err != nil {
 		t.Fatalf("valid exhausted search response: %v", err)
+	}
+}
+
+func validSearchResponseForTest(now time.Time, exhausted bool) SearchResponse {
+	nextPageToken := ""
+	if !exhausted {
+		nextPageToken = "oms-page-v1." + strings.Repeat("a", 32) + ".1"
+	}
+	return SearchResponse{
+		ProtocolVersion: Version, Binding: testBinding(), RequestedMode: SearchModeAuto,
+		ActualMode: SearchModeKeyword, Records: []MemoryRecord{}, NextPageToken: nextPageToken,
+		Exhausted: exhausted, SnapshotExpiresAt: now.Add(time.Minute),
 	}
 }
 

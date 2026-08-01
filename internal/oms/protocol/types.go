@@ -326,6 +326,20 @@ type SearchResponse struct {
 	SnapshotExpiresAt time.Time      `json:"snapshotExpiresAt"`
 }
 
+// ContinuationExpiresAt caps a caller-selected local continuation deadline at
+// the provider snapshot expiry. The boolean is false when this response does
+// not carry a nonterminal continuation. Callers should use this only after the
+// response has passed protocol validation.
+func (response SearchResponse) ContinuationExpiresAt(localExpiresAt time.Time) (time.Time, bool) {
+	if response.Exhausted || response.NextPageToken == "" || response.SnapshotExpiresAt.IsZero() {
+		return time.Time{}, false
+	}
+	if localExpiresAt.IsZero() || !localExpiresAt.Before(response.SnapshotExpiresAt) {
+		return response.SnapshotExpiresAt, true
+	}
+	return localExpiresAt, true
+}
+
 // ErrorResponse is used only for transport/codec/profile errors. Semantic
 // mutation outcomes use MutationReceipt variants.
 type ErrorResponse struct {
