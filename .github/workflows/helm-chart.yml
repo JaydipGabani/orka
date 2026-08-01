@@ -341,8 +341,8 @@ jobs:
           grep -Fq 'name: secondary-orka-task-job-provenance-preflight' "${secondary_task_worker_policy}"
           grep -Fq 'name: secondary-orka-task-pod-provenance-preflight' "${secondary_task_worker_policy}"
           test "$(grep -Fc 'helm.sh/hook: pre-install,pre-upgrade' "${secondary_task_worker_policy}")" -eq 4
-          test "$(grep -Fc 'helm.sh/hook-weight: \"-20\"' "${secondary_task_worker_policy}")" -eq 2
-          test "$(grep -Fc 'helm.sh/hook-weight: \"-10\"' "${secondary_task_worker_policy}")" -eq 2
+          test "$(grep -Fc 'helm.sh/hook-weight: "-20"' "${secondary_task_worker_policy}")" -eq 2
+          test "$(grep -Fc 'helm.sh/hook-weight: "-10"' "${secondary_task_worker_policy}")" -eq 2
           grep -Fq ".subresource('task-provenance')" "${secondary_task_worker_policy}"
           grep -Fq 'orka.ai/task-name' "${secondary_task_worker_policy}"
           grep -Fq 'resources: ["pods/task-provenance"]' "${secondary_task_provenance_rbac}"
@@ -350,7 +350,7 @@ jobs:
           grep -Fq 'name: secondary-orka-task-job-provenance-controller-preflight' "${secondary_task_provenance_rbac}"
           grep -Fq 'name: secondary-orka-task-pod-provenance-admitter-preflight' "${secondary_task_provenance_rbac}"
           test "$(grep -Fc 'helm.sh/hook: pre-install,pre-upgrade' "${secondary_task_provenance_rbac}")" -eq 4
-          test "$(grep -Fc 'helm.sh/hook-weight: \"-40\"' "${secondary_task_provenance_rbac}")" -eq 4
+          test "$(grep -Fc 'helm.sh/hook-weight: "-40"' "${secondary_task_provenance_rbac}")" -eq 4
           grep -Fq 'helm.sh/resource-policy: keep' "${secondary_store_pvc}"
           grep -Fq 'claimName: operator-store' "${external_store_render}"
           if grep -Fq '# Source: orka/templates/store-pvc.yaml' "${external_store_render}"; then
