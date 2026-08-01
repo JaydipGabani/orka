@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -303,6 +304,17 @@ func migrateMemoryGovernance(db *sql.DB) error {
 			WHERE source_proposal_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_remote_memory_catalog_list
 			ON remote_memory_catalog(namespace_uid, deleted, disabled, updated_at DESC, id DESC)`,
+		`CREATE TABLE IF NOT EXISTS remote_memory_generation_watermarks (
+			namespace_uid   TEXT NOT NULL,
+			id              TEXT NOT NULL,
+			backend_uid     TEXT NOT NULL,
+			authority_epoch INTEGER NOT NULL CHECK (authority_epoch > 0),
+			routing_epoch   INTEGER NOT NULL CHECK (routing_epoch > 0),
+			store_uuid      TEXT NOT NULL,
+			generation      INTEGER NOT NULL CHECK (generation > 0),
+			updated_at      TIMESTAMP NOT NULL,
+			PRIMARY KEY (namespace_uid, id)
+		)`,
 		`CREATE TABLE IF NOT EXISTS memory_operations (
 			sequence                         INTEGER PRIMARY KEY AUTOINCREMENT,
 			id                               TEXT NOT NULL UNIQUE,
@@ -2229,7 +2241,24 @@ func admitRemoteMemoryCreateTx(
 	proposalAppliedBy string,
 ) (*store.RemoteMemoryCatalogEntry, *store.MemoryOperation, error) {
 	proposalApply := proposalAppliedBy != ""
-	if err := validateAndCanonicalizeMemoryMutation(&mutation, store.MemoryOperationCreate, 1, 0, "", binding); err != nil {
+	if _, err := getRemoteMemoryQuery(ctx, tx, mutation.NamespaceUID, mutation.MemoryID); err == nil {
+		return nil, nil, fmt.Errorf("%w: memory id already exists", store.ErrConflict)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, err
+	}
+	expectedGeneration, err := getRemoteMemoryGenerationWatermarkQuery(
+		ctx, tx, mutation.NamespaceUID, mutation.MemoryID, binding.BackendUID, binding.AuthorityEpoch, binding.StoreUUID,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	if expectedGeneration == math.MaxInt64 {
+		return nil, nil, fmt.Errorf("%w: memory generation watermark is exhausted", store.ErrConflict)
+	}
+	desiredGeneration := expectedGeneration + 1
+	if err := validateAndCanonicalizeMemoryMutation(
+		&mutation, store.MemoryOperationCreate, desiredGeneration, expectedGeneration, "", binding,
+	); err != nil {
 		return nil, nil, err
 	}
 	canonicalTags, err := canonicalMutationTags(mutation.Payload)
@@ -2238,11 +2267,6 @@ func admitRemoteMemoryCreateTx(
 	}
 	desired.Tags = canonicalTags
 	if err := enforceMemoryOperationAdmissionCapacity(ctx, tx, mutation.NamespaceUID, mutation.Payload, store.MemoryOperationCreate); err != nil {
-		return nil, nil, err
-	}
-	if _, err := getRemoteMemoryQuery(ctx, tx, mutation.NamespaceUID, mutation.MemoryID); err == nil {
-		return nil, nil, fmt.Errorf("%w: memory id already exists", store.ErrConflict)
-	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, err
 	}
 	if proposalApply {
@@ -2262,7 +2286,9 @@ func admitRemoteMemoryCreateTx(
 		if proposal.ReviewedAt == nil {
 			return nil, nil, store.ValidationErrorf("proposal is missing an authoritative review")
 		}
-		if err := validateRemoteProposalApplyMutation(proposal, mutation, &desired, binding); err != nil {
+		if err := validateRemoteProposalApplyMutation(
+			proposal, mutation, &desired, binding, desiredGeneration, expectedGeneration,
+		); err != nil {
 			return nil, nil, err
 		}
 		result, err := tx.ExecContext(ctx, `UPDATE memory_proposals
@@ -2277,15 +2303,21 @@ func admitRemoteMemoryCreateTx(
 			return nil, nil, err
 		}
 	}
-	catalog := normalizeNewRemoteCatalog(desired, mutation, binding, proposalApply)
+	catalog := normalizeNewRemoteCatalog(
+		desired, mutation, binding, proposalApply, expectedGeneration, desiredGeneration,
+	)
 	if err := insertRemoteMemoryCatalog(ctx, tx, &catalog); err != nil {
 		if isSQLiteConstraintError(err) {
 			return nil, nil, fmt.Errorf("%w: remote memory catalog identity already exists", store.ErrConflict)
 		}
 		return nil, nil, err
 	}
-	operation := newMemoryOperation(mutation, store.MemoryOperationCreate, 1, 0, "")
+	operation := newMemoryOperation(mutation, store.MemoryOperationCreate, desiredGeneration, expectedGeneration, "")
 	if err := insertMemoryOperationWithPayload(ctx, tx, &operation, mutation.Payload); err != nil {
+		return nil, nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM remote_memory_generation_watermarks
+		WHERE namespace_uid = ? AND id = ?`, mutation.NamespaceUID, mutation.MemoryID); err != nil {
 		return nil, nil, err
 	}
 	return &catalog, &operation, nil
@@ -2296,14 +2328,15 @@ func validateRemoteProposalApplyMutation(
 	mutation store.MemoryMutationAdmission,
 	desired *store.RemoteMemoryCatalogEntry,
 	binding *store.MemoryBackendBinding,
+	desiredGeneration, expectedGeneration int64,
 ) error {
 	envelope, err := omsprotocol.DecodeMutationEnvelope(mutation.Payload)
 	if err != nil {
 		return store.ValidationErrorf("canonical proposal mutation payload is invalid: %v", err)
 	}
 	if envelope.OperationID != mutation.OperationID || envelope.MemoryID != mutation.MemoryID ||
-		envelope.Kind != omsprotocol.MutationKindCreate || envelope.Generation != 1 ||
-		envelope.ExpectedGeneration != 0 || envelope.ExpectedBackendVersion != "" ||
+		envelope.Kind != omsprotocol.MutationKindCreate || envelope.Generation != uint64(desiredGeneration) ||
+		envelope.ExpectedGeneration != uint64(expectedGeneration) || envelope.ExpectedBackendVersion != "" ||
 		envelope.MutationDigest != mutation.MutationDigest || envelope.ContentDigest != mutation.ContentDigest {
 		return store.ValidationErrorf("canonical proposal mutation payload does not match the admitted mutation")
 	}
@@ -2577,7 +2610,13 @@ func canonicalMutationTags(payload []byte) ([]string, error) {
 	return append([]string(nil), envelope.State.Tags...), nil
 }
 
-func normalizeNewRemoteCatalog(desired store.RemoteMemoryCatalogEntry, mutation store.MemoryMutationAdmission, binding *store.MemoryBackendBinding, proposalApply bool) store.RemoteMemoryCatalogEntry {
+func normalizeNewRemoteCatalog(
+	desired store.RemoteMemoryCatalogEntry,
+	mutation store.MemoryMutationAdmission,
+	binding *store.MemoryBackendBinding,
+	proposalApply bool,
+	expectedGeneration, desiredGeneration int64,
+) store.RemoteMemoryCatalogEntry {
 	trust := store.MemoryTrustUntrusted
 	sourceProposalID := ""
 	if proposalApply {
@@ -2592,7 +2631,7 @@ func normalizeNewRemoteCatalog(desired store.RemoteMemoryCatalogEntry, mutation 
 		ID: mutation.MemoryID, Namespace: mutation.Namespace, NamespaceUID: mutation.NamespaceUID,
 		ClusterID: mutation.ClusterID, BackendUID: mutation.BackendUID, AuthorityEpoch: mutation.AuthorityEpoch,
 		RoutingEpoch: mutation.RoutingEpoch, TenantID: binding.TenantID, StoreUUID: binding.StoreUUID,
-		Generation: 0, DesiredGeneration: 1, GovernanceRevision: 1,
+		Generation: expectedGeneration, DesiredGeneration: desiredGeneration, GovernanceRevision: 1,
 		MaterializationState: store.MemoryMaterializationPending, Trust: trust,
 		SessionName: desired.SessionName, AgentName: desired.AgentName, TaskName: desired.TaskName,
 		ParentTask: desired.ParentTask, Source: source, SourceProposalID: sourceProposalID,
@@ -2978,8 +3017,11 @@ func enforceMemoryGovernanceAdmissionCapacity(ctx context.Context, q rowQueryer,
 	}
 	if limits.NamespaceTombstoneRows > 0 {
 		var tombstones int64
-		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM remote_memory_catalog
-			WHERE namespace_uid = ? AND (deleted = TRUE OR materialization_state IN ('deleted','orphaned'))`, namespaceUID).Scan(&tombstones); err != nil {
+		if err := q.QueryRowContext(ctx, `SELECT
+			(SELECT COUNT(*) FROM remote_memory_catalog
+				WHERE namespace_uid = ? AND (deleted = TRUE OR materialization_state IN ('deleted','orphaned'))) +
+			(SELECT COUNT(*) FROM remote_memory_generation_watermarks WHERE namespace_uid = ?)`,
+			namespaceUID, namespaceUID).Scan(&tombstones); err != nil {
 			return err
 		}
 		if !safetyOperation && tombstones >= threshold(limits.NamespaceTombstoneRows) {
@@ -2988,8 +3030,10 @@ func enforceMemoryGovernanceAdmissionCapacity(ctx context.Context, q rowQueryer,
 	}
 	if limits.GlobalTombstoneRows > 0 {
 		var tombstones int64
-		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM remote_memory_catalog
-			WHERE deleted = TRUE OR materialization_state IN ('deleted','orphaned')`).Scan(&tombstones); err != nil {
+		if err := q.QueryRowContext(ctx, `SELECT
+			(SELECT COUNT(*) FROM remote_memory_catalog
+				WHERE deleted = TRUE OR materialization_state IN ('deleted','orphaned')) +
+			(SELECT COUNT(*) FROM remote_memory_generation_watermarks)`).Scan(&tombstones); err != nil {
 			return err
 		}
 		if !safetyOperation && tombstones >= threshold(limits.GlobalTombstoneRows) {
@@ -3224,6 +3268,26 @@ func (s *Store) GetRemoteMemory(ctx context.Context, namespaceUID, id string) (*
 		return nil, store.ErrNotFound
 	}
 	return catalog, err
+}
+
+// GetRemoteMemoryGenerationWatermark returns the compact provider generation
+// retained after a catalog tombstone has been purged for the same authority.
+func (s *Store) GetRemoteMemoryGenerationWatermark(
+	ctx context.Context,
+	namespaceUID, id, backendUID string,
+	authorityEpoch int64,
+	storeUUID string,
+) (int64, error) {
+	namespaceUID = strings.TrimSpace(namespaceUID)
+	id = strings.TrimSpace(id)
+	backendUID = strings.TrimSpace(backendUID)
+	storeUUID = strings.TrimSpace(storeUUID)
+	if namespaceUID == "" || id == "" || backendUID == "" || authorityEpoch <= 0 || storeUUID == "" {
+		return 0, store.ValidationErrorf("generation watermark requires exact memory authority identity")
+	}
+	return getRemoteMemoryGenerationWatermarkQuery(
+		ctx, s.db, namespaceUID, id, backendUID, authorityEpoch, storeUUID,
+	)
 }
 
 // ListRemoteMemories lists catalog metadata deterministically without loading operation payloads.
@@ -3718,6 +3782,29 @@ func selectRemoteMemorySQL() string {
 
 func getRemoteMemoryQuery(ctx context.Context, q rowQueryer, namespaceUID, id string) (*store.RemoteMemoryCatalogEntry, error) {
 	return scanRemoteMemory(q.QueryRowContext(ctx, selectRemoteMemorySQL()+` WHERE namespace_uid = ? AND id = ?`, namespaceUID, id))
+}
+
+func getRemoteMemoryGenerationWatermarkQuery(
+	ctx context.Context,
+	q rowQueryer,
+	namespaceUID, id, backendUID string,
+	authorityEpoch int64,
+	storeUUID string,
+) (int64, error) {
+	var generation int64
+	err := q.QueryRowContext(ctx, `SELECT generation FROM remote_memory_generation_watermarks
+		WHERE namespace_uid = ? AND id = ? AND backend_uid = ? AND authority_epoch = ? AND store_uuid = ?`,
+		namespaceUID, id, backendUID, authorityEpoch, storeUUID).Scan(&generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if generation <= 0 {
+		return 0, store.ValidationErrorf("stored memory generation watermark is invalid")
+	}
+	return generation, nil
 }
 
 func scanRemoteMemory(scanner rowScanner) (*store.RemoteMemoryCatalogEntry, error) {
@@ -4697,7 +4784,7 @@ func (s *Store) RecordMemoryVerifiedCheckpoint(ctx context.Context, checkpoint s
 	}
 	var maximumCommitted int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence), 0) FROM memory_operations
-		WHERE namespace_uid = ? AND backend_uid = ? AND authority_epoch = ? AND routing_epoch = ?`,
+		WHERE namespace_uid = ? AND backend_uid = ? AND authority_epoch = ? AND routing_epoch <= ?`,
 		checkpoint.NamespaceUID, checkpoint.BackendUID, checkpoint.AuthorityEpoch, checkpoint.RoutingEpoch).
 		Scan(&maximumCommitted); err != nil {
 		return nil, err
@@ -4707,7 +4794,7 @@ func (s *Store) RecordMemoryVerifiedCheckpoint(ctx context.Context, checkpoint s
 	}
 	var unresolved int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM memory_operations
-		WHERE namespace_uid = ? AND backend_uid = ? AND authority_epoch = ? AND routing_epoch = ? AND sequence <= ?
+		WHERE namespace_uid = ? AND backend_uid = ? AND authority_epoch = ? AND routing_epoch <= ? AND sequence <= ?
 			AND state IN ('queued','leased','dispatching','ambiguous','dead_lettered')`,
 		checkpoint.NamespaceUID, checkpoint.BackendUID, checkpoint.AuthorityEpoch, checkpoint.RoutingEpoch,
 		checkpoint.MaximumOperationSequence).Scan(&unresolved); err != nil {
@@ -4725,9 +4812,9 @@ func (s *Store) RecordMemoryVerifiedCheckpoint(ctx context.Context, checkpoint s
 		return nil, err
 	}
 	if err == nil && existingBackend == checkpoint.BackendUID && existingAuthority == checkpoint.AuthorityEpoch &&
-		existingRouting == checkpoint.RoutingEpoch && existingStore == checkpoint.StoreUUID &&
-		checkpoint.MaximumOperationSequence < existingSequence {
-		return nil, fmt.Errorf("%w: checkpoint sequence cannot move backward", store.ErrConflict)
+		existingStore == checkpoint.StoreUUID &&
+		(checkpoint.RoutingEpoch < existingRouting || checkpoint.MaximumOperationSequence < existingSequence) {
+		return nil, fmt.Errorf("%w: checkpoint route or sequence cannot move backward", store.ErrConflict)
 	}
 	checkpoint.Namespace = binding.Namespace
 	checkpoint.TenantID = binding.TenantID
@@ -4830,7 +4917,7 @@ func (s *Store) PurgeMemoryGovernance(ctx context.Context, purge store.MemoryGov
 	result := &store.MemoryGovernancePurgeResult{}
 	if purge.PurgePayloads {
 		updated, err := tx.ExecContext(ctx, `UPDATE memory_operations SET payload = X'', payload_bytes = 0
-			WHERE namespace_uid = ? AND backend_uid = ? AND authority_epoch = ? AND routing_epoch = ?
+			WHERE namespace_uid = ? AND backend_uid = ? AND authority_epoch = ? AND routing_epoch <= ?
 				AND sequence <= ? AND state IN ('succeeded','abandoned','superseded','orphaned')
 				AND completed_at IS NOT NULL AND completed_at < ?
 				AND payload_retain_until <= ? AND length(payload) > 0`, purge.NamespaceUID, purge.BackendUID,
@@ -4847,7 +4934,7 @@ func (s *Store) PurgeMemoryGovernance(ctx context.Context, purge store.MemoryGov
 		updated, err := tx.ExecContext(ctx, `UPDATE memory_operations SET receipt_binding_digest = '',
 			receipt_applied_generation = 0, receipt_backend_version = '', receipt_backend_memory_id = '',
 			receipt_content_digest = '', receipt_mutation_digest = '', receipt_completed_at = NULL
-			WHERE namespace_uid = ? AND backend_uid = ? AND authority_epoch = ? AND routing_epoch = ?
+			WHERE namespace_uid = ? AND backend_uid = ? AND authority_epoch = ? AND routing_epoch <= ?
 				AND sequence <= ? AND state = 'succeeded' AND completed_at IS NOT NULL AND completed_at < ?
 				AND (receipt_binding_digest <> '' OR receipt_applied_generation <> 0 OR receipt_backend_version <> ''
 					OR receipt_backend_memory_id <> '' OR receipt_content_digest <> '' OR receipt_mutation_digest <> ''
@@ -4881,7 +4968,7 @@ func (s *Store) PurgeMemoryGovernance(ctx context.Context, purge store.MemoryGov
 		for {
 			rows, err := tx.QueryContext(ctx, `SELECT c.id FROM remote_memory_catalog c
 				WHERE c.namespace_uid = ? AND c.backend_uid = ? AND c.authority_epoch = ?
-					AND c.routing_epoch >= ? AND c.store_uuid = ? AND c.updated_at < ?
+					AND c.routing_epoch <= ? AND c.store_uuid = ? AND c.updated_at < ?
 					AND (c.deleted = TRUE OR c.materialization_state IN ('deleted','orphaned'))
 					AND NOT EXISTS (SELECT 1 FROM memory_idempotency i
 						WHERE i.namespace_uid = c.namespace_uid AND i.memory_id = c.id)
@@ -4925,6 +5012,31 @@ func (s *Store) PurgeMemoryGovernance(ctx context.Context, purge store.MemoryGov
 			args = append(args, purge.NamespaceUID)
 			for _, id := range ids {
 				args = append(args, id)
+			}
+			watermarkArgs := make([]any, 0, len(args)+1)
+			watermarkArgs = append(watermarkArgs, purge.Now)
+			watermarkArgs = append(watermarkArgs, args...)
+			if _, err := tx.ExecContext(ctx, `INSERT INTO remote_memory_generation_watermarks
+				(namespace_uid, id, backend_uid, authority_epoch, routing_epoch, store_uuid, generation, updated_at)
+				SELECT c.namespace_uid, c.id, c.backend_uid, c.authority_epoch, c.routing_epoch, c.store_uuid,
+					MAX(c.generation, c.desired_generation), ?
+				FROM remote_memory_catalog c WHERE c.namespace_uid = ? AND c.id IN (`+placeholders+`)
+				ON CONFLICT(namespace_uid, id) DO UPDATE SET
+					backend_uid = excluded.backend_uid, authority_epoch = excluded.authority_epoch,
+					routing_epoch = CASE
+						WHEN remote_memory_generation_watermarks.backend_uid = excluded.backend_uid
+							AND remote_memory_generation_watermarks.authority_epoch = excluded.authority_epoch
+							AND remote_memory_generation_watermarks.store_uuid = excluded.store_uuid
+						THEN MAX(remote_memory_generation_watermarks.routing_epoch, excluded.routing_epoch)
+						ELSE excluded.routing_epoch END,
+					store_uuid = excluded.store_uuid, generation = CASE
+						WHEN remote_memory_generation_watermarks.backend_uid = excluded.backend_uid
+							AND remote_memory_generation_watermarks.authority_epoch = excluded.authority_epoch
+							AND remote_memory_generation_watermarks.store_uuid = excluded.store_uuid
+						THEN MAX(remote_memory_generation_watermarks.generation, excluded.generation)
+						ELSE excluded.generation END,
+					updated_at = excluded.updated_at`, watermarkArgs...); err != nil {
+				return nil, err
 			}
 			archiveArgs := make([]any, 0, len(args)+1)
 			archiveArgs = append(archiveArgs, args...)

@@ -514,7 +514,8 @@ func (r *MemoryBackendReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		persistedCandidate = &candidate
 	}
 
-	resolution, err := r.EndpointPolicy.Resolve(ctx, backend.Spec.Deployment.Endpoint)
+	probeTimeout := r.probeTimeout()
+	resolution, err := r.resolveMemoryBackendEndpoint(ctx, backend.Spec.Deployment.Endpoint, probeTimeout)
 	if err != nil {
 		status.Reason = "EndpointRejected"
 		status.Message = sanitizeMemoryBackendMessage(err.Error())
@@ -537,10 +538,6 @@ func (r *MemoryBackendReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	status.ResolvedRefs = true
 	conditions.resolved = true
 
-	probeTimeout := r.ProbeTimeout
-	if probeTimeout <= 0 {
-		probeTimeout = defaultMemoryBackendProbeTimeout
-	}
 	prober := r.OMSProber
 	if prober == nil {
 		prober = &OMSHTTPProber{Policy: r.EndpointPolicy}
@@ -1111,7 +1108,8 @@ func (r *MemoryBackendReconciler) resolveMemoryBackendDurableRoute(
 	if tenantID != route.TenantID || route.ClusterID != "" && route.ClusterID != r.ClusterIdentity {
 		return nil, newOMSProbeError("OMSRoutingFenceIdentityInvalid", "durable routing fence tenant or cluster identity changed")
 	}
-	resolution, err := r.EndpointPolicy.Resolve(ctx, fresh.Spec.Deployment.Endpoint)
+	timeout := r.probeTimeout()
+	resolution, err := r.resolveMemoryBackendEndpoint(ctx, fresh.Spec.Deployment.Endpoint, timeout)
 	if err != nil {
 		return nil, newOMSProbeError("OMSEndpointResolutionFailed", "OMS endpoint failed fresh public DNS validation")
 	}
@@ -1125,10 +1123,6 @@ func (r *MemoryBackendReconciler) resolveMemoryBackendDurableRoute(
 	if secret.Name != route.SecretName || secret.Key != route.SecretKey || string(secret.UID) != route.SecretUID ||
 		secret.ResourceVersion != route.SecretResourceVersion {
 		return nil, newOMSProbeError("OMSSecretIdentityChanged", "OMS routing fence bearer Secret identity or resourceVersion changed")
-	}
-	timeout := r.ProbeTimeout
-	if timeout <= 0 {
-		timeout = defaultMemoryBackendProbeTimeout
 	}
 	prober := r.OMSProber
 	if prober == nil {
@@ -1163,10 +1157,7 @@ func (r *MemoryBackendReconciler) advanceMemoryBackendRemoteFence(
 	if err != nil {
 		return nil, err
 	}
-	timeout := r.ProbeTimeout
-	if timeout <= 0 {
-		timeout = defaultMemoryBackendProbeTimeout
-	}
+	timeout := r.probeTimeout()
 	prober := r.OMSProber
 	if prober == nil {
 		prober = &OMSHTTPProber{Policy: r.EndpointPolicy}
@@ -1407,6 +1398,26 @@ func (r *MemoryBackendReconciler) validationTTL() time.Duration {
 		return r.ValidationTTL
 	}
 	return defaultMemoryBackendValidationTTL
+}
+
+func (r *MemoryBackendReconciler) probeTimeout() time.Duration {
+	if r.ProbeTimeout > 0 {
+		return r.ProbeTimeout
+	}
+	return defaultMemoryBackendProbeTimeout
+}
+
+func (r *MemoryBackendReconciler) resolveMemoryBackendEndpoint(
+	ctx context.Context,
+	endpoint string,
+	timeout time.Duration,
+) (endpointpolicy.Resolution, error) {
+	if timeout <= 0 {
+		timeout = defaultMemoryBackendProbeTimeout
+	}
+	resolveCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return r.EndpointPolicy.Resolve(resolveCtx, endpoint)
 }
 
 func initialMemoryBackendStatus(backend *corev1alpha1.MemoryBackend) corev1alpha1.MemoryBackendStatus {
@@ -1772,7 +1783,7 @@ func (r *MemoryBackendReconciler) revalidateMemoryBackendCandidateRoute(
 	if string(namespace.UID) != candidate.NamespaceUID || !namespace.DeletionTimestamp.IsZero() {
 		return memoryBackendFreshCandidateRoute{}, fmt.Errorf("namespace identity or termination state changed")
 	}
-	resolution, err := r.EndpointPolicy.Resolve(ctx, fresh.Spec.Deployment.Endpoint)
+	resolution, err := r.resolveMemoryBackendEndpoint(ctx, fresh.Spec.Deployment.Endpoint, probeTimeout)
 	if err != nil {
 		return memoryBackendFreshCandidateRoute{}, err
 	}
@@ -1840,7 +1851,7 @@ func (r *MemoryBackendReconciler) revalidateRetiringMemoryBackendCandidateRoute(
 	if string(namespace.UID) != candidate.NamespaceUID {
 		return memoryBackendFreshCandidateRoute{}, fmt.Errorf("namespace identity changed")
 	}
-	resolution, err := r.EndpointPolicy.Resolve(ctx, candidate.EndpointIdentity)
+	resolution, err := r.resolveMemoryBackendEndpoint(ctx, candidate.EndpointIdentity, probeTimeout)
 	if err != nil {
 		return memoryBackendFreshCandidateRoute{}, err
 	}
@@ -1894,10 +1905,7 @@ func (r *MemoryBackendReconciler) fenceAndRetireMemoryBackendValidationCandidate
 	if r.BindingCoordinator == nil {
 		return fmt.Errorf("durable backend coordinator is not configured")
 	}
-	probeTimeout := r.ProbeTimeout
-	if probeTimeout <= 0 {
-		probeTimeout = defaultMemoryBackendProbeTimeout
-	}
+	probeTimeout := r.probeTimeout()
 	prober := r.OMSProber
 	if prober == nil {
 		prober = &OMSHTTPProber{Policy: r.EndpointPolicy}

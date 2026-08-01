@@ -44,12 +44,38 @@ const (
 	testProberFence                  = "prober.fence"
 	testProbeToken                   = "probe-token"
 	testMemoryBackendActivatedReason = "Activated"
+	testMemoryBackendHost            = "memory.example.com"
 )
 
 type memoryStaticResolver map[string][]netip.Addr
 
 func (r memoryStaticResolver) LookupNetIP(_ context.Context, _ string, host string) ([]netip.Addr, error) {
 	return append([]netip.Addr(nil), r[host]...), nil
+}
+
+type memoryBackendRecordingResolver struct {
+	addresses    map[string][]netip.Addr
+	stall        bool
+	observations []memoryBackendProbeObservation
+}
+
+func (r *memoryBackendRecordingResolver) LookupNetIP(ctx context.Context, _ string, host string) ([]netip.Addr, error) {
+	observation := observeMemoryBackendProbeContext(ctx)
+	if r.stall {
+		<-ctx.Done()
+		observation.err = ctx.Err()
+	}
+	r.observations = append(r.observations, observation)
+	if observation.err != nil {
+		return nil, observation.err
+	}
+	return append([]netip.Addr(nil), r.addresses[host]...), nil
+}
+
+func newMemoryBackendRecordingResolver() *memoryBackendRecordingResolver {
+	return &memoryBackendRecordingResolver{addresses: map[string][]netip.Addr{
+		testMemoryBackendHost: {netip.MustParseAddr("8.8.8.8")},
+	}}
 }
 
 type memoryRedirectDialer struct {
@@ -316,6 +342,8 @@ func TestMemoryBackendReconcilerStagedUsesFreshTimeoutForEachOMSProbe(t *testing
 	backend, namespace, secret := memoryBackendTestObjects(t, corev1alpha1.MemoryBackendLifecycleStaged)
 	prober := &fakeMemoryBackendProber{result: validMemoryBackendProbeResult(now.Add(10 * time.Minute))}
 	reconciler, kubeClient := newMemoryBackendReconciler(t, now, prober, &fakeMemoryBackendCoordinator{}, backend, namespace, secret)
+	resolver := newMemoryBackendRecordingResolver()
+	reconciler.EndpointPolicy.Resolver = resolver
 	reconciler.ProbeTimeout = probeTimeout
 	parentMarker := "staged-validation"
 	parentCtx := context.WithValue(context.Background(), memoryBackendProbeParentContextKey{}, parentMarker)
@@ -326,12 +354,88 @@ func TestMemoryBackendReconcilerStagedUsesFreshTimeoutForEachOMSProbe(t *testing
 	if !updated.Status.Ready {
 		t.Fatalf("staged status = %+v", updated.Status)
 	}
-	if len(prober.storeObservations) != 1 || len(prober.capabilityObservations) != 1 {
-		t.Fatalf("probe observations store=%d capabilities=%d",
-			len(prober.storeObservations), len(prober.capabilityObservations))
+	if len(resolver.observations) != 1 || len(prober.storeObservations) != 1 || len(prober.capabilityObservations) != 1 {
+		t.Fatalf("operation observations resolve=%d store=%d capabilities=%d",
+			len(resolver.observations), len(prober.storeObservations), len(prober.capabilityObservations))
 	}
 	requireFreshMemoryBackendProbeObservations(t, probeTimeout, parentMarker,
-		prober.storeObservations[0], prober.capabilityObservations[0])
+		resolver.observations[0], prober.storeObservations[0], prober.capabilityObservations[0])
+}
+
+func TestMemoryBackendReconcilerEndpointResolutionHonorsProbeTimeout(t *testing.T) {
+	const probeTimeout = 25 * time.Millisecond
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	backend, namespace, secret := memoryBackendTestObjects(t, corev1alpha1.MemoryBackendLifecycleStaged)
+	prober := &fakeMemoryBackendProber{result: validMemoryBackendProbeResult(now.Add(10 * time.Minute))}
+	reconciler, kubeClient := newMemoryBackendReconciler(t, now, prober, &fakeMemoryBackendCoordinator{}, backend, namespace, secret)
+	resolver := newMemoryBackendRecordingResolver()
+	resolver.stall = true
+	reconciler.EndpointPolicy.Resolver = resolver
+	reconciler.ProbeTimeout = probeTimeout
+	parentMarker := "stalled-resolution"
+	parentCtx, cancelParent := context.WithTimeout(
+		context.WithValue(context.Background(), memoryBackendProbeParentContextKey{}, parentMarker),
+		500*time.Millisecond,
+	)
+	defer cancelParent()
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: backend.Namespace, Name: backend.Name}}
+
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("finalizer Reconcile() error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(parentCtx, request); err != nil {
+		t.Fatalf("validation Reconcile() error = %v", err)
+	}
+
+	if len(resolver.observations) != 1 {
+		t.Fatalf("resolution observations = %#v", resolver.observations)
+	}
+	observation := resolver.observations[0]
+	if !errors.Is(observation.err, context.DeadlineExceeded) || observation.deadline.IsZero() ||
+		observation.remaining <= 0 || observation.remaining > probeTimeout || observation.parentMarker != parentMarker {
+		t.Fatalf("stalled resolution observation = %#v", observation)
+	}
+	if prober.storeCalls != 0 {
+		t.Fatalf("stalled resolution reached OMS store probe %d times", prober.storeCalls)
+	}
+	updated := getMemoryBackend(t, kubeClient, backend.Namespace)
+	if updated.Status.Reason != "EndpointRejected" || updated.Status.Ready {
+		t.Fatalf("stalled resolution status = %+v", updated.Status)
+	}
+}
+
+func TestMemoryBackendReconcilerEndpointResolutionPreservesParentCancellation(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	backend, namespace, secret := memoryBackendTestObjects(t, corev1alpha1.MemoryBackendLifecycleStaged)
+	prober := &fakeMemoryBackendProber{result: validMemoryBackendProbeResult(now.Add(10 * time.Minute))}
+	reconciler, _ := newMemoryBackendReconciler(t, now, prober, &fakeMemoryBackendCoordinator{}, backend, namespace, secret)
+	resolver := newMemoryBackendRecordingResolver()
+	resolver.stall = true
+	reconciler.EndpointPolicy.Resolver = resolver
+	reconciler.ProbeTimeout = 5 * time.Second
+	parentMarker := "canceled-resolution"
+	parentCtx, cancelParent := context.WithCancel(
+		context.WithValue(context.Background(), memoryBackendProbeParentContextKey{}, parentMarker),
+	)
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: backend.Namespace, Name: backend.Name}}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("finalizer Reconcile() error = %v", err)
+	}
+	cancelParent()
+	if _, err := reconciler.Reconcile(parentCtx, request); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Reconcile() error = %v", err)
+	}
+
+	if len(resolver.observations) != 1 {
+		t.Fatalf("resolution observations = %#v", resolver.observations)
+	}
+	observation := resolver.observations[0]
+	if !errors.Is(observation.err, context.Canceled) || observation.parentMarker != parentMarker {
+		t.Fatalf("canceled resolution observation = %#v", observation)
+	}
+	if prober.storeCalls != 0 {
+		t.Fatalf("canceled resolution reached OMS store probe %d times", prober.storeCalls)
+	}
 }
 
 func TestMemoryBackendReconcilerFreshProbeTimeoutsPreserveParentCancellation(t *testing.T) {
@@ -519,6 +623,8 @@ func TestMemoryBackendReconcilerActiveUsesFreshTimeoutForStoreFenceAndBindingPro
 		},
 	}
 	reconciler, kubeClient := newMemoryBackendReconciler(t, now, prober, coordinator, backend, namespace, secret)
+	resolver := newMemoryBackendRecordingResolver()
+	reconciler.EndpointPolicy.Resolver = resolver
 	reconciler.ProbeTimeout = probeTimeout
 	parentMarker := "active-validation"
 	parentCtx := context.WithValue(context.Background(), memoryBackendProbeParentContextKey{}, parentMarker)
@@ -529,11 +635,13 @@ func TestMemoryBackendReconcilerActiveUsesFreshTimeoutForStoreFenceAndBindingPro
 	if !updated.Status.Ready {
 		t.Fatalf("active status = %+v", updated.Status)
 	}
-	if len(prober.storeObservations) != 4 || len(prober.fenceObservations) != 1 || len(prober.bindingObservations) != 1 {
-		t.Fatalf("probe observations store=%d fence=%d binding=%d",
-			len(prober.storeObservations), len(prober.fenceObservations), len(prober.bindingObservations))
+	if len(resolver.observations) != 4 || len(prober.storeObservations) != 4 ||
+		len(prober.fenceObservations) != 1 || len(prober.bindingObservations) != 1 {
+		t.Fatalf("operation observations resolve=%d store=%d fence=%d binding=%d",
+			len(resolver.observations), len(prober.storeObservations), len(prober.fenceObservations), len(prober.bindingObservations))
 	}
-	observations := append([]memoryBackendProbeObservation(nil), prober.storeObservations...)
+	observations := append([]memoryBackendProbeObservation(nil), resolver.observations...)
+	observations = append(observations, prober.storeObservations...)
 	observations = append(observations, prober.fenceObservations[0], prober.bindingObservations[0])
 	requireFreshMemoryBackendProbeObservations(t, probeTimeout, parentMarker, observations...)
 }
@@ -542,7 +650,7 @@ func TestMemoryBackendRetiresStaleCandidateUsingPersistedRoute(t *testing.T) {
 	now := time.Date(2026, 7, 30, 12, 30, 0, 0, time.UTC)
 	backend, namespace, secret := memoryBackendTestObjects(t, corev1alpha1.MemoryBackendLifecycleActive)
 	resolution, err := (endpointpolicy.PublicHTTPSPolicy{Resolver: memoryStaticResolver{
-		"memory.example.com": {netip.MustParseAddr("8.8.8.8")},
+		testMemoryBackendHost: {netip.MustParseAddr("8.8.8.8")},
 	}}).Resolve(context.Background(), backend.Spec.Deployment.Endpoint)
 	if err != nil {
 		t.Fatal(err)
@@ -573,6 +681,11 @@ func TestMemoryBackendRetiresStaleCandidateUsingPersistedRoute(t *testing.T) {
 	prober := &fakeMemoryBackendProber{storeResult: storeProbe}
 	coordinator := &fakeMemoryBackendCoordinator{}
 	reconciler, kubeClient := newMemoryBackendReconciler(t, now, prober, coordinator, backend, namespace, secret)
+	resolver := newMemoryBackendRecordingResolver()
+	reconciler.EndpointPolicy.Resolver = resolver
+	reconciler.ProbeTimeout = 5 * time.Second
+	parentMarker := "candidate-retirement"
+	parentCtx := context.WithValue(context.Background(), memoryBackendProbeParentContextKey{}, parentMarker)
 
 	fresh := getMemoryBackend(t, kubeClient, backend.Namespace)
 	fresh.Spec.Deployment.Endpoint = "https://replacement.example.com"
@@ -588,7 +701,7 @@ func TestMemoryBackendRetiresStaleCandidateUsingPersistedRoute(t *testing.T) {
 		t.Fatalf("update stale backend route: %v", err)
 	}
 
-	if err := reconciler.fenceAndRetireMemoryBackendValidationCandidate(context.Background(), fresh, candidate); err != nil {
+	if err := reconciler.fenceAndRetireMemoryBackendValidationCandidate(parentCtx, fresh, candidate); err != nil {
 		t.Fatalf("fenceAndRetireMemoryBackendValidationCandidate: %v", err)
 	}
 	if prober.fenceCalls != 1 || prober.fenceTarget.EndpointIdentity != candidate.EndpointIdentity ||
@@ -599,6 +712,12 @@ func TestMemoryBackendRetiresStaleCandidateUsingPersistedRoute(t *testing.T) {
 		!coordinator.retireRequest.RemoteFenceAcknowledged {
 		t.Fatalf("retirement = %+v, calls=%d", coordinator.retireRequest, coordinator.retireCalls)
 	}
+	if len(resolver.observations) != 1 || len(prober.storeObservations) != 1 || len(prober.fenceObservations) != 1 {
+		t.Fatalf("retirement observations resolve=%d store=%d fence=%d",
+			len(resolver.observations), len(prober.storeObservations), len(prober.fenceObservations))
+	}
+	requireFreshMemoryBackendProbeObservations(t, reconciler.ProbeTimeout, parentMarker,
+		resolver.observations[0], prober.storeObservations[0], prober.fenceObservations[0])
 	updated := getMemoryBackend(t, kubeClient, backend.Namespace)
 	if updated.Spec.Deployment.Endpoint != "https://replacement.example.com" ||
 		strings.TrimSpace(updated.Annotations[corev1alpha1.MemoryBackendValidationCandidateAnnotation]) != "" {
@@ -665,9 +784,14 @@ func TestMemoryBackendReconcilerDisabledAdvancesAuthenticatedRemoteFenceAfterLoc
 			AuthorityEpoch: 3, RoutingEpoch: 8, Reason: "Disabled", Message: "local and remote routing fences advanced", Route: route},
 	}}
 	reconciler, kubeClient := newMemoryBackendReconciler(t, now, prober, coordinator, backend, namespace, secret)
+	resolver := newMemoryBackendRecordingResolver()
+	reconciler.EndpointPolicy.Resolver = resolver
+	reconciler.ProbeTimeout = 5 * time.Second
+	parentMarker := "durable-remote-fence"
+	parentCtx := context.WithValue(context.Background(), memoryBackendProbeParentContextKey{}, parentMarker)
 
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: backend.Namespace, Name: backend.Name}}
-	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+	if _, err := reconciler.Reconcile(parentCtx, request); err != nil {
 		t.Fatal(err)
 	}
 	updated := getMemoryBackend(t, kubeClient, backend.Namespace)
@@ -683,6 +807,14 @@ func TestMemoryBackendReconcilerDisabledAdvancesAuthenticatedRemoteFenceAfterLoc
 		prober.fenceTarget.AuthorityEpoch != 3 || len(prober.fenceTarget.ResolvedAddresses) != 1 {
 		t.Fatalf("routing fence target = %+v", prober.fenceTarget)
 	}
+	if len(resolver.observations) != 2 || len(prober.storeObservations) != 2 || len(prober.fenceObservations) != 1 {
+		t.Fatalf("durable route observations resolve=%d store=%d fence=%d",
+			len(resolver.observations), len(prober.storeObservations), len(prober.fenceObservations))
+	}
+	observations := append([]memoryBackendProbeObservation(nil), resolver.observations...)
+	observations = append(observations, prober.storeObservations...)
+	observations = append(observations, prober.fenceObservations[0])
+	requireFreshMemoryBackendProbeObservations(t, reconciler.ProbeTimeout, parentMarker, observations...)
 }
 
 func TestMemoryBackendReconcilerDisabledKeepsPreviousLifecycleWhenRemoteFenceUnavailable(t *testing.T) {
@@ -889,7 +1021,7 @@ func TestValidateMemoryBackendProbeResultRejectsMissingCapability(t *testing.T) 
 
 func TestOMSHTTPProberPerformsExactProtocolSequence(t *testing.T) {
 	now := time.Now().UTC()
-	resolver := memoryStaticResolver{"memory.example.com": {netip.MustParseAddr("8.8.8.8")}}
+	resolver := memoryStaticResolver{testMemoryBackendHost: {netip.MustParseAddr("8.8.8.8")}}
 	policy := endpointpolicy.PublicHTTPSPolicy{Resolver: resolver}
 	resolution, err := policy.Resolve(context.Background(), "https://memory.example.com")
 	if err != nil {
@@ -1111,7 +1243,7 @@ func TestOMSHTTPProberActualAdapterFenceRejectsStaleMutation(t *testing.T) {
 }
 
 func TestOMSHTTPProberRejectsNonProtocolStoreResponses(t *testing.T) {
-	resolver := memoryStaticResolver{"memory.example.com": {netip.MustParseAddr("8.8.8.8")}}
+	resolver := memoryStaticResolver{testMemoryBackendHost: {netip.MustParseAddr("8.8.8.8")}}
 	policy := endpointpolicy.PublicHTTPSPolicy{Resolver: resolver}
 	resolution, err := policy.Resolve(context.Background(), "https://memory.example.com")
 	if err != nil {
@@ -1191,7 +1323,7 @@ func newMemoryBackendReconciler(
 		WithStatusSubresource(&corev1alpha1.MemoryBackend{}).
 		WithObjects(objects...).
 		Build()
-	resolver := memoryStaticResolver{"memory.example.com": {netip.MustParseAddr("8.8.8.8")}}
+	resolver := memoryStaticResolver{testMemoryBackendHost: {netip.MustParseAddr("8.8.8.8")}}
 	return &MemoryBackendReconciler{
 		Client: kubeClient, APIReader: kubeClient,
 		EndpointPolicy: endpointpolicy.PublicHTTPSPolicy{Resolver: resolver},
@@ -1275,7 +1407,7 @@ func testMemoryBackendDurableRoute(
 ) MemoryBackendDurableRoute {
 	t.Helper()
 	resolution, err := (endpointpolicy.PublicHTTPSPolicy{Resolver: memoryStaticResolver{
-		"memory.example.com": {netip.MustParseAddr("8.8.8.8")},
+		testMemoryBackendHost: {netip.MustParseAddr("8.8.8.8")},
 	}}).Resolve(context.Background(), backend.Spec.Deployment.Endpoint)
 	if err != nil {
 		t.Fatal(err)
@@ -1303,7 +1435,7 @@ func seedActivatedMemoryBackendStatus(
 ) {
 	t.Helper()
 	resolution, err := (endpointpolicy.PublicHTTPSPolicy{Resolver: memoryStaticResolver{
-		"memory.example.com": {netip.MustParseAddr("8.8.8.8")},
+		testMemoryBackendHost: {netip.MustParseAddr("8.8.8.8")},
 	}}).Resolve(context.Background(), backend.Spec.Deployment.Endpoint)
 	if err != nil {
 		t.Fatal(err)

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/url"
 	"slices"
@@ -79,6 +80,15 @@ type legacyMemoryTrustGovernanceStore interface {
 		actor, reason, requestID string,
 		now time.Time,
 	) (*store.Memory, error)
+}
+
+type remoteMemoryGenerationWatermarkStore interface {
+	GetRemoteMemoryGenerationWatermark(
+		ctx context.Context,
+		namespaceUID, id, backendUID string,
+		authorityEpoch int64,
+		storeUUID string,
+	) (int64, error)
 }
 
 type legacyMemoryProposalGovernanceStore interface {
@@ -501,6 +511,10 @@ func (s *Service) CreateMemory(
 	if memoryID == "" {
 		memoryID = "mem-" + uuid.NewString()
 	}
+	expectedGeneration, desiredGeneration, err := s.remoteCreateGenerations(ctx, authority, memoryID)
+	if err != nil {
+		return nil, err
+	}
 	binding, err := protocolBinding(authority.Binding)
 	if err != nil {
 		return nil, identityError()
@@ -513,8 +527,8 @@ func (s *Service) CreateMemory(
 		Binding:                binding,
 		MemoryID:               memoryID,
 		Kind:                   protocol.MutationKindCreate,
-		Generation:             1,
-		ExpectedGeneration:     0,
+		Generation:             uint64(desiredGeneration),
+		ExpectedGeneration:     uint64(expectedGeneration),
 		ExpectedBackendVersion: "",
 		State:                  &protocol.MutationState{Content: content, Tags: tags, Metadata: memoryMetadata(request)},
 	}
@@ -530,7 +544,7 @@ func (s *Service) CreateMemory(
 		ClusterID: authority.Binding.ClusterID, BackendUID: authority.Binding.BackendUID,
 		AuthorityEpoch: authority.Binding.AuthorityEpoch, RoutingEpoch: authority.Binding.RoutingEpoch,
 		TenantID: authority.Binding.TenantID, StoreUUID: authority.Binding.StoreUUID,
-		Generation: 0, DesiredGeneration: 1, GovernanceRevision: 1,
+		Generation: expectedGeneration, DesiredGeneration: desiredGeneration, GovernanceRevision: 1,
 		MaterializationState: store.MemoryMaterializationPending,
 		Trust:                store.MemoryTrustUntrusted, SessionName: request.SessionName, AgentName: request.AgentName,
 		TaskName: request.TaskName, ParentTask: request.ParentTask, Source: normalizeSource(request.Source), Tags: tags,
@@ -1142,6 +1156,33 @@ func (s *Service) markMaterializationIssue(
 		ExpectedGeneration: entry.Generation, ExpectedBackendVersion: entry.BackendVersion,
 		State: state, Actor: "orka-memory-hydrator", Reason: reason, Now: s.now(),
 	})
+}
+
+func (s *Service) remoteCreateGenerations(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	memoryID string,
+) (int64, int64, error) {
+	if authority == nil || authority.Binding == nil {
+		return 0, 0, identityError()
+	}
+	watermarks, ok := s.Governed.(remoteMemoryGenerationWatermarkStore)
+	if !ok {
+		return 0, 0, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory generation watermark store is unavailable")
+	}
+	expected, err := watermarks.GetRemoteMemoryGenerationWatermark(
+		ctx, authority.NamespaceUID, memoryID, authority.Binding.BackendUID,
+		authority.Binding.AuthorityEpoch, authority.Binding.StoreUUID,
+	)
+	if err != nil {
+		return 0, 0, mapStoreError(err)
+	}
+	if expected < 0 || expected == math.MaxInt64 {
+		return 0, 0, apierror.New(http.StatusConflict, ReasonDiverged,
+			"memory generation watermark is exhausted")
+	}
+	return expected, expected + 1, nil
 }
 
 func (s *Service) normalizeContent(content string, tags []string) (string, []string, error) {
@@ -2475,10 +2516,15 @@ func (s *Service) ApplyMemoryProposal(
 	}
 	now := s.now()
 	memoryID := "mem-" + uuid.NewString()
+	expectedGeneration, desiredGeneration, err := s.remoteCreateGenerations(ctx, authority, memoryID)
+	if err != nil {
+		return nil, err
+	}
 	operationID := "mop-" + uuid.NewString()
 	envelope := protocol.MutationEnvelope{
 		ProtocolVersion: protocol.Version, OperationID: operationID, Binding: binding,
-		MemoryID: memoryID, Kind: protocol.MutationKindCreate, Generation: 1, ExpectedGeneration: 0,
+		MemoryID: memoryID, Kind: protocol.MutationKindCreate,
+		Generation: uint64(desiredGeneration), ExpectedGeneration: uint64(expectedGeneration),
 		State: &protocol.MutationState{Content: content, Tags: tags, Metadata: compactMetadata(map[string]string{
 			"agentName": proposal.AgentName, "taskName": proposal.TaskName,
 			"source": "memory_proposal", "sourceProposalId": proposal.ID,
@@ -2496,7 +2542,7 @@ func (s *Service) ApplyMemoryProposal(
 		ClusterID: authority.Binding.ClusterID, BackendUID: authority.Binding.BackendUID,
 		AuthorityEpoch: authority.Binding.AuthorityEpoch, RoutingEpoch: authority.Binding.RoutingEpoch,
 		TenantID: authority.Binding.TenantID, StoreUUID: authority.Binding.StoreUUID,
-		Generation: 0, DesiredGeneration: 1, GovernanceRevision: 1,
+		Generation: expectedGeneration, DesiredGeneration: desiredGeneration, GovernanceRevision: 1,
 		MaterializationState: store.MemoryMaterializationPending, Trust: store.MemoryTrustReviewed,
 		AgentName: proposal.AgentName, TaskName: proposal.TaskName, Source: "memory_proposal",
 		SourceProposalID: proposal.ID, Tags: tags, ContentDigest: envelope.ContentDigest,

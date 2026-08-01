@@ -46,7 +46,7 @@ func TestMemoryGovernanceMigrationIdempotent(t *testing.T) {
 
 	for _, table := range []string{
 		"memory_governance_migrations", "legacy_memory_archive", "memory_legacy_fences", "controller_feature_heartbeats",
-		"memory_backend_bindings", "remote_memory_catalog", "memory_operations",
+		"memory_backend_bindings", "remote_memory_catalog", "remote_memory_generation_watermarks", "memory_operations",
 		"memory_idempotency", "memory_audit",
 	} {
 		var count int
@@ -4379,6 +4379,63 @@ func TestHistoricalRoutingCheckpointCanPurgeRetainedOperation(t *testing.T) {
 	}
 }
 
+func TestCurrentRoutingCheckpointCoversPriorFencedPayloads(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 11, 15, 0, 0, time.UTC)
+	binding := activateMemoryBackendForTest(t, s, "team-current-checkpoint", "team-current-checkpoint-uid", now)
+	created := materializedRemoteMemoryForTest(t, s, binding, now.Add(time.Second), "current-checkpoint")
+	operation, err := s.GetMemoryOperation(ctx, binding.NamespaceUID, created.Operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCheckpoint, err := s.RecordMemoryVerifiedCheckpoint(ctx, store.MemoryVerifiedCheckpoint{
+		ID: "mcheckpoint-prior-route", NamespaceUID: binding.NamespaceUID, BackendUID: binding.BackendUID,
+		AuthorityEpoch: binding.AuthorityEpoch, RoutingEpoch: binding.RoutingEpoch, StoreUUID: binding.StoreUUID,
+		MaximumOperationSequence: operation.Sequence, CheckpointDigest: protocol.ContentDigest("prior route checkpoint"),
+		Actor: "operator", Reason: "verify prior route", VerifiedAt: now.Add(2 * time.Second),
+	})
+	if err != nil || oldCheckpoint.RoutingEpoch != binding.RoutingEpoch {
+		t.Fatalf("prior checkpoint = %+v, %v", oldCheckpoint, err)
+	}
+	current, err := s.TransitionMemoryBackendBinding(ctx, store.MemoryBackendTransition{
+		NamespaceUID: binding.NamespaceUID, BackendUID: binding.BackendUID,
+		ExpectedState: binding.State, State: store.MemoryBackendBindingDraining,
+		ExpectedRoutingEpoch: binding.RoutingEpoch, RoutingEpoch: binding.RoutingEpoch + 1,
+		Actor: "operator", Reason: "fence prior route", Now: now.Add(3 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointAt := now.Add(8 * 24 * time.Hour)
+	checkpoint, err := s.RecordMemoryVerifiedCheckpoint(ctx, store.MemoryVerifiedCheckpoint{
+		ID: "mcheckpoint-current-route", NamespaceUID: current.NamespaceUID, BackendUID: current.BackendUID,
+		AuthorityEpoch: current.AuthorityEpoch, RoutingEpoch: current.RoutingEpoch, StoreUUID: current.StoreUUID,
+		MaximumOperationSequence: operation.Sequence, CheckpointDigest: protocol.ContentDigest("current route checkpoint"),
+		Actor: "operator", Reason: "verify current route and prior fenced ledger", VerifiedAt: checkpointAt,
+	})
+	if err != nil {
+		t.Fatalf("RecordMemoryVerifiedCheckpoint(current route): %v", err)
+	}
+	purged, err := s.PurgeMemoryGovernance(ctx, store.MemoryGovernancePurge{
+		NamespaceUID: current.NamespaceUID, BackendUID: current.BackendUID,
+		AuthorityEpoch: current.AuthorityEpoch, RoutingEpoch: current.RoutingEpoch, StoreUUID: current.StoreUUID,
+		CheckpointID: checkpoint.ID, MaximumOperationSequence: operation.Sequence,
+		Before: now.Add(24 * time.Hour), PurgePayloads: true, PurgeReceipts: true,
+		Actor: "operator", Reason: "reclaim prior route payload", Now: checkpointAt,
+	})
+	if err != nil || purged.PayloadsPurged != 1 || purged.ReceiptsPurged != 1 {
+		t.Fatalf("current route purge = %+v, %v", purged, err)
+	}
+	retained, err := s.GetMemoryOperation(ctx, current.NamespaceUID, operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained.PayloadBytes != 0 || retained.ReceiptBindingDigest != "" || retained.ReceiptAppliedGeneration != 0 {
+		t.Fatalf("prior route operation was not compacted: %+v", retained)
+	}
+}
+
 func TestTombstonePurgeWaitsForIndependentRetentionGates(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
@@ -4439,6 +4496,49 @@ func TestTombstonePurgeWaitsForIndependentRetentionGates(t *testing.T) {
 	}
 	if _, err := s.GetRemoteMemory(ctx, binding.NamespaceUID, active.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("purged tombstone lookup error = %v, want ErrNotFound", err)
+	}
+	watermark, err := s.GetRemoteMemoryGenerationWatermark(
+		ctx, binding.NamespaceUID, active.ID, binding.BackendUID, binding.AuthorityEpoch, binding.StoreUUID,
+	)
+	if err != nil || watermark != deleteOperation.DesiredGeneration {
+		t.Fatalf("purged tombstone watermark = %d, %v; want %d", watermark, err, deleteOperation.DesiredGeneration)
+	}
+	refreshedBinding := binding
+	refreshedBinding.BackendGeneration++
+	refreshedBinding.ValidationExpiresAt = late.Add(time.Hour)
+	refreshed, err := s.RefreshMemoryBackendBinding(ctx, store.MemoryBackendBindingRefresh{
+		Binding: refreshedBinding, ExpectedRoutingEpoch: binding.RoutingEpoch,
+		Actor: "operator", Reason: "refresh validation for recreation", Now: late,
+	})
+	if err != nil {
+		t.Fatalf("refresh binding before recreation: %v", err)
+	}
+	recreated, err := s.AdmitRemoteMemoryCreate(ctx, store.RemoteMemoryCreateAdmission{
+		Mutation: newCanonicalMemoryMutation(
+			*refreshed, late.Add(time.Second), active.ID, "tombstone-recreate", "recreate-request",
+			store.MemoryOperationCreate, watermark+1, watermark, "", "recreated content",
+		),
+		Memory: store.RemoteMemoryCatalogEntry{Source: "manual", Tags: []string{}},
+	})
+	if err != nil {
+		t.Fatalf("recreate after tombstone purge: %v", err)
+	}
+	if recreated.Memory.Generation != watermark || recreated.Memory.DesiredGeneration != watermark+1 ||
+		recreated.Operation.ExpectedMaterializedGeneration != watermark || recreated.Operation.DesiredGeneration != watermark+1 {
+		t.Fatalf("recreated generations = memory %+v operation %+v", recreated.Memory, recreated.Operation)
+	}
+	completeOperationForTest(
+		t, s, *refreshed, recreated.Operation, late.Add(2*time.Second), "backend-v3", "remote-recreated",
+	)
+	materialized, err := s.GetRemoteMemory(ctx, binding.NamespaceUID, active.ID)
+	if err != nil || materialized.Generation != watermark+1 || materialized.MaterializationState != store.MemoryMaterializationActive {
+		t.Fatalf("materialized recreation = %+v, %v", materialized, err)
+	}
+	watermark, err = s.GetRemoteMemoryGenerationWatermark(
+		ctx, binding.NamespaceUID, active.ID, binding.BackendUID, binding.AuthorityEpoch, binding.StoreUUID,
+	)
+	if err != nil || watermark != 0 {
+		t.Fatalf("generation watermark remained after recreation: %d, %v", watermark, err)
 	}
 }
 

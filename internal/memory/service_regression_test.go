@@ -19,6 +19,8 @@ import (
 	"github.com/orka-agents/orka/internal/store"
 )
 
+const testRemoteCreateRoute = "createMemory"
+
 type governedSearchStore struct {
 	store.GovernedMemoryStore
 	entries   []store.RemoteMemoryCatalogEntry
@@ -1319,6 +1321,51 @@ func TestLegacySearchReportsPreFilterCapAsIncomplete(t *testing.T) {
 	}
 }
 
+type generationWatermarkAdmissionStore struct {
+	store.GovernedMemoryStore
+	watermark int64
+	admission *store.RemoteMemoryCreateAdmission
+}
+
+func (s *generationWatermarkAdmissionStore) GetMemoryIdempotency(
+	context.Context, string, string, string, string,
+) (*store.MemoryIdempotencyRecord, error) {
+	return nil, store.ErrNotFound
+}
+
+func (s *generationWatermarkAdmissionStore) GetRemoteMemoryGenerationWatermark(
+	context.Context, string, string, string, int64, string,
+) (int64, error) {
+	return s.watermark, nil
+}
+
+func (s *generationWatermarkAdmissionStore) AdmitRemoteMemoryCreate(
+	_ context.Context,
+	admission store.RemoteMemoryCreateAdmission,
+) (*store.MemoryMutationAdmissionResult, error) {
+	copy := admission
+	s.admission = &copy
+	envelope, err := protocol.DecodeMutationEnvelope(admission.Mutation.Payload)
+	if err != nil {
+		return nil, err
+	}
+	return &store.MemoryMutationAdmissionResult{
+		Memory: admission.Memory,
+		Operation: store.MemoryOperation{
+			ID: admission.Mutation.OperationID, Namespace: admission.Mutation.Namespace,
+			NamespaceUID: admission.Mutation.NamespaceUID, BackendUID: admission.Mutation.BackendUID,
+			AuthorityEpoch: admission.Mutation.AuthorityEpoch, RoutingEpoch: admission.Mutation.RoutingEpoch,
+			MemoryID: admission.Mutation.MemoryID, Kind: store.MemoryOperationCreate,
+			DesiredGeneration: int64(envelope.Generation), ExpectedMaterializedGeneration: int64(envelope.ExpectedGeneration),
+			State: store.MemoryOperationQueued,
+		},
+		Idempotency: store.MemoryIdempotencyRecord{
+			OriginalStatus: admission.Mutation.OriginalStatus, Location: admission.Mutation.Location,
+			RetryAfterSeconds: admission.Mutation.RetryAfterSeconds,
+		},
+	}, nil
+}
+
 type replayBeforeFreshStore struct {
 	store.GovernedMemoryStore
 	record    store.MemoryIdempotencyRecord
@@ -1347,6 +1394,45 @@ func (r *replayBeforeFreshResolver) ResolveLocal(context.Context, string) (*Reso
 func (r *replayBeforeFreshResolver) Resolve(context.Context, string) (*ResolvedAuthority, error) {
 	r.freshCalls++
 	return nil, errors.New("fresh backend unavailable")
+}
+
+func TestRemoteCreateUsesRetainedGenerationWatermark(t *testing.T) {
+	const watermark int64 = 2
+	binding := &store.MemoryBackendBinding{
+		Namespace: "team-a", NamespaceUID: "11111111-1111-4111-8111-111111111111", Mode: store.MemoryBackendModeRemote,
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222", AuthorityEpoch: 1, RoutingEpoch: 3,
+		TenantID: protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"), StoreUUID: "44444444-4444-4444-8444-444444444444",
+		State: store.MemoryBackendBindingAccepting,
+	}
+	backend := &corev1alpha1.MemoryBackend{}
+	backend.Status.EffectiveLifecycleState = corev1alpha1.MemoryBackendEffectiveLifecycleActive
+	backend.Status.Ready = true
+	authority := &ResolvedAuthority{
+		Namespace: binding.Namespace, NamespaceUID: binding.NamespaceUID, Binding: binding, Backend: backend,
+	}
+	governed := &generationWatermarkAdmissionStore{watermark: watermark}
+	service := &Service{Governed: governed, Resolver: staticAuthorityResolver{authority: authority}}
+	result, err := service.CreateMemory(context.Background(), binding.Namespace, CreateRequest{
+		ID: "mem-recreated", Content: "recreated content",
+	}, MutationContext{
+		Actor: "alice", Principal: "alice", Route: testRemoteCreateRoute, IdempotencyKey: "recreate-key",
+	})
+	if err != nil || result == nil || result.Operation == nil {
+		t.Fatalf("CreateMemory() = %#v, %v", result, err)
+	}
+	if governed.admission == nil {
+		t.Fatal("CreateMemory() did not reach durable admission")
+	}
+	envelope, err := protocol.DecodeMutationEnvelope(governed.admission.Mutation.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Generation != uint64(watermark+1) || envelope.ExpectedGeneration != uint64(watermark) ||
+		governed.admission.Memory.Generation != watermark || governed.admission.Memory.DesiredGeneration != watermark+1 ||
+		result.Operation.DesiredGeneration != watermark+1 {
+		t.Fatalf("recreate generations = envelope %+v admission %+v operation %+v",
+			envelope, governed.admission.Memory, result.Operation)
+	}
 }
 
 func TestMutationIdempotencyReplayPrecedesFreshBackendResolution(t *testing.T) {
