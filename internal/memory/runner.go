@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -42,16 +43,51 @@ func (r *Runner) Start(ctx context.Context) error {
 }
 
 func (r *Runner) runPass(ctx context.Context) error {
-	return forEachMemoryBackendBinding(ctx, r.Store, store.MemoryBackendBindingFilter{
+	workerCount := r.Dispatcher.GlobalConcurrency
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+
+	namespaces := make(chan string)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for namespace := range namespaces {
+				if ctx.Err() != nil {
+					continue
+				}
+				_, dispatchErr := r.Dispatcher.DispatchOne(ctx, namespace)
+				if dispatchErr != nil && !errors.Is(dispatchErr, store.ErrNotFound) && !errors.Is(dispatchErr, store.ErrNotReady) {
+					log.FromContext(ctx).Info("memory operation dispatch deferred", "reason", boundedRunnerReason(dispatchErr))
+				}
+			}
+		}()
+	}
+
+	seenNamespaces := make(map[string]struct{})
+	iterationErr := forEachMemoryBackendBinding(ctx, r.Store, store.MemoryBackendBindingFilter{
 		Modes:  []store.MemoryBackendMode{store.MemoryBackendModeRemote},
 		States: []store.MemoryBackendBindingState{store.MemoryBackendBindingAccepting, store.MemoryBackendBindingDraining},
 	}, func(binding store.MemoryBackendBinding) error {
-		_, dispatchErr := r.Dispatcher.DispatchOne(ctx, binding.Namespace)
-		if dispatchErr != nil && !errors.Is(dispatchErr, store.ErrNotFound) && !errors.Is(dispatchErr, store.ErrNotReady) {
-			log.FromContext(ctx).Info("memory operation dispatch deferred", "reason", boundedRunnerReason(dispatchErr))
+		if _, seen := seenNamespaces[binding.Namespace]; seen {
+			return nil
 		}
-		return ctx.Err()
+		seenNamespaces[binding.Namespace] = struct{}{}
+		select {
+		case namespaces <- binding.Namespace:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	})
+	close(namespaces)
+	workers.Wait()
+	if iterationErr != nil {
+		return iterationErr
+	}
+	return ctx.Err()
 }
 
 func boundedRunnerReason(err error) string {
