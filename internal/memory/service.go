@@ -1510,6 +1510,13 @@ func memoryEntryMatchesFilter(entry *store.RemoteMemoryCatalogEntry, filter stor
 	if entry == nil {
 		return false
 	}
+	if entry.Deleted || entry.MaterializationState == store.MemoryMaterializationDeleted {
+		if !filter.IncludeDeleted || !entry.Deleted || entry.MaterializationState != store.MemoryMaterializationDeleted {
+			return false
+		}
+	} else if entry.MaterializationState != store.MemoryMaterializationActive || entry.Disabled && !filter.IncludeDisabled {
+		return false
+	}
 	if filter.SessionName != "" && entry.SessionName != filter.SessionName ||
 		filter.AgentName != "" && entry.AgentName != filter.AgentName ||
 		filter.TaskName != "" && entry.TaskName != filter.TaskName ||

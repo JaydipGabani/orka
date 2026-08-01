@@ -1660,6 +1660,51 @@ func TestSuccessfulMemoryIdempotencyReplayUsesImmutableBodyWithoutProvider(t *te
 	}
 }
 
+func TestRemoteListIncludeDeletedSkipsLiveDisabledBeforeLimitAcrossPages(t *testing.T) {
+	now := time.Date(2026, 8, 1, 17, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, maxRemoteCatalogLimit+1)
+	for i := range maxRemoteCatalogLimit {
+		entry, _ := remoteSearchFixture(
+			binding, fmt.Sprintf("mem-disabled-%03d", i), now.Add(-time.Duration(i)*time.Second),
+			"disabled live content", store.MemoryTrustReviewed,
+		)
+		entry.Disabled = true
+		entries = append(entries, entry)
+	}
+	tombstone, _ := remoteSearchFixture(
+		binding, "mem-deleted", now.Add(-time.Duration(maxRemoteCatalogLimit)*time.Second),
+		"deleted content", store.MemoryTrustReviewed,
+	)
+	tombstone.Disabled = true
+	tombstone.Deleted = true
+	tombstone.MaterializationState = store.MemoryMaterializationDeleted
+	tombstone.ContentAvailable = false
+	entries = append(entries, tombstone)
+
+	service, adapter, activeBinding, governed := remoteSearchService(t, entries, nil)
+	page, err := service.ListMemoriesPageWithSearchContext(context.Background(), store.MemoryFilter{
+		Namespace: activeBinding.Namespace, IncludeDeleted: true, Limit: 1,
+	}, SearchContext{})
+	if err != nil || page == nil || len(page.Items) != 1 || page.Items[0].ID != tombstone.ID ||
+		!page.Items[0].Deleted || !page.Items[0].Disabled || page.Items[0].ContentAvailable ||
+		!page.Complete || !page.Exhausted || page.Cursor != "" {
+		t.Fatalf("includeDeleted page = %#v, %v; want only completed tombstone", page, err)
+	}
+	if governed.listCalls < 2 {
+		t.Fatalf("catalog list calls = %d, want pagination past disabled live records", governed.listCalls)
+	}
+	if adapter.getCalls != 0 {
+		t.Fatalf("provider Get calls = %d, want no hydration for filtered live disabled records or tombstone", adapter.getCalls)
+	}
+}
+
 func TestRemoteListIncludeDeletedIncludesDisabledTombstone(t *testing.T) {
 	now := time.Date(2026, 8, 1, 5, 20, 0, 0, time.UTC)
 	binding := store.MemoryBackendBinding{

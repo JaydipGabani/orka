@@ -272,15 +272,24 @@ func newMemoryBackendUpdateCmd() *cobra.Command {
 				return fmt.Errorf("--yes is required for memory backend update")
 			}
 			client := newClientFromCmd(cmd)
-			body, err := manifestWithNamespaceJSON(cmd, file, client.Namespace)
+			manifest, _, err := manifestMap(file)
 			if err != nil {
 				return err
 			}
+			query, err := namespaceQueryForManifest(cmd, client.Namespace, manifest)
+			if err != nil {
+				return err
+			}
+			body, err := marshalManifestWithNamespace(cmd, manifest, client.Namespace)
+			if err != nil {
+				return err
+			}
+			query = mergeQuery(query, "reason", strings.TrimSpace(reason))
 			result, err := client.DoJSON(
 				cmd.Context(),
 				http.MethodPut,
 				"/api/v1/memory-backends/default",
-				map[string]string{"reason": strings.TrimSpace(reason)},
+				query,
 				body,
 			)
 			if err != nil {
