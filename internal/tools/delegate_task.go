@@ -524,10 +524,15 @@ func (t *DelegateTaskTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if err != nil {
 		return "", err
 	}
+	var childTokenPreparation *childTransactionTokenPreparation
 	if childTokenExchangeEnabled {
 		markChildTransactionTokenPending(childTask)
-		if err := prepareChildTransactionToken(ctx, t.k8sClient, dc.parentTask, childTask, "delegateTask", dc.args.Agent); err != nil {
+		childTokenPreparation, err = prepareChildTransactionToken(ctx, t.k8sClient, dc.parentTask, childTask, "delegateTask", dc.args.Agent)
+		if err != nil {
 			return "", err
+		}
+		if childTokenPreparation == nil {
+			return "", fmt.Errorf("child transaction token exchange became unavailable during preparation")
 		}
 	}
 
@@ -540,7 +545,7 @@ func (t *DelegateTaskTool) Execute(ctx context.Context, args json.RawMessage) (s
 	span.SetAttributes(orkatracing.DelegateAttributes("", childTask.Name)...)
 
 	if childTokenExchangeEnabled {
-		if err := adoptChildTransactionTokenSecret(ctx, t.k8sClient, childTask); err != nil {
+		if err := completeChildTransactionToken(ctx, t.k8sClient, childTask, childTokenPreparation); err != nil {
 			cleanupChildTaskAfterTokenAdoptionFailure(ctx, t.k8sClient, childTask)
 			return "", err
 		}

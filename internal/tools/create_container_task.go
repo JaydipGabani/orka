@@ -199,13 +199,18 @@ func (t *CreateContainerTaskTool) executeCoordination(ctx context.Context, args 
 	if err != nil {
 		return "", err
 	}
+	var childTokenPreparation *childTransactionTokenPreparation
 	if childTokenExchangeEnabled {
 		if task.Spec.Schedule != "" {
 			return ChatToolErrorResult("unsupported_schedule", "scheduled child container tasks cannot inherit delegated transaction tokens", "Create an immediate child container task, or create scheduled work from a task that does not need delegated child tokens.")
 		}
 		markChildTransactionTokenPending(task)
-		if err := prepareChildTransactionToken(ctx, t.k8sClient, parentTask, task, "createContainerTask", ""); err != nil {
+		childTokenPreparation, err = prepareChildTransactionToken(ctx, t.k8sClient, parentTask, task, "createContainerTask", "")
+		if err != nil {
 			return "", err
+		}
+		if childTokenPreparation == nil {
+			return "", fmt.Errorf("child transaction token exchange became unavailable during preparation")
 		}
 	}
 	if err := t.k8sClient.Create(ctx, task); err != nil {
@@ -215,7 +220,7 @@ func (t *CreateContainerTaskTool) executeCoordination(ctx context.Context, args 
 		return classifyChatK8sErr(err)
 	}
 	if childTokenExchangeEnabled {
-		if err := adoptChildTransactionTokenSecret(ctx, t.k8sClient, task); err != nil {
+		if err := completeChildTransactionToken(ctx, t.k8sClient, task, childTokenPreparation); err != nil {
 			cleanupChildTaskAfterTokenAdoptionFailure(ctx, t.k8sClient, task)
 			return classifyChatK8sErr(err)
 		}
