@@ -1890,6 +1890,7 @@ Available Commands:
   force-orphan   Force-orphan the namespace memory backend
   get            Get the memory backend
   list           List memory backends
+  purge          Purge checkpoint-covered local memory retention state
   restore-legacy Restore-legacy the namespace memory backend
   status         Get effective memory backend status
   update         Update the requested memory backend lifecycle or endpoint configuration

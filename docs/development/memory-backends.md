@@ -96,6 +96,21 @@ A recoverable set contains:
 
 Successful payloads must not be purged until a verified adapter/KD6 checkpoint covers their sequence and the recovery window. The initial target is RPO <= 15 minutes and RTO <= 60 minutes.
 
+After the checkpoint is recorded and its recovery window has elapsed, operators
+can reclaim bounded local retention capacity explicitly, for example:
+
+```bash
+orka memory backend purge \
+  --checkpoint-id mcheckpoint-... \
+  --before 2026-08-01T08:00:00Z \
+  --payloads --expired-idempotency \
+  --reason "reclaim checkpoint-covered memory retention" \
+  --yes
+```
+
+The server resolves the active binding identity and refuses any purge that is
+not covered by the exact verified checkpoint watermark and retention gates.
+
 ## Restore procedure
 
 1. Restore the matched SQLite, adapter, Kubernetes, and KD6 set.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -20,9 +21,82 @@ func newMemoryBackendCmd() *cobra.Command {
 	cmd.AddCommand(newMemoryBackendUpdateCmd())
 	cmd.AddCommand(newMemoryBackendDeleteCmd())
 	cmd.AddCommand(newMemoryBackendCheckpointCmd())
+	cmd.AddCommand(newMemoryBackendPurgeCmd())
 	for _, action := range []string{"activate", "decommission", "force-orphan", "restore-legacy"} {
 		cmd.AddCommand(newMemoryBackendActionCmd(action))
 	}
+	return cmd
+}
+
+func newMemoryBackendPurgeCmd() *cobra.Command {
+	var checkpointID, beforeRaw, reason string
+	var maximumOperationSequence int64
+	var purgePayloads, purgeReceipts, purgeExpiredIdempotency, purgeTombstones, purgeAudit, yes bool
+	cmd := &cobra.Command{
+		Use:   "purge",
+		Short: "Purge checkpoint-covered local memory retention state",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if strings.TrimSpace(checkpointID) == "" {
+				return fmt.Errorf("--checkpoint-id is required")
+			}
+			if strings.TrimSpace(beforeRaw) == "" {
+				return fmt.Errorf("--before is required")
+			}
+			before, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(beforeRaw))
+			if err != nil {
+				return fmt.Errorf("--before must be RFC3339: %w", err)
+			}
+			if maximumOperationSequence < 0 {
+				return fmt.Errorf("--max-sequence cannot be negative")
+			}
+			if strings.TrimSpace(reason) == "" {
+				return fmt.Errorf("--reason is required")
+			}
+			if !purgePayloads && !purgeReceipts && !purgeExpiredIdempotency && !purgeTombstones && !purgeAudit {
+				return fmt.Errorf("at least one purge target flag is required")
+			}
+			if !yes {
+				return fmt.Errorf("--yes is required for memory backend purge")
+			}
+			body, err := json.Marshal(map[string]any{
+				"checkpointId":             strings.TrimSpace(checkpointID),
+				"maximumOperationSequence": maximumOperationSequence,
+				"before":                   before.UTC(),
+				"purgePayloads":            purgePayloads,
+				"purgeReceipts":            purgeReceipts,
+				"purgeExpiredIdempotency":  purgeExpiredIdempotency,
+				"purgeTombstones":          purgeTombstones,
+				"purgeAudit":               purgeAudit,
+				"reason":                   strings.TrimSpace(reason),
+			})
+			if err != nil {
+				return err
+			}
+			result, err := newClientFromCmd(cmd).DoJSON(
+				cmd.Context(), http.MethodPost, "/api/v1/memory-backends/default/purge", nil, body,
+			)
+			if err != nil {
+				return err
+			}
+			return printStructured(cmd, result)
+		},
+	}
+	cmd.Flags().StringVar(&checkpointID, "checkpoint-id", "", "Verified checkpoint ID covering the purge")
+	cmd.Flags().StringVar(&beforeRaw, "before", "", "Purge records older than this RFC3339 timestamp")
+	cmd.Flags().Int64Var(
+		&maximumOperationSequence,
+		"max-sequence",
+		0,
+		"Maximum operation sequence to purge (0 uses checkpoint watermark)",
+	)
+	cmd.Flags().BoolVar(&purgePayloads, "payloads", false, "Purge retained successful operation payloads")
+	cmd.Flags().BoolVar(&purgeReceipts, "receipts", false, "Purge retained successful operation receipts")
+	cmd.Flags().BoolVar(&purgeExpiredIdempotency, "expired-idempotency", false, "Purge expired idempotency records")
+	cmd.Flags().BoolVar(&purgeTombstones, "tombstones", false, "Purge eligible tombstones")
+	cmd.Flags().BoolVar(&purgeAudit, "audit", false, "Purge eligible non-authoritative audit rows")
+	cmd.Flags().StringVar(&reason, "reason", "", "Required audit reason")
+	cmd.Flags().BoolVar(&yes, "yes", false, "Confirm the retention purge")
+	addOutputFlag(cmd, outputJSON)
 	return cmd
 }
 

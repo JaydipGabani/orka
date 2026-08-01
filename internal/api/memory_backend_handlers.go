@@ -199,6 +199,81 @@ func (h *Handlers) RecordMemoryBackendCheckpoint(c fiber.Ctx) error {
 	return c.Status(http.StatusCreated).JSON(fiber.Map{"kind": "verifiedCheckpoint", "checkpoint": checkpoint})
 }
 
+// PurgeMemoryBackendGovernance reclaims checkpoint-covered local retention
+// state under the exact active binding identity.
+func (h *Handlers) PurgeMemoryBackendGovernance(c fiber.Ctx) error {
+	if err := h.ensureMemoryBackendManager(); err != nil {
+		return err
+	}
+	namespace, err := h.resolveNamespace(c, c.Query("namespace", ""))
+	if err != nil {
+		return err
+	}
+	if err := h.authorizeMemoryBackend(c, namespace, "get", corev1alpha1.MemoryBackendDefaultName, true); err != nil {
+		return err
+	}
+	backend, err := h.authorizedMemoryBackendInNamespace(c, namespace, true, "update")
+	if err != nil {
+		return err
+	}
+	var request struct {
+		CheckpointID             string    `json:"checkpointId"`
+		MaximumOperationSequence int64     `json:"maximumOperationSequence,omitempty"`
+		Before                   time.Time `json:"before"`
+		PurgePayloads            bool      `json:"purgePayloads,omitempty"`
+		PurgeReceipts            bool      `json:"purgeReceipts,omitempty"`
+		PurgeExpiredIdempotency  bool      `json:"purgeExpiredIdempotency,omitempty"`
+		PurgeTombstones          bool      `json:"purgeTombstones,omitempty"`
+		PurgeAudit               bool      `json:"purgeAudit,omitempty"`
+		Reason                   string    `json:"reason"`
+	}
+	if err := bindStrictMemoryJSON(c, &request); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid request body")
+	}
+	request.CheckpointID = strings.TrimSpace(request.CheckpointID)
+	request.Reason = strings.TrimSpace(request.Reason)
+	if request.CheckpointID == "" || request.Before.IsZero() || request.MaximumOperationSequence < 0 || request.Reason == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "checkpointId, before, non-negative maximumOperationSequence, and reason are required")
+	}
+	if !request.PurgePayloads && !request.PurgeReceipts && !request.PurgeExpiredIdempotency &&
+		!request.PurgeTombstones && !request.PurgeAudit {
+		return fiber.NewError(fiber.StatusBadRequest, "at least one purge target is required")
+	}
+	reader := h.apiReader
+	if reader == nil {
+		reader = h.client
+	}
+	namespaceObject := &corev1.Namespace{}
+	if err := reader.Get(c.Context(), client.ObjectKey{Name: namespace}, namespaceObject); err != nil || namespaceObject.UID == "" {
+		return fiber.NewError(fiber.StatusServiceUnavailable, "namespace identity is unavailable")
+	}
+	binding, err := h.memoryBackendManager.Store.GetMemoryBackendBinding(c.Context(), string(namespaceObject.UID))
+	if err != nil {
+		return memoryBackendServiceError(err)
+	}
+	if binding == nil || binding.Mode != store.MemoryBackendModeRemote || binding.BackendUID != string(backend.UID) {
+		return fiber.NewError(fiber.StatusConflict, "memory backend does not match the durable remote authority")
+	}
+	now := time.Now().UTC()
+	if h.memoryBackendManager.Now != nil {
+		now = h.memoryBackendManager.Now().UTC()
+	}
+	actor, _ := memoryActor(c)
+	result, err := h.memoryBackendManager.Store.PurgeMemoryGovernance(c.Context(), store.MemoryGovernancePurge{
+		NamespaceUID: binding.NamespaceUID, BackendUID: binding.BackendUID,
+		AuthorityEpoch: binding.AuthorityEpoch, RoutingEpoch: binding.RoutingEpoch, StoreUUID: binding.StoreUUID,
+		CheckpointID: request.CheckpointID, MaximumOperationSequence: request.MaximumOperationSequence,
+		Before: request.Before.UTC(), PurgePayloads: request.PurgePayloads, PurgeReceipts: request.PurgeReceipts,
+		PurgeExpiredIdempotency: request.PurgeExpiredIdempotency, PurgeTombstones: request.PurgeTombstones,
+		PurgeAudit: request.PurgeAudit, Actor: actor, Reason: request.Reason,
+		RequestID: requestid.FromContext(c), Now: now,
+	})
+	if err != nil {
+		return memoryBackendServiceError(err)
+	}
+	return c.JSON(result)
+}
+
 func validatedMemoryRecoveryRouteIdentity(
 	backend *corev1alpha1.MemoryBackend,
 	namespaceUID string,

@@ -302,6 +302,7 @@ func (s *Server) setupRoutes() {
 	api.Post("/memory-backends/default/force-orphan", s.handlers.ForceOrphanMemoryBackend)
 	api.Post("/memory-backends/default/restore-legacy", s.handlers.RestoreLegacyMemoryBackend)
 	api.Post("/memory-backends/default/checkpoints", s.handlers.RecordMemoryBackendCheckpoint)
+	api.Post("/memory-backends/default/purge", s.handlers.PurgeMemoryBackendGovernance)
 	api.Get("/memory-backends/default/status", s.handlers.GetMemoryBackendStatus)
 	api.Get("/memories", s.handlers.ListMemories)
 	api.Post("/memories", s.handlers.CreateMemory)

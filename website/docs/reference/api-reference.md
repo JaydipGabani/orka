@@ -193,6 +193,8 @@ Non-terminal states are `queued`, `leased`, `dispatching`, and `ambiguous`. Term
 | `/api/v1/memory-backends/default/decommission` | POST | Preview or start clean decommission |
 | `/api/v1/memory-backends/default/force-orphan` | POST | Fence locally and orphan unresolved remote state |
 | `/api/v1/memory-backends/default/restore-legacy` | POST | Preview or explicitly restore archived SQLite after clean decommission |
+| `/api/v1/memory-backends/default/checkpoints` | POST | Record a matched activation receipt or verified runtime checkpoint |
+| `/api/v1/memory-backends/default/purge` | POST | Purge explicitly selected, checkpoint-covered local retention state |
 
 Administrative writes require a non-empty audit `reason`. Lifecycle actions accept `dryRun` for preview where supported. Requested `spec.lifecycleState` values are `Staged`, `Active`, `ReadOnly`, `Disabled`, and `Decommissioning`; durable `status.effectiveLifecycleState` may additionally report `Validating`, `Draining`, `Recovering`, identity/divergence failures, `Decommissioned`, or `Removed`.
 

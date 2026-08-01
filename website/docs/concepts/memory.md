@@ -194,6 +194,8 @@ curl -i -X POST http://localhost:8080/api/v1/memories \
 | `/api/v1/memory-backends/default/decommission` | POST | Start or preview clean decommission |
 | `/api/v1/memory-backends/default/force-orphan` | POST | Fence locally and orphan unresolved remote state |
 | `/api/v1/memory-backends/default/restore-legacy` | POST | Preview or explicitly restore archived SQLite authority after clean decommission |
+| `/api/v1/memory-backends/default/checkpoints` | POST | Record a matched activation receipt or verified runtime checkpoint |
+| `/api/v1/memory-backends/default/purge` | POST | Purge explicitly selected, checkpoint-covered local retention state |
 
 Administrative writes require an audit `reason`; destructive/lifecycle CLI commands also require explicit confirmation.
 

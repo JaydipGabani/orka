@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/require"
@@ -249,4 +250,57 @@ func TestUpdateMemoryBackendRejectsQueryBodyNamespaceMismatch(t *testing.T) {
 		"/api/v1/memory-backends/default?namespace=team-b&reason=update", request))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusBadRequest, response.StatusCode)
+}
+
+type memoryGovernancePurgeCaptureStore struct {
+	store.GovernedMemoryStore
+	binding store.MemoryBackendBinding
+	purge   store.MemoryGovernancePurge
+}
+
+func (s *memoryGovernancePurgeCaptureStore) GetMemoryBackendBinding(context.Context, string) (*store.MemoryBackendBinding, error) {
+	binding := s.binding
+	return &binding, nil
+}
+
+func (s *memoryGovernancePurgeCaptureStore) PurgeMemoryGovernance(
+	_ context.Context,
+	purge store.MemoryGovernancePurge,
+) (*store.MemoryGovernancePurgeResult, error) {
+	s.purge = purge
+	return &store.MemoryGovernancePurgeResult{PayloadsPurged: 3, PurgeDigest: "sha256:purge"}, nil
+}
+
+func TestPurgeMemoryBackendGovernanceUsesActiveBindingIdentity(t *testing.T) {
+	base := newMemoryBackendAPITestStore(t)
+	now := time.Date(2026, 8, 1, 9, 30, 0, 0, time.UTC)
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default", UID: types.UID("namespace-a")}}
+	backend := &corev1alpha1.MemoryBackend{ObjectMeta: metav1.ObjectMeta{
+		Name: corev1alpha1.MemoryBackendDefaultName, Namespace: namespace.Name, UID: types.UID("backend-a"),
+	}}
+	capture := &memoryGovernancePurgeCaptureStore{GovernedMemoryStore: base, binding: store.MemoryBackendBinding{
+		Namespace: namespace.Name, NamespaceUID: string(namespace.UID), Mode: store.MemoryBackendModeRemote,
+		BackendUID: string(backend.UID), AuthorityEpoch: 3, RoutingEpoch: 4, StoreUUID: "store-uuid-a",
+	}}
+	user := &UserInfo{AuthType: AuthTypeTokenReview, Username: "system:serviceaccount:default:operator", Namespace: namespace.Name}
+	h, app := memoryBackendTestHandlerWithStore(t, user, true, capture, namespace, backend)
+	h.memoryBackendManager.Now = func() time.Time { return now }
+	app.Post("/api/v1/memory-backends/default/purge", h.PurgeMemoryBackendGovernance)
+	before := now.Add(-time.Hour)
+	response, err := app.Test(newRequest(http.MethodPost, "/api/v1/memory-backends/default/purge", map[string]any{
+		"checkpointId": "mcheckpoint-a", "maximumOperationSequence": 42,
+		"before": before, "purgePayloads": true, "reason": "reclaim retained payload capacity",
+	}))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.Equal(t, capture.binding.NamespaceUID, capture.purge.NamespaceUID)
+	require.Equal(t, capture.binding.BackendUID, capture.purge.BackendUID)
+	require.Equal(t, capture.binding.AuthorityEpoch, capture.purge.AuthorityEpoch)
+	require.Equal(t, capture.binding.RoutingEpoch, capture.purge.RoutingEpoch)
+	require.Equal(t, capture.binding.StoreUUID, capture.purge.StoreUUID)
+	require.Equal(t, "mcheckpoint-a", capture.purge.CheckpointID)
+	require.Equal(t, int64(42), capture.purge.MaximumOperationSequence)
+	require.True(t, capture.purge.PurgePayloads)
+	require.Equal(t, before, capture.purge.Before)
+	require.Equal(t, now, capture.purge.Now)
 }
