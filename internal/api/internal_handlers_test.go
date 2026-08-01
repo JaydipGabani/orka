@@ -93,6 +93,7 @@ func setupTestInternalMemoryHandlers(t *testing.T) (*InternalHandlers, *fiber.Ap
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 	h := NewInternalHandlers(ss, ss, ss, ss, ss, InternalHandlersConfig{
 		Client: kubeClient, APIReader: kubeClient, MemoryStore: ss, MemoryProposalStore: ss,
+		ContextTokenAuthorization: ContextTokenAuthorizationConfig{Mode: ContextTokenAuthorizationModeEnforce},
 	})
 	user := &UserInfo{
 		AuthType: AuthTypeTokenReview, Username: "system:serviceaccount:default:worker", Namespace: "default",

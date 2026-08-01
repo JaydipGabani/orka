@@ -222,7 +222,7 @@ Workers use namespace-in-path routes under `/internal/v1`:
 - `GET /internal/v1/memory-proposals/:namespace/:id`
 - `POST /internal/v1/memory-proposals/:namespace/:id/review|apply|archive`
 
-Internal routes are not a weaker authorization path. Namespace identity, task transaction context, required memory scopes, and remote-search approval must still be validated server-side.
+Internal routes are not a weaker authorization path. They always validate the Kubernetes workload and namespace. When context-token authorization is enabled, task transaction context, required memory scopes, and remote-search approval are also validated server-side.
 
 ## CLI
 

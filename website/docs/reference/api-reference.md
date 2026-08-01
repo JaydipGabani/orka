@@ -210,7 +210,7 @@ Proposal list parameters are `namespace`, `taskName`, `agentName`, `type`, `stat
 
 ### Internal Worker Routes
 
-Namespace-bound worker equivalents are under `/internal/v1`: `/memories/:namespace`, `/memories/:namespace/search`, `/memories/:namespace/:id`, `/memory-operations/:namespace[/:id]`, and `/memory-proposals/:namespace[/:id]` plus the corresponding enable, disable, review, apply, and archive actions. These routes still require server-side namespace, task transaction, scope, and approval validation; they are not an authorization bypass.
+Namespace-bound worker equivalents are under `/internal/v1`: `/memories/:namespace`, `/memories/:namespace/search`, `/memories/:namespace/:id`, `/memory-operations/:namespace[/:id]`, and `/memory-proposals/:namespace[/:id]` plus the corresponding enable, disable, review, apply, and archive actions. These routes always verify the Kubernetes workload and namespace. When context-token authorization is enabled, they additionally require task-bound transaction context, operation-specific scopes, and remote-search approval; they are not an authorization bypass.
 
 ## Agents
 

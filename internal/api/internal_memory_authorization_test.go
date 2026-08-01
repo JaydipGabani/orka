@@ -258,3 +258,13 @@ func TestHarnessWrapperInternalMemoryAccessStillRequiresTaskTxnToken(t *testing.
 	require.Equal(t, http.StatusOK,
 		testInternalMemoryRequest(t, app, http.MethodGet, "/internal/v1/memories/default", "").StatusCode)
 }
+
+func TestInternalMemoryAuthorizationOffPreservesVerifiedWorkloadCompatibility(t *testing.T) {
+	h, app, _, user := setupTestInternalMemoryHandlers(t)
+	h.contextTokenAuthorization = ContextTokenAuthorizationConfig{Mode: ContextTokenAuthorizationModeOff}
+	app.Get("/internal/v1/memories/:namespace", h.ListMemories)
+	user.ContextToken = nil
+
+	require.Equal(t, http.StatusOK,
+		testInternalMemoryRequest(t, app, http.MethodGet, "/internal/v1/memories/default", "").StatusCode)
+}

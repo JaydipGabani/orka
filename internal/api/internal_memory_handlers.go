@@ -362,19 +362,33 @@ func (h *InternalHandlers) authorizeInternalMemoryTask(
 	namespace, action string,
 	requiredScopeGroups ...[]string,
 ) error {
+	if !h.contextTokenAuthorization.Enabled() {
+		return nil
+	}
+	authorizationFailure := func(token *ContextToken, message string) error {
+		if token == nil {
+			token = &ContextToken{}
+		}
+		return handleContextTokenAuthorizationFailures(
+			h.contextTokenAuthorization,
+			token,
+			action,
+			[]string{message},
+		)
+	}
 	userInfo := GetUserInfo(c)
 	if userInfo == nil || userInfo.ContextToken == nil {
-		return fiber.NewError(fiber.StatusForbidden, action+" requires a task-scoped Txn-Token")
+		return authorizationFailure(nil, "task-scoped Txn-Token is required")
 	}
 	token := userInfo.ContextToken
 	for _, required := range requiredScopeGroups {
 		if !hasAnyScope(token.Scopes, required) {
-			return fiber.NewError(fiber.StatusForbidden, action+" is not authorized by the Txn-Token scope")
+			return authorizationFailure(token, "missing one of required scopes "+strings.Join(required, ","))
 		}
 	}
 	tokenNamespace, ok := contextString(token.TransactionContext, "namespace")
 	if !ok || tokenNamespace != namespace {
-		return fiber.NewError(fiber.StatusForbidden, action+" requires an exact namespace-bound Txn-Token")
+		return authorizationFailure(token, "namespace does not match the task-scoped Txn-Token")
 	}
 	taskName, ok := contextString(token.TransactionContext, "taskName")
 	if !ok {
@@ -387,7 +401,7 @@ func (h *InternalHandlers) authorizeInternalMemoryTask(
 		}
 	}
 	if strings.TrimSpace(taskName) == "" {
-		return fiber.NewError(fiber.StatusForbidden, action+" requires a task-bound Txn-Token")
+		return authorizationFailure(token, "task name is missing from the Txn-Token context")
 	}
 	var task *corev1alpha1.Task
 	if current, ok := c.Locals(internalMemoryTaskLocalKey).(*corev1alpha1.Task); ok {
@@ -398,16 +412,16 @@ func (h *InternalHandlers) authorizeInternalMemoryTask(
 			reader = h.k8sClient
 		}
 		if reader == nil {
-			return fiber.NewError(fiber.StatusForbidden, action+" task identity could not be verified")
+			return authorizationFailure(token, "task identity could not be verified")
 		}
 		task = &corev1alpha1.Task{}
 		if err := reader.Get(c.Context(), types.NamespacedName{Namespace: namespace, Name: taskName}, task); err != nil {
-			return fiber.NewError(fiber.StatusForbidden, action+" task identity could not be verified")
+			return authorizationFailure(token, "task identity could not be verified")
 		}
 	}
 	if task.Namespace != namespace || task.Name != taskName || !task.DeletionTimestamp.IsZero() ||
 		isTerminalInternalTaskPhase(task.Status.Phase) {
-		return fiber.NewError(fiber.StatusForbidden, action+" task identity is not active")
+		return authorizationFailure(token, "task identity is not active")
 	}
 	return nil
 }
