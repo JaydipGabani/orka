@@ -2,7 +2,9 @@
 
 # Controller configuration
 controller:
-  # Number of controller replicas
+  # Number of controller replicas. MemoryBackend support currently requires 1
+  # because the durable SQLite authority is single-writer and upgrades use a
+  # Recreate barrier between foundation and activation release artifacts.
   replicas: 1
 
   # Controller image
@@ -80,6 +82,28 @@ controller:
     claimLease: 1m
     pollInterval: 500ms
     batchSize: 25
+
+  # Namespaced remote memory control plane. Both gates are disabled by default.
+  # Apply the exact target MemoryBackend CRD before enabling this during an upgrade.
+  memoryBackend:
+    enabled: false
+    # The second release gate. The foundation chart artifact rejects true even
+    # when supplied with --set; a later activation release must carry the
+    # explicit activation source/chart gate.
+    activationEnabled: false
+    # Stable non-secret identity shared by all controller replicas.
+    clusterId: ""
+    # Offline rendering cannot use lookup; set only after separately applying/verifying the CRD.
+    crdsReadyOverride: false
+    validationTTL: 5m
+    probeTimeout: 15s
+    dispatcherInterval: 1s
+    dispatcherGlobalConcurrency: 16
+    dispatcherNamespaceConcurrency: 2
+    dispatcherGlobalRPS: 100
+    dispatcherNamespaceRPS: 10
+    dispatcherGlobalBurst: 16
+    dispatcherNamespaceBurst: 2
 
   # Experimental agent sandbox workspace support (disabled by default)
   executionWorkspace:
@@ -163,6 +187,8 @@ controller:
       agentWrite: ""
       memoryRead: ""
       memoryWrite: ""
+      memoryOperate: ""
+      memorySearchRemote: ""
       sessionRead: ""
       sessionWrite: ""
       securityRead: ""
@@ -226,6 +252,66 @@ workers:
     # Optional Codex CLI sandbox mode for the Codex adapter.
     codexSandboxMode: ""
     resources: {}
+
+# Optional durable OMS bridge to an operator-managed KD6/proxy deployment.
+# The adapter is disabled by default and never creates a MemoryBackend resource.
+omsKd6Adapter:
+  enabled: false
+  # SQLite control state is single-writer; exactly one replica is supported.
+  replicas: 1
+
+  image:
+    repository: ghcr.io/orka-agents/orka/oms-kd6-adapter
+    tag: "0.1.1"
+    pullPolicy: IfNotPresent
+
+  # Existing Secret containing the bearer token accepted from Orka. The chart
+  # intentionally does not generate this Secret because MemoryBackend binding
+  # annotations depend on the final backend, namespace, endpoint, tenant, and
+  # store. The mounted token file is re-read for every authenticated request.
+  auth:
+    existingSecret: ""
+    tokenKey: token
+
+  # Existing kubernetes.io/tls Secret used by the adapter's HTTPS listener.
+  # The certificate pair is reloaded after this bounded cache interval.
+  tls:
+    existingSecret: ""
+    certKey: tls.crt
+    keyKey: tls.key
+    reloadInterval: 1s
+
+  kd6:
+    # Absolute HTTPS KD6/proxy base URL.
+    endpoint: ""
+    # Existing Secret containing the KD6/proxy bearer token. The mounted token
+    # file is re-read before every outbound KD6 request.
+    auth:
+      existingSecret: ""
+      tokenKey: token
+    # Map immutable OMS store names to operator-precreated KD6 provider store IDs.
+    # At least one mapping is required when the adapter is enabled.
+    storeMappings: {}
+
+  # This Service is only a backend for an external public HTTPS exposure. A
+  # ClusterIP, private address, or *.svc name is not a valid MemoryBackend
+  # external-endpoint. Configure a public load balancer or ingress separately.
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 8091
+    annotations: {}
+
+  # Durable OMS receipts, ownership, routing fences, tombstones, and snapshots
+  # require a PVC. Disabling persistence is rejected at template time.
+  persistence:
+    enabled: true
+    existingClaim: ""
+    size: 1Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+
+  resources: {}
 
 # GitHub webhook and label-trigger configuration.
 # Configure a repository webhook to POST to /webhooks/github with the secret below.
@@ -308,6 +394,7 @@ store:
   path: /data/orka.db
   persistence:
     enabled: true        # durable gateway inbox/outbox and Session history require a PVC
+    existingClaim: ""    # optional pre-created PVC; chart-created PVCs are retained on uninstall
     size: 1Gi
     storageClass: ""     # use cluster default
     accessMode: ReadWriteOnce

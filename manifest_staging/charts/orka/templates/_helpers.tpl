@@ -63,6 +63,28 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+Create the durable controller store PVC name, or return the operator-provided
+claim name when one is configured.
+*/}}
+{{- define "orka.storePVCName" -}}
+{{- if .Values.store.persistence.existingClaim -}}
+{{- .Values.store.persistence.existingClaim -}}
+{{- else -}}
+{{- printf "%s-store" (include "orka.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Return the immutable memory release stage carried by this chart artifact. A
+missing annotation is treated as foundation so repackaging cannot enable
+activation by omission. A later activation release must explicitly change the
+Chart.yaml annotation together with the controller source gate.
+*/}}
+{{- define "orka.memoryReleaseStage" -}}
+{{- index .Chart.Annotations "memory.orka.ai/release-stage" | default "foundation" -}}
+{{- end }}
+
+{{/*
 Create release-scoped worker ServiceAccount names. Reserve room for each
 suffix so long release names cannot collapse all trust tiers to one name.
 */}}
@@ -134,4 +156,56 @@ Create release-scoped static worker ClusterRoleBinding names.
 
 {{- define "orka.containerWorkerClusterRoleBindingName" -}}
 {{- printf "%s-container-worker-rolebinding" (include "orka.fullname" .) | trunc 253 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create a release-scoped OMS KD6 adapter name while reserving room for the
+component suffix on long release names.
+*/}}
+{{- define "orka.omsKd6AdapterName" -}}
+{{- printf "%s-oms-kd6-adapter" (include "orka.fullname" . | trunc 47 | trimSuffix "-") | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create the PVC name for the OMS KD6 adapter, or return the operator-provided
+claim name when one is configured.
+*/}}
+{{- define "orka.omsKd6AdapterPVCName" -}}
+{{- if .Values.omsKd6Adapter.persistence.existingClaim -}}
+{{- .Values.omsKd6Adapter.persistence.existingClaim -}}
+{{- else -}}
+{{- printf "%s-oms-kd6-adapter-data" (include "orka.fullname" . | trunc 42 | trimSuffix "-") | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Fail closed on unsupported or incomplete OMS KD6 adapter configuration.
+*/}}
+{{- define "orka.omsKd6AdapterValidate" -}}
+{{- if .Values.omsKd6Adapter.enabled -}}
+{{- if ne (int .Values.omsKd6Adapter.replicas) 1 -}}
+{{- fail "omsKd6Adapter supports exactly one active replica" -}}
+{{- end -}}
+{{- if not .Values.omsKd6Adapter.persistence.enabled -}}
+{{- fail "omsKd6Adapter requires durable persistence" -}}
+{{- end -}}
+{{- $_ := required "omsKd6Adapter.auth.existingSecret is required when the adapter is enabled" .Values.omsKd6Adapter.auth.existingSecret -}}
+{{- $_ := required "omsKd6Adapter.auth.tokenKey is required when the adapter is enabled" .Values.omsKd6Adapter.auth.tokenKey -}}
+{{- $_ := required "omsKd6Adapter.tls.existingSecret is required when the adapter is enabled" .Values.omsKd6Adapter.tls.existingSecret -}}
+{{- $_ := required "omsKd6Adapter.tls.certKey is required when the adapter is enabled" .Values.omsKd6Adapter.tls.certKey -}}
+{{- $_ := required "omsKd6Adapter.tls.keyKey is required when the adapter is enabled" .Values.omsKd6Adapter.tls.keyKey -}}
+{{- $_ := required "omsKd6Adapter.tls.reloadInterval is required when the adapter is enabled" .Values.omsKd6Adapter.tls.reloadInterval -}}
+{{- $_ := required "omsKd6Adapter.kd6.endpoint is required when the adapter is enabled" .Values.omsKd6Adapter.kd6.endpoint -}}
+{{- if not (hasPrefix "https://" .Values.omsKd6Adapter.kd6.endpoint) -}}
+{{- fail "omsKd6Adapter.kd6.endpoint must be an absolute HTTPS URL" -}}
+{{- end -}}
+{{- $_ := required "omsKd6Adapter.kd6.auth.existingSecret is required when the adapter is enabled" .Values.omsKd6Adapter.kd6.auth.existingSecret -}}
+{{- $_ := required "omsKd6Adapter.kd6.auth.tokenKey is required when the adapter is enabled" .Values.omsKd6Adapter.kd6.auth.tokenKey -}}
+{{- if eq (len .Values.omsKd6Adapter.kd6.storeMappings) 0 -}}
+{{- fail "omsKd6Adapter.kd6.storeMappings requires at least one store mapping" -}}
+{{- end -}}
+{{- range $name, $providerStoreID := .Values.omsKd6Adapter.kd6.storeMappings -}}
+{{- $_ := required (printf "omsKd6Adapter.kd6.storeMappings[%s] must name a provider store" $name) $providerStoreID -}}
+{{- end -}}
+{{- end -}}
 {{- end }}

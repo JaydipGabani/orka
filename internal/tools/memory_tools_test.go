@@ -11,8 +11,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/orka-agents/orka/internal/workerenv"
 )
 
 func TestRememberMemoryToolExecute_BlankContent(t *testing.T) {
@@ -135,5 +140,126 @@ func TestRememberMemoryToolExecute_DerivesTitleWhenOmitted(t *testing.T) {
 	}
 	if payload.Type != "memory" {
 		t.Errorf("type = %q", payload.Type)
+	}
+}
+
+func TestRecallMemoryToolUsesStrictSearchAndNormalizesMemoryArray(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/memories/test-ns/search" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request["query"] != "sqlite" || request["mode"] != "keyword" {
+			t.Fatalf("search request = %#v", request)
+		}
+		if request["limit"] != float64(5) {
+			t.Fatalf("limit = %#v", request["limit"])
+		}
+		trust, _ := request["trust"].([]any)
+		if len(trust) != 2 || trust[0] != "reviewed" || trust[1] != "trusted" {
+			t.Fatalf("trust = %#v", request["trust"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[{"memory":{"id":"mem-1","content":"use sqlite"},"score":1}],"actualMode":"keyword","exhausted":true,"complete":true}`))
+	}))
+	defer server.Close()
+
+	t.Setenv("ORKA_CONTROLLER_URL", server.URL)
+	t.Setenv("ORKA_TASK_NAMESPACE", "test-ns")
+	t.Setenv("ORKA_TASK_NAME", "task-a")
+	t.Setenv("ORKA_SA_TOKEN", "test-token")
+	t.Setenv(workerenv.TransactionTokenFile, "")
+	result, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"query":"sqlite","limit":5}`))
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result != `[{"id":"mem-1","content":"use sqlite"}]` {
+		t.Fatalf("result = %s", result)
+	}
+}
+
+func TestRecallMemoryToolPropagatesMountedTaskTransactionToken(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "transaction-token")
+	if err := os.WriteFile(tokenPath, []byte(" task-scoped-token \n"), 0o600); err != nil {
+		t.Fatalf("write transaction token: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer service-account-token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if got := r.Header.Get(internalMemoryTransactionTokenHeader); got != "task-scoped-token" {
+			t.Errorf("%s = %q", internalMemoryTransactionTokenHeader, got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"actualMode":"keyword","exhausted":true,"complete":true}`))
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "test-ns")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, tokenPath)
+
+	if _, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"query":"sqlite"}`)); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+}
+
+func TestRecallMemoryToolFailsClosedWhenMountedTransactionTokenCannotBeRead(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "test-ns")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, filepath.Join(t.TempDir(), "missing-token"))
+
+	_, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"query":"sqlite"}`))
+	if err == nil || !strings.Contains(err.Error(), "failed to load task transaction token") {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("controller requests = %d, want 0", got)
+	}
+}
+
+func TestRecallMemoryToolOmitsLimitWhenNotProvided(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if _, present := request["limit"]; present {
+			t.Fatalf("omitted limit was serialized: %#v", request["limit"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"actualMode":"keyword","exhausted":true,"complete":true}`))
+	}))
+	defer server.Close()
+
+	t.Setenv("ORKA_CONTROLLER_URL", server.URL)
+	t.Setenv("ORKA_TASK_NAMESPACE", "test-ns")
+	t.Setenv("ORKA_TASK_NAME", "task-a")
+	t.Setenv("ORKA_SA_TOKEN", "test-token")
+	t.Setenv(workerenv.TransactionTokenFile, "")
+	if _, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"query":"sqlite"}`)); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+}
+
+func TestRecallMemoryToolRejectsNonPositiveLimit(t *testing.T) {
+	if _, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"limit":0}`)); err == nil ||
+		!strings.Contains(err.Error(), "limit must be positive") {
+		t.Fatalf("Execute() error = %v", err)
 	}
 }

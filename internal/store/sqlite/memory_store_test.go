@@ -109,6 +109,221 @@ func TestMemoryStore(t *testing.T) {
 	}
 }
 
+func TestSetLegacyMemoryDisabledWithAuditIsAtomic(t *testing.T) {
+	original := governedMemoryQuotas
+	t.Cleanup(func() { governedMemoryQuotas = original })
+	s := setupTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	memory := &store.Memory{Namespace: "ns-governance", Source: "api", Content: "durable guidance"}
+	if err := s.CreateMemory(ctx, memory); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendMemoryAudit(ctx, store.MemoryAuditRecord{
+		Namespace: memory.Namespace, NamespaceUID: "ns-governance-uid", Actor: "test",
+		Action: "memory.test", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	governedMemoryQuotas.NamespaceAuditRows = 1
+	governedMemoryQuotas.GlobalAuditRows = 100
+
+	err := s.SetLegacyMemoryDisabledWithAudit(
+		ctx, memory.Namespace, "ns-governance-uid", memory.ID, true,
+		"alice", "local memory governance change", "request-a", now.Add(time.Second),
+	)
+	if !errors.Is(err, store.ErrCapacity) {
+		t.Fatalf("SetLegacyMemoryDisabledWithAudit() error = %v, want ErrCapacity", err)
+	}
+	unchanged, err := s.GetMemory(ctx, memory.Namespace, memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Disabled {
+		t.Fatalf("memory disabled after rolled-back audit failure: %#v", unchanged)
+	}
+
+	governedMemoryQuotas.NamespaceAuditRows = 10
+	if err := s.SetLegacyMemoryDisabledWithAudit(
+		ctx, memory.Namespace, "ns-governance-uid", memory.ID, true,
+		"alice", "local memory governance change", "request-b", now.Add(2*time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.GetMemory(ctx, memory.Namespace, memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Disabled {
+		t.Fatalf("memory not disabled after atomic governance change: %#v", updated)
+	}
+	audits, err := s.ListMemoryAudit(ctx, store.MemoryAuditFilter{
+		NamespaceUID: "ns-governance-uid", MemoryID: memory.ID, Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 1 || audits[0].Action != "memory.disable" ||
+		audits[0].PreviousState != "disabled=false" || audits[0].NewState != "disabled=true" {
+		t.Fatalf("disable audits = %#v", audits)
+	}
+}
+
+func TestMemoryStoreTrustFilterRequiresAppliedProposalProvenance(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	untrusted := &store.Memory{
+		Namespace: "ns-trust", Source: "manual", Content: "direct memory", Trust: store.MemoryTrustReviewed,
+	}
+	if err := s.CreateMemory(ctx, untrusted); err != nil {
+		t.Fatalf("CreateMemory untrusted: %v", err)
+	}
+	if untrusted.Trust != store.MemoryTrustUntrusted {
+		t.Fatalf("direct memory trust = %q, want untrusted", untrusted.Trust)
+	}
+	if err := s.CreateMemory(ctx, &store.Memory{
+		Namespace: "ns-trust", Source: memorySourceProposal, SourceProposalID: "proposal-spoof", Content: "spoofed",
+	}); !errors.Is(err, store.ErrValidation) {
+		t.Fatalf("CreateMemory spoofed proposal provenance error = %v, want ErrValidation", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO memories
+		(id, namespace, source, source_proposal_id, content) VALUES (?, ?, ?, ?, ?)`,
+		"mem-spoofed-provenance", "ns-trust", memorySourceProposal, "proposal-spoof", "spoofed legacy row"); err != nil {
+		t.Fatalf("insert historical spoofed row: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO memories
+		(id, namespace, source, source_proposal_id, content) VALUES (?, ?, ?, ?, ?)`,
+		"mem-spoofed-applied", "ns-trust", memorySourceProposal, "proposal-spoofed-applied", "spoofed applied row"); err != nil {
+		t.Fatalf("insert historical spoofed applied memory: %v", err)
+	}
+	spoofedAt := time.Now().UTC()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO memory_proposals
+		(id, namespace, type, title, content, status, reviewer, applied_memory_id, applied_by, reviewed_at, applied_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"proposal-spoofed-applied", "ns-trust", proposalTypeMemory, "spoofed applied proposal",
+		"spoofed applied row", proposalStatusApplied, "forged-reviewer", "mem-spoofed-applied", "forged-applier",
+		spoofedAt, spoofedAt); err != nil {
+		t.Fatalf("insert historical spoofed applied proposal: %v", err)
+	}
+
+	proposal := &store.MemoryProposal{
+		Namespace: "ns-trust", Type: proposalTypeMemory, Title: "reviewed", Content: "reviewed memory",
+	}
+	if err := s.CreateMemoryProposal(ctx, proposal); err != nil {
+		t.Fatalf("CreateMemoryProposal: %v", err)
+	}
+	if err := s.ReviewMemoryProposal(ctx, store.MemoryProposalReview{
+		Namespace: proposal.Namespace, ID: proposal.ID, Status: proposalStatusAccepted, Reviewer: "reviewer",
+	}); err != nil {
+		t.Fatalf("ReviewMemoryProposal: %v", err)
+	}
+	untrusted.Source = memorySourceProposal
+	untrusted.SourceProposalID = proposal.ID
+	untrusted.Content = proposal.Content
+	if err := s.UpdateMemory(ctx, untrusted); err != nil {
+		t.Fatalf("UpdateMemory with spoofed provenance: %v", err)
+	}
+	unchanged, err := s.GetMemory(ctx, untrusted.Namespace, untrusted.ID)
+	if err != nil {
+		t.Fatalf("GetMemory after spoofed update: %v", err)
+	}
+	if unchanged.Source != "manual" || unchanged.SourceProposalID != "" || unchanged.Trust != store.MemoryTrustUntrusted {
+		t.Fatalf("UpdateMemory changed server-owned provenance: %+v", unchanged)
+	}
+	reviewed, err := s.ApplyMemoryProposal(ctx, store.MemoryProposalApply{
+		Namespace: proposal.Namespace, ID: proposal.ID, AppliedBy: "reviewer",
+	})
+	if err != nil {
+		t.Fatalf("ApplyMemoryProposal: %v", err)
+	}
+	if reviewed.Trust != store.MemoryTrustReviewed {
+		t.Fatalf("applied proposal trust = %q, want reviewed", reviewed.Trust)
+	}
+
+	all, err := s.ListMemories(ctx, store.MemoryFilter{Namespace: "ns-trust"})
+	if err != nil || len(all) != 4 {
+		t.Fatalf("unfiltered legacy list = %+v, %v", all, err)
+	}
+	reviewedOnly, err := s.ListMemories(ctx, store.MemoryFilter{
+		Namespace: "ns-trust", Trust: []store.MemoryTrust{store.MemoryTrustReviewed},
+	})
+	if err != nil || len(reviewedOnly) != 1 || reviewedOnly[0].ID != reviewed.ID {
+		t.Fatalf("reviewed trust filter = %+v, %v", reviewedOnly, err)
+	}
+	untrustedOnly, err := s.ListMemories(ctx, store.MemoryFilter{
+		Namespace: "ns-trust", Trust: []store.MemoryTrust{store.MemoryTrustUntrusted},
+	})
+	if err != nil || len(untrustedOnly) != 3 {
+		t.Fatalf("untrusted trust filter = %+v, %v", untrustedOnly, err)
+	}
+	untrustedIDs := map[string]bool{}
+	for _, memory := range untrustedOnly {
+		untrustedIDs[memory.ID] = true
+	}
+	if !untrustedIDs[untrusted.ID] || !untrustedIDs["mem-spoofed-provenance"] || !untrustedIDs["mem-spoofed-applied"] {
+		t.Fatalf("untrusted trust filter ids = %+v", untrustedIDs)
+	}
+	trustedOnly, err := s.ListMemories(ctx, store.MemoryFilter{
+		Namespace: "ns-trust", Trust: []store.MemoryTrust{store.MemoryTrustTrusted},
+	})
+	if err != nil || len(trustedOnly) != 0 {
+		t.Fatalf("trusted trust filter = %+v, %v", trustedOnly, err)
+	}
+}
+
+func TestReviewedProposalMemoryContentCannotBeEdited(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	proposal := &store.MemoryProposal{
+		Namespace: "ns-reviewed-immutable",
+		Type:      proposalTypeMemory,
+		Title:     "Reviewed guidance",
+		Content:   "Keep reviewed guidance immutable until it is reproposed.",
+	}
+	if err := s.CreateMemoryProposal(ctx, proposal); err != nil {
+		t.Fatalf("CreateMemoryProposal: %v", err)
+	}
+	if err := s.ReviewMemoryProposal(ctx, store.MemoryProposalReview{
+		Namespace: proposal.Namespace, ID: proposal.ID, Status: proposalStatusAccepted, Reviewer: "reviewer",
+	}); err != nil {
+		t.Fatalf("ReviewMemoryProposal: %v", err)
+	}
+	memory, err := s.ApplyMemoryProposal(ctx, store.MemoryProposalApply{
+		Namespace: proposal.Namespace, ID: proposal.ID, AppliedBy: "reviewer",
+	})
+	if err != nil {
+		t.Fatalf("ApplyMemoryProposal: %v", err)
+	}
+
+	memory.TaskName = "updated-task-metadata"
+	if err := s.UpdateMemory(ctx, memory); err != nil {
+		t.Fatalf("UpdateMemory metadata-only: %v", err)
+	}
+	memory.Content = "silently edited reviewed guidance"
+	if err := s.UpdateMemory(ctx, memory); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("UpdateMemory reviewed content error = %v, want ErrConflict", err)
+	}
+	unchanged, err := s.GetMemory(ctx, proposal.Namespace, memory.ID)
+	if err != nil {
+		t.Fatalf("GetMemory after rejected edit: %v", err)
+	}
+	if unchanged.Content != proposal.Content || unchanged.Trust != store.MemoryTrustReviewed {
+		t.Fatalf("reviewed memory changed after rejected edit: %+v", unchanged)
+	}
+
+	if _, err := s.db.ExecContext(ctx, `UPDATE memories SET content = ? WHERE namespace = ? AND id = ?`,
+		"historical out-of-band edit", proposal.Namespace, memory.ID); err != nil {
+		t.Fatalf("simulate historical reviewed-memory edit: %v", err)
+	}
+	demoted, err := s.GetMemory(ctx, proposal.Namespace, memory.ID)
+	if err != nil {
+		t.Fatalf("GetMemory after historical edit: %v", err)
+	}
+	if demoted.Trust != store.MemoryTrustUntrusted {
+		t.Fatalf("historically edited memory trust = %q, want untrusted", demoted.Trust)
+	}
+}
+
 func TestMemoryProposalStore(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
@@ -170,6 +385,48 @@ func TestMemoryProposalStore(t *testing.T) {
 	if _, err := s.GetMemoryProposal(ctx, "ns-prop", "missing"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("GetMemoryProposal missing error = %v, want ErrNotFound", err)
 	}
+}
+
+func TestCreateMemoryProposalClearsServerOwnedState(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	proposal := &store.MemoryProposal{
+		Namespace:                  "ns-proposal-state",
+		Type:                       proposalTypeMemory,
+		Title:                      "Cannot fabricate proposal state",
+		Content:                    "Proposal creation always begins pending.",
+		Status:                     proposalStatusApplied,
+		Reviewer:                   "forged-reviewer",
+		ReviewNote:                 "forged-review",
+		AppliedMemoryID:            "mem-forged",
+		ApplyOperationID:           "mop-forged",
+		AppliedBy:                  "forged-applier",
+		ApplicationAbandonedBy:     "forged-abandoner",
+		ApplicationAbandonedReason: "forged-reason",
+		ReviewedAt:                 &now,
+		AppliedAt:                  &now,
+		ApplicationAbandonedAt:     &now,
+	}
+	if err := s.CreateMemoryProposal(ctx, proposal); err != nil {
+		t.Fatalf("CreateMemoryProposal: %v", err)
+	}
+
+	assertPendingProposalState := func(label string, got *store.MemoryProposal) {
+		t.Helper()
+		if got.Status != proposalStatusPending || got.Reviewer != "" || got.ReviewNote != "" ||
+			got.AppliedMemoryID != "" || got.ApplyOperationID != "" || got.AppliedBy != "" ||
+			got.ApplicationAbandonedBy != "" || got.ApplicationAbandonedReason != "" ||
+			got.ReviewedAt != nil || got.AppliedAt != nil || got.ApplicationAbandonedAt != nil {
+			t.Fatalf("%s proposal retained caller-owned state: %+v", label, got)
+		}
+	}
+	assertPendingProposalState("returned", proposal)
+	persisted, err := s.GetMemoryProposal(ctx, proposal.Namespace, proposal.ID)
+	if err != nil {
+		t.Fatalf("GetMemoryProposal: %v", err)
+	}
+	assertPendingProposalState("persisted", persisted)
 }
 
 func setupDiskStorePair(t *testing.T) (*Store, *Store) {
@@ -234,7 +491,9 @@ func TestApplyMemoryProposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMemoryProposal: %v", err)
 	}
-	if updated.Status != proposalStatusApplied || updated.AppliedMemoryID != memory.ID || updated.AppliedBy != "coordinator" || updated.AppliedAt == nil {
+	if updated.Status != proposalStatusApplied || updated.AppliedMemoryID != memory.ID ||
+		!strings.HasPrefix(updated.ApplyOperationID, legacyProposalApplyOperationPrefix) ||
+		updated.AppliedBy != "coordinator" || updated.AppliedAt == nil {
 		t.Fatalf("proposal apply metadata not persisted: %+v", updated)
 	}
 
@@ -254,6 +513,133 @@ func TestApplyMemoryProposal(t *testing.T) {
 	}
 	if err := s.ArchiveMemoryProposal(ctx, "ns-apply", proposal.ID); err == nil {
 		t.Fatalf("ArchiveMemoryProposal applied proposal succeeded, want error")
+	}
+}
+
+func TestApplyMemoryProposalRecoveryRequiresCanonicalExistingProvenance(t *testing.T) {
+	t.Run("canonical existing row", func(t *testing.T) {
+		s := setupTestStore(t)
+		ctx := context.Background()
+		proposal := &store.MemoryProposal{
+			Namespace: "ns-apply-existing-canonical",
+			Type:      proposalTypeMemory,
+			Title:     "Canonical recovery",
+			Content:   "Recover only canonical proposal provenance.",
+		}
+		if err := s.CreateMemoryProposal(ctx, proposal); err != nil {
+			t.Fatalf("CreateMemoryProposal: %v", err)
+		}
+		if err := s.ReviewMemoryProposal(ctx, store.MemoryProposalReview{
+			Namespace: proposal.Namespace, ID: proposal.ID, Status: proposalStatusAccepted, Reviewer: "reviewer",
+		}); err != nil {
+			t.Fatalf("ReviewMemoryProposal: %v", err)
+		}
+		const memoryID = "mem-existing-canonical"
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO memories
+			(id, namespace, source, source_proposal_id, content) VALUES (?, ?, ?, ?, ?)`,
+			memoryID, proposal.Namespace, memorySourceProposal, proposal.ID, proposal.Content); err != nil {
+			t.Fatalf("insert canonical recovery row: %v", err)
+		}
+
+		memory, err := s.ApplyMemoryProposal(ctx, store.MemoryProposalApply{
+			Namespace: proposal.Namespace, ID: proposal.ID, AppliedBy: "coordinator",
+		})
+		if err != nil {
+			t.Fatalf("ApplyMemoryProposal: %v", err)
+		}
+		if memory.ID != memoryID || memory.Source != memorySourceProposal ||
+			memory.SourceProposalID != proposal.ID || memory.Trust != store.MemoryTrustReviewed {
+			t.Fatalf("recovered memory = %+v", memory)
+		}
+	})
+
+	t.Run("non-proposal existing row", func(t *testing.T) {
+		s := setupTestStore(t)
+		ctx := context.Background()
+		proposal := &store.MemoryProposal{
+			Namespace: "ns-apply-existing-noncanonical",
+			Type:      proposalTypeMemory,
+			Title:     "Reject noncanonical recovery",
+			Content:   "Matching content is insufficient without canonical provenance.",
+		}
+		if err := s.CreateMemoryProposal(ctx, proposal); err != nil {
+			t.Fatalf("CreateMemoryProposal: %v", err)
+		}
+		if err := s.ReviewMemoryProposal(ctx, store.MemoryProposalReview{
+			Namespace: proposal.Namespace, ID: proposal.ID, Status: proposalStatusAccepted, Reviewer: "reviewer",
+		}); err != nil {
+			t.Fatalf("ReviewMemoryProposal: %v", err)
+		}
+		const memoryID = "mem-existing-noncanonical"
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO memories
+			(id, namespace, source, source_proposal_id, content) VALUES (?, ?, ?, ?, ?)`,
+			memoryID, proposal.Namespace, "manual", proposal.ID, proposal.Content); err != nil {
+			t.Fatalf("insert noncanonical recovery row: %v", err)
+		}
+
+		memory, err := s.ApplyMemoryProposal(ctx, store.MemoryProposalApply{
+			Namespace: proposal.Namespace, ID: proposal.ID, AppliedBy: "coordinator",
+		})
+		if !errors.Is(err, store.ErrConflict) || memory != nil {
+			t.Fatalf("ApplyMemoryProposal = (%+v, %v), want provenance conflict", memory, err)
+		}
+		unchangedProposal, getErr := s.GetMemoryProposal(ctx, proposal.Namespace, proposal.ID)
+		if getErr != nil {
+			t.Fatalf("GetMemoryProposal: %v", getErr)
+		}
+		if unchangedProposal.Status != proposalStatusAccepted || unchangedProposal.AppliedMemoryID != "" {
+			t.Fatalf("proposal changed after provenance conflict: %+v", unchangedProposal)
+		}
+		unchangedMemory, getErr := s.GetMemory(ctx, proposal.Namespace, memoryID)
+		if getErr != nil {
+			t.Fatalf("GetMemory: %v", getErr)
+		}
+		if unchangedMemory.Source != "manual" || unchangedMemory.Trust != store.MemoryTrustUntrusted {
+			t.Fatalf("noncanonical memory was promoted: %+v", unchangedMemory)
+		}
+	})
+}
+
+func TestApplyMemoryProposalRecoveryRejectsTamperedAppliedProvenance(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	proposal := &store.MemoryProposal{
+		Namespace: "ns-apply-tampered",
+		Type:      proposalTypeMemory,
+		Title:     "Tampered applied provenance",
+		Content:   "Applied recovery must revalidate provenance.",
+	}
+	if err := s.CreateMemoryProposal(ctx, proposal); err != nil {
+		t.Fatalf("CreateMemoryProposal: %v", err)
+	}
+	if err := s.ReviewMemoryProposal(ctx, store.MemoryProposalReview{
+		Namespace: proposal.Namespace, ID: proposal.ID, Status: proposalStatusAccepted, Reviewer: "reviewer",
+	}); err != nil {
+		t.Fatalf("ReviewMemoryProposal: %v", err)
+	}
+	memory, err := s.ApplyMemoryProposal(ctx, store.MemoryProposalApply{
+		Namespace: proposal.Namespace, ID: proposal.ID, AppliedBy: "coordinator",
+	})
+	if err != nil {
+		t.Fatalf("ApplyMemoryProposal: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE memories SET source = 'manual' WHERE namespace = ? AND id = ?`,
+		proposal.Namespace, memory.ID); err != nil {
+		t.Fatalf("tamper memory provenance: %v", err)
+	}
+
+	recovered, err := s.ApplyMemoryProposal(ctx, store.MemoryProposalApply{
+		Namespace: proposal.Namespace, ID: proposal.ID, AppliedBy: "retry",
+	})
+	if !errors.Is(err, store.ErrConflict) || recovered != nil {
+		t.Fatalf("ApplyMemoryProposal = (%+v, %v), want tampered-provenance conflict", recovered, err)
+	}
+	stored, err := s.GetMemory(ctx, proposal.Namespace, memory.ID)
+	if err != nil {
+		t.Fatalf("GetMemory: %v", err)
+	}
+	if stored.Trust != store.MemoryTrustUntrusted {
+		t.Fatalf("tampered memory trust = %q, want untrusted", stored.Trust)
 	}
 }
 
@@ -401,6 +787,94 @@ func TestApplyMemoryProposalConcurrentIdempotent(t *testing.T) {
 	}
 	if updated.Status != proposalStatusApplied || updated.AppliedMemoryID != memoryID {
 		t.Fatalf("proposal apply metadata = %+v, want status applied and memory %q", updated, memoryID)
+	}
+}
+
+func TestApplyLegacyMemoryProposalWithAuditCapturesConcurrentReplayGovernance(t *testing.T) {
+	s1, s2 := setupDiskStorePair(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const (
+		ns           = "ns-apply-governance-race"
+		namespaceUID = "ns-apply-governance-race-uid"
+	)
+	proposal := &store.MemoryProposal{
+		Namespace: ns, Type: "memory", Title: "Concurrent governed proposal",
+		Content: "Concurrent replay must include the committed governance overlay.",
+	}
+	if err := s1.CreateMemoryProposal(ctx, proposal); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.ReviewMemoryProposal(ctx, store.MemoryProposalReview{
+		Namespace: ns, ID: proposal.ID, Status: "accepted", Reviewer: "alice",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	var readyOnce, releaseOnce sync.Once
+	releaseApply := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseApply)
+	s1.applyMemoryProposalAfterAcceptedRead = func() {
+		readyOnce.Do(func() {
+			close(ready)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		})
+	}
+
+	type applyResult struct {
+		memory *store.Memory
+		audits []store.MemoryAuditRecord
+		err    error
+	}
+	resultCh := make(chan applyResult, 1)
+	go func() {
+		memory, audits, err := s1.ApplyLegacyMemoryProposalWithAudit(ctx, store.MemoryProposalApply{
+			Namespace: ns, ID: proposal.ID, AppliedBy: "first",
+		}, namespaceUID)
+		resultCh <- applyResult{memory: memory, audits: audits, err: err}
+	}()
+	select {
+	case <-ready:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for first apply to read accepted proposal")
+	}
+
+	applied, _, err := s2.ApplyLegacyMemoryProposalWithAudit(ctx, store.MemoryProposalApply{
+		Namespace: ns, ID: proposal.ID, AppliedBy: "second",
+	}, namespaceUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.AppendMemoryAudit(ctx, store.MemoryAuditRecord{
+		Namespace: ns, NamespaceUID: namespaceUID, Actor: "alice", Action: "memory.trust",
+		PreviousState: string(store.MemoryTrustReviewed), NewState: string(store.MemoryTrustTrusted),
+		MemoryID: applied.ID, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	releaseApply()
+
+	var result applyResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for replaying apply")
+	}
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if result.memory == nil || result.memory.ID != applied.ID {
+		t.Fatalf("replayed memory = %#v, want %q", result.memory, applied.ID)
+	}
+	if len(result.audits) != 1 || result.audits[0].Action != "memory.trust" ||
+		result.audits[0].NewState != string(store.MemoryTrustTrusted) {
+		t.Fatalf("replayed governance audits = %#v", result.audits)
 	}
 }
 
@@ -676,5 +1150,25 @@ func TestTranscriptSearch(t *testing.T) {
 	}
 	if len([]rune(results[0].Snippet)) > 92 { // allow ellipsis on both sides
 		t.Fatalf("snippet too long: %d %q", len([]rune(results[0].Snippet)), results[0].Snippet)
+	}
+}
+
+func TestUpdateMemoryPreservesOrdinarySourceChanges(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	memory := &store.Memory{Namespace: "ns-source", Content: "content", Source: "manual"}
+	if err := s.CreateMemory(ctx, memory); err != nil {
+		t.Fatal(err)
+	}
+	memory.Source = testMetadataImport
+	if err := s.UpdateMemory(ctx, memory); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.GetMemory(ctx, memory.Namespace, memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Source != testMetadataImport || updated.SourceProposalID != "" {
+		t.Fatalf("updated provenance = source %q proposal %q", updated.Source, updated.SourceProposalID)
 	}
 }

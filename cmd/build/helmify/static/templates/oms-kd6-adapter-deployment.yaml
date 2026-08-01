@@ -1,0 +1,139 @@
+{{- include "orka.omsKd6AdapterValidate" . -}}
+{{- if .Values.omsKd6Adapter.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "orka.omsKd6AdapterName" . }}
+  labels:
+    {{- include "orka.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oms-kd6-adapter
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "orka.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: oms-kd6-adapter
+  template:
+    metadata:
+      labels:
+        {{- include "orka.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: oms-kd6-adapter
+      {{- with .Values.annotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: oms-kd6-adapter
+          image: "{{ .Values.omsKd6Adapter.image.repository }}:{{ .Values.omsKd6Adapter.image.tag }}"
+          imagePullPolicy: {{ .Values.omsKd6Adapter.image.pullPolicy }}
+          args:
+            - --listen=:8091
+            - --tls-cert-file=/var/run/orka/oms-tls/tls.crt
+            - --tls-key-file=/var/run/orka/oms-tls/tls.key
+            - {{ printf "--tls-reload-interval=%s" .Values.omsKd6Adapter.tls.reloadInterval | quote }}
+            - --inbound-token-file=/var/run/orka/oms-auth/token
+            - --control-db=/data/oms-control.db
+            - {{ printf "--kd6-endpoint=%s" .Values.omsKd6Adapter.kd6.endpoint | quote }}
+            - --kd6-token-file=/var/run/orka/kd6-auth/token
+            {{- range $name, $providerStoreID := .Values.omsKd6Adapter.kd6.storeMappings }}
+            - {{ printf "--store-mapping=%s=%s" $name $providerStoreID | quote }}
+            {{- end }}
+          ports:
+            - name: https
+              containerPort: 8091
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop:
+                - ALL
+          startupProbe:
+            tcpSocket:
+              port: https
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: inbound-auth
+              mountPath: /var/run/orka/oms-auth
+              readOnly: true
+            - name: tls
+              mountPath: /var/run/orka/oms-tls
+              readOnly: true
+            - name: kd6-auth
+              mountPath: /var/run/orka/kd6-auth
+              readOnly: true
+          {{- with .Values.omsKd6Adapter.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "orka.omsKd6AdapterPVCName" . }}
+        - name: tmp
+          emptyDir: {}
+        - name: inbound-auth
+          secret:
+            secretName: {{ .Values.omsKd6Adapter.auth.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.omsKd6Adapter.auth.tokenKey }}
+                path: token
+        - name: tls
+          secret:
+            secretName: {{ .Values.omsKd6Adapter.tls.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.omsKd6Adapter.tls.certKey }}
+                path: tls.crt
+              - key: {{ .Values.omsKd6Adapter.tls.keyKey }}
+                path: tls.key
+        - name: kd6-auth
+          secret:
+            secretName: {{ .Values.omsKd6Adapter.kd6.auth.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.omsKd6Adapter.kd6.auth.tokenKey }}
+                path: token
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -167,15 +167,47 @@ make docker-build                  # Controller image
 make docker-build-ai-worker        # AI worker
 make docker-build-general-worker   # General worker
 make docker-build-harness-wrapper  # Agent CLI harness wrapper (codex/claude/copilot/opencode)
-make docker-build-all              # Controller, workers, and harness wrapper
+make docker-build-oms-kd6-adapter  # Durable OMS adapter for a KD6/proxy ContentStore
+make docker-build-all              # Controller, workers, harness wrapper, and OMS KD6 adapter
 
 # Push images
 make docker-push
 make docker-push-ai-worker
 make docker-push-general-worker
 make docker-push-harness-wrapper
+make docker-push-oms-kd6-adapter
 make docker-push-all
 ```
+
+### Durable OMS KD6 adapter
+
+The `orka-oms-kd6-adapter` keeps only OMS control state in its SQLite database:
+store UUID mappings, operation receipts, ownership/routing fences,
+generation/delete high-watermarks, and pagination descriptors. A configured
+KD6-compatible HTTPS `ContentStore` remains authoritative for acknowledged
+content.
+
+Run a local adapter with mounted token files and a durable control database:
+
+```bash
+go run ./cmd/orka-oms-kd6-adapter \
+  --listen=:8091 \
+  --tls-cert-file=/path/to/tls.crt \
+  --tls-key-file=/path/to/tls.key \
+  --inbound-token-file=/path/to/oms-token \
+  --control-db=/path/to/oms-control.db \
+  --kd6-endpoint=https://kd6-proxy.example \
+  --kd6-token-file=/path/to/kd6-token \
+  --store-mapping=memory=provider-store-id
+```
+
+Repeat `--store-mapping` for each operator-visible OMS store name. The provider
+transport is HTTPS-only, does not follow redirects, ignores environment proxy
+variables, sends the derived tenant as `X-Tenant-Id`, and emits `X-Agent-Id`
+only as an opaque value derived from normalized Orka provenance. Do not pass
+bearer values on the command line; use token files or the
+`ORKA_OMS_INBOUND_BEARER_TOKEN` and `ORKA_KD6_BEARER_TOKEN` environment
+variables.
 
 ## Local Development with Kind
 

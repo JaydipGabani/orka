@@ -21,7 +21,10 @@ import (
 	"github.com/orka-agents/orka/internal/workerenv"
 )
 
-const internalMemoryToolBodyLimit = 1 << 20 // 1MB
+const (
+	internalMemoryToolBodyLimit          = 1 << 20 // 1MB
+	internalMemoryTransactionTokenHeader = "Txn-Token"
+)
 
 // RecallMemoryTool retrieves durable namespace-scoped memories relevant to the current task.
 type RecallMemoryTool struct{}
@@ -66,8 +69,8 @@ func (t *RecallMemoryTool) Parameters() json.RawMessage {
 			},
 			"limit": {
 				"type": "integer",
-				"minimum": 0,
-				"description": "Maximum number of memories to return. Controller defaults apply when omitted or 0."
+				"minimum": 1,
+				"description": "Maximum number of memories to return. Controller defaults apply when omitted."
 			},
 			"include_disabled": {
 				"type": "boolean",
@@ -85,47 +88,85 @@ type recallMemoryArgs struct {
 	AgentName            string               `json:"agent_name,omitempty"`
 	AgentNameCamel       string               `json:"agentName,omitempty"`
 	Source               string               `json:"source,omitempty"`
-	Limit                int                  `json:"limit,omitempty"`
+	Limit                *int                 `json:"limit,omitempty"`
 	IncludeDisabled      bool                 `json:"include_disabled,omitempty"`
 	IncludeDisabledCamel bool                 `json:"includeDisabled,omitempty"`
 }
 
-// Execute recalls matching memories through the controller's internal API.
+// Execute recalls matching memories through the controller's strict internal search API.
 func (t *RecallMemoryTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a recallMemoryArgs
 	if err := decodeMemoryToolArgs(args, &a); err != nil {
 		return "", fmt.Errorf("failed to parse arguments: %w", err)
 	}
-	if a.Limit < 0 {
-		return "", fmt.Errorf("limit must be non-negative")
+	if a.Limit != nil && *a.Limit <= 0 {
+		return "", fmt.Errorf("limit must be positive")
 	}
-
 	cfg, err := loadInternalControllerConfig()
 	if err != nil {
 		return "", err
 	}
-
-	values := url.Values{}
-	addQueryValue(values, "query", a.Query)
-	if len(a.Tags) > 0 {
-		values.Set("tags", strings.Join(a.Tags, ","))
+	request := map[string]any{
+		"query":           a.Query,
+		"tags":            []string(a.Tags),
+		"taskName":        firstNonEmpty(a.TaskName, a.TaskNameCamel),
+		"agentName":       firstNonEmpty(a.AgentName, a.AgentNameCamel),
+		"sources":         compactMemoryToolStrings([]string{a.Source}),
+		"trust":           []string{"reviewed", "trusted"},
+		"includeDisabled": a.IncludeDisabled || a.IncludeDisabledCamel,
+		"mode":            "keyword",
 	}
-	addQueryValue(values, "taskName", firstNonEmpty(a.TaskName, a.TaskNameCamel))
-	addQueryValue(values, "agentName", firstNonEmpty(a.AgentName, a.AgentNameCamel))
-	addQueryValue(values, "source", a.Source)
-	if a.Limit > 0 {
-		values.Set("limit", fmt.Sprintf("%d", a.Limit))
+	if a.Limit != nil {
+		request["limit"] = *a.Limit
 	}
-	if a.IncludeDisabled || a.IncludeDisabledCamel {
-		values.Set("includeDisabled", trueStr)
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode memory search: %w", err)
 	}
-
-	endpoint := cfg.url("/internal/v1/memories/"+url.PathEscape(cfg.Namespace), values)
-	body, err := doInternalControllerRequest(ctx, cfg, http.MethodGet, endpoint, nil)
+	transactionToken, err := loadTaskTransactionToken()
+	if err != nil {
+		return "", fmt.Errorf("failed to load task transaction token: %w", err)
+	}
+	endpoint := cfg.url("/internal/v1/memories/"+url.PathEscape(cfg.Namespace)+"/search", nil)
+	body, err := doInternalControllerRequestWithTransactionToken(
+		ctx, cfg, http.MethodPost, endpoint, payload, transactionToken,
+	)
 	if err != nil {
 		return "", fmt.Errorf("failed to recall memory: %w", err)
 	}
-	return body, nil
+	var response struct {
+		Items []struct {
+			Memory json.RawMessage `json:"memory"`
+		} `json:"items"`
+		Complete bool `json:"complete"`
+	}
+	if err := json.Unmarshal([]byte(body), &response); err != nil {
+		return "", fmt.Errorf("failed to decode memory search response: %w", err)
+	}
+	if !response.Complete {
+		return "", fmt.Errorf("memory search was incomplete; use a narrower query")
+	}
+	memories := make([]json.RawMessage, 0, len(response.Items))
+	for _, item := range response.Items {
+		if len(item.Memory) > 0 {
+			memories = append(memories, item.Memory)
+		}
+	}
+	encoded, err := json.Marshal(memories)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode recalled memories: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func compactMemoryToolStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 // ProposeMemoryTool submits memory-adjacent governance proposals for coordinator review.
@@ -575,7 +616,28 @@ func (c internalControllerConfig) url(path string, values url.Values) string {
 	return endpoint
 }
 
+func loadTaskTransactionToken() (string, error) {
+	token, ok, err := workerenv.ReadTokenFileEnv(workerenv.TransactionTokenFile, "task transaction token")
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", nil
+	}
+	return token, nil
+}
+
 func doInternalControllerRequest(ctx context.Context, cfg internalControllerConfig, method, endpoint string, payload []byte) (string, error) {
+	return doInternalControllerRequestWithTransactionToken(ctx, cfg, method, endpoint, payload, "")
+}
+
+func doInternalControllerRequestWithTransactionToken(
+	ctx context.Context,
+	cfg internalControllerConfig,
+	method, endpoint string,
+	payload []byte,
+	transactionToken string,
+) (string, error) {
 	var body io.Reader
 	if payload != nil {
 		body = bytes.NewReader(payload)
@@ -589,6 +651,9 @@ func doInternalControllerRequest(ctx context.Context, cfg internalControllerConf
 	}
 	if cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	}
+	if transactionToken = strings.TrimSpace(transactionToken); transactionToken != "" {
+		req.Header.Set(internalMemoryTransactionTokenHeader, transactionToken)
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}

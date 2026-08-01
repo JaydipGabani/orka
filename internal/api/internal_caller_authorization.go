@@ -11,13 +11,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -29,6 +32,13 @@ import (
 type internalCallerAuthorizer struct {
 	k8sReader client.Reader
 }
+
+const (
+	internalMemoryTaskLocalKey       = "internalMemoryTask"
+	taskProvenancePolicyLabel        = "orka.ai/task-provenance-policy"
+	taskProvenancePolicyJobComponent = "job"
+	taskProvenancePolicyPodComponent = "pod"
+)
 
 func (h *InternalHandlers) internalCallerAuthorizer() internalCallerAuthorizer {
 	if h == nil {
@@ -75,6 +85,141 @@ func (a internalCallerAuthorizer) verifyNamespace(c fiber.Ctx, namespace string)
 	}
 
 	return nil
+}
+
+func (a internalCallerAuthorizer) verifyMemoryNamespace(c fiber.Ctx, namespace string) error {
+	if err := a.verifyNamespace(c, namespace); err != nil {
+		return err
+	}
+	userInfo := GetUserInfo(c)
+	if userInfo == nil || userInfo.AuthType != AuthTypeTokenReview ||
+		serviceAccountNameFromUsername(userInfo.Username) == "" {
+		return fiber.NewError(fiber.StatusForbidden, "internal memory caller must be a Kubernetes workload identity")
+	}
+	if serviceAccountNameFromUsername(userInfo.Username) == expectedHarnessWrapperServiceAccountName() &&
+		parseServiceAccountNamespace(userInfo.Username) == currentPodNamespace() {
+		return nil
+	}
+	task, err := a.currentTaskWorker(c.Context(), userInfo, namespace)
+	if err != nil {
+		return err
+	}
+	c.Locals(internalMemoryTaskLocalKey, task)
+	return nil
+}
+
+func (a internalCallerAuthorizer) currentTaskWorker(
+	ctx context.Context,
+	userInfo *UserInfo,
+	namespace string,
+) (*corev1alpha1.Task, error) {
+	if a.k8sReader == nil || userInfo == nil {
+		return nil, fiber.NewError(fiber.StatusForbidden, "current worker identity could not be verified")
+	}
+	podName := firstUserExtra(userInfo, "authentication.kubernetes.io/pod-name")
+	podUID := firstUserExtra(userInfo, "authentication.kubernetes.io/pod-uid")
+	if podName == "" || podUID == "" {
+		return nil, fiber.NewError(fiber.StatusForbidden, "caller pod identity required")
+	}
+	pod := &corev1.Pod{}
+	if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, pod); err != nil {
+		return nil, fiber.NewError(fiber.StatusForbidden, "caller pod not found")
+	}
+	if string(pod.UID) != podUID || pod.Spec.ServiceAccountName != serviceAccountNameFromUsername(userInfo.Username) {
+		return nil, fiber.NewError(fiber.StatusForbidden, "caller pod identity mismatch")
+	}
+	for _, owner := range pod.OwnerReferences {
+		if !trustedControllerOwner(owner, batchv1.SchemeGroupVersion.String(), "Job") {
+			continue
+		}
+		job := &batchv1.Job{}
+		if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: owner.Name}, job); err != nil ||
+			owner.UID != job.UID {
+			continue
+		}
+		for _, taskOwner := range job.OwnerReferences {
+			if !trustedControllerOwner(taskOwner, corev1alpha1.GroupVersion.String(), "Task") {
+				continue
+			}
+			task := &corev1alpha1.Task{}
+			if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: taskOwner.Name}, task); err != nil ||
+				taskOwner.UID != task.UID {
+				continue
+			}
+			if !activeInternalMemoryTask(task, job, pod) {
+				continue
+			}
+			if !taskUIDProvenanceMatches(task, job, pod, false) || !a.legacyTaskProvenanceAdmitted(ctx, job, pod) {
+				continue
+			}
+			return task, nil
+		}
+	}
+	return nil, fiber.NewError(fiber.StatusForbidden, "caller is not the current worker for an active task")
+}
+
+func trustedControllerOwner(owner metav1.OwnerReference, apiVersion, kind string) bool {
+	return owner.APIVersion == apiVersion && owner.Kind == kind && owner.Name != "" && owner.UID != "" &&
+		owner.Controller != nil && *owner.Controller
+}
+
+func activeInternalMemoryTask(task *corev1alpha1.Task, job *batchv1.Job, pod *corev1.Pod) bool {
+	if task == nil || job == nil || pod == nil {
+		return false
+	}
+	taskLabel := labels.SelectorValue(task.Name)
+	return (task.Spec.Type == corev1alpha1.TaskTypeAI || task.Spec.Type == corev1alpha1.TaskTypeAgent) &&
+		task.Status.JobName == job.Name && task.DeletionTimestamp.IsZero() &&
+		!isTerminalInternalTaskPhase(task.Status.Phase) &&
+		job.Labels[labels.LabelTask] == taskLabel && pod.Labels[labels.LabelTask] == taskLabel
+}
+
+func taskUIDProvenanceMatches(task *corev1alpha1.Task, job *batchv1.Job, pod *corev1.Pod, required bool) bool {
+	jobTaskUID := strings.TrimSpace(job.Labels[labels.LabelTaskUID])
+	podTaskUID := strings.TrimSpace(pod.Labels[labels.LabelTaskUID])
+	if jobTaskUID == "" && podTaskUID == "" {
+		return !required
+	}
+	return jobTaskUID == string(task.UID) && podTaskUID == string(task.UID)
+}
+
+func (a internalCallerAuthorizer) legacyTaskProvenanceAdmitted(ctx context.Context, job *batchv1.Job, pod *corev1.Pod) bool {
+	if a.k8sReader == nil || job == nil || pod == nil {
+		return false
+	}
+	// The policies allow the legacy provenance shape only when it is established
+	// by the authorized Orka Task and Kubernetes Job controllers. Requiring the
+	// policies to be currently active preserves that attestation while allowing
+	// Jobs and Pods created before the policies were installed to keep running
+	// through a mixed-version rollout.
+	return a.taskProvenancePolicyActive(ctx, taskProvenancePolicyJobComponent) &&
+		a.taskProvenancePolicyActive(ctx, taskProvenancePolicyPodComponent)
+}
+
+func (a internalCallerAuthorizer) taskProvenancePolicyActive(ctx context.Context, component string) bool {
+	policies := &admissionregistrationv1.ValidatingAdmissionPolicyList{}
+	if err := a.k8sReader.List(ctx, policies, client.MatchingLabels{taskProvenancePolicyLabel: component}); err != nil {
+		return false
+	}
+	bindings := &admissionregistrationv1.ValidatingAdmissionPolicyBindingList{}
+	if err := a.k8sReader.List(ctx, bindings, client.MatchingLabels{taskProvenancePolicyLabel: component}); err != nil {
+		return false
+	}
+	for i := range policies.Items {
+		policy := &policies.Items[i]
+		if !policy.DeletionTimestamp.IsZero() {
+			continue
+		}
+		for j := range bindings.Items {
+			binding := &bindings.Items[j]
+			if !binding.DeletionTimestamp.IsZero() || binding.Spec.PolicyName != policy.Name ||
+				!slices.Contains(binding.Spec.ValidationActions, admissionregistrationv1.Deny) {
+				continue
+			}
+			return true
+		}
+	}
+	return false
 }
 
 func (a internalCallerAuthorizer) verifyArtifactUploadCaller(c fiber.Ctx, namespace, taskName string) error {
@@ -183,7 +328,7 @@ func (a internalCallerAuthorizer) verifyTaskWorker(ctx context.Context, userInfo
 	if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: podName}, pod); err != nil {
 		return fiber.NewError(fiber.StatusForbidden, "caller pod not found")
 	}
-	if string(pod.UID) != podUID {
+	if string(pod.UID) != podUID || pod.Spec.ServiceAccountName != serviceAccountNameFromUsername(userInfo.Username) {
 		return fiber.NewError(fiber.StatusForbidden, "caller pod identity mismatch")
 	}
 	if pod.Labels[labels.LabelTask] != labels.SelectorValue(task.Name) {
@@ -195,18 +340,20 @@ func (a internalCallerAuthorizer) verifyTaskWorker(ctx context.Context, userInfo
 	}
 
 	for _, owner := range pod.OwnerReferences {
-		if owner.Kind != "Job" || owner.Name != currentJobName {
+		if !trustedControllerOwner(owner, batchv1.SchemeGroupVersion.String(), "Job") || owner.Name != currentJobName {
 			continue
 		}
 		job := &batchv1.Job{}
 		if err := a.k8sReader.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: owner.Name}, job); err != nil {
 			return fiber.NewError(fiber.StatusForbidden, "caller job not found")
 		}
-		if owner.UID != "" && owner.UID != job.UID {
+		if owner.UID != job.UID || job.Labels[labels.LabelTask] != labels.SelectorValue(task.Name) ||
+			!taskUIDProvenanceMatches(task, job, pod, false) {
 			continue
 		}
 		for _, jobOwner := range job.OwnerReferences {
-			if jobOwner.Kind == "Task" && jobOwner.UID == task.UID {
+			if trustedControllerOwner(jobOwner, corev1alpha1.GroupVersion.String(), "Task") &&
+				jobOwner.Name == task.Name && jobOwner.UID == task.UID {
 				return nil
 			}
 		}

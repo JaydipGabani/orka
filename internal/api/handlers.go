@@ -28,6 +28,8 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	gatewayruntime "github.com/orka-agents/orka/internal/gateway"
 	"github.com/orka-agents/orka/internal/labels"
+	memoryruntime "github.com/orka-agents/orka/internal/memory"
+	"github.com/orka-agents/orka/internal/memorybackend"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/tools"
 	"github.com/orka-agents/orka/internal/tracing"
@@ -94,6 +96,8 @@ type Handlers struct {
 	artifactStore             store.ArtifactStore
 	memoryStore               store.MemoryStore
 	memoryProposalStore       store.MemoryProposalStore
+	memoryService             *memoryruntime.Service
+	memoryBackendManager      *memorybackend.Manager
 	securityStore             store.SecurityStore
 	repositoryMonitorStore    store.RepositoryMonitorStore
 	executionEventStore       store.ExecutionEventStore
@@ -120,6 +124,8 @@ type HandlersConfig struct {
 	ArtifactStore             store.ArtifactStore
 	MemoryStore               store.MemoryStore
 	MemoryProposalStore       store.MemoryProposalStore
+	MemoryService             *memoryruntime.Service
+	MemoryBackendManager      *memorybackend.Manager
 	SecurityStore             store.SecurityStore
 	RepositoryMonitorStore    store.RepositoryMonitorStore
 	ExecutionEventStore       store.ExecutionEventStore
@@ -130,7 +136,7 @@ type HandlersConfig struct {
 
 // NewHandlers creates a new Handlers instance
 func NewHandlers(cfg HandlersConfig) *Handlers {
-	return &Handlers{
+	h := &Handlers{
 		client:                    cfg.Client,
 		apiReader:                 cfg.APIReader,
 		clientset:                 cfg.KubeClient,
@@ -144,6 +150,8 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		artifactStore:             cfg.ArtifactStore,
 		memoryStore:               cfg.MemoryStore,
 		memoryProposalStore:       cfg.MemoryProposalStore,
+		memoryService:             cfg.MemoryService,
+		memoryBackendManager:      cfg.MemoryBackendManager,
 		securityStore:             cfg.SecurityStore,
 		repositoryMonitorStore:    cfg.RepositoryMonitorStore,
 		executionEventStore:       cfg.ExecutionEventStore,
@@ -154,6 +162,10 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		eventStreamPollInterval:   defaultEventStreamPollInterval,
 		eventStreamHeartbeatEvery: defaultEventStreamHeartbeatEvery,
 	}
+	if h.memoryService == nil && (h.memoryStore != nil || h.memoryProposalStore != nil) {
+		h.memoryService = &memoryruntime.Service{Legacy: h.memoryStore, Proposals: h.memoryProposalStore}
+	}
+	return h
 }
 
 // MetadataRequest holds Kubernetes-style metadata fields

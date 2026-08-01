@@ -8,6 +8,7 @@ IMG ?= controller:latest
 AI_WORKER_IMG ?= ghcr.io/orka-agents/orka/ai-worker:latest
 GENERAL_WORKER_IMG ?= ghcr.io/orka-agents/orka/general-worker:latest
 HARNESS_WRAPPER_IMG ?= ghcr.io/orka-agents/orka/agent-harness-wrapper:latest
+OMS_KD6_ADAPTER_IMG ?= ghcr.io/orka-agents/orka/oms-kd6-adapter:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -64,7 +65,36 @@ manifests: controller-gen kustomize ## Generate canonical and Gatekeeper-style s
 		}; \
 		trap cleanup EXIT; \
 		mkdir -p "$$tmp/deploy" "$$tmp/charts/orka"; \
-		"$(KUSTOMIZE)" build config/default -o "$$tmp/deploy/orka.yaml"; \
+		"$(KUSTOMIZE)" build config/default | \
+		awk ' \
+		function flush_doc() { \
+			if (doc == "") return; \
+			docs[++count] = doc; \
+			prioritized[count] = index(doc, "orka.ai/task-provenance-policy:") > 0 && \
+				(index(doc, "\nkind: ValidatingAdmissionPolicy\n") > 0 || doc ~ /^kind: ValidatingAdmissionPolicy\n/ || \
+				 index(doc, "\nkind: ValidatingAdmissionPolicyBinding\n") > 0 || doc ~ /^kind: ValidatingAdmissionPolicyBinding\n/); \
+			deployment[count] = index(doc, "\nkind: Deployment\n") > 0 || doc ~ /^kind: Deployment\n/; \
+			doc = ""; \
+		} \
+		function emit_doc(text) { \
+			if (emitted) print "---"; \
+			print text; \
+			emitted = 1; \
+		} \
+		$$0 == "---" { flush_doc(); next } \
+		{ doc = doc (doc == "" ? "" : ORS) $$0 } \
+		END { \
+			flush_doc(); \
+			inserted = 0; \
+			for (i = 1; i <= count; i++) { \
+				if (!inserted && deployment[i]) { \
+					for (j = 1; j <= count; j++) if (prioritized[j]) emit_doc(docs[j]); \
+					inserted = 1; \
+				} \
+				if (!prioritized[i]) emit_doc(docs[i]); \
+			} \
+			if (!inserted) for (j = 1; j <= count; j++) if (prioritized[j]) emit_doc(docs[j]); \
+		}' > "$$tmp/deploy/orka.yaml"; \
 		"$(KUSTOMIZE)" build \
 			--load-restrictor LoadRestrictionsNone \
 			cmd/build/helmify | go run ./cmd/build/helmify -output-dir "$$tmp/charts/orka"; \
@@ -189,6 +219,7 @@ test-e2e-setup-only: setup-test-e2e docker-build-all ## Set up Kind cluster and 
 	$(KIND) load docker-image $(AI_WORKER_IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(GENERAL_WORKER_IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(HARNESS_WRAPPER_IMG) --name $(KIND_CLUSTER)
+	$(KIND) load docker-image $(OMS_KD6_ADAPTER_IMG) --name $(KIND_CLUSTER)
 
 .PHONY: test-e2e-run-only
 test-e2e-run-only: manifests generate fmt vet ## Run e2e tests without rebuilding images (for fast iteration).
@@ -322,6 +353,10 @@ docker-build-harness-wrapper: ## Build docker image for the agent harness wrappe
 docker-build-general-worker: ## Build docker image for the general worker.
 	$(CONTAINER_TOOL) build -t ${GENERAL_WORKER_IMG} -f workers/general/Dockerfile .
 
+.PHONY: docker-build-oms-kd6-adapter
+docker-build-oms-kd6-adapter: ## Build docker image for the durable OMS KD6 adapter.
+	$(CONTAINER_TOOL) build -t ${OMS_KD6_ADAPTER_IMG} -f cmd/orka-oms-kd6-adapter/Dockerfile .
+
 .PHONY: docker-push-ai-worker
 docker-push-ai-worker: ## Push docker image for the AI worker.
 	$(CONTAINER_TOOL) push ${AI_WORKER_IMG}
@@ -334,11 +369,15 @@ docker-push-harness-wrapper: ## Push docker image for the agent harness wrapper.
 docker-push-general-worker: ## Push docker image for the general worker.
 	$(CONTAINER_TOOL) push ${GENERAL_WORKER_IMG}
 
+.PHONY: docker-push-oms-kd6-adapter
+docker-push-oms-kd6-adapter: ## Push docker image for the durable OMS KD6 adapter.
+	$(CONTAINER_TOOL) push ${OMS_KD6_ADAPTER_IMG}
+
 .PHONY: docker-build-all
-docker-build-all: docker-build docker-build-ai-worker docker-build-general-worker docker-build-harness-wrapper ## Build all docker images.
+docker-build-all: docker-build docker-build-ai-worker docker-build-general-worker docker-build-harness-wrapper docker-build-oms-kd6-adapter ## Build all docker images.
 
 .PHONY: docker-push-all
-docker-push-all: docker-push docker-push-ai-worker docker-push-general-worker docker-push-harness-wrapper ## Push all docker images.
+docker-push-all: docker-push docker-push-ai-worker docker-push-general-worker docker-push-harness-wrapper docker-push-oms-kd6-adapter ## Push all docker images.
 
 ##@ Deployment
 

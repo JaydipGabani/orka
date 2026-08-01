@@ -1,0 +1,333 @@
+package memory
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"path/filepath"
+	"testing"
+	"time"
+
+	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/apierror"
+	"github.com/orka-agents/orka/internal/oms/protocol"
+	"github.com/orka-agents/orka/internal/store"
+	storesqlite "github.com/orka-agents/orka/internal/store/sqlite"
+)
+
+type staticAuthorityResolver struct{ authority *ResolvedAuthority }
+
+func (r staticAuthorityResolver) Resolve(context.Context, string) (*ResolvedAuthority, error) {
+	return r.authority, nil
+}
+func (r staticAuthorityResolver) ResolveLocal(context.Context, string) (*ResolvedAuthority, error) {
+	return r.authority, nil
+}
+
+func TestServiceLegacyCreatePreservesSynchronousBehavior(t *testing.T) {
+	storeImpl := newMemoryTestStore(t)
+	service := &Service{Legacy: storeImpl, Proposals: storeImpl}
+	result, err := service.CreateMemory(context.Background(), "team-a", CreateRequest{
+		Content: " durable guidance ", Source: "cli", Tags: []string{"Storage", "storage"},
+	}, MutationContext{})
+	if err != nil {
+		t.Fatalf("CreateMemory() error = %v", err)
+	}
+	if result.StatusCode != http.StatusCreated || result.Memory == nil || result.Operation != nil {
+		t.Fatalf("result = %#v", result)
+	}
+	if result.Memory.Trust != store.MemoryTrustUntrusted || len(result.Memory.Tags) != 1 || result.Memory.Tags[0] != "storage" {
+		t.Fatalf("memory = %#v", result.Memory)
+	}
+}
+
+func TestServiceRemoteCreateRequiresIdempotencyAndReplays(t *testing.T) {
+	storeImpl := newMemoryTestStore(t)
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	binding := activateServiceTestBinding(t, storeImpl, now)
+	backend := &corev1alpha1.MemoryBackend{}
+	backend.Status.EffectiveLifecycleState = corev1alpha1.MemoryBackendEffectiveLifecycleActive
+	backend.Status.Ready = true
+	authority := &ResolvedAuthority{Namespace: binding.Namespace, NamespaceUID: binding.NamespaceUID, Binding: &binding, Backend: backend}
+	service := &Service{
+		Legacy: storeImpl, Proposals: storeImpl, Governed: storeImpl,
+		Resolver: staticAuthorityResolver{authority: authority}, Now: func() time.Time { return now.Add(time.Minute) },
+	}
+	request := CreateRequest{Content: "remote durable guidance", Source: "api", Tags: []string{"storage"}}
+	_, err := service.CreateMemory(context.Background(), binding.Namespace, request, MutationContext{Actor: "alice", Principal: "alice", Route: "createMemory"})
+	var structured *apierror.Error
+	if !errors.As(err, &structured) || structured.Status != http.StatusPreconditionRequired || structured.Reason != ReasonIdempotencyKeyRequired {
+		t.Fatalf("unkeyed error = %#v", err)
+	}
+	ctx := MutationContext{Actor: "alice", Principal: "alice", Route: "createMemory", IdempotencyKey: "key-1"}
+	first, err := service.CreateMemory(context.Background(), binding.Namespace, request, ctx)
+	if err != nil {
+		t.Fatalf("first CreateMemory() error = %v", err)
+	}
+	if first.StatusCode != http.StatusAccepted || first.Operation == nil || first.Memory != nil {
+		t.Fatalf("first result = %#v", first)
+	}
+	second, err := service.CreateMemory(context.Background(), binding.Namespace, request, ctx)
+	if err != nil {
+		t.Fatalf("replay CreateMemory() error = %v", err)
+	}
+	if !second.Replayed || second.Operation == nil || second.Operation.ID != first.Operation.ID {
+		t.Fatalf("replay result = %#v, first = %#v", second, first)
+	}
+	_, err = service.CreateMemory(context.Background(), binding.Namespace, CreateRequest{Content: "different"}, ctx)
+	if !errors.As(err, &structured) || structured.Status != http.StatusConflict || structured.Reason != ReasonIdempotencyKeyReuse {
+		t.Fatalf("reuse error = %#v", err)
+	}
+}
+
+func newMemoryTestStore(t *testing.T) *storesqlite.Store {
+	t.Helper()
+	db, err := storesqlite.NewDB(filepath.Join(t.TempDir(), "memory.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return storesqlite.NewStore(db, filepath.Join(t.TempDir(), "memory.db"))
+}
+
+func activateServiceTestBinding(t *testing.T, governed store.GovernedMemoryStore, now time.Time) store.MemoryBackendBinding {
+	t.Helper()
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", Mode: store.MemoryBackendModeRemote,
+		BackendUID: "22222222-2222-4222-8222-222222222222", BackendGeneration: 1,
+		AuthorityEpoch: 1, RoutingEpoch: 1, SpecDigest: digestString("spec"), EndpointDigest: digestString("endpoint"),
+		ResolvedAddressDigest: digestString("addresses"), ServerCertificateDigest: digestString("certificate"),
+		SecretName: "memory-auth", SecretKey: "token",
+		SecretUID: "33333333-3333-4333-8333-333333333333", SecretResourceVersion: "1",
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreName: "store-a", StoreUUID: "44444444-4444-4444-8444-444444444444",
+		OwnershipClaim: "claim-a", CapabilityRevision: "cap-a", Protocol: "orka.oms.v0alpha1",
+		State: store.MemoryBackendBindingAccepting, ActivationEpoch: 1, MinimumFeatureEpoch: 0,
+		ValidationExpiresAt: now.Add(time.Hour),
+	}
+	if _, err := governed.RecordMemoryActivationRecoveryReceipt(context.Background(), store.MemoryActivationRecoveryReceipt{
+		Namespace: binding.Namespace, NamespaceUID: binding.NamespaceUID, BackendUID: binding.BackendUID,
+		RouteDigest: binding.RecoveryRouteIdentity().Digest(), StoreUUID: binding.StoreUUID,
+		ManifestDigest: protocol.ContentDigest("service test recovery manifest"),
+		Actor:          "test", Reason: "test recovery prerequisite", VerifiedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := governed.ActivateMemoryBackend(context.Background(), store.MemoryBackendActivation{
+		Binding: binding, Actor: "test", Reason: "test activation", Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result.Binding
+}
+
+func TestServiceLegacyTrustUsesDurableAuditOverlay(t *testing.T) {
+	storeImpl := newMemoryTestStore(t)
+	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
+	service := &Service{
+		Legacy: storeImpl, Governed: storeImpl,
+		Resolver: staticAuthorityResolver{authority: authority},
+		Now:      func() time.Time { return time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC) },
+	}
+	created, err := service.CreateMemory(context.Background(), authority.Namespace, CreateRequest{
+		Content: "legacy guidance", Source: "api",
+	}, MutationContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewed, err := service.SetMemoryTrust(context.Background(), authority.Namespace, created.Memory.ID, TrustRequest{
+		Trust: store.MemoryTrustReviewed, Reason: "initial review",
+	}, TrustContext{Actor: "alice", RequestID: "request-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reviewed.Trust != store.MemoryTrustReviewed || reviewed.GovernanceRevision != 2 {
+		t.Fatalf("reviewed memory = %#v", reviewed)
+	}
+	updated, err := service.SetMemoryTrust(context.Background(), authority.Namespace, created.Memory.ID, TrustRequest{
+		Trust: store.MemoryTrustTrusted, Reason: "operator review",
+	}, TrustContext{Actor: "alice", RequestID: "request-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Trust != store.MemoryTrustTrusted || updated.GovernanceRevision != 3 {
+		t.Fatalf("updated memory = %#v", updated)
+	}
+	got, err := service.GetMemory(context.Background(), authority.Namespace, created.Memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Trust != store.MemoryTrustTrusted || got.GovernanceRevision != 3 {
+		t.Fatalf("persisted memory = %#v", got)
+	}
+	if err := service.SetMemoryDisabled(context.Background(), authority.Namespace, created.Memory.ID, true, "alice", "request-c"); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := service.GetMemory(context.Background(), authority.Namespace, created.Memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !disabled.Disabled || disabled.Trust != store.MemoryTrustTrusted || disabled.GovernanceRevision != 4 {
+		t.Fatalf("disabled memory = %#v", disabled)
+	}
+	if err := service.SetMemoryDisabled(context.Background(), authority.Namespace, created.Memory.ID, false, "alice", "request-d"); err != nil {
+		t.Fatal(err)
+	}
+
+	tags := []string{"updated"}
+	mutation, err := service.UpdateMemory(context.Background(), authority.Namespace, created.Memory.ID, UpdateRequest{Tags: &tags}, MutationContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutation.Memory.Disabled || mutation.Memory.Trust != store.MemoryTrustTrusted || mutation.Memory.GovernanceRevision != 5 {
+		t.Fatalf("updated mutation memory = %#v", mutation.Memory)
+	}
+	reloaded, err := service.GetMemory(context.Background(), authority.Namespace, created.Memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Disabled || reloaded.Trust != store.MemoryTrustTrusted || reloaded.GovernanceRevision != 5 {
+		t.Fatalf("reloaded memory = %#v", reloaded)
+	}
+	listed, err := service.ListMemories(context.Background(), store.MemoryFilter{
+		Namespace: authority.Namespace, Trust: []store.MemoryTrust{store.MemoryTrustTrusted},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != created.Memory.ID {
+		t.Fatalf("trusted list = %#v", listed)
+	}
+}
+
+func TestServiceLegacyTrustFilterFailsClosedBeyondScanCap(t *testing.T) {
+	storeImpl := newMemoryTestStore(t)
+	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
+	service := &Service{
+		Legacy: storeImpl, Governed: storeImpl,
+		Resolver: staticAuthorityResolver{authority: authority},
+	}
+
+	var oldestID string
+	for i := range maxRemoteCatalogLimit + 1 {
+		created, err := service.CreateMemory(context.Background(), authority.Namespace, CreateRequest{
+			Content: "legacy guidance", Source: "api", Tags: []string{"storage"},
+		}, MutationContext{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			oldestID = created.Memory.ID
+		}
+	}
+	if _, err := service.SetMemoryTrust(context.Background(), authority.Namespace, oldestID, TrustRequest{
+		Trust: store.MemoryTrustReviewed, Reason: "review older memory",
+	}, TrustContext{Actor: "alice", RequestID: "request-a"}); err != nil {
+		t.Fatal(err)
+	}
+
+	memories, err := service.ListMemories(context.Background(), store.MemoryFilter{
+		Namespace: authority.Namespace,
+		Trust:     []store.MemoryTrust{store.MemoryTrustReviewed},
+		Limit:     1,
+	})
+	var structured *apierror.Error
+	if !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable ||
+		structured.Reason != ReasonResultSetIncomplete {
+		t.Fatalf("ListMemories() = (%#v, %#v), want strict incomplete error", memories, err)
+	}
+}
+
+func TestServiceLegacyProposalReplayReturnsGovernanceOverlay(t *testing.T) {
+	storeImpl := newMemoryTestStore(t)
+	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
+	service := &Service{
+		Legacy: storeImpl, Proposals: storeImpl, Governed: storeImpl,
+		Resolver: staticAuthorityResolver{authority: authority},
+	}
+	proposal := &store.MemoryProposal{
+		Namespace: authority.Namespace, Type: "memory", Title: "reviewed guidance",
+		Content: "Keep durable memory governance explicit.",
+	}
+	if err := storeImpl.CreateMemoryProposal(context.Background(), proposal); err != nil {
+		t.Fatal(err)
+	}
+	if err := storeImpl.ReviewMemoryProposal(context.Background(), store.MemoryProposalReview{
+		Namespace: authority.Namespace, ID: proposal.ID, Status: "accepted", Reviewer: "alice",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := service.ApplyMemoryProposal(context.Background(), authority.Namespace, proposal.ID, "alice", MutationContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetMemoryTrust(context.Background(), authority.Namespace, first.Memory.ID, TrustRequest{
+		Trust: store.MemoryTrustTrusted, Reason: "operator approval",
+	}, TrustContext{Actor: "alice", RequestID: "request-a"}); err != nil {
+		t.Fatal(err)
+	}
+
+	replayed, err := service.ApplyMemoryProposal(context.Background(), authority.Namespace, proposal.ID, "alice", MutationContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Memory.Trust != store.MemoryTrustTrusted || replayed.Memory.GovernanceRevision != 2 {
+		t.Fatalf("replayed proposal memory = %#v", replayed.Memory)
+	}
+}
+
+func TestServiceLegacyUpdatePreservesPointerCompatibilityFields(t *testing.T) {
+	storeImpl := newMemoryTestStore(t)
+	service := &Service{Legacy: storeImpl}
+	created, err := service.CreateMemory(context.Background(), "team-a", CreateRequest{
+		Content: "legacy guidance", SessionName: "session-old", AgentName: "agent-old",
+		TaskName: "task-old", ParentTask: "parent-old",
+	}, MutationContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty := ""
+	newAgent := "agent-new"
+	newParent := "parent-new"
+	updated, err := service.UpdateMemory(context.Background(), "team-a", created.Memory.ID, UpdateRequest{
+		SessionName: &empty, AgentName: &newAgent, ParentTask: &newParent,
+	}, MutationContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Memory.SessionName != "" || updated.Memory.AgentName != newAgent ||
+		updated.Memory.TaskName != "task-old" || updated.Memory.ParentTask != newParent {
+		t.Fatalf("updated memory = %#v", updated.Memory)
+	}
+}
+
+func TestRemoteListExcludesPendingCreateWithoutHydration(t *testing.T) {
+	storeImpl := newMemoryTestStore(t)
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	binding := activateServiceTestBinding(t, storeImpl, now)
+	backend := &corev1alpha1.MemoryBackend{}
+	backend.Status.EffectiveLifecycleState = corev1alpha1.MemoryBackendEffectiveLifecycleActive
+	backend.Status.Ready = true
+	authority := &ResolvedAuthority{
+		Namespace: binding.Namespace, NamespaceUID: binding.NamespaceUID, Binding: &binding, Backend: backend,
+		Adapter: &fakeOMSAdapter{},
+	}
+	service := &Service{Governed: storeImpl, Resolver: staticAuthorityResolver{authority: authority}, Now: func() time.Time { return now.Add(time.Minute) }}
+	created, err := service.CreateMemory(context.Background(), binding.Namespace, CreateRequest{Content: "pending"}, MutationContext{
+		Actor: "alice", Principal: "alice", Route: "createMemory", IdempotencyKey: "pending-key",
+	})
+	if err != nil || created.Operation == nil {
+		t.Fatalf("CreateMemory() = %#v, %v", created, err)
+	}
+	page, err := service.ListMemoriesPageWithSearchContext(context.Background(), store.MemoryFilter{
+		Namespace: binding.Namespace, Limit: 10,
+	}, SearchContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 0 || !page.Paginated || !page.Exhausted || !page.Complete {
+		t.Fatalf("page = %#v", page)
+	}
+}

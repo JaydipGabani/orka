@@ -67,6 +67,10 @@ const (
 	ContextTokenScopeMemoryRead = "orka:memory:read"
 	// ContextTokenScopeMemoryWrite authorizes context-token callers to mutate memory resources.
 	ContextTokenScopeMemoryWrite = "orka:memory:write"
+	// ContextTokenScopeMemoryOperate authorizes administrative memory lifecycle and operation actions.
+	ContextTokenScopeMemoryOperate = "orka:memory:operate"
+	// ContextTokenScopeMemorySearchRemote authorizes outbound remote-memory search query egress.
+	ContextTokenScopeMemorySearchRemote = "orka:memory:search:remote"
 	// ContextTokenScopeSessionsRead authorizes context-token callers to read sessions.
 	ContextTokenScopeSessionsRead = "orka:sessions:read"
 	// ContextTokenScopeSessionsWrite authorizes context-token callers to delete or mutate sessions.
@@ -105,6 +109,8 @@ type ContextTokenAuthorizationConfig struct {
 	AgentWriteScopes              []string
 	MemoryReadScopes              []string
 	MemoryWriteScopes             []string
+	MemoryOperateScopes           []string
+	MemorySearchRemoteScopes      []string
 	SessionReadScopes             []string
 	SessionWriteScopes            []string
 	SecurityReadScopes            []string
@@ -137,6 +143,8 @@ type ContextTokenAuthorizationConfigOptions struct {
 	AgentWriteScopes           string
 	MemoryReadScopes           string
 	MemoryWriteScopes          string
+	MemoryOperateScopes        string
+	MemorySearchRemoteScopes   string
 	SessionReadScopes          string
 	SessionWriteScopes         string
 	SecurityReadScopes         string
@@ -177,6 +185,8 @@ func NewContextTokenAuthorizationConfig(opts ContextTokenAuthorizationConfigOpti
 	agentWrite := defaultScopes(opts.AgentWriteScopes, ContextTokenScopeAgentsWrite)
 	memoryRead := defaultScopes(opts.MemoryReadScopes, ContextTokenScopeMemoryRead)
 	memoryWrite := defaultScopes(opts.MemoryWriteScopes, ContextTokenScopeMemoryWrite)
+	memoryOperate := defaultScopes(opts.MemoryOperateScopes, ContextTokenScopeMemoryOperate)
+	memorySearchRemote := defaultScopes(opts.MemorySearchRemoteScopes, ContextTokenScopeMemorySearchRemote)
 	sessionRead := defaultScopes(opts.SessionReadScopes, ContextTokenScopeSessionsRead)
 	sessionWrite := defaultScopes(opts.SessionWriteScopes, ContextTokenScopeSessionsWrite)
 	securityRead := defaultScopes(opts.SecurityReadScopes, ContextTokenScopeSecurityRead)
@@ -205,6 +215,8 @@ func NewContextTokenAuthorizationConfig(opts ContextTokenAuthorizationConfigOpti
 		AgentWriteScopes:              agentWrite,
 		MemoryReadScopes:              memoryRead,
 		MemoryWriteScopes:             memoryWrite,
+		MemoryOperateScopes:           memoryOperate,
+		MemorySearchRemoteScopes:      memorySearchRemote,
 		SessionReadScopes:             sessionRead,
 		SessionWriteScopes:            sessionWrite,
 		SecurityReadScopes:            securityRead,
@@ -698,7 +710,7 @@ func authorizeContextTokenActionWithConfig(c fiber.Ctx, cfg ContextTokenAuthoriz
 		return nil
 	}
 	ui := GetUserInfo(c)
-	if ui == nil || ui.AuthType != AuthTypeContextToken || ui.ContextToken == nil {
+	if ui == nil || ui.ContextToken == nil {
 		return nil
 	}
 

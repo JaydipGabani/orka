@@ -1,0 +1,2174 @@
+package memory
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/apierror"
+	"github.com/orka-agents/orka/internal/oms/protocol"
+	"github.com/orka-agents/orka/internal/redact"
+	"github.com/orka-agents/orka/internal/store"
+)
+
+const (
+	defaultMemoryContentBytes         = 64 << 10
+	defaultMemoryOperationMaxAge      = 7 * 24 * time.Hour
+	defaultMemoryIdempotencyRetention = 30 * 24 * time.Hour
+	defaultMemoryOperationRetryAfter  = 2 * time.Second
+	defaultRemoteCatalogLimit         = 100
+	maxRemoteCatalogLimit             = 200
+	maxRemoteSearchCandidates         = 1000
+	maxRemoteSearchPages              = 20
+	maxRemoteListCandidates           = 1000
+	maxRemoteListPages                = 20
+	remoteListCursorTTL               = 5 * time.Minute
+	maxRemoteListCursorBytes          = 4 << 10
+	legacyMemoryDisableAuditAction    = "memory.disable"
+	legacyMemoryTrustAuditAction      = "memory.trust"
+)
+
+// Service is the single governed entry point for legacy and remote memory.
+type Service struct {
+	Legacy       store.MemoryStore
+	Proposals    store.MemoryProposalStore
+	Governed     store.GovernedMemoryStore
+	Resolver     AuthorityResolver
+	Dispatcher   *Dispatcher
+	Now          func() time.Time
+	ContentLimit int
+}
+
+type legacyMemoryGovernanceStore interface {
+	SetLegacyMemoryDisabledWithAudit(
+		ctx context.Context,
+		namespace, namespaceUID, id string,
+		disabled bool,
+		actor, reason, requestID string,
+		now time.Time,
+	) error
+}
+
+type legacyMemoryProposalGovernanceStore interface {
+	ApplyLegacyMemoryProposalWithAudit(
+		ctx context.Context,
+		apply store.MemoryProposalApply,
+		namespaceUID string,
+	) (*store.Memory, []store.MemoryAuditRecord, error)
+}
+
+// ListMemories lists through the durable authority selected for the namespace incarnation.
+func (s *Service) ListMemories(ctx context.Context, filter store.MemoryFilter) ([]store.Memory, error) {
+	page, err := s.listMemoriesPage(ctx, filter, SearchContext{})
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+// ListMemoriesWithSearchContext lists memories while carrying server-derived
+// authorization that can be checked at the exact remote-search egress point.
+func (s *Service) ListMemoriesWithSearchContext(
+	ctx context.Context,
+	filter store.MemoryFilter,
+	searchContext SearchContext,
+) ([]store.Memory, error) {
+	page, err := s.listMemoriesPage(ctx, filter, searchContext)
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+// ListMemoriesPageWithSearchContext returns deterministic continuation metadata
+// for remote authority while preserving the existing legacy list behavior.
+func (s *Service) ListMemoriesPageWithSearchContext(
+	ctx context.Context,
+	filter store.MemoryFilter,
+	searchContext SearchContext,
+) (*ListPage, error) {
+	return s.listMemoriesPage(ctx, filter, searchContext)
+}
+
+func (s *Service) listMemoriesPage(
+	ctx context.Context,
+	filter store.MemoryFilter,
+	searchContext SearchContext,
+) (*ListPage, error) {
+	authority, err := s.resolve(ctx, filter.Namespace, true)
+	if err != nil {
+		return nil, err
+	}
+	if !authority.Remote() {
+		if s.Legacy == nil {
+			return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
+		}
+		legacyFilter := filter
+		legacyFilter.Trust = nil
+		if len(filter.Trust) > 0 {
+			legacyFilter.Limit = maxRemoteCatalogLimit
+		}
+		memories, listErr := s.Legacy.ListMemories(ctx, legacyFilter)
+		if listErr != nil {
+			return nil, mapStoreError(listErr)
+		}
+		limit := boundedMemoryLimit(filter.Limit)
+		filtered, filterErr := s.applyLegacyGovernanceFilter(ctx, authority, memories, filter.Trust, limit)
+		if filterErr != nil {
+			return nil, filterErr
+		}
+		if len(filter.Trust) > 0 && len(memories) >= maxRemoteCatalogLimit && len(filtered) < limit {
+			memoryIncompleteTotal.Inc()
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+				"legacy memory trust filtering reached its pre-filter scan cap and cannot prove completeness")
+		}
+		return &ListPage{Items: filtered, Complete: true}, nil
+	}
+	if err := requireRemoteRead(authority); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(filter.Query) != "" {
+		searchContext.PreserveEmptyTrust = true
+		response, searchErr := s.search(ctx, filter.Namespace, SearchRequest{
+			Query: filter.Query, Tags: filter.Tags, IDs: filter.IDs,
+			Sources: sourceFilterValues(filter.Source), SessionName: filter.SessionName,
+			TaskName: filter.TaskName, ParentTask: filter.ParentTask, AgentName: filter.AgentName,
+			Trust: filter.Trust, Limit: filter.Limit, Cursor: filter.Cursor,
+			IncludeDisabled: filter.IncludeDisabled, IncludeDeleted: filter.IncludeDeleted,
+			Mode: protocol.SearchModeKeyword,
+		}, searchContext)
+		if searchErr != nil {
+			return nil, searchErr
+		}
+		memories := make([]store.Memory, 0, len(response.Items))
+		for _, item := range response.Items {
+			memories = append(memories, item.Memory)
+		}
+		return &ListPage{
+			Items: memories, Cursor: response.Cursor, Exhausted: response.Exhausted,
+			Complete: response.Complete, Paginated: true,
+		}, nil
+	}
+	return s.listRemoteMemoriesPage(ctx, authority, filter)
+}
+
+type remoteListCursor struct {
+	BeforeUpdatedAt time.Time `json:"t"`
+	BeforeID        string    `json:"i"`
+}
+
+func (s *Service) listRemoteMemoriesPage(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	filter store.MemoryFilter,
+) (*ListPage, error) {
+	limit := boundedMemoryLimit(filter.Limit)
+	result := make([]store.Memory, 0, limit)
+	queryDigest := remoteListQueryDigest(filter)
+	cursor, err := loadRemoteListCursor(ctx, s.Governed, authority.Binding, queryDigest, filter.Cursor, s.now())
+	if err != nil {
+		return nil, apierror.New(http.StatusBadRequest, "", "invalid or expired memory list cursor")
+	}
+	var beforeUpdatedAt *time.Time
+	beforeID := cursor.BeforeID
+	if !cursor.BeforeUpdatedAt.IsZero() {
+		value := cursor.BeforeUpdatedAt.UTC()
+		beforeUpdatedAt = &value
+	}
+	states := []store.MemoryMaterializationState{store.MemoryMaterializationActive}
+	if filter.IncludeDeleted {
+		states = append(states, store.MemoryMaterializationDeleted)
+	}
+	scanned := 0
+	pages := 0
+	exhausted := false
+	for len(result) < limit && scanned < maxRemoteListCandidates && pages < maxRemoteListPages {
+		pageSize := min(maxRemoteCatalogLimit, maxRemoteListCandidates-scanned)
+		entries, err := s.Governed.ListRemoteMemories(ctx, store.RemoteMemoryCatalogFilter{
+			NamespaceUID: authority.NamespaceUID, IDs: filter.IDs, Trust: filter.Trust,
+			IncludeDisabled: filter.IncludeDisabled, IncludeDeleted: filter.IncludeDeleted,
+			States: states, BeforeUpdatedAt: beforeUpdatedAt, BeforeID: beforeID, Limit: pageSize,
+		})
+		if err != nil {
+			return nil, mapStoreError(err)
+		}
+		if len(entries) == 0 {
+			exhausted = true
+			break
+		}
+		pages++
+		processed := 0
+		for i := range entries {
+			entry := &entries[i]
+			processed++
+			scanned++
+			updatedAt := entry.UpdatedAt.UTC()
+			beforeUpdatedAt = &updatedAt
+			beforeID = entry.ID
+			if !entryMatchesAuthority(entry, authority.Binding) || !memoryEntryMatchesFilter(entry, filter) {
+				continue
+			}
+			memory, hydrateErr := s.hydrate(ctx, authority, entry)
+			if hydrateErr != nil {
+				return nil, hydrateErr
+			}
+			result = append(result, *memory)
+			if len(result) == limit {
+				break
+			}
+		}
+		if processed == len(entries) && len(entries) < pageSize {
+			exhausted = true
+			break
+		}
+	}
+	nextCursor := ""
+	if !exhausted {
+		if beforeUpdatedAt == nil || beforeID == "" {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete, "memory catalog pagination did not advance")
+		}
+		nextCursor, err = saveRemoteListCursor(ctx, s.Governed, authority.Binding, queryDigest, remoteListCursor{
+			BeforeUpdatedAt: *beforeUpdatedAt, BeforeID: beforeID,
+		}, s.now())
+		if err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+				"memory list continuation could not be preserved")
+		}
+	}
+	if len(result) < limit && !exhausted {
+		memoryIncompleteTotal.Inc()
+		return nil, &IncompleteSearchError{
+			Cause: apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+				"memory list scan budget was exhausted"),
+			Cursor: nextCursor,
+		}
+	}
+	return &ListPage{Items: result, Cursor: nextCursor, Exhausted: exhausted, Complete: true, Paginated: true}, nil
+}
+
+func remoteListQueryDigest(filter store.MemoryFilter) string {
+	return digestJSON(struct {
+		SessionName, AgentName, TaskName, ParentTask, Source string
+		Tags, IDs                                            []string
+		Trust                                                []store.MemoryTrust
+		IncludeDisabled, IncludeDeleted                      bool
+		Limit                                                int
+	}{
+		SessionName: filter.SessionName, AgentName: filter.AgentName, TaskName: filter.TaskName,
+		ParentTask: filter.ParentTask, Source: filter.Source, Tags: filter.Tags, IDs: filter.IDs,
+		Trust: filter.Trust, IncludeDisabled: filter.IncludeDisabled,
+		IncludeDeleted: filter.IncludeDeleted, Limit: boundedMemoryLimit(filter.Limit),
+	})
+}
+
+func saveRemoteListCursor(
+	ctx context.Context,
+	governed store.GovernedMemoryStore,
+	binding *store.MemoryBackendBinding,
+	queryDigest string,
+	state remoteListCursor,
+	now time.Time,
+) (string, error) {
+	if governed == nil || binding == nil || state.BeforeUpdatedAt.IsZero() || strings.TrimSpace(state.BeforeID) == "" {
+		return "", errors.New("memory list cursor state is unavailable")
+	}
+	identity, err := protocolBinding(binding)
+	if err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(state)
+	if err != nil || len(payload) == 0 || len(payload) > maxRemoteListCursorBytes {
+		return "", errors.New("memory list cursor state is invalid")
+	}
+	id := "mlc-" + uuid.NewString()
+	if err := governed.SaveMemorySearchCursor(ctx, store.MemorySearchCursorState{
+		ID: id, NamespaceUID: binding.NamespaceUID, BindingDigest: protocol.BindingDigest(identity),
+		QueryDigest: queryDigest, State: payload, CreatedAt: now, ExpiresAt: now.Add(remoteListCursorTTL),
+	}); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func loadRemoteListCursor(
+	ctx context.Context,
+	governed store.GovernedMemoryStore,
+	binding *store.MemoryBackendBinding,
+	queryDigest, encoded string,
+	now time.Time,
+) (remoteListCursor, error) {
+	if strings.TrimSpace(encoded) == "" {
+		return remoteListCursor{}, nil
+	}
+	if governed == nil || binding == nil || !strings.HasPrefix(encoded, "mlc-") || len(encoded) > 128 {
+		return remoteListCursor{}, errors.New("invalid memory list cursor")
+	}
+	identity, err := protocolBinding(binding)
+	if err != nil {
+		return remoteListCursor{}, err
+	}
+	stored, err := governed.GetMemorySearchCursor(ctx, binding.NamespaceUID, encoded, now)
+	if err != nil {
+		return remoteListCursor{}, err
+	}
+	if stored.BindingDigest != protocol.BindingDigest(identity) || stored.QueryDigest != queryDigest ||
+		len(stored.State) == 0 || len(stored.State) > maxRemoteListCursorBytes {
+		return remoteListCursor{}, errors.New("mismatched memory list cursor")
+	}
+	var cursor remoteListCursor
+	if err := json.Unmarshal(stored.State, &cursor); err != nil || cursor.BeforeUpdatedAt.IsZero() ||
+		strings.TrimSpace(cursor.BeforeID) == "" {
+		return remoteListCursor{}, errors.New("invalid memory list cursor state")
+	}
+	return cursor, nil
+}
+
+// GetMemory returns exact local suppression metadata and verified remote content when materialized.
+func (s *Service) GetMemory(ctx context.Context, namespace, id string) (*store.Memory, error) {
+	authority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	if !authority.Remote() {
+		if s.Legacy == nil {
+			return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
+		}
+		memory, getErr := s.Legacy.GetMemory(ctx, namespace, id)
+		if getErr != nil {
+			return nil, mapStoreError(getErr)
+		}
+		if overlayErr := s.applyLegacyGovernance(ctx, authority, memory); overlayErr != nil {
+			return nil, overlayErr
+		}
+		return memory, nil
+	}
+	entry, err := s.Governed.GetRemoteMemory(ctx, authority.NamespaceUID, id)
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	if !entryMatchesAuthority(entry, authority.Binding) {
+		return nil, apierror.New(http.StatusConflict, ReasonIdentityMismatch, "memory belongs to a different backend authority")
+	}
+	if entry.Deleted || entry.MaterializationState == store.MemoryMaterializationDeleted ||
+		entry.MaterializationState == store.MemoryMaterializationOrphaned {
+		memory := remoteEntryToMemory(entry, "")
+		return &memory, nil
+	}
+	if entry.MaterializationState == store.MemoryMaterializationPending || entry.Generation == 0 {
+		memory := remoteEntryToMemory(entry, "")
+		return &memory, nil
+	}
+	fresh, err := s.resolve(ctx, namespace, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireRemoteRead(fresh); err != nil {
+		return nil, err
+	}
+	return s.hydrate(ctx, fresh, entry)
+}
+
+// CreateMemory preserves synchronous legacy behavior and durably admits remote work.
+func (s *Service) CreateMemory(
+	ctx context.Context,
+	namespace string,
+	request CreateRequest,
+	mutationContext MutationContext,
+) (*MutationResult, error) {
+	localAuthority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	if !localAuthority.Remote() {
+		return s.createLegacy(ctx, namespace, request)
+	}
+	if err := requireIdempotency(mutationContext); err != nil {
+		return nil, err
+	}
+	requestDigest := digestJSON(request)
+	if replay, found, replayErr := s.lookupMutationReplay(ctx, localAuthority, mutationContext, requestDigest); found || replayErr != nil {
+		return replay, replayErr
+	}
+
+	authority, err := s.resolve(ctx, namespace, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireRemoteMutation(authority, false); err != nil {
+		return nil, err
+	}
+	content, tags, err := s.normalizeContent(request.Content, request.Tags)
+	if err != nil {
+		return nil, err
+	}
+	memoryID := strings.TrimSpace(request.ID)
+	if memoryID == "" {
+		memoryID = "mem-" + uuid.NewString()
+	}
+	binding, err := protocolBinding(authority.Binding)
+	if err != nil {
+		return nil, identityError()
+	}
+	now := s.now()
+	operationID := "mop-" + uuid.NewString()
+	envelope := protocol.MutationEnvelope{
+		ProtocolVersion:        protocol.Version,
+		OperationID:            operationID,
+		Binding:                binding,
+		MemoryID:               memoryID,
+		Kind:                   protocol.MutationKindCreate,
+		Generation:             1,
+		ExpectedGeneration:     0,
+		ExpectedBackendVersion: "",
+		State:                  &protocol.MutationState{Content: content, Tags: tags, Metadata: memoryMetadata(request)},
+	}
+	if err := protocol.PrepareMutation(&envelope); err != nil {
+		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory mutation")
+	}
+	payload, _ := json.Marshal(envelope)
+	catalog := store.RemoteMemoryCatalogEntry{
+		ID: memoryID, Namespace: namespace, NamespaceUID: authority.NamespaceUID,
+		ClusterID: authority.Binding.ClusterID, BackendUID: authority.Binding.BackendUID,
+		AuthorityEpoch: authority.Binding.AuthorityEpoch, RoutingEpoch: authority.Binding.RoutingEpoch,
+		TenantID: authority.Binding.TenantID, StoreUUID: authority.Binding.StoreUUID,
+		Generation: 0, DesiredGeneration: 1, GovernanceRevision: 1,
+		MaterializationState: store.MemoryMaterializationPending,
+		Trust:                store.MemoryTrustUntrusted, SessionName: request.SessionName, AgentName: request.AgentName,
+		TaskName: request.TaskName, ParentTask: request.ParentTask, Source: normalizeSource(request.Source), Tags: tags,
+		ContentDigest: envelope.ContentDigest, ContentAvailable: false, PendingOperationID: operationID,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	admission, err := s.Governed.AdmitRemoteMemoryCreate(ctx, store.RemoteMemoryCreateAdmission{
+		Mutation: s.mutationAdmission(mutationContext, authority, memoryID, operationID, "", requestDigest, envelope, payload, now),
+		Memory:   catalog,
+	})
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	memoryEnqueueTotal.WithLabelValues(string(store.MemoryOperationCreate)).Inc()
+	return s.materializeOrQueue(ctx, authority, admission, http.StatusCreated)
+}
+
+// UpdateMemory hydrates and verifies current remote content before admitting a full replacement.
+func (s *Service) UpdateMemory(
+	ctx context.Context,
+	namespace, id string,
+	request UpdateRequest,
+	mutationContext MutationContext,
+) (*MutationResult, error) {
+	localAuthority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	if !localAuthority.Remote() {
+		return s.updateLegacy(ctx, localAuthority, namespace, id, request)
+	}
+	if err := requireIdempotency(mutationContext); err != nil {
+		return nil, err
+	}
+	requestDigest := digestJSON(struct {
+		ID      string        `json:"id"`
+		Request UpdateRequest `json:"request"`
+	}{id, request})
+	if replay, found, replayErr := s.lookupMutationReplay(ctx, localAuthority, mutationContext, requestDigest); found || replayErr != nil {
+		return replay, replayErr
+	}
+
+	authority, err := s.resolve(ctx, namespace, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireRemoteMutation(authority, false); err != nil {
+		return nil, err
+	}
+	entry, err := s.Governed.GetRemoteMemory(ctx, authority.NamespaceUID, id)
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	if !entryMatchesAuthority(entry, authority.Binding) {
+		return nil, identityError()
+	}
+	current, err := s.hydrate(ctx, authority, entry)
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "verified current memory content is unavailable")
+	}
+	if request.SessionName != nil {
+		current.SessionName = *request.SessionName
+	}
+	if request.AgentName != nil {
+		current.AgentName = *request.AgentName
+	}
+	if request.TaskName != nil {
+		current.TaskName = *request.TaskName
+	}
+	if request.ParentTask != nil {
+		current.ParentTask = *request.ParentTask
+	}
+	if request.Content != nil {
+		current.Content = *request.Content
+	}
+	if request.Source != nil {
+		current.Source = *request.Source
+	}
+	if request.Tags != nil {
+		current.Tags = append([]string(nil), (*request.Tags)...)
+	}
+	content, tags, err := s.normalizeContent(current.Content, current.Tags)
+	if err != nil {
+		return nil, err
+	}
+	binding, err := protocolBinding(authority.Binding)
+	if err != nil {
+		return nil, identityError()
+	}
+	now := s.now()
+	desired := max(entry.Generation, entry.DesiredGeneration) + 1
+	operationID := "mop-" + uuid.NewString()
+	envelope := protocol.MutationEnvelope{
+		ProtocolVersion: protocol.Version, OperationID: operationID, Binding: binding,
+		MemoryID: id, Kind: protocol.MutationKindReplace, Generation: uint64(desired),
+		ExpectedGeneration: uint64(entry.Generation), ExpectedBackendVersion: entry.BackendVersion,
+		State: &protocol.MutationState{Content: content, Tags: tags, Metadata: memoryMetadataFromStore(*current)},
+	}
+	if err := protocol.PrepareMutation(&envelope); err != nil {
+		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory mutation")
+	}
+	payload, _ := json.Marshal(envelope)
+	updatedEntry := *entry
+	updatedEntry.DesiredGeneration = desired
+	updatedEntry.PendingOperationID = operationID
+	updatedEntry.Tags = tags
+	updatedEntry.SessionName = current.SessionName
+	updatedEntry.AgentName = current.AgentName
+	updatedEntry.TaskName = current.TaskName
+	updatedEntry.ParentTask = current.ParentTask
+	updatedEntry.Source = normalizeSource(current.Source)
+	updatedEntry.ContentDigest = envelope.ContentDigest
+	updatedEntry.UpdatedAt = now
+	admission, err := s.Governed.AdmitRemoteMemoryReplace(ctx, store.RemoteMemoryReplaceAdmission{
+		Mutation:               s.mutationAdmission(mutationContext, authority, id, operationID, "", requestDigest, envelope, payload, now),
+		Memory:                 updatedEntry,
+		ExpectedGeneration:     entry.Generation,
+		ExpectedBackendVersion: entry.BackendVersion,
+	})
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	memoryEnqueueTotal.WithLabelValues(string(store.MemoryOperationReplace)).Inc()
+	return s.materializeOrQueue(ctx, authority, admission, http.StatusOK)
+}
+
+// DeleteMemory installs local suppression before any remote dependency is contacted.
+func (s *Service) DeleteMemory(
+	ctx context.Context,
+	namespace, id string,
+	mutationContext MutationContext,
+) (*MutationResult, error) {
+	authority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	if !authority.Remote() {
+		if s.Legacy == nil {
+			return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
+		}
+		if err := s.Legacy.DeleteMemory(ctx, namespace, id); err != nil {
+			return nil, mapStoreError(err)
+		}
+		return &MutationResult{StatusCode: http.StatusNoContent}, nil
+	}
+	if err := requireIdempotency(mutationContext); err != nil {
+		return nil, err
+	}
+	requestDigest := digestJSON(struct {
+		ID string `json:"id"`
+	}{id})
+	if replay, found, replayErr := s.lookupMutationReplay(ctx, authority, mutationContext, requestDigest); found || replayErr != nil {
+		return replay, replayErr
+	}
+	if authority.Binding.State != store.MemoryBackendBindingAccepting && authority.Binding.State != store.MemoryBackendBindingDraining {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend is not accepting safety mutations")
+	}
+	entry, err := s.Governed.GetRemoteMemory(ctx, authority.NamespaceUID, id)
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	if !entryMatchesAuthority(entry, authority.Binding) {
+		return nil, identityError()
+	}
+	binding, err := protocolBinding(authority.Binding)
+	if err != nil {
+		return nil, identityError()
+	}
+	now := s.now()
+	desired := max(entry.Generation, entry.DesiredGeneration) + 1
+	operationID := "mop-" + uuid.NewString()
+	envelope := protocol.MutationEnvelope{
+		ProtocolVersion: protocol.Version, OperationID: operationID, Binding: binding,
+		MemoryID: id, Kind: protocol.MutationKindDelete, Generation: uint64(desired),
+		ExpectedGeneration: uint64(entry.Generation), ExpectedBackendVersion: entry.BackendVersion, State: nil,
+	}
+	if err := protocol.PrepareMutation(&envelope); err != nil {
+		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory delete")
+	}
+	payload, _ := json.Marshal(envelope)
+	admission, err := s.Governed.AdmitRemoteMemoryDelete(ctx, store.RemoteMemoryDeleteAdmission{
+		Mutation:               s.mutationAdmission(mutationContext, authority, id, operationID, "", requestDigest, envelope, payload, now),
+		ExpectedGeneration:     entry.Generation,
+		ExpectedBackendVersion: entry.BackendVersion,
+	})
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	memoryEnqueueTotal.WithLabelValues(string(store.MemoryOperationDelete)).Inc()
+	// Try immediate dispatch only if fresh credentials are currently available;
+	// the tombstone remains admitted even when this fails.
+	fresh, freshErr := s.Resolver.Resolve(ctx, namespace)
+	if freshErr == nil {
+		authority = fresh
+	}
+	return s.materializeOrQueue(ctx, authority, admission, http.StatusNoContent)
+}
+
+// SetMemoryDisabled changes only the local governance overlay.
+func (s *Service) SetMemoryDisabled(ctx context.Context, namespace, id string, disabled bool, actor, requestID string) error {
+	authority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return err
+	}
+	if !authority.Remote() {
+		if s.Legacy == nil {
+			return apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
+		}
+		if s.Governed == nil || strings.TrimSpace(authority.NamespaceUID) == "" {
+			return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+				"legacy memory governance is unavailable")
+		}
+		auditActor := strings.TrimSpace(actor)
+		if auditActor == "" {
+			auditActor = "memory-operator"
+		}
+		governedLegacy, ok := s.Legacy.(legacyMemoryGovernanceStore)
+		if !ok {
+			return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+				"legacy memory governance does not support atomic disable changes")
+		}
+		return mapStoreError(governedLegacy.SetLegacyMemoryDisabledWithAudit(
+			ctx, namespace, authority.NamespaceUID, id, disabled, auditActor,
+			"local memory governance change", requestID, s.now(),
+		))
+	}
+	entry, err := s.Governed.GetRemoteMemory(ctx, authority.NamespaceUID, id)
+	if err != nil {
+		return mapStoreError(err)
+	}
+	if !entryMatchesAuthority(entry, authority.Binding) {
+		return identityError()
+	}
+	if !disabled && (entry.Deleted || entry.MaterializationState == store.MemoryMaterializationDiverged ||
+		entry.MaterializationState == store.MemoryMaterializationLost || entry.MaterializationState == store.MemoryMaterializationOrphaned) {
+		return apierror.New(http.StatusConflict, ReasonDiverged, "memory cannot be enabled in its current state")
+	}
+	_, err = s.Governed.SetRemoteMemoryDisabled(ctx, store.RemoteMemoryDisabledChange{
+		NamespaceUID: authority.NamespaceUID, ID: id, Disabled: disabled,
+		ExpectedGovernanceRevision: entry.GovernanceRevision,
+		Actor:                      actor, Reason: "local memory governance change", RequestID: requestID, Now: s.now(),
+	})
+	return mapStoreError(err)
+}
+
+// SetMemoryTrust changes only server-owned local trust after explicit authorization.
+func (s *Service) SetMemoryTrust(
+	ctx context.Context,
+	namespace, id string,
+	request TrustRequest,
+	trustContext TrustContext,
+) (*store.Memory, error) {
+	if request.Trust != store.MemoryTrustUntrusted && request.Trust != store.MemoryTrustReviewed && request.Trust != store.MemoryTrustTrusted {
+		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory trust value")
+	}
+	if strings.TrimSpace(request.Reason) == "" {
+		return nil, apierror.New(http.StatusBadRequest, "", "reason is required")
+	}
+	authority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	if !authority.Remote() {
+		if s.Legacy == nil {
+			return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
+		}
+		memory, getErr := s.Legacy.GetMemory(ctx, namespace, id)
+		if getErr != nil {
+			return nil, mapStoreError(getErr)
+		}
+		if overlayErr := s.applyLegacyGovernance(ctx, authority, memory); overlayErr != nil {
+			return nil, overlayErr
+		}
+		if memory.Trust == request.Trust {
+			return memory, nil
+		}
+		if s.Governed == nil || strings.TrimSpace(authority.NamespaceUID) == "" {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "legacy memory trust governance is unavailable")
+		}
+		actor := strings.TrimSpace(trustContext.Actor)
+		if actor == "" {
+			actor = "memory-operator"
+		}
+		if err := s.Governed.AppendMemoryAudit(ctx, store.MemoryAuditRecord{
+			Namespace: namespace, NamespaceUID: authority.NamespaceUID, Actor: actor,
+			Action: legacyMemoryTrustAuditAction, Reason: request.Reason,
+			PreviousState: string(memory.Trust), NewState: string(request.Trust),
+			MemoryID: id, RequestID: trustContext.RequestID, CreatedAt: s.now(),
+		}); err != nil {
+			return nil, mapStoreError(err)
+		}
+		memory.Trust = request.Trust
+		memory.GovernanceRevision++
+		return memory, nil
+	}
+	if trustContext.AuthorizeRemote != nil {
+		if err := trustContext.AuthorizeRemote(); err != nil {
+			return nil, err
+		}
+	}
+	entry, err := s.Governed.GetRemoteMemory(ctx, authority.NamespaceUID, id)
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	if !entryMatchesAuthority(entry, authority.Binding) {
+		return nil, identityError()
+	}
+	updated, err := s.Governed.SetRemoteMemoryTrust(ctx, store.RemoteMemoryTrustChange{
+		NamespaceUID: authority.NamespaceUID, ID: id, Trust: request.Trust,
+		ExpectedGovernanceRevision: entry.GovernanceRevision,
+		Actor:                      trustContext.Actor, Reason: request.Reason, RequestID: trustContext.RequestID, Now: s.now(),
+	})
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	memory := remoteEntryToMemory(updated, "")
+	return &memory, nil
+}
+
+// GetMemoryOperation returns an allowlisted operation summary.
+func (s *Service) GetMemoryOperation(ctx context.Context, namespace, id string) (*store.MemoryOperation, error) {
+	authority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	if !authority.Remote() {
+		return nil, store.ErrNotFound
+	}
+	operation, err := s.Governed.GetMemoryOperation(ctx, authority.NamespaceUID, id)
+	return operation, mapStoreError(err)
+}
+
+// ListMemoryOperations returns bounded operation summaries for the active namespace incarnation.
+func (s *Service) ListMemoryOperations(ctx context.Context, namespace string, filter store.MemoryOperationFilter) ([]store.MemoryOperation, error) {
+	authority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	if !authority.Remote() {
+		return []store.MemoryOperation{}, nil
+	}
+	filter.NamespaceUID = authority.NamespaceUID
+	operations, err := s.Governed.ListMemoryOperations(ctx, filter)
+	return operations, mapStoreError(err)
+}
+
+func (s *Service) createLegacy(ctx context.Context, namespace string, request CreateRequest) (*MutationResult, error) {
+	if s.Legacy == nil {
+		return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
+	}
+	content, tags, err := s.normalizeContent(request.Content, request.Tags)
+	if err != nil {
+		return nil, err
+	}
+	memory := &store.Memory{
+		ID: strings.TrimSpace(request.ID), Namespace: namespace, SessionName: request.SessionName,
+		AgentName: request.AgentName, TaskName: request.TaskName, ParentTask: request.ParentTask,
+		Source: normalizeSource(request.Source), Content: content, Tags: tags,
+		Trust: store.MemoryTrustUntrusted,
+	}
+	if err := s.Legacy.CreateMemory(ctx, memory); err != nil {
+		return nil, mapStoreError(err)
+	}
+	return &MutationResult{Memory: memory, StatusCode: http.StatusCreated}, nil
+}
+
+func (s *Service) updateLegacy(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	namespace, id string,
+	request UpdateRequest,
+) (*MutationResult, error) {
+	if s.Legacy == nil {
+		return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
+	}
+	memory, err := s.Legacy.GetMemory(ctx, namespace, id)
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	if overlayErr := s.applyLegacyGovernance(ctx, authority, memory); overlayErr != nil {
+		return nil, overlayErr
+	}
+	if request.SessionName != nil {
+		memory.SessionName = *request.SessionName
+	}
+	if request.AgentName != nil {
+		memory.AgentName = *request.AgentName
+	}
+	if request.TaskName != nil {
+		memory.TaskName = *request.TaskName
+	}
+	if request.ParentTask != nil {
+		memory.ParentTask = *request.ParentTask
+	}
+	if request.Content != nil {
+		memory.Content = *request.Content
+	}
+	if request.Source != nil {
+		memory.Source = *request.Source
+	}
+	if request.Tags != nil {
+		memory.Tags = append([]string(nil), (*request.Tags)...)
+	}
+	content, tags, err := s.normalizeContent(memory.Content, memory.Tags)
+	if err != nil {
+		return nil, err
+	}
+	memory.Content, memory.Tags = content, tags
+	if err := s.Legacy.UpdateMemory(ctx, memory); err != nil {
+		return nil, mapStoreError(err)
+	}
+	updated, err := s.Legacy.GetMemory(ctx, namespace, id)
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	updated.Trust = memory.Trust
+	updated.GovernanceRevision = memory.GovernanceRevision
+	return &MutationResult{Memory: updated, StatusCode: http.StatusOK}, nil
+}
+
+func (s *Service) mutationAdmission(
+	mutationContext MutationContext,
+	authority *ResolvedAuthority,
+	memoryID, operationID, proposalID, requestDigest string,
+	envelope protocol.MutationEnvelope,
+	payload []byte,
+	now time.Time,
+) store.MemoryMutationAdmission {
+	principal := mutationPrincipal(mutationContext)
+	locationBase := strings.TrimSpace(mutationContext.LocationBase)
+	if locationBase == "" {
+		locationBase = "/api/v1/memory-operations/"
+	}
+	location := strings.TrimRight(locationBase, "/") + "/" + operationID
+	return store.MemoryMutationAdmission{
+		Namespace: authority.Namespace, NamespaceUID: authority.NamespaceUID,
+		ClusterID: authority.Binding.ClusterID, BackendUID: authority.Binding.BackendUID,
+		AuthorityEpoch: authority.Binding.AuthorityEpoch, RoutingEpoch: authority.Binding.RoutingEpoch,
+		MemoryID: memoryID, OperationID: operationID, ProposalID: proposalID,
+		Principal: principal, Route: mutationContext.Route, IdempotencyKey: mutationContext.IdempotencyKey,
+		RequestDigest:           requestDigest,
+		OperationIdempotencyKey: operationID, MutationDigest: envelope.MutationDigest,
+		ContentDigest: envelope.ContentDigest, Payload: payload, Actor: mutationContext.Actor,
+		Reason: mutationContext.Reason, RequestID: mutationContext.RequestID,
+		OriginalStatus: http.StatusAccepted, ResponseType: store.MemoryIdempotencyOperation,
+		Location: location, RetryAfterSeconds: int(defaultMemoryOperationRetryAfter / time.Second),
+		Now: now, MaxAgeAt: now.Add(defaultMemoryOperationMaxAge),
+		IdempotencyExpiresAt: now.Add(defaultMemoryIdempotencyRetention),
+	}
+}
+
+func (s *Service) materializeOrQueue(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	admission *store.MemoryMutationAdmissionResult,
+	immediateStatus int,
+) (*MutationResult, error) {
+	if admission == nil {
+		return nil, apierror.New(http.StatusInternalServerError, ReasonBackendUnavailable, "memory admission returned no result")
+	}
+	operation := admission.Operation
+	if admission.Replayed && admission.Idempotency.OriginalStatus == http.StatusAccepted {
+		publicOperation := OperationFromStore(operation)
+		return &MutationResult{
+			Operation: &publicOperation, StatusCode: http.StatusAccepted,
+			Location:   admission.Idempotency.Location,
+			RetryAfter: time.Duration(admission.Idempotency.RetryAfterSeconds) * time.Second,
+			Replayed:   true,
+		}, nil
+	}
+	if authority != nil && authority.Adapter != nil && s.Dispatcher != nil {
+		_, _ = s.Dispatcher.DispatchImmediate(ctx, authority.Namespace, operation.ID)
+		if refreshed, err := s.Governed.GetMemoryOperation(ctx, authority.NamespaceUID, operation.ID); err == nil {
+			operation = *refreshed
+		}
+	}
+	if operation.State == store.MemoryOperationSucceeded {
+		if immediateStatus == http.StatusNoContent {
+			return &MutationResult{StatusCode: http.StatusNoContent, Replayed: admission.Replayed}, nil
+		}
+		entry, err := s.Governed.GetRemoteMemory(ctx, authority.NamespaceUID, admission.Memory.ID)
+		if err != nil {
+			return nil, mapStoreError(err)
+		}
+		if !entryMatchesAuthority(entry, authority.Binding) {
+			return nil, identityError()
+		}
+		memory, err := s.hydrate(ctx, authority, entry)
+		if err != nil {
+			return nil, err
+		}
+		return &MutationResult{Memory: memory, StatusCode: immediateStatus, Replayed: admission.Replayed}, nil
+	}
+	publicOperation := OperationFromStore(operation)
+	return &MutationResult{
+		Operation: &publicOperation, StatusCode: http.StatusAccepted,
+		Location: admission.Idempotency.Location, RetryAfter: time.Duration(admission.Idempotency.RetryAfterSeconds) * time.Second,
+		Replayed: admission.Replayed,
+	}, nil
+}
+
+func (s *Service) hydrate(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	entry *store.RemoteMemoryCatalogEntry,
+) (*store.Memory, error) {
+	if entry == nil {
+		return nil, store.ErrNotFound
+	}
+	if entry.Disabled || entry.Deleted || entry.MaterializationState == store.MemoryMaterializationDeleted ||
+		entry.MaterializationState == store.MemoryMaterializationOrphaned {
+		memory := remoteEntryToMemory(entry, "")
+		return &memory, nil
+	}
+	if entry.MaterializationState == store.MemoryMaterializationDiverged || entry.MaterializationState == store.MemoryMaterializationLost {
+		return nil, apierror.New(http.StatusConflict, ReasonDiverged, "remote memory materialization is not trusted")
+	}
+	if authority == nil || authority.Adapter == nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend content is unavailable")
+	}
+	binding, err := protocolBinding(authority.Binding)
+	if err != nil {
+		return nil, identityError()
+	}
+	response, err := authority.Adapter.Get(ctx, protocol.GetRequest{
+		ProtocolVersion: protocol.Version, Binding: binding,
+		UpsertKey: protocol.CanonicalUpsertKey(binding, entry.ID),
+	})
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend content is unavailable")
+	}
+	if response.Binding != binding {
+		s.markMaterializationIssue(ctx, entry, store.MemoryMaterializationDiverged, "provider binding identity mismatch")
+		return nil, apierror.New(http.StatusConflict, ReasonDiverged, "memory backend materialization has wrong identity")
+	}
+	if !response.Found || response.Record == nil {
+		s.markMaterializationIssue(ctx, entry, store.MemoryMaterializationLost, "provider materialization missing")
+		return nil, apierror.New(http.StatusConflict, ReasonDiverged, "memory backend materialization is missing")
+	}
+	record := response.Record
+	if record.MemoryID != entry.ID || record.UpsertKey != protocol.CanonicalUpsertKey(binding, entry.ID) ||
+		int64(record.Generation) != entry.Generation || record.BackendVersion != entry.BackendVersion ||
+		record.BackendMemoryID != entry.BackendMemoryID || record.ContentDigest != entry.ContentDigest ||
+		protocol.ContentDigest(record.Content) != entry.ContentDigest || record.State != protocol.RecordStateLive {
+		s.markMaterializationIssue(ctx, entry, store.MemoryMaterializationDiverged, "provider materialization verification failed")
+		return nil, apierror.New(http.StatusConflict, ReasonDiverged, "memory backend materialization failed verification")
+	}
+	memory := remoteEntryToMemory(entry, record.Content)
+	memory.ContentAvailable = true
+	return &memory, nil
+}
+
+func (s *Service) markMaterializationIssue(
+	ctx context.Context,
+	entry *store.RemoteMemoryCatalogEntry,
+	state store.MemoryMaterializationState,
+	reason string,
+) {
+	if s == nil || s.Governed == nil || entry == nil {
+		return
+	}
+	memoryDivergenceTotal.WithLabelValues(string(state)).Inc()
+	_, _ = s.Governed.MarkRemoteMemoryMaterializationIssue(ctx, store.RemoteMemoryMaterializationIssue{
+		NamespaceUID: entry.NamespaceUID, ID: entry.ID, BackendUID: entry.BackendUID,
+		AuthorityEpoch: entry.AuthorityEpoch, RoutingEpoch: entry.RoutingEpoch,
+		ExpectedGeneration: entry.Generation, ExpectedBackendVersion: entry.BackendVersion,
+		State: state, Actor: "orka-memory-hydrator", Reason: reason, Now: s.now(),
+	})
+}
+
+func (s *Service) normalizeContent(content string, tags []string) (string, []string, error) {
+	content = redact.SensitiveText(content)
+	if strings.TrimSpace(content) == "" {
+		return "", nil, apierror.New(http.StatusBadRequest, "", "content is required")
+	}
+	limit := s.ContentLimit
+	if limit <= 0 || limit > 256<<10 {
+		limit = defaultMemoryContentBytes
+	}
+	if len([]byte(content)) > limit {
+		return "", nil, apierror.New(http.StatusRequestEntityTooLarge, "", "memory content exceeds the configured limit")
+	}
+	normalized, err := protocol.NormalizeTags(nonNilStrings(tags))
+	if err != nil {
+		return "", nil, apierror.New(http.StatusBadRequest, "", "invalid memory tags")
+	}
+	return content, normalized, nil
+}
+
+func (s *Service) resolve(ctx context.Context, namespace string, fresh bool) (*ResolvedAuthority, error) {
+	if s.Resolver == nil || s.Governed == nil {
+		return &ResolvedAuthority{Namespace: namespace}, nil
+	}
+	if fresh {
+		return s.Resolver.Resolve(ctx, namespace)
+	}
+	return s.Resolver.ResolveLocal(ctx, namespace)
+}
+
+func (s *Service) now() time.Time {
+	if s.Now != nil {
+		return s.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func requireRemoteRead(authority *ResolvedAuthority) error {
+	if authority == nil || authority.Backend == nil || authority.Binding == nil || authority.Adapter == nil {
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend is unavailable")
+	}
+	switch authority.Backend.Status.EffectiveLifecycleState {
+	case corev1alpha1.MemoryBackendEffectiveLifecycleActive, corev1alpha1.MemoryBackendEffectiveLifecycleReadOnly:
+		if authority.Backend.Status.Ready {
+			return nil
+		}
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend is not ready")
+	case corev1alpha1.MemoryBackendEffectiveLifecycleDisabled:
+		return apierror.New(http.StatusConflict, ReasonBackendDisabled, "memory backend is disabled")
+	case corev1alpha1.MemoryBackendEffectiveLifecycleRemoved, corev1alpha1.MemoryBackendEffectiveLifecycleDecommissioned:
+		return apierror.New(http.StatusGone, ReasonBackendRemoved, "memory backend has been removed")
+	default:
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend lifecycle is unavailable")
+	}
+}
+
+func requireRemoteMutation(authority *ResolvedAuthority, deleteOnly bool) error {
+	if authority == nil || authority.Backend == nil || authority.Binding == nil {
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend is unavailable")
+	}
+	if deleteOnly {
+		return nil
+	}
+	switch authority.Backend.Status.EffectiveLifecycleState {
+	case corev1alpha1.MemoryBackendEffectiveLifecycleActive:
+		if authority.Backend.Status.Ready {
+			return nil
+		}
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend is not ready")
+	case corev1alpha1.MemoryBackendEffectiveLifecycleReadOnly:
+		return apierror.New(http.StatusConflict, ReasonBackendReadOnly, "memory backend is read-only")
+	case corev1alpha1.MemoryBackendEffectiveLifecycleDisabled:
+		return apierror.New(http.StatusConflict, ReasonBackendDisabled, "memory backend is disabled")
+	case corev1alpha1.MemoryBackendEffectiveLifecycleRemoved, corev1alpha1.MemoryBackendEffectiveLifecycleDecommissioned:
+		return apierror.New(http.StatusGone, ReasonBackendRemoved, "memory backend has been removed")
+	default:
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend lifecycle is unavailable")
+	}
+}
+
+func requireIdempotency(mutationContext MutationContext) error {
+	if strings.TrimSpace(mutationContext.IdempotencyKey) == "" {
+		return apierror.New(http.StatusPreconditionRequired, ReasonIdempotencyKeyRequired,
+			"Idempotency-Key is required for remote memory mutations; upgrade the client and retry")
+	}
+	if len(mutationContext.IdempotencyKey) > 256 {
+		return apierror.New(http.StatusBadRequest, "", "Idempotency-Key is too long")
+	}
+	return nil
+}
+
+func mutationPrincipal(mutationContext MutationContext) string {
+	principal := strings.TrimSpace(mutationContext.Principal)
+	if principal == "" {
+		principal = strings.TrimSpace(mutationContext.Actor)
+	}
+	return principal
+}
+
+// lookupMutationReplay checks caller idempotency against local durable state before
+// any fresh backend validation or provider hydration. Its bounded immutable snapshot
+// reproduces the original status, headers, operation, and successful memory body.
+func (s *Service) lookupMutationReplay(
+	ctx context.Context,
+	localAuthority *ResolvedAuthority,
+	mutationContext MutationContext,
+	requestDigest string,
+) (*MutationResult, bool, error) {
+	if localAuthority == nil || !localAuthority.Remote() {
+		return nil, false, nil
+	}
+	if s.Governed == nil {
+		return nil, true, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory idempotency store is unavailable")
+	}
+	record, err := s.Governed.GetMemoryIdempotency(ctx, localAuthority.NamespaceUID, mutationPrincipal(mutationContext),
+		strings.TrimSpace(mutationContext.Route), strings.TrimSpace(mutationContext.IdempotencyKey))
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, mapStoreError(err)
+	}
+	if localAuthority.Binding == nil || record.AuthorityEpoch != localAuthority.Binding.AuthorityEpoch ||
+		record.RoutingEpoch != localAuthority.Binding.RoutingEpoch {
+		return nil, true, apierror.New(http.StatusConflict, ReasonIdempotencyKeyReuse,
+			"Idempotency-Key belongs to a prior memory authority or routing binding")
+	}
+	if record.RequestDigest != requestDigest {
+		return nil, true, apierror.New(http.StatusConflict, ReasonIdempotencyKeyReuse,
+			"Idempotency-Key was reused with different input")
+	}
+	var snapshot struct {
+		Memory    store.RemoteMemoryCatalogEntry `json:"memory"`
+		Operation store.MemoryOperation          `json:"operation"`
+		Content   []byte                         `json:"content"`
+	}
+	if len(record.ResponseSnapshot) > 0 {
+		if err := json.Unmarshal(record.ResponseSnapshot, &snapshot); err != nil ||
+			snapshot.Memory.ID != record.MemoryID || snapshot.Operation.ID != record.OperationID {
+			return nil, true, apierror.New(http.StatusInternalServerError, ReasonBackendUnavailable,
+				"memory idempotency snapshot is invalid")
+		}
+	}
+	status := record.OriginalStatus
+	if status == 0 {
+		status = http.StatusAccepted
+	}
+	result := &MutationResult{
+		StatusCode: status, Location: record.Location,
+		RetryAfter: time.Duration(record.RetryAfterSeconds) * time.Second, Replayed: true,
+	}
+	switch record.ResponseType {
+	case store.MemoryIdempotencyOperation:
+		operation := &snapshot.Operation
+		if operation.ID == "" {
+			var getErr error
+			operation, getErr = s.Governed.GetMemoryOperation(ctx, localAuthority.NamespaceUID, record.OperationID)
+			if getErr != nil {
+				return nil, true, mapStoreError(getErr)
+			}
+		}
+		publicOperation := OperationFromStore(*operation)
+		result.Operation = &publicOperation
+		return result, true, nil
+	case store.MemoryIdempotencyEmpty:
+		return result, true, nil
+	case store.MemoryIdempotencyMemory:
+		entry := &snapshot.Memory
+		if entry.ID == "" || len(record.ResponseSnapshot) == 0 {
+			return nil, true, apierror.New(http.StatusInternalServerError, ReasonBackendUnavailable,
+				"memory idempotency response snapshot is unavailable")
+		}
+		if entry.NamespaceUID != localAuthority.NamespaceUID {
+			return nil, true, identityError()
+		}
+		memory := remoteEntryToMemory(entry, string(snapshot.Content))
+		result.Memory = &memory
+		return result, true, nil
+	default:
+		return nil, true, apierror.New(http.StatusInternalServerError, ReasonBackendUnavailable,
+			"memory idempotency response is invalid")
+	}
+}
+
+func mapStoreError(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return apierror.New(http.StatusNotFound, "", "memory resource not found")
+	case errors.Is(err, store.ErrDuplicateMismatch):
+		return apierror.New(http.StatusConflict, ReasonIdempotencyKeyReuse, "Idempotency-Key was reused with different input")
+	case errors.Is(err, store.ErrConflict):
+		return apierror.New(http.StatusConflict, ReasonOperationInProgress, err.Error())
+	case errors.Is(err, store.ErrCapacity):
+		return apierror.New(http.StatusTooManyRequests, ReasonBackendUnavailable, "memory operation capacity is full").WithRetryAfter(5 * time.Second)
+	case errors.Is(err, store.ErrNotReady):
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend is not ready")
+	case errors.Is(err, store.ErrValidation):
+		return apierror.New(http.StatusBadRequest, "", err.Error())
+	default:
+		return apierror.New(http.StatusInternalServerError, ReasonBackendUnavailable, "memory operation failed")
+	}
+}
+
+func identityError() error {
+	return apierror.New(http.StatusConflict, ReasonIdentityMismatch, "memory binding identity is invalid")
+}
+
+func remoteEntryToMemory(entry *store.RemoteMemoryCatalogEntry, content string) store.Memory {
+	if entry == nil {
+		return store.Memory{}
+	}
+	return store.Memory{
+		ID: entry.ID, Namespace: entry.Namespace, SessionName: entry.SessionName, AgentName: entry.AgentName,
+		TaskName: entry.TaskName, ParentTask: entry.ParentTask, Source: entry.Source,
+		SourceProposalID: entry.SourceProposalID, Content: content, Tags: append([]string(nil), entry.Tags...),
+		Disabled: entry.Disabled, Deleted: entry.Deleted, CreatedAt: entry.CreatedAt, UpdatedAt: entry.UpdatedAt,
+		LastRecalledAt: entry.LastRecalledAt, RecalledCount: entry.RecalledCount,
+		Generation: entry.Generation, DesiredGeneration: entry.DesiredGeneration,
+		GovernanceRevision: entry.GovernanceRevision, MaterializationState: entry.MaterializationState,
+		PendingOperationID: entry.PendingOperationID, Trust: entry.Trust,
+		ContentDigest: entry.ContentDigest, ContentAvailable: content != "" && entry.ContentAvailable,
+	}
+}
+
+func memoryMetadata(request CreateRequest) map[string]string {
+	return compactMetadata(map[string]string{
+		"sessionName": request.SessionName, "agentName": request.AgentName, "taskName": request.TaskName,
+		"parentTask": request.ParentTask, "source": normalizeSource(request.Source),
+	})
+}
+
+func memoryMetadataFromStore(memory store.Memory) map[string]string {
+	return compactMetadata(map[string]string{
+		"sessionName": memory.SessionName, "agentName": memory.AgentName, "taskName": memory.TaskName,
+		"parentTask": memory.ParentTask, "source": normalizeSource(memory.Source),
+		"sourceProposalId": memory.SourceProposalID,
+	})
+}
+
+func compactMetadata(input map[string]string) map[string]string {
+	result := make(map[string]string, len(input))
+	for key, value := range input {
+		if value = strings.TrimSpace(redact.SensitiveText(value)); value != "" {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+func normalizeSource(source string) string {
+	source = strings.TrimSpace(redact.SensitiveText(source))
+	if source == "" {
+		return "api"
+	}
+	return source
+}
+
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
+}
+
+func digestJSON(value any) string {
+	encoded, _ := json.Marshal(value)
+	sum := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func boundedMemoryLimit(limit int) int {
+	if limit <= 0 {
+		return defaultRemoteCatalogLimit
+	}
+	return min(limit, maxRemoteCatalogLimit)
+}
+
+func entryMatchesAuthority(entry *store.RemoteMemoryCatalogEntry, binding *store.MemoryBackendBinding) bool {
+	return entry != nil && binding != nil && entry.Namespace == binding.Namespace && entry.NamespaceUID == binding.NamespaceUID &&
+		entry.ClusterID == binding.ClusterID && entry.BackendUID == binding.BackendUID &&
+		entry.AuthorityEpoch == binding.AuthorityEpoch && entry.TenantID == binding.TenantID && entry.StoreUUID == binding.StoreUUID
+}
+
+func sourceFilterValues(source string) []string {
+	if source = strings.TrimSpace(source); source != "" {
+		return []string{source}
+	}
+	return nil
+}
+
+func memoryEntryMatchesFilter(entry *store.RemoteMemoryCatalogEntry, filter store.MemoryFilter) bool {
+	if entry == nil {
+		return false
+	}
+	if filter.SessionName != "" && entry.SessionName != filter.SessionName ||
+		filter.AgentName != "" && entry.AgentName != filter.AgentName ||
+		filter.TaskName != "" && entry.TaskName != filter.TaskName ||
+		filter.ParentTask != "" && entry.ParentTask != filter.ParentTask ||
+		filter.Source != "" && entry.Source != filter.Source {
+		return false
+	}
+	if len(filter.Trust) > 0 && !slices.Contains(filter.Trust, entry.Trust) {
+		return false
+	}
+	for _, tag := range filter.Tags {
+		if !slices.Contains(entry.Tags, strings.ToLower(strings.TrimSpace(tag))) {
+			return false
+		}
+	}
+	return true
+}
+
+// Search performs explicit bounded search and verifies every remote result against the active local catalog.
+func (s *Service) Search(
+	ctx context.Context,
+	namespace string,
+	request SearchRequest,
+	searchContext SearchContext,
+) (*SearchResponse, error) {
+	return s.search(ctx, namespace, request, searchContext)
+}
+
+//nolint:gocyclo // Search enforces bounded paging, authorization, local joins, filtering, and verification in one flow.
+func (s *Service) search(
+	ctx context.Context,
+	namespace string,
+	request SearchRequest,
+	searchContext SearchContext,
+) (*SearchResponse, error) {
+	if len(request.Trust) == 0 && !searchContext.PreserveEmptyTrust {
+		request.Trust = []store.MemoryTrust{store.MemoryTrustReviewed, store.MemoryTrustTrusted}
+	}
+	mode := strings.ToLower(strings.TrimSpace(request.Mode))
+	if mode == "" {
+		mode = protocol.SearchModeKeyword
+	}
+	if mode != protocol.SearchModeKeyword && mode != protocol.SearchModeSemantic &&
+		mode != protocol.SearchModeHybrid && mode != protocol.SearchModeAuto {
+		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory search mode")
+	}
+	authority, err := s.resolve(ctx, namespace, true)
+	if err != nil {
+		return nil, err
+	}
+	if !authority.Remote() {
+		return s.searchLegacy(ctx, namespace, request, mode)
+	}
+	if err := requireRemoteRead(authority); err != nil {
+		return nil, err
+	}
+	if err := authorizeRemoteSearch(searchContext); err != nil {
+		return nil, err
+	}
+	if err := ensureSearchCapability(authority.Backend, mode); err != nil {
+		return nil, err
+	}
+	binding, err := protocolBinding(authority.Binding)
+	if err != nil {
+		return nil, identityError()
+	}
+	request.Query = strings.TrimSpace(redact.SensitiveText(request.Query))
+	if err := protocol.ValidateSearchRequest(&protocol.SearchRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, Mode: mode,
+		Query: request.Query, PageSize: 1, PageToken: "",
+	}); err != nil {
+		return nil, apierror.New(http.StatusBadRequest, "", "memory search query is invalid")
+	}
+	queryDigest := digestJSON(struct {
+		Query           string              `json:"query"`
+		Tags            []string            `json:"tags"`
+		IDs             []string            `json:"ids"`
+		Sources         []string            `json:"sources"`
+		Trust           []store.MemoryTrust `json:"trust"`
+		SessionName     string              `json:"sessionName"`
+		TaskName        string              `json:"taskName"`
+		ParentTask      string              `json:"parentTask"`
+		AgentName       string              `json:"agentName"`
+		Mode            string              `json:"mode"`
+		IncludeDisabled bool                `json:"includeDisabled"`
+		IncludeDeleted  bool                `json:"includeDeleted"`
+	}{
+		Query: request.Query, Tags: request.Tags, IDs: request.IDs,
+		Sources: request.Sources, Trust: request.Trust, SessionName: request.SessionName,
+		TaskName: request.TaskName, ParentTask: request.ParentTask, AgentName: request.AgentName,
+		Mode: mode, IncludeDisabled: request.IncludeDisabled, IncludeDeleted: request.IncludeDeleted,
+	})
+	actor := strings.TrimSpace(searchContext.Actor)
+	if actor == "" {
+		actor = "authenticated-memory-search"
+	}
+	if err := s.Governed.AppendMemoryAudit(ctx, store.MemoryAuditRecord{
+		Namespace: namespace, NamespaceUID: authority.NamespaceUID, Actor: actor,
+		Action: "memory.search", AuthorityEpoch: authority.Binding.AuthorityEpoch,
+		RoutingEpoch: authority.Binding.RoutingEpoch, RequestDigest: queryDigest,
+		RequestID: searchContext.RequestID, CreatedAt: s.now(),
+	}); err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search audit could not be committed")
+	}
+	cursorState, err := loadRemoteSearchCursor(ctx, s.Governed, authority.Binding, queryDigest, request.Cursor, s.now())
+	if err != nil {
+		return nil, apierror.New(http.StatusBadRequest, "", "invalid or expired memory search cursor")
+	}
+	target := boundedMemoryLimit(request.Limit)
+	if cursorState.PageSize == 0 {
+		cursorState.PageSize = min(target, protocol.MaxPageSize)
+	}
+	items := make([]SearchHit, 0, target)
+	actualMode := cursorState.ActualMode
+	if actualMode == "" {
+		actualMode = mode
+	}
+	candidates := 0
+
+	for len(cursorState.Pending) > 0 && len(items) < target && candidates < maxRemoteSearchCandidates {
+		descriptor := cursorState.Pending[0]
+		cursorState.Pending = cursorState.Pending[1:]
+		candidates++
+		record, getErr := s.getCursorSearchRecord(ctx, authority, binding, descriptor)
+		if getErr != nil {
+			return nil, getErr
+		}
+		hit, eligible, hitErr := s.searchHit(ctx, authority, binding, record, descriptor.Score, request, actualMode)
+		if hitErr != nil {
+			return nil, hitErr
+		}
+		if eligible {
+			items = append(items, *hit)
+		}
+	}
+
+	for page := 0; page < maxRemoteSearchPages && len(items) < target && candidates < maxRemoteSearchCandidates &&
+		len(cursorState.Pending) == 0 && !cursorState.ProviderExhausted; page++ {
+		requestPageToken := cursorState.ProviderToken
+		response, searchErr := authority.Adapter.Search(ctx, protocol.SearchRequest{
+			ProtocolVersion: protocol.Version, Binding: binding, Mode: mode,
+			Query: request.Query, PageSize: cursorState.PageSize, PageToken: requestPageToken,
+		})
+		if searchErr != nil {
+			var adapterErr *AdapterError
+			if errors.As(searchErr, &adapterErr) && adapterErr.Code == protocol.ErrorCodeSearchModeUnsupported {
+				return nil, apierror.New(http.StatusUnprocessableEntity, ReasonSearchModeUnsupported, "memory search mode is unsupported")
+			}
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search backend is unavailable")
+		}
+		if response.Binding != binding {
+			return nil, identityError()
+		}
+		if len(response.Records) > cursorState.PageSize {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search backend exceeded the requested page bound")
+		}
+		actualMode = response.ActualMode
+		cursorState.ActualMode = response.ActualMode
+		cursorState.ProviderToken = response.NextPageToken
+		cursorState.ProviderExhausted = response.Exhausted
+		if !response.Exhausted && cursorState.ProviderToken == requestPageToken {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete, "memory search pagination did not advance")
+		}
+		for i := range response.Records {
+			if len(items) >= target || candidates >= maxRemoteSearchCandidates {
+				cursorState.Pending = appendSearchCursorRecords(cursorState.Pending, response.Records[i:])
+				break
+			}
+			candidates++
+			record := &response.Records[i]
+			hit, eligible, hitErr := s.searchHit(ctx, authority, binding, record, record.Score, request, actualMode)
+			if hitErr != nil {
+				return nil, hitErr
+			}
+			if eligible {
+				items = append(items, *hit)
+			}
+		}
+	}
+	exhausted := cursorState.ProviderExhausted && len(cursorState.Pending) == 0
+	pageComplete := exhausted || len(items) >= target
+	cursor := ""
+	if !exhausted {
+		cursor, err = saveRemoteSearchCursor(ctx, s.Governed, authority.Binding, queryDigest, cursorState, s.now())
+		if err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+				"memory search continuation could not be preserved")
+		}
+	}
+	if !pageComplete && !request.AllowIncomplete {
+		memoryIncompleteTotal.Inc()
+		return nil, &IncompleteSearchError{
+			Cause: apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+				"memory search scan budget was exhausted"),
+			Cursor: cursor,
+		}
+	}
+	if len(items) > 0 {
+		ids := make([]string, 0, len(items))
+		for _, item := range items {
+			ids = append(ids, item.Memory.ID)
+		}
+		_ = s.Governed.MarkRemoteMemoriesRecalled(ctx, authority.NamespaceUID, ids, s.now())
+	}
+	return &SearchResponse{
+		Items: items, ActualMode: actualMode, Cursor: cursor, Exhausted: exhausted, Complete: pageComplete,
+	}, nil
+}
+
+func (s *Service) searchLegacy(
+	ctx context.Context,
+	namespace string,
+	request SearchRequest,
+	mode string,
+) (*SearchResponse, error) {
+	if mode == protocol.SearchModeSemantic || mode == protocol.SearchModeHybrid {
+		return nil, apierror.New(http.StatusUnprocessableEntity, ReasonSearchModeUnsupported, "memory search mode is unsupported")
+	}
+	if s.Legacy == nil {
+		return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
+	}
+	filter := store.MemoryFilter{
+		Namespace: namespace, Query: request.Query, SessionName: request.SessionName,
+		AgentName: request.AgentName, TaskName: request.TaskName, ParentTask: request.ParentTask,
+		Tags: request.Tags, IDs: request.IDs,
+		IncludeDisabled: request.IncludeDisabled, IncludeDeleted: request.IncludeDeleted,
+		Limit: maxRemoteCatalogLimit,
+	}
+	target := boundedMemoryLimit(request.Limit)
+	var memories []store.Memory
+	var err error
+	capped := false
+	if len(request.Sources) <= 1 {
+		if len(request.Sources) == 1 {
+			filter.Source = request.Sources[0]
+		}
+		memories, err = s.Legacy.ListMemories(ctx, filter)
+		if err != nil {
+			return nil, mapStoreError(err)
+		}
+		capped = len(memories) >= maxRemoteCatalogLimit
+	} else {
+		seen := make(map[string]struct{})
+		for _, source := range request.Sources {
+			filter.Source = source
+			batch, listErr := s.Legacy.ListMemories(ctx, filter)
+			if listErr != nil {
+				return nil, mapStoreError(listErr)
+			}
+			if len(batch) >= maxRemoteCatalogLimit {
+				capped = true
+			}
+			for _, memory := range batch {
+				if _, ok := seen[memory.ID]; ok {
+					continue
+				}
+				seen[memory.ID] = struct{}{}
+				memories = append(memories, memory)
+			}
+		}
+	}
+	authority, _ := s.resolve(ctx, namespace, false)
+	items := make([]SearchHit, 0, min(len(memories), target))
+	for _, memory := range memories {
+		if overlayErr := s.applyLegacyGovernance(ctx, authority, &memory); overlayErr != nil {
+			return nil, overlayErr
+		}
+		if !memoryMatchesSearchRequest(memory, request) {
+			continue
+		}
+		items = append(items, SearchHit{Memory: memory})
+		if len(items) == target {
+			break
+		}
+	}
+	if capped && !request.AllowIncomplete {
+		memoryIncompleteTotal.Inc()
+		return nil, &IncompleteSearchError{Cause: apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+			"legacy memory search reached its pre-filter scan cap and cannot prove completeness")}
+	}
+	return &SearchResponse{
+		Items: items, ActualMode: protocol.SearchModeKeyword, Exhausted: !capped, Complete: !capped,
+	}, nil
+}
+
+func (s *Service) applyLegacyGovernanceFilter(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	memories []store.Memory,
+	trust []store.MemoryTrust,
+	limit int,
+) ([]store.Memory, error) {
+	result := make([]store.Memory, 0, min(len(memories), limit))
+	for i := range memories {
+		if err := s.applyLegacyGovernance(ctx, authority, &memories[i]); err != nil {
+			return nil, err
+		}
+		if len(trust) > 0 && !slices.Contains(trust, memories[i].Trust) {
+			continue
+		}
+		result = append(result, memories[i])
+		if len(result) == limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) applyLegacyGovernance(ctx context.Context, authority *ResolvedAuthority, memory *store.Memory) error {
+	if memory == nil || s.Governed == nil || authority == nil || strings.TrimSpace(authority.NamespaceUID) == "" {
+		return nil
+	}
+	var audits []store.MemoryAuditRecord
+	var beforeCreatedAt *time.Time
+	beforeID := ""
+	for {
+		records, err := s.Governed.ListMemoryAudit(ctx, store.MemoryAuditFilter{
+			NamespaceUID: authority.NamespaceUID, MemoryID: memory.ID,
+			BeforeCreatedAt: beforeCreatedAt, BeforeID: beforeID, Limit: maxRemoteCatalogLimit,
+		})
+		if err != nil {
+			return mapStoreError(err)
+		}
+		audits = append(audits, records...)
+		if len(records) < maxRemoteCatalogLimit {
+			break
+		}
+		last := records[len(records)-1]
+		createdAt := last.CreatedAt.UTC()
+		beforeCreatedAt = &createdAt
+		beforeID = last.ID
+	}
+	applyLegacyGovernanceRecords(memory, audits)
+	return nil
+}
+
+func applyLegacyGovernanceRecords(memory *store.Memory, records []store.MemoryAuditRecord) {
+	if memory == nil {
+		return
+	}
+	effectiveTrust := memory.Trust
+	governanceRevision := max(memory.GovernanceRevision, int64(1))
+	trustResolved := false
+	for _, record := range records {
+		if record.AuthorityEpoch != 0 || record.RoutingEpoch != 0 {
+			continue
+		}
+		switch record.Action {
+		case legacyMemoryTrustAuditAction:
+			previousTrust := store.MemoryTrust(record.PreviousState)
+			newTrust := store.MemoryTrust(record.NewState)
+			if !validMemoryTrust(previousTrust) || !validMemoryTrust(newTrust) || previousTrust == newTrust {
+				continue
+			}
+			governanceRevision++
+			if !trustResolved {
+				effectiveTrust = newTrust
+				trustResolved = true
+			}
+		case legacyMemoryDisableAuditAction:
+			if (record.PreviousState == legacyMemoryDisabledState(false) && record.NewState == legacyMemoryDisabledState(true)) ||
+				(record.PreviousState == legacyMemoryDisabledState(true) && record.NewState == legacyMemoryDisabledState(false)) {
+				governanceRevision++
+			}
+		}
+	}
+	memory.Trust = effectiveTrust
+	memory.GovernanceRevision = governanceRevision
+}
+
+func validMemoryTrust(trust store.MemoryTrust) bool {
+	return trust == store.MemoryTrustUntrusted || trust == store.MemoryTrustReviewed || trust == store.MemoryTrustTrusted
+}
+
+func legacyMemoryDisabledState(disabled bool) string {
+	if disabled {
+		return "disabled=true"
+	}
+	return "disabled=false"
+}
+
+func authorizeRemoteSearch(searchContext SearchContext) error {
+	if searchContext.RemoteAuthorized {
+		return nil
+	}
+	if searchContext.AuthorizeRemote == nil {
+		return apierror.New(http.StatusForbidden, ReasonSearchRemoteAuth, "remote memory search requires explicit authorization")
+	}
+	if err := searchContext.AuthorizeRemote(); err != nil {
+		return apierror.New(http.StatusForbidden, ReasonSearchRemoteAuth, "remote memory search is not authorized")
+	}
+	return nil
+}
+
+func ensureSearchCapability(backend *corev1alpha1.MemoryBackend, mode string) error {
+	if backend == nil || backend.Status.ObservedCapabilities == nil {
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search capabilities are unavailable")
+	}
+	capabilities := backend.Status.ObservedCapabilities.Effective
+	has := func(capability corev1alpha1.MemoryBackendCapability) bool {
+		return slices.Contains(capabilities, capability)
+	}
+	switch mode {
+	case protocol.SearchModeKeyword:
+		if !has(corev1alpha1.MemoryBackendCapabilityKeywordSearch) {
+			return apierror.New(http.StatusUnprocessableEntity, ReasonSearchModeUnsupported, "keyword memory search is unsupported")
+		}
+	case protocol.SearchModeSemantic:
+		if !has(corev1alpha1.MemoryBackendCapabilitySemanticSearch) {
+			return apierror.New(http.StatusUnprocessableEntity, ReasonSearchModeUnsupported, "semantic memory search is unsupported")
+		}
+	case protocol.SearchModeHybrid:
+		if !has(corev1alpha1.MemoryBackendCapabilityHybridSearch) {
+			return apierror.New(http.StatusUnprocessableEntity, ReasonSearchModeUnsupported, "hybrid memory search is unsupported")
+		}
+	case protocol.SearchModeAuto:
+		if !has(corev1alpha1.MemoryBackendCapabilityKeywordSearch) {
+			return apierror.New(http.StatusUnprocessableEntity, ReasonSearchModeUnsupported, "automatic memory search is unsupported")
+		}
+	}
+	return nil
+}
+
+func searchEntryEligible(entry *store.RemoteMemoryCatalogEntry, request SearchRequest) bool {
+	if entry == nil || entry.MaterializationState != store.MemoryMaterializationActive {
+		return false
+	}
+	if entry.Disabled && !request.IncludeDisabled || entry.Deleted && !request.IncludeDeleted {
+		return false
+	}
+	if len(request.IDs) > 0 && !slices.Contains(request.IDs, entry.ID) {
+		return false
+	}
+	if len(request.Trust) > 0 && !slices.Contains(request.Trust, entry.Trust) {
+		return false
+	}
+	if len(request.Sources) > 0 && !slices.Contains(request.Sources, entry.Source) {
+		return false
+	}
+	if request.SessionName != "" && entry.SessionName != request.SessionName ||
+		request.TaskName != "" && entry.TaskName != request.TaskName ||
+		request.ParentTask != "" && entry.ParentTask != request.ParentTask ||
+		request.AgentName != "" && entry.AgentName != request.AgentName {
+		return false
+	}
+	for _, tag := range request.Tags {
+		if !slices.Contains(entry.Tags, strings.ToLower(strings.TrimSpace(tag))) {
+			return false
+		}
+	}
+	return true
+}
+
+func memoryMatchesSearchRequest(memory store.Memory, request SearchRequest) bool {
+	entry := store.RemoteMemoryCatalogEntry{
+		ID: memory.ID, SessionName: memory.SessionName, AgentName: memory.AgentName,
+		TaskName: memory.TaskName, ParentTask: memory.ParentTask, Source: memory.Source,
+		Tags: memory.Tags, Disabled: memory.Disabled, Deleted: memory.Deleted, Trust: memory.Trust,
+		MaterializationState: store.MemoryMaterializationActive,
+	}
+	return searchEntryEligible(&entry, request)
+}
+
+func keywordRecordMatches(record *protocol.MemoryRecord, entry *store.RemoteMemoryCatalogEntry, query string) bool {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return true
+	}
+	contains := func(value string) bool {
+		return strings.Contains(strings.ToLower(value), query)
+	}
+	if record == nil || entry == nil {
+		return false
+	}
+	if contains(record.Content) || slices.ContainsFunc(entry.Tags, contains) {
+		return true
+	}
+	localMetadata := []string{
+		entry.ID, entry.SessionName, entry.AgentName, entry.TaskName, entry.ParentTask,
+		entry.Source, entry.SourceProposalID,
+	}
+	return slices.ContainsFunc(localMetadata, contains)
+}
+
+func appendSearchCursorRecords(
+	pending []remoteSearchCursorRecord,
+	records []protocol.MemoryRecord,
+) []remoteSearchCursorRecord {
+	for i := range records {
+		record := &records[i]
+		pending = append(pending, remoteSearchCursorRecord{
+			MemoryID: record.MemoryID, Generation: record.Generation,
+			BackendVersion: record.BackendVersion, BackendMemoryID: record.BackendMemoryID,
+			ContentDigest: record.ContentDigest, Score: record.Score,
+		})
+	}
+	return pending
+}
+
+func (s *Service) getCursorSearchRecord(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	binding protocol.Binding,
+	descriptor remoteSearchCursorRecord,
+) (*protocol.MemoryRecord, error) {
+	response, err := authority.Adapter.Get(ctx, protocol.GetRequest{
+		ProtocolVersion: protocol.Version, Binding: binding,
+		UpsertKey: protocol.CanonicalUpsertKey(binding, descriptor.MemoryID),
+	})
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search continuation backend is unavailable")
+	}
+	if response.Binding != binding || !response.Found || response.Record == nil {
+		return nil, apierror.New(http.StatusConflict, ReasonDiverged, "memory search continuation record is unavailable")
+	}
+	record := response.Record
+	if record.MemoryID != descriptor.MemoryID || record.Generation != descriptor.Generation ||
+		record.BackendVersion != descriptor.BackendVersion || record.BackendMemoryID != descriptor.BackendMemoryID ||
+		record.ContentDigest != descriptor.ContentDigest {
+		return nil, apierror.New(http.StatusConflict, ReasonDiverged, "memory search continuation record changed")
+	}
+	return record, nil
+}
+
+func (s *Service) searchHit(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	binding protocol.Binding,
+	record *protocol.MemoryRecord,
+	score float64,
+	request SearchRequest,
+	actualMode string,
+) (*SearchHit, bool, error) {
+	if record == nil {
+		return nil, false, apierror.New(http.StatusConflict, ReasonDiverged, "memory search result is missing")
+	}
+	entry, err := s.Governed.GetRemoteMemory(ctx, authority.NamespaceUID, record.MemoryID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, mapStoreError(err)
+	}
+	if !entryMatchesAuthority(entry, authority.Binding) || !searchEntryEligible(entry, request) {
+		return nil, false, nil
+	}
+	if record.State != protocol.RecordStateLive || record.UpsertKey != protocol.CanonicalUpsertKey(binding, entry.ID) ||
+		int64(record.Generation) != entry.Generation || record.BackendVersion != entry.BackendVersion ||
+		record.BackendMemoryID != entry.BackendMemoryID || record.ContentDigest != entry.ContentDigest ||
+		protocol.ContentDigest(record.Content) != entry.ContentDigest {
+		return nil, false, apierror.New(http.StatusConflict, ReasonDiverged, "memory search result failed materialization verification")
+	}
+	if actualMode == protocol.SearchModeKeyword && !keywordRecordMatches(record, entry, request.Query) {
+		return nil, false, nil
+	}
+	memory := remoteEntryToMemory(entry, record.Content)
+	memory.ContentAvailable = true
+	return &SearchHit{Memory: memory, Score: score}, true, nil
+}
+
+// ApplyMemoryProposal atomically links accepted proposal governance to remote admission.
+func (s *Service) ApplyMemoryProposal(
+	ctx context.Context,
+	namespace, proposalID, appliedBy string,
+	mutationContext MutationContext,
+) (*MutationResult, error) {
+	localAuthority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	if !localAuthority.Remote() {
+		if s.Proposals == nil {
+			return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory proposal store is not configured")
+		}
+		apply := store.MemoryProposalApply{Namespace: namespace, ID: proposalID, AppliedBy: appliedBy}
+		var memory *store.Memory
+		var applyErr error
+		if s.Governed != nil && strings.TrimSpace(localAuthority.NamespaceUID) != "" {
+			governedProposals, ok := s.Proposals.(legacyMemoryProposalGovernanceStore)
+			if !ok {
+				return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+					"legacy memory proposal governance does not support atomic audit snapshots")
+			}
+			var audits []store.MemoryAuditRecord
+			memory, audits, applyErr = governedProposals.ApplyLegacyMemoryProposalWithAudit(
+				ctx, apply, localAuthority.NamespaceUID,
+			)
+			if applyErr == nil {
+				applyLegacyGovernanceRecords(memory, audits)
+			}
+		} else {
+			memory, applyErr = s.Proposals.ApplyMemoryProposal(ctx, apply)
+		}
+		if applyErr != nil {
+			return nil, mapStoreError(applyErr)
+		}
+		return &MutationResult{Memory: memory, StatusCode: http.StatusOK}, nil
+	}
+	if err := requireIdempotency(mutationContext); err != nil {
+		return nil, err
+	}
+	requestDigest := digestJSON(struct {
+		ProposalID string `json:"proposalId"`
+		AppliedBy  string `json:"appliedBy"`
+	}{proposalID, appliedBy})
+	if replay, found, replayErr := s.lookupMutationReplay(ctx, localAuthority, mutationContext, requestDigest); found || replayErr != nil {
+		return replay, replayErr
+	}
+
+	authority, err := s.resolve(ctx, namespace, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireRemoteMutation(authority, false); err != nil {
+		return nil, err
+	}
+	if s.Proposals == nil {
+		return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory proposal store is not configured")
+	}
+	proposal, err := s.Proposals.GetMemoryProposal(ctx, namespace, proposalID)
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	if proposal.Type != "memory" {
+		return nil, apierror.New(http.StatusBadRequest, "", "proposal cannot be applied as memory")
+	}
+	if proposal.Status == "applied" || proposal.Status == "applying" {
+		return nil, apierror.New(http.StatusConflict, ReasonOperationInProgress,
+			"proposal application already has a caller-idempotency outcome")
+	}
+	if proposal.Status != "accepted" {
+		return nil, apierror.New(http.StatusConflict, ReasonOperationInProgress, "proposal must be accepted before application")
+	}
+	content, tags, err := s.normalizeContent(proposal.Content, tagsFromProposalDescription(proposal.Description))
+	if err != nil {
+		return nil, err
+	}
+	binding, err := protocolBinding(authority.Binding)
+	if err != nil {
+		return nil, identityError()
+	}
+	now := s.now()
+	memoryID := "mem-" + uuid.NewString()
+	operationID := "mop-" + uuid.NewString()
+	envelope := protocol.MutationEnvelope{
+		ProtocolVersion: protocol.Version, OperationID: operationID, Binding: binding,
+		MemoryID: memoryID, Kind: protocol.MutationKindCreate, Generation: 1, ExpectedGeneration: 0,
+		State: &protocol.MutationState{Content: content, Tags: tags, Metadata: compactMetadata(map[string]string{
+			"agentName": proposal.AgentName, "taskName": proposal.TaskName,
+			"source": "memory_proposal", "sourceProposalId": proposal.ID,
+		})},
+	}
+	if err := protocol.PrepareMutation(&envelope); err != nil {
+		return nil, apierror.New(http.StatusBadRequest, "", "invalid proposal memory mutation")
+	}
+	payload, _ := json.Marshal(envelope)
+	catalog := store.RemoteMemoryCatalogEntry{
+		ID: memoryID, Namespace: namespace, NamespaceUID: authority.NamespaceUID,
+		ClusterID: authority.Binding.ClusterID, BackendUID: authority.Binding.BackendUID,
+		AuthorityEpoch: authority.Binding.AuthorityEpoch, RoutingEpoch: authority.Binding.RoutingEpoch,
+		TenantID: authority.Binding.TenantID, StoreUUID: authority.Binding.StoreUUID,
+		Generation: 0, DesiredGeneration: 1, GovernanceRevision: 1,
+		MaterializationState: store.MemoryMaterializationPending, Trust: store.MemoryTrustReviewed,
+		AgentName: proposal.AgentName, TaskName: proposal.TaskName, Source: "memory_proposal",
+		SourceProposalID: proposal.ID, Tags: tags, ContentDigest: envelope.ContentDigest,
+		PendingOperationID: operationID, CreatedAt: now, UpdatedAt: now,
+	}
+	admission, err := s.Governed.AdmitRemoteMemoryProposalApply(ctx, store.RemoteMemoryProposalApplyAdmission{
+		Mutation: s.mutationAdmission(mutationContext, authority, memoryID, operationID, proposal.ID, requestDigest, envelope, payload, now),
+		Memory:   catalog, AppliedBy: appliedBy,
+	})
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	memoryEnqueueTotal.WithLabelValues(string(store.MemoryOperationCreate)).Inc()
+	return s.materializeOrQueue(ctx, authority, admission, http.StatusOK)
+}
+
+// RetryMemoryOperation performs an audited manual retry of the same operation ID.
+func (s *Service) RetryMemoryOperation(ctx context.Context, namespace, id, actor, reason, requestID string) (*store.MemoryOperation, error) {
+	if strings.TrimSpace(reason) == "" {
+		return nil, apierror.New(http.StatusBadRequest, "", "reason is required")
+	}
+	authority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	if !authority.Remote() {
+		return nil, store.ErrNotFound
+	}
+	operation, err := s.Governed.GetMemoryOperation(ctx, authority.NamespaceUID, id)
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	updated, err := s.Governed.RetryMemoryOperation(ctx, store.MemoryOperationRetry{
+		NamespaceUID: authority.NamespaceUID, ID: id, BackendUID: operation.BackendUID,
+		AuthorityEpoch: operation.AuthorityEpoch, RoutingEpoch: operation.RoutingEpoch,
+		Manual: true, NextRetryAt: s.now(), Actor: actor, Reason: reason, RequestID: requestID, Now: s.now(),
+	})
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	return updated, nil
+}
+
+// AbandonMemoryOperation derives provider non-application and durable fencing
+// from authenticated OMS calls; callers supply only audited intent metadata.
+func (s *Service) AbandonMemoryOperation(
+	ctx context.Context,
+	namespace, id, actor, reason, requestID string,
+) (*store.MemoryOperation, error) {
+	if strings.TrimSpace(reason) == "" {
+		return nil, apierror.New(http.StatusBadRequest, "", "reason is required")
+	}
+	localAuthority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	if !localAuthority.Remote() {
+		return nil, store.ErrNotFound
+	}
+	operation, err := s.Governed.GetMemoryOperation(ctx, localAuthority.NamespaceUID, id)
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	if operation.State != store.MemoryOperationDeadLettered {
+		return nil, apierror.New(http.StatusConflict, ReasonOperationInProgress,
+			"only a dead-lettered memory operation can be abandoned")
+	}
+	authority, err := s.resolve(ctx, namespace, true)
+	if err != nil {
+		return nil, err
+	}
+	if authority.Binding == nil || authority.Adapter == nil ||
+		authority.Binding.BackendUID != operation.BackendUID ||
+		authority.Binding.AuthorityEpoch != operation.AuthorityEpoch ||
+		authority.Binding.RoutingEpoch < operation.RoutingEpoch {
+		return nil, apierror.New(http.StatusConflict, ReasonIdentityMismatch,
+			"memory operation no longer belongs to the active provider authority")
+	}
+	binding, err := protocolBinding(authority.Binding)
+	if err != nil {
+		return nil, identityError()
+	}
+	fence, err := authority.Adapter.AdvanceRoutingFence(ctx, protocol.RoutingFenceRequest{
+		ProtocolVersion: protocol.Version, Binding: binding,
+	})
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory provider fence could not be verified")
+	}
+	if fence == nil || fence.Binding != binding || fence.BindingDigest != protocol.BindingDigest(binding) ||
+		fence.MaximumRoutingEpoch < binding.RoutingEpoch ||
+		(fence.Result != protocol.ResultApplied && fence.Result != protocol.ResultPreconditionFailed) {
+		return nil, apierror.New(http.StatusConflict, ReasonIdentityMismatch,
+			"memory provider returned an invalid routing fence acknowledgement")
+	}
+	if operation.SendStartedAt != nil && fence.MaximumRoutingEpoch <= uint64(operation.RoutingEpoch) {
+		return nil, apierror.New(http.StatusConflict, ReasonOperationInProgress,
+			"sent memory operation cannot be abandoned until a newer routing epoch is durably fenced")
+	}
+	lookup, err := authority.Adapter.LookupOperation(ctx, protocol.OperationLookupRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, OperationID: operation.ID,
+	})
+	if err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory provider operation outcome could not be verified")
+	}
+	providerNeverApplied, err := providerOperationNeverApplied(binding, operation, lookup)
+	if err != nil {
+		return nil, err
+	}
+	updated, err := s.Governed.AbandonMemoryOperation(ctx, store.MemoryOperationAbandonment{
+		NamespaceUID: localAuthority.NamespaceUID, ID: id, BackendUID: operation.BackendUID,
+		AuthorityEpoch: operation.AuthorityEpoch, RoutingEpoch: operation.RoutingEpoch,
+		Actor: actor, Reason: reason, RequestID: requestID,
+		ProviderNeverApplied: providerNeverApplied, Fenced: true, Now: s.now(),
+	})
+	if err != nil {
+		return nil, mapStoreError(err)
+	}
+	return updated, nil
+}
+
+func providerOperationNeverApplied(
+	currentBinding protocol.Binding,
+	operation *store.MemoryOperation,
+	lookup *protocol.OperationLookupResponse,
+) (bool, error) {
+	if operation == nil || lookup == nil || lookup.Binding != currentBinding {
+		return false, apierror.New(http.StatusConflict, ReasonIdentityMismatch,
+			"memory provider operation lookup identity did not match")
+	}
+	if !lookup.Found {
+		if lookup.Receipt != nil {
+			return false, apierror.New(http.StatusConflict, ReasonIdentityMismatch,
+				"memory provider returned an invalid operation lookup")
+		}
+		return true, nil
+	}
+	receipt := lookup.Receipt
+	if receipt == nil || receipt.OperationID != operation.ID || receipt.MutationDigest != operation.MutationDigest ||
+		protocol.AuthorityDigest(receipt.Binding) != protocol.AuthorityDigest(currentBinding) ||
+		int64(receipt.Binding.RoutingEpoch) != operation.RoutingEpoch {
+		return false, apierror.New(http.StatusConflict, ReasonIdentityMismatch,
+			"memory provider operation receipt did not correlate to the operation")
+	}
+	switch receipt.Result {
+	case protocol.ResultApplied, protocol.ResultNotFound:
+		return false, apierror.New(http.StatusConflict, ReasonOperationInProgress,
+			"memory provider reports that the operation was applied")
+	case protocol.ResultPreconditionFailed, protocol.ResultIdempotencyConflict, protocol.ResultIdentityConflict,
+		protocol.ResultRetryableError, protocol.ResultNonRetryableError:
+		return true, nil
+	default:
+		return false, apierror.New(http.StatusConflict, ReasonIdentityMismatch,
+			"memory provider returned an unsupported operation outcome")
+	}
+}
+
+func tagsFromProposalDescription(description string) []string {
+	for line := range strings.SplitSeq(description, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) < 5 || !strings.EqualFold(line[:5], "tags:") {
+			continue
+		}
+		parts := strings.Split(line[5:], ",")
+		result := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if part = strings.TrimSpace(part); part != "" {
+				result = append(result, part)
+			}
+		}
+		return result
+	}
+	return []string{}
+}
+
+// IsRemote reports whether durable remote authority has ever been activated for the current namespace incarnation.
+func (s *Service) IsRemote(ctx context.Context, namespace string) (bool, error) {
+	authority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return false, err
+	}
+	return authority.Remote(), nil
+}
+
+// MarkMemoriesRecalled updates recall telemetry without changing content generation.
+func (s *Service) MarkMemoriesRecalled(ctx context.Context, namespace string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	authority, err := s.resolve(ctx, namespace, false)
+	if err != nil {
+		return err
+	}
+	if !authority.Remote() {
+		if s.Legacy == nil {
+			return nil
+		}
+		return s.Legacy.MarkMemoriesRecalled(ctx, namespace, ids)
+	}
+	return s.Governed.MarkRemoteMemoriesRecalled(ctx, authority.NamespaceUID, ids, s.now())
+}

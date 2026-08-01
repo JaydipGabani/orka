@@ -4683,3 +4683,27 @@ func TestHandlers_CreateTask_RejectsServerOwnedSpecCaseVariants(t *testing.T) {
 	resp := testJSONRequest(t, app, http.MethodPost, "/tasks", body)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
+
+func TestHandlers_CreateMemoryRejectsServerOwnedFields(t *testing.T) {
+	db, err := sqlite.NewDB(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	ss := sqlite.NewStore(db, ":memory:")
+	h := NewHandlers(HandlersConfig{MemoryStore: ss, MemoryProposalStore: ss})
+	app := fiber.New()
+	app.Post("/memories", h.CreateMemory)
+	request := httptest.NewRequest(http.MethodPost, "/memories?namespace=default", strings.NewReader(`{
+		"content":"safe content",
+		"source":"api",
+		"trust":"trusted",
+		"generation":99,
+		"deleted":true
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := app.Test(request)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, response.StatusCode)
+	memories, err := ss.ListMemories(context.Background(), store.MemoryFilter{Namespace: "default"})
+	require.NoError(t, err)
+	require.Empty(t, memories)
+}

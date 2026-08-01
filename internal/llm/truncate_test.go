@@ -7,6 +7,11 @@ import (
 	"testing"
 )
 
+const (
+	testRoleUser = "user"
+	testRoleTool = "tool"
+)
+
 func Test_estimateTokens(t *testing.T) {
 	tests := []struct {
 		name string
@@ -244,6 +249,64 @@ func TestTruncateMessages(t *testing.T) {
 			t.Errorf("expected 1 message, got %d", len(result))
 		}
 	})
+}
+
+func TestTruncateMessagesFreshPassiveToolDataFollowsTaskAndDropsAtomically(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: "real task"},
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{{
+				ID:        "synthetic-context",
+				Name:      "context_loader",
+				Arguments: json.RawMessage(`{"policy_label":"data-only"}`),
+			}},
+		},
+		{Role: "tool", Name: "context_loader", ToolCallID: "synthetic-context", Content: strings.Repeat("x", 100)},
+	}
+
+	result := TruncateMessages(msgs, estimateMessageTokens(msgs[0])+1)
+	if len(result) == 0 || result[0].Role != testRoleUser || result[0].Content != "real task" {
+		t.Fatalf("real task was not preserved as the initial boundary: %#v", result)
+	}
+	for i, message := range result {
+		if message.Role == testRoleTool {
+			t.Fatalf("synthetic tool result survived without its call at %d: %#v", i, result)
+		}
+		if message.Role == roleAssistant && len(message.ToolCalls) > 0 {
+			t.Fatalf("oversized passive-memory pair was only partially retained: %#v", result)
+		}
+	}
+}
+
+func TestTruncateMessagesHistoryRemainsUserFirstAndKeepsCurrentTask(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: "initial question"},
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{{
+				ID:        "synthetic-context",
+				Name:      "context_loader",
+				Arguments: json.RawMessage(`{"policy_label":"data-only"}`),
+			}},
+		},
+		{Role: "tool", Name: "context_loader", ToolCallID: "synthetic-context", Content: "untrusted data"},
+		{Role: "assistant", Content: strings.Repeat("x", 400)},
+		{Role: "user", Content: "current task"},
+	}
+
+	result := TruncateMessages(msgs, 20)
+	if len(result) < 2 || result[0].Role != testRoleUser || result[0].Content != "initial question" {
+		t.Fatalf("truncated history lost the initial user boundary: %#v", result)
+	}
+	if last := result[len(result)-1]; last.Role != testRoleUser || last.Content != "current task" {
+		t.Fatalf("truncated history lost the current task: %#v", result)
+	}
+	for i, message := range result {
+		if message.Role == testRoleTool && (i == 0 || result[i-1].Role != roleAssistant) {
+			t.Fatalf("orphaned tool result after truncation: %#v", result)
+		}
+	}
 }
 
 func TestExtractDroppedSummary(t *testing.T) {

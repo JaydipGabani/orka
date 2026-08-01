@@ -340,13 +340,19 @@ func (b *JobBuilder) BuildWithOptions(ctx context.Context, task *corev1alpha1.Ta
 
 	jobName := buildTaskJobName(task)
 	execution := resolveExecution(task, agent)
+	taskLabel := labels.SelectorValue(task.Name)
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
 			Namespace: task.Namespace,
+			Annotations: map[string]string{
+				labels.AnnotationTaskLabel: taskLabel,
+				labels.AnnotationTaskName:  task.Name,
+			},
 			Labels: map[string]string{
-				labels.LabelTask:     labels.SelectorValue(task.Name),
+				labels.LabelTask:     taskLabel,
+				labels.LabelTaskUID:  string(task.UID),
 				labels.LabelTaskType: string(task.Spec.Type),
 			},
 		},
@@ -354,8 +360,13 @@ func (b *JobBuilder) BuildWithOptions(ctx context.Context, task *corev1alpha1.Ta
 			BackoffLimit: new(int32(0)), // No retries at Job level, we handle retries in the controller
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						labels.AnnotationTaskLabel: taskLabel,
+						labels.AnnotationTaskName:  task.Name,
+					},
 					Labels: map[string]string{
-						labels.LabelTask:     labels.SelectorValue(task.Name),
+						labels.LabelTask:     taskLabel,
+						labels.LabelTaskUID:  string(task.UID),
 						labels.LabelTaskType: string(task.Spec.Type),
 					},
 				},
