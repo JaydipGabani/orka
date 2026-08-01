@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/orka-agents/orka/internal/tracing"
 	"github.com/orka-agents/orka/internal/tracing/genai"
 	"github.com/orka-agents/orka/internal/tracing/testutil"
+	"github.com/orka-agents/orka/internal/transactiontoken"
 	"github.com/orka-agents/orka/internal/workerenv"
 	"github.com/orka-agents/orka/workers/common"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -1700,5 +1702,62 @@ func TestPassiveMemoryToolDataCannotAuthorizeDisabledTool(t *testing.T) {
 	if rejection.Role != "tool" || rejection.ToolCallID != "call-disabled-from-memory" ||
 		!strings.Contains(rejection.Content, "not enabled") {
 		t.Fatalf("memory-derived tool call was not rejected: %#v", rejection)
+	}
+}
+
+func TestLoadDurableMemoryContextPropagatesMountedTaskTransactionToken(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "transaction-token")
+	if err := os.WriteFile(tokenPath, []byte(" task-scoped-token \n"), 0o600); err != nil {
+		t.Fatalf("write transaction token: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/internal/v1/memories/default") {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer service-account-token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if got := r.Header.Get(transactiontoken.HeaderName); got != "task-scoped-token" {
+			t.Errorf("%s = %q", transactiontoken.HeaderName, got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]store.Memory{{
+			ID: "mem-1", Source: "operator", Trust: store.MemoryTrustReviewed, Content: "reviewed context",
+		}})
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "default")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, tokenPath)
+	t.Setenv(workerenv.MemoryContextEnabled, "true")
+
+	if got := loadDurableMemoryContext(context.Background()); !strings.Contains(got, "reviewed context") {
+		t.Fatalf("loadDurableMemoryContext() = %q", got)
+	}
+}
+
+func TestLoadDurableMemoryContextFailsClosedWhenMountedTransactionTokenCannotBeRead(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "default")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, filepath.Join(t.TempDir(), "missing-token"))
+	t.Setenv(workerenv.MemoryContextEnabled, "true")
+
+	if got := loadDurableMemoryContext(context.Background()); got != "" {
+		t.Fatalf("loadDurableMemoryContext() = %q, want empty", got)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("controller requests = %d, want 0", got)
 	}
 }

@@ -284,9 +284,15 @@ func (t *ProposeMemoryTool) Execute(ctx context.Context, args json.RawMessage) (
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal memory proposal: %w", err)
 	}
+	transactionToken, err := loadTaskTransactionToken()
+	if err != nil {
+		return "", fmt.Errorf("failed to load task transaction token: %w", err)
+	}
 
 	endpoint := cfg.url("/internal/v1/memory-proposals/"+url.PathEscape(cfg.Namespace), nil)
-	body, err := doInternalControllerRequest(ctx, cfg, http.MethodPost, endpoint, payload)
+	body, err := doInternalControllerRequestWithTransactionToken(
+		ctx, cfg, http.MethodPost, endpoint, payload, transactionToken,
+	)
 	if err != nil {
 		return "", fmt.Errorf("failed to propose memory: %w", err)
 	}
@@ -388,9 +394,15 @@ func (t *RememberMemoryTool) Execute(ctx context.Context, args json.RawMessage) 
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal memory proposal: %w", err)
 	}
+	transactionToken, err := loadTaskTransactionToken()
+	if err != nil {
+		return "", fmt.Errorf("failed to load task transaction token: %w", err)
+	}
 
 	endpoint := cfg.url("/internal/v1/memory-proposals/"+url.PathEscape(cfg.Namespace), nil)
-	body, err := doInternalControllerRequest(ctx, cfg, http.MethodPost, endpoint, payload)
+	body, err := doInternalControllerRequestWithTransactionToken(
+		ctx, cfg, http.MethodPost, endpoint, payload, transactionToken,
+	)
 	if err != nil {
 		return "", fmt.Errorf("failed to remember: %w", err)
 	}

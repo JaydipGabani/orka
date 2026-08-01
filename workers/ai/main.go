@@ -46,6 +46,7 @@ import (
 	"github.com/orka-agents/orka/internal/tools"
 	"github.com/orka-agents/orka/internal/tracing"
 	"github.com/orka-agents/orka/internal/tracing/genai"
+	"github.com/orka-agents/orka/internal/transactiontoken"
 	"github.com/orka-agents/orka/internal/worker"
 	"github.com/orka-agents/orka/internal/workerenv"
 	"github.com/orka-agents/orka/workers/common"
@@ -829,6 +830,17 @@ func loadDurableMemoryContext(ctx context.Context) string {
 	}
 	if token := workerServiceAccountToken(); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	transactionToken, configured, err := workerenv.ReadTokenFileEnv(
+		workerenv.TransactionTokenFile,
+		"task transaction token",
+	)
+	if err != nil {
+		fmt.Printf("Warning: failed to load durable memory transaction token: %v\n", err)
+		return ""
+	}
+	if configured {
+		req.Header.Set(transactiontoken.HeaderName, transactionToken)
 	}
 
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)

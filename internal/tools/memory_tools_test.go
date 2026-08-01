@@ -263,3 +263,73 @@ func TestRecallMemoryToolRejectsNonPositiveLimit(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 }
+
+func TestMemoryProposalToolsPropagateMountedTaskTransactionToken(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "transaction-token")
+	if err := os.WriteFile(tokenPath, []byte(" task-scoped-token \n"), 0o600); err != nil {
+		t.Fatalf("write transaction token: %v", err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got := r.Header.Get("Authorization"); got != "Bearer service-account-token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if got := r.Header.Get(internalMemoryTransactionTokenHeader); got != "task-scoped-token" {
+			t.Errorf("%s = %q", internalMemoryTransactionTokenHeader, got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"proposed"}`))
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "test-ns")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, tokenPath)
+
+	if _, err := NewRememberMemoryTool().Execute(context.Background(), json.RawMessage(`{"content":"remember this"}`)); err != nil {
+		t.Fatalf("remember Execute() error = %v", err)
+	}
+	if _, err := NewProposeMemoryTool().Execute(context.Background(), json.RawMessage(`{"title":"proposal","content":"propose this"}`)); err != nil {
+		t.Fatalf("propose Execute() error = %v", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("controller requests = %d, want 2", got)
+	}
+}
+
+func TestMemoryProposalToolsFailClosedWhenMountedTransactionTokenCannotBeRead(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "test-ns")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, filepath.Join(t.TempDir(), "missing-token"))
+
+	for name, execute := range map[string]func() (string, error){
+		"remember": func() (string, error) {
+			return NewRememberMemoryTool().Execute(context.Background(), json.RawMessage(`{"content":"remember this"}`))
+		},
+		"propose": func() (string, error) {
+			return NewProposeMemoryTool().Execute(context.Background(), json.RawMessage(`{"title":"proposal","content":"propose this"}`))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := execute()
+			if err == nil || !strings.Contains(err.Error(), "failed to load task transaction token") {
+				t.Fatalf("Execute() error = %v", err)
+			}
+		})
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("controller requests = %d, want 0", got)
+	}
+}
