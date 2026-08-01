@@ -1216,3 +1216,16 @@ func TestDoJSONWithHeadersReturnsTypedAPIError(t *testing.T) {
 		t.Fatalf("body = %s", apiErr.Body)
 	}
 }
+
+func TestResourceURLPreservesNamespaceFromLocation(t *testing.T) {
+	client := New("https://orka.example.test", "")
+	client.Namespace = "default"
+
+	got, err := client.resourceURL("/api/v1/memory-operations/mop-1?namespace=team-blue", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://orka.example.test/api/v1/memory-operations/mop-1?namespace=team-blue" {
+		t.Fatalf("resourceURL() = %q", got)
+	}
+}

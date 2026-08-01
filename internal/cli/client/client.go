@@ -289,7 +289,7 @@ func (c *Client) resourceURL(path string, query map[string]string) (string, erro
 	}
 	q := u.Query()
 	if c.Namespace != "" {
-		if _, ok := query["namespace"]; !ok {
+		if _, ok := query["namespace"]; !ok && q.Get("namespace") == "" {
 			q.Set("namespace", c.Namespace)
 		}
 	}
