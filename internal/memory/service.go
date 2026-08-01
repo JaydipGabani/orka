@@ -555,6 +555,11 @@ func (s *Service) UpdateMemory(
 	if !entryMatchesAuthority(entry, authority.Binding) {
 		return nil, identityError()
 	}
+	if entry.MaterializationState == store.MemoryMaterializationPending || entry.PendingOperationID != "" ||
+		entry.DesiredGeneration != entry.Generation {
+		return nil, apierror.New(http.StatusConflict, ReasonOperationInProgress,
+			"memory content materialization is still in progress")
+	}
 	current, err := s.hydrate(ctx, authority, entry)
 	if err != nil {
 		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "verified current memory content is unavailable")
@@ -1499,7 +1504,9 @@ func (s *Service) search(
 		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
 			"memory search audit could not be committed")
 	}
-	cursorState, err := loadRemoteSearchCursor(ctx, s.Governed, authority.Binding, queryDigest, request.Cursor, s.now())
+	cursorState, replayPageToken, snapshotExpiresAt, err := loadRemoteSearchContinuation(
+		ctx, s.Governed, authority.Binding, queryDigest, request.Cursor, s.now(),
+	)
 	if err != nil {
 		return nil, apierror.New(http.StatusBadRequest, "", "invalid or expired memory search cursor")
 	}
@@ -1513,31 +1520,14 @@ func (s *Service) search(
 		actualMode = mode
 	}
 	candidates := 0
+	pages := 0
 
-	for len(cursorState.Pending) > 0 && len(items) < target && candidates < maxRemoteSearchCandidates {
-		descriptor := cursorState.Pending[0]
-		cursorState.Pending = cursorState.Pending[1:]
-		candidates++
-		record, getErr := s.getCursorSearchRecord(ctx, authority, binding, descriptor)
-		if getErr != nil {
-			return nil, getErr
-		}
-		hit, eligible, hitErr := s.searchHit(ctx, authority, binding, record, descriptor.Score, request, actualMode)
-		if hitErr != nil {
-			return nil, hitErr
-		}
-		if eligible {
-			items = append(items, *hit)
-		}
-	}
-
-	for page := 0; page < maxRemoteSearchPages && len(items) < target && candidates < maxRemoteSearchCandidates &&
-		len(cursorState.Pending) == 0 && !cursorState.ProviderExhausted; page++ {
-		requestPageToken := cursorState.ProviderToken
+	if len(cursorState.Pending) > 0 && len(items) < target && candidates < maxRemoteSearchCandidates {
 		response, searchErr := authority.Adapter.Search(ctx, protocol.SearchRequest{
 			ProtocolVersion: protocol.Version, Binding: binding, Mode: mode,
-			Query: request.Query, PageSize: cursorState.PageSize, PageToken: requestPageToken,
+			Query: request.Query, PageSize: cursorState.PageSize, PageToken: replayPageToken,
 		})
+		pages++
 		if searchErr != nil {
 			var adapterErr *AdapterError
 			if errors.As(searchErr, &adapterErr) && adapterErr.Code == protocol.ErrorCodeSearchModeUnsupported {
@@ -1545,26 +1535,82 @@ func (s *Service) search(
 			}
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search backend is unavailable")
 		}
-		if response.Binding != binding {
-			return nil, identityError()
+		responseExpiry, responseErr := validateRemoteSearchPage(
+			response, binding, mode, cursorState.PageSize, cursorState.ActualMode, snapshotExpiresAt, s.now(),
+		)
+		if responseErr != nil {
+			return nil, responseErr
 		}
-		if len(response.Records) > cursorState.PageSize {
-			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search backend exceeded the requested page bound")
+		if response.NextPageToken != cursorState.ProviderToken || response.Exhausted != cursorState.ProviderExhausted ||
+			len(response.Records) < len(cursorState.Pending) {
+			return nil, apierror.New(http.StatusConflict, ReasonDiverged,
+				"memory search continuation snapshot changed")
 		}
-		if cursorState.ActualMode != "" && response.ActualMode != cursorState.ActualMode {
-			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
-				"memory search backend changed the resolved mode across pages")
+		snapshotExpiresAt = responseExpiry
+		actualMode = response.ActualMode
+		pendingOffset := len(response.Records) - len(cursorState.Pending)
+		for i := range cursorState.Pending {
+			if !searchCursorRecordMatches(cursorState.Pending[i], &response.Records[pendingOffset+i]) {
+				return nil, apierror.New(http.StatusConflict, ReasonDiverged,
+					"memory search continuation snapshot changed")
+			}
 		}
+		for len(cursorState.Pending) > 0 && len(items) < target && candidates < maxRemoteSearchCandidates {
+			descriptor := cursorState.Pending[0]
+			recordIndex := len(response.Records) - len(cursorState.Pending)
+			record := &response.Records[recordIndex]
+			cursorState.Pending = cursorState.Pending[1:]
+			candidates++
+			hit, eligible, hitErr := s.searchHit(ctx, authority, binding, record, descriptor.Score, request, actualMode)
+			if hitErr != nil {
+				return nil, hitErr
+			}
+			if eligible {
+				items = append(items, *hit)
+			}
+		}
+		if len(cursorState.Pending) == 0 {
+			replayPageToken = ""
+		}
+	}
+
+	for pages < maxRemoteSearchPages && len(items) < target && candidates < maxRemoteSearchCandidates &&
+		len(cursorState.Pending) == 0 && !cursorState.ProviderExhausted {
+		requestPageToken := cursorState.ProviderToken
+		response, searchErr := authority.Adapter.Search(ctx, protocol.SearchRequest{
+			ProtocolVersion: protocol.Version, Binding: binding, Mode: mode,
+			Query: request.Query, PageSize: cursorState.PageSize, PageToken: requestPageToken,
+		})
+		pages++
+		if searchErr != nil {
+			var adapterErr *AdapterError
+			if errors.As(searchErr, &adapterErr) && adapterErr.Code == protocol.ErrorCodeSearchModeUnsupported {
+				return nil, apierror.New(http.StatusUnprocessableEntity, ReasonSearchModeUnsupported, "memory search mode is unsupported")
+			}
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search backend is unavailable")
+		}
+		responseExpiry, responseErr := validateRemoteSearchPage(
+			response, binding, mode, cursorState.PageSize, cursorState.ActualMode, snapshotExpiresAt, s.now(),
+		)
+		if responseErr != nil {
+			return nil, responseErr
+		}
+		if !response.Exhausted && response.NextPageToken == requestPageToken {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete, "memory search pagination did not advance")
+		}
+		snapshotExpiresAt = responseExpiry
 		actualMode = response.ActualMode
 		cursorState.ActualMode = response.ActualMode
 		cursorState.ProviderToken = response.NextPageToken
 		cursorState.ProviderExhausted = response.Exhausted
-		if !response.Exhausted && cursorState.ProviderToken == requestPageToken {
-			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete, "memory search pagination did not advance")
-		}
 		for i := range response.Records {
 			if len(items) >= target || candidates >= maxRemoteSearchCandidates {
+				if requestPageToken == "" {
+					return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+						"memory search continuation could not preserve the provider snapshot")
+				}
 				cursorState.Pending = appendSearchCursorRecords(cursorState.Pending, response.Records[i:])
+				replayPageToken = requestPageToken
 				break
 			}
 			candidates++
@@ -1582,7 +1628,9 @@ func (s *Service) search(
 	pageComplete := exhausted || len(items) >= target
 	cursor := ""
 	if !exhausted {
-		cursor, err = saveRemoteSearchCursor(ctx, s.Governed, authority.Binding, queryDigest, cursorState, s.now())
+		cursor, err = saveRemoteSearchContinuation(
+			ctx, s.Governed, authority.Binding, queryDigest, cursorState, replayPageToken, snapshotExpiresAt, s.now(),
+		)
 		if err != nil {
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
 				"memory search continuation could not be preserved")
@@ -1883,6 +1931,168 @@ func keywordRecordMatches(record *protocol.MemoryRecord, entry *store.RemoteMemo
 	return slices.ContainsFunc(localMetadata, contains)
 }
 
+type persistedRemoteSearchCursor struct {
+	ProviderToken     string                     `json:"p"`
+	ProviderExhausted bool                       `json:"x,omitempty"`
+	PageSize          int                        `json:"z"`
+	ActualMode        string                     `json:"m,omitempty"`
+	Pending           []remoteSearchCursorRecord `json:"n,omitempty"`
+	SnapshotExpiresAt time.Time                  `json:"e"`
+	ReplayPageToken   string                     `json:"r,omitempty"`
+}
+
+func (p persistedRemoteSearchCursor) cursor() remoteSearchCursor {
+	return remoteSearchCursor{
+		ProviderToken: p.ProviderToken, ProviderExhausted: p.ProviderExhausted,
+		PageSize: p.PageSize, ActualMode: p.ActualMode,
+		Pending: append([]remoteSearchCursorRecord(nil), p.Pending...),
+	}
+}
+
+func saveRemoteSearchContinuation(
+	ctx context.Context,
+	governed store.GovernedMemoryStore,
+	binding *store.MemoryBackendBinding,
+	queryDigest string,
+	state remoteSearchCursor,
+	replayPageToken string,
+	snapshotExpiresAt, now time.Time,
+) (string, error) {
+	now = now.UTC()
+	snapshotExpiresAt = snapshotExpiresAt.UTC()
+	if governed == nil || binding == nil || (state.ProviderToken == "" && len(state.Pending) == 0) ||
+		!snapshotExpiresAt.After(now) || state.PageSize <= 0 || state.PageSize > protocol.MaxPageSize ||
+		(state.ActualMode != protocol.SearchModeKeyword && state.ActualMode != protocol.SearchModeSemantic &&
+			state.ActualMode != protocol.SearchModeHybrid) ||
+		len(state.Pending) > protocol.MaxPageSize || (len(state.Pending) > 0) != (replayPageToken != "") ||
+		state.ProviderExhausted != (state.ProviderToken == "") ||
+		(replayPageToken != "" && !state.ProviderExhausted && replayPageToken == state.ProviderToken) ||
+		len(state.ProviderToken) > protocol.MaxPageTokenBytes || len(replayPageToken) > protocol.MaxPageTokenBytes {
+		return "", errors.New("memory search cursor state is unavailable")
+	}
+	identity, err := protocolBinding(binding)
+	if err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(persistedRemoteSearchCursor{
+		ProviderToken: state.ProviderToken, ProviderExhausted: state.ProviderExhausted,
+		PageSize: state.PageSize, ActualMode: state.ActualMode,
+		Pending: state.Pending, SnapshotExpiresAt: snapshotExpiresAt, ReplayPageToken: replayPageToken,
+	})
+	if err != nil || len(payload) == 0 || len(payload) > maxRemoteSearchCursorBytes {
+		return "", errors.New("memory search cursor state is invalid")
+	}
+	continuationToken := state.ProviderToken
+	if continuationToken == "" {
+		continuationToken = replayPageToken
+	}
+	expiresAt, ok := (protocol.SearchResponse{
+		NextPageToken: continuationToken, SnapshotExpiresAt: snapshotExpiresAt,
+	}).ContinuationExpiresAt(now.Add(remoteSearchCursorTTL))
+	if !ok || !expiresAt.After(now) {
+		return "", errors.New("memory search cursor snapshot has expired")
+	}
+	id := "msc-" + uuid.NewString()
+	if err := governed.SaveMemorySearchCursor(ctx, store.MemorySearchCursorState{
+		ID: id, NamespaceUID: binding.NamespaceUID,
+		BindingDigest: protocol.BindingDigest(identity), QueryDigest: queryDigest,
+		State: payload, CreatedAt: now, ExpiresAt: expiresAt,
+	}); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+//nolint:gocyclo // Cursor decoding validates every authority, bound, replay, and expiry invariant fail closed.
+func loadRemoteSearchContinuation(
+	ctx context.Context,
+	governed store.GovernedMemoryStore,
+	binding *store.MemoryBackendBinding,
+	queryDigest, encoded string,
+	now time.Time,
+) (remoteSearchCursor, string, time.Time, error) {
+	if strings.TrimSpace(encoded) == "" {
+		return remoteSearchCursor{}, "", time.Time{}, nil
+	}
+	if governed == nil || binding == nil || !strings.HasPrefix(encoded, "msc-") || len(encoded) > 128 {
+		return remoteSearchCursor{}, "", time.Time{}, errors.New("invalid memory search cursor")
+	}
+	identity, err := protocolBinding(binding)
+	if err != nil {
+		return remoteSearchCursor{}, "", time.Time{}, err
+	}
+	now = now.UTC()
+	stored, err := governed.GetMemorySearchCursor(ctx, binding.NamespaceUID, encoded, now)
+	if err != nil {
+		return remoteSearchCursor{}, "", time.Time{}, err
+	}
+	if stored.ID != encoded || stored.NamespaceUID != binding.NamespaceUID ||
+		stored.BindingDigest != protocol.BindingDigest(identity) || stored.QueryDigest != queryDigest ||
+		len(stored.State) == 0 || len(stored.State) > maxRemoteSearchCursorBytes {
+		return remoteSearchCursor{}, "", time.Time{}, errors.New("mismatched memory search cursor")
+	}
+	var persisted persistedRemoteSearchCursor
+	if err := json.Unmarshal(stored.State, &persisted); err != nil {
+		return remoteSearchCursor{}, "", time.Time{}, errors.New("invalid memory search cursor state")
+	}
+	cursor := persisted.cursor()
+	snapshotExpiresAt := persisted.SnapshotExpiresAt.UTC()
+	if cursor.PageSize <= 0 || cursor.PageSize > protocol.MaxPageSize ||
+		(cursor.ActualMode != protocol.SearchModeKeyword && cursor.ActualMode != protocol.SearchModeSemantic &&
+			cursor.ActualMode != protocol.SearchModeHybrid) ||
+		(cursor.ProviderToken == "" && len(cursor.Pending) == 0) || len(cursor.Pending) > protocol.MaxPageSize ||
+		(len(cursor.Pending) > 0) != (persisted.ReplayPageToken != "") ||
+		cursor.ProviderExhausted != (cursor.ProviderToken == "") ||
+		(persisted.ReplayPageToken != "" && !cursor.ProviderExhausted && persisted.ReplayPageToken == cursor.ProviderToken) ||
+		len(cursor.ProviderToken) > protocol.MaxPageTokenBytes || len(persisted.ReplayPageToken) > protocol.MaxPageTokenBytes ||
+		!snapshotExpiresAt.After(now) ||
+		stored.CreatedAt.After(now) || !stored.ExpiresAt.After(now) || !stored.ExpiresAt.After(stored.CreatedAt) ||
+		stored.ExpiresAt.After(snapshotExpiresAt) || stored.ExpiresAt.Sub(stored.CreatedAt) > remoteSearchCursorTTL {
+		return remoteSearchCursor{}, "", time.Time{}, errors.New("invalid memory search cursor state")
+	}
+	return cursor, persisted.ReplayPageToken, snapshotExpiresAt, nil
+}
+
+func validateRemoteSearchPage(
+	response *protocol.SearchResponse,
+	binding protocol.Binding,
+	requestedMode string,
+	pageSize int,
+	expectedActualMode string,
+	expectedSnapshotExpiresAt time.Time,
+	now time.Time,
+) (time.Time, error) {
+	if response == nil {
+		return time.Time{}, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search backend returned no response")
+	}
+	if response.Binding != binding {
+		return time.Time{}, identityError()
+	}
+	if response.RequestedMode != requestedMode || len(response.Records) > pageSize ||
+		(response.ActualMode != protocol.SearchModeKeyword && response.ActualMode != protocol.SearchModeSemantic &&
+			response.ActualMode != protocol.SearchModeHybrid) ||
+		(requestedMode != protocol.SearchModeAuto && response.ActualMode != requestedMode) ||
+		response.Exhausted != (response.NextPageToken == "") || len(response.NextPageToken) > protocol.MaxPageTokenBytes {
+		return time.Time{}, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search backend returned an invalid page")
+	}
+	if expectedActualMode != "" && response.ActualMode != expectedActualMode {
+		return time.Time{}, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search backend changed the resolved mode across pages")
+	}
+	snapshotExpiresAt := response.SnapshotExpiresAt.UTC()
+	if (!response.Exhausted || !expectedSnapshotExpiresAt.IsZero()) && !snapshotExpiresAt.After(now.UTC()) {
+		return time.Time{}, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search backend returned an expired continuation snapshot")
+	}
+	if !expectedSnapshotExpiresAt.IsZero() && !snapshotExpiresAt.Equal(expectedSnapshotExpiresAt.UTC()) {
+		return time.Time{}, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search backend changed the snapshot expiry across pages")
+	}
+	return snapshotExpiresAt, nil
+}
+
 func appendSearchCursorRecords(
 	pending []remoteSearchCursorRecord,
 	records []protocol.MemoryRecord,
@@ -1898,29 +2108,10 @@ func appendSearchCursorRecords(
 	return pending
 }
 
-func (s *Service) getCursorSearchRecord(
-	ctx context.Context,
-	authority *ResolvedAuthority,
-	binding protocol.Binding,
-	descriptor remoteSearchCursorRecord,
-) (*protocol.MemoryRecord, error) {
-	response, err := authority.Adapter.Get(ctx, protocol.GetRequest{
-		ProtocolVersion: protocol.Version, Binding: binding,
-		UpsertKey: protocol.CanonicalUpsertKey(binding, descriptor.MemoryID),
-	})
-	if err != nil {
-		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search continuation backend is unavailable")
-	}
-	if response.Binding != binding || !response.Found || response.Record == nil {
-		return nil, apierror.New(http.StatusConflict, ReasonDiverged, "memory search continuation record is unavailable")
-	}
-	record := response.Record
-	if record.MemoryID != descriptor.MemoryID || record.Generation != descriptor.Generation ||
-		record.BackendVersion != descriptor.BackendVersion || record.BackendMemoryID != descriptor.BackendMemoryID ||
-		record.ContentDigest != descriptor.ContentDigest {
-		return nil, apierror.New(http.StatusConflict, ReasonDiverged, "memory search continuation record changed")
-	}
-	return record, nil
+func searchCursorRecordMatches(descriptor remoteSearchCursorRecord, record *protocol.MemoryRecord) bool {
+	return record != nil && record.MemoryID == descriptor.MemoryID && record.Generation == descriptor.Generation &&
+		record.BackendVersion == descriptor.BackendVersion && record.BackendMemoryID == descriptor.BackendMemoryID &&
+		record.ContentDigest == descriptor.ContentDigest && record.Score == descriptor.Score
 }
 
 func (s *Service) searchHit(

@@ -112,14 +112,15 @@ func (s *governedSearchStore) MarkRemoteMemoriesRecalled(context.Context, string
 
 type pagedSearchAdapter struct {
 	fakeOMSAdapter
-	binding     protocol.Binding
-	records     []protocol.MemoryRecord
-	byUpsertKey map[string]protocol.MemoryRecord
-	searchCalls int
-	getCalls    int
-	pageSizes   []int
-	queries     []string
-	actualModes []string
+	binding           protocol.Binding
+	records           []protocol.MemoryRecord
+	byUpsertKey       map[string]protocol.MemoryRecord
+	searchCalls       int
+	getCalls          int
+	pageSizes         []int
+	queries           []string
+	actualModes       []string
+	snapshotExpiresAt time.Time
 
 	getMu         sync.Mutex
 	activeGets    int
@@ -133,7 +134,10 @@ func newPagedSearchAdapter(binding protocol.Binding, records []protocol.MemoryRe
 	for _, record := range records {
 		byUpsertKey[record.UpsertKey] = record
 	}
-	return &pagedSearchAdapter{binding: binding, records: records, byUpsertKey: byUpsertKey}
+	return &pagedSearchAdapter{
+		binding: binding, records: records, byUpsertKey: byUpsertKey,
+		snapshotExpiresAt: time.Now().UTC().Add(time.Minute),
+	}
 }
 
 func (a *pagedSearchAdapter) Search(_ context.Context, request protocol.SearchRequest) (*protocol.SearchResponse, error) {
@@ -150,7 +154,7 @@ func (a *pagedSearchAdapter) Search(_ context.Context, request protocol.SearchRe
 		offset = parsed
 	}
 	end := min(offset+request.PageSize, len(a.records))
-	records := append([]protocol.MemoryRecord(nil), a.records[offset:end]...)
+	records := append([]protocol.MemoryRecord{}, a.records[offset:end]...)
 	next := ""
 	if end < len(a.records) {
 		next = fmt.Sprintf("page-%d", end)
@@ -165,7 +169,7 @@ func (a *pagedSearchAdapter) Search(_ context.Context, request protocol.SearchRe
 	return &protocol.SearchResponse{
 		ProtocolVersion: protocol.Version, Binding: request.Binding,
 		RequestedMode: request.Mode, ActualMode: actualMode, Records: records,
-		NextPageToken: next, Exhausted: next == "", SnapshotExpiresAt: time.Now().Add(time.Minute),
+		NextPageToken: next, Exhausted: next == "", SnapshotExpiresAt: a.snapshotExpiresAt,
 	}, nil
 }
 
@@ -208,6 +212,24 @@ func (a *pagedSearchAdapter) getStats() (calls, maxActive int) {
 	a.getMu.Lock()
 	defer a.getMu.Unlock()
 	return a.getCalls, a.maxActiveGets
+}
+
+type countingGetAdapter struct {
+	fakeOMSAdapter
+	getCalls int
+}
+
+func (a *countingGetAdapter) Get(ctx context.Context, request protocol.GetRequest) (*protocol.GetResponse, error) {
+	a.mu.Lock()
+	a.getCalls++
+	a.mu.Unlock()
+	return a.fakeOMSAdapter.Get(ctx, request)
+}
+
+func (a *countingGetAdapter) getCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.getCalls
 }
 
 type recordingMaterializationStore struct {
@@ -311,6 +333,112 @@ func remoteSearchService(
 	}
 	service := &Service{Governed: governed, Resolver: staticAuthorityResolver{authority: authority}}
 	return service, adapter, binding, governed
+}
+
+func TestRemoteUpdateRejectsPendingMaterializationBeforeProviderHydration(t *testing.T) {
+	const (
+		actor       = "alice"
+		createRoute = "createMemory"
+		updateRoute = "updateMemory"
+	)
+	t.Run("create", func(t *testing.T) {
+		storeImpl := newMemoryTestStore(t)
+		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+		binding := activateServiceTestBinding(t, storeImpl, now)
+		backend := &corev1alpha1.MemoryBackend{}
+		backend.Status.EffectiveLifecycleState = corev1alpha1.MemoryBackendEffectiveLifecycleActive
+		backend.Status.Ready = true
+		adapter := &countingGetAdapter{}
+		authority := &ResolvedAuthority{
+			Namespace: binding.Namespace, NamespaceUID: binding.NamespaceUID, Binding: &binding, Backend: backend, Adapter: adapter,
+		}
+		service := &Service{
+			Governed: storeImpl, Resolver: staticAuthorityResolver{authority: authority}, Now: func() time.Time { return now.Add(time.Minute) },
+		}
+		created, err := service.CreateMemory(context.Background(), binding.Namespace, CreateRequest{Content: "pending create"}, MutationContext{
+			Actor: actor, Principal: actor, Route: createRoute, IdempotencyKey: "create-pending",
+		})
+		if err != nil || created.Operation == nil {
+			t.Fatalf("CreateMemory() = %#v, %v", created, err)
+		}
+		before, err := storeImpl.GetRemoteMemory(context.Background(), binding.NamespaceUID, created.Operation.MemoryID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		content := "replacement"
+		_, err = service.UpdateMemory(context.Background(), binding.Namespace, before.ID, UpdateRequest{Content: &content}, MutationContext{
+			Actor: actor, Principal: actor, Route: updateRoute, IdempotencyKey: "update-pending-create",
+		})
+		var structured *apierror.Error
+		if !errors.As(err, &structured) || structured.Status != http.StatusConflict || structured.Reason != ReasonOperationInProgress {
+			t.Fatalf("UpdateMemory() error = %#v, want operation-in-progress conflict", err)
+		}
+		after, err := storeImpl.GetRemoteMemory(context.Background(), binding.NamespaceUID, before.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if adapter.getCount() != 0 || after.MaterializationState != store.MemoryMaterializationPending ||
+			after.PendingOperationID != before.PendingOperationID || after.Generation != before.Generation ||
+			after.DesiredGeneration != before.DesiredGeneration {
+			t.Fatalf("pending create was hydrated or reclassified: gets=%d before=%#v after=%#v", adapter.getCount(), before, after)
+		}
+	})
+
+	t.Run("replacement", func(t *testing.T) {
+		storeImpl := newMemoryTestStore(t)
+		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+		binding := activateServiceTestBinding(t, storeImpl, now)
+		backend := &corev1alpha1.MemoryBackend{}
+		backend.Status.EffectiveLifecycleState = corev1alpha1.MemoryBackendEffectiveLifecycleActive
+		backend.Status.Ready = true
+		adapter := &countingGetAdapter{}
+		authority := &ResolvedAuthority{
+			Namespace: binding.Namespace, NamespaceUID: binding.NamespaceUID, Binding: &binding, Backend: backend, Adapter: adapter,
+		}
+		resolver := staticAuthorityResolver{authority: authority}
+		service := &Service{
+			Governed: storeImpl, Resolver: resolver,
+			Dispatcher: &Dispatcher{Store: storeImpl, Resolver: resolver, LeaseOwner: "service-test", Now: func() time.Time { return now.Add(time.Minute) }},
+			Now:        func() time.Time { return now.Add(time.Minute) },
+		}
+		created, err := service.CreateMemory(context.Background(), binding.Namespace, CreateRequest{Content: "materialized"}, MutationContext{
+			Actor: actor, Principal: actor, Route: createRoute, IdempotencyKey: "create-materialized",
+		})
+		if err != nil || created.Memory == nil {
+			t.Fatalf("CreateMemory() = %#v, %v", created, err)
+		}
+		service.Dispatcher = nil
+		firstReplacement := "replacement one"
+		queued, err := service.UpdateMemory(context.Background(), binding.Namespace, created.Memory.ID, UpdateRequest{Content: &firstReplacement}, MutationContext{
+			Actor: actor, Principal: actor, Route: updateRoute, IdempotencyKey: "replace-queued",
+		})
+		if err != nil || queued.Operation == nil {
+			t.Fatalf("first UpdateMemory() = %#v, %v", queued, err)
+		}
+		before, err := storeImpl.GetRemoteMemory(context.Background(), binding.NamespaceUID, created.Memory.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		getsBefore := adapter.getCount()
+		secondReplacement := "replacement two"
+		_, err = service.UpdateMemory(context.Background(), binding.Namespace, created.Memory.ID, UpdateRequest{Content: &secondReplacement}, MutationContext{
+			Actor: actor, Principal: actor, Route: updateRoute, IdempotencyKey: "replace-while-queued",
+		})
+		var structured *apierror.Error
+		if !errors.As(err, &structured) || structured.Status != http.StatusConflict || structured.Reason != ReasonOperationInProgress {
+			t.Fatalf("second UpdateMemory() error = %#v, want operation-in-progress conflict", err)
+		}
+		after, err := storeImpl.GetRemoteMemory(context.Background(), binding.NamespaceUID, created.Memory.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if adapter.getCount() != getsBefore || after.MaterializationState != store.MemoryMaterializationActive ||
+			after.PendingOperationID != before.PendingOperationID || after.Generation != before.Generation ||
+			after.DesiredGeneration != before.DesiredGeneration {
+			t.Fatalf("pending replacement was hydrated or reclassified: gets=%d/%d before=%#v after=%#v",
+				adapter.getCount(), getsBefore, before, after)
+		}
+	})
 }
 
 func TestRemoteMutationAdmissionPublicLocationIncludesEncodedNamespace(t *testing.T) {
@@ -560,17 +688,213 @@ func TestRemoteSearchCursorPreservesUnconsumedProviderRecords(t *testing.T) {
 	if first.Items[2].Memory.ID != "mem-4" {
 		t.Fatalf("first page last item = %q, want mem-4", first.Items[2].Memory.ID)
 	}
+	protocolIdentity, err := protocolBinding(&activeBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.getMu.Lock()
+	delete(adapter.byUpsertKey, protocol.CanonicalUpsertKey(protocolIdentity, "mem-5"))
+	adapter.getMu.Unlock()
+
 	second, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
 		Query: "needle", Limit: 1, Cursor: first.Cursor,
 	}, SearchContext{RemoteAuthorized: true})
-	if err != nil || len(second.Items) != 1 || second.Items[0].Memory.ID != "mem-5" || !second.Complete {
+	if err != nil || len(second.Items) != 1 || second.Items[0].Memory.ID != "mem-5" ||
+		second.Items[0].Memory.Content != "needle" || !second.Complete {
 		t.Fatalf("second Search() = %#v, err=%v", second, err)
 	}
-	if adapter.searchCalls != 2 || adapter.getCalls != 1 {
-		t.Fatalf("search calls=%d get calls=%d, want 2/1", adapter.searchCalls, adapter.getCalls)
+	if adapter.searchCalls != 3 || adapter.getCalls != 0 {
+		t.Fatalf("search calls=%d get calls=%d, want immutable snapshot replay 3/0", adapter.searchCalls, adapter.getCalls)
 	}
-	if len(adapter.pageSizes) != 2 || adapter.pageSizes[0] != adapter.pageSizes[1] {
+	if len(adapter.pageSizes) != 3 || adapter.pageSizes[0] != adapter.pageSizes[1] ||
+		adapter.pageSizes[1] != adapter.pageSizes[2] {
 		t.Fatalf("provider page sizes = %#v, want stable snapshot page size", adapter.pageSizes)
+	}
+}
+
+func TestRemoteSearchContinuationRemainsBoundToQueryAndAuthority(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 30, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, 5)
+	records := make([]protocol.MemoryRecord, 0, 5)
+	for i := 1; i <= 5; i++ {
+		trust := store.MemoryTrustReviewed
+		if i == 1 {
+			trust = store.MemoryTrustUntrusted
+		}
+		entry, record := remoteSearchFixture(binding, fmt.Sprintf("mem-%d", i), now.Add(-time.Duration(i)*time.Second), "needle", trust)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	service, adapter, activeBinding, _ := remoteSearchService(t, entries, records)
+	first, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 3, AllowIncomplete: true,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || first.Cursor == "" {
+		t.Fatalf("first Search() = %#v, err=%v", first, err)
+	}
+	searchCalls := adapter.searchCalls
+	_, err = service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "different", Limit: 1, Cursor: first.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if !errors.As(err, &structured) || structured.Status != http.StatusBadRequest {
+		t.Fatalf("query-mismatched cursor error = %#v, want bad request", err)
+	}
+	if adapter.searchCalls != searchCalls {
+		t.Fatalf("query-mismatched cursor reached provider: calls=%d, want %d", adapter.searchCalls, searchCalls)
+	}
+
+	authority := service.Resolver.(staticAuthorityResolver).authority
+	authority.Binding.RoutingEpoch++
+	_, err = service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: first.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	if !errors.As(err, &structured) || structured.Status != http.StatusBadRequest {
+		t.Fatalf("authority-mismatched cursor error = %#v, want bad request", err)
+	}
+	if adapter.searchCalls != searchCalls {
+		t.Fatalf("authority-mismatched cursor reached provider: calls=%d, want %d", adapter.searchCalls, searchCalls)
+	}
+}
+
+func TestRemoteSearchContinuationRejectsChangedReplayedSnapshot(t *testing.T) {
+	now := time.Date(2026, 8, 1, 13, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, 5)
+	records := make([]protocol.MemoryRecord, 0, 5)
+	for i := 1; i <= 5; i++ {
+		trust := store.MemoryTrustReviewed
+		if i == 1 {
+			trust = store.MemoryTrustUntrusted
+		}
+		entry, record := remoteSearchFixture(binding, fmt.Sprintf("mem-%d", i), now.Add(-time.Duration(i)*time.Second), "needle", trust)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	service, adapter, activeBinding, _ := remoteSearchService(t, entries, records)
+	first, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 3, AllowIncomplete: true,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || first.Cursor == "" {
+		t.Fatalf("first Search() = %#v, err=%v", first, err)
+	}
+	adapter.records[4].BackendVersion = "changed-version"
+	_, err = service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: first.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if !errors.As(err, &structured) || structured.Status != http.StatusConflict || structured.Reason != ReasonDiverged {
+		t.Fatalf("continued Search() error = %#v, want changed-snapshot conflict", err)
+	}
+	if adapter.getCalls != 0 {
+		t.Fatalf("continuation issued %d live Get calls", adapter.getCalls)
+	}
+}
+
+func TestRemoteSearchCursorExpiresWithProviderSnapshot(t *testing.T) {
+	now := time.Date(2026, 8, 1, 14, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, 5)
+	records := make([]protocol.MemoryRecord, 0, 5)
+	for i := 1; i <= 5; i++ {
+		trust := store.MemoryTrustReviewed
+		if i == 1 {
+			trust = store.MemoryTrustUntrusted
+		}
+		entry, record := remoteSearchFixture(binding, fmt.Sprintf("mem-%d", i), now.Add(-time.Duration(i)*time.Second), "needle", trust)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	service, adapter, activeBinding, governed := remoteSearchService(t, entries, records)
+	current := now
+	service.Now = func() time.Time { return current }
+	adapter.snapshotExpiresAt = now.Add(30 * time.Second)
+	first, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 3, AllowIncomplete: true,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || first.Cursor == "" {
+		t.Fatalf("first Search() = %#v, err=%v", first, err)
+	}
+	stored, ok := governed.cursors[first.Cursor]
+	if !ok || !stored.ExpiresAt.Equal(adapter.snapshotExpiresAt) {
+		t.Fatalf("cursor expiry = %v, want provider snapshot expiry %v", stored.ExpiresAt, adapter.snapshotExpiresAt)
+	}
+	searchCalls := adapter.searchCalls
+	current = adapter.snapshotExpiresAt.Add(time.Nanosecond)
+	_, err = service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: first.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if !errors.As(err, &structured) || structured.Status != http.StatusBadRequest {
+		t.Fatalf("expired cursor error = %#v, want bad request", err)
+	}
+	if adapter.searchCalls != searchCalls {
+		t.Fatalf("expired cursor reached provider: search calls=%d, want %d", adapter.searchCalls, searchCalls)
+	}
+}
+
+func TestRemoteSearchRejectsAlreadyExpiredContinuationSnapshot(t *testing.T) {
+	now := time.Date(2026, 8, 1, 15, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	firstEntry, firstRecord := remoteSearchFixture(binding, "mem-1", now, "needle", store.MemoryTrustReviewed)
+	secondEntry, secondRecord := remoteSearchFixture(binding, "mem-2", now.Add(-time.Second), "needle", store.MemoryTrustReviewed)
+	service, adapter, activeBinding, _ := remoteSearchService(t,
+		[]store.RemoteMemoryCatalogEntry{firstEntry, secondEntry}, []protocol.MemoryRecord{firstRecord, secondRecord})
+	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now
+	_, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1,
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable ||
+		structured.Reason != ReasonBackendUnavailable {
+		t.Fatalf("Search() error = %#v, want expired-snapshot backend failure", err)
+	}
+}
+
+func TestRemoteSearchAcceptsExpiredTerminalSnapshotWithoutCursor(t *testing.T) {
+	now := time.Date(2026, 8, 1, 15, 30, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entry, record := remoteSearchFixture(binding, "mem-1", now, "needle", store.MemoryTrustReviewed)
+	service, adapter, activeBinding, _ := remoteSearchService(t, []store.RemoteMemoryCatalogEntry{entry}, []protocol.MemoryRecord{record})
+	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now.Add(-time.Minute)
+	response, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || response == nil || !response.Exhausted || response.Cursor != "" || len(response.Items) != 1 {
+		t.Fatalf("Search() = %#v, %v; want complete terminal page without cursor", response, err)
 	}
 }
 
