@@ -42,8 +42,14 @@ const (
 
 	defaultProviderTimeout = 30 * time.Second
 	maxProviderErrorBytes  = 16 << 10
-	kd6CodeSnapshotInvalid = "KD6_SNAPSHOT_INVALID"
-	kd6CodeSnapshotExpired = "KD6_SNAPSHOT_EXPIRED"
+	// A provider page carries up to MaxPageSize complete documents. Reuse the
+	// per-document worst-case JSON expansion budget while keeping the public OMS
+	// response limit unchanged.
+	maxKD6SearchPageResponseBytes = protocol.MaxPageSize * protocol.MaxHTTPBodyBytes
+	kd6CodeSnapshotInvalid        = "KD6_SNAPSHOT_INVALID"
+	kd6CodeSnapshotExpired        = "KD6_SNAPSHOT_EXPIRED"
+	kd6CodeIncompleteSearchPage   = "KD6_INCOMPLETE_SEARCH_PAGE"
+	kd6CodeSearchSnapshotChanged  = "KD6_SEARCH_SNAPSHOT_CHANGED"
 )
 
 // HTTPSContentStoreConfig configures the strict KD6/proxy transport. Endpoint
@@ -363,19 +369,22 @@ func (c *HTTPSContentStore) ReadSearchPage(ctx context.Context, request ContentS
 	if err := validateContentAuthorityScope(request.Scope, request.TenantID); err != nil {
 		return nil, &StoreError{Code: "KD6_INVALID_SEARCH_SCOPE", Kind: err}
 	}
+	if len(request.Entries) == 0 || len(request.Entries) > protocol.MaxPageSize {
+		return nil, &StoreError{Code: "KD6_INVALID_SEARCH_PAGE_REQUEST"}
+	}
 	wireEntries := make([]kd6Descriptor, len(request.Entries))
 	for i := range request.Entries {
 		wireEntries[i] = encodeKD6Descriptor(request.Entries[i], request.Scope)
 	}
 	var response kd6SearchPageResponse
-	if err := c.doJSON(ctx, request.TenantID, "", kd6PathSearchPage, kd6SearchPageRequest{
+	if err := c.doJSONWithResponseLimit(ctx, request.TenantID, "", kd6PathSearchPage, kd6SearchPageRequest{
 		ProviderStoreID: request.ProviderStoreID, Scope: request.Scope,
 		SnapshotID: request.SnapshotID, Entries: wireEntries,
-	}, &response); err != nil {
+	}, &response, maxKD6SearchPageResponseBytes); err != nil {
 		return nil, err
 	}
 	if len(response.Records) != len(request.Entries) {
-		return nil, &StoreError{Code: "KD6_INCOMPLETE_SEARCH_PAGE", Kind: ErrProviderDiverged}
+		return nil, &StoreError{Code: kd6CodeIncompleteSearchPage, Kind: ErrProviderDiverged}
 	}
 	records := make([]ContentRecord, len(response.Records))
 	for i := range response.Records {
@@ -385,7 +394,7 @@ func (c *HTTPSContentStore) ReadSearchPage(ctx context.Context, request ContentS
 		}
 		if !contentScopeMatchesAuthority(record.Scope, request.Scope) ||
 			!contentDescriptorIdentityEqual(descriptorFromRecord(record), request.Entries[i]) {
-			return nil, &StoreError{Code: "KD6_SEARCH_SNAPSHOT_CHANGED", Kind: ErrProviderDiverged}
+			return nil, &StoreError{Code: kd6CodeSearchSnapshotChanged, Kind: ErrProviderDiverged}
 		}
 		record.Score = request.Entries[i].Score
 		records[i] = record
@@ -411,6 +420,17 @@ func validateContentSearchRequest(request ContentSearchRequest) error {
 }
 
 func (c *HTTPSContentStore) doJSON(ctx context.Context, tenantID, agentID, path string, requestValue, responseValue any) error {
+	return c.doJSONWithResponseLimit(
+		ctx, tenantID, agentID, path, requestValue, responseValue, protocol.MaxAdapterResponseBytes,
+	)
+}
+
+func (c *HTTPSContentStore) doJSONWithResponseLimit(
+	ctx context.Context,
+	tenantID, agentID, path string,
+	requestValue, responseValue any,
+	maxResponseBytes int,
+) error {
 	token, err := bearerTokenFromProvider("KD6 bearer token", c.authProvider)
 	if err != nil {
 		return &StoreError{Code: "KD6_AUTH_UNAVAILABLE", Retryable: true, Kind: err}
@@ -440,7 +460,7 @@ func (c *HTTPSContentStore) doJSON(ctx context.Context, tenantID, agentID, path 
 		return &StoreError{Code: "KD6_TRANSPORT_ERROR", Retryable: true, Kind: err}
 	}
 	defer response.Body.Close() //nolint:errcheck
-	limit := int64(protocol.MaxAdapterResponseBytes + 1)
+	limit := int64(maxResponseBytes) + 1
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		limit = maxProviderErrorBytes + 1
 	}
@@ -458,7 +478,7 @@ func (c *HTTPSContentStore) doJSON(ctx context.Context, tenantID, agentID, path 
 	if err != nil || mediaType != "application/json" {
 		return &StoreError{Code: "KD6_INVALID_CONTENT_TYPE", Kind: ErrProviderDiverged}
 	}
-	if err := decodeStrictJSON(responseBody, responseValue); err != nil {
+	if err := decodeStrictJSONWithLimit(responseBody, responseValue, maxResponseBytes); err != nil {
 		return &StoreError{Code: "KD6_INVALID_RESPONSE", Kind: err}
 	}
 	return nil
@@ -603,7 +623,11 @@ func equalStringMaps(left, right map[string]string) bool {
 }
 
 func decodeStrictJSON(body []byte, destination any) error {
-	if len(body) == 0 || len(body) > protocol.MaxAdapterResponseBytes {
+	return decodeStrictJSONWithLimit(body, destination, protocol.MaxAdapterResponseBytes)
+}
+
+func decodeStrictJSONWithLimit(body []byte, destination any, maxBytes int) error {
+	if len(body) == 0 || maxBytes <= 0 || len(body) > maxBytes {
 		return errors.New("JSON body size is invalid")
 	}
 	if !utf8.Valid(body) {

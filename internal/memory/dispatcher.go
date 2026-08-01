@@ -151,7 +151,7 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, namespace, operationID str
 	endpointCircuitKey := memoryEndpointCircuitKey(authority.Binding)
 	credentialCircuitKey := memoryCredentialCircuitKey(authority.Binding)
 	if d.circuitOpen(endpointCircuitKey, now) || d.circuitOpen(credentialCircuitKey, now) {
-		return d.releaseUnsentClaim(ctx, operation, authority.Binding, store.ErrNotReady)
+		return d.releaseUnsentClaimWithoutCircuitFailure(ctx, operation, authority.Binding, store.ErrNotReady)
 	}
 
 	envelope, err := protocol.DecodeMutationEnvelope(claim.Payload)
@@ -298,8 +298,29 @@ func (d *Dispatcher) releaseUnsentClaim(
 	binding *store.MemoryBackendBinding,
 	cause error,
 ) (*store.MemoryOperation, error) {
+	return d.releaseUnsentClaimWithCircuitFailure(ctx, operation, binding, cause, true)
+}
+
+func (d *Dispatcher) releaseUnsentClaimWithoutCircuitFailure(
+	ctx context.Context,
+	operation store.MemoryOperation,
+	binding *store.MemoryBackendBinding,
+	cause error,
+) (*store.MemoryOperation, error) {
+	return d.releaseUnsentClaimWithCircuitFailure(ctx, operation, binding, cause, false)
+}
+
+func (d *Dispatcher) releaseUnsentClaimWithCircuitFailure(
+	ctx context.Context,
+	operation store.MemoryOperation,
+	binding *store.MemoryBackendBinding,
+	cause error,
+	recordFailure bool,
+) (*store.MemoryOperation, error) {
 	now := d.now()
-	d.recordCircuitFailure(memoryEndpointCircuitKey(binding), now)
+	if recordFailure {
+		d.recordCircuitFailure(memoryEndpointCircuitKey(binding), now)
+	}
 	deadLetter := !operation.MaxAgeAt.After(now)
 	ambiguous := operation.LeaseOriginState == store.MemoryOperationAmbiguous
 	outcome := "retry"

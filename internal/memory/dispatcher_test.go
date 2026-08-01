@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -39,11 +40,12 @@ func (s *exactClaimTestStore) ClaimMemoryOperation(
 }
 
 type fakeOMSAdapter struct {
-	mu        sync.Mutex
-	mutations int
-	failFirst bool
-	record    *protocol.MemoryRecord
-	receipt   *protocol.MutationReceipt
+	mu                sync.Mutex
+	mutations         int
+	failFirst         bool
+	failuresRemaining int
+	record            *protocol.MemoryRecord
+	receipt           *protocol.MutationReceipt
 }
 
 func (f *fakeOMSAdapter) Capabilities(context.Context, protocol.CapabilitiesRequest) (*protocol.CapabilitiesResponse, error) {
@@ -59,6 +61,10 @@ func (f *fakeOMSAdapter) Mutate(_ context.Context, envelope protocol.MutationEnv
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.mutations++
+	if f.failuresRemaining > 0 {
+		f.failuresRemaining--
+		return nil, errors.New("endpoint unavailable")
+	}
 	if f.failFirst && f.mutations == 1 {
 		return nil, errors.New("lost acknowledgement")
 	}
@@ -249,6 +255,114 @@ func TestDispatcherImmediateRequiresExactClaimSupport(t *testing.T) {
 	}
 	if adapter.mutations != 0 {
 		t.Fatalf("mutations = %d, want no fallback dispatch", adapter.mutations)
+	}
+}
+
+func TestRunnerCircuitOpenBacklogExpiresAndRunsHalfOpenProbe(t *testing.T) {
+	governed := newMemoryTestStore(t)
+	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	binding := activateServiceTestBinding(t, governed, base)
+	backend := &corev1alpha1.MemoryBackend{}
+	backend.Status.EffectiveLifecycleState = corev1alpha1.MemoryBackendEffectiveLifecycleActive
+	backend.Status.Ready = true
+	adapter := &fakeOMSAdapter{failuresRemaining: 6}
+	authority := &ResolvedAuthority{
+		Namespace: binding.Namespace, NamespaceUID: binding.NamespaceUID,
+		Binding: &binding, Backend: backend, Adapter: adapter,
+	}
+	resolver := staticAuthorityResolver{authority: authority}
+	current := base.Add(time.Minute)
+	service := &Service{Governed: governed, Resolver: resolver, Now: func() time.Time { return current }}
+	for i := range 14 {
+		result, err := service.CreateMemory(context.Background(), binding.Namespace,
+			CreateRequest{Content: fmt.Sprintf("queued-%d", i)}, MutationContext{
+				Actor: "alice", Principal: "alice", Route: "createMemory",
+				IdempotencyKey: fmt.Sprintf("circuit-backlog-%d", i),
+			})
+		if err != nil || result.Operation == nil {
+			t.Fatalf("queue operation %d: result=%#v err=%v", i, result, err)
+		}
+	}
+	dispatcher := &Dispatcher{
+		Store: governed, Resolver: resolver, LeaseOwner: "dispatcher-a", Now: func() time.Time { return current },
+		GlobalConcurrency: 1, NamespaceConcurrency: 1, RetryJitterFraction: -1,
+	}
+	runner := &Runner{Dispatcher: dispatcher, Store: governed}
+	runPass := func() {
+		t.Helper()
+		if err := runner.runPass(context.Background()); err != nil {
+			t.Fatalf("runPass() error = %v", err)
+		}
+	}
+	circuitKey := memoryEndpointCircuitKey(&binding)
+	circuitState := func() (memoryCircuitState, bool) {
+		dispatcher.circuitMu.Lock()
+		defer dispatcher.circuitMu.Unlock()
+		state, ok := dispatcher.circuits[circuitKey]
+		return state, ok
+	}
+
+	for range 5 {
+		runPass()
+		current = current.Add(time.Second)
+	}
+	state, ok := circuitState()
+	if !ok || state.failures != 5 || !state.openedUntil.After(current) || adapter.mutations != 5 {
+		t.Fatalf("opened circuit state=%+v exists=%t mutations=%d", state, ok, adapter.mutations)
+	}
+	firstOpenedUntil := state.openedUntil
+
+	for _, beforeExpiry := range []time.Duration{20 * time.Second, 10 * time.Second, time.Second} {
+		current = firstOpenedUntil.Add(-beforeExpiry)
+		runPass()
+		state, ok = circuitState()
+		if !ok || state.failures != 5 || !state.openedUntil.Equal(firstOpenedUntil) || adapter.mutations != 5 {
+			t.Fatalf("circuit-open release renewed state=%+v exists=%t mutations=%d", state, ok, adapter.mutations)
+		}
+	}
+
+	current = firstOpenedUntil
+	runPass()
+	state, ok = circuitState()
+	if !ok || state.failures != 6 || adapter.mutations != 6 {
+		t.Fatalf("failed half-open probe state=%+v exists=%t mutations=%d", state, ok, adapter.mutations)
+	}
+	if want := current.Add(time.Minute); !state.openedUntil.Equal(want) {
+		t.Fatalf("failed half-open probe openedUntil=%s, want %s", state.openedUntil, want)
+	}
+	secondOpenedUntil := state.openedUntil
+
+	for _, beforeExpiry := range []time.Duration{30 * time.Second, time.Second} {
+		current = secondOpenedUntil.Add(-beforeExpiry)
+		runPass()
+		state, ok = circuitState()
+		if !ok || state.failures != 6 || !state.openedUntil.Equal(secondOpenedUntil) || adapter.mutations != 6 {
+			t.Fatalf("second circuit-open release renewed state=%+v exists=%t mutations=%d", state, ok, adapter.mutations)
+		}
+	}
+
+	current = secondOpenedUntil
+	runPass()
+	if _, ok := circuitState(); ok {
+		t.Fatal("successful half-open probe did not close the circuit")
+	}
+	if adapter.mutations != 7 {
+		t.Fatalf("adapter mutations=%d, want 7 actual outbound attempts", adapter.mutations)
+	}
+	operations, err := governed.ListMemoryOperations(context.Background(), store.MemoryOperationFilter{
+		NamespaceUID: binding.NamespaceUID, Limit: 20,
+	})
+	if err != nil {
+		t.Fatalf("ListMemoryOperations() error = %v", err)
+	}
+	succeeded := 0
+	for _, operation := range operations {
+		if operation.State == store.MemoryOperationSucceeded {
+			succeeded++
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("succeeded operations=%d, want one recovery probe materialization", succeeded)
 	}
 }
 

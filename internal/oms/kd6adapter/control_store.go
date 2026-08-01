@@ -2212,30 +2212,30 @@ func readProviderPage(ctx context.Context, store ContentStore, binding protocol.
 	if len(entries) == 0 {
 		return []protocol.MemoryRecord{}, nil
 	}
-	records := make([]protocol.MemoryRecord, 0, len(entries))
-	scope := authorityScopeForBinding(binding)
+	requestedEntries := append([]ContentDescriptor(nil), entries...)
+	contents, err := store.ReadSearchPage(ctx, ContentSearchPageRequest{
+		TenantID: binding.TenantID, ProviderStoreID: providerStoreID, Scope: authorityScopeForBinding(binding),
+		SnapshotID: providerSnapshot, Entries: requestedEntries,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(contents) != len(entries) {
+		return nil, &StoreError{Code: kd6CodeIncompleteSearchPage, Retryable: true, Kind: ErrProviderDiverged}
+	}
+	records := make([]protocol.MemoryRecord, len(entries))
 	for i := range entries {
-		contents, err := store.ReadSearchPage(ctx, ContentSearchPageRequest{
-			TenantID: binding.TenantID, ProviderStoreID: providerStoreID, Scope: scope,
-			SnapshotID: providerSnapshot, Entries: entries[i : i+1],
-		})
-		if err != nil {
-			return nil, err
-		}
-		if len(contents) != 1 {
-			return nil, &StoreError{Code: "KD6_INCOMPLETE_SEARCH_PAGE", Retryable: true, Kind: ErrProviderDiverged}
-		}
+		entry := entries[i]
 		control := controlRecord{
-			UpsertKey: entries[i].UpsertKey, MemoryID: entries[i].MemoryID, State: protocol.RecordStateLive,
-			Generation: entries[i].Generation, BackendVersion: entries[i].Version,
-			BackendMemoryID: entries[i].ProviderID, ContentDigest: entries[i].ContentDigest,
-			UpdatedAt: entries[i].UpdatedAt,
+			UpsertKey: entry.UpsertKey, MemoryID: entry.MemoryID, State: protocol.RecordStateLive,
+			Generation: entry.Generation, BackendVersion: entry.Version,
+			BackendMemoryID: entry.ProviderID, ContentDigest: entry.ContentDigest, UpdatedAt: entry.UpdatedAt,
 		}
-		if !contentMatchesControl(contents[0], control, binding) {
-			return nil, &StoreError{Code: "KD6_SEARCH_SNAPSHOT_CHANGED", Retryable: true, Kind: ErrProviderDiverged}
+		if !contentMatchesControl(contents[i], control, binding) {
+			return nil, &StoreError{Code: kd6CodeSearchSnapshotChanged, Retryable: true, Kind: ErrProviderDiverged}
 		}
-		contents[0].Score = entries[i].Score
-		records = append(records, liveRecordFromContent(control, contents[0]))
+		contents[i].Score = entry.Score
+		records[i] = liveRecordFromContent(control, contents[i])
 	}
 	return records, nil
 }
