@@ -85,11 +85,13 @@ type UserInfo struct {
 	Extra     map[string]authenticationv1.ExtraValue
 	Namespace string // Extracted from ServiceAccount username (system:serviceaccount:<ns>:<name>)
 
-	AuthType     string
-	Subject      string
-	Email        string
-	Issuer       string
-	Roles        []string
+	AuthType string
+	Subject  string
+	Email    string
+	Issuer   string
+	Roles    []string
+	// ContextToken is an independently verified request-local transaction token.
+	// It may be attached while AuthType continues to identify the primary caller.
 	ContextToken *ContextToken
 }
 
