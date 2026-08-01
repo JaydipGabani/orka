@@ -19,6 +19,7 @@ func internalMemoryTaskToken(scopes ...string) *ContextToken {
 		TransactionContext: map[string]any{
 			"namespace": "default",
 			"taskName":  "memory-task",
+			"taskUID":   "task-uid",
 		},
 	}
 }
@@ -266,5 +267,15 @@ func TestInternalMemoryAuthorizationOffPreservesVerifiedWorkloadCompatibility(t 
 	user.ContextToken = nil
 
 	require.Equal(t, http.StatusOK,
+		testInternalMemoryRequest(t, app, http.MethodGet, "/internal/v1/memories/default", "").StatusCode)
+}
+
+func TestInternalMemoryAuthorizationRejectsRecreatedTaskUID(t *testing.T) {
+	h, app, _, user := setupTestInternalMemoryHandlers(t)
+	app.Get("/internal/v1/memories/:namespace", h.ListMemories)
+	user.ContextToken = internalMemoryTaskToken(ContextTokenScopeMemoryRead)
+	user.ContextToken.TransactionContext["taskUID"] = "recreated-task-uid"
+
+	require.Equal(t, http.StatusForbidden,
 		testInternalMemoryRequest(t, app, http.MethodGet, "/internal/v1/memories/default", "").StatusCode)
 }

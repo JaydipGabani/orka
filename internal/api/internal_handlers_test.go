@@ -1361,7 +1361,7 @@ func TestInternalMemoryAuthorizationRequiresCurrentWorkerAndTaskScopedTxnScopes(
 	user.ContextToken = &ContextToken{
 		Scopes: []string{ContextTokenScopeMemoryRead, ContextTokenScopeMemoryOperate},
 		TransactionContext: map[string]any{
-			"namespace": "default", "taskName": "memory-task",
+			"namespace": "default", "taskName": "memory-task", "taskUID": "task-uid",
 		},
 	}
 	req = httptest.NewRequest(http.MethodPost, "/internal/v1/memories/default/search", bytes.NewReader(body))

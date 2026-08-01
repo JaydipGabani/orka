@@ -423,6 +423,10 @@ func (h *InternalHandlers) authorizeInternalMemoryTask(
 		isTerminalInternalTaskPhase(task.Status.Phase) {
 		return authorizationFailure(token, "task identity is not active")
 	}
+	tokenTaskUID, ok := contextString(token.TransactionContext, "taskUID")
+	if !ok || tokenTaskUID != string(task.UID) {
+		return authorizationFailure(token, "task UID does not match the active task")
+	}
 	return nil
 }
 
