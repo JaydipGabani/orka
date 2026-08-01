@@ -1,11 +1,15 @@
 package api
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/requestid"
@@ -102,7 +106,7 @@ func (h *Handlers) ListMemoryOperations(c fiber.Ctx) error {
 	if err := h.authorizeContextTokenAction(c, "listMemoryOperations", h.contextTokenAuthorization.MemoryReadScopes); err != nil {
 		return err
 	}
-	filter, err := parseMemoryOperationFilter(c)
+	filter, err := parseMemoryOperationFilter(c, namespace)
 	if err != nil {
 		return err
 	}
@@ -114,7 +118,11 @@ func (h *Handlers) ListMemoryOperations(c fiber.Ctx) error {
 	for _, operation := range operations {
 		items = append(items, memoryruntime.OperationFromStore(operation))
 	}
-	return c.JSON(ListResponse{Items: items, Metadata: ListMeta{}})
+	next, err := encodeMemoryOperationCursor(namespace, filter, operations)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "memory operation cursor could not be encoded")
+	}
+	return c.JSON(ListResponse{Items: items, Metadata: ListMeta{Continue: next}})
 }
 
 // GetMemoryOperation gets an allowlisted durable operation summary.
@@ -244,7 +252,7 @@ func (h *InternalHandlers) ListMemoryOperations(c fiber.Ctx) error {
 	if err := h.authorizeInternalMemoryTask(c, namespace, "listMemoryOperations", h.memoryReadScopes()); err != nil {
 		return err
 	}
-	filter, err := parseMemoryOperationFilter(c)
+	filter, err := parseMemoryOperationFilter(c, namespace)
 	if err != nil {
 		return err
 	}
@@ -256,7 +264,11 @@ func (h *InternalHandlers) ListMemoryOperations(c fiber.Ctx) error {
 	for _, operation := range operations {
 		items = append(items, memoryruntime.OperationFromStore(operation))
 	}
-	return c.JSON(items)
+	next, err := encodeMemoryOperationCursor(namespace, filter, operations)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "memory operation cursor could not be encoded")
+	}
+	return c.JSON(ListResponse{Items: items, Metadata: ListMeta{Continue: next}})
 }
 
 // GetMemoryOperation gets an internal namespace-bound operation.
@@ -282,7 +294,24 @@ func (h *InternalHandlers) GetMemoryOperation(c fiber.Ctx) error {
 	return c.JSON(memoryruntime.OperationFromStore(*operation))
 }
 
-func parseMemoryOperationFilter(c fiber.Ctx) (store.MemoryOperationFilter, error) {
+const (
+	defaultMemoryOperationPageLimit = 100
+	maxMemoryOperationPageLimit     = 200
+	maxMemoryOperationCursorBytes   = 2048
+)
+
+type memoryOperationCursor struct {
+	Namespace  string                       `json:"namespace"`
+	CreatedAt  time.Time                    `json:"createdAt"`
+	Sequence   int64                        `json:"sequence"`
+	MemoryID   string                       `json:"memoryId,omitempty"`
+	ProposalID string                       `json:"proposalId,omitempty"`
+	Kinds      []store.MemoryOperationKind  `json:"kinds,omitempty"`
+	States     []store.MemoryOperationState `json:"states,omitempty"`
+	PageLimit  int                          `json:"limit"`
+}
+
+func parseMemoryOperationFilter(c fiber.Ctx, namespace ...string) (store.MemoryOperationFilter, error) {
 	limit, err := parseOptionalLimit(c.Query("limit", ""))
 	if err != nil {
 		return store.MemoryOperationFilter{}, err
@@ -296,12 +325,113 @@ func parseMemoryOperationFilter(c fiber.Ctx) (store.MemoryOperationFilter, error
 	for _, state := range splitCSV(c.Query("state", "")) {
 		filter.States = append(filter.States, store.MemoryOperationState(state))
 	}
-	if raw := strings.TrimSpace(c.Query("beforeSequence", "")); raw != "" {
+	cursorValue := strings.TrimSpace(c.Query("cursor", c.Query("continue", "")))
+	beforeSequence := strings.TrimSpace(c.Query("beforeSequence", ""))
+	beforeCreatedAt := strings.TrimSpace(c.Query("beforeCreatedAt", ""))
+	if cursorValue != "" && (beforeSequence != "" || beforeCreatedAt != "") {
+		return store.MemoryOperationFilter{}, fiber.NewError(fiber.StatusBadRequest,
+			"memory operation cursor cannot be combined with beforeSequence or beforeCreatedAt")
+	}
+	if cursorValue != "" {
+		expectedNamespace := ""
+		if len(namespace) > 0 {
+			expectedNamespace = namespace[0]
+		}
+		cursor, decodeErr := decodeMemoryOperationCursor(cursorValue)
+		if decodeErr != nil || !memoryOperationCursorMatches(cursor, expectedNamespace, filter) {
+			return store.MemoryOperationFilter{}, fiber.NewError(fiber.StatusBadRequest, "invalid memory operation cursor")
+		}
+		filter.BeforeCreatedAt = &cursor.CreatedAt
+		filter.BeforeSequence = cursor.Sequence
+		return filter, nil
+	}
+	if (beforeSequence == "") != (beforeCreatedAt == "") {
+		return store.MemoryOperationFilter{}, fiber.NewError(fiber.StatusBadRequest,
+			"memory operation pagination requires both beforeCreatedAt and beforeSequence")
+	}
+	if beforeSequence != "" {
+		raw := beforeSequence
 		sequence, parseErr := strconv.ParseInt(raw, 10, 64)
-		if parseErr != nil || sequence < 0 {
+		if parseErr != nil || sequence <= 0 {
 			return store.MemoryOperationFilter{}, fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("invalid beforeSequence %q", raw))
 		}
+		createdAt, parseErr := time.Parse(time.RFC3339Nano, beforeCreatedAt)
+		if parseErr != nil || createdAt.IsZero() {
+			return store.MemoryOperationFilter{}, fiber.NewError(fiber.StatusBadRequest,
+				fmt.Sprintf("invalid beforeCreatedAt %q", beforeCreatedAt))
+		}
+		createdAt = createdAt.UTC()
+		filter.BeforeCreatedAt = &createdAt
 		filter.BeforeSequence = sequence
 	}
 	return filter, nil
+}
+
+func encodeMemoryOperationCursor(namespace string, filter store.MemoryOperationFilter, operations []store.MemoryOperation) (string, error) {
+	if len(operations) < memoryOperationPageLimit(filter.Limit) || len(operations) == 0 {
+		return "", nil
+	}
+	last := operations[len(operations)-1]
+	if last.Sequence <= 0 || last.CreatedAt.IsZero() {
+		return "", fmt.Errorf("operation cursor requires stable ordering fields")
+	}
+	cursor := memoryOperationCursor{
+		Namespace: strings.TrimSpace(namespace), CreatedAt: last.CreatedAt.UTC(), Sequence: last.Sequence,
+		MemoryID: strings.TrimSpace(filter.MemoryID), ProposalID: strings.TrimSpace(filter.ProposalID),
+		Kinds: canonicalMemoryOperationKinds(filter.Kinds), States: canonicalMemoryOperationStates(filter.States),
+		PageLimit: memoryOperationPageLimit(filter.Limit),
+	}
+	encoded, err := json.Marshal(cursor)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(encoded), nil
+}
+
+func decodeMemoryOperationCursor(value string) (memoryOperationCursor, error) {
+	if value == "" || len(value) > maxMemoryOperationCursorBytes {
+		return memoryOperationCursor{}, fmt.Errorf("invalid cursor length")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(decoded) > maxMemoryOperationCursorBytes {
+		return memoryOperationCursor{}, fmt.Errorf("invalid cursor encoding")
+	}
+	var cursor memoryOperationCursor
+	if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.CreatedAt.IsZero() || cursor.Sequence <= 0 ||
+		cursor.PageLimit <= 0 || cursor.PageLimit > maxMemoryOperationPageLimit {
+		return memoryOperationCursor{}, fmt.Errorf("invalid cursor payload")
+	}
+	cursor.Namespace = strings.TrimSpace(cursor.Namespace)
+	cursor.MemoryID = strings.TrimSpace(cursor.MemoryID)
+	cursor.ProposalID = strings.TrimSpace(cursor.ProposalID)
+	cursor.CreatedAt = cursor.CreatedAt.UTC()
+	cursor.Kinds = canonicalMemoryOperationKinds(cursor.Kinds)
+	cursor.States = canonicalMemoryOperationStates(cursor.States)
+	return cursor, nil
+}
+
+func memoryOperationCursorMatches(cursor memoryOperationCursor, namespace string, filter store.MemoryOperationFilter) bool {
+	return cursor.Namespace == strings.TrimSpace(namespace) && cursor.MemoryID == strings.TrimSpace(filter.MemoryID) &&
+		cursor.ProposalID == strings.TrimSpace(filter.ProposalID) && cursor.PageLimit == memoryOperationPageLimit(filter.Limit) &&
+		slices.Equal(cursor.Kinds, canonicalMemoryOperationKinds(filter.Kinds)) &&
+		slices.Equal(cursor.States, canonicalMemoryOperationStates(filter.States))
+}
+
+func canonicalMemoryOperationKinds(values []store.MemoryOperationKind) []store.MemoryOperationKind {
+	result := slices.Clone(values)
+	slices.Sort(result)
+	return result
+}
+
+func canonicalMemoryOperationStates(values []store.MemoryOperationState) []store.MemoryOperationState {
+	result := slices.Clone(values)
+	slices.Sort(result)
+	return result
+}
+
+func memoryOperationPageLimit(limit int) int {
+	if limit <= 0 {
+		return defaultMemoryOperationPageLimit
+	}
+	return min(limit, maxMemoryOperationPageLimit)
 }

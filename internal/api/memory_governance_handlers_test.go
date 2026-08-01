@@ -4,9 +4,47 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
+
+	"github.com/orka-agents/orka/internal/store"
 )
+
+func TestMemoryOperationCursorRoundTripBindsNamespaceAndFilters(t *testing.T) {
+	createdAt := time.Date(2026, 8, 1, 8, 30, 0, 123, time.UTC)
+	filter := store.MemoryOperationFilter{
+		MemoryID: "mem-a", ProposalID: "proposal-a",
+		Kinds:  []store.MemoryOperationKind{store.MemoryOperationDelete, store.MemoryOperationCreate},
+		States: []store.MemoryOperationState{store.MemoryOperationQueued, store.MemoryOperationSucceeded},
+		Limit:  2,
+	}
+	operations := []store.MemoryOperation{
+		{Sequence: 9, CreatedAt: createdAt.Add(time.Second)},
+		{Sequence: 8, CreatedAt: createdAt},
+	}
+
+	encoded, err := encodeMemoryOperationCursor("team-a", filter, operations)
+	if err != nil || encoded == "" {
+		t.Fatalf("encodeMemoryOperationCursor() = %q, %v", encoded, err)
+	}
+	cursor, err := decodeMemoryOperationCursor(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.CreatedAt.Equal(createdAt) || cursor.Sequence != 8 ||
+		!memoryOperationCursorMatches(cursor, "team-a", filter) {
+		t.Fatalf("decoded cursor = %#v", cursor)
+	}
+	if memoryOperationCursorMatches(cursor, "team-b", filter) {
+		t.Fatal("cursor matched a different namespace")
+	}
+	changed := filter
+	changed.MemoryID = "mem-b"
+	if memoryOperationCursorMatches(cursor, "team-a", changed) {
+		t.Fatal("cursor matched different filters")
+	}
+}
 
 func TestAuthorizeMemoryReadVisibilityRequiresOperateForDisabledContent(t *testing.T) {
 	h := &Handlers{contextTokenAuthorization: ContextTokenAuthorizationConfig{
