@@ -259,7 +259,14 @@ func TestRecallMemoryToolOmitsLimitWhenNotProvided(t *testing.T) {
 
 func TestRecallMemoryToolRejectsNonPositiveLimit(t *testing.T) {
 	if _, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"limit":0}`)); err == nil ||
-		!strings.Contains(err.Error(), "limit must be positive") {
+		!strings.Contains(err.Error(), "limit must be between 1 and 200") {
+		t.Fatalf("Execute() error = %v", err)
+	}
+}
+
+func TestRecallMemoryToolRejectsLimitAboveHardCap(t *testing.T) {
+	if _, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"limit":201}`)); err == nil ||
+		!strings.Contains(err.Error(), "limit must be between 1 and 200") {
 		t.Fatalf("Execute() error = %v", err)
 	}
 }

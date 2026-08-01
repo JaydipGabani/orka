@@ -1720,6 +1720,9 @@ func TestLoadDurableMemoryContextPropagatesMountedTaskTransactionToken(t *testin
 		if got := r.Header.Get(transactiontoken.HeaderName); got != "task-scoped-token" {
 			t.Errorf("%s = %q", transactiontoken.HeaderName, got)
 		}
+		if got := r.URL.Query().Get("recordRecall"); got != "" {
+			t.Errorf("recordRecall = %q, want empty on prefetch", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode([]store.Memory{{
 			ID: "mem-1", Source: "operator", Trust: store.MemoryTrustReviewed, Content: "reviewed context",
@@ -1734,8 +1737,103 @@ func TestLoadDurableMemoryContextPropagatesMountedTaskTransactionToken(t *testin
 	t.Setenv(workerenv.TransactionTokenFile, tokenPath)
 	t.Setenv(workerenv.MemoryContextEnabled, "true")
 
-	if got := loadDurableMemoryContext(context.Background()); !strings.Contains(got, "reviewed context") {
-		t.Fatalf("loadDurableMemoryContext() = %q", got)
+	if got := loadDurableMemoryContext(context.Background()); !strings.Contains(got.content, "reviewed context") {
+		t.Fatalf("loadDurableMemoryContext() = %q", got.content)
+	}
+}
+
+func TestPassiveMemoryRecallMarksOnlyMemoryIncludedAfterFormattingTruncation(t *testing.T) {
+	const includedMemoryID = "mem-included"
+
+	var requests atomic.Int32
+	var recalledIDs string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestNumber := requests.Add(1)
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/internal/v1/memories/default") {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("recordRecall") == "true" {
+			recalledIDs = r.URL.Query().Get("ids")
+			if got := r.URL.Query().Get("limit"); got != "1" {
+				t.Errorf("recall limit = %q, want 1", got)
+			}
+			_ = json.NewEncoder(w).Encode([]store.Memory{})
+			return
+		}
+		if requestNumber != 1 {
+			t.Errorf("prefetch request number = %d, want 1", requestNumber)
+		}
+		if got := r.URL.Query().Get("ids"); got != "" {
+			t.Errorf("prefetch ids = %q, want empty", got)
+		}
+		_ = json.NewEncoder(w).Encode([]store.Memory{
+			{
+				ID: includedMemoryID, Source: "operator", Trust: store.MemoryTrustReviewed,
+				Content: strings.Repeat("a", memoryContextPerEntryMaxChars+100),
+			},
+			{ID: "mem-omitted", Source: "operator", Trust: store.MemoryTrustReviewed, Content: "must not be recalled"},
+		})
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "default")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.MemoryContextEnabled, "true")
+	t.Setenv(workerenv.MemoryContextMaxChars, fmt.Sprint(len(durableMemoryContextHeader)+80))
+
+	memoryContext := loadDurableMemoryContext(context.Background())
+	if len(memoryContext.entries) != 1 || memoryContext.entries[0].id != includedMemoryID {
+		t.Fatalf("formatted memory entries = %#v, want only mem-included", memoryContext.entries)
+	}
+	if strings.Contains(memoryContext.content, "must not be recalled") {
+		t.Fatalf("formatted context included omitted memory: %q", memoryContext.content)
+	}
+
+	messages := prependDurableMemoryContext(
+		context.Background(),
+		[]llm.Message{{Role: roleUser, Content: "current task"}},
+		memoryContext,
+	)
+	if len(messages) != 3 || messages[1].Role != testRoleAssistant || messages[2].Role != testRoleTool {
+		t.Fatalf("messages = %#v, want task plus passive-memory exchange", messages)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("controller requests = %d, want prefetch and recall", got)
+	}
+	if recalledIDs != includedMemoryID {
+		t.Fatalf("recalled ids = %q, want mem-included", recalledIDs)
+	}
+}
+
+func TestPassiveMemoryRecallMarksNoneWhenExchangeIsOmittedByMessageBudget(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got := r.URL.Query().Get("recordRecall"); got != "" {
+			t.Errorf("recordRecall = %q, want no recall request", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]store.Memory{{
+			ID: "mem-not-injected", Source: "operator", Trust: store.MemoryTrustReviewed, Content: "reviewed context",
+		}})
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "default")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.MemoryContextEnabled, "true")
+
+	memoryContext := loadDurableMemoryContext(context.Background())
+	original := []llm.Message{{Role: roleUser, Content: strings.Repeat("x", maxSessionContextBytes)}}
+	messages := prependDurableMemoryContext(context.Background(), original, memoryContext)
+	if len(messages) != 1 || messages[0].Role != roleUser || messages[0].Content != original[0].Content {
+		t.Fatalf("messages = %#v, want oversized task unchanged", messages)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("controller requests = %d, want prefetch only", got)
 	}
 }
 
@@ -1754,8 +1852,8 @@ func TestLoadDurableMemoryContextFailsClosedWhenMountedTransactionTokenCannotBeR
 	t.Setenv(workerenv.TransactionTokenFile, filepath.Join(t.TempDir(), "missing-token"))
 	t.Setenv(workerenv.MemoryContextEnabled, "true")
 
-	if got := loadDurableMemoryContext(context.Background()); got != "" {
-		t.Fatalf("loadDurableMemoryContext() = %q, want empty", got)
+	if got := loadDurableMemoryContext(context.Background()); got.content != "" {
+		t.Fatalf("loadDurableMemoryContext() = %q, want empty", got.content)
 	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("controller requests = %d, want 0", got)

@@ -24,6 +24,7 @@ import (
 const (
 	internalMemoryToolBodyLimit          = 1 << 20 // 1MB
 	internalMemoryTransactionTokenHeader = "Txn-Token"
+	maxRecallMemoryToolLimit             = 200
 )
 
 // RecallMemoryTool retrieves durable namespace-scoped memories relevant to the current task.
@@ -67,10 +68,11 @@ func (t *RecallMemoryTool) Parameters() json.RawMessage {
 				"type": "string",
 				"description": "Optional source filter such as task, session, user, or system"
 			},
-			"limit": {
-				"type": "integer",
-				"minimum": 1,
-				"description": "Maximum number of memories to return. Controller defaults apply when omitted."
+				"limit": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 200,
+					"description": "Maximum number of memories to return. Controller defaults apply when omitted."
 			},
 			"include_disabled": {
 				"type": "boolean",
@@ -99,8 +101,8 @@ func (t *RecallMemoryTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if err := decodeMemoryToolArgs(args, &a); err != nil {
 		return "", fmt.Errorf("failed to parse arguments: %w", err)
 	}
-	if a.Limit != nil && *a.Limit <= 0 {
-		return "", fmt.Errorf("limit must be positive")
+	if a.Limit != nil && (*a.Limit <= 0 || *a.Limit > maxRecallMemoryToolLimit) {
+		return "", fmt.Errorf("limit must be between 1 and %d", maxRecallMemoryToolLimit)
 	}
 	cfg, err := loadInternalControllerConfig()
 	if err != nil {

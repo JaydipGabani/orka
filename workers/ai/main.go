@@ -317,7 +317,7 @@ func run() (err error) {
 	// Load reviewed/trusted durable memory best-effort. Memory is inserted as a
 	// synthetic tool-call/result data exchange, never as ordinary user/system text.
 	memoryContext := loadDurableMemoryContext(ctx)
-	if strings.TrimSpace(memoryContext) != "" {
+	if strings.TrimSpace(memoryContext.content) != "" {
 		systemPrompt = appendPassiveMemorySafetyPolicy(systemPrompt)
 	}
 	if shouldAppendMemoryReflectionGuidance(enabledTools) {
@@ -327,12 +327,12 @@ func run() (err error) {
 	// Build messages
 	promptIncluded := strings.EqualFold(strings.TrimSpace(os.Getenv(workerenv.SessionPromptIncluded)), "true")
 	messages := buildInitialMessages(sessionContext, prompt, promptIncluded, planPromptContext, approvalPromptContext)
-	messages = prependDurableMemoryMessage(messages, memoryContext)
+	messages = prependDurableMemoryContext(ctx, messages, memoryContext)
 
 	// Build tools for LLM (built-in + custom). The synthetic passive-memory
 	// exchange must also have a provider-visible declaration, but that declaration
 	// is deliberately excluded from executable tool authorization.
-	llmTools := withPassiveMemoryToolDeclaration(buildLLMTools(enabledTools, customTools), memoryContext)
+	llmTools := withPassiveMemoryToolDeclaration(buildLLMTools(enabledTools, customTools), memoryContext.content)
 
 	// Create tool executor for custom tools
 	toolExecutor := worker.NewToolExecutor()
@@ -805,12 +805,22 @@ func registerMemoryTools() {
 	tools.DefaultRegistry.Register(tools.NewSearchTranscriptTool())
 }
 
-func loadDurableMemoryContext(ctx context.Context) string {
+type durableMemoryContext struct {
+	content string
+	entries []durableMemoryContextEntry
+}
+
+type durableMemoryContextEntry struct {
+	id    string
+	start int
+}
+
+func loadDurableMemoryContext(ctx context.Context) durableMemoryContext {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv(workerenv.MemoryContextEnabled)), "false") {
-		return ""
+		return durableMemoryContext{}
 	}
 	if !memoryControllerConfigPresent() {
-		return ""
+		return durableMemoryContext{}
 	}
 
 	controllerURL := strings.TrimRight(strings.TrimSpace(os.Getenv(workerenv.ControllerURL)), "/")
@@ -820,13 +830,40 @@ func loadDurableMemoryContext(ctx context.Context) string {
 	values := url.Values{}
 	values.Set("limit", strconv.Itoa(limit))
 	values.Set("trust", "reviewed,trusted")
-	values.Set("recordRecall", "true")
 	endpoint := fmt.Sprintf("%s/internal/v1/memories/%s?%s", controllerURL, url.PathEscape(namespace), values.Encode())
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	req, err := newDurableMemoryRequest(ctx, endpoint)
 	if err != nil {
 		fmt.Printf("Warning: failed to create durable memory request: %v\n", err)
-		return ""
+		return durableMemoryContext{}
+	}
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		fmt.Printf("Warning: failed to fetch durable memory: %v\n", err)
+		return durableMemoryContext{}
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		fmt.Printf("Warning: durable memory fetch returned HTTP %d: %s\n", resp.StatusCode, strings.TrimSpace(string(body)))
+		return durableMemoryContext{}
+	}
+
+	var memories []store.Memory
+	if err := json.NewDecoder(io.LimitReader(resp.Body, memoryContextResponseBodyLimit)).Decode(&memories); err != nil {
+		fmt.Printf("Warning: failed to decode durable memory context: %v\n", err)
+		return durableMemoryContext{}
+	}
+
+	return buildDurableMemoryContext(memories, limit, memoryContextMaxChars())
+}
+
+func newDurableMemoryRequest(ctx context.Context, endpoint string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
 	}
 	if token := workerServiceAccountToken(); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -836,33 +873,62 @@ func loadDurableMemoryContext(ctx context.Context) string {
 		"task transaction token",
 	)
 	if err != nil {
-		fmt.Printf("Warning: failed to load durable memory transaction token: %v\n", err)
-		return ""
+		return nil, fmt.Errorf("load durable memory transaction token: %w", err)
 	}
 	if configured {
 		req.Header.Set(transactiontoken.HeaderName, transactionToken)
 	}
+	return req, nil
+}
 
+func recordDurableMemoryRecall(ctx context.Context, memoryIDs []string) {
+	if len(memoryIDs) == 0 || !memoryControllerConfigPresent() {
+		return
+	}
+
+	uniqueIDs := make([]string, 0, len(memoryIDs))
+	seen := make(map[string]struct{}, len(memoryIDs))
+	for _, rawID := range memoryIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniqueIDs = append(uniqueIDs, id)
+	}
+	if len(uniqueIDs) == 0 {
+		return
+	}
+
+	controllerURL := strings.TrimRight(strings.TrimSpace(os.Getenv(workerenv.ControllerURL)), "/")
+	namespace := strings.TrimSpace(os.Getenv(workerenv.TaskNamespace))
+	values := url.Values{}
+	values.Set("ids", strings.Join(uniqueIDs, ","))
+	values.Set("limit", strconv.Itoa(len(uniqueIDs)))
+	values.Set("recordRecall", "true")
+	endpoint := fmt.Sprintf("%s/internal/v1/memories/%s?%s", controllerURL, url.PathEscape(namespace), values.Encode())
+
+	req, err := newDurableMemoryRequest(ctx, endpoint)
+	if err != nil {
+		fmt.Printf("Warning: failed to create durable memory recall request: %v\n", err)
+		return
+	}
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
-		fmt.Printf("Warning: failed to fetch durable memory: %v\n", err)
-		return ""
+		fmt.Printf("Warning: failed to record durable memory recall: %v\n", err)
+		return
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		fmt.Printf("Warning: durable memory fetch returned HTTP %d: %s\n", resp.StatusCode, strings.TrimSpace(string(body)))
-		return ""
+		fmt.Printf("Warning: durable memory recall returned HTTP %d: %s\n", resp.StatusCode, strings.TrimSpace(string(body)))
+		return
 	}
-
-	var memories []store.Memory
-	if err := json.NewDecoder(io.LimitReader(resp.Body, memoryContextResponseBodyLimit)).Decode(&memories); err != nil {
-		fmt.Printf("Warning: failed to decode durable memory context: %v\n", err)
-		return ""
-	}
-
-	return formatDurableMemoryContextWithLimit(memories, limit, memoryContextMaxChars())
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, memoryContextResponseBodyLimit))
 }
 
 func workerServiceAccountToken() string {
@@ -911,8 +977,12 @@ func formatDurableMemoryContext(memories []store.Memory, maxChars int) string {
 }
 
 func formatDurableMemoryContextWithLimit(memories []store.Memory, limit, maxChars int) string {
+	return buildDurableMemoryContext(memories, limit, maxChars).content
+}
+
+func buildDurableMemoryContext(memories []store.Memory, limit, maxChars int) durableMemoryContext {
 	if len(memories) == 0 || limit <= 0 {
-		return ""
+		return durableMemoryContext{}
 	}
 	if limit > maxMemoryContextLimit {
 		limit = maxMemoryContextLimit
@@ -924,6 +994,7 @@ func formatDurableMemoryContextWithLimit(memories []store.Memory, limit, maxChar
 	var sb strings.Builder
 	appendBounded(&sb, durableMemoryContextHeader, maxChars)
 
+	entries := make([]durableMemoryContextEntry, 0, min(len(memories), limit))
 	written := 0
 	for _, memory := range memories {
 		if written >= limit || sb.Len() >= maxChars {
@@ -944,6 +1015,9 @@ func formatDurableMemoryContextWithLimit(memories []store.Memory, limit, maxChar
 		complete := appendBounded(&sb, entry, maxChars)
 		if sb.Len() > before {
 			written++
+			if id := strings.TrimSpace(memory.ID); id != "" {
+				entries = append(entries, durableMemoryContextEntry{id: id, start: before})
+			}
 		}
 		if !complete {
 			break
@@ -951,9 +1025,9 @@ func formatDurableMemoryContextWithLimit(memories []store.Memory, limit, maxChar
 	}
 
 	if written == 0 {
-		return ""
+		return durableMemoryContext{}
 	}
-	return sb.String()
+	return durableMemoryContext{content: sb.String(), entries: entries}
 }
 
 func memoryEligibleForPassiveRecall(memory store.Memory) bool {
@@ -965,10 +1039,39 @@ func memoryEligibleForPassiveRecall(memory store.Memory) bool {
 	}
 }
 
+func prependDurableMemoryContext(
+	ctx context.Context,
+	messages []llm.Message,
+	memoryContext durableMemoryContext,
+) []llm.Message {
+	result, includedBytes, ok := prependDurableMemoryMessageWithStatus(messages, memoryContext.content)
+	if !ok {
+		return result
+	}
+
+	includedIDs := make([]string, 0, len(memoryContext.entries))
+	for _, entry := range memoryContext.entries {
+		if entry.start >= includedBytes {
+			break
+		}
+		includedIDs = append(includedIDs, entry.id)
+	}
+	recordDurableMemoryRecall(ctx, includedIDs)
+	return result
+}
+
 func prependDurableMemoryMessage(messages []llm.Message, memoryContext string) []llm.Message {
+	result, _, _ := prependDurableMemoryMessageWithStatus(messages, memoryContext)
+	return result
+}
+
+func prependDurableMemoryMessageWithStatus(
+	messages []llm.Message,
+	memoryContext string,
+) ([]llm.Message, int, bool) {
 	memoryContext = strings.TrimSpace(memoryContext)
 	if memoryContext == "" {
-		return messages
+		return messages, 0, false
 	}
 
 	taskIndex := -1
@@ -981,12 +1084,12 @@ func prependDurableMemoryMessage(messages []llm.Message, memoryContext string) [
 	if taskIndex < 0 {
 		// Passive memory is useful only as tool data attached to a real user
 		// turn. Without that boundary, fail closed and omit it.
-		return messages
+		return messages, 0, false
 	}
 
-	memoryMessages, ok := passiveMemoryToolMessages(memoryContext)
+	memoryMessages, includedBytes, ok := passiveMemoryToolMessages(memoryContext)
 	if !ok {
-		return messages
+		return messages, 0, false
 	}
 
 	mandatoryBytes := 0
@@ -998,7 +1101,7 @@ func prependDurableMemoryMessage(messages []llm.Message, memoryContext string) [
 	}
 	if mandatoryBytes > maxSessionContextBytes {
 		// Never trade away or truncate the real task to inject passive data.
-		return messages
+		return messages, 0, false
 	}
 
 	remaining := maxSessionContextBytes - mandatoryBytes
@@ -1019,21 +1122,21 @@ func prependDurableMemoryMessage(messages []llm.Message, memoryContext string) [
 	result = append(result, messages[start])
 	result = append(result, memoryMessages...)
 	result = append(result, messages[start+1:]...)
-	return result
+	return result, includedBytes, true
 }
 
-func passiveMemoryToolMessages(memoryContext string) ([]llm.Message, bool) {
+func passiveMemoryToolMessages(memoryContext string) ([]llm.Message, int, bool) {
 	callPayload, err := json.Marshal(passiveMemoryToolPayload{
 		PolicyLabel:          passiveMemoryPolicyLabel,
 		DataClassification:   "untrusted_tool_data",
 		AuthorizationGranted: false,
 	})
 	if err != nil {
-		return nil, false
+		return nil, 0, false
 	}
-	resultPayload, ok := boundedPassiveMemoryToolResult(memoryContext)
+	resultPayload, includedBytes, ok := boundedPassiveMemoryToolResult(memoryContext)
 	if !ok {
-		return nil, false
+		return nil, 0, false
 	}
 
 	return []llm.Message{
@@ -1051,13 +1154,13 @@ func passiveMemoryToolMessages(memoryContext string) ([]llm.Message, bool) {
 			ToolCallID: passiveMemoryToolCallID,
 			Content:    resultPayload,
 		},
-	}, true
+	}, includedBytes, true
 }
 
-func boundedPassiveMemoryToolResult(memoryContext string) (string, bool) {
+func boundedPassiveMemoryToolResult(memoryContext string) (string, int, bool) {
 	memoryContext = strings.TrimSpace(memoryContext)
 	if memoryContext == "" {
-		return "", false
+		return "", 0, false
 	}
 
 	encode := func(content string) (string, bool) {
@@ -1074,24 +1177,26 @@ func boundedPassiveMemoryToolResult(memoryContext string) (string, bool) {
 	}
 
 	if payload, ok := encode(memoryContext); ok {
-		return payload, true
+		return payload, len(memoryContext), true
 	}
 
 	const marker = "\n[passive memory data truncated]"
 	low, high := 1, len(memoryContext)
 	best := ""
+	bestIncludedBytes := 0
 	for low <= high {
 		mid := low + (high-low)/2
-		candidate := truncateWithMarker(memoryContext, mid, marker)
+		candidate, includedBytes := truncateWithMarkerPrefix(memoryContext, mid, marker)
 		payload, fits := encode(candidate)
 		if fits {
 			best = payload
+			bestIncludedBytes = includedBytes
 			low = mid + 1
 		} else {
 			high = mid - 1
 		}
 	}
-	return best, best != ""
+	return best, bestIncludedBytes, best != ""
 }
 
 func durableMemoryMetadata(memory store.Memory) string {
@@ -1149,16 +1254,23 @@ func appendBounded(sb *strings.Builder, value string, maxChars int) bool {
 }
 
 func truncateWithMarker(value string, maxChars int, marker string) string {
+	truncated, _ := truncateWithMarkerPrefix(value, maxChars, marker)
+	return truncated
+}
+
+func truncateWithMarkerPrefix(value string, maxChars int, marker string) (string, int) {
 	if maxChars <= 0 {
-		return ""
+		return "", 0
 	}
 	if len(value) <= maxChars {
-		return value
+		return value, len(value)
 	}
 	if len(marker) >= maxChars {
-		return truncateUTF8(value, maxChars)
+		prefix := truncateUTF8(value, maxChars)
+		return prefix, len(prefix)
 	}
-	return truncateUTF8(value, maxChars-len(marker)) + marker
+	prefix := truncateUTF8(value, maxChars-len(marker))
+	return prefix + marker, len(prefix)
 }
 
 func truncateUTF8(value string, maxBytes int) string {
