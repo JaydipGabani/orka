@@ -64,6 +64,7 @@ func (s *governedSearchStore) ListRemoteMemories(
 		if entry.NamespaceUID != filter.NamespaceUID ||
 			!filter.IncludeDisabled && entry.Disabled || !filter.IncludeDeleted && entry.Deleted ||
 			len(filter.IDs) > 0 && !slices.Contains(filter.IDs, entry.ID) ||
+			len(filter.States) > 0 && !slices.Contains(filter.States, entry.MaterializationState) ||
 			len(filter.Trust) > 0 && !slices.Contains(filter.Trust, entry.Trust) {
 			continue
 		}
@@ -1285,6 +1286,203 @@ func TestRemoteListIncludeDeletedIncludesDisabledTombstone(t *testing.T) {
 	})
 	if err != nil || len(memories) != 1 || memories[0].ID != entry.ID || !memories[0].Deleted {
 		t.Fatalf("ListMemories(includeDeleted) = %#v, err=%v; want tombstone %q", memories, err, entry.ID)
+	}
+}
+
+func TestRemoteSearchIncludeDeletedMergesCompletedTombstonesWithoutHydration(t *testing.T) {
+	const liveMemoryID = "mem-live"
+	now := time.Date(2026, 8, 1, 8, 45, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	liveEntry, liveRecord := remoteSearchFixture(binding, liveMemoryID, now, "needle live", store.MemoryTrustReviewed)
+	disabledEntry, disabledRecord := remoteSearchFixture(binding, "mem-disabled", now.Add(-time.Second), "needle disabled", store.MemoryTrustReviewed)
+	disabledEntry.Disabled = true
+	deletedEntry, deletedRecord := remoteSearchFixture(binding, "mem-deleted", now.Add(-2*time.Second), "stale provider content", store.MemoryTrustReviewed)
+	deletedEntry.Disabled = true
+	deletedEntry.Deleted = true
+	deletedEntry.MaterializationState = store.MemoryMaterializationDeleted
+	deletedEntry.ContentAvailable = false
+	deletedEntry.Tags = []string{"needle"}
+	foreignEntry, foreignRecord := remoteSearchFixture(binding, "mem-foreign-deleted", now.Add(time.Second), "stale foreign content", store.MemoryTrustReviewed)
+	foreignEntry.Disabled = true
+	foreignEntry.Deleted = true
+	foreignEntry.MaterializationState = store.MemoryMaterializationDeleted
+	foreignEntry.ContentAvailable = false
+	foreignEntry.Tags = []string{"needle"}
+
+	for _, test := range []struct {
+		name            string
+		includeDisabled bool
+		wantIDs         []string
+	}{
+		{name: "deleted does not imply disabled live", wantIDs: []string{liveMemoryID, "mem-deleted"}},
+		{name: "disabled live remains independently selectable", includeDisabled: true, wantIDs: []string{liveMemoryID, "mem-disabled", "mem-deleted"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, adapter, activeBinding, governed := remoteSearchService(t,
+				[]store.RemoteMemoryCatalogEntry{foreignEntry, liveEntry, disabledEntry, deletedEntry},
+				[]protocol.MemoryRecord{foreignRecord, deletedRecord, liveRecord, disabledRecord})
+			governed.entries[0].ClusterID = "foreign-cluster"
+			governed.byID[foreignEntry.ID] = governed.entries[0]
+
+			response, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+				Query: "needle", Limit: 4, IncludeDeleted: true, IncludeDisabled: test.includeDisabled,
+			}, SearchContext{RemoteAuthorized: true})
+			if err != nil || response == nil || !response.Complete || !response.Exhausted || response.Cursor != "" {
+				t.Fatalf("Search() = %#v, err=%v", response, err)
+			}
+			gotIDs := make([]string, 0, len(response.Items))
+			seen := make(map[string]struct{}, len(response.Items))
+			for _, item := range response.Items {
+				if _, duplicate := seen[item.Memory.ID]; duplicate {
+					t.Fatalf("Search() returned duplicate %q: %#v", item.Memory.ID, response.Items)
+				}
+				seen[item.Memory.ID] = struct{}{}
+				gotIDs = append(gotIDs, item.Memory.ID)
+			}
+			if !slices.Equal(gotIDs, test.wantIDs) {
+				t.Fatalf("Search() ids = %#v, want %#v", gotIDs, test.wantIDs)
+			}
+			deleted := response.Items[len(response.Items)-1].Memory
+			if !deleted.Deleted || !deleted.Disabled || deleted.Content != "" || deleted.ContentAvailable {
+				t.Fatalf("completed tombstone = %#v", deleted)
+			}
+			if adapter.searchCalls != 1 || adapter.getCalls != 0 {
+				t.Fatalf("provider calls search=%d get=%d, want 1/0", adapter.searchCalls, adapter.getCalls)
+			}
+		})
+	}
+}
+
+func TestRemoteQueriedListIncludeDeletedReturnsCompletedTombstone(t *testing.T) {
+	now := time.Date(2026, 8, 1, 8, 50, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entry, _ := remoteSearchFixture(binding, "mem-deleted", now, "unavailable content", store.MemoryTrustReviewed)
+	entry.Disabled = true
+	entry.Deleted = true
+	entry.MaterializationState = store.MemoryMaterializationDeleted
+	entry.ContentAvailable = false
+	entry.Tags = []string{"needle"}
+	service, adapter, activeBinding, _ := remoteSearchService(t, []store.RemoteMemoryCatalogEntry{entry}, nil)
+
+	page, err := service.ListMemoriesPageWithSearchContext(context.Background(), store.MemoryFilter{
+		Namespace: activeBinding.Namespace, Query: "needle", IncludeDeleted: true, Limit: 1,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || page == nil || len(page.Items) != 1 || page.Items[0].ID != entry.ID ||
+		!page.Items[0].Deleted || !page.Exhausted || !page.Complete || !page.Paginated {
+		t.Fatalf("queried ListMemories() = %#v, err=%v", page, err)
+	}
+	if adapter.searchCalls != 1 || adapter.getCalls != 0 {
+		t.Fatalf("provider calls search=%d get=%d, want 1/0", adapter.searchCalls, adapter.getCalls)
+	}
+}
+
+func TestRemoteSearchIncludeDeletedContinuationKeepsStableTombstoneOrder(t *testing.T) {
+	now := time.Date(2026, 8, 1, 8, 55, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	liveEntry, liveRecord := remoteSearchFixture(binding, "mem-live", now.Add(time.Second), "needle live", store.MemoryTrustReviewed)
+	tombstoneB, _ := remoteSearchFixture(binding, "mem-tomb-b", now, "unavailable", store.MemoryTrustReviewed)
+	tombstoneA, _ := remoteSearchFixture(binding, "mem-tomb-a", now, "unavailable", store.MemoryTrustReviewed)
+	for _, entry := range []*store.RemoteMemoryCatalogEntry{&tombstoneB, &tombstoneA} {
+		entry.Disabled = true
+		entry.Deleted = true
+		entry.MaterializationState = store.MemoryMaterializationDeleted
+		entry.ContentAvailable = false
+		entry.Tags = []string{"needle"}
+	}
+	service, adapter, activeBinding, governed := remoteSearchService(t,
+		[]store.RemoteMemoryCatalogEntry{liveEntry, tombstoneB, tombstoneA}, []protocol.MemoryRecord{liveRecord})
+
+	cursor := ""
+	wantIDs := []string{"mem-live", "mem-tomb-b", "mem-tomb-a"}
+	for i, wantID := range wantIDs {
+		response, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+			Query: "needle", Limit: 1, Cursor: cursor, IncludeDeleted: true,
+		}, SearchContext{RemoteAuthorized: true})
+		if err != nil || response == nil || len(response.Items) != 1 || response.Items[0].Memory.ID != wantID || !response.Complete {
+			t.Fatalf("page %d Search() = %#v, err=%v; want %q", i+1, response, err, wantID)
+		}
+		if i < len(wantIDs)-1 {
+			if response.Exhausted || response.Cursor == "" {
+				t.Fatalf("page %d continuation = %#v", i+1, response)
+			}
+			stored := governed.cursors[response.Cursor]
+			if len(stored.State) == 0 || len(stored.State) > maxRemoteSearchCursorBytes {
+				t.Fatalf("page %d cursor state bytes = %d", i+1, len(stored.State))
+			}
+		} else if !response.Exhausted || response.Cursor != "" {
+			t.Fatalf("final continuation = %#v", response)
+		}
+		cursor = response.Cursor
+	}
+	if adapter.searchCalls != 1 || adapter.getCalls != 0 {
+		t.Fatalf("provider calls search=%d get=%d, want 1/0", adapter.searchCalls, adapter.getCalls)
+	}
+}
+
+func TestRemoteSearchIncludeDeletedPreservesCompletenessAcrossCatalogBudget(t *testing.T) {
+	now := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, maxRemoteSearchCandidates+1)
+	for i := 0; i <= maxRemoteSearchCandidates; i++ {
+		entry, _ := remoteSearchFixture(binding, fmt.Sprintf("mem-%04d", i), now.Add(-time.Duration(i)*time.Second), "unavailable", store.MemoryTrustReviewed)
+		entry.Disabled = true
+		entry.Deleted = true
+		entry.MaterializationState = store.MemoryMaterializationDeleted
+		entry.ContentAvailable = false
+		entry.Tags = []string{"other"}
+		if i == maxRemoteSearchCandidates {
+			entry.Tags = []string{"needle"}
+		}
+		entries = append(entries, entry)
+	}
+	service, adapter, activeBinding, governed := remoteSearchService(t, entries, nil)
+	service.Now = func() time.Time { return now }
+
+	_, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, IncludeDeleted: true,
+	}, SearchContext{RemoteAuthorized: true})
+	var incomplete *IncompleteSearchError
+	if !errors.As(err, &incomplete) || incomplete.Cursor == "" {
+		t.Fatalf("first Search() error = %#v, want incomplete cursor", err)
+	}
+	stored := governed.cursors[incomplete.Cursor]
+	if len(stored.State) == 0 || len(stored.State) > maxRemoteSearchCursorBytes ||
+		!stored.ExpiresAt.Equal(now.Add(remoteSearchCursorTTL)) {
+		t.Fatalf("stored continuation = %#v", stored)
+	}
+	response, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: incomplete.Cursor, IncludeDeleted: true,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || response == nil || len(response.Items) != 1 ||
+		response.Items[0].Memory.ID != entries[len(entries)-1].ID || !response.Exhausted || !response.Complete {
+		t.Fatalf("continued Search() = %#v, err=%v", response, err)
+	}
+	if adapter.searchCalls != 1 || adapter.getCalls != 0 {
+		t.Fatalf("provider calls search=%d get=%d, want 1/0", adapter.searchCalls, adapter.getCalls)
 	}
 }
 

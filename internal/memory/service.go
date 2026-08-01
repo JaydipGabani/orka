@@ -1504,17 +1504,21 @@ func (s *Service) search(
 		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
 			"memory search audit could not be committed")
 	}
-	cursorState, replayPageToken, snapshotExpiresAt, err := loadRemoteSearchContinuation(
+	cursorState, replayPageToken, snapshotExpiresAt, tombstones, err := loadRemoteSearchContinuation(
 		ctx, s.Governed, authority.Binding, queryDigest, request.Cursor, s.now(),
 	)
-	if err != nil {
+	if err != nil || !request.IncludeDeleted && tombstones != nil {
 		return nil, apierror.New(http.StatusBadRequest, "", "invalid or expired memory search cursor")
+	}
+	if tombstones == nil {
+		tombstones = &remoteSearchTombstoneCursor{Exhausted: !request.IncludeDeleted}
 	}
 	target := boundedMemoryLimit(request.Limit)
 	if cursorState.PageSize == 0 {
 		cursorState.PageSize = min(target, protocol.MaxPageSize)
 	}
 	items := make([]SearchHit, 0, target)
+	seen := make(map[string]struct{}, target)
 	actualMode := cursorState.ActualMode
 	if actualMode == "" {
 		actualMode = mode
@@ -1566,7 +1570,7 @@ func (s *Service) search(
 				return nil, hitErr
 			}
 			if eligible {
-				items = append(items, *hit)
+				appendUniqueSearchHit(&items, seen, hit)
 			}
 		}
 		if len(cursorState.Pending) == 0 {
@@ -1620,16 +1624,32 @@ func (s *Service) search(
 				return nil, hitErr
 			}
 			if eligible {
-				items = append(items, *hit)
+				appendUniqueSearchHit(&items, seen, hit)
 			}
 		}
 	}
-	exhausted := cursorState.ProviderExhausted && len(cursorState.Pending) == 0
+	providerExhausted := cursorState.ProviderExhausted && len(cursorState.Pending) == 0
+	// Preserve provider ranking first, then append completed local tombstones in
+	// deterministic catalog order once the immutable provider snapshot is exhausted.
+	if providerExhausted && !tombstones.Exhausted && len(items) < target &&
+		candidates < maxRemoteSearchCandidates && pages < maxRemoteSearchPages {
+		if err := s.appendRemoteSearchTombstones(
+			ctx, authority, request, target, &items, seen, tombstones, &candidates, &pages,
+		); err != nil {
+			return nil, err
+		}
+	}
+	exhausted := providerExhausted && tombstones.Exhausted
 	pageComplete := exhausted || len(items) >= target
 	cursor := ""
 	if !exhausted {
+		var persistedTombstones *remoteSearchTombstoneCursor
+		if request.IncludeDeleted {
+			persistedTombstones = tombstones
+		}
 		cursor, err = saveRemoteSearchContinuation(
-			ctx, s.Governed, authority.Binding, queryDigest, cursorState, replayPageToken, snapshotExpiresAt, s.now(),
+			ctx, s.Governed, authority.Binding, queryDigest, cursorState, replayPageToken,
+			snapshotExpiresAt, persistedTombstones, s.now(),
 		)
 		if err != nil {
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
@@ -1647,13 +1667,93 @@ func (s *Service) search(
 	if len(items) > 0 {
 		ids := make([]string, 0, len(items))
 		for _, item := range items {
-			ids = append(ids, item.Memory.ID)
+			if !item.Memory.Deleted {
+				ids = append(ids, item.Memory.ID)
+			}
 		}
 		_ = s.Governed.MarkRemoteMemoriesRecalled(ctx, authority.NamespaceUID, ids, s.now())
 	}
 	return &SearchResponse{
 		Items: items, ActualMode: actualMode, Cursor: cursor, Exhausted: exhausted, Complete: pageComplete,
 	}, nil
+}
+
+func appendUniqueSearchHit(items *[]SearchHit, seen map[string]struct{}, hit *SearchHit) {
+	if hit == nil || strings.TrimSpace(hit.Memory.ID) == "" {
+		return
+	}
+	if _, exists := seen[hit.Memory.ID]; exists {
+		return
+	}
+	seen[hit.Memory.ID] = struct{}{}
+	*items = append(*items, *hit)
+}
+
+func (s *Service) appendRemoteSearchTombstones(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	request SearchRequest,
+	target int,
+	items *[]SearchHit,
+	seen map[string]struct{},
+	cursor *remoteSearchTombstoneCursor,
+	candidates, pages *int,
+) error {
+	if cursor == nil || cursor.Exhausted {
+		return nil
+	}
+	var beforeUpdatedAt *time.Time
+	beforeID := cursor.BeforeID
+	if !cursor.BeforeUpdatedAt.IsZero() {
+		value := cursor.BeforeUpdatedAt.UTC()
+		beforeUpdatedAt = &value
+	}
+	for len(*items) < target && *candidates < maxRemoteSearchCandidates && *pages < maxRemoteSearchPages {
+		pageSize := min(maxRemoteCatalogLimit, maxRemoteSearchCandidates-*candidates)
+		entries, err := s.Governed.ListRemoteMemories(ctx, store.RemoteMemoryCatalogFilter{
+			NamespaceUID: authority.NamespaceUID, IDs: request.IDs, Trust: request.Trust,
+			IncludeDisabled: true, IncludeDeleted: true,
+			States:          []store.MemoryMaterializationState{store.MemoryMaterializationDeleted},
+			BeforeUpdatedAt: beforeUpdatedAt, BeforeID: beforeID, Limit: pageSize,
+		})
+		if err != nil {
+			return mapStoreError(err)
+		}
+		if len(entries) == 0 {
+			cursor.Exhausted = true
+			return nil
+		}
+		*pages++
+		processed := 0
+		for i := range entries {
+			entry := &entries[i]
+			processed++
+			*candidates++
+			cursor.BeforeUpdatedAt = entry.UpdatedAt.UTC()
+			cursor.BeforeID = entry.ID
+			beforeUpdatedAt = &cursor.BeforeUpdatedAt
+			beforeID = cursor.BeforeID
+			// Deleted provider content is intentionally unavailable. Match only the
+			// locally authoritative metadata and tags; never hydrate a tombstone.
+			if !entryMatchesAuthority(entry, authority.Binding) || !searchEntryEligible(entry, request) ||
+				!keywordCatalogEntryMatches(entry, request.Query) {
+				continue
+			}
+			memory := remoteEntryToMemory(entry, "")
+			appendUniqueSearchHit(items, seen, &SearchHit{Memory: memory})
+			if len(*items) == target || *candidates == maxRemoteSearchCandidates {
+				break
+			}
+		}
+		if processed == len(entries) && len(entries) < pageSize {
+			cursor.Exhausted = true
+			return nil
+		}
+		if len(*items) == target || *candidates == maxRemoteSearchCandidates {
+			return nil
+		}
+	}
+	return nil
 }
 
 func (s *Service) searchLegacy(
@@ -1872,10 +1972,14 @@ func ensureSearchCapability(backend *corev1alpha1.MemoryBackend, mode string) er
 }
 
 func searchEntryEligible(entry *store.RemoteMemoryCatalogEntry, request SearchRequest) bool {
-	if entry == nil || entry.MaterializationState != store.MemoryMaterializationActive {
+	if entry == nil {
 		return false
 	}
-	if entry.Disabled && !request.IncludeDisabled || entry.Deleted && !request.IncludeDeleted {
+	if entry.Deleted || entry.MaterializationState == store.MemoryMaterializationDeleted {
+		if !request.IncludeDeleted || !entry.Deleted || entry.MaterializationState != store.MemoryMaterializationDeleted {
+			return false
+		}
+	} else if entry.MaterializationState != store.MemoryMaterializationActive || entry.Disabled && !request.IncludeDisabled {
 		return false
 	}
 	if len(request.IDs) > 0 && !slices.Contains(request.IDs, entry.ID) {
@@ -1902,27 +2006,31 @@ func searchEntryEligible(entry *store.RemoteMemoryCatalogEntry, request SearchRe
 }
 
 func memoryMatchesSearchRequest(memory store.Memory, request SearchRequest) bool {
+	materializationState := store.MemoryMaterializationActive
+	if memory.Deleted {
+		materializationState = store.MemoryMaterializationDeleted
+	}
 	entry := store.RemoteMemoryCatalogEntry{
 		ID: memory.ID, SessionName: memory.SessionName, AgentName: memory.AgentName,
 		TaskName: memory.TaskName, ParentTask: memory.ParentTask, Source: memory.Source,
 		Tags: memory.Tags, Disabled: memory.Disabled, Deleted: memory.Deleted, Trust: memory.Trust,
-		MaterializationState: store.MemoryMaterializationActive,
+		MaterializationState: materializationState,
 	}
 	return searchEntryEligible(&entry, request)
 }
 
-func keywordRecordMatches(record *protocol.MemoryRecord, entry *store.RemoteMemoryCatalogEntry, query string) bool {
+func keywordCatalogEntryMatches(entry *store.RemoteMemoryCatalogEntry, query string) bool {
 	query = strings.ToLower(strings.TrimSpace(query))
 	if query == "" {
 		return true
 	}
+	if entry == nil {
+		return false
+	}
 	contains := func(value string) bool {
 		return strings.Contains(strings.ToLower(value), query)
 	}
-	if record == nil || entry == nil {
-		return false
-	}
-	if contains(record.Content) || slices.ContainsFunc(entry.Tags, contains) {
+	if slices.ContainsFunc(entry.Tags, contains) {
 		return true
 	}
 	localMetadata := []string{
@@ -1932,14 +2040,36 @@ func keywordRecordMatches(record *protocol.MemoryRecord, entry *store.RemoteMemo
 	return slices.ContainsFunc(localMetadata, contains)
 }
 
+func keywordRecordMatches(record *protocol.MemoryRecord, entry *store.RemoteMemoryCatalogEntry, query string) bool {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return true
+	}
+	if record != nil && strings.Contains(strings.ToLower(record.Content), query) {
+		return true
+	}
+	return keywordCatalogEntryMatches(entry, query)
+}
+
+type remoteSearchTombstoneCursor struct {
+	BeforeUpdatedAt time.Time `json:"t,omitempty"`
+	BeforeID        string    `json:"i,omitempty"`
+	Exhausted       bool      `json:"x,omitempty"`
+}
+
+func (c remoteSearchTombstoneCursor) valid() bool {
+	return c.BeforeUpdatedAt.IsZero() == (strings.TrimSpace(c.BeforeID) == "")
+}
+
 type persistedRemoteSearchCursor struct {
-	ProviderToken     string                     `json:"p"`
-	ProviderExhausted bool                       `json:"x,omitempty"`
-	PageSize          int                        `json:"z"`
-	ActualMode        string                     `json:"m,omitempty"`
-	Pending           []remoteSearchCursorRecord `json:"n,omitempty"`
-	SnapshotExpiresAt time.Time                  `json:"e"`
-	ReplayPageToken   string                     `json:"r,omitempty"`
+	ProviderToken     string                       `json:"p"`
+	ProviderExhausted bool                         `json:"x,omitempty"`
+	PageSize          int                          `json:"z"`
+	ActualMode        string                       `json:"m,omitempty"`
+	Pending           []remoteSearchCursorRecord   `json:"n,omitempty"`
+	SnapshotExpiresAt time.Time                    `json:"e"`
+	ReplayPageToken   string                       `json:"r,omitempty"`
+	Tombstones        *remoteSearchTombstoneCursor `json:"d,omitempty"`
 }
 
 func (p persistedRemoteSearchCursor) cursor() remoteSearchCursor {
@@ -1950,6 +2080,7 @@ func (p persistedRemoteSearchCursor) cursor() remoteSearchCursor {
 	}
 }
 
+//nolint:gocyclo // Cursor persistence validates provider and local-tombstone continuation invariants together.
 func saveRemoteSearchContinuation(
 	ctx context.Context,
 	governed store.GovernedMemoryStore,
@@ -1957,41 +2088,66 @@ func saveRemoteSearchContinuation(
 	queryDigest string,
 	state remoteSearchCursor,
 	replayPageToken string,
-	snapshotExpiresAt, now time.Time,
+	snapshotExpiresAt time.Time,
+	tombstones *remoteSearchTombstoneCursor,
+	now time.Time,
 ) (string, error) {
 	now = now.UTC()
-	snapshotExpiresAt = snapshotExpiresAt.UTC()
-	if governed == nil || binding == nil || (state.ProviderToken == "" && len(state.Pending) == 0) ||
-		!snapshotExpiresAt.After(now) || state.PageSize <= 0 || state.PageSize > protocol.MaxPageSize ||
+	providerContinuation := state.ProviderToken != "" || len(state.Pending) > 0
+	tombstoneContinuation := tombstones != nil && !tombstones.Exhausted
+	if governed == nil || binding == nil || !providerContinuation && !tombstoneContinuation ||
+		state.PageSize <= 0 || state.PageSize > protocol.MaxPageSize ||
 		(state.ActualMode != protocol.SearchModeKeyword && state.ActualMode != protocol.SearchModeSemantic &&
 			state.ActualMode != protocol.SearchModeHybrid) ||
 		len(state.Pending) > protocol.MaxPageSize || (len(state.Pending) > 0) != (replayPageToken != "") ||
 		state.ProviderExhausted != (state.ProviderToken == "") ||
 		(replayPageToken != "" && !state.ProviderExhausted && replayPageToken == state.ProviderToken) ||
-		len(state.ProviderToken) > protocol.MaxPageTokenBytes || len(replayPageToken) > protocol.MaxPageTokenBytes {
+		len(state.ProviderToken) > protocol.MaxPageTokenBytes || len(replayPageToken) > protocol.MaxPageTokenBytes ||
+		tombstones != nil && !tombstones.valid() {
 		return "", errors.New("memory search cursor state is unavailable")
+	}
+	if providerContinuation {
+		snapshotExpiresAt = snapshotExpiresAt.UTC()
+		if !snapshotExpiresAt.After(now) {
+			return "", errors.New("memory search cursor snapshot has expired")
+		}
+	} else {
+		if !state.ProviderExhausted || replayPageToken != "" {
+			return "", errors.New("memory search cursor state is unavailable")
+		}
+		snapshotExpiresAt = time.Time{}
 	}
 	identity, err := protocolBinding(binding)
 	if err != nil {
 		return "", err
 	}
+	var tombstoneState *remoteSearchTombstoneCursor
+	if tombstones != nil {
+		copy := *tombstones
+		tombstoneState = &copy
+	}
 	payload, err := json.Marshal(persistedRemoteSearchCursor{
 		ProviderToken: state.ProviderToken, ProviderExhausted: state.ProviderExhausted,
 		PageSize: state.PageSize, ActualMode: state.ActualMode,
 		Pending: state.Pending, SnapshotExpiresAt: snapshotExpiresAt, ReplayPageToken: replayPageToken,
+		Tombstones: tombstoneState,
 	})
 	if err != nil || len(payload) == 0 || len(payload) > maxRemoteSearchCursorBytes {
 		return "", errors.New("memory search cursor state is invalid")
 	}
-	continuationToken := state.ProviderToken
-	if continuationToken == "" {
-		continuationToken = replayPageToken
-	}
-	expiresAt, ok := (protocol.SearchResponse{
-		NextPageToken: continuationToken, SnapshotExpiresAt: snapshotExpiresAt,
-	}).ContinuationExpiresAt(now.Add(remoteSearchCursorTTL))
-	if !ok || !expiresAt.After(now) {
-		return "", errors.New("memory search cursor snapshot has expired")
+	expiresAt := now.Add(remoteSearchCursorTTL)
+	if providerContinuation {
+		continuationToken := state.ProviderToken
+		if continuationToken == "" {
+			continuationToken = replayPageToken
+		}
+		var ok bool
+		expiresAt, ok = (protocol.SearchResponse{
+			NextPageToken: continuationToken, SnapshotExpiresAt: snapshotExpiresAt,
+		}).ContinuationExpiresAt(expiresAt)
+		if !ok || !expiresAt.After(now) {
+			return "", errors.New("memory search cursor snapshot has expired")
+		}
 	}
 	id := "msc-" + uuid.NewString()
 	if err := governed.SaveMemorySearchCursor(ctx, store.MemorySearchCursorState{
@@ -2011,47 +2167,61 @@ func loadRemoteSearchContinuation(
 	binding *store.MemoryBackendBinding,
 	queryDigest, encoded string,
 	now time.Time,
-) (remoteSearchCursor, string, time.Time, error) {
+) (remoteSearchCursor, string, time.Time, *remoteSearchTombstoneCursor, error) {
 	if strings.TrimSpace(encoded) == "" {
-		return remoteSearchCursor{}, "", time.Time{}, nil
+		return remoteSearchCursor{}, "", time.Time{}, nil, nil
 	}
 	if governed == nil || binding == nil || !strings.HasPrefix(encoded, "msc-") || len(encoded) > 128 {
-		return remoteSearchCursor{}, "", time.Time{}, errors.New("invalid memory search cursor")
+		return remoteSearchCursor{}, "", time.Time{}, nil, errors.New("invalid memory search cursor")
 	}
 	identity, err := protocolBinding(binding)
 	if err != nil {
-		return remoteSearchCursor{}, "", time.Time{}, err
+		return remoteSearchCursor{}, "", time.Time{}, nil, err
 	}
 	now = now.UTC()
 	stored, err := governed.GetMemorySearchCursor(ctx, binding.NamespaceUID, encoded, now)
 	if err != nil {
-		return remoteSearchCursor{}, "", time.Time{}, err
+		return remoteSearchCursor{}, "", time.Time{}, nil, err
 	}
 	if stored.ID != encoded || stored.NamespaceUID != binding.NamespaceUID ||
 		stored.BindingDigest != protocol.BindingDigest(identity) || stored.QueryDigest != queryDigest ||
 		len(stored.State) == 0 || len(stored.State) > maxRemoteSearchCursorBytes {
-		return remoteSearchCursor{}, "", time.Time{}, errors.New("mismatched memory search cursor")
+		return remoteSearchCursor{}, "", time.Time{}, nil, errors.New("mismatched memory search cursor")
 	}
 	var persisted persistedRemoteSearchCursor
 	if err := json.Unmarshal(stored.State, &persisted); err != nil {
-		return remoteSearchCursor{}, "", time.Time{}, errors.New("invalid memory search cursor state")
+		return remoteSearchCursor{}, "", time.Time{}, nil, errors.New("invalid memory search cursor state")
 	}
 	cursor := persisted.cursor()
+	providerContinuation := cursor.ProviderToken != "" || len(cursor.Pending) > 0
+	tombstoneContinuation := persisted.Tombstones != nil && !persisted.Tombstones.Exhausted
 	snapshotExpiresAt := persisted.SnapshotExpiresAt.UTC()
 	if cursor.PageSize <= 0 || cursor.PageSize > protocol.MaxPageSize ||
 		(cursor.ActualMode != protocol.SearchModeKeyword && cursor.ActualMode != protocol.SearchModeSemantic &&
 			cursor.ActualMode != protocol.SearchModeHybrid) ||
-		(cursor.ProviderToken == "" && len(cursor.Pending) == 0) || len(cursor.Pending) > protocol.MaxPageSize ||
+		!providerContinuation && !tombstoneContinuation || len(cursor.Pending) > protocol.MaxPageSize ||
 		(len(cursor.Pending) > 0) != (persisted.ReplayPageToken != "") ||
 		cursor.ProviderExhausted != (cursor.ProviderToken == "") ||
 		(persisted.ReplayPageToken != "" && !cursor.ProviderExhausted && persisted.ReplayPageToken == cursor.ProviderToken) ||
 		len(cursor.ProviderToken) > protocol.MaxPageTokenBytes || len(persisted.ReplayPageToken) > protocol.MaxPageTokenBytes ||
-		!snapshotExpiresAt.After(now) ||
+		persisted.Tombstones != nil && !persisted.Tombstones.valid() ||
 		stored.CreatedAt.After(now) || !stored.ExpiresAt.After(now) || !stored.ExpiresAt.After(stored.CreatedAt) ||
-		stored.ExpiresAt.After(snapshotExpiresAt) || stored.ExpiresAt.Sub(stored.CreatedAt) > remoteSearchCursorTTL {
-		return remoteSearchCursor{}, "", time.Time{}, errors.New("invalid memory search cursor state")
+		stored.ExpiresAt.Sub(stored.CreatedAt) > remoteSearchCursorTTL {
+		return remoteSearchCursor{}, "", time.Time{}, nil, errors.New("invalid memory search cursor state")
 	}
-	return cursor, persisted.ReplayPageToken, snapshotExpiresAt, nil
+	if providerContinuation {
+		if !snapshotExpiresAt.After(now) || stored.ExpiresAt.After(snapshotExpiresAt) {
+			return remoteSearchCursor{}, "", time.Time{}, nil, errors.New("invalid memory search cursor state")
+		}
+	} else if !cursor.ProviderExhausted || persisted.ReplayPageToken != "" || !persisted.SnapshotExpiresAt.IsZero() {
+		return remoteSearchCursor{}, "", time.Time{}, nil, errors.New("invalid memory search cursor state")
+	}
+	var tombstones *remoteSearchTombstoneCursor
+	if persisted.Tombstones != nil {
+		copy := *persisted.Tombstones
+		tombstones = &copy
+	}
+	return cursor, persisted.ReplayPageToken, snapshotExpiresAt, tombstones, nil
 }
 
 func validateRemoteSearchPage(
@@ -2134,7 +2304,8 @@ func (s *Service) searchHit(
 	if err != nil {
 		return nil, false, mapStoreError(err)
 	}
-	if !entryMatchesAuthority(entry, authority.Binding) || !searchEntryEligible(entry, request) {
+	if !entryMatchesAuthority(entry, authority.Binding) || entry.Deleted ||
+		entry.MaterializationState != store.MemoryMaterializationActive || !searchEntryEligible(entry, request) {
 		return nil, false, nil
 	}
 	if record.State != protocol.RecordStateLive || record.UpsertKey != protocol.CanonicalUpsertKey(binding, entry.ID) ||
