@@ -1809,6 +1809,12 @@ func (d *controlDatabase) createSnapshot(
 	if err := tx.Commit(); err != nil {
 		return searchPage{}, err
 	}
+	cleanupSnapshot := true
+	defer func() {
+		if cleanupSnapshot {
+			_ = d.releaseSearchSnapshot(context.WithoutCancel(ctx), snapshotID)
+		}
+	}()
 
 	providerSnapshot, err := store.StartSearch(ctx, ContentSearchRequest{
 		TenantID: request.Binding.TenantID, ProviderStoreID: providerStoreID,
@@ -1816,9 +1822,6 @@ func (d *controlDatabase) createSnapshot(
 		Mode:  request.Mode, Query: request.Query, MaxSnapshotRecords: maxRecords,
 	})
 	if err != nil {
-		if providerFailureDefinitive(err) {
-			_ = d.releaseSnapshotReservation(ctx, snapshotID)
-		}
 		return searchPage{}, err
 	}
 	currentNow := time.Now().UTC()
@@ -1906,6 +1909,7 @@ func (d *controlDatabase) createSnapshot(
 	if err != nil {
 		return searchPage{}, err
 	}
+	cleanupSnapshot = false
 	return pageFromRecords(snapshotID, 0, end, len(entries), providerSnapshot.ActualMode, expiresAt, records), nil
 }
 
@@ -1919,8 +1923,8 @@ func providerFailureNeverApplied(err error) bool {
 	return errors.As(err, &storeErr) && storeErr.NeverApplied
 }
 
-func (d *controlDatabase) releaseSnapshotReservation(ctx context.Context, snapshotID string) error {
-	result, err := d.db.ExecContext(ctx, `DELETE FROM pagination_snapshots WHERE snapshot_id = ? AND state = ?`, snapshotID, snapshotStateReserved)
+func (d *controlDatabase) releaseSearchSnapshot(ctx context.Context, snapshotID string) error {
+	result, err := d.db.ExecContext(ctx, `DELETE FROM pagination_snapshots WHERE snapshot_id = ?`, snapshotID)
 	if err != nil {
 		return err
 	}

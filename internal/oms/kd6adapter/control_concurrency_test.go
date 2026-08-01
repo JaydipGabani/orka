@@ -67,6 +67,15 @@ type blockingSnapshotStore struct {
 	expires time.Time
 }
 
+type failingSearchSnapshotStore struct {
+	ContentStore
+	err error
+}
+
+func (s failingSearchSnapshotStore) StartSearch(context.Context, ContentSearchRequest) (ContentSearchSnapshot, error) {
+	return ContentSearchSnapshot{}, s.err
+}
+
 type blockingTenantGetStore struct {
 	ContentStore
 	blockedTenant      string
@@ -636,7 +645,27 @@ func TestSearchSnapshotQuotaIsReservedBeforeProviderStart(t *testing.T) {
 	}
 }
 
-func TestSearchSnapshotReservationSurvivesFinalizeCrash(t *testing.T) {
+func TestSearchSnapshotReservationReleasedAfterProviderError(t *testing.T) {
+	baseStore, _, closeProvider := newKD6ProviderStore(t)
+	defer closeProvider()
+	now := time.Now().UTC()
+	store := failingSearchSnapshotStore{ContentStore: baseStore, err: errors.New("provider unavailable")}
+	adapter, binding := openKD6ControlTestServer(t, store, filepath.Join(t.TempDir(), "control.db"), func() time.Time { return now })
+	defer adapter.Close() //nolint:errcheck
+	request := &protocol.SearchRequest{ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword, PageSize: 1}
+	if _, err := adapter.db.createSnapshot(context.Background(), store, request, now, func() time.Time { return now }, time.Minute, 1); err == nil {
+		t.Fatal("createSnapshot succeeded despite provider error")
+	}
+	var snapshots int
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots`).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 0 {
+		t.Fatalf("snapshots after provider error = %d, want 0", snapshots)
+	}
+}
+
+func TestSearchSnapshotReservationReleasedAfterFinalizeError(t *testing.T) {
 	baseStore, _, closeProvider := newKD6ProviderStore(t)
 	defer closeProvider()
 	now := time.Now().UTC()
@@ -654,22 +683,12 @@ func TestSearchSnapshotReservationSurvivesFinalizeCrash(t *testing.T) {
 	if _, err := adapter.db.createSnapshot(context.Background(), store, request, now, func() time.Time { return now }, time.Minute, 1); err == nil {
 		t.Fatal("createSnapshot succeeded despite simulated finalize crash")
 	}
-	if err := adapter.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := Open(context.Background(), Config{
-		DatabasePath: path, BearerToken: testInboundToken, ContentStore: baseStore,
-		StoreMappings: map[string]string{testOMSStoreName: fakeProviderStoreID}, Clock: func() time.Time { return now },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close() //nolint:errcheck
+	defer adapter.Close() //nolint:errcheck
 	var reserved int
-	if err := reopened.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots WHERE state = ?`, snapshotStateReserved).Scan(&reserved); err != nil {
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots WHERE state = ?`, snapshotStateReserved).Scan(&reserved); err != nil {
 		t.Fatal(err)
 	}
-	if reserved != 1 {
-		t.Fatalf("durable reserved snapshots after reopen = %d, want 1", reserved)
+	if reserved != 0 {
+		t.Fatalf("reserved snapshots after finalize error = %d, want 0", reserved)
 	}
 }
