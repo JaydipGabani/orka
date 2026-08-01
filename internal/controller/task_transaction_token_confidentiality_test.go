@@ -7,11 +7,13 @@ MIT License - see LICENSE file for details.
 package controller
 
 import (
+	"context"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -111,5 +113,45 @@ func TestWorkloadTokenSecretContainsNoRenewalAuthority(t *testing.T) {
 		if value == authority.Name {
 			t.Fatal("Task annotation exposes the controller-only authority Secret name")
 		}
+	}
+}
+
+func TestTaskTransactionTokenCleanupPreservesPlaceholderReplacement(t *testing.T) {
+	const (
+		parentName     = "parent-task"
+		parentUID      = "parent-task-uid"
+		placeholderUID = "original-placeholder-uid"
+	)
+	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{
+		Name: "delegated-child", Namespace: "children", UID: types.UID("delegated-child-uid"),
+		Labels: map[string]string{labels.LabelParentTask: labels.SelectorValue(parentName)},
+		Annotations: map[string]string{
+			labels.AnnotationParentTaskName:            parentName,
+			labels.AnnotationTransactionTokenSecret:    "delegated-placeholder",
+			transactiontoken.ParentUIDAnnotation:       parentUID,
+			transactiontoken.ParentNamespaceAnnotation: "parents",
+			transactiontoken.PlaceholderUIDAnnotation:  placeholderUID,
+		},
+	}}
+	placeholderLabels := map[string]string{
+		labels.LabelPurpose:    transactiontoken.PlaceholderSecretPurpose,
+		labels.LabelParentTask: labels.SelectorValue(parentName),
+		labels.LabelTaskUID:    labels.SelectorValue(parentUID),
+	}
+	placeholderAnnotations := map[string]string{
+		labels.AnnotationParentTaskName:            parentName,
+		transactiontoken.ParentUIDAnnotation:       parentUID,
+		transactiontoken.ParentNamespaceAnnotation: "parents",
+	}
+	replacement := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: "delegated-placeholder", Namespace: task.Namespace, UID: types.UID("replacement-placeholder-uid"),
+		Labels: placeholderLabels, Annotations: placeholderAnnotations,
+	}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{}}
+	r := newUnitReconciler(newTestScheme(), task, replacement)
+	if err := r.cleanupOwnedTaskTransactionTokenSecret(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(replacement), &corev1.Secret{}); err != nil {
+		t.Fatalf("replacement placeholder was deleted: %v", err)
 	}
 }

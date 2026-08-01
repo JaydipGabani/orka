@@ -9,7 +9,12 @@ MIT License - see LICENSE file for details.
 // provider-specific behavior.
 package transactiontoken
 
-import "time"
+import (
+	"errors"
+	"net/url"
+	"strings"
+	"time"
+)
 
 const (
 	// ProfileName is the only context-token profile accepted by Orka.
@@ -39,6 +44,18 @@ const (
 	WorkloadSecretPurpose = "task-token-workload"
 	// AuthoritySecretPurpose labels the controller-only Secret that retains renewal authority.
 	AuthoritySecretPurpose = "task-token-renewal"
+	// PlaceholderSecretPurpose labels an ownerless delegated-child workload placeholder.
+	PlaceholderSecretPurpose = "task-token-placeholder"
+	// SubjectTokenTypeSecretKey persists the exact subject type used for every renewal.
+	SubjectTokenTypeSecretKey = "subject-token-type"
+	// RequestDetailsSecretKey persists safe delegated request_details for later controller exchange.
+	RequestDetailsSecretKey = "request-details"
+	// ParentUIDAnnotation binds an ownerless placeholder to the exact parent Task UID.
+	ParentUIDAnnotation = "orka.ai/transaction-token-parent-uid"
+	// ParentNamespaceAnnotation binds an ownerless placeholder to the exact parent Task namespace.
+	ParentNamespaceAnnotation = "orka.ai/transaction-token-parent-namespace"
+	// PlaceholderUIDAnnotation binds delegated cleanup to the exact placeholder Secret instance.
+	PlaceholderUIDAnnotation = "orka.ai/transaction-token-placeholder-uid"
 
 	// MinimumProjectedTokenRequestedTTL is the minimum requested TTS lifetime for tokens delivered through Kubernetes Secret volumes.
 	MinimumProjectedTokenRequestedTTL = 5 * time.Minute
@@ -63,4 +80,17 @@ type Claims struct {
 	RequestingWorkload string         `json:"req_wl"`
 	TransactionContext map[string]any `json:"tctx,omitempty"`
 	RequesterContext   map[string]any `json:"rctx,omitempty"`
+}
+
+// ValidateSubjectTokenType verifies the RFC 8693 subject token type is a
+// non-empty absolute URI with no surrounding or embedded whitespace.
+func ValidateSubjectTokenType(value string) error {
+	if value == "" || strings.TrimSpace(value) != value || strings.ContainsAny(value, " \t\r\n") {
+		return errors.New("transaction token subject token type is invalid")
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" {
+		return errors.New("transaction token subject token type is invalid")
+	}
+	return nil
 }

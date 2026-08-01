@@ -1052,14 +1052,16 @@ func TestKD6AdapterSearchSnapshotQuotas(t *testing.T) {
 	maximumContent := strings.Repeat("\n", protocol.MaxContentBytes)
 	mutation := newKD6TestMutation(t, binding, "mop-snapshot-quota", "mem-snapshot-quota", maximumContent)
 	postOMS(t, endpoint.URL, protocol.PathMutations, mutation)
+	secondMutation := newKD6TestMutation(t, binding, "mop-snapshot-quota-second", "mem-snapshot-quota-second", "second record")
+	postOMS(t, endpoint.URL, protocol.PathMutations, secondMutation)
 	request := protocol.SearchRequest{
 		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword,
 		Query: "", PageSize: 1, PageToken: "",
 	}
 	for i := range maxActiveSearchSnapshotsPerAuthority {
 		response, decodeErr := protocol.DecodeSearchResponse(postOMS(t, endpoint.URL, protocol.PathSearch, request))
-		if decodeErr != nil || len(response.Records) != 1 || response.Records[0].Content != maximumContent {
-			t.Fatalf("maximum-content search %d = %#v, err = %v", i, response, decodeErr)
+		if decodeErr != nil || len(response.Records) != 1 || response.Exhausted || response.NextPageToken == "" {
+			t.Fatalf("continuable search %d = %#v, err = %v", i, response, decodeErr)
 		}
 	}
 	provider.mu.Lock()

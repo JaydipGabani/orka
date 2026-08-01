@@ -9,7 +9,6 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"net/http/httptest"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,7 +18,6 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/contexttoken"
 	"github.com/orka-agents/orka/internal/labels"
-	"github.com/orka-agents/orka/internal/transactiontoken"
 	"github.com/orka-agents/orka/internal/workerenv"
 )
 
@@ -324,64 +322,33 @@ func TestCreateContainerTaskTool_Execute(t *testing.T) {
 func TestCreateContainerTaskTool_ExecuteCoordination_BindsTTSChildTokenToCreatedTask(t *testing.T) {
 	t.Setenv(envOrkaTaskName, parentTaskName)
 	t.Setenv(envOrkaTaskNamespace, defaultNamespace)
-
-	issuer := newTransactionTokenIssuer(t)
-	jwksServer := httptest.NewServer(issuer.JWKSHandler())
-	defer jwksServer.Close()
 	exchange := &childTokenExchange{}
+	issuer := newTransactionTokenIssuer(t)
 	ttsServer := startChildTransactionTokenServer(t, issuer, exchange)
 	defer ttsServer.Close()
-
 	t.Setenv(workerenv.ContextTokenTTSEndpoint, ttsServer.URL+"/token_endpoint")
 	t.Setenv(workerenv.ContextTokenTTSTokenSource, contexttoken.TTSTokenSourceIncoming)
-	t.Setenv(workerenv.ContextTokenTTSAudience, childTransactionAudience)
 	t.Setenv(workerenv.ContextTokenSubjectTokenFile, writeTestSubjectToken(t))
 	t.Setenv(workerenv.ContextTokenChildScope, childTransactionScope)
 
-	parent := parentTask()
-	fc := newFakeClient(parent)
-	tool := NewCreateContainerTaskTool(fc)
-	result, err := tool.Execute(context.Background(), json.RawMessage(`{"image":"busybox","command":["echo"],"args":["hello"]}`))
+	fc := newFakeClient(parentTask())
+	result, err := NewCreateContainerTaskTool(fc).Execute(context.Background(), json.RawMessage(`{"image":"busybox","command":["echo"],"args":["hello"]}`))
 	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+		t.Fatal(err)
 	}
 	parsed := parseContainerTaskToolResult(t, result)
-	if !parsed.Success {
-		t.Fatalf("Execute() result = %#v", parsed)
-	}
-	resultData, ok := parsed.Data.(map[string]any)
-	if !ok {
-		t.Fatalf("Execute() data = %#v, want object", parsed.Data)
-	}
-	childName, _ := resultData[nameField].(string)
-	if childName == "" {
-		t.Fatalf("Execute() data = %#v, want child task name", resultData)
-	}
+	data := parsed.Data.(map[string]any)
 	child := &corev1alpha1.Task{}
-	if err := fc.Get(context.Background(), client.ObjectKey{Name: childName, Namespace: defaultNamespace}, child); err != nil {
-		t.Fatalf("get child task: %v", err)
+	if err := fc.Get(context.Background(), client.ObjectKey{Name: data[nameField].(string), Namespace: defaultNamespace}, child); err != nil {
+		t.Fatal(err)
 	}
-	if !exchange.called.Load() {
-		t.Fatal("expected child transaction token exchange")
+	if exchange.called.Load() {
+		t.Fatal("delegated container performed one-shot TTS exchange")
 	}
-	if exchange.subjectToken != "parent-tx-token" || exchange.subjectTokenTyp != transactiontoken.SubjectTokenTypeTransactionToken {
-		t.Fatalf("subject token exchange = %#v", exchange)
+	if child.Annotations[labels.AnnotationTransactionTokenPending] != trueStr {
+		t.Fatal("delegated container is not gated pending controller exchange")
 	}
-	if exchange.requestDetails["operation"] != "createContainerTask" ||
-		exchange.requestDetails["txn"] != parentTransactionID ||
-		exchange.requestDetails[namespaceField] != child.Namespace ||
-		exchange.requestDetails["taskName"] != child.Name ||
-		exchange.requestDetails["taskUID"] != string(child.UID) {
-		t.Fatalf("request_details = %#v, want created child identity", exchange.requestDetails)
-	}
-	if _, ok := child.Annotations[labels.AnnotationTransactionTokenPending]; ok {
-		t.Fatalf("child transaction token pending annotation was not removed: %#v", child.Annotations)
-	}
-	secretName := child.Annotations[labels.AnnotationTransactionTokenSecret]
-	if secretName == "" {
-		t.Fatal("expected child transaction token secret annotation")
-	}
-	requireAdoptedChildTransactionTokenSecret(t, fc, child, secretName, jwksServer.URL)
+	requireRenewableChildTransactionSecrets(t, fc, child, child.Annotations[labels.AnnotationTransactionTokenSecret], "parent-tx-token")
 }
 
 func TestCreateContainerTaskTool_ExecuteCoordination_InheritsParentProvenance(t *testing.T) {

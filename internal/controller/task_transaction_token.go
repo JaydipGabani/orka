@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -30,14 +31,18 @@ import (
 )
 
 const (
-	taskTransactionTokenOwnerKind       = "Task"
-	taskTokenRequestOperationKey        = "operation"
-	taskTokenRequestOperationCreateTask = "createTask"
-	taskTokenRequestNamespaceKey        = "namespace"
-	taskTokenRequestTaskNameKey         = "taskName"
-	taskTokenRequestTaskUIDKey          = "taskUID"
-	taskTokenRequestTransactionIDKey    = "txn"
-	taskTokenRequestRotationKey         = "rotation"
+	taskTransactionTokenOwnerKind                = "Task"
+	taskTokenRequestOperationKey                 = "operation"
+	taskTokenRequestOperationCreateTask          = "createTask"
+	taskTokenRequestOperationDelegateTask        = "delegateTask"
+	taskTokenRequestOperationCreateContainerTask = "createContainerTask"
+	taskTokenRequestNamespaceKey                 = "namespace"
+	taskTokenRequestTaskNameKey                  = "taskName"
+	taskTokenRequestTaskUIDKey                   = "taskUID"
+	taskTokenRequestTransactionIDKey             = "txn"
+	taskTokenRequestRotationKey                  = "rotation"
+	taskTokenRequestParentTaskKey                = "parentTask"
+	taskTokenRequestAgentKey                     = "agent"
 
 	taskTokenExpiresAtSecretKey  = "token-expires-at"
 	taskTokenRefreshAtSecretKey  = "token-refresh-at"
@@ -78,17 +83,23 @@ func (r *TaskReconciler) reconcilePendingTaskTransactionToken(
 	if err != nil || wait {
 		return false, false, err
 	}
+	taskToken := strings.TrimSpace(string(workloadSecret.Data[transactiontoken.TokenSecretKey]))
+	directWorkload := directTaskTokenWorkloadSecret(task, workloadSecret)
+	if !directWorkload && taskToken == "" {
+		// Delegated child creation starts with an empty ownerless placeholder.
+		// Wait only when it is exactly bound to this child's parent identity.
+		if delegatedTokenPlaceholderForTask(task, workloadSecret) {
+			return false, false, nil
+		}
+		return false, true, errors.New("delegated task transaction token placeholder identity is invalid")
+	}
 	if !taskOwnsTransactionTokenSecret(task, workloadSecret) {
 		return false, true, errors.New("task transaction token Secret is not owned by the pending task")
 	}
 	if workloadSecret.Type != corev1.SecretTypeOpaque {
 		return false, true, errors.New("task transaction token Secret has an invalid type")
 	}
-
-	taskToken := strings.TrimSpace(string(workloadSecret.Data[transactiontoken.TokenSecretKey]))
-	if !directTaskTokenWorkloadSecret(task, workloadSecret) {
-		// Delegated child creation uses an empty placeholder Secret and completes
-		// adoption synchronously in the creating worker.
+	if !directWorkload {
 		return taskToken != "", false, nil
 	}
 	authoritySecret, err := r.taskTransactionRenewalAuthoritySecret(ctx, task)
@@ -172,8 +183,14 @@ func (r *TaskReconciler) taskTransactionRenewalAuthoritySecret(
 		authority.Labels[labels.LabelTaskUID] != labels.SelectorValue(string(task.UID)) {
 		return nil, errors.New("task transaction renewal authority metadata is invalid")
 	}
-	if len(authority.Data) != 1 || strings.TrimSpace(string(authority.Data[transactiontoken.SubjectSecretKey])) == "" {
+	if len(authority.Data) != 3 || strings.TrimSpace(string(authority.Data[transactiontoken.SubjectSecretKey])) == "" {
 		return nil, errors.New("task transaction renewal authority data is invalid")
+	}
+	if err := transactiontoken.ValidateSubjectTokenType(string(authority.Data[transactiontoken.SubjectTokenTypeSecretKey])); err != nil {
+		return nil, err
+	}
+	if _, err := taskTransactionTokenAuthorityRequestDetails(task, authority); err != nil {
+		return nil, err
 	}
 	return authority, nil
 }
@@ -196,12 +213,9 @@ func (r *TaskReconciler) rotateTaskTransactionToken(
 	if config == nil || config.Exchanger == nil || !config.TTS.Enabled() {
 		return time.Time{}, errors.New("task transaction token exchange is not configured")
 	}
-	if config.TTS.TokenSource != contexttoken.TTSTokenSourceIncoming {
-		return time.Time{}, fmt.Errorf("task transaction token exchange requires %q token source", contexttoken.TTSTokenSourceIncoming)
-	}
-	subjectTokenType := strings.TrimSpace(config.SubjectTokenType)
-	if subjectTokenType == "" {
-		subjectTokenType = contexttoken.SubjectTokenTypeForSource(contexttoken.TTSTokenSourceIncoming)
+	subjectTokenType := string(authoritySecret.Data[transactiontoken.SubjectTokenTypeSecretKey])
+	if err := transactiontoken.ValidateSubjectTokenType(subjectTokenType); err != nil {
+		return time.Time{}, err
 	}
 	generation, err := taskTokenGeneration(workloadSecret)
 	if err != nil {
@@ -211,16 +225,11 @@ func (r *TaskReconciler) rotateTaskTransactionToken(
 		return time.Time{}, errors.New("task transaction token generation is exhausted")
 	}
 	nextGeneration := generation + 1
-	requestDetails := map[string]any{
-		taskTokenRequestOperationKey: taskTokenRequestOperationCreateTask,
-		taskTokenRequestNamespaceKey: task.Namespace,
-		taskTokenRequestTaskNameKey:  task.Name,
-		taskTokenRequestTaskUIDKey:   string(task.UID),
-		taskTokenRequestRotationKey:  nextGeneration,
+	requestDetails, err := taskTransactionTokenAuthorityRequestDetails(task, authoritySecret)
+	if err != nil {
+		return time.Time{}, err
 	}
-	if transactionID := strings.TrimSpace(task.Spec.Transaction.ID); transactionID != "" {
-		requestDetails[taskTokenRequestTransactionIDKey] = transactionID
-	}
+	requestDetails[taskTokenRequestRotationKey] = nextGeneration
 	taskToken, err := config.Exchanger.Exchange(ctx, contexttoken.ExchangeRequest{
 		SubjectToken:     subjectToken,
 		SubjectTokenType: subjectTokenType,
@@ -242,7 +251,7 @@ func (r *TaskReconciler) rotateTaskTransactionToken(
 	}
 	remaining := expiresAt.Sub(now)
 	minimumLifetime := taskTokenMinimumRotationLifetime
-	if task.Spec.Type == corev1alpha1.TaskTypeAI {
+	if task.Spec.Type == corev1alpha1.TaskTypeAI || task.Spec.Type == corev1alpha1.TaskTypeContainer {
 		minimumLifetime = transactiontoken.MinimumProjectedTokenRemainingLifetime
 	}
 	if remaining < minimumLifetime {
@@ -256,6 +265,89 @@ func (r *TaskReconciler) rotateTaskTransactionToken(
 		taskTokenGenerationSecretKey:    []byte(strconv.FormatUint(nextGeneration, 10)),
 	}
 	return r.persistTaskTokenRotation(ctx, task, workloadSecret, generation, nextGeneration, refreshAt)
+}
+
+func taskTransactionTokenAuthorityRequestDetails(
+	task *corev1alpha1.Task,
+	authority *corev1.Secret,
+) (map[string]any, error) {
+	if task == nil || authority == nil {
+		return nil, errors.New("task transaction token request details are unavailable")
+	}
+	raw := authority.Data[transactiontoken.RequestDetailsSecretKey]
+	if len(raw) == 0 {
+		return nil, errors.New("task transaction token request details are missing")
+	}
+	var details map[string]any
+	if err := json.Unmarshal(raw, &details); err != nil || details == nil {
+		return nil, errors.New("task transaction token request details are invalid")
+	}
+	requireString := func(key, expected string) bool {
+		actual, ok := details[key].(string)
+		return ok && actual == expected
+	}
+	if !requireString(taskTokenRequestNamespaceKey, task.Namespace) ||
+		!requireString(taskTokenRequestTaskNameKey, task.Name) ||
+		!requireString(taskTokenRequestTaskUIDKey, string(task.UID)) {
+		return nil, errors.New("task transaction token request details identity is invalid")
+	}
+	expectedOperation := taskTokenRequestOperationCreateTask
+	parentTask := labels.ParentTaskName(task.Labels, task.Annotations)
+	if parentTask != "" {
+		expectedOperation = taskTokenRequestOperationDelegateTask
+		if task.Spec.Type == corev1alpha1.TaskTypeContainer {
+			expectedOperation = taskTokenRequestOperationCreateContainerTask
+		}
+		if !requireString(taskTokenRequestParentTaskKey, parentTask) {
+			return nil, errors.New("task transaction token request details parent identity is invalid")
+		}
+	}
+	if !requireString(taskTokenRequestOperationKey, expectedOperation) {
+		return nil, errors.New("task transaction token request details operation is invalid")
+	}
+	if task.Spec.Transaction != nil {
+		if transactionID := strings.TrimSpace(task.Spec.Transaction.ID); transactionID != "" &&
+			!requireString(taskTokenRequestTransactionIDKey, transactionID) {
+			return nil, errors.New("task transaction token request details transaction is invalid")
+		}
+	}
+	if parentTask != "" && task.Spec.AgentRef != nil {
+		if agent := strings.TrimSpace(task.Spec.AgentRef.Name); agent != "" && !requireString(taskTokenRequestAgentKey, agent) {
+			return nil, errors.New("task transaction token request details agent is invalid")
+		}
+	}
+	delete(details, taskTokenRequestRotationKey)
+	return details, nil
+}
+
+func taskTransactionTokenRequestDetails(task *corev1alpha1.Task, generation uint64) map[string]any {
+	operation := taskTokenRequestOperationCreateTask
+	details := map[string]any{
+		taskTokenRequestNamespaceKey: task.Namespace,
+		taskTokenRequestTaskNameKey:  task.Name,
+		taskTokenRequestTaskUIDKey:   string(task.UID),
+		taskTokenRequestRotationKey:  generation,
+	}
+	if parentTask := labels.ParentTaskName(task.Labels, task.Annotations); parentTask != "" {
+		details[taskTokenRequestParentTaskKey] = parentTask
+		if task.Spec.Type == corev1alpha1.TaskTypeContainer {
+			operation = taskTokenRequestOperationCreateContainerTask
+		} else {
+			operation = taskTokenRequestOperationDelegateTask
+		}
+		if task.Spec.AgentRef != nil {
+			if agent := strings.TrimSpace(task.Spec.AgentRef.Name); agent != "" {
+				details[taskTokenRequestAgentKey] = agent
+			}
+		}
+	}
+	details[taskTokenRequestOperationKey] = operation
+	if task.Spec.Transaction != nil {
+		if transactionID := strings.TrimSpace(task.Spec.Transaction.ID); transactionID != "" {
+			details[taskTokenRequestTransactionIDKey] = transactionID
+		}
+	}
+	return details
 }
 
 func (r *TaskReconciler) persistTaskTokenRotation(
@@ -335,7 +427,8 @@ func (r *TaskReconciler) reconcileActiveTaskTransactionToken(
 	now time.Time,
 ) (refreshAfter time.Duration, fatal bool, err error) {
 	if task == nil || task.Spec.Transaction == nil || task.Annotations == nil ||
-		(task.Spec.Type != corev1alpha1.TaskTypeAI && task.Spec.Type != corev1alpha1.TaskTypeAgent) {
+		(task.Spec.Type != corev1alpha1.TaskTypeAI && task.Spec.Type != corev1alpha1.TaskTypeAgent &&
+			task.Spec.Type != corev1alpha1.TaskTypeContainer) {
 		return 0, false, nil
 	}
 	secretName := strings.TrimSpace(task.Annotations[labels.AnnotationTransactionTokenSecret])
@@ -493,10 +586,50 @@ func (r *TaskReconciler) clearPendingTaskTransactionToken(ctx context.Context, t
 	patch := client.MergeFrom(task.DeepCopy())
 	delete(task.Annotations, labels.AnnotationTransactionTokenPending)
 	delete(task.Annotations, labels.AnnotationTransactionTokenPendingSince)
+	delete(task.Annotations, transactiontoken.ParentUIDAnnotation)
+	delete(task.Annotations, transactiontoken.ParentNamespaceAnnotation)
+	delete(task.Annotations, transactiontoken.PlaceholderUIDAnnotation)
 	if err := r.Patch(ctx, task, patch); err != nil {
 		return fmt.Errorf("clearing task transaction token pending state: %w", err)
 	}
 	return nil
+}
+
+func delegatedTokenPlaceholderForTask(task *corev1alpha1.Task, secret *corev1.Secret) bool {
+	if task == nil || secret == nil || secret.Type != corev1.SecretTypeOpaque || len(secret.Data) != 0 ||
+		len(secret.OwnerReferences) != 0 || task.Annotations == nil {
+		return false
+	}
+	parentName := labels.ParentTaskName(task.Labels, task.Annotations)
+	parentUID := strings.TrimSpace(task.Annotations[transactiontoken.ParentUIDAnnotation])
+	parentNamespace := strings.TrimSpace(task.Annotations[transactiontoken.ParentNamespaceAnnotation])
+	placeholderUID := strings.TrimSpace(task.Annotations[transactiontoken.PlaceholderUIDAnnotation])
+	if parentName == "" || parentUID == "" || parentNamespace == "" || placeholderUID == "" ||
+		string(secret.UID) != placeholderUID {
+		return false
+	}
+	expectedLabels := map[string]string{
+		labels.LabelPurpose:    transactiontoken.PlaceholderSecretPurpose,
+		labels.LabelParentTask: labels.SelectorValue(parentName),
+		labels.LabelTaskUID:    labels.SelectorValue(parentUID),
+	}
+	expectedAnnotations := map[string]string{
+		labels.AnnotationParentTaskName:            parentName,
+		transactiontoken.ParentUIDAnnotation:       parentUID,
+		transactiontoken.ParentNamespaceAnnotation: parentNamespace,
+	}
+	return maps.Equal(secret.Labels, expectedLabels) && maps.Equal(secret.Annotations, expectedAnnotations)
+}
+
+func (r *TaskReconciler) deleteTaskTransactionTokenSecret(ctx context.Context, secret *corev1.Secret) error {
+	if secret == nil {
+		return nil
+	}
+	if secret.UID == "" {
+		return errors.New("task transaction token Secret UID is unavailable")
+	}
+	uid := secret.UID
+	return r.Delete(ctx, secret, client.Preconditions{UID: &uid})
 }
 
 func (r *TaskReconciler) cleanupOwnedTaskTransactionTokenSecret(ctx context.Context, task *corev1alpha1.Task) error {
@@ -512,8 +645,8 @@ func (r *TaskReconciler) cleanupOwnedTaskTransactionTokenSecret(ctx context.Cont
 				if !apierrors.IsNotFound(err) {
 					cleanupErrors = append(cleanupErrors, fmt.Errorf("reading task transaction token Secret for cleanup: %w", err))
 				}
-			} else if taskOwnsTransactionTokenSecret(task, workloadSecret) {
-				if err := r.Delete(ctx, workloadSecret); err != nil && !apierrors.IsNotFound(err) {
+			} else if taskOwnsTransactionTokenSecret(task, workloadSecret) || delegatedTokenPlaceholderForTask(task, workloadSecret) {
+				if err := r.deleteTaskTransactionTokenSecret(ctx, workloadSecret); err != nil && !apierrors.IsNotFound(err) {
 					cleanupErrors = append(cleanupErrors, fmt.Errorf("deleting task transaction token Secret: %w", err))
 				}
 			}
@@ -535,7 +668,7 @@ func (r *TaskReconciler) cleanupOwnedTaskTransactionTokenSecret(ctx context.Cont
 				if !taskOwnsTransactionTokenSecret(task, authority) {
 					continue
 				}
-				if err := r.Delete(ctx, authority); err != nil && !apierrors.IsNotFound(err) {
+				if err := r.deleteTaskTransactionTokenSecret(ctx, authority); err != nil && !apierrors.IsNotFound(err) {
 					cleanupErrors = append(cleanupErrors, fmt.Errorf("deleting task transaction renewal authority: %w", err))
 				}
 			}

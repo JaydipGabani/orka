@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/outboundaccess"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/transactiontoken"
 	"github.com/orka-agents/orka/internal/workerenv"
 	"github.com/orka-agents/orka/workers/common"
 	"github.com/orka-agents/orka/workers/harness/cliwrapper"
@@ -1346,6 +1348,172 @@ func TestHarnessWrapperBrokeredCoordinationDelegateTaskCreatesChild(t *testing.T
 	}
 	if childCount != 1 {
 		t.Fatalf("child task count = %d, want 1; tasks=%#v", childCount, tasks.Items)
+	}
+}
+
+//nolint:gocyclo // End-to-end brokered delegation test covers child creation, Secret adoption, and controller exchange.
+func TestHarnessWrapperBrokeredTransactionalDelegationCreatesRenewableChildToken(t *testing.T) {
+	task, agent := harnessWrapperTaskAndAgent()
+	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "runtime"}}
+	agent.Spec.Coordination = &corev1alpha1.CoordinationConfig{
+		Enabled: true, MaxDepth: 3,
+		AllowedAgents: []corev1alpha1.AllowedAgent{{Name: "worker-agent"}},
+	}
+	task.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"delegate_task"}}
+	task.Spec.Transaction = &corev1alpha1.TaskTransaction{
+		ID: "txn-brokered-parent", Scope: directTokenMemoryReadScope,
+		Scopes: []string{directTokenMemoryReadScope},
+	}
+	parentToken := taskTokenJWTForTest(t, time.Now().Add(10*time.Minute), "brokered-parent")
+	parentWorkload := directTaskTokenWorkloadSecretForTest(task, "brokered-parent-token")
+	setRenewableTaskTokenSecret(parentWorkload, parentToken, time.Now().Add(2*time.Minute), 1)
+	task.Annotations = map[string]string{labels.AnnotationTransactionTokenSecret: parentWorkload.Name}
+	targetAgent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-agent", Namespace: task.Namespace},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "child-runtime"},
+		}},
+	}
+	r := newUnitReconciler(newTestScheme(), task, agent, targetAgent, parentWorkload)
+	baseClient := r.Client.(ctrlclient.WithWatch)
+	r.APIReader = baseClient
+	r.Client = interceptor.NewClient(baseClient, interceptor.Funcs{
+		Create: func(ctx context.Context, c ctrlclient.WithWatch, object ctrlclient.Object, opts ...ctrlclient.CreateOption) error {
+			if child, ok := object.(*corev1alpha1.Task); ok && child.Name == "" {
+				child.Name = child.GenerateName + "brokered"
+				child.GenerateName = ""
+			}
+			if object.GetUID() == "" {
+				object.SetUID(types.UID("uid-" + object.GetName()))
+			}
+			return c.Create(ctx, object, opts...)
+		},
+	})
+	r.JobBuilder.ContextTokenChildScope = directTokenMemoryReadScope
+	childToken := taskTokenJWTForTest(t, time.Now().Add(10*time.Minute), "brokered-child")
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{childToken}}
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+	frame := harness.HarnessEventFrame{
+		Version: harness.ProtocolVersion, Type: harness.FrameToolCallRequested,
+		RuntimeSessionID: "runtime-session", TurnID: "turn", CorrelationID: "corr", Seq: 1,
+		ToolName: "delegate_task", ToolCallID: "call-delegate-transactional",
+		Content: json.RawMessage(`{"agent":"worker-agent","prompt":"investigate"}`),
+	}
+	result, err := r.handleHarnessBrokeredToolCall(context.Background(), task, agent, frame)
+	if err != nil || result.Error != nil {
+		t.Fatalf("brokered transactional delegate = %#v, %v", result, err)
+	}
+	var delegated struct {
+		TaskName string `json:"taskName"`
+	}
+	if err := json.Unmarshal(result.Output, &delegated); err != nil || delegated.TaskName == "" {
+		t.Fatalf("delegate output = %s, %v", result.Output, err)
+	}
+	child := &corev1alpha1.Task{}
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: task.Namespace, Name: delegated.TaskName}, child); err != nil {
+		t.Fatal(err)
+	}
+	if child.Annotations[labels.AnnotationTransactionTokenPending] != scheduledRunLabelValue ||
+		child.Annotations[labels.AnnotationTransactionTokenSecret] == "" {
+		t.Fatalf("delegated child is not pending token setup: %#v", child.Annotations)
+	}
+	workload := &corev1.Secret{}
+	if err := r.Get(context.Background(), types.NamespacedName{
+		Namespace: child.Namespace, Name: child.Annotations[labels.AnnotationTransactionTokenSecret],
+	}, workload); err != nil {
+		t.Fatal(err)
+	}
+	if !taskOwnsTransactionTokenSecret(child, workload) || len(workload.Data) != 0 {
+		t.Fatalf("delegated workload Secret = %#v", workload)
+	}
+	authorities := &corev1.SecretList{}
+	if err := r.List(context.Background(), authorities, ctrlclient.InNamespace(child.Namespace), ctrlclient.MatchingLabels{
+		labels.LabelPurpose: transactiontoken.AuthoritySecretPurpose,
+		labels.LabelTaskUID: labels.SelectorValue(string(child.UID)),
+	}); err != nil || len(authorities.Items) != 1 {
+		t.Fatalf("delegated renewal authorities = %d, %v", len(authorities.Items), err)
+	}
+	authority := &authorities.Items[0]
+	if string(authority.Data[transactiontoken.SubjectSecretKey]) != parentToken ||
+		string(authority.Data[transactiontoken.SubjectTokenTypeSecretKey]) != transactiontoken.SubjectTokenTypeTransactionToken {
+		t.Fatal("delegated renewal authority did not preserve the brokered parent token")
+	}
+
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: child.Namespace, Name: child.Name}}
+	for attempt := range 4 {
+		if _, err := r.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("child token reconciliation %d: %v", attempt+1, err)
+		}
+		if err := r.Get(context.Background(), ctrlclient.ObjectKeyFromObject(child), child); err != nil {
+			t.Fatal(err)
+		}
+		if _, pending := child.Annotations[labels.AnnotationTransactionTokenPending]; !pending {
+			break
+		}
+	}
+	if _, pending := child.Annotations[labels.AnnotationTransactionTokenPending]; pending {
+		t.Fatalf("child token setup remained pending: %#v", child.Annotations)
+	}
+	if err := r.Get(context.Background(), ctrlclient.ObjectKeyFromObject(workload), workload); err != nil {
+		t.Fatal(err)
+	}
+	if string(workload.Data[transactiontoken.TokenSecretKey]) != childToken || exchanger.calls != 1 {
+		t.Fatalf("child workload token/calls = %q/%d", workload.Data[transactiontoken.TokenSecretKey], exchanger.calls)
+	}
+	requestDetails := exchanger.requests[0].RequestDetails
+	if requestDetails[taskTokenRequestOperationKey] != taskTokenRequestOperationDelegateTask ||
+		requestDetails[taskTokenRequestParentTaskKey] != task.Name ||
+		requestDetails[taskTokenRequestAgentKey] != targetAgent.Name ||
+		requestDetails[taskTokenRequestTaskNameKey] != child.Name ||
+		requestDetails[taskTokenRequestTaskUIDKey] != string(child.UID) {
+		t.Fatalf("brokered child request details = %#v", requestDetails)
+	}
+}
+
+func TestHarnessWrapperBrokeredTransactionalDelegationRequiresProvisioning(t *testing.T) {
+	task, agent := harnessWrapperTaskAndAgent()
+	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "runtime"}}
+	agent.Spec.Coordination = &corev1alpha1.CoordinationConfig{
+		Enabled: true, MaxDepth: 3,
+		AllowedAgents: []corev1alpha1.AllowedAgent{{Name: "worker-agent"}},
+	}
+	task.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"delegate_task"}}
+	task.Spec.Transaction = &corev1alpha1.TaskTransaction{
+		ID: "txn-brokered-parent", Scope: directTokenMemoryReadScope,
+		Scopes: []string{directTokenMemoryReadScope},
+	}
+	parentToken := taskTokenJWTForTest(t, time.Now().Add(10*time.Minute), "brokered-parent-no-tts")
+	parentWorkload := directTaskTokenWorkloadSecretForTest(task, "brokered-parent-no-tts")
+	setRenewableTaskTokenSecret(parentWorkload, parentToken, time.Now().Add(2*time.Minute), 1)
+	task.Annotations = map[string]string{labels.AnnotationTransactionTokenSecret: parentWorkload.Name}
+	targetAgent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-agent", Namespace: task.Namespace},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "child-runtime"},
+		}},
+	}
+	r := newUnitReconciler(newTestScheme(), task, agent, targetAgent, parentWorkload)
+	r.JobBuilder.ContextTokenChildScope = directTokenMemoryReadScope
+	frame := harness.HarnessEventFrame{
+		Version: harness.ProtocolVersion, Type: harness.FrameToolCallRequested,
+		RuntimeSessionID: "runtime-session", TurnID: "turn", CorrelationID: "corr", Seq: 1,
+		ToolName: "delegate_task", ToolCallID: "call-delegate-no-tts",
+		Content: json.RawMessage(`{"agent":"worker-agent","prompt":"investigate"}`),
+	}
+	result, err := r.handleHarnessBrokeredToolCall(context.Background(), task, agent, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Error == nil || !strings.Contains(result.Error.Message, "transaction token exchange is unavailable") {
+		t.Fatalf("brokered delegation without TTS result = %#v", result)
+	}
+	var tasks corev1alpha1.TaskList
+	if err := r.List(context.Background(), &tasks); err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks.Items) != 1 || tasks.Items[0].Name != task.Name {
+		t.Fatalf("brokered delegation created a child without TTS: %#v", tasks.Items)
 	}
 }
 

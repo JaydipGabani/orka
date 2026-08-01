@@ -10,6 +10,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -20,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -27,114 +30,104 @@ import (
 	"github.com/orka-agents/orka/internal/contexttoken"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/taskmeta"
+	"github.com/orka-agents/orka/internal/transactiontoken"
 	"github.com/orka-agents/orka/internal/workerenv"
 )
 
-// childTransactionTokenPreparation contains the in-memory exchange state and
-// parent-owned placeholder Secret created before a generated-name child Task.
-// The subject token is never persisted or attached to the Task.
+// childTransactionTokenPreparation retains renewal authority in memory until a
+// generated-name child receives its Kubernetes identity. Completion persists it
+// only in a hidden, child-owned authority Secret.
 type childTransactionTokenPreparation struct {
-	ttsClient        *contexttoken.TTSClient
 	subjectToken     string
 	subjectTokenType string
 	scope            string
-	requestedTTL     time.Duration
-	requestDetails   map[string]any
+	parentName       string
+	parentNamespace  string
+	parentUID        string
+	placeholderUID   types.UID
+}
+
+type childTransactionTokenSettings struct {
+	tts              contexttoken.TTSConfig
+	subjectToken     string
+	subjectTokenType string
+	scope            string
 }
 
 // prepareChildTransactionToken validates the delegated scope and prepares an
-// empty, parent-owned Secret referenced by the child Task. The actual child
-// TxToken is not exchanged until Kubernetes has assigned the child name and UID.
+// empty ownerless workload placeholder referenced by the child Task. The
+// placeholder is bound to the exact parent identity so it works across
+// namespaces without allowing an unrelated Secret to be adopted or deleted.
 func prepareChildTransactionToken(
 	ctx context.Context,
 	k8sClient client.Client,
 	parentTask, childTask *corev1alpha1.Task,
-	operation, agent string,
 ) (*childTransactionTokenPreparation, error) {
-	ttsConfig, enabled, err := childTransactionTokenExchangeConfigForParent(parentTask)
+	settings, enabled, err := childTransactionTokenSettingsForParent(ctx, parentTask)
 	if err != nil {
 		return nil, err
 	}
 	if !enabled {
 		return nil, nil
 	}
-
-	if parentTask.UID == "" {
-		return nil, fmt.Errorf("parent task UID is required for child transaction token exchange")
+	if parentTask == nil || parentTask.UID == "" || strings.TrimSpace(parentTask.Name) == "" ||
+		strings.TrimSpace(parentTask.Namespace) == "" {
+		return nil, fmt.Errorf("parent task identity is required for child transaction token exchange")
 	}
-	subjectToken, err := childTransactionSubjectToken(ttsConfig.TokenSource)
-	if err != nil {
+	if childTask == nil || strings.TrimSpace(childTask.Namespace) == "" {
+		return nil, fmt.Errorf("child task namespace is required for child transaction token exchange")
+	}
+	if err := validateChildTransactionScope(parentTask, settings.scope); err != nil {
 		return nil, err
-	}
-	scope := strings.TrimSpace(os.Getenv(workerenv.ContextTokenChildScope))
-	if scope == "" {
-		return nil, fmt.Errorf("%s is required when %s is set for child task tokens", workerenv.ContextTokenChildScope, workerenv.ContextTokenTTSEndpoint)
-	}
-	if err := validateChildTransactionScope(parentTask, scope); err != nil {
-		return nil, err
-	}
-	subjectTokenType := strings.TrimSpace(os.Getenv(workerenv.ContextTokenSubjectTokenType))
-	if subjectTokenType == "" {
-		subjectTokenType = contexttoken.SubjectTokenTypeForSource(ttsConfig.TokenSource)
-	}
-	ttsClient, err := contexttoken.NewTTSClient(ttsConfig)
-	if err != nil {
-		return nil, fmt.Errorf("configuring child transaction token exchange: %w", err)
 	}
 
-	secretName, err := childTransactionTokenSecretName(parentTask.Name)
+	secretName, err := childTransactionTokenSecretName("orka-task-token")
 	if err != nil {
 		return nil, err
 	}
+	labelsSet, annotations := childTransactionTokenPlaceholderMetadata(parentTask)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            secretName,
-			Namespace:       childTask.Namespace,
-			OwnerReferences: taskOwnerReference(parentTask),
-			Labels: map[string]string{
-				labels.LabelParentTask: labels.SelectorValue(parentTask.Name),
-			},
-			Annotations: map[string]string{
-				labels.AnnotationParentTaskName: parentTask.Name,
-			},
+			Name:        secretName,
+			Namespace:   childTask.Namespace,
+			Labels:      labelsSet,
+			Annotations: annotations,
 		},
 		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{},
 	}
 	if err := k8sClient.Create(ctx, secret); err != nil {
-		return nil, fmt.Errorf("creating child transaction token secret: %w", err)
+		return nil, fmt.Errorf("creating child transaction token placeholder: %w", err)
+	}
+	if secret.UID == "" {
+		_ = k8sClient.Delete(ctx, secret)
+		return nil, errors.New("created child transaction token placeholder is missing its UID")
 	}
 
-	stampChildTransactionScope(childTask, scope)
+	stampChildTransactionScope(childTask, settings.scope)
 	if childTask.Annotations == nil {
 		childTask.Annotations = map[string]string{}
 	}
 	childTask.Annotations[labels.AnnotationTransactionTokenSecret] = secretName
+	childTask.Annotations[transactiontoken.ParentUIDAnnotation] = string(parentTask.UID)
+	childTask.Annotations[transactiontoken.ParentNamespaceAnnotation] = parentTask.Namespace
+	childTask.Annotations[transactiontoken.PlaceholderUIDAnnotation] = string(secret.UID)
 
-	requestDetails := map[string]any{
-		"operation":    operation,
-		"parentTask":   parentTask.Name,
-		namespaceField: childTask.Namespace,
-	}
-	if agent != "" {
-		requestDetails["agent"] = agent
-	}
-	if parentTask.Spec.Transaction != nil && parentTask.Spec.Transaction.ID != "" {
-		requestDetails["txn"] = parentTask.Spec.Transaction.ID
-	}
 	return &childTransactionTokenPreparation{
-		ttsClient:        ttsClient,
-		subjectToken:     subjectToken,
-		subjectTokenType: subjectTokenType,
-		scope:            scope,
-		requestedTTL:     ttsConfig.ChildTokenTTL,
-		requestDetails:   requestDetails,
+		subjectToken:     settings.subjectToken,
+		subjectTokenType: settings.subjectTokenType,
+		scope:            settings.scope,
+		parentName:       parentTask.Name,
+		parentNamespace:  parentTask.Namespace,
+		parentUID:        string(parentTask.UID),
+		placeholderUID:   secret.UID,
 	}, nil
 }
 
-// completeChildTransactionToken exchanges a token bound to the actual child
-// Task identity, then writes it and adopts the placeholder Secret in one update.
-// The pending annotation prevents the child from beginning execution until this
-// function succeeds and the caller clears the pending state.
+// completeChildTransactionToken validates and adopts the workload placeholder
+// to the child and creates the hidden child-owned renewal authority. The
+// pending annotation stays set until the Task controller exchanges and persists
+// a renewable child token.
 func completeChildTransactionToken(
 	ctx context.Context,
 	k8sClient client.Client,
@@ -144,29 +137,120 @@ func completeChildTransactionToken(
 	if preparation == nil {
 		return nil
 	}
-	if childTask == nil || strings.TrimSpace(childTask.Name) == "" {
-		return fmt.Errorf("child task name is required for child transaction token exchange")
+	if childTask == nil || strings.TrimSpace(childTask.Name) == "" || childTask.UID == "" {
+		return fmt.Errorf("child task identity is required for renewable transaction token setup")
 	}
-	if childTask.UID == "" {
-		return fmt.Errorf("child task UID is required for child transaction token exchange")
+	workloadName := strings.TrimSpace(childTask.Annotations[labels.AnnotationTransactionTokenSecret])
+	if workloadName == "" {
+		return errors.New("child transaction token workload Secret reference is required")
+	}
+	if err := transactiontoken.ValidateSubjectTokenType(preparation.subjectTokenType); err != nil {
+		return err
+	}
+	workload := &corev1.Secret{}
+	if err := childTransactionTokenReader(ctx, k8sClient).Get(ctx, client.ObjectKey{Name: workloadName, Namespace: childTask.Namespace}, workload); err != nil {
+		return fmt.Errorf("getting child transaction token placeholder: %w", err)
+	}
+	if !validChildTransactionTokenPlaceholder(workload, preparation) {
+		return errors.New("child transaction token placeholder identity is invalid")
 	}
 
-	requestDetails := make(map[string]any, len(preparation.requestDetails)+2)
-	maps.Copy(requestDetails, preparation.requestDetails)
-	requestDetails["taskName"] = childTask.Name
-	requestDetails["taskUID"] = string(childTask.UID)
-
-	token, err := preparation.ttsClient.Exchange(ctx, contexttoken.ExchangeRequest{
-		SubjectToken:     preparation.subjectToken,
-		SubjectTokenType: preparation.subjectTokenType,
-		Scope:            preparation.scope,
-		RequestedTTL:     preparation.requestedTTL,
-		RequestDetails:   requestDetails,
-	})
+	requestDetails, err := json.Marshal(childTransactionTokenRequestDetails(childTask, preparation))
 	if err != nil {
-		return fmt.Errorf("exchanging child transaction token: %w", err)
+		return fmt.Errorf("encoding child transaction token request details: %w", err)
 	}
-	return adoptChildTransactionTokenSecret(ctx, k8sClient, childTask, token)
+	taskUIDLabel := labels.SelectorValue(string(childTask.UID))
+	authorityName, err := childTransactionTokenSecretName("orka-task-authority")
+	if err != nil {
+		return err
+	}
+	authority := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: authorityName, Namespace: childTask.Namespace,
+			Labels: map[string]string{
+				labels.LabelPurpose: transactiontoken.AuthoritySecretPurpose,
+				labels.LabelTaskUID: taskUIDLabel,
+			},
+			OwnerReferences: childOwnerReference(childTask),
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			transactiontoken.SubjectSecretKey:          []byte(preparation.subjectToken),
+			transactiontoken.SubjectTokenTypeSecretKey: []byte(preparation.subjectTokenType),
+			transactiontoken.RequestDetailsSecretKey:   requestDetails,
+		},
+	}
+	if err := k8sClient.Create(ctx, authority); err != nil {
+		return fmt.Errorf("creating child transaction renewal authority: %w", err)
+	}
+	workload.OwnerReferences = childOwnerReference(childTask)
+	workload.Labels = map[string]string{
+		labels.LabelPurpose: transactiontoken.WorkloadSecretPurpose,
+		labels.LabelTaskUID: labels.SelectorValue(string(childTask.UID)),
+	}
+	workload.Annotations = nil
+	workload.Data = map[string][]byte{}
+	if err := k8sClient.Update(ctx, workload); err != nil {
+		_ = k8sClient.Delete(ctx, authority)
+		return fmt.Errorf("adopting child transaction token workload Secret: %w", err)
+	}
+	return nil
+}
+
+func childTransactionTokenSettingsForParent(
+	ctx context.Context,
+	parentTask *corev1alpha1.Task,
+) (childTransactionTokenSettings, bool, error) {
+	if parentTask == nil || parentTask.Spec.Transaction == nil {
+		return childTransactionTokenSettings{}, false, nil
+	}
+	if tc := GetToolContext(ctx); tc != nil && tc.TransactionTokenTTS != nil {
+		config := *tc.TransactionTokenTTS
+		if !config.Enabled() {
+			return childTransactionTokenSettings{}, false, nil
+		}
+		subjectToken := strings.TrimSpace(tc.TransactionTokenSubject)
+		if subjectToken == "" {
+			return childTransactionTokenSettings{}, false, errors.New("controller-brokered child transaction token subject authority is unavailable")
+		}
+		subjectTokenType := strings.TrimSpace(tc.TransactionTokenSubjectType)
+		if subjectTokenType == "" {
+			subjectTokenType = contexttoken.SubjectTokenTypeForSource(config.TokenSource)
+		}
+		if err := transactiontoken.ValidateSubjectTokenType(subjectTokenType); err != nil {
+			return childTransactionTokenSettings{}, false, err
+		}
+		scope := strings.TrimSpace(tc.TransactionTokenChildScope)
+		if scope == "" {
+			return childTransactionTokenSettings{}, false, errors.New("controller-brokered child transaction token scope is unavailable")
+		}
+		return childTransactionTokenSettings{
+			tts: config, subjectToken: subjectToken, subjectTokenType: subjectTokenType, scope: scope,
+		}, true, nil
+	}
+
+	config, enabled, err := childTransactionTokenExchangeConfig()
+	if err != nil || !enabled {
+		return childTransactionTokenSettings{}, enabled, err
+	}
+	subjectToken, err := childTransactionSubjectToken(config.TokenSource)
+	if err != nil {
+		return childTransactionTokenSettings{}, false, err
+	}
+	subjectTokenType := strings.TrimSpace(os.Getenv(workerenv.ContextTokenSubjectTokenType))
+	if subjectTokenType == "" {
+		subjectTokenType = contexttoken.SubjectTokenTypeForSource(config.TokenSource)
+	}
+	if err := transactiontoken.ValidateSubjectTokenType(subjectTokenType); err != nil {
+		return childTransactionTokenSettings{}, false, err
+	}
+	scope := strings.TrimSpace(os.Getenv(workerenv.ContextTokenChildScope))
+	if scope == "" {
+		return childTransactionTokenSettings{}, false, fmt.Errorf("%s is required when %s is set for child task tokens", workerenv.ContextTokenChildScope, workerenv.ContextTokenTTSEndpoint)
+	}
+	return childTransactionTokenSettings{
+		tts: config, subjectToken: subjectToken, subjectTokenType: subjectTokenType, scope: scope,
+	}, true, nil
 }
 
 func childTransactionTokenExchangeConfig() (contexttoken.TTSConfig, bool, error) {
@@ -188,19 +272,8 @@ func childTransactionTokenExchangeConfig() (contexttoken.TTSConfig, bool, error)
 	return ttsConfig, ttsConfig.Enabled(), nil
 }
 
-func childTransactionTokenExchangeConfigForParent(parentTask *corev1alpha1.Task) (contexttoken.TTSConfig, bool, error) {
-	ttsConfig, enabled, err := childTransactionTokenExchangeConfig()
-	if err != nil {
-		return contexttoken.TTSConfig{}, false, err
-	}
-	if !enabled || parentTask == nil || parentTask.Spec.Transaction == nil {
-		return ttsConfig, false, nil
-	}
-	return ttsConfig, true, nil
-}
-
-func shouldPrepareChildTransactionToken(parentTask *corev1alpha1.Task) (bool, error) {
-	_, enabled, err := childTransactionTokenExchangeConfigForParent(parentTask)
+func shouldPrepareChildTransactionToken(ctx context.Context, parentTask *corev1alpha1.Task) (bool, error) {
+	_, enabled, err := childTransactionTokenSettingsForParent(ctx, parentTask)
 	return enabled, err
 }
 
@@ -253,30 +326,56 @@ func stampChildTransactionScope(childTask *corev1alpha1.Task, scope string) {
 	taskmeta.ApplyTransactionMetadata(&childTask.ObjectMeta, childTask.Spec.Transaction)
 }
 
-func adoptChildTransactionTokenSecret(ctx context.Context, k8sClient client.Client, childTask *corev1alpha1.Task, token string) error {
-	if childTask == nil || childTask.Annotations == nil {
-		return nil
+func childTransactionTokenPlaceholderMetadata(parentTask *corev1alpha1.Task) (map[string]string, map[string]string) {
+	return map[string]string{
+			labels.LabelPurpose:    transactiontoken.PlaceholderSecretPurpose,
+			labels.LabelParentTask: labels.SelectorValue(parentTask.Name),
+			labels.LabelTaskUID:    labels.SelectorValue(string(parentTask.UID)),
+		}, map[string]string{
+			labels.AnnotationParentTaskName:            parentTask.Name,
+			transactiontoken.ParentUIDAnnotation:       string(parentTask.UID),
+			transactiontoken.ParentNamespaceAnnotation: parentTask.Namespace,
+		}
+}
+
+func validChildTransactionTokenPlaceholder(secret *corev1.Secret, preparation *childTransactionTokenPreparation) bool {
+	if secret == nil || preparation == nil || preparation.placeholderUID == "" || secret.UID != preparation.placeholderUID ||
+		secret.Type != corev1.SecretTypeOpaque || len(secret.OwnerReferences) != 0 || len(secret.Data) != 0 {
+		return false
 	}
-	secretName := strings.TrimSpace(childTask.Annotations[labels.AnnotationTransactionTokenSecret])
-	if secretName == "" {
-		return nil
+	parent := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{
+		Name: preparation.parentName, Namespace: preparation.parentNamespace, UID: types.UID(preparation.parentUID),
+	}}
+	expectedLabels, expectedAnnotations := childTransactionTokenPlaceholderMetadata(parent)
+	return maps.Equal(secret.Labels, expectedLabels) && maps.Equal(secret.Annotations, expectedAnnotations)
+}
+
+func childTransactionTokenRequestDetails(
+	childTask *corev1alpha1.Task,
+	preparation *childTransactionTokenPreparation,
+) map[string]any {
+	operation := "delegateTask"
+	if childTask.Spec.Type == corev1alpha1.TaskTypeContainer {
+		operation = "createContainerTask"
 	}
-	if childTask.UID == "" {
-		return fmt.Errorf("child task UID is required to adopt child transaction token secret %q", secretName)
+	details := map[string]any{
+		"operation":  operation,
+		"namespace":  childTask.Namespace,
+		"taskName":   childTask.Name,
+		"taskUID":    string(childTask.UID),
+		"parentTask": preparation.parentName,
 	}
-	if strings.TrimSpace(token) == "" {
-		return fmt.Errorf("child transaction token is required to adopt secret %q", secretName)
+	if childTask.Spec.Transaction != nil {
+		if transactionID := strings.TrimSpace(childTask.Spec.Transaction.ID); transactionID != "" {
+			details["txn"] = transactionID
+		}
 	}
-	secret := &corev1.Secret{}
-	if err := k8sClient.Get(ctx, client.ObjectKey{Name: secretName, Namespace: childTask.Namespace}, secret); err != nil {
-		return fmt.Errorf("getting child transaction token secret for adoption: %w", err)
+	if childTask.Spec.AgentRef != nil {
+		if agent := strings.TrimSpace(childTask.Spec.AgentRef.Name); agent != "" {
+			details["agent"] = agent
+		}
 	}
-	secret.Data = map[string][]byte{"token": []byte(token)}
-	secret.OwnerReferences = childOwnerReference(childTask)
-	if err := k8sClient.Update(ctx, secret); err != nil {
-		return fmt.Errorf("adopting child transaction token secret: %w", err)
-	}
-	return nil
+	return details
 }
 
 func validateChildTransactionScope(parentTask *corev1alpha1.Task, childScope string) error {
@@ -302,29 +401,87 @@ func validateChildTransactionScope(parentTask *corev1alpha1.Task, childScope str
 	return nil
 }
 
-func cleanupChildTransactionTokenSecret(ctx context.Context, k8sClient client.Client, childTask *corev1alpha1.Task) {
-	if childTask == nil || childTask.Annotations == nil {
+func childTransactionTokenReader(ctx context.Context, fallback client.Reader) client.Reader {
+	if toolContext := GetToolContext(ctx); toolContext != nil && toolContext.APIReader != nil {
+		return toolContext.APIReader
+	}
+	return fallback
+}
+
+func cleanupChildTransactionTokenSecret(
+	ctx context.Context,
+	k8sClient client.Client,
+	childTask *corev1alpha1.Task,
+	preparation *childTransactionTokenPreparation,
+) {
+	if childTask == nil || childTask.Annotations == nil || preparation == nil {
 		return
 	}
 	secretName := strings.TrimSpace(childTask.Annotations[labels.AnnotationTransactionTokenSecret])
 	if secretName == "" {
 		return
 	}
-	if err := k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: childTask.Namespace}}); err != nil && !apierrors.IsNotFound(err) {
-		log.FromContext(ctx).Error(err, "failed to cleanup child transaction token secret", "secret", secretName, "namespace", childTask.Namespace)
+	secret := &corev1.Secret{}
+	if err := childTransactionTokenReader(ctx, k8sClient).Get(ctx, client.ObjectKey{Name: secretName, Namespace: childTask.Namespace}, secret); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.FromContext(ctx).Error(err, "failed to read child transaction token Secret for cleanup", "secret", secretName, "namespace", childTask.Namespace)
+		}
+		return
+	}
+	if !validChildTransactionTokenPlaceholder(secret, preparation) && !childOwnsTransactionTokenWorkload(childTask, secret) {
+		log.FromContext(ctx).Info("refusing to cleanup child transaction token Secret with mismatched identity", "secret", secretName, "namespace", childTask.Namespace)
+		return
+	}
+	preconditions := client.Preconditions{}
+	if secret.UID != "" {
+		uid := secret.UID
+		preconditions.UID = &uid
+	}
+	if secret.ResourceVersion != "" {
+		resourceVersion := secret.ResourceVersion
+		preconditions.ResourceVersion = &resourceVersion
+	}
+	if err := k8sClient.Delete(ctx, secret, preconditions); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+		log.FromContext(ctx).Error(err, "failed to cleanup child transaction token Secret", "secret", secretName, "namespace", childTask.Namespace)
 	}
 }
 
-func cleanupChildTaskAfterTokenAdoptionFailure(ctx context.Context, k8sClient client.Client, childTask *corev1alpha1.Task) {
+func childOwnsTransactionTokenWorkload(childTask *corev1alpha1.Task, secret *corev1.Secret) bool {
+	if childTask == nil || childTask.UID == "" || secret == nil || secret.Type != corev1.SecretTypeOpaque ||
+		secret.Labels[labels.LabelPurpose] != transactiontoken.WorkloadSecretPurpose ||
+		secret.Labels[labels.LabelTaskUID] != labels.SelectorValue(string(childTask.UID)) {
+		return false
+	}
+	for _, owner := range secret.OwnerReferences {
+		if owner.APIVersion == corev1alpha1.GroupVersion.String() && owner.Kind == "Task" &&
+			owner.Name == childTask.Name && owner.UID == childTask.UID {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanupChildTaskAfterTokenAdoptionFailure(
+	ctx context.Context,
+	k8sClient client.Client,
+	childTask *corev1alpha1.Task,
+	preparation *childTransactionTokenPreparation,
+) {
 	if childTask == nil || childTask.Name == "" {
-		cleanupChildTransactionTokenSecret(ctx, k8sClient, childTask)
+		cleanupChildTransactionTokenSecret(ctx, k8sClient, childTask, preparation)
 		return
 	}
-	err := k8sClient.Delete(ctx, &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: childTask.Name, Namespace: childTask.Namespace}})
-	if err != nil && !apierrors.IsNotFound(err) {
+	if childTask.UID == "" {
+		log.FromContext(ctx).Info("refusing to cleanup child task without UID", "task", childTask.Name, "namespace", childTask.Namespace)
+		cleanupChildTransactionTokenSecret(ctx, k8sClient, childTask, preparation)
+		return
+	}
+	uid := childTask.UID
+	err := k8sClient.Delete(ctx, &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: childTask.Name, Namespace: childTask.Namespace}}, client.Preconditions{UID: &uid})
+	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 		log.FromContext(ctx).Error(err, "failed to cleanup child task after transaction token secret adoption failure", "task", childTask.Name, "namespace", childTask.Namespace)
 	}
-	cleanupChildTransactionTokenSecret(ctx, k8sClient, childTask)
+	cleanupChildTransactionTokenSecret(ctx, k8sClient, childTask, preparation)
 }
 
 func childTransactionTokenSecretName(parentName string) (string, error) {

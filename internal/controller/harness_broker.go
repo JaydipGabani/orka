@@ -21,12 +21,14 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/approvals"
+	"github.com/orka-agents/orka/internal/contexttoken"
 	"github.com/orka-agents/orka/internal/events"
 	"github.com/orka-agents/orka/internal/harness"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/outboundaccess"
 	"github.com/orka-agents/orka/internal/store"
 	toolspkg "github.com/orka-agents/orka/internal/tools"
+	"github.com/orka-agents/orka/internal/transactiontoken"
 	worker "github.com/orka-agents/orka/internal/worker"
 	"github.com/orka-agents/orka/internal/workerenv"
 	corev1 "k8s.io/api/core/v1"
@@ -149,16 +151,47 @@ func (r *TaskReconciler) executeHarnessBrokeredCoordinationTool(
 	defer harnessBrokeredCoordinationEnvMu.Unlock()
 	restore := setHarnessBrokeredCoordinationEnv(task, agent)
 	defer restore()
+	var transactionTTS *contexttoken.TTSConfig
+	transactionSubject, _, subjectErr := r.harnessBrokeredTransactionAuthority(ctx, task)
+	if subjectErr != nil && task.Spec.Transaction != nil {
+		return "", subjectErr
+	}
+	childScope := ""
+	if r.BrokeredTransactionExchange != nil {
+		config := r.BrokeredTransactionExchange.TTS
+		transactionTTS = &config
+	}
+	if r.JobBuilder != nil {
+		childScope = r.JobBuilder.ContextTokenChildScope
+	}
+	if task.Spec.Transaction != nil {
+		if transactionTTS == nil || !transactionTTS.Enabled() ||
+			r.BrokeredTransactionExchange == nil || r.BrokeredTransactionExchange.Exchanger == nil {
+			return "", errors.New("controller-brokered child transaction token exchange is unavailable")
+		}
+		if strings.TrimSpace(transactionSubject) == "" || strings.TrimSpace(childScope) == "" {
+			return "", errors.New("controller-brokered child transaction token authority is incomplete")
+		}
+	}
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
 	toolCtx := &toolspkg.ToolContext{
-		Client:       r.Client,
-		Namespace:    task.Namespace,
-		Tenant:       task.Namespace,
-		TaskID:       task.Name,
-		TaskUID:      string(task.UID),
-		ParentTaskID: harnessBrokeredParentTaskName(task),
-		ToolCallID:   frame.ToolCallID,
-		ResultStore:  r.ResultStore,
-		MessageStore: r.MessageStore,
+		Client:                      r.Client,
+		APIReader:                   reader,
+		Namespace:                   task.Namespace,
+		Tenant:                      task.Namespace,
+		TaskID:                      task.Name,
+		TaskUID:                     string(task.UID),
+		ParentTaskID:                harnessBrokeredParentTaskName(task),
+		ToolCallID:                  frame.ToolCallID,
+		ResultStore:                 r.ResultStore,
+		MessageStore:                r.MessageStore,
+		TransactionTokenTTS:         transactionTTS,
+		TransactionTokenSubject:     transactionSubject,
+		TransactionTokenSubjectType: transactiontoken.SubjectTokenTypeTransactionToken,
+		TransactionTokenChildScope:  childScope,
 	}
 	return tool.Execute(toolspkg.WithToolContext(ctx, toolCtx), argsOrEmptyObject(frame.Content))
 }

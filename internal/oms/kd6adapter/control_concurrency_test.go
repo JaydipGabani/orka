@@ -599,6 +599,420 @@ func TestMutationRejectsReceiptUnsafeProviderIdentity(t *testing.T) {
 	}
 }
 
+func insertSearchSnapshotQuotaRow(
+	t *testing.T,
+	adapter *Server,
+	id, authority, state string,
+	snapshotBytes int,
+	createdAt, expiresAt time.Time,
+) {
+	t.Helper()
+	_, err := adapter.db.db.Exec(`INSERT INTO pagination_snapshots(
+		snapshot_id, authority_digest, request_fingerprint, provider_snapshot_id, provider_store_id,
+		requested_mode, actual_mode, page_size, entry_count, created_at, expires_at, state, snapshot_bytes
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, authority, "fingerprint-"+id,
+		"provider-"+id, fakeProviderStoreID, protocol.SearchModeKeyword, protocol.SearchModeKeyword,
+		1, 1, formatTime(createdAt), formatTime(expiresAt), state, snapshotBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEmptySearchSnapshotsReleaseSlotsImmediately(t *testing.T) {
+	baseStore, _, closeProvider := newKD6ProviderStore(t)
+	defer closeProvider()
+	now := time.Date(2026, 8, 1, 18, 0, 0, 0, time.UTC)
+	store := fixedSearchSnapshotStore{ContentStore: baseStore, snapshot: ContentSearchSnapshot{
+		SnapshotID: "provider-empty-snapshot", ActualMode: protocol.SearchModeKeyword,
+		ExpiresAt: now.Add(time.Hour), Entries: []ContentDescriptor{},
+	}}
+	adapter, binding := openKD6ControlTestServer(t, store, filepath.Join(t.TempDir(), "control.db"), func() time.Time { return now })
+	defer adapter.Close() //nolint:errcheck
+	request := &protocol.SearchRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword, PageSize: 1,
+	}
+	for i := range maxActiveSearchSnapshotsPerAuthority + 2 {
+		page, err := adapter.db.createSnapshot(context.Background(), store, request, now, func() time.Time { return now }, time.Minute, 10)
+		if err != nil || !page.exhausted || page.nextToken != "" || len(page.records) != 0 {
+			t.Fatalf("empty search %d = %+v, %v", i, page, err)
+		}
+	}
+	var snapshots, entries int
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots`).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_entries`).Scan(&entries); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 0 || entries != 0 {
+		t.Fatalf("terminal empty snapshots retained snapshots/entries = %d/%d", snapshots, entries)
+	}
+}
+
+func TestSinglePageSearchSnapshotReleasesSlotImmediately(t *testing.T) {
+	store, _, closeProvider := newKD6ProviderStore(t)
+	defer closeProvider()
+	now := time.Now().UTC().Truncate(time.Second)
+	adapter, binding := openKD6ControlTestServer(t, store, filepath.Join(t.TempDir(), "control.db"), func() time.Time { return now })
+	defer adapter.Close() //nolint:errcheck
+	mutation := newKD6TestMutation(t, binding, "mop-single-page", "mem-single-page", "single page")
+	if receipt, err := adapter.db.applyMutation(context.Background(), store, &mutation, now); err != nil || receipt.Result != protocol.ResultApplied {
+		t.Fatalf("apply mutation = %+v, %v", receipt, err)
+	}
+	request := &protocol.SearchRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword, PageSize: 2,
+	}
+	page, err := adapter.db.createSnapshot(context.Background(), store, request, now, func() time.Time { return now }, time.Minute, 10)
+	if err != nil || !page.exhausted || page.nextToken != "" || len(page.records) != 1 {
+		t.Fatalf("single-page search = %+v, %v", page, err)
+	}
+	var snapshots int
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots`).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 0 {
+		t.Fatalf("single-page terminal snapshots = %d, want 0", snapshots)
+	}
+}
+
+func TestTerminalContinuationReleasesSearchSnapshot(t *testing.T) {
+	store, _, closeProvider := newKD6ProviderStore(t)
+	defer closeProvider()
+	now := time.Now().UTC().Truncate(time.Second)
+	adapter, binding := openKD6ControlTestServer(t, store, filepath.Join(t.TempDir(), "control.db"), func() time.Time { return now })
+	defer adapter.Close() //nolint:errcheck
+	for i := range 2 {
+		mutation := newKD6TestMutation(t, binding, fmt.Sprintf("mop-terminal-%d", i), fmt.Sprintf("mem-terminal-%d", i), "terminal page")
+		if receipt, err := adapter.db.applyMutation(context.Background(), store, &mutation, now); err != nil || receipt.Result != protocol.ResultApplied {
+			t.Fatalf("apply mutation %d = %+v, %v", i, receipt, err)
+		}
+	}
+	request := &protocol.SearchRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword, PageSize: 1,
+	}
+	first, err := adapter.db.createSnapshot(context.Background(), store, request, now, func() time.Time { return now }, time.Minute, 10)
+	if err != nil || first.exhausted || first.nextToken == "" || len(first.records) != 1 {
+		t.Fatalf("first search page = %+v, %v", first, err)
+	}
+	var snapshots int
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots`).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 1 {
+		t.Fatalf("continuable snapshots = %d, want 1", snapshots)
+	}
+	request.PageToken = first.nextToken
+	terminal, err := adapter.db.readSnapshotPage(context.Background(), store, request, now)
+	if err != nil || !terminal.exhausted || terminal.nextToken != "" || len(terminal.records) != 1 {
+		t.Fatalf("terminal search page = %+v, %v", terminal, err)
+	}
+	var entries, active, retainedBytes int
+	var lifecycleState string
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*), MIN(state), COALESCE(SUM(snapshot_bytes), 0)
+		FROM pagination_snapshots`).Scan(&snapshots, &lifecycleState, &retainedBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_entries`).Scan(&entries); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots WHERE state IN (?, ?)`,
+		snapshotStateReserved, snapshotStateReady).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 1 || lifecycleState != snapshotStateTerminal || active != 0 || entries != 2 ||
+		retainedBytes <= 0 || retainedBytes > maxSearchSnapshotBytes {
+		t.Fatalf("terminal continuation snapshots/state/active/entries/bytes = %d/%q/%d/%d/%d",
+			snapshots, lifecycleState, active, entries, retainedBytes)
+	}
+	replayed, err := adapter.db.readSnapshotPage(context.Background(), store, request, now)
+	if err != nil || !replayed.exhausted || len(replayed.records) != 1 {
+		t.Fatalf("replayed terminal cursor = %+v, %v", replayed, err)
+	}
+}
+
+func TestTerminalSearchSnapshotReplayQuotaSurvivesRestart(t *testing.T) {
+	store, _, closeProvider := newKD6ProviderStore(t)
+	defer closeProvider()
+	now := time.Now().UTC().Truncate(time.Second)
+	path := filepath.Join(t.TempDir(), "control.db")
+	adapter, binding := openKD6ControlTestServer(t, store, path, func() time.Time { return now })
+	for i := range 2 {
+		mutation := newKD6TestMutation(t, binding, fmt.Sprintf("mop-restart-terminal-%d", i),
+			fmt.Sprintf("mem-restart-terminal-%d", i), "restart terminal page")
+		if receipt, err := adapter.db.applyMutation(context.Background(), store, &mutation, now); err != nil || receipt.Result != protocol.ResultApplied {
+			t.Fatalf("apply mutation %d = %+v, %v", i, receipt, err)
+		}
+	}
+	request := &protocol.SearchRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword, PageSize: 1,
+	}
+	first, err := adapter.db.createSnapshot(context.Background(), store, request, now, func() time.Time { return now }, time.Hour, 10)
+	if err != nil || first.nextToken == "" || first.exhausted {
+		t.Fatalf("first page = %+v, %v", first, err)
+	}
+	request.PageToken = first.nextToken
+	if terminal, err := adapter.db.readSnapshotPage(context.Background(), store, request, now); err != nil || !terminal.exhausted {
+		t.Fatalf("terminal page = %+v, %v", terminal, err)
+	}
+	var retainedBytes int
+	if err := adapter.db.db.QueryRow(`SELECT snapshot_bytes FROM pagination_snapshots WHERE snapshot_id = ?`, first.snapshotID).Scan(&retainedBytes); err != nil {
+		t.Fatal(err)
+	}
+	if retainedBytes <= 0 || retainedBytes > maxSearchSnapshotBytes {
+		t.Fatalf("retained snapshot bytes = %d", retainedBytes)
+	}
+	if err := adapter.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, restartedBinding := openKD6ControlTestServer(t, store, path, func() time.Time { return now })
+	defer restarted.Close() //nolint:errcheck
+	if protocol.AuthorityDigest(restartedBinding) != protocol.AuthorityDigest(binding) {
+		t.Fatalf("restarted authority changed: before=%+v after=%+v", binding, restartedBinding)
+	}
+	request.Binding = restartedBinding
+	replayed, err := restarted.db.readSnapshotPage(context.Background(), store, request, now)
+	if err != nil || !replayed.exhausted || len(replayed.records) != 1 {
+		t.Fatalf("replayed terminal page after restart = %+v, %v", replayed, err)
+	}
+	var state string
+	var active int
+	if err := restarted.db.db.QueryRow(`SELECT state, snapshot_bytes FROM pagination_snapshots WHERE snapshot_id = ?`,
+		first.snapshotID).Scan(&state, &retainedBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots WHERE state IN (?, ?)`,
+		snapshotStateReserved, snapshotStateReady).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if state != snapshotStateTerminal || active != 0 || retainedBytes <= 0 {
+		t.Fatalf("restarted terminal state/active/bytes = %q/%d/%d", state, active, retainedBytes)
+	}
+}
+
+func TestTerminalSearchSnapshotQuotasFailClosedAndPreserveReadyCursor(t *testing.T) {
+	tests := []struct {
+		name      string
+		seedCount int
+		seedBytes int
+		authority func(int, string) string
+	}{
+		{
+			name: "per-authority count", seedCount: maxTerminalSearchSnapshotsPerAuthority, seedBytes: 1,
+			authority: func(_ int, current string) string { return current },
+		},
+		{
+			name: "global count", seedCount: maxTerminalSearchSnapshotsGlobal, seedBytes: 1,
+			authority: func(i int, _ string) string { return fmt.Sprintf("other-authority-%03d", i) },
+		},
+		{
+			name: "per-authority bytes", seedCount: maxTerminalSearchBytesPerAuthority / maxSearchSnapshotBytes,
+			seedBytes: maxSearchSnapshotBytes, authority: func(_ int, current string) string { return current },
+		},
+		{
+			name: "global bytes", seedCount: maxTerminalSearchBytesGlobal / maxSearchSnapshotBytes,
+			seedBytes: maxSearchSnapshotBytes, authority: func(i int, _ string) string { return fmt.Sprintf("byte-authority-%03d", i) },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			baseStore, _, closeProvider := newKD6ProviderStore(t)
+			defer closeProvider()
+			now := time.Now().UTC().Truncate(time.Second)
+			adapter, binding := openKD6ControlTestServer(
+				t, baseStore, filepath.Join(t.TempDir(), "control.db"), func() time.Time { return now },
+			)
+			defer adapter.Close() //nolint:errcheck
+			authority := protocol.AuthorityDigest(binding)
+			for i := range test.seedCount {
+				insertSearchSnapshotQuotaRow(t, adapter, fmt.Sprintf("terminal-%03d", i),
+					test.authority(i, authority), snapshotStateTerminal, test.seedBytes, now, now.Add(time.Hour))
+			}
+			insertSearchSnapshotQuotaRow(t, adapter, "ready-candidate", authority, snapshotStateReady, 1, now, now.Add(time.Hour))
+			if err := adapter.db.completeSearchSnapshot(context.Background(), "ready-candidate", now); !errors.Is(err, errSnapshotCapacity) {
+				t.Fatalf("completeSearchSnapshot() error = %v, want capacity", err)
+			}
+			var state string
+			if err := adapter.db.db.QueryRow(`SELECT state FROM pagination_snapshots WHERE snapshot_id = 'ready-candidate'`).Scan(&state); err != nil {
+				t.Fatal(err)
+			}
+			if state != snapshotStateReady {
+				t.Fatalf("capacity failure changed cursor state to %q", state)
+			}
+			if _, err := adapter.db.db.Exec(`DELETE FROM pagination_snapshots WHERE state = ?`, snapshotStateTerminal); err != nil {
+				t.Fatal(err)
+			}
+			if err := adapter.db.completeSearchSnapshot(context.Background(), "ready-candidate", now); err != nil {
+				t.Fatalf("retry after capacity release: %v", err)
+			}
+		})
+	}
+}
+
+func TestTerminalSearchSnapshotCapacityErrorKeepsIssuedCursorRetryable(t *testing.T) {
+	store, _, closeProvider := newKD6ProviderStore(t)
+	defer closeProvider()
+	now := time.Now().UTC().Truncate(time.Second)
+	adapter, binding := openKD6ControlTestServer(t, store, filepath.Join(t.TempDir(), "control.db"), func() time.Time { return now })
+	defer adapter.Close() //nolint:errcheck
+	for i := range 2 {
+		mutation := newKD6TestMutation(t, binding, fmt.Sprintf("mop-capacity-retry-%d", i),
+			fmt.Sprintf("mem-capacity-retry-%d", i), "capacity retry")
+		if receipt, err := adapter.db.applyMutation(context.Background(), store, &mutation, now); err != nil || receipt.Result != protocol.ResultApplied {
+			t.Fatalf("apply mutation %d = %+v, %v", i, receipt, err)
+		}
+	}
+	request := &protocol.SearchRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword, PageSize: 1,
+	}
+	first, err := adapter.db.createSnapshot(context.Background(), store, request, now, func() time.Time { return now }, time.Hour, 10)
+	if err != nil || first.exhausted || first.nextToken == "" {
+		t.Fatalf("first page = %+v, %v", first, err)
+	}
+	authority := protocol.AuthorityDigest(binding)
+	for i := range maxTerminalSearchSnapshotsPerAuthority {
+		insertSearchSnapshotQuotaRow(t, adapter, fmt.Sprintf("blocking-terminal-%03d", i),
+			authority, snapshotStateTerminal, 1, now, now.Add(time.Hour))
+	}
+	request.PageToken = first.nextToken
+	if _, err := adapter.db.readSnapshotPage(context.Background(), store, request, now); !errors.Is(err, errSnapshotCapacity) {
+		t.Fatalf("terminal page at capacity error = %v, want capacity", err)
+	}
+	var state string
+	if err := adapter.db.db.QueryRow(`SELECT state FROM pagination_snapshots WHERE snapshot_id = ?`, first.snapshotID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != snapshotStateReady {
+		t.Fatalf("capacity error invalidated issued cursor state: %q", state)
+	}
+	if _, err := adapter.db.db.Exec(`DELETE FROM pagination_snapshots WHERE snapshot_id = 'blocking-terminal-000'`); err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := adapter.db.readSnapshotPage(context.Background(), store, request, now)
+	if err != nil || !terminal.exhausted || len(terminal.records) != 1 {
+		t.Fatalf("retried terminal page = %+v, %v", terminal, err)
+	}
+}
+
+func TestTerminalSearchSnapshotCapacityIsAtomicUnderConcurrency(t *testing.T) {
+	baseStore, _, closeProvider := newKD6ProviderStore(t)
+	defer closeProvider()
+	now := time.Now().UTC().Truncate(time.Second)
+	adapter, binding := openKD6ControlTestServer(t, baseStore, filepath.Join(t.TempDir(), "control.db"), func() time.Time { return now })
+	defer adapter.Close() //nolint:errcheck
+	authority := protocol.AuthorityDigest(binding)
+	for i := range maxTerminalSearchSnapshotsPerAuthority - 1 {
+		insertSearchSnapshotQuotaRow(t, adapter, fmt.Sprintf("terminal-%03d", i), authority, snapshotStateTerminal, 1, now, now.Add(time.Hour))
+	}
+	for _, id := range []string{"ready-a", "ready-b"} {
+		insertSearchSnapshotQuotaRow(t, adapter, id, authority, snapshotStateReady, 1, now, now.Add(time.Hour))
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var workers sync.WaitGroup
+	for _, id := range []string{"ready-a", "ready-b"} {
+		workers.Go(func() {
+			<-start
+			errs <- adapter.db.completeSearchSnapshot(context.Background(), id, now)
+		})
+	}
+	close(start)
+	workers.Wait()
+	close(errs)
+	succeeded, capacity := 0, 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, errSnapshotCapacity):
+			capacity++
+		default:
+			t.Fatal(err)
+		}
+	}
+	if succeeded != 1 || capacity != 1 {
+		t.Fatalf("concurrent terminal transitions success/capacity = %d/%d, want 1/1", succeeded, capacity)
+	}
+	var terminal, ready int
+	if err := adapter.db.db.QueryRow(`SELECT
+		COUNT(CASE WHEN state = ? THEN 1 END), COUNT(CASE WHEN state = ? THEN 1 END)
+		FROM pagination_snapshots WHERE authority_digest = ?`, snapshotStateTerminal, snapshotStateReady, authority).
+		Scan(&terminal, &ready); err != nil {
+		t.Fatal(err)
+	}
+	if terminal != maxTerminalSearchSnapshotsPerAuthority || ready != 1 {
+		t.Fatalf("terminal/ready snapshots = %d/%d", terminal, ready)
+	}
+}
+
+func TestExpiredTerminalSnapshotsReleaseReplayQuota(t *testing.T) {
+	baseStore, _, closeProvider := newKD6ProviderStore(t)
+	defer closeProvider()
+	now := time.Now().UTC().Truncate(time.Second)
+	adapter, binding := openKD6ControlTestServer(t, baseStore, filepath.Join(t.TempDir(), "control.db"), func() time.Time { return now })
+	defer adapter.Close() //nolint:errcheck
+	authority := protocol.AuthorityDigest(binding)
+	for i := range maxTerminalSearchSnapshotsPerAuthority {
+		insertSearchSnapshotQuotaRow(t, adapter, fmt.Sprintf("expired-%03d", i), authority, snapshotStateTerminal, 1,
+			now.Add(-2*time.Minute), now.Add(-time.Minute))
+	}
+	insertSearchSnapshotQuotaRow(t, adapter, "ready-after-expiry", authority, snapshotStateReady, 1, now, now.Add(time.Hour))
+	if err := adapter.db.completeSearchSnapshot(context.Background(), "ready-after-expiry", now); err != nil {
+		t.Fatalf("complete after terminal expiry: %v", err)
+	}
+	var snapshots int
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots`).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 1 {
+		t.Fatalf("snapshots after expiry reclamation = %d, want 1", snapshots)
+	}
+}
+
+func TestTerminalSearchSnapshotsReleaseSlotsConcurrently(t *testing.T) {
+	baseStore, _, closeProvider := newKD6ProviderStore(t)
+	defer closeProvider()
+	now := time.Date(2026, 8, 1, 18, 45, 0, 0, time.UTC)
+	store := fixedSearchSnapshotStore{ContentStore: baseStore, snapshot: ContentSearchSnapshot{
+		SnapshotID: "provider-concurrent-empty", ActualMode: protocol.SearchModeKeyword,
+		ExpiresAt: now.Add(time.Hour), Entries: []ContentDescriptor{},
+	}}
+	adapter, binding := openKD6ControlTestServer(t, store, filepath.Join(t.TempDir(), "control.db"), func() time.Time { return now })
+	defer adapter.Close() //nolint:errcheck
+	request := &protocol.SearchRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword, PageSize: 1,
+	}
+	var workers sync.WaitGroup
+	errs := make(chan error, maxActiveSearchSnapshotsPerAuthority)
+	for range maxActiveSearchSnapshotsPerAuthority {
+		workers.Go(func() {
+			for range 5 {
+				page, err := adapter.db.createSnapshot(context.Background(), store, request, now, func() time.Time { return now }, time.Minute, 10)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if !page.exhausted || page.nextToken != "" {
+					errs <- fmt.Errorf("non-terminal empty page: %+v", page)
+					return
+				}
+			}
+		})
+	}
+	workers.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	var snapshots int
+	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots`).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 0 {
+		t.Fatalf("concurrent terminal snapshots = %d, want 0", snapshots)
+	}
+}
+
 func TestSearchSnapshotQuotaIsReservedBeforeProviderStart(t *testing.T) {
 	baseStore, _, closeProvider := newKD6ProviderStore(t)
 	defer closeProvider()

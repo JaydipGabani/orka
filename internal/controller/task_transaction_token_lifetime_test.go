@@ -138,6 +138,91 @@ func TestDirectTaskTransactionTokenRotatesBeyondOriginalTTL(t *testing.T) {
 	}
 }
 
+func TestDelegatedServiceAccountRenewalAuthorityUsesAccessTokenSubjectType(t *testing.T) {
+	now := time.Now().UTC()
+	task, workload, _ := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	authority := directTaskTokenAuthoritySecretWithTypeForTest(task, testRenewableSubjectToken, transactiontoken.SubjectTokenTypeAccessToken)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{
+		taskTokenJWTForTest(t, now.Add(5*time.Minute), "service-account-child"),
+	}}
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	r.BrokeredTransactionExchange.TTS.TokenSource = contexttoken.TTSTokenSourceServiceAccount
+	ready, fatal, err := r.reconcilePendingTaskTransactionToken(context.Background(), task, now)
+	if err != nil || fatal || !ready {
+		t.Fatalf("service-account delegated setup = ready:%v fatal:%v err:%v", ready, fatal, err)
+	}
+	if len(exchanger.requests) != 1 ||
+		exchanger.requests[0].SubjectTokenType != contexttoken.SubjectTokenTypeForSource(contexttoken.TTSTokenSourceServiceAccount) {
+		t.Fatal("delegated service-account authority used the wrong subject token type")
+	}
+}
+
+func TestDelegatedChildTransactionTokenRotatesBeyondTTL(t *testing.T) {
+	start := time.Date(2026, time.August, 1, 14, 0, 0, 0, time.UTC)
+	for _, taskType := range []corev1alpha1.TaskType{
+		corev1alpha1.TaskTypeAI, corev1alpha1.TaskTypeAgent, corev1alpha1.TaskTypeContainer,
+	} {
+		t.Run(string(taskType), func(t *testing.T) {
+			task, _, _ := renewableTaskTokenFixture(taskType)
+			task.Name = "delegated-" + string(taskType)
+			task.UID = types.UID("delegated-" + string(taskType) + "-uid")
+			const parentTaskName = "parent-task"
+			task.Labels = map[string]string{labels.LabelParentTask: labels.SelectorValue(parentTaskName)}
+			task.Annotations[labels.AnnotationParentTaskName] = parentTaskName
+			if taskType == corev1alpha1.TaskTypeAgent {
+				task.Spec.AgentRef = &corev1alpha1.AgentReference{Name: "delegated-agent"}
+			}
+			workload := directTaskTokenWorkloadSecretForTest(task, testRenewableSecretName+"-"+string(taskType))
+			task.Annotations[labels.AnnotationTransactionTokenSecret] = workload.Name
+			authority := directTaskTokenAuthoritySecretForTest(task, testRenewableSubjectToken)
+			exchanger := &queuedTaskTokenExchanger{tokens: []string{
+				taskTokenJWTForTest(t, start.Add(5*time.Minute), "delegated-1"),
+				taskTokenJWTForTest(t, start.Add(20*time.Minute), "delegated-2"),
+			}}
+			r := newUnitReconciler(newTestScheme(), task, workload, authority)
+			r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+			ready, fatal, err := r.reconcilePendingTaskTransactionToken(context.Background(), task, start)
+			if err != nil || fatal || !ready {
+				t.Fatalf("delegated setup = ready:%v fatal:%v err:%v", ready, fatal, err)
+			}
+			refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(context.Background(), task, start.Add(2*time.Minute))
+			if err != nil || fatal || refreshAfter <= 0 {
+				t.Fatalf("delegated pre-expiry rotation = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+			}
+			refreshAfter, fatal, err = r.reconcileActiveTaskTransactionToken(context.Background(), task, start.Add(6*time.Minute))
+			if err != nil || fatal || refreshAfter <= 0 {
+				t.Fatalf("delegated post-original-TTL state = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+			}
+			latest := currentTaskTokenSecret(t, r, task)
+			_, exposed := latest.Data[transactiontoken.SubjectSecretKey]
+			if string(latest.Data[taskTokenGenerationSecretKey]) != "2" || exposed {
+				t.Fatal("delegated workload Secret did not rotate confidentially")
+			}
+			details := exchanger.requests[0].RequestDetails
+			wantOperation := taskTokenRequestOperationDelegateTask
+			if taskType == corev1alpha1.TaskTypeContainer {
+				wantOperation = taskTokenRequestOperationCreateContainerTask
+			}
+			if details[taskTokenRequestOperationKey] != wantOperation ||
+				details[taskTokenRequestParentTaskKey] != parentTaskName ||
+				details[taskTokenRequestTaskNameKey] != task.Name ||
+				details[taskTokenRequestTaskUIDKey] != string(task.UID) {
+				t.Fatalf("delegated request details = %#v", details)
+			}
+			if taskType == corev1alpha1.TaskTypeAgent && details[taskTokenRequestAgentKey] != task.Spec.AgentRef.Name {
+				t.Fatalf("delegated agent request details = %#v", details)
+			}
+			if taskType == corev1alpha1.TaskTypeAgent {
+				resolved, _, err := r.harnessBrokeredTransactionAuthority(context.Background(), task)
+				if err != nil || resolved != string(latest.Data[transactiontoken.TokenSecretKey]) {
+					t.Fatal("delegated runtimeRef did not resolve latest token")
+				}
+			}
+		})
+	}
+}
+
 func TestTransactionalRuntimeRefStartsOnSecondReconcileWithLatestToken(t *testing.T) {
 	server := harnesstest.NewFakeHarnessServer(harnesstest.FakeHarnessConfig{
 		Behavior: harnesstest.BehaviorLongRunning, RuntimeName: testRuntimeRefName,
@@ -398,7 +483,7 @@ func renewableTaskTokenFixture(taskType corev1alpha1.TaskType) (*corev1alpha1.Ta
 func directTaskTokenWorkloadSecretForTest(task *corev1alpha1.Task, name string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name, Namespace: task.Namespace,
+			Name: name, Namespace: task.Namespace, UID: types.UID("uid-" + name),
 			Labels: map[string]string{
 				labels.LabelPurpose: transactiontoken.WorkloadSecretPurpose,
 				labels.LabelTaskUID: labels.SelectorValue(string(task.UID)),
@@ -413,9 +498,20 @@ func directTaskTokenWorkloadSecretForTest(task *corev1alpha1.Task, name string) 
 }
 
 func directTaskTokenAuthoritySecretForTest(task *corev1alpha1.Task, subject string) *corev1.Secret {
+	return directTaskTokenAuthoritySecretWithTypeForTest(task, subject, transactiontoken.SubjectTokenTypeTransactionToken)
+}
+
+func directTaskTokenAuthoritySecretWithTypeForTest(task *corev1alpha1.Task, subject, subjectTokenType string) *corev1.Secret {
+	requestDetails := taskTransactionTokenRequestDetails(task, 0)
+	delete(requestDetails, taskTokenRequestRotationKey)
+	encodedRequestDetails, err := json.Marshal(requestDetails)
+	if err != nil {
+		panic(err)
+	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: testRenewableSecretName + "-authority", Namespace: task.Namespace,
+			UID: types.UID("uid-" + task.Name + "-authority"),
 			Labels: map[string]string{
 				labels.LabelPurpose: transactiontoken.AuthoritySecretPurpose,
 				labels.LabelTaskUID: labels.SelectorValue(string(task.UID)),
@@ -426,7 +522,11 @@ func directTaskTokenAuthoritySecretForTest(task *corev1alpha1.Task, subject stri
 			}},
 		},
 		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{transactiontoken.SubjectSecretKey: []byte(subject)},
+		Data: map[string][]byte{
+			transactiontoken.SubjectSecretKey:          []byte(subject),
+			transactiontoken.SubjectTokenTypeSecretKey: []byte(subjectTokenType),
+			transactiontoken.RequestDetailsSecretKey:   encodedRequestDetails,
+		},
 	}
 }
 
@@ -498,4 +598,34 @@ func (e *queuedTaskTokenExchanger) Exchange(_ context.Context, request contextto
 	token := e.tokens[0]
 	e.tokens = e.tokens[1:]
 	return token, nil
+}
+
+func TestTaskTransactionTokenRotationUsesPersistedSubjectTypeAcrossRollout(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name          string
+		persistedType string
+		currentSource string
+	}{
+		{name: "incoming authority after serviceAccount rollout", persistedType: transactiontoken.SubjectTokenTypeTransactionToken, currentSource: contexttoken.TTSTokenSourceServiceAccount},
+		{name: "serviceAccount authority after incoming rollout", persistedType: transactiontoken.SubjectTokenTypeAccessToken, currentSource: contexttoken.TTSTokenSourceIncoming},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task, workload, _ := renewableTaskTokenFixture(corev1alpha1.TaskTypeAgent)
+			authority := directTaskTokenAuthoritySecretWithTypeForTest(task, testRenewableSubjectToken, tt.persistedType)
+			exchanger := &queuedTaskTokenExchanger{tokens: []string{taskTokenJWTForTest(t, now.Add(5*time.Minute), tt.name)}}
+			// A new reconciler models controller restart after the global tokenSource rollout.
+			r := newUnitReconciler(newTestScheme(), task, workload, authority)
+			r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+			r.BrokeredTransactionExchange.TTS.TokenSource = tt.currentSource
+			ready, fatal, err := r.reconcilePendingTaskTransactionToken(context.Background(), task, now)
+			if err != nil || fatal || !ready {
+				t.Fatalf("rotation = ready:%v fatal:%v err:%v", ready, fatal, err)
+			}
+			if got := exchanger.requests[0].SubjectTokenType; got != tt.persistedType {
+				t.Fatalf("subject type = %q, want persisted %q", got, tt.persistedType)
+			}
+		})
+	}
 }

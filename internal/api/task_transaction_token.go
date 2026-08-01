@@ -8,6 +8,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -92,6 +93,19 @@ func (h *Handlers) persistDirectTaskTransactionTokenSubject(
 		Name: task.Name, UID: task.UID,
 	}}
 	taskUIDLabel := labels.SelectorValue(string(task.UID))
+	requestDetails := map[string]any{
+		"operation": "createTask",
+		"namespace": task.Namespace,
+		"taskName":  task.Name,
+		"taskUID":   string(task.UID),
+	}
+	if transactionID := strings.TrimSpace(task.Spec.Transaction.ID); transactionID != "" {
+		requestDetails["txn"] = transactionID
+	}
+	encodedRequestDetails, err := json.Marshal(requestDetails)
+	if err != nil {
+		return fmt.Errorf("encoding task transaction token request details: %w", err)
+	}
 	authoritySecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "orka-task-authority-" + uuid.NewString(),
@@ -103,7 +117,11 @@ func (h *Handlers) persistDirectTaskTransactionTokenSubject(
 			OwnerReferences: ownerReferences,
 		},
 		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{transactiontoken.SubjectSecretKey: []byte(subjectToken)},
+		Data: map[string][]byte{
+			transactiontoken.SubjectSecretKey:          []byte(subjectToken),
+			transactiontoken.SubjectTokenTypeSecretKey: []byte(transactiontoken.SubjectTokenTypeTransactionToken),
+			transactiontoken.RequestDetailsSecretKey:   encodedRequestDetails,
+		},
 	}
 	if err := h.client.Create(ctx, authoritySecret); err != nil {
 		return fmt.Errorf("creating task transaction renewal authority: %w", err)

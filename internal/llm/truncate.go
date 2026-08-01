@@ -116,6 +116,9 @@ func TruncateMessages(messages []Message, tokenBudget int) []Message {
 		for noteTokens > remaining && len(kept) > 1 {
 			remaining += kept[0].tokens
 			kept = kept[1:]
+			droppedBlocks++
+			noteContent = extractDroppedSummary(remainingBlocks[:droppedBlocks])
+			noteTokens = estimateTokens(noteContent)
 		}
 		if noteTokens > remaining {
 			noteContent = "[Earlier messages truncated.]"

@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apitypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -40,9 +42,6 @@ const childTransactionAudience = "child.example.test"
 func TestPrepareAndCompleteChildTransactionToken(t *testing.T) {
 	subjectPath := writeTestSubjectToken(t)
 	issuer := newTransactionTokenIssuer(t)
-	jwksServer := httptest.NewServer(issuer.JWKSHandler())
-	defer jwksServer.Close()
-
 	exchange := &childTokenExchange{}
 	ttsServer := startChildTransactionTokenServer(t, issuer, exchange)
 	defer ttsServer.Close()
@@ -62,7 +61,7 @@ func TestPrepareAndCompleteChildTransactionToken(t *testing.T) {
 		},
 	}
 	fc := newFakeClient()
-	preparation, err := prepareChildTransactionToken(context.Background(), fc, parent, child, "delegateTask", testResearcherAgentName)
+	preparation, err := prepareChildTransactionToken(context.Background(), fc, parent, child)
 	if err != nil {
 		t.Fatalf("prepareChildTransactionToken() error = %v", err)
 	}
@@ -79,15 +78,14 @@ func TestPrepareAndCompleteChildTransactionToken(t *testing.T) {
 	if err := completeChildTransactionToken(context.Background(), fc, child, preparation); err != nil {
 		t.Fatalf("completeChildTransactionToken() error = %v", err)
 	}
-	requireChildTokenExchange(t, exchange, child, "parent-tx-token", transactiontoken.SubjectTokenTypeTransactionToken)
-	requireAdoptedChildTransactionTokenSecret(t, fc, child, secretName, jwksServer.URL)
+	if exchange.called.Load() {
+		t.Fatal("child creation performed a one-shot exchange instead of deferring renewable setup")
+	}
+	requireRenewableChildTransactionSecrets(t, fc, child, secretName, "parent-tx-token")
 }
 
 func TestCompleteChildTransactionTokenDefaultsToServiceAccountSubjectToken(t *testing.T) {
 	issuer := newTransactionTokenIssuer(t)
-	jwksServer := httptest.NewServer(issuer.JWKSHandler())
-	defer jwksServer.Close()
-
 	exchange := &childTokenExchange{}
 	ttsServer := startChildTransactionTokenServer(t, issuer, exchange)
 	defer ttsServer.Close()
@@ -110,7 +108,7 @@ func TestCompleteChildTransactionTokenDefaultsToServiceAccountSubjectToken(t *te
 		},
 	}
 	fc := newFakeClient()
-	preparation, err := prepareChildTransactionToken(context.Background(), fc, parent, child, "delegateTask", testResearcherAgentName)
+	preparation, err := prepareChildTransactionToken(context.Background(), fc, parent, child)
 	if err != nil {
 		t.Fatalf("prepareChildTransactionToken() error = %v", err)
 	}
@@ -119,8 +117,43 @@ func TestCompleteChildTransactionTokenDefaultsToServiceAccountSubjectToken(t *te
 		t.Fatalf("completeChildTransactionToken() error = %v", err)
 	}
 
-	requireChildTokenExchange(t, exchange, child, "service-account-token", transactiontoken.SubjectTokenTypeAccessToken)
-	requireAdoptedChildTransactionTokenSecret(t, fc, child, secretName, jwksServer.URL)
+	if exchange.called.Load() {
+		t.Fatal("service-account child creation performed a one-shot exchange")
+	}
+	requireRenewableChildTransactionSecrets(t, fc, child, secretName, "service-account-token")
+}
+
+func requireRenewableChildTransactionSecrets(
+	t *testing.T,
+	k8sClient client.Client,
+	child *corev1alpha1.Task,
+	workloadName, subject string,
+) {
+	t.Helper()
+	workload := &corev1.Secret{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKey{Namespace: child.Namespace, Name: workloadName}, workload); err != nil {
+		t.Fatalf("get child workload token Secret: %v", err)
+	}
+	if workload.Labels[labels.LabelPurpose] != transactiontoken.WorkloadSecretPurpose ||
+		workload.Labels[labels.LabelTaskUID] != labels.SelectorValue(string(child.UID)) || len(workload.Data) != 0 {
+		t.Fatal("child workload Secret contains renewal authority or invalid identity metadata")
+	}
+	authorities := &corev1.SecretList{}
+	if err := k8sClient.List(context.Background(), authorities, client.InNamespace(child.Namespace), client.MatchingLabels{
+		labels.LabelPurpose: transactiontoken.AuthoritySecretPurpose,
+		labels.LabelTaskUID: labels.SelectorValue(string(child.UID)),
+	}); err != nil {
+		t.Fatalf("list child renewal authority: %v", err)
+	}
+	if len(authorities.Items) != 1 || string(authorities.Items[0].Data[transactiontoken.SubjectSecretKey]) != subject {
+		t.Fatal("child controller-only renewal authority was not preserved")
+	}
+	for _, owner := range authorities.Items[0].OwnerReferences {
+		if owner.Kind == taskKindString && owner.Name == child.Name && owner.UID == child.UID {
+			return
+		}
+	}
+	t.Fatal("child renewal authority is not owned by the child Task")
 }
 
 type childTokenExchange struct {
@@ -196,43 +229,6 @@ func startChildTransactionTokenServer(t *testing.T, issuer *txtest.Issuer, excha
 	}))
 }
 
-func requireChildTokenExchange(
-	t *testing.T,
-	exchange *childTokenExchange,
-	child *corev1alpha1.Task,
-	wantSubjectToken, wantSubjectTokenType string,
-) {
-	t.Helper()
-
-	if !exchange.called.Load() {
-		t.Fatal("expected child transaction token exchange")
-	}
-	if exchange.subjectToken != wantSubjectToken {
-		t.Fatalf("subject_token = %q, want %q", exchange.subjectToken, wantSubjectToken)
-	}
-	if exchange.scope != childTransactionScope {
-		t.Fatalf("scope = %q, want %q", exchange.scope, childTransactionScope)
-	}
-	if exchange.audience != childTransactionAudience {
-		t.Fatalf("audience = %q, want child.example.test", exchange.audience)
-	}
-	if exchange.subjectTokenTyp != wantSubjectTokenType {
-		t.Fatalf("subject_token_type = %q, want %q", exchange.subjectTokenTyp, wantSubjectTokenType)
-	}
-	if exchange.requestedExpiresIn != "42" {
-		t.Fatalf("requested_expires_in = %q, want 42", exchange.requestedExpiresIn)
-	}
-	if exchange.requestDetails["operation"] != "delegateTask" ||
-		exchange.requestDetails["agent"] != testResearcherAgentName ||
-		exchange.requestDetails["txn"] != parentTransactionID ||
-		exchange.requestDetails["parentTask"] != parentTaskName ||
-		exchange.requestDetails[namespaceField] != child.Namespace ||
-		exchange.requestDetails["taskName"] != child.Name ||
-		exchange.requestDetails["taskUID"] != string(child.UID) {
-		t.Fatalf("request_details = %#v", exchange.requestDetails)
-	}
-}
-
 func requirePreparedChildTransactionToken(
 	t *testing.T,
 	fc client.Client,
@@ -240,17 +236,23 @@ func requirePreparedChildTransactionToken(
 	child *corev1alpha1.Task,
 ) string {
 	t.Helper()
-
 	secretName := child.Annotations[labels.AnnotationTransactionTokenSecret]
 	if secretName == "" {
 		t.Fatal("expected child transaction token secret annotation")
 	}
 	secret := &corev1.Secret{}
-	if err := fc.Get(context.Background(), client.ObjectKey{Name: secretName, Namespace: defaultNamespace}, secret); err != nil {
-		t.Fatalf("failed to get child transaction token secret: %v", err)
+	if err := fc.Get(context.Background(), client.ObjectKey{Name: secretName, Namespace: child.Namespace}, secret); err != nil {
+		t.Fatalf("failed to get child transaction token placeholder: %v", err)
 	}
-	if len(secret.Data) != 0 {
-		t.Fatalf("prepared child transaction token secret contains data before child identity assignment: %#v", secret.Data)
+	if len(secret.Data) != 0 || len(secret.OwnerReferences) != 0 {
+		t.Fatalf("placeholder data/owners = %#v/%#v, want empty and ownerless", secret.Data, secret.OwnerReferences)
+	}
+	expectedLabels, expectedAnnotations := childTransactionTokenPlaceholderMetadata(parent)
+	if !maps.Equal(secret.Labels, expectedLabels) || !maps.Equal(secret.Annotations, expectedAnnotations) {
+		t.Fatalf("placeholder metadata = %#v/%#v, want %#v/%#v", secret.Labels, secret.Annotations, expectedLabels, expectedAnnotations)
+	}
+	if got := child.Annotations[transactiontoken.PlaceholderUIDAnnotation]; got != string(secret.UID) {
+		t.Fatalf("placeholder UID annotation = %q, want %q", got, secret.UID)
 	}
 	if child.Spec.Transaction.Scope != childTransactionScope {
 		t.Fatalf("child transaction scope = %q, want %q", child.Spec.Transaction.Scope, childTransactionScope)
@@ -258,64 +260,7 @@ func requirePreparedChildTransactionToken(
 	if got, want := child.Spec.Transaction.Scopes, []string{childTransactionScope}; !slices.Equal(got, want) {
 		t.Fatalf("child transaction scopes = %#v, want %#v", got, want)
 	}
-	if got := child.Annotations[labels.AnnotationTransactionScope]; got != childTransactionScope {
-		t.Fatalf("transaction scope annotation = %q, want %q", got, childTransactionScope)
-	}
-	if len(secret.OwnerReferences) != 1 {
-		t.Fatalf("ownerReferences = %#v, want parent task owner before child task adoption", secret.OwnerReferences)
-	}
-	preAdoptionOwner := secret.OwnerReferences[0]
-	if preAdoptionOwner.Name != parent.Name || preAdoptionOwner.UID != parent.UID {
-		t.Fatalf("ownerReference = %#v, want parent task name %q uid %q", preAdoptionOwner, parent.Name, parent.UID)
-	}
-	if preAdoptionOwner.BlockOwnerDeletion != nil {
-		t.Fatalf("ownerReference BlockOwnerDeletion = %#v, want nil", preAdoptionOwner.BlockOwnerDeletion)
-	}
 	return secretName
-}
-
-func requireAdoptedChildTransactionTokenSecret(
-	t *testing.T,
-	fc client.Client,
-	child *corev1alpha1.Task,
-	secretName, jwksURL string,
-) {
-	t.Helper()
-
-	adoptedSecret := &corev1.Secret{}
-	if err := fc.Get(context.Background(), client.ObjectKey{Name: secretName, Namespace: defaultNamespace}, adoptedSecret); err != nil {
-		t.Fatalf("failed to get adopted child transaction token secret: %v", err)
-	}
-	if len(adoptedSecret.OwnerReferences) != 1 {
-		t.Fatalf("ownerReferences = %#v, want child task owner", adoptedSecret.OwnerReferences)
-	}
-	owner := adoptedSecret.OwnerReferences[0]
-	if owner.Name != child.Name || owner.UID != child.UID {
-		t.Fatalf("ownerReference = %#v, want child task name %q uid %q", owner, child.Name, child.UID)
-	}
-	if owner.Name == parentTaskName {
-		t.Fatalf("ownerReference = %#v, want child task owner not parent task", owner)
-	}
-	if owner.BlockOwnerDeletion != nil {
-		t.Fatalf("ownerReference BlockOwnerDeletion = %#v, want nil", owner.BlockOwnerDeletion)
-	}
-	secretToken := string(adoptedSecret.Data["token"])
-	if secretToken == "" {
-		t.Fatal("adopted child transaction token secret is missing token data")
-	}
-	claims, err := txtest.Verify(context.Background(), jwksURL, childTransactionAudience, secretToken)
-	if err != nil {
-		t.Fatalf("failed to verify child TxToken from secret: %v", err)
-	}
-	if claims.TransactionID != parentTransactionID {
-		t.Fatalf("child token txn = %q, want %q", claims.TransactionID, parentTransactionID)
-	}
-	if claims.Scope != childTransactionScope {
-		t.Fatalf("child token scope = %q, want %q", claims.Scope, childTransactionScope)
-	}
-	if claims.TransactionContext["taskName"] != child.Name || claims.TransactionContext["taskUID"] != string(child.UID) {
-		t.Fatalf("child token transaction context = %#v, want task name %q uid %q", claims.TransactionContext, child.Name, child.UID)
-	}
 }
 
 func TestPrepareChildTransactionTokenRequiresParentUID(t *testing.T) {
@@ -327,6 +272,9 @@ func TestPrepareChildTransactionTokenRequiresParentUID(t *testing.T) {
 	defer ttsServer.Close()
 
 	t.Setenv(workerenv.ContextTokenTTSEndpoint, ttsServer.URL+"/token_endpoint")
+	t.Setenv(workerenv.ContextTokenTTSTokenSource, contexttoken.TTSTokenSourceIncoming)
+	t.Setenv(workerenv.ContextTokenSubjectTokenFile, writeTestSubjectToken(t))
+	t.Setenv(workerenv.ContextTokenChildScope, childTransactionScope)
 
 	parent := parentTask()
 	parent.UID = ""
@@ -338,8 +286,8 @@ func TestPrepareChildTransactionTokenRequiresParentUID(t *testing.T) {
 	}
 	k8sClient := newFakeClient()
 
-	_, err := prepareChildTransactionToken(context.Background(), k8sClient, parent, child, "delegateTask", testResearcherAgentName)
-	if err == nil || !strings.Contains(err.Error(), "parent task UID is required") {
+	_, err := prepareChildTransactionToken(context.Background(), k8sClient, parent, child)
+	if err == nil || !strings.Contains(err.Error(), "parent task identity is required") {
 		t.Fatalf("prepareChildTransactionToken() error = %v, want parent UID error", err)
 	}
 	if called.Load() {
@@ -357,150 +305,87 @@ func TestPrepareChildTransactionTokenRequiresParentUID(t *testing.T) {
 	}
 }
 
-func TestAdoptChildTransactionTokenSecretRequiresChildUID(t *testing.T) {
-	child := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "child-task",
-			Namespace: defaultNamespace,
-			Annotations: map[string]string{
-				labels.AnnotationTransactionTokenSecret: "child-token-secret",
-			},
-		},
-	}
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "child-token-secret",
-			Namespace: defaultNamespace,
-		},
-	}
-	k8sClient := newFakeClient(secret)
-
-	err := adoptChildTransactionTokenSecret(context.Background(), k8sClient, child, "child-token")
-	if err == nil || !strings.Contains(err.Error(), "child task UID is required") {
-		t.Fatalf("adoptChildTransactionTokenSecret() error = %v, want child UID error", err)
-	}
-	gotSecret := &corev1.Secret{}
-	if err := k8sClient.Get(context.Background(), client.ObjectKey{Name: secret.Name, Namespace: secret.Namespace}, gotSecret); err != nil {
-		t.Fatalf("failed to get secret: %v", err)
-	}
-	if len(gotSecret.OwnerReferences) != 0 {
-		t.Fatalf("secret ownerReferences = %#v, want unchanged empty refs", gotSecret.OwnerReferences)
+func TestCompleteChildTransactionTokenRequiresChildUID(t *testing.T) {
+	child := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "child-task", Namespace: defaultNamespace}}
+	err := completeChildTransactionToken(context.Background(), newFakeClient(), child, &childTransactionTokenPreparation{
+		subjectToken: "subject", subjectTokenType: transactiontoken.SubjectTokenTypeTransactionToken,
+	})
+	if err == nil || !strings.Contains(err.Error(), "child task identity is required") {
+		t.Fatalf("completeChildTransactionToken() error = %v, want child identity error", err)
 	}
 }
 
-func TestCleanupChildTransactionTokenSecretOnlyDeletesAnnotatedPreparedSecret(t *testing.T) {
-	existingSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "existing-child-token-secret",
-			Namespace: defaultNamespace,
-		},
+func TestCleanupChildTransactionTokenSecretOnlyDeletesValidatedPlaceholder(t *testing.T) {
+	parent := parentTask()
+	prep := &childTransactionTokenPreparation{
+		parentName: parent.Name, parentNamespace: parent.Namespace, parentUID: string(parent.UID),
+		placeholderUID: apitypes.UID("prepared-secret-uid"),
 	}
-	preparedSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "prepared-child-token-secret",
-			Namespace: defaultNamespace,
-		},
+	placeholderLabels, placeholderAnnotations := childTransactionTokenPlaceholderMetadata(parent)
+	placeholder := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: "prepared-child-token-secret", Namespace: defaultNamespace, UID: apitypes.UID("prepared-secret-uid"),
+		Labels: placeholderLabels, Annotations: placeholderAnnotations,
+	}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{}}
+	unrelated := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: defaultNamespace}}
+	child := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "child", Namespace: defaultNamespace, Annotations: map[string]string{
+		labels.AnnotationTransactionTokenSecret: placeholder.Name,
+	}}}
+	fc := newFakeClient(placeholder, unrelated)
+	cleanupChildTaskAfterTokenAdoptionFailure(context.Background(), fc, child, prep)
+	if err := fc.Get(context.Background(), client.ObjectKeyFromObject(placeholder), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("validated placeholder still exists: %v", err)
 	}
-	child := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "child-task",
-			Namespace: defaultNamespace,
-			Annotations: map[string]string{
-				labels.AnnotationTransactionTokenSecret: preparedSecret.Name,
-			},
-		},
-	}
-	k8sClient := newFakeClient(existingSecret, preparedSecret)
-
-	cleanupChildTaskAfterTokenAdoptionFailure(context.Background(), k8sClient, child)
-
-	gotExisting := &corev1.Secret{}
-	if err := k8sClient.Get(context.Background(), client.ObjectKey{Name: existingSecret.Name, Namespace: existingSecret.Namespace}, gotExisting); err != nil {
-		t.Fatalf("existing child transaction token secret was deleted: %v", err)
-	}
-	gotPrepared := &corev1.Secret{}
-	if err := k8sClient.Get(context.Background(), client.ObjectKey{Name: preparedSecret.Name, Namespace: preparedSecret.Namespace}, gotPrepared); err == nil {
-		t.Fatalf("prepared child transaction token secret still exists: %#v", gotPrepared)
+	if err := fc.Get(context.Background(), client.ObjectKeyFromObject(unrelated), &corev1.Secret{}); err != nil {
+		t.Fatalf("unrelated Secret was deleted: %v", err)
 	}
 }
 
 func TestCleanupChildTaskAfterTokenAdoptionFailureAttemptsSecretCleanupWhenTaskDeleteFails(t *testing.T) {
-	forcedErr := errors.New("forced task delete failure")
-	child := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "child-task",
-			Namespace: defaultNamespace,
-			Annotations: map[string]string{
-				labels.AnnotationTransactionTokenSecret: "child-token-secret",
-			},
-		},
+	parent := parentTask()
+	prep := &childTransactionTokenPreparation{
+		parentName: parent.Name, parentNamespace: parent.Namespace, parentUID: string(parent.UID),
+		placeholderUID: apitypes.UID("secret-uid"),
 	}
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "child-token-secret",
-			Namespace: defaultNamespace,
-		},
-	}
-	k8sClient := newFakeClientWithInterceptorFuncs(interceptor.Funcs{
+	placeholderLabels, placeholderAnnotations := childTransactionTokenPlaceholderMetadata(parent)
+	child := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{
+		Name: "child-task", Namespace: defaultNamespace, UID: apitypes.UID("child-uid"),
+		Annotations: map[string]string{labels.AnnotationTransactionTokenSecret: "child-token-secret"},
+	}}
+	placeholder := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: "child-token-secret", Namespace: defaultNamespace, UID: apitypes.UID("secret-uid"),
+		Labels: placeholderLabels, Annotations: placeholderAnnotations,
+	}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{}}
+	fc := newFakeClientWithInterceptorFuncs(interceptor.Funcs{
 		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
 			if _, ok := obj.(*corev1alpha1.Task); ok {
-				return forcedErr
+				return errors.New("forced task delete failure")
 			}
 			return c.Delete(ctx, obj, opts...)
 		},
-	}, child, secret)
-
-	cleanupChildTaskAfterTokenAdoptionFailure(context.Background(), k8sClient, child)
-
-	gotSecret := &corev1.Secret{}
-	if err := k8sClient.Get(context.Background(), client.ObjectKey{Name: secret.Name, Namespace: secret.Namespace}, gotSecret); err == nil {
-		t.Fatalf("expected child transaction token secret to be deleted despite task delete failure")
+	}, child, placeholder)
+	cleanupChildTaskAfterTokenAdoptionFailure(context.Background(), fc, child, prep)
+	if err := fc.Get(context.Background(), client.ObjectKeyFromObject(placeholder), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("validated placeholder still exists: %v", err)
 	}
 }
 
 func TestCompleteChildTransactionTokenFailsClosedOnTTSExchangeError(t *testing.T) {
-	subjectPath := filepath.Join(t.TempDir(), "subject-token")
-	if err := os.WriteFile(subjectPath, []byte("parent-tx-token"), 0600); err != nil {
-		t.Fatalf("failed to write subject token: %v", err)
-	}
-	ttsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"error":"temporarily_unavailable","error_description":"maintenance"}`))
-	}))
-	defer ttsServer.Close()
-
-	t.Setenv(workerenv.ContextTokenTTSEndpoint, ttsServer.URL+"/token_endpoint")
+	t.Setenv(workerenv.ContextTokenTTSEndpoint, "https://transactions.example.test/token")
 	t.Setenv(workerenv.ContextTokenTTSTokenSource, contexttoken.TTSTokenSourceIncoming)
-	t.Setenv(workerenv.ContextTokenSubjectTokenFile, subjectPath)
+	t.Setenv(workerenv.ContextTokenSubjectTokenFile, writeTestSubjectToken(t))
 	t.Setenv(workerenv.ContextTokenChildScope, childTransactionScope)
-
 	parent := parentTask()
-	child := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "child-task",
-			Namespace: defaultNamespace,
-			UID:       apitypes.UID("child-uid-1234"),
-		},
-		Spec: corev1alpha1.TaskSpec{Transaction: parent.Spec.Transaction.DeepCopy()},
-	}
+	child := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "child-task", Namespace: defaultNamespace, UID: apitypes.UID("child-uid-1234")}, Spec: corev1alpha1.TaskSpec{Transaction: parent.Spec.Transaction.DeepCopy()}}
 	k8sClient := newFakeClient()
-	preparation, err := prepareChildTransactionToken(context.Background(), k8sClient, parent, child, "delegateTask", testResearcherAgentName)
+	preparation, err := prepareChildTransactionToken(context.Background(), k8sClient, parent, child)
 	if err != nil {
-		t.Fatalf("prepareChildTransactionToken() error = %v", err)
+		t.Fatal(err)
 	}
 	secretName := requirePreparedChildTransactionToken(t, k8sClient, parent, child)
-	err = completeChildTransactionToken(context.Background(), k8sClient, child, preparation)
-	if err == nil || !strings.Contains(err.Error(), "exchanging child transaction token") || !strings.Contains(err.Error(), "temporarily_unavailable") {
-		t.Fatalf("completeChildTransactionToken() error = %v, want TTS exchange failure", err)
+	if err := completeChildTransactionToken(context.Background(), k8sClient, child, preparation); err != nil {
+		t.Fatal(err)
 	}
-	secret := &corev1.Secret{}
-	if err := k8sClient.Get(context.Background(), client.ObjectKey{Name: secretName, Namespace: defaultNamespace}, secret); err != nil {
-		t.Fatalf("get prepared secret after failed exchange: %v", err)
-	}
-	if len(secret.Data) != 0 {
-		t.Fatalf("prepared secret contains token data after failed exchange: %#v", secret.Data)
-	}
+	requireRenewableChildTransactionSecrets(t, k8sClient, child, secretName, "parent-tx-token")
 }
 
 func TestPrepareChildTransactionTokenRejectsScopeExpansion(t *testing.T) {
@@ -518,7 +403,7 @@ func TestPrepareChildTransactionTokenRejectsScopeExpansion(t *testing.T) {
 	t.Setenv(workerenv.ContextTokenChildScope, "orka:admin")
 
 	child := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Namespace: defaultNamespace}}
-	_, err := prepareChildTransactionToken(context.Background(), newFakeClient(), parentTask(), child, "delegateTask", testResearcherAgentName)
+	_, err := prepareChildTransactionToken(context.Background(), newFakeClient(), parentTask(), child)
 	if err == nil || !strings.Contains(err.Error(), "not present in parent") {
 		t.Fatalf("prepareChildTransactionToken() error = %v, want scope expansion error", err)
 	}
@@ -526,7 +411,7 @@ func TestPrepareChildTransactionTokenRejectsScopeExpansion(t *testing.T) {
 
 func TestPrepareChildTransactionTokenDisabledWithoutTTSURL(t *testing.T) {
 	child := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Namespace: defaultNamespace}}
-	preparation, err := prepareChildTransactionToken(context.Background(), newFakeClient(), parentTask(), child, "delegateTask", testResearcherAgentName)
+	preparation, err := prepareChildTransactionToken(context.Background(), newFakeClient(), parentTask(), child)
 	if err != nil {
 		t.Fatalf("prepareChildTransactionToken() error = %v", err)
 	}
@@ -560,7 +445,7 @@ func TestPrepareChildTransactionTokenDisabledForNonTransactionalParent(t *testin
 	}
 	k8sClient := newFakeClient()
 
-	preparation, err := prepareChildTransactionToken(context.Background(), k8sClient, parent, child, "delegateTask", testResearcherAgentName)
+	preparation, err := prepareChildTransactionToken(context.Background(), k8sClient, parent, child)
 	if err != nil {
 		t.Fatalf("prepareChildTransactionToken() error = %v", err)
 	}
@@ -632,5 +517,74 @@ func TestChildTransactionTokenSecretNameExtremeParentNames(t *testing.T) {
 				t.Fatalf("childTransactionTokenSecretName(%q) = %q, has leading or trailing hyphen", tt.parentName, got)
 			}
 		})
+	}
+}
+
+func TestCrossNamespaceChildTransactionTokenPlaceholderAdoption(t *testing.T) {
+	t.Setenv(workerenv.ContextTokenTTSEndpoint, "https://transactions.example.test/token")
+	t.Setenv(workerenv.ContextTokenTTSTokenSource, contexttoken.TTSTokenSourceIncoming)
+	t.Setenv(workerenv.ContextTokenSubjectTokenFile, writeTestSubjectToken(t))
+	t.Setenv(workerenv.ContextTokenChildScope, childTransactionScope)
+	parent := parentTask()
+	parent.Namespace = "parents"
+	child := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "child", Namespace: "children", UID: apitypes.UID("cross-child-uid")}, Spec: corev1alpha1.TaskSpec{
+		Type: corev1alpha1.TaskTypeAgent, AgentRef: &corev1alpha1.AgentReference{Name: "worker"}, Transaction: parent.Spec.Transaction.DeepCopy(),
+	}}
+	fc := newFakeClient()
+	prep, err := prepareChildTransactionToken(context.Background(), fc, parent, child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := requirePreparedChildTransactionToken(t, fc, parent, child)
+	if err := completeChildTransactionToken(context.Background(), fc, child, prep); err != nil {
+		t.Fatal(err)
+	}
+	requireRenewableChildTransactionSecrets(t, fc, child, name, "parent-tx-token")
+	authorities := &corev1.SecretList{}
+	if err := fc.List(context.Background(), authorities, client.InNamespace(child.Namespace), client.MatchingLabels{labels.LabelPurpose: transactiontoken.AuthoritySecretPurpose}); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(authorities.Items[0].Data[transactiontoken.SubjectTokenTypeSecretKey]); got != transactiontoken.SubjectTokenTypeTransactionToken {
+		t.Fatalf("persisted subject type = %q", got)
+	}
+	var details map[string]any
+	if err := json.Unmarshal(authorities.Items[0].Data[transactiontoken.RequestDetailsSecretKey], &details); err != nil || details["parentTask"] != parent.Name || details["taskUID"] != string(child.UID) {
+		t.Fatalf("persisted request details = %#v, err=%v", details, err)
+	}
+}
+
+func TestChildTransactionTokenPlaceholderReplacementRaceFailsClosed(t *testing.T) {
+	t.Setenv(workerenv.ContextTokenTTSEndpoint, "https://transactions.example.test/token")
+	t.Setenv(workerenv.ContextTokenTTSTokenSource, contexttoken.TTSTokenSourceIncoming)
+	t.Setenv(workerenv.ContextTokenSubjectTokenFile, writeTestSubjectToken(t))
+	t.Setenv(workerenv.ContextTokenChildScope, childTransactionScope)
+	parent := parentTask()
+	child := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "child", Namespace: "children", UID: apitypes.UID("race-child-uid")}, Spec: corev1alpha1.TaskSpec{Transaction: parent.Spec.Transaction.DeepCopy()}}
+	fc := newFakeClient()
+	prep, err := prepareChildTransactionToken(context.Background(), fc, parent, child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := child.Annotations[labels.AnnotationTransactionTokenSecret]
+	original := &corev1.Secret{}
+	if err := fc.Get(context.Background(), client.ObjectKey{Namespace: child.Namespace, Name: name}, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.Delete(context.Background(), original); err != nil {
+		t.Fatal(err)
+	}
+	replacement := original.DeepCopy()
+	replacement.ResourceVersion = ""
+	replacement.UID = apitypes.UID("replacement-placeholder-uid")
+	replacement.OwnerReferences = nil
+	if err := fc.Create(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := completeChildTransactionToken(context.Background(), fc, child, prep); err == nil || !strings.Contains(err.Error(), "placeholder identity is invalid") {
+		t.Fatalf("complete error = %v", err)
+	}
+	cleanupChildTaskAfterTokenAdoptionFailure(context.Background(), fc, child, prep)
+	if err := fc.Get(context.Background(), client.ObjectKeyFromObject(replacement), &corev1.Secret{}); err != nil {
+		t.Fatalf("replacement Secret was deleted: %v", err)
 	}
 }

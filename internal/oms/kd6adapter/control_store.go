@@ -31,18 +31,23 @@ import (
 )
 
 const (
-	controlSchemaVersion                 = 5
-	maxSearchSnapshotBytes               = 1 << 20
-	maxActiveSearchSnapshotsPerAuthority = 8
-	maxActiveSearchSnapshotsGlobal       = 64
-	mutationProviderDispatchTimeout      = defaultProviderTimeout
-	mutationRecoveryLease                = defaultProviderTimeout
-	mutationIntentPrepared               = "prepared"
-	mutationIntentDispatching            = "dispatching"
-	mutationIntentRecovering             = "recovering"
-	mutationIntentLegacyUnknown          = "legacyUnknown"
-	snapshotStateReserved                = "reserved"
-	snapshotStateReady                   = "ready"
+	controlSchemaVersion                   = 6
+	maxSearchSnapshotBytes                 = 1 << 20
+	maxActiveSearchSnapshotsPerAuthority   = 8
+	maxActiveSearchSnapshotsGlobal         = 64
+	maxTerminalSearchSnapshotsPerAuthority = 16
+	maxTerminalSearchSnapshotsGlobal       = 128
+	maxTerminalSearchBytesPerAuthority     = 8 << 20
+	maxTerminalSearchBytesGlobal           = 64 << 20
+	mutationProviderDispatchTimeout        = defaultProviderTimeout
+	mutationRecoveryLease                  = defaultProviderTimeout
+	mutationIntentPrepared                 = "prepared"
+	mutationIntentDispatching              = "dispatching"
+	mutationIntentRecovering               = "recovering"
+	mutationIntentLegacyUnknown            = "legacyUnknown"
+	snapshotStateReserved                  = "reserved"
+	snapshotStateReady                     = "ready"
+	snapshotStateTerminal                  = "terminal"
 )
 
 var (
@@ -457,8 +462,20 @@ func (d *controlDatabase) migrate(ctx context.Context) error {
 				return fmt.Errorf("migrate OMS KD6 provider writer fencing: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE oms_schema SET version = ? WHERE id = 1`, controlSchemaVersion); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE oms_schema SET version = 5 WHERE id = 1`); err != nil {
 			return fmt.Errorf("record OMS KD6 provider writer fencing schema version: %w", err)
+		}
+		version = 5
+	}
+	if version == 5 {
+		statement := fmt.Sprintf(`ALTER TABLE pagination_snapshots ADD COLUMN snapshot_bytes
+			INTEGER NOT NULL DEFAULT %d CHECK (snapshot_bytes >= 0 AND snapshot_bytes <= %d)`,
+			maxSearchSnapshotBytes, maxSearchSnapshotBytes)
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate OMS KD6 terminal snapshot accounting: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE oms_schema SET version = ? WHERE id = 1`, controlSchemaVersion); err != nil {
+			return fmt.Errorf("record OMS KD6 terminal snapshot accounting schema version: %w", err)
 		}
 		version = controlSchemaVersion
 	}
@@ -1875,10 +1892,10 @@ func (d *controlDatabase) createSnapshot(
 		entries = append(entries, entry)
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE pagination_snapshots SET provider_snapshot_id = ?,
-		actual_mode = ?, entry_count = ?, expires_at = ?, state = ?
+		actual_mode = ?, entry_count = ?, snapshot_bytes = ?, expires_at = ?, state = ?
 		WHERE snapshot_id = ? AND authority_digest = ? AND request_fingerprint = ? AND state = ?
 		AND julianday(expires_at) > julianday(?)`, providerSnapshot.SnapshotID, providerSnapshot.ActualMode,
-		len(entries), formatTime(expiresAt), snapshotStateReady, snapshotID, authority, fingerprint,
+		len(entries), snapshotBytes, formatTime(expiresAt), snapshotStateReady, snapshotID, authority, fingerprint,
 		snapshotStateReserved, formatTime(currentNow))
 	if err != nil {
 		return searchPage{}, err
@@ -1909,8 +1926,18 @@ func (d *controlDatabase) createSnapshot(
 	if err != nil {
 		return searchPage{}, err
 	}
+	page := pageFromRecords(snapshotID, 0, end, len(entries), providerSnapshot.ActualMode, expiresAt, records)
+	response, err := boundedSearchResponse(request, page)
+	if err != nil {
+		return searchPage{}, err
+	}
+	if response.Exhausted {
+		if err := d.releaseSearchSnapshot(context.WithoutCancel(ctx), snapshotID); err != nil {
+			return searchPage{}, err
+		}
+	}
 	cleanupSnapshot = false
-	return pageFromRecords(snapshotID, 0, end, len(entries), providerSnapshot.ActualMode, expiresAt, records), nil
+	return page, nil
 }
 
 func providerFailureDefinitive(err error) bool {
@@ -1932,6 +1959,49 @@ func (d *controlDatabase) releaseSearchSnapshot(ctx context.Context, snapshotID 
 	return err
 }
 
+func (d *controlDatabase) completeSearchSnapshot(ctx context.Context, snapshotID string, now time.Time) error {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := deleteExpiredSearchSnapshotsInTx(ctx, tx, now); err != nil {
+		return err
+	}
+	var authority, state string
+	var snapshotBytes int
+	err = tx.QueryRowContext(ctx, `SELECT authority_digest, state, snapshot_bytes
+		FROM pagination_snapshots WHERE snapshot_id = ?`, snapshotID).Scan(&authority, &state, &snapshotBytes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errSnapshotInvalid
+	}
+	if err != nil {
+		return err
+	}
+	if state == snapshotStateTerminal {
+		return tx.Commit()
+	}
+	if state != snapshotStateReady {
+		return errSnapshotInvalid
+	}
+	if err := ensureTerminalSearchSnapshotCapacityInTx(ctx, tx, authority, snapshotBytes); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE pagination_snapshots SET state = ?
+		WHERE snapshot_id = ? AND state = ?`, snapshotStateTerminal, snapshotID, snapshotStateReady)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return errSnapshotInvalid
+	}
+	return tx.Commit()
+}
+
 func deleteExpiredSearchSnapshotsInTx(ctx context.Context, tx *sql.Tx, now time.Time) error {
 	_, err := tx.ExecContext(ctx,
 		`DELETE FROM pagination_snapshots WHERE julianday(expires_at) <= julianday(?)`,
@@ -1942,13 +2012,43 @@ func deleteExpiredSearchSnapshotsInTx(ctx context.Context, tx *sql.Tx, now time.
 
 func ensureSearchSnapshotCountCapacityInTx(ctx context.Context, tx *sql.Tx, authority string) error {
 	var globalCount, authorityCount int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*),
-		COALESCE(SUM(CASE WHEN authority_digest = ? THEN 1 ELSE 0 END), 0)
-		FROM pagination_snapshots`, authority).Scan(&globalCount, &authorityCount)
+	err := tx.QueryRowContext(ctx, `SELECT
+		COUNT(CASE WHEN state IN (?, ?) THEN 1 END),
+		COALESCE(SUM(CASE WHEN authority_digest = ? AND state IN (?, ?) THEN 1 ELSE 0 END), 0)
+		FROM pagination_snapshots`, snapshotStateReserved, snapshotStateReady, authority,
+		snapshotStateReserved, snapshotStateReady).Scan(&globalCount, &authorityCount)
 	if err != nil {
 		return err
 	}
 	if globalCount >= maxActiveSearchSnapshotsGlobal || authorityCount >= maxActiveSearchSnapshotsPerAuthority {
+		return errSnapshotCapacity
+	}
+	return nil
+}
+
+func ensureTerminalSearchSnapshotCapacityInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	authority string,
+	addingBytes int,
+) error {
+	if addingBytes < 0 || addingBytes > maxSearchSnapshotBytes {
+		return errSnapshotCapacity
+	}
+	var globalCount, authorityCount int
+	var globalBytes, authorityBytes int64
+	err := tx.QueryRowContext(ctx, `SELECT
+		COUNT(*), COALESCE(SUM(snapshot_bytes), 0),
+		COALESCE(SUM(CASE WHEN authority_digest = ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN authority_digest = ? THEN snapshot_bytes ELSE 0 END), 0)
+		FROM pagination_snapshots WHERE state = ?`, authority, authority, snapshotStateTerminal).
+		Scan(&globalCount, &globalBytes, &authorityCount, &authorityBytes)
+	if err != nil {
+		return err
+	}
+	if globalCount >= maxTerminalSearchSnapshotsGlobal || authorityCount >= maxTerminalSearchSnapshotsPerAuthority ||
+		globalBytes+int64(addingBytes) > maxTerminalSearchBytesGlobal ||
+		authorityBytes+int64(addingBytes) > maxTerminalSearchBytesPerAuthority {
 		return errSnapshotCapacity
 	}
 	return nil
@@ -1968,13 +2068,14 @@ func (d *controlDatabase) readSnapshotPage(ctx context.Context, store ContentSto
 		return searchPage{}, err
 	}
 	var state snapshotState
-	var authority, fingerprint, expiresAtRaw string
+	var authority, fingerprint, expiresAtRaw, lifecycleState string
 	var pageSize int
 	err = tx.QueryRowContext(ctx, `SELECT authority_digest, request_fingerprint, provider_snapshot_id,
-		provider_store_id, actual_mode, page_size, entry_count, expires_at
-		FROM pagination_snapshots WHERE snapshot_id = ? AND state = ?`, snapshotID, snapshotStateReady).
+		provider_store_id, actual_mode, page_size, entry_count, expires_at, state
+		FROM pagination_snapshots WHERE snapshot_id = ? AND state IN (?, ?)`,
+		snapshotID, snapshotStateReady, snapshotStateTerminal).
 		Scan(&authority, &fingerprint, &state.providerSnapshot, &state.providerStoreID,
-			&state.actualMode, &pageSize, &state.entryCount, &expiresAtRaw)
+			&state.actualMode, &pageSize, &state.entryCount, &expiresAtRaw, &lifecycleState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return searchPage{}, errSnapshotInvalid
 	}
@@ -2008,7 +2109,17 @@ func (d *controlDatabase) readSnapshotPage(ctx context.Context, store ContentSto
 	if err != nil {
 		return searchPage{}, err
 	}
-	return pageFromRecords(snapshotID, offset, end, state.entryCount, state.actualMode, state.expiresAt, records), nil
+	page := pageFromRecords(snapshotID, offset, end, state.entryCount, state.actualMode, state.expiresAt, records)
+	response, err := boundedSearchResponse(request, page)
+	if err != nil {
+		return searchPage{}, err
+	}
+	if response.Exhausted && lifecycleState == snapshotStateReady {
+		if err := d.completeSearchSnapshot(context.WithoutCancel(ctx), snapshotID, now); err != nil {
+			return searchPage{}, err
+		}
+	}
+	return page, nil
 }
 
 func liveControlsForEntriesInTx(
