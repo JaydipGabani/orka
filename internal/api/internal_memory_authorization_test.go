@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -99,6 +100,50 @@ func TestInternalMemoryCRUDRequiresTaskScopedTxnScopes(t *testing.T) {
 				require.Equal(t, test.wantSuccess, status)
 			}
 		})
+	}
+}
+
+func TestInternalGetMemoryDisabledInspectionRequiresOperateScope(t *testing.T) {
+	h, app, memoryStore, user := setupTestInternalMemoryHandlers(t)
+	app.Get("/internal/v1/memories/:namespace/:id", h.GetMemory)
+	if err := memoryStore.CreateMemory(context.Background(), &store.Memory{
+		ID: "mem-disabled", Namespace: "default", Content: "disabled content", Disabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	user.ContextToken = internalMemoryTaskToken(ContextTokenScopeMemoryRead)
+	response := testInternalMemoryRequest(t, app, http.MethodGet,
+		"/internal/v1/memories/default/mem-disabled", "")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("default disabled GET status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	var memory store.Memory
+	if err := json.NewDecoder(response.Body).Decode(&memory); err != nil {
+		t.Fatal(err)
+	}
+	if !memory.Disabled || memory.Content != "" {
+		t.Fatalf("default disabled GET memory = %#v, want suppression metadata", memory)
+	}
+
+	response = testInternalMemoryRequest(t, app, http.MethodGet,
+		"/internal/v1/memories/default/mem-disabled?includeDisabled=true", "")
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("read-only includeDisabled status = %d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+
+	user.ContextToken = internalMemoryTaskToken(ContextTokenScopeMemoryRead, ContextTokenScopeMemoryOperate)
+	response = testInternalMemoryRequest(t, app, http.MethodGet,
+		"/internal/v1/memories/default/mem-disabled?includeDisabled=true", "")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("operator includeDisabled status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	memory = store.Memory{}
+	if err := json.NewDecoder(response.Body).Decode(&memory); err != nil {
+		t.Fatal(err)
+	}
+	if memory.Content != "disabled content" {
+		t.Fatalf("operator includeDisabled memory = %#v, want content", memory)
 	}
 }
 

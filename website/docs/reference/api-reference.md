@@ -118,7 +118,7 @@ A namespace that has never activated a remote backend continues to use SQLite. A
 | `/api/v1/memories` | GET | Deterministically list memories; `query`/`q` is legacy keyword compatibility |
 | `/api/v1/memories` | POST | Create memory |
 | `/api/v1/memories/search` | POST | Explicit bounded `keyword`, `semantic`, `hybrid`, or `auto` search |
-| `/api/v1/memories/:id` | GET | Get and verify one memory |
+| `/api/v1/memories/:id` | GET | Get one memory; disabled content requires `includeDisabled=true` and memory-operate scope |
 | `/api/v1/memories/:id` | PUT | Update mutable memory fields |
 | `/api/v1/memories/:id` | DELETE | Delete memory / install a remote tombstone |
 | `/api/v1/memories/:id/disable` | POST | Suppress normal recall locally |
@@ -126,6 +126,8 @@ A namespace that has never activated a remote backend continues to use SQLite. A
 | `/api/v1/memories/:id/trust` | POST | Perform an audited trust transition |
 
 Common list query parameters are `namespace`, `query`/`q`, `sessionName`, `agentName`, `taskName`, `parentTask`, `source`, `tags`, `ids`, `trust`, `includeDisabled`, `includeDeleted`, `cursor`, and `limit`.
+
+Exact GET returns suppression metadata without content for a disabled record by default. Authorized operators can request verified disabled content with `includeDisabled=true`; context-token callers need both memory-read and memory-operate scopes.
 
 Explicit search request fields are `query`, `tags`, `ids`, `sources`, `sessionName`, `taskName`, `parentTask`, `agentName`, `trust`, `limit`, `cursor`, `mode`, `allowIncomplete`, `includeDisabled`, and `includeDeleted`. Successful search returns verified Memory objects plus provider-local scores, the actual mode, a safe opaque cursor, `exhausted`, and `complete`:
 

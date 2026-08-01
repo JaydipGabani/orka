@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -8,7 +10,9 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	memoryruntime "github.com/orka-agents/orka/internal/memory"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/store/sqlite"
 )
 
 func TestMemoryOperationCursorRoundTripBindsNamespaceAndFilters(t *testing.T) {
@@ -134,5 +138,71 @@ func TestMemorySearchContextUsesRemoteSearchScopeCallback(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d with remote-search scope", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+func TestGetMemoryDisabledInspectionRequiresOperateScope(t *testing.T) {
+	db, err := sqlite.NewDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoryStore := sqlite.NewStore(db, ":memory:")
+	if err := memoryStore.CreateMemory(context.Background(), &store.Memory{
+		ID: "mem-disabled", Namespace: "default", Content: "disabled content", Disabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandlers(HandlersConfig{
+		MemoryStore:   memoryStore,
+		MemoryService: &memoryruntime.Service{Legacy: memoryStore},
+		ContextTokenAuthorization: ContextTokenAuthorizationConfig{
+			Mode:                ContextTokenAuthorizationModeEnforce,
+			MemoryReadScopes:    []string{ContextTokenScopeMemoryRead},
+			MemoryOperateScopes: []string{ContextTokenScopeMemoryOperate},
+		},
+	})
+	user := &UserInfo{
+		AuthType: AuthTypeContextToken, Namespace: "default",
+		ContextToken: &ContextToken{
+			Scopes:             []string{ContextTokenScopeMemoryRead},
+			TransactionContext: map[string]any{"namespace": "default"},
+		},
+	}
+	app := fiber.New()
+	app.Use(func(c fiber.Ctx) error {
+		c.Locals(UserInfoContextKey, user)
+		return c.Next()
+	})
+	app.Get("/api/v1/memories/:id", h.GetMemory)
+
+	request := func(target string) (*http.Response, store.Memory) {
+		t.Helper()
+		response, err := app.Test(httptest.NewRequest(http.MethodGet, target, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var memory store.Memory
+		if response.StatusCode == http.StatusOK {
+			if err := json.NewDecoder(response.Body).Decode(&memory); err != nil {
+				_ = response.Body.Close()
+				t.Fatal(err)
+			}
+		}
+		_ = response.Body.Close()
+		return response, memory
+	}
+
+	response, memory := request("/api/v1/memories/mem-disabled?namespace=default")
+	if response.StatusCode != http.StatusOK || !memory.Disabled || memory.Content != "" {
+		t.Fatalf("default disabled GET status=%d memory=%#v, want suppression metadata", response.StatusCode, memory)
+	}
+	response, _ = request("/api/v1/memories/mem-disabled?namespace=default&includeDisabled=true")
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("read-only includeDisabled status = %d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+	user.ContextToken.Scopes = append(user.ContextToken.Scopes, ContextTokenScopeMemoryOperate)
+	response, memory = request("/api/v1/memories/mem-disabled?namespace=default&includeDisabled=true")
+	if response.StatusCode != http.StatusOK || memory.Content != "disabled content" {
+		t.Fatalf("operator includeDisabled status=%d memory=%#v, want content", response.StatusCode, memory)
 	}
 }

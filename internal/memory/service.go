@@ -402,8 +402,17 @@ func loadRemoteListCursor(
 	return cursor, nil
 }
 
-// GetMemory returns exact local suppression metadata and verified remote content when materialized.
+// GetMemory returns exact local suppression metadata while keeping disabled content suppressed.
 func (s *Service) GetMemory(ctx context.Context, namespace, id string) (*store.Memory, error) {
+	return s.GetMemoryWithVisibility(ctx, namespace, id, false)
+}
+
+// GetMemoryWithVisibility returns exact memory content when disabled inspection is explicitly authorized.
+func (s *Service) GetMemoryWithVisibility(
+	ctx context.Context,
+	namespace, id string,
+	includeDisabled bool,
+) (*store.Memory, error) {
 	authority, err := s.resolve(ctx, namespace, false)
 	if err != nil {
 		return nil, err
@@ -418,6 +427,10 @@ func (s *Service) GetMemory(ctx context.Context, namespace, id string) (*store.M
 		}
 		if overlayErr := s.applyLegacyGovernance(ctx, authority, memory); overlayErr != nil {
 			return nil, overlayErr
+		}
+		if memory.Disabled && !includeDisabled {
+			memory.Content = ""
+			memory.ContentAvailable = false
 		}
 		return memory, nil
 	}
@@ -437,6 +450,10 @@ func (s *Service) GetMemory(ctx context.Context, namespace, id string) (*store.M
 		memory := remoteEntryToMemory(entry, "")
 		return &memory, nil
 	}
+	if entry.Disabled && !includeDisabled {
+		memory := remoteEntryToMemory(entry, "")
+		return &memory, nil
+	}
 	fresh, err := s.resolve(ctx, namespace, true)
 	if err != nil {
 		return nil, err
@@ -444,7 +461,7 @@ func (s *Service) GetMemory(ctx context.Context, namespace, id string) (*store.M
 	if err := requireRemoteRead(fresh); err != nil {
 		return nil, err
 	}
-	return s.hydrate(ctx, fresh, entry, true)
+	return s.hydrate(ctx, fresh, entry, includeDisabled)
 }
 
 // CreateMemory preserves synchronous legacy behavior and durably admits remote work.

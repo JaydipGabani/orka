@@ -110,10 +110,11 @@ func (h *Handlers) GetMemory(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.authorizeContextTokenAction(c, "getMemory", h.contextTokenAuthorization.MemoryReadScopes); err != nil {
+	includeDisabled := c.Query("includeDisabled", "") == queryTrue
+	if err := h.authorizeMemoryReadVisibility(c, "getMemory", includeDisabled); err != nil {
 		return err
 	}
-	memory, err := h.memoryService.GetMemory(c.Context(), namespace, c.Params("id"))
+	memory, err := h.memoryService.GetMemoryWithVisibility(c.Context(), namespace, c.Params("id"), includeDisabled)
 	if err != nil {
 		return memoryServiceError(err)
 	}

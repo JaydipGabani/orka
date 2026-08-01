@@ -128,7 +128,14 @@ func (h *InternalHandlers) GetMemory(c fiber.Ctx) error {
 	if err := h.authorizeInternalMemoryTask(c, namespace, "getMemory", h.memoryReadScopes()); err != nil {
 		return err
 	}
-	memory, err := h.memoryService.GetMemory(c.Context(), namespace, c.Params("id"))
+	includeDisabled := c.Query("includeDisabled", "") == queryTrue
+	if includeDisabled {
+		if err := h.authorizeInternalMemoryTask(c, namespace, "getMemoryIncludeDisabled",
+			h.memoryReadScopes(), h.memoryOperateScopes()); err != nil {
+			return err
+		}
+	}
+	memory, err := h.memoryService.GetMemoryWithVisibility(c.Context(), namespace, c.Params("id"), includeDisabled)
 	if err != nil {
 		return memoryServiceError(err)
 	}

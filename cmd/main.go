@@ -1396,6 +1396,7 @@ func main() {
 		},
 		ContextTokens:             contextTokenConfig,
 		ContextTokenAuthorization: contextTokenAuthzConfig,
+		ContextTokenTTS:           contextTokenTTSConfig,
 		ResultStore:               sqliteStore,
 		SessionStore:              sqliteStore,
 		PlanStore:                 sqliteStore,

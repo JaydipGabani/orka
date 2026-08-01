@@ -549,12 +549,16 @@ func TestServerPropagatesCustomContextTokenScopesToInternalMemoryHandlers(t *tes
 		MemoryOperateScopes:      []string{"custom:memory:operate"},
 		MemorySearchRemoteScopes: []string{"custom:memory:remote"},
 	}
+	tts := testDirectTaskIncomingTTSConfig()
 	server := NewServer(fakeClient, nil, ServerConfig{
 		Port: 8080, ResultStore: ss, SessionStore: ss, PlanStore: ss, MessageStore: ss,
-		ContextTokenAuthorization: custom,
+		ContextTokenAuthorization: custom, ContextTokenTTS: tts,
 	})
 	if server.internalHandlers == nil {
 		t.Fatal("internal handlers were not configured")
+	}
+	if server.handlers == nil || server.handlers.contextTokenTTS != tts {
+		t.Fatalf("public handler TTS config = %#v, want %#v", server.handlers.contextTokenTTS, tts)
 	}
 	got := server.internalHandlers.contextTokenAuthorization
 	if !slices.Equal(got.MemoryReadScopes, custom.MemoryReadScopes) ||

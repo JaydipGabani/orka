@@ -44,6 +44,14 @@ func (h *Handlers) prepareDirectTaskTransactionToken(c fiber.Ctx, task *corev1al
 		return "", fiber.NewError(fiber.StatusUnprocessableEntity,
 			"scheduled transactional AI and agent tasks require per-run task token provisioning")
 	}
+	if !h.contextTokenTTS.Enabled() {
+		return "", fiber.NewError(fiber.StatusServiceUnavailable,
+			"direct transactional task creation requires context-token TTS")
+	}
+	if h.contextTokenTTS.TokenSource != ContextTokenTTSTokenSourceIncoming {
+		return "", fiber.NewError(fiber.StatusServiceUnavailable,
+			"direct transactional task creation requires context-token TTS tokenSource=incoming")
+	}
 	credential := contextTokenCredential(c)
 	if credential == "" {
 		return "", fiber.NewError(fiber.StatusServiceUnavailable,

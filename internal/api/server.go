@@ -47,6 +47,7 @@ type ServerConfig struct {
 	OIDC                      OIDCConfig
 	ContextTokens             ContextTokenConfig
 	ContextTokenAuthorization ContextTokenAuthorizationConfig
+	ContextTokenTTS           ContextTokenTTSConfig
 	Chat                      ChatConfig
 	ResultStore               store.ResultStore
 	SessionStore              store.SessionStore
@@ -129,6 +130,7 @@ func NewServer(c client.Client, sessionManager *controller.SessionManager, confi
 		WatchNamespace:            config.WatchNamespace,
 		EnforceNamespaceIsolation: config.EnforceNamespaceIsolation,
 		ContextTokenAuthorization: config.ContextTokenAuthorization,
+		ContextTokenTTS:           config.ContextTokenTTS,
 		ResultStore:               config.ResultStore,
 		SessionStore:              config.SessionStore,
 		PlanStore:                 config.PlanStore,

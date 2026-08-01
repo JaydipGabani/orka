@@ -976,6 +976,8 @@ Optional authorization is controlled by `--context-token-authz-mode` / `ORKA_CON
 
 Configure `--context-token-tts-endpoint` / `ORKA_CONTEXT_TOKEN_TTS_ENDPOINT` when workers should exchange a mounted subject token for child or outbound replacement TxTokens. Delegation tools require `ORKA_CONTEXT_TOKEN_SUBJECT_TOKEN_FILE` and `ORKA_CONTEXT_TOKEN_CHILD_SCOPE`; HTTP Tool calls can use `ORKA_CONTEXT_TOKEN_OUTBOUND_SCOPE` or fall back to the current transaction scope. Child scopes are fail-closed: Orka rejects a requested child scope that is not already present in the parent transaction scopes before it creates the child Task.
 
+Direct transactional AI and agent Tasks created by a context-token caller while authorization is in `enforce` mode additionally require `--context-token-tts-token-source=incoming` (or `ORKA_CONTEXT_TOKEN_TTS_TOKEN_SOURCE=incoming`). Disabled TTS and the default `serviceAccount` source are rejected synchronously before Orka creates the Task.
+
 Successful delegation exchanges store the raw child TxToken only in an owner-referenced Kubernetes Secret and annotate the child Task with the Secret name. The controller mounts that Secret into the child worker and sets `ORKA_TRANSACTION_TOKEN_FILE` / `ORKA_CONTEXT_TOKEN_SUBJECT_TOKEN_FILE` so deeper delegation and downstream Tool calls can continue the same transaction with configured child/outbound scopes.
 
 ### Task Provenance Admission Hardening

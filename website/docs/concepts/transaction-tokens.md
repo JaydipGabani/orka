@@ -47,6 +47,8 @@ controller:
 
 Equivalent flags and environment variables are `--context-token-tts-endpoint` and `ORKA_CONTEXT_TOKEN_TTS_ENDPOINT`. The value is the exact OAuth endpoint; Orka does not append a path.
 
+With context-token authorization in `enforce` mode, direct transactional AI and agent Task creation requires this endpoint with `tokenSource: incoming`. Orka rejects the request before creating a Task when TTS is disabled or uses `serviceAccount`, because only the incoming caller token can be exchanged after Kubernetes assigns the Task name and UID.
+
 Transaction-token TTS calls use RFC 8693, request `urn:ietf:params:oauth:token-type:txn_token`, and require a matching `issued_token_type` plus `token_type=N_A`.
 
 ## Provider integrations

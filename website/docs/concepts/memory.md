@@ -118,7 +118,7 @@ Public routes are under `/api/v1` and use the server's configured authentication
 | `/api/v1/memories` | GET | Deterministically list memories; legacy `query`/`q` compatibility may invoke keyword search under remote authority |
 | `/api/v1/memories` | POST | Create memory |
 | `/api/v1/memories/search` | POST | Explicit bounded `keyword`, `semantic`, `hybrid`, or `auto` search |
-| `/api/v1/memories/:id` | GET | Get and verify one memory |
+| `/api/v1/memories/:id` | GET | Get one memory; disabled content requires `includeDisabled=true` and memory-operate scope |
 | `/api/v1/memories/:id` | PUT | Replace mutable memory fields |
 | `/api/v1/memories/:id` | DELETE | Delete memory or install a remote tombstone |
 | `/api/v1/memories/:id/disable` | POST | Disable normal recall locally |
@@ -126,6 +126,8 @@ Public routes are under `/api/v1` and use the server's configured authentication
 | `/api/v1/memories/:id/trust` | POST | Audited trust transition |
 
 Common list filters include `namespace`, `query`/`q`, `sessionName`, `agentName`, `taskName`, `parentTask`, `source`, `tags`, `ids`, `trust`, `includeDisabled`, `includeDeleted`, `cursor`, and `limit`.
+
+Exact GET keeps disabled content suppressed unless an authorized operator explicitly sets `includeDisabled=true`; context-token callers need both memory-read and memory-operate scopes for that inspection.
 
 Explicit search accepts `query`, `tags`, `ids`, provenance filters, `trust`, `limit`, `cursor`, `mode`, `allowIncomplete`, `includeDisabled`, and `includeDeleted`. A successful response contains:
 

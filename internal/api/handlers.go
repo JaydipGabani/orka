@@ -89,6 +89,7 @@ type Handlers struct {
 	watchNamespace            string
 	enforceNamespaceIsolation bool
 	contextTokenAuthorization ContextTokenAuthorizationConfig
+	contextTokenTTS           ContextTokenTTSConfig
 	resultStore               store.ResultStore
 	sessionStore              store.SessionStore
 	planStore                 store.PlanStore
@@ -116,6 +117,7 @@ type HandlersConfig struct {
 	WatchNamespace            string
 	EnforceNamespaceIsolation bool
 	ContextTokenAuthorization ContextTokenAuthorizationConfig
+	ContextTokenTTS           ContextTokenTTSConfig
 	ResultStore               store.ResultStore
 	SessionStore              store.SessionStore
 	PlanStore                 store.PlanStore
@@ -143,6 +145,7 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		watchNamespace:            cfg.WatchNamespace,
 		enforceNamespaceIsolation: cfg.EnforceNamespaceIsolation,
 		contextTokenAuthorization: cfg.ContextTokenAuthorization,
+		contextTokenTTS:           cfg.ContextTokenTTS,
 		resultStore:               cfg.ResultStore,
 		sessionStore:              cfg.SessionStore,
 		planStore:                 cfg.PlanStore,

@@ -464,8 +464,15 @@ func TestRemoteDisabledMemoryHydratesForExplicitInspection(t *testing.T) {
 	}
 
 	got, err := service.GetMemory(context.Background(), activeBinding.Namespace, entry.ID)
+	if err != nil || got == nil || !got.Disabled || got.Content != "" || got.ContentAvailable {
+		t.Fatalf("GetMemory() = %#v, %v; want disabled metadata without content", got, err)
+	}
+	if calls, _ := adapter.getStats(); calls != 0 {
+		t.Fatalf("default exact get hydrated disabled memory with %d Get calls", calls)
+	}
+	got, err = service.GetMemoryWithVisibility(context.Background(), activeBinding.Namespace, entry.ID, true)
 	if err != nil || got == nil || !got.Disabled || got.Content != record.Content || !got.ContentAvailable {
-		t.Fatalf("GetMemory() = %#v, %v; want verified disabled content", got, err)
+		t.Fatalf("GetMemoryWithVisibility() = %#v, %v; want verified disabled content", got, err)
 	}
 	listed, err = service.ListMemories(context.Background(), store.MemoryFilter{
 		Namespace: activeBinding.Namespace, IncludeDisabled: true, Limit: 10,

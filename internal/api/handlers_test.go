@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/require"
@@ -139,10 +140,30 @@ func setupTestHandlers() (*Handlers, *fiber.App) {
 	return handlers, app
 }
 
+func testDirectTaskIncomingTTSConfig() ContextTokenTTSConfig {
+	return ContextTokenTTSConfig{
+		Endpoint:      "https://transactions.example.test/token",
+		TokenSource:   ContextTokenTTSTokenSourceIncoming,
+		ChildTokenTTL: time.Minute,
+	}
+}
+
 func setupTestHandlersWithAuthzTaskUID(
 	t *testing.T,
 	ctxTokenConfig ContextTokenConfig,
 	mode string,
+	objs ...runtime.Object,
+) (*fiber.App, client.Client) {
+	return setupTestHandlersWithAuthzTaskUIDAndTTS(
+		t, ctxTokenConfig, mode, testDirectTaskIncomingTTSConfig(), objs...,
+	)
+}
+
+func setupTestHandlersWithAuthzTaskUIDAndTTS(
+	t *testing.T,
+	ctxTokenConfig ContextTokenConfig,
+	mode string,
+	ttsConfig ContextTokenTTSConfig,
 	objs ...runtime.Object,
 ) (*fiber.App, client.Client) {
 	t.Helper()
@@ -164,7 +185,9 @@ func setupTestHandlersWithAuthzTaskUID(
 		Build()
 	authz, err := NewContextTokenAuthorizationConfig(ContextTokenAuthorizationConfigOptions{Mode: mode})
 	require.NoError(t, err)
-	handlers := NewHandlers(HandlersConfig{Client: fakeClient, ContextTokenAuthorization: authz})
+	handlers := NewHandlers(HandlersConfig{
+		Client: fakeClient, ContextTokenAuthorization: authz, ContextTokenTTS: ttsConfig,
+	})
 	app := fiber.New()
 	app.Use(NewAuthMiddleware(fakeClient, AuthConfig{ContextTokens: ctxTokenConfig}))
 	app.Post("/tasks", handlers.CreateTask)
@@ -617,6 +640,65 @@ func TestHandlers_CreateTask_ContextTokenAuthorizationEnforceAllowsMatchingToken
 	}
 }
 
+func TestHandlers_CreateTask_ContextTokenEnforceRejectsUnsupportedDirectTaskTTS(t *testing.T) {
+	provider := newTestOIDCProvider(t)
+	ctxTokenConfig := testContextTokenConfig(t, provider, "")
+	serviceAccountConfig, err := NewContextTokenTTSConfig(
+		"https://transactions.example.test/token", "", "", "", "", "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serviceAccountConfig.TokenSource != ContextTokenTTSTokenSourceServiceAccount {
+		t.Fatalf("default TokenSource = %q, want %q", serviceAccountConfig.TokenSource, ContextTokenTTSTokenSourceServiceAccount)
+	}
+
+	tests := []struct {
+		name       string
+		tts        ContextTokenTTSConfig
+		schedule   string
+		wantStatus int
+	}{
+		{name: "TTS disabled", wantStatus: http.StatusServiceUnavailable},
+		{name: "default serviceAccount source", tts: serviceAccountConfig, wantStatus: http.StatusServiceUnavailable},
+		{name: "unsupported schedule takes precedence", schedule: "@hourly", wantStatus: http.StatusUnprocessableEntity},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			app, k8sClient := setupTestHandlersWithAuthzTaskUIDAndTTS(
+				t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, test.tts,
+			)
+			token := issueTestContextToken(t, provider, nil, map[string]any{
+				testContextTokenScopeClaim: ContextTokenScopeTaskCreate + " orka:agents:run " + ContextTokenScopeMemoryRead,
+				"tctx": map[string]any{
+					"namespace": "default", "taskType": "agent", "agent": "reviewer",
+				},
+			})
+			resp := postCreateTaskWithContextToken(t, app, token, CreateTaskRequest{
+				Name: "unsupported-direct-tts", Namespace: "default", Type: corev1alpha1.TaskTypeAgent,
+				AgentRef: &corev1alpha1.AgentReference{Name: "reviewer"}, Prompt: "perform review", Schedule: test.schedule,
+			})
+			if resp.StatusCode != test.wantStatus {
+				t.Fatalf("StatusCode = %d, want %d", resp.StatusCode, test.wantStatus)
+			}
+			created := &corev1alpha1.Task{}
+			err := k8sClient.Get(context.Background(), types.NamespacedName{
+				Namespace: "default", Name: "unsupported-direct-tts",
+			}, created)
+			if !apierrors.IsNotFound(err) {
+				t.Fatalf("unsupported configuration created a Task: %v", err)
+			}
+			secrets := &corev1.SecretList{}
+			if err := k8sClient.List(context.Background(), secrets, client.InNamespace("default")); err != nil {
+				t.Fatalf("list Secrets: %v", err)
+			}
+			if len(secrets.Items) != 0 {
+				t.Fatalf("unsupported configuration created %d transaction token Secrets", len(secrets.Items))
+			}
+		})
+	}
+}
+
 func TestHandlers_CreateTask_ContextTokenEnforceCleansUpWhenSubjectSecretCreationFails(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")
@@ -641,7 +723,9 @@ func TestHandlers_CreateTask_ContextTokenEnforceCleansUpWhenSubjectSecretCreatio
 		Mode: ContextTokenAuthorizationModeEnforce,
 	})
 	require.NoError(t, err)
-	handlers := NewHandlers(HandlersConfig{Client: fakeClient, ContextTokenAuthorization: authz})
+	handlers := NewHandlers(HandlersConfig{
+		Client: fakeClient, ContextTokenAuthorization: authz, ContextTokenTTS: testDirectTaskIncomingTTSConfig(),
+	})
 	app := fiber.New()
 	app.Use(NewAuthMiddleware(fakeClient, AuthConfig{ContextTokens: ctxTokenConfig}))
 	app.Post("/tasks", handlers.CreateTask)
