@@ -1746,8 +1746,9 @@ Usage:
   orka memory get <id> [flags]
 
 Flags:
-  -h, --help            help for get
-  -o, --output string   Output format: table, json, yaml (default "json")
+  -h, --help               help for get
+      --include-disabled   Include disabled memory
+  -o, --output string      Output format: table, json, yaml (default "json")
 
 Global Flags:
       --kubeconfig string       Path to kubeconfig file

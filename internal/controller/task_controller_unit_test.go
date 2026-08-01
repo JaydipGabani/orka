@@ -5737,10 +5737,8 @@ func TestHandlePending_DirectTaskTransactionTokenExchangeCompletesBeforeExecutio
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			const (
-				subjectToken = "verified-caller-transaction-token"
-				taskToken    = "task-bound-transaction-token"
-			)
+			const subjectToken = "verified-caller-transaction-token"
+			taskToken := taskTokenJWTForTest(t, time.Now().Add(transactiontoken.MinimumProjectedTokenRequestedTTL), "initial")
 			task := test.task.DeepCopy()
 			secretName := task.Name + "-transaction"
 			task.Annotations = map[string]string{
@@ -5753,17 +5751,9 @@ func TestHandlePending_DirectTaskTransactionTokenExchangeCompletesBeforeExecutio
 				Scopes: []string{directTokenMemoryReadScope, directTokenMemoryWriteScope},
 			}
 			task.Status.Phase = corev1alpha1.TaskPhasePending
-			secret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: secretName, Namespace: task.Namespace,
-					OwnerReferences: []metav1.OwnerReference{{
-						APIVersion: corev1alpha1.GroupVersion.String(), Kind: taskTransactionTokenOwnerKind, Name: task.Name, UID: task.UID,
-					}},
-				},
-				Type: corev1.SecretTypeOpaque,
-				Data: map[string][]byte{transactiontoken.SubjectSecretKey: []byte(subjectToken)},
-			}
-			objects := []client.Object{task, secret}
+			secret := directTaskTokenWorkloadSecretForTest(task, secretName)
+			authority := directTaskTokenAuthoritySecretForTest(task, subjectToken)
+			objects := []client.Object{task, secret, authority}
 			if test.agent != nil {
 				objects = append(objects, test.agent.DeepCopy())
 			}
@@ -5772,7 +5762,7 @@ func TestHandlePending_DirectTaskTransactionTokenExchangeCompletesBeforeExecutio
 			r.BrokeredTransactionExchange = &workerpkg.TransactionExchangeConfig{
 				TTS: contexttoken.TTSConfig{
 					Endpoint: "https://transactions.example.test/token", TokenSource: contexttoken.TTSTokenSourceIncoming,
-					ChildTokenTTL: time.Minute,
+					ChildTokenTTL: transactiontoken.MinimumProjectedTokenRequestedTTL,
 				},
 				Exchanger: exchanger,
 			}
@@ -5799,7 +5789,17 @@ func TestHandlePending_DirectTaskTransactionTokenExchangeCompletesBeforeExecutio
 				t.Fatal("Secret does not contain the exchanged task-bound token")
 			}
 			if _, ok := updatedSecret.Data[transactiontoken.SubjectSecretKey]; ok {
-				t.Fatal("raw caller token remained after successful exchange")
+				t.Fatal("workload Secret exposed the renewal authority")
+			}
+			updatedAuthority := &corev1.Secret{}
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(authority), updatedAuthority); err != nil ||
+				string(updatedAuthority.Data[transactiontoken.SubjectSecretKey]) != subjectToken {
+				t.Fatal("controller-only renewal authority was not retained")
+			}
+			if len(updatedSecret.Data[taskTokenExpiresAtSecretKey]) == 0 ||
+				len(updatedSecret.Data[taskTokenRefreshAtSecretKey]) == 0 ||
+				string(updatedSecret.Data[taskTokenGenerationSecretKey]) != "1" {
+				t.Fatal("renewable task token metadata was not persisted")
 			}
 			if test.agent != nil {
 				runtimeToken, _, err := r.harnessBrokeredTransactionAuthority(context.Background(), updatedTask)
@@ -5821,8 +5821,15 @@ func TestHandlePending_DirectTaskTransactionTokenExchangeCompletesBeforeExecutio
 			if err := r.List(context.Background(), jobs, client.InNamespace(task.Namespace)); err != nil {
 				t.Fatalf("list Jobs: %v", err)
 			}
-			if len(jobs.Items) != 0 || updatedTask.Status.HarnessRuntime != nil {
-				t.Fatal("task execution started in the same reconciliation as token exchange")
+			switch test.task.Spec.Type {
+			case corev1alpha1.TaskTypeAI:
+				if len(jobs.Items) != 1 {
+					t.Fatalf("Job-backed Task created %d Jobs after token setup, want 1", len(jobs.Items))
+				}
+			case corev1alpha1.TaskTypeAgent:
+				if len(jobs.Items) != 0 || updatedTask.Status.JobName != "" {
+					t.Fatal("runtimeRef Task incorrectly created a Kubernetes Job")
+				}
 			}
 		})
 	}
@@ -5847,17 +5854,9 @@ func TestHandlePending_DirectTaskTransactionTokenExchangeFailureCleansUpAndFails
 		},
 		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhasePending},
 	}
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "direct-token-failure-secret", Namespace: defaultNS,
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: corev1alpha1.GroupVersion.String(), Kind: taskTransactionTokenOwnerKind, Name: task.Name, UID: task.UID,
-			}},
-		},
-		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{transactiontoken.SubjectSecretKey: []byte(subjectToken)},
-	}
-	r := newUnitReconciler(newTestScheme(), task, secret)
+	secret := directTaskTokenWorkloadSecretForTest(task, "direct-token-failure-secret")
+	authority := directTaskTokenAuthoritySecretForTest(task, subjectToken)
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
 	r.BrokeredTransactionExchange = &workerpkg.TransactionExchangeConfig{
 		TTS: contexttoken.TTSConfig{
 			Endpoint: "https://transactions.example.test/token", TokenSource: contexttoken.TTSTokenSourceIncoming,
@@ -5879,7 +5878,10 @@ func TestHandlePending_DirectTaskTransactionTokenExchangeFailureCleansUpAndFails
 		t.Fatal("failed task status leaked the caller transaction token")
 	}
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("transaction token subject Secret remained after exchange failure: %v", err)
+		t.Fatalf("transaction token workload Secret remained after exchange failure: %v", err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(authority), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("transaction renewal authority remained after exchange failure: %v", err)
 	}
 	jobs := &batchv1.JobList{}
 	if err := r.List(context.Background(), jobs, client.InNamespace(task.Namespace)); err != nil {

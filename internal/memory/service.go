@@ -34,7 +34,7 @@ const (
 	maxRemoteSearchPages              = 20
 	maxRemoteListCandidates           = 1000
 	maxRemoteListPages                = 20
-	maxRemoteListHydrationConcurrency = 8
+	maxRemoteListHydrationConcurrency = omsHTTPMaxConnsPerHost
 	remoteListCursorTTL               = 5 * time.Minute
 	maxRemoteListCursorBytes          = 4 << 10
 	legacyMemoryDisableAuditAction    = "memory.disable"
@@ -1625,8 +1625,15 @@ func (s *Service) search(
 		tombstones = &remoteSearchTombstoneCursor{Exhausted: !request.IncludeDeleted}
 	}
 	target := boundedMemoryLimit(request.Limit)
+	providerPageSize, err := remoteSearchPageSize(authority)
+	if err != nil {
+		return nil, err
+	}
 	if cursorState.PageSize == 0 {
-		cursorState.PageSize = min(target, protocol.MaxPageSize)
+		cursorState.PageSize = min(target, providerPageSize)
+	} else if cursorState.PageSize > providerPageSize {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search page size exceeds the active backend capability")
 	}
 	items := make([]SearchHit, 0, target)
 	seen := make(map[string]struct{}, target)
@@ -2051,6 +2058,19 @@ func authorizeRemoteSearch(searchContext SearchContext) error {
 		return apierror.New(http.StatusForbidden, ReasonSearchRemoteAuth, "remote memory search is not authorized")
 	}
 	return nil
+}
+
+func remoteSearchPageSize(authority *ResolvedAuthority) (int, error) {
+	if authority == nil || authority.Backend == nil || authority.Backend.Status.ObservedCapabilities == nil {
+		return 0, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search capabilities are unavailable")
+	}
+	pageSize := int(authority.Backend.Status.ObservedCapabilities.Limits.MaxPageSize)
+	if pageSize <= 0 || pageSize > protocol.MaxPageSize {
+		return 0, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search page size capability is invalid")
+	}
+	return pageSize, nil
 }
 
 func ensureSearchCapability(backend *corev1alpha1.MemoryBackend, mode string) error {

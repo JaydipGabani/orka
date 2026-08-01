@@ -9,8 +9,12 @@ package api
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/gofiber/fiber/v3"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -20,9 +24,54 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/transactiontoken"
 )
 
-const taskResourceNameForTokenCleanupTest = "tasks"
+const (
+	taskResourceNameForTokenCleanupTest = "tasks"
+	projectedTokenSafeCase              = "safe"
+)
+
+func TestPrepareDirectTaskTransactionTokenRequiresProjectedLifetime(t *testing.T) {
+	tests := []struct {
+		name       string
+		ttl        time.Duration
+		wantStatus int
+	}{
+		{name: "too short", ttl: transactiontoken.MinimumProjectedTokenRequestedTTL - time.Second, wantStatus: http.StatusServiceUnavailable},
+		{name: projectedTokenSafeCase, ttl: transactiontoken.MinimumProjectedTokenRequestedTTL, wantStatus: http.StatusNoContent},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := &Handlers{
+				contextTokenAuthorization: ContextTokenAuthorizationConfig{Mode: ContextTokenAuthorizationModeEnforce},
+				contextTokenTTS: ContextTokenTTSConfig{
+					Endpoint: "https://transactions.example.test/token", TokenSource: ContextTokenTTSTokenSourceIncoming,
+					ChildTokenTTL: test.ttl,
+				},
+			}
+			app := fiber.New()
+			app.Post("/check", func(c fiber.Ctx) error {
+				c.Locals(contextTokenCredentialLocalKey, "verified-caller-token")
+				_, err := h.prepareDirectTaskTransactionToken(c, &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+					Type: corev1alpha1.TaskTypeAI, Transaction: &corev1alpha1.TaskTransaction{ID: "txn-projected"},
+				}})
+				if err != nil {
+					return err
+				}
+				return c.SendStatus(fiber.StatusNoContent)
+			})
+			response, err := app.Test(httptest.NewRequest(http.MethodPost, "/check", nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = response.Body.Close() }()
+			if response.StatusCode != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.StatusCode, test.wantStatus)
+			}
+		})
+	}
+}
 
 func TestCleanupTaskAfterTransactionTokenSetupFailureDeletesExactTaskUID(t *testing.T) {
 	scheme := runtime.NewScheme()

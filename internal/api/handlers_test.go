@@ -18,7 +18,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/require"
@@ -144,7 +143,7 @@ func testDirectTaskIncomingTTSConfig() ContextTokenTTSConfig {
 	return ContextTokenTTSConfig{
 		Endpoint:      "https://transactions.example.test/token",
 		TokenSource:   ContextTokenTTSTokenSourceIncoming,
-		ChildTokenTTL: time.Minute,
+		ChildTokenTTL: transactiontoken.MinimumProjectedTokenRequestedTTL,
 	}
 }
 
@@ -620,23 +619,31 @@ func TestHandlers_CreateTask_ContextTokenAuthorizationEnforceAllowsMatchingToken
 	}
 	secret := &corev1.Secret{}
 	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: secretName}, secret); err != nil {
-		t.Fatalf("get transaction token subject Secret: %v", err)
+		t.Fatalf("get transaction token workload Secret: %v", err)
 	}
 	if !taskOwnsTransactionTokenSecretForTest(created, secret) {
-		t.Fatal("transaction token subject Secret is not owned by the created Task")
+		t.Fatal("transaction token workload Secret is not owned by the created Task")
 	}
-	if string(secret.Data[transactiontoken.SubjectSecretKey]) != token {
-		t.Fatal("transaction token subject Secret did not preserve the verified request credential")
+	if secret.Labels[labels.LabelPurpose] != transactiontoken.WorkloadSecretPurpose || len(secret.Data) != 0 {
+		t.Fatal("workload Secret contains renewal authority or unexpected data")
 	}
-	if _, ok := secret.Data[transactiontoken.TokenSecretKey]; ok {
-		t.Fatal("transaction token subject Secret exposed an unexchanged task token")
+	authorities := &corev1.SecretList{}
+	if err := k8sClient.List(context.Background(), authorities, client.InNamespace("default"), client.MatchingLabels{
+		labels.LabelPurpose: transactiontoken.AuthoritySecretPurpose,
+		labels.LabelTaskUID: labels.SelectorValue(string(created.UID)),
+	}); err != nil {
+		t.Fatalf("list transaction renewal authority: %v", err)
+	}
+	if len(authorities.Items) != 1 || !taskOwnsTransactionTokenSecretForTest(created, &authorities.Items[0]) ||
+		string(authorities.Items[0].Data[transactiontoken.SubjectSecretKey]) != token {
+		t.Fatal("controller-only transaction renewal authority was not created correctly")
 	}
 	encodedTask, err := json.Marshal(created)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(encodedTask, []byte(token)) {
-		t.Fatal("raw transaction token was persisted on the Task")
+	if bytes.Contains(encodedTask, []byte(token)) || bytes.Contains(encodedTask, []byte(authorities.Items[0].Name)) {
+		t.Fatal("Task exposed raw authority or the controller-only authority Secret name")
 	}
 }
 
@@ -4695,7 +4702,9 @@ func TestHandlers_ApplyMemoryProposal_ContextTokenAuthorization(t *testing.T) {
 		scope string
 		want  int
 	}{
-		{name: "allowed with memory write", scope: ContextTokenScopeMemoryWrite, want: http.StatusOK},
+		{name: "allowed with memory write and operate", scope: ContextTokenScopeMemoryWrite + " " + ContextTokenScopeMemoryOperate, want: http.StatusOK},
+		{name: "denied with only memory write", scope: ContextTokenScopeMemoryWrite, want: http.StatusForbidden},
+		{name: "denied with only memory operate", scope: ContextTokenScopeMemoryOperate, want: http.StatusForbidden},
 		{name: "denied with only memory read", scope: ContextTokenScopeMemoryRead, want: http.StatusForbidden},
 	}
 

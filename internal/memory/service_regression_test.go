@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strconv"
 	"strings"
@@ -328,6 +330,7 @@ func remoteSearchService(
 	backend.Status.Ready = true
 	backend.Status.ObservedCapabilities = &corev1alpha1.MemoryBackendObservedCapabilities{
 		Effective: []corev1alpha1.MemoryBackendCapability{corev1alpha1.MemoryBackendCapabilityKeywordSearch},
+		Limits:    corev1alpha1.MemoryBackendCapabilityLimits{MaxPageSize: protocol.MaxPageSize},
 	}
 	governed := newGovernedSearchStore(entries)
 	authority := &ResolvedAuthority{
@@ -795,6 +798,99 @@ func TestRemoteCatalogHydratesConcurrentlyWithinFixedBoundAndPreservesOrder(t *t
 	}
 }
 
+func TestRemoteCatalogHTTP1HydrationRespectsTransportConnectionCap(t *testing.T) {
+	now := time.Date(2026, 8, 1, 16, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	count := omsHTTPMaxConnsPerHost * 2
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, count)
+	records := make([]protocol.MemoryRecord, 0, count)
+	byUpsertKey := make(map[string]protocol.MemoryRecord, count)
+	for i := range count {
+		entry, record := remoteSearchFixture(
+			binding, fmt.Sprintf("mem-http1-%02d", i), now.Add(-time.Duration(i)*time.Second), "slow content", store.MemoryTrustReviewed,
+		)
+		entries = append(entries, entry)
+		records = append(records, record)
+		byUpsertKey[record.UpsertKey] = record
+	}
+
+	const requestDelay = 300 * time.Millisecond
+	var concurrencyMu sync.Mutex
+	active, maxActive := 0, 0
+	protocolMajor := 0
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			http.Error(writer, "invalid body", http.StatusBadRequest)
+			return
+		}
+		decoded, err := protocol.DecodeGetRequest(body)
+		if err != nil || request.URL.Path != protocol.PathRecordsGet {
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		concurrencyMu.Lock()
+		active++
+		maxActive = max(maxActive, active)
+		protocolMajor = request.ProtoMajor
+		concurrencyMu.Unlock()
+		defer func() {
+			concurrencyMu.Lock()
+			active--
+			concurrencyMu.Unlock()
+		}()
+		time.Sleep(requestDelay)
+		record, found := byUpsertKey[decoded.UpsertKey]
+		response := protocol.GetResponse{
+			ProtocolVersion: protocol.Version, Binding: decoded.Binding, Found: found,
+		}
+		if found {
+			copy := record
+			response.Record = &copy
+		}
+		encoded, err := protocol.EncodeJSON(response)
+		if err != nil {
+			http.Error(writer, "encode response", http.StatusInternalServerError)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write(encoded)
+	}))
+	server.EnableHTTP2 = false
+	server.StartTLS()
+	defer server.Close()
+
+	transport := server.Client().Transport.(*http.Transport).Clone()
+	transport.MaxConnsPerHost = omsHTTPMaxConnsPerHost
+	client := &OMSClient{
+		baseURL: server.URL, token: "test-token",
+		client: &http.Client{Transport: transport, Timeout: 500 * time.Millisecond},
+	}
+	service, _, activeBinding, _ := remoteSearchService(t, entries, records)
+	authority := service.Resolver.(staticAuthorityResolver).authority
+	authority.Adapter = client
+
+	listed, err := service.ListMemories(context.Background(), store.MemoryFilter{
+		Namespace: activeBinding.Namespace, Limit: count,
+	})
+	if err != nil || len(listed) != count {
+		t.Fatalf("ListMemories() = %d items, %v; want all slow HTTP/1.1 records", len(listed), err)
+	}
+	concurrencyMu.Lock()
+	gotMaxActive, gotProtocolMajor := maxActive, protocolMajor
+	concurrencyMu.Unlock()
+	if gotProtocolMajor != 1 || gotMaxActive != omsHTTPMaxConnsPerHost {
+		t.Fatalf("HTTP protocol=%d max active=%d, want HTTP/1.1 and %d",
+			gotProtocolMajor, gotMaxActive, omsHTTPMaxConnsPerHost)
+	}
+}
+
 func TestRemoteCatalogConcurrentHydrationStillRejectsDivergence(t *testing.T) {
 	now := time.Date(2026, 7, 29, 1, 0, 0, 0, time.UTC)
 	binding := store.MemoryBackendBinding{
@@ -822,6 +918,55 @@ func TestRemoteCatalogConcurrentHydrationStillRejectsDivergence(t *testing.T) {
 	issues := recordingStore.recordedIssues()
 	if len(issues) != 1 || issues[0].ID != secondEntry.ID || issues[0].State != store.MemoryMaterializationDiverged {
 		t.Fatalf("materialization issues = %#v", issues)
+	}
+}
+
+func TestRemoteSearchPersistsAdvertisedMaximumPageSize(t *testing.T) {
+	now := time.Date(2026, 8, 1, 16, 15, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, 4)
+	records := make([]protocol.MemoryRecord, 0, 4)
+	for i := 1; i <= 4; i++ {
+		entry, record := remoteSearchFixture(
+			binding, fmt.Sprintf("mem-page-%d", i), now.Add(-time.Duration(i)*time.Second), "needle", store.MemoryTrustReviewed,
+		)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	service, adapter, activeBinding, governed := remoteSearchService(t, entries, records)
+	authority := service.Resolver.(staticAuthorityResolver).authority
+	authority.Backend.Status.ObservedCapabilities.Limits.MaxPageSize = 1
+
+	first, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 2,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || first == nil || len(first.Items) != 2 || first.Cursor == "" || first.Exhausted {
+		t.Fatalf("first Search() = %#v, %v", first, err)
+	}
+	stored := governed.cursors[first.Cursor]
+	var cursor persistedRemoteSearchCursor
+	if err := json.Unmarshal(stored.State, &cursor); err != nil || cursor.PageSize != 1 {
+		t.Fatalf("persisted cursor = %#v, %v; want page size 1", cursor, err)
+	}
+	second, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 2, Cursor: first.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || second == nil || len(second.Items) != 2 || !second.Exhausted {
+		t.Fatalf("second Search() = %#v, %v", second, err)
+	}
+	if adapter.searchCalls != 4 || len(adapter.pageSizes) != 4 {
+		t.Fatalf("provider calls=%d page sizes=%v, want four single-record pages", adapter.searchCalls, adapter.pageSizes)
+	}
+	for i, pageSize := range adapter.pageSizes {
+		if pageSize != 1 {
+			t.Fatalf("provider page size[%d] = %d, want 1", i, pageSize)
+		}
 	}
 }
 

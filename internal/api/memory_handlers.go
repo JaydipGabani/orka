@@ -276,7 +276,7 @@ func (h *Handlers) ReviewMemoryProposal(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.authorizeContextTokenAction(c, "reviewMemoryProposal", h.contextTokenAuthorization.MemoryWriteScopes); err != nil {
+	if err := h.authorizeContextTokenAction(c, "reviewMemoryProposal", h.contextTokenAuthorization.MemoryOperateScopes); err != nil {
 		return err
 	}
 	review.Namespace = namespace
@@ -323,6 +323,9 @@ func (h *Handlers) ApplyMemoryProposal(c fiber.Ctx) error {
 		return err
 	}
 	if err := h.authorizeContextTokenAction(c, "applyMemoryProposal", h.contextTokenAuthorization.MemoryWriteScopes); err != nil {
+		return err
+	}
+	if err := h.authorizeContextTokenAction(c, "applyMemoryProposal", h.contextTokenAuthorization.MemoryOperateScopes); err != nil {
 		return err
 	}
 	actor, _ := memoryActor(c)

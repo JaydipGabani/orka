@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -13,6 +14,11 @@ import (
 	memoryruntime "github.com/orka-agents/orka/internal/memory"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/store/sqlite"
+)
+
+const (
+	testMemoryProposalNamespaceKey = "namespace"
+	testMemoryProposalTypeValue    = "memory"
 )
 
 func TestMemoryOperationCursorRoundTripBindsNamespaceAndFilters(t *testing.T) {
@@ -94,6 +100,122 @@ func TestAuthorizeMemoryReadVisibilityRequiresOperateForDisabledContent(t *testi
 	}
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("includeDisabled status = %d, want %d with operate scope", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+func TestPublicMemoryProposalGovernanceRequiresOperateScope(t *testing.T) {
+	db, err := sqlite.NewDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoryStore := sqlite.NewStore(db, ":memory:")
+	h := NewHandlers(HandlersConfig{
+		MemoryStore:         memoryStore,
+		MemoryProposalStore: memoryStore,
+		MemoryService: &memoryruntime.Service{
+			Legacy: memoryStore, Proposals: memoryStore, Governed: memoryStore,
+		},
+		ContextTokenAuthorization: ContextTokenAuthorizationConfig{
+			Mode:                ContextTokenAuthorizationModeEnforce,
+			MemoryReadScopes:    []string{ContextTokenScopeMemoryRead},
+			MemoryWriteScopes:   []string{ContextTokenScopeMemoryWrite},
+			MemoryOperateScopes: []string{ContextTokenScopeMemoryOperate},
+		},
+	})
+	user := &UserInfo{
+		AuthType: AuthTypeContextToken, Namespace: testDefaultNamespace,
+		ContextToken: &ContextToken{TransactionContext: map[string]any{testMemoryProposalNamespaceKey: testDefaultNamespace}},
+	}
+	app := fiber.New()
+	app.Use(func(c fiber.Ctx) error {
+		c.Locals(UserInfoContextKey, user)
+		return c.Next()
+	})
+	app.Post("/api/v1/memory-proposals", h.CreateMemoryProposal)
+	app.Post("/api/v1/memory-proposals/:id/review", h.ReviewMemoryProposal)
+	app.Post("/api/v1/memory-proposals/:id/apply", h.ApplyMemoryProposal)
+
+	request := func(target, body string) *http.Response {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, target, bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		response, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = response.Body.Close() })
+		return response
+	}
+
+	createBody := `{"namespace":"default","type":"memory","title":"Submitted proposal","content":"submitted content"}`
+	user.ContextToken.Scopes = []string{ContextTokenScopeMemoryOperate}
+	if response := request("/api/v1/memory-proposals", createBody); response.StatusCode != http.StatusForbidden {
+		t.Fatalf("operate-only proposal create status = %d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+	user.ContextToken.Scopes = []string{ContextTokenScopeMemoryWrite}
+	response := request("/api/v1/memory-proposals", createBody)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("write-scoped proposal create status = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	var submitted store.MemoryProposal
+	if err := json.NewDecoder(response.Body).Decode(&submitted); err != nil {
+		t.Fatal(err)
+	}
+
+	reviewProposal := &store.MemoryProposal{
+		Namespace: testDefaultNamespace, Type: testMemoryProposalTypeValue, Title: "Review proposal", Content: "review content",
+	}
+	if err := memoryStore.CreateMemoryProposal(context.Background(), reviewProposal); err != nil {
+		t.Fatal(err)
+	}
+	reviewTarget := "/api/v1/memory-proposals/" + reviewProposal.ID + "/review?namespace=default"
+	user.ContextToken.Scopes = []string{ContextTokenScopeMemoryWrite}
+	if response := request(reviewTarget, `{"status":"accepted"}`); response.StatusCode != http.StatusForbidden {
+		t.Fatalf("write-only proposal review status = %d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+	pending, err := memoryStore.GetMemoryProposal(context.Background(), testDefaultNamespace, reviewProposal.ID)
+	if err != nil || pending.Status != reviewProposal.Status {
+		t.Fatalf("proposal after denied review = %#v, %v", pending, err)
+	}
+	user.ContextToken.Scopes = []string{ContextTokenScopeMemoryOperate}
+	if response := request(reviewTarget, `{"status":"accepted"}`); response.StatusCode != http.StatusNoContent {
+		t.Fatalf("operate-scoped proposal review status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+
+	applyProposal := &store.MemoryProposal{
+		Namespace: testDefaultNamespace, Type: testMemoryProposalTypeValue, Title: "Apply proposal", Content: "apply content",
+	}
+	if err := memoryStore.CreateMemoryProposal(context.Background(), applyProposal); err != nil {
+		t.Fatal(err)
+	}
+	if err := memoryStore.ReviewMemoryProposal(context.Background(), store.MemoryProposalReview{
+		Namespace: testDefaultNamespace, ID: applyProposal.ID, Status: githubCommandStatusAccepted, Reviewer: "operator",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	applyTarget := "/api/v1/memory-proposals/" + applyProposal.ID + "/apply?namespace=default"
+	for name, scopes := range map[string][]string{
+		"write only":   {ContextTokenScopeMemoryWrite},
+		"operate only": {ContextTokenScopeMemoryOperate},
+	} {
+		t.Run(name, func(t *testing.T) {
+			user.ContextToken.Scopes = scopes
+			if response := request(applyTarget, `{}`); response.StatusCode != http.StatusForbidden {
+				t.Fatalf("proposal apply status = %d, want %d", response.StatusCode, http.StatusForbidden)
+			}
+		})
+	}
+	accepted, err := memoryStore.GetMemoryProposal(context.Background(), testDefaultNamespace, applyProposal.ID)
+	if err != nil || accepted.Status != githubCommandStatusAccepted || accepted.ApplyOperationID != "" {
+		t.Fatalf("proposal after denied apply = %#v, %v", accepted, err)
+	}
+	user.ContextToken.Scopes = []string{ContextTokenScopeMemoryWrite, ContextTokenScopeMemoryOperate}
+	if response := request(applyTarget, `{}`); response.StatusCode != http.StatusOK {
+		t.Fatalf("write+operate proposal apply status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	applied, err := memoryStore.GetMemoryProposal(context.Background(), testDefaultNamespace, applyProposal.ID)
+	if err != nil || applied.Status != "applied" || applied.AppliedMemoryID == "" {
+		t.Fatalf("applied proposal = %#v, %v", applied, err)
 	}
 }
 

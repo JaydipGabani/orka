@@ -160,6 +160,9 @@ func TestNewOMSClientUsesExactPinnedResolutionWithoutDNSReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	transport := client.client.Transport.(*http.Transport)
+	if transport.MaxConnsPerHost != omsHTTPMaxConnsPerHost {
+		t.Fatalf("MaxConnsPerHost = %d, want %d", transport.MaxConnsPerHost, omsHTTPMaxConnsPerHost)
+	}
 	connection, err := transport.DialContext(context.Background(), "tcp", "memory.example.com:443")
 	if err != nil {
 		t.Fatal(err)

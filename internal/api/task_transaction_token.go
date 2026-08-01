@@ -53,6 +53,11 @@ func (h *Handlers) prepareDirectTaskTransactionToken(c fiber.Ctx, task *corev1al
 		return "", fiber.NewError(fiber.StatusServiceUnavailable,
 			"direct transactional task creation requires context-token TTS tokenSource=incoming")
 	}
+	if task.Spec.Type == corev1alpha1.TaskTypeAI &&
+		h.contextTokenTTS.ChildTokenTTL < transactiontoken.MinimumProjectedTokenRequestedTTL {
+		return "", fiber.NewError(fiber.StatusServiceUnavailable,
+			"direct transactional AI task creation requires a propagation-safe context-token TTS child TTL")
+	}
 	credential := contextTokenCredential(c)
 	if credential == "" {
 		return "", fiber.NewError(fiber.StatusServiceUnavailable,
@@ -78,31 +83,53 @@ func (h *Handlers) persistDirectTaskTransactionTokenSubject(
 	if task.UID == "" {
 		return errors.New("created task UID is required for transaction token setup")
 	}
-	secretName := strings.TrimSpace(task.Annotations[labels.AnnotationTransactionTokenSecret])
-	if secretName == "" {
+	workloadSecretName := strings.TrimSpace(task.Annotations[labels.AnnotationTransactionTokenSecret])
+	if workloadSecretName == "" {
 		return errors.New("created task is missing its transaction token Secret reference")
 	}
-	secret := &corev1.Secret{
+	ownerReferences := []metav1.OwnerReference{{
+		APIVersion: corev1alpha1.GroupVersion.String(), Kind: directTaskTokenOwnerKind,
+		Name: task.Name, UID: task.UID,
+	}}
+	taskUIDLabel := labels.SelectorValue(string(task.UID))
+	authoritySecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
+			Name:      "orka-task-authority-" + uuid.NewString(),
 			Namespace: task.Namespace,
 			Labels: map[string]string{
-				labels.LabelTask: labels.SelectorValue(task.Name),
+				labels.LabelPurpose: transactiontoken.AuthoritySecretPurpose,
+				labels.LabelTaskUID: taskUIDLabel,
 			},
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: corev1alpha1.GroupVersion.String(),
-				Kind:       directTaskTokenOwnerKind,
-				Name:       task.Name,
-				UID:        task.UID,
-			}},
+			OwnerReferences: ownerReferences,
 		},
 		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{
-			transactiontoken.SubjectSecretKey: []byte(subjectToken),
-		},
+		Data: map[string][]byte{transactiontoken.SubjectSecretKey: []byte(subjectToken)},
 	}
-	if err := h.client.Create(ctx, secret); err != nil {
-		return fmt.Errorf("creating task transaction token subject secret: %w", err)
+	if err := h.client.Create(ctx, authoritySecret); err != nil {
+		return fmt.Errorf("creating task transaction renewal authority: %w", err)
+	}
+	workloadSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      workloadSecretName,
+			Namespace: task.Namespace,
+			Labels: map[string]string{
+				labels.LabelTask:    labels.SelectorValue(task.Name),
+				labels.LabelTaskUID: taskUIDLabel,
+				labels.LabelPurpose: transactiontoken.WorkloadSecretPurpose,
+			},
+			OwnerReferences: ownerReferences,
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{},
+	}
+	if err := h.client.Create(ctx, workloadSecret); err != nil {
+		if cleanupErr := h.client.Delete(ctx, authoritySecret); cleanupErr != nil && !apierrors.IsNotFound(cleanupErr) {
+			return errors.Join(
+				fmt.Errorf("creating task transaction token workload Secret: %w", err),
+				fmt.Errorf("cleaning task transaction renewal authority: %w", cleanupErr),
+			)
+		}
+		return fmt.Errorf("creating task transaction token workload Secret: %w", err)
 	}
 	return nil
 }

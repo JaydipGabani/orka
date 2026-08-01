@@ -325,16 +325,21 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
-	// Handle based on current phase
+	// Handle based on current phase. Direct transaction-token Tasks retain their
+	// owner-bound renewal authority and cap every active phase's requeue at the
+	// next token rotation deadline.
 	switch task.Status.Phase {
 	case corev1alpha1.TaskPhasePending:
-		return r.handlePending(ctx, task)
+		if taskTransactionTokenPending(task) {
+			return r.handlePending(ctx, task)
+		}
+		return r.handleWithTaskTransactionTokenRefresh(ctx, task, r.handlePending)
 	case corev1alpha1.TaskPhaseScheduled:
-		return r.handleScheduled(ctx, task)
+		return r.handleWithTaskTransactionTokenRefresh(ctx, task, r.handleScheduled)
 	case corev1alpha1.TaskPhaseRunning:
-		return r.handleRunning(ctx, task)
+		return r.handleWithTaskTransactionTokenRefresh(ctx, task, r.handleRunning)
 	case corev1alpha1.TaskPhaseFinalizing:
-		return r.handleFinalizing(ctx, task)
+		return r.handleWithTaskTransactionTokenRefresh(ctx, task, r.handleFinalizing)
 	case corev1alpha1.TaskPhaseSucceeded, corev1alpha1.TaskPhaseFailed, corev1alpha1.TaskPhaseCancelled:
 		return r.handleCompleted(ctx, task)
 	}
@@ -475,6 +480,10 @@ func (r *TaskReconciler) handleDeletion(ctx context.Context, task *corev1alpha1.
 	log := logf.FromContext(ctx)
 
 	if controllerutil.ContainsFinalizer(task, labels.TaskFinalizer) {
+		if err := r.cleanupOwnedTaskTransactionTokenSecret(ctx, task); err != nil {
+			return ctrl.Result{}, err
+		}
+
 		// Clean up result data from store
 		if r.ResultStore != nil {
 			if err := r.ResultStore.DeleteResult(ctx, task.Namespace, task.Name); err != nil {
@@ -710,7 +719,7 @@ func (r *TaskReconciler) handleTransactionTokenPending(ctx context.Context, task
 		return r.failTask(ctx, task, msg)
 	}
 
-	ready, fatal, setupErr := r.reconcilePendingTaskTransactionToken(ctx, task)
+	ready, fatal, setupErr := r.reconcilePendingTaskTransactionToken(ctx, task, now)
 	if setupErr != nil {
 		if !fatal {
 			return ctrl.Result{}, setupErr
@@ -728,7 +737,10 @@ func (r *TaskReconciler) handleTransactionTokenPending(ctx context.Context, task
 			return ctrl.Result{}, err
 		}
 		log.Info("task-scoped transaction token setup completed")
-		return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
+		// Continue through Pending now that the durable workload token and hidden
+		// renewal authority are both ready. RuntimeRef planning is persisted in
+		// this reconciliation so the next reconciliation can start the turn.
+		return r.handlePending(ctx, task)
 	}
 
 	requeueAfter := min(taskTransactionTokenPendingTimeout-elapsed, time.Second)
@@ -2129,6 +2141,9 @@ func (r *TaskReconciler) handleFinalizing(
 
 func (r *TaskReconciler) handleCompleted(ctx context.Context, task *corev1alpha1.Task) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+	if err := r.cleanupOwnedTaskTransactionTokenSecret(ctx, task); err != nil {
+		return ctrl.Result{}, err
+	}
 	terminalEventRecorded := r.recordTerminalTaskLifecycleEventIfMissing(ctx, task)
 	if task.Status.Phase == corev1alpha1.TaskPhaseCancelled {
 		if cancelErr := r.cancelHarnessWrapperTurn(ctx, task, "task cancelled"); cancelErr != nil {

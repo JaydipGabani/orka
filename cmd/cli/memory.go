@@ -126,19 +126,31 @@ func ptrStringMap(in map[string]*string) map[string]string {
 }
 
 func newMemoryGetCmd() *cobra.Command {
+	var includeDisabled bool
 	cmd := &cobra.Command{
 		Use:   "get <id>",
 		Short: "Get a memory",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c := newClientFromCmd(cmd)
-			result, err := c.DoJSON(context.Background(), http.MethodGet, "/api/v1/memories/"+url.PathEscape(args[0]), nil, nil)
+			var query map[string]string
+			if includeDisabled {
+				query = map[string]string{"includeDisabled": cliQueryTrue}
+			}
+			result, err := c.DoJSON(
+				context.Background(),
+				http.MethodGet,
+				"/api/v1/memories/"+url.PathEscape(args[0]),
+				query,
+				nil,
+			)
 			if err != nil {
 				return err
 			}
 			return printStructured(cmd, result)
 		},
 	}
+	cmd.Flags().BoolVar(&includeDisabled, "include-disabled", false, "Include disabled memory")
 	addOutputFlag(cmd, outputJSON)
 	return cmd
 }

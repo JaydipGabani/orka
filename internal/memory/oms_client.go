@@ -18,7 +18,10 @@ import (
 	"github.com/orka-agents/orka/internal/oms/protocol"
 )
 
-const defaultOMSRequestTimeout = 15 * time.Second
+const (
+	defaultOMSRequestTimeout = 15 * time.Second
+	omsHTTPMaxConnsPerHost   = 4
+)
 
 // AdapterError is a bounded, provider-neutral OMS error. Raw provider bodies,
 // headers, URLs, and credentials are never retained.
@@ -105,6 +108,7 @@ func NewOMSClient(
 		return nil
 	}
 	transport.TLSClientConfig = tlsConfig
+	transport.MaxConnsPerHost = omsHTTPMaxConnsPerHost
 	client.Transport = transport
 	return &OMSClient{
 		baseURL: strings.TrimRight(resolution.Identity, "/"),

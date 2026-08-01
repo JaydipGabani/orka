@@ -211,7 +211,7 @@ Administrative writes require an audit `reason`; destructive/lifecycle CLI comma
 | `/api/v1/memory-proposals/:id/apply` | POST | Apply an accepted memory proposal; may return Memory JSON or `202 MemoryOperation` |
 | `/api/v1/memory-proposals/:id/archive` | POST | Archive without applying |
 
-Review and archive return `204 No Content`. Proposal apply participates in the same remote idempotency and operation behavior as other mutations.
+Review and archive return `204 No Content`. For context-token callers, review requires memory-operate; apply requires both memory-write and memory-operate. Proposal apply participates in the same remote idempotency and operation behavior as other mutations.
 
 ## Internal worker routes
 

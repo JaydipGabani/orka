@@ -9,6 +9,8 @@ MIT License - see LICENSE file for details.
 // provider-specific behavior.
 package transactiontoken
 
+import "time"
+
 const (
 	// ProfileName is the only context-token profile accepted by Orka.
 	ProfileName = "transaction-token"
@@ -30,8 +32,18 @@ const (
 
 	// TokenSecretKey stores a task-bound transaction token in an owner-referenced Secret.
 	TokenSecretKey = "token"
-	// SubjectSecretKey stores the verified caller token only while post-create task binding is pending.
+	// SubjectSecretKey stores the verified caller token in a controller-only renewal authority Secret.
 	SubjectSecretKey = "subject-token"
+
+	// WorkloadSecretPurpose labels the Task-annotated Secret mounted into the workload.
+	WorkloadSecretPurpose = "task-token-workload"
+	// AuthoritySecretPurpose labels the controller-only Secret that retains renewal authority.
+	AuthoritySecretPurpose = "task-token-renewal"
+
+	// MinimumProjectedTokenRequestedTTL is the minimum requested TTS lifetime for tokens delivered through Kubernetes Secret volumes.
+	MinimumProjectedTokenRequestedTTL = 5 * time.Minute
+	// MinimumProjectedTokenRemainingLifetime reserves propagation time after exchange before a mounted token expires.
+	MinimumProjectedTokenRemainingLifetime = 4 * time.Minute
 )
 
 // RequiredClaims are mandatory in every transaction token accepted by Orka.

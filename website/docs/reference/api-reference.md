@@ -210,7 +210,7 @@ Administrative writes require a non-empty audit `reason`. Lifecycle actions acce
 | `/api/v1/memory-proposals/:id/apply` | POST | Apply an accepted memory proposal; returns Memory JSON or `202 MemoryOperation` |
 | `/api/v1/memory-proposals/:id/archive` | POST | Archive without applying |
 
-Proposal list parameters are `namespace`, `taskName`, `agentName`, `type`, `status`, `query`/`q`, and `limit`. Review and archive return `204 No Content`. Apply uses the same remote idempotency/status contract as other mutations. Applied proposal memories carry proposal provenance and `reviewed` trust.
+Proposal list parameters are `namespace`, `taskName`, `agentName`, `type`, `status`, `query`/`q`, and `limit`. Review and archive return `204 No Content`. For context-token callers, review requires memory-operate; apply requires both memory-write and memory-operate. Apply uses the same remote idempotency/status contract as other mutations. Applied proposal memories carry proposal provenance and `reviewed` trust.
 
 ### Internal Worker Routes
 
