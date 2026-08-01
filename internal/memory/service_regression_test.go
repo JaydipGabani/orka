@@ -939,3 +939,27 @@ func TestSuccessfulMemoryIdempotencyReplayUsesImmutableBodyWithoutProvider(t *te
 		t.Fatalf("fresh resolver calls = %d, want immutable replay without provider", resolver.freshCalls)
 	}
 }
+
+func TestRemoteListIncludeDeletedIncludesDisabledTombstone(t *testing.T) {
+	now := time.Date(2026, 8, 1, 5, 20, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entry, record := remoteSearchFixture(binding, "mem-deleted", now, "deleted content", store.MemoryTrustReviewed)
+	entry.Disabled = true
+	entry.Deleted = true
+	entry.MaterializationState = store.MemoryMaterializationDeleted
+	entry.ContentAvailable = false
+	service, _, activeBinding, _ := remoteSearchService(t, []store.RemoteMemoryCatalogEntry{entry}, []protocol.MemoryRecord{record})
+
+	memories, err := service.ListMemories(context.Background(), store.MemoryFilter{
+		Namespace: activeBinding.Namespace, IncludeDeleted: true,
+	})
+	if err != nil || len(memories) != 1 || memories[0].ID != entry.ID || !memories[0].Deleted {
+		t.Fatalf("ListMemories(includeDeleted) = %#v, err=%v; want tombstone %q", memories, err, entry.ID)
+	}
+}

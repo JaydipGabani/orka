@@ -181,14 +181,14 @@ func TestServiceLegacyTrustUsesDurableAuditOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mutation.Memory.Disabled || mutation.Memory.Trust != store.MemoryTrustTrusted || mutation.Memory.GovernanceRevision != 5 {
+	if mutation.Memory.Disabled || mutation.Memory.Trust != store.MemoryTrustUntrusted || mutation.Memory.GovernanceRevision != 6 {
 		t.Fatalf("updated mutation memory = %#v", mutation.Memory)
 	}
 	reloaded, err := service.GetMemory(context.Background(), authority.Namespace, created.Memory.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.Disabled || reloaded.Trust != store.MemoryTrustTrusted || reloaded.GovernanceRevision != 5 {
+	if reloaded.Disabled || reloaded.Trust != store.MemoryTrustUntrusted || reloaded.GovernanceRevision != 6 {
 		t.Fatalf("reloaded memory = %#v", reloaded)
 	}
 	listed, err := service.ListMemories(context.Background(), store.MemoryFilter{
@@ -197,8 +197,8 @@ func TestServiceLegacyTrustUsesDurableAuditOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listed) != 1 || listed[0].ID != created.Memory.ID {
-		t.Fatalf("trusted list = %#v", listed)
+	if len(listed) != 0 {
+		t.Fatalf("trusted list after provenance change = %#v, want empty", listed)
 	}
 }
 

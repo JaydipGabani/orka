@@ -42,7 +42,55 @@ const (
 	durablePayloadCompressionPrefix = "orka.zlib.v1\x00"
 	maxFeatureHeartbeatTTL          = 2 * time.Minute
 	maxFeatureHeartbeatClockSkew    = 30 * time.Second
+
+	legacyAppliedProposalBackfillMigration = "legacy-applied-proposal-operation-id-v1"
+	legacyAppliedProposalBackfillPrefix    = legacyProposalApplyOperationPrefix + "migrated-"
 )
+
+func backfillLegacyAppliedProposalOperationIDs(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.Exec(`INSERT INTO memory_governance_migrations(name) VALUES (?)
+		ON CONFLICT(name) DO NOTHING`, legacyAppliedProposalBackfillMigration)
+	if err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
+	if inserted == 0 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("migration failed: %w", err)
+		}
+		return nil
+	}
+
+	if _, err := tx.Exec(`UPDATE memory_proposals AS p
+		SET apply_operation_id = ? || p.id
+		WHERE p.apply_operation_id = ''
+			AND lower(trim(p.type)) = 'memory'
+			AND lower(trim(p.status)) = 'applied'
+			AND trim(p.applied_memory_id) <> ''
+			AND p.reviewed_at IS NOT NULL AND p.applied_at IS NOT NULL
+			AND p.applied_at >= p.reviewed_at
+			AND EXISTS (
+				SELECT 1 FROM memories AS m
+				WHERE m.namespace = p.namespace AND m.id = p.applied_memory_id
+					AND m.source = 'memory_proposal' AND m.source_proposal_id = p.id
+					AND m.content = p.content
+			)`, legacyAppliedProposalBackfillPrefix); err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
+	return nil
+}
 
 type memoryGovernanceQuotaConfig struct {
 	NamespaceCatalogRows          int64
@@ -103,12 +151,21 @@ var governedMemoryQuotas = memoryGovernanceQuotaConfig{
 }
 
 func migrateMemoryGovernance(db *sql.DB) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS memory_governance_migrations (
+		name       TEXT PRIMARY KEY,
+		applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
 	if err := ensureSQLiteColumns(db, "memory_proposals", []sqliteColumnMigration{
 		{Name: "apply_operation_id", Definition: "apply_operation_id TEXT NOT NULL DEFAULT ''"},
 		{Name: "application_abandoned_by", Definition: "application_abandoned_by TEXT NOT NULL DEFAULT ''"},
 		{Name: "application_abandoned_reason", Definition: "application_abandoned_reason TEXT NOT NULL DEFAULT ''"},
 		{Name: "application_abandoned_at", Definition: "application_abandoned_at TIMESTAMP"},
 	}); err != nil {
+		return err
+	}
+	if err := backfillLegacyAppliedProposalOperationIDs(db); err != nil {
 		return err
 	}
 
@@ -4244,8 +4301,14 @@ func completeRemoteCatalogOperation(ctx context.Context, tx *sql.Tx, catalog *st
 			catalog.NamespaceUID, catalog.ID, operation.ExpectedMaterializedGeneration, operation.DesiredGeneration,
 			operation.ID, operation.BackendUID, operation.AuthorityEpoch, operation.RoutingEpoch)
 	case store.MemoryOperationReplace:
-		contentChanged := operation.ContentDigest != catalog.ContentDigest
-		if contentChanged {
+		provenanceChanged := operation.ContentDigest != catalog.ContentDigest
+		if !provenanceChanged {
+			provenanceChanged, err = remoteReplacementProvenanceChanged(ctx, tx, catalog, operation)
+			if err != nil {
+				return err
+			}
+		}
+		if provenanceChanged {
 			result, err = tx.ExecContext(ctx, `UPDATE remote_memory_catalog
 				SET generation = ?, desired_generation = ?, backend_memory_id = ?, backend_version = ?,
 					materialization_state = ?, content_digest = ?, content_available = TRUE,
@@ -4267,19 +4330,13 @@ func completeRemoteCatalogOperation(ctx context.Context, tx *sql.Tx, catalog *st
 			result, err = tx.ExecContext(ctx, `UPDATE remote_memory_catalog
 				SET generation = ?, desired_generation = ?, backend_memory_id = ?, backend_version = ?,
 					materialization_state = ?, content_digest = ?, content_available = TRUE,
-					session_name = pending_session_name, agent_name = pending_agent_name,
-					task_name = pending_task_name, parent_task = pending_parent_task,
-					source = CASE WHEN pending_source = ? THEN ? ELSE pending_source END,
-					source_proposal_id = '', tags_json = pending_tags_json, trust = ?,
-					governance_revision = governance_revision + 1,
 					pending_session_name = '', pending_agent_name = '', pending_task_name = '', pending_parent_task = '',
 					pending_source = '', pending_tags_json = '[]', pending_operation_id = '', updated_at = ?
 				WHERE namespace_uid = ? AND id = ? AND generation = ? AND desired_generation = ? AND pending_operation_id = ?
 					AND backend_uid = ? AND authority_epoch = ? AND routing_epoch = ?`,
 				operation.DesiredGeneration, operation.DesiredGeneration, completion.Receipt.BackendMemoryID,
 				completion.Receipt.BackendVersion, store.MemoryMaterializationActive, completion.Receipt.ContentDigest,
-				memorySourceProposal, memorySourceManual, store.MemoryTrustUntrusted, completion.Now,
-				catalog.NamespaceUID, catalog.ID, operation.ExpectedMaterializedGeneration,
+				completion.Now, catalog.NamespaceUID, catalog.ID, operation.ExpectedMaterializedGeneration,
 				operation.DesiredGeneration, operation.ID, operation.BackendUID, operation.AuthorityEpoch, operation.RoutingEpoch)
 		}
 	case store.MemoryOperationCreate:
@@ -4300,6 +4357,32 @@ func completeRemoteCatalogOperation(ctx context.Context, tx *sql.Tx, catalog *st
 		return err
 	}
 	return ensureMemoryRowsAffectedConflict(result, "catalog changed before operation completion")
+}
+
+func remoteReplacementProvenanceChanged(
+	ctx context.Context,
+	q rowQueryer,
+	catalog *store.RemoteMemoryCatalogEntry,
+	operation *store.MemoryOperation,
+) (bool, error) {
+	var changed bool
+	err := q.QueryRowContext(ctx, `SELECT NOT (
+			session_name = pending_session_name AND agent_name = pending_agent_name AND
+			task_name = pending_task_name AND parent_task = pending_parent_task AND
+			source = pending_source AND tags_json = pending_tags_json
+		) FROM remote_memory_catalog
+		WHERE namespace_uid = ? AND id = ? AND generation = ? AND desired_generation = ? AND pending_operation_id = ?
+			AND backend_uid = ? AND authority_epoch = ? AND routing_epoch = ?`,
+		catalog.NamespaceUID, catalog.ID, operation.ExpectedMaterializedGeneration, operation.DesiredGeneration,
+		operation.ID, operation.BackendUID, operation.AuthorityEpoch, operation.RoutingEpoch,
+	).Scan(&changed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("%w: catalog changed before operation completion", store.ErrConflict)
+	}
+	if err != nil {
+		return false, err
+	}
+	return changed, nil
 }
 
 // RetryMemoryOperation reschedules or dead-letters the same durable operation.

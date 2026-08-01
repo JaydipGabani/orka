@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -193,6 +194,179 @@ func (s *Store) UpdateMemory(ctx context.Context, memory *store.Memory) error {
 		return fmt.Errorf("%w: reviewed proposal memory content is immutable", store.ErrConflict)
 	}
 	return fmt.Errorf("%w: memory changed during update", store.ErrConflict)
+}
+
+// UpdateLegacyMemoryWithAudit atomically replaces caller-owned legacy memory
+// fields and records a trust demotion when reviewed content or provenance changes.
+func (s *Store) UpdateLegacyMemoryWithAudit(
+	ctx context.Context,
+	memory *store.Memory,
+	namespaceUID, actor, reason, requestID string,
+	now time.Time,
+) (*store.Memory, error) {
+	if err := normalizeAndValidateLegacyMemoryUpdate(memory, &namespaceUID, &actor, &reason); err != nil {
+		return nil, err
+	}
+	memory.Tags = normalizeTags(memory.Tags)
+	tagsJSON, err := marshalTags(memory.Tags)
+	if err != nil {
+		return nil, err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	current, err := scanMemory(tx.QueryRowContext(ctx,
+		selectMemorySQL()+` WHERE m.namespace = ? AND m.id = ?`, memory.Namespace, memory.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := applyLegacyMemoryAuditGovernance(ctx, tx, namespaceUID, current); err != nil {
+		return nil, err
+	}
+	if memory.Disabled != current.Disabled || memory.Deleted != current.Deleted {
+		return nil, store.ValidationErrorf("legacy memory disable and delete state require dedicated mutations")
+	}
+
+	provenanceChanged := legacyMemoryProvenanceChanged(current, memory)
+	if !provenanceChanged {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return current, nil
+	}
+
+	currentTagsJSON, err := marshalTags(current.Tags)
+	if err != nil {
+		return nil, err
+	}
+	updatedSource := memory.Source
+	if updatedSource == memorySourceProposal {
+		updatedSource = memorySourceManual
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE memories
+		SET session_name = ?, agent_name = ?, task_name = ?, parent_task = ?, source = ?, source_proposal_id = '',
+			content = ?, tags_json = ?, updated_at = ?
+		WHERE namespace = ? AND id = ? AND session_name = ? AND agent_name = ? AND task_name = ? AND parent_task = ?
+			AND source = ? AND source_proposal_id = ? AND content = ? AND tags_json = ?
+			AND disabled = ? AND deleted = ?`,
+		memory.SessionName, memory.AgentName, memory.TaskName, memory.ParentTask, updatedSource,
+		memory.Content, tagsJSON, now,
+		current.Namespace, current.ID, current.SessionName, current.AgentName, current.TaskName, current.ParentTask,
+		current.Source, current.SourceProposalID, current.Content, currentTagsJSON,
+		current.Disabled, current.Deleted,
+	)
+	if err != nil {
+		return nil, mapLegacyMemoryFenceError(err)
+	}
+	if err := ensureMemoryRowsAffectedConflict(result, "legacy memory changed during governed update"); err != nil {
+		return nil, err
+	}
+	if current.Trust == store.MemoryTrustReviewed || current.Trust == store.MemoryTrustTrusted {
+		if err := insertMemoryAudit(ctx, tx, store.MemoryAuditRecord{
+			Namespace: current.Namespace, NamespaceUID: namespaceUID, Actor: actor,
+			Action: "memory.trust", Reason: reason,
+			PreviousState: string(current.Trust), NewState: string(store.MemoryTrustUntrusted),
+			MemoryID: current.ID, RequestID: requestID, CreatedAt: now,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	updated, err := scanMemory(tx.QueryRowContext(ctx,
+		selectMemorySQL()+` WHERE m.namespace = ? AND m.id = ?`, current.Namespace, current.ID))
+	if err != nil {
+		return nil, err
+	}
+	if err := applyLegacyMemoryAuditGovernance(ctx, tx, namespaceUID, updated); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+func normalizeAndValidateLegacyMemoryUpdate(
+	memory *store.Memory,
+	namespaceUID, actor, reason *string,
+) error {
+	if memory == nil {
+		return store.ValidationErrorf("memory is required")
+	}
+	memory.Namespace = strings.TrimSpace(memory.Namespace)
+	memory.ID = strings.TrimSpace(memory.ID)
+	*namespaceUID = strings.TrimSpace(*namespaceUID)
+	*actor = strings.TrimSpace(*actor)
+	*reason = strings.TrimSpace(*reason)
+	if memory.Namespace == "" || memory.ID == "" || *namespaceUID == "" || *actor == "" || *reason == "" {
+		return store.ValidationErrorf("legacy memory namespace, id, namespace uid, actor, and reason are required")
+	}
+	memory.Content = redact.SensitiveText(memory.Content)
+	if strings.TrimSpace(memory.Content) == "" {
+		return store.ValidationErrorf("content is required")
+	}
+	return nil
+}
+
+func legacyMemoryProvenanceChanged(current, desired *store.Memory) bool {
+	return current.SessionName != desired.SessionName ||
+		current.AgentName != desired.AgentName ||
+		current.TaskName != desired.TaskName ||
+		current.ParentTask != desired.ParentTask ||
+		current.Source != desired.Source ||
+		current.Content != desired.Content ||
+		!slices.Equal(current.Tags, desired.Tags)
+}
+
+func applyLegacyMemoryAuditGovernance(
+	ctx context.Context,
+	q rowQueryer,
+	namespaceUID string,
+	memory *store.Memory,
+) error {
+	if memory == nil {
+		return nil
+	}
+	var transitionCount int64
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM memory_audit
+		WHERE namespace_uid = ? AND memory_id = ? AND authority_epoch = 0 AND routing_epoch = 0 AND (
+			(action = 'memory.trust' AND previous_state IN ('untrusted','reviewed','trusted')
+				AND new_state IN ('untrusted','reviewed','trusted') AND previous_state <> new_state)
+			OR (action = 'memory.disable' AND (
+				(previous_state = 'disabled=false' AND new_state = 'disabled=true') OR
+				(previous_state = 'disabled=true' AND new_state = 'disabled=false')
+			))
+		)`, namespaceUID, memory.ID).Scan(&transitionCount); err != nil {
+		return err
+	}
+	memory.GovernanceRevision = max(int64(1), memory.GovernanceRevision) + transitionCount
+
+	var latestTrust string
+	err := q.QueryRowContext(ctx, `SELECT new_state FROM memory_audit
+		WHERE namespace_uid = ? AND memory_id = ? AND authority_epoch = 0 AND routing_epoch = 0
+			AND action = 'memory.trust' AND previous_state IN ('untrusted','reviewed','trusted')
+			AND new_state IN ('untrusted','reviewed','trusted') AND previous_state <> new_state
+		ORDER BY created_at DESC, id DESC LIMIT 1`, namespaceUID, memory.ID).Scan(&latestTrust)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	memory.Trust = store.MemoryTrust(latestTrust)
+	return nil
 }
 
 // DeleteMemory soft-deletes a memory by ID within a namespace.

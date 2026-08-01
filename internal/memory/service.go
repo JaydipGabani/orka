@@ -61,6 +61,15 @@ type legacyMemoryGovernanceStore interface {
 	) error
 }
 
+type legacyMemoryUpdateGovernanceStore interface {
+	UpdateLegacyMemoryWithAudit(
+		ctx context.Context,
+		memory *store.Memory,
+		namespaceUID, actor, reason, requestID string,
+		now time.Time,
+	) (*store.Memory, error)
+}
+
 type legacyMemoryProposalGovernanceStore interface {
 	ApplyLegacyMemoryProposalWithAudit(
 		ctx context.Context,
@@ -198,7 +207,7 @@ func (s *Service) listRemoteMemoriesPage(
 		pageSize := min(maxRemoteCatalogLimit, maxRemoteListCandidates-scanned)
 		entries, err := s.Governed.ListRemoteMemories(ctx, store.RemoteMemoryCatalogFilter{
 			NamespaceUID: authority.NamespaceUID, IDs: filter.IDs, Trust: filter.Trust,
-			IncludeDisabled: filter.IncludeDisabled, IncludeDeleted: filter.IncludeDeleted,
+			IncludeDisabled: filter.IncludeDisabled || filter.IncludeDeleted, IncludeDeleted: filter.IncludeDeleted,
 			States: states, BeforeUpdatedAt: beforeUpdatedAt, BeforeID: beforeID, Limit: pageSize,
 		})
 		if err != nil {
@@ -519,7 +528,7 @@ func (s *Service) UpdateMemory(
 		return nil, err
 	}
 	if !localAuthority.Remote() {
-		return s.updateLegacy(ctx, localAuthority, namespace, id, request)
+		return s.updateLegacy(ctx, localAuthority, namespace, id, request, mutationContext)
 	}
 	if err := requireIdempotency(mutationContext); err != nil {
 		return nil, err
@@ -861,6 +870,7 @@ func (s *Service) updateLegacy(
 	authority *ResolvedAuthority,
 	namespace, id string,
 	request UpdateRequest,
+	mutationContext MutationContext,
 ) (*MutationResult, error) {
 	if s.Legacy == nil {
 		return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
@@ -898,6 +908,28 @@ func (s *Service) updateLegacy(
 		return nil, err
 	}
 	memory.Content, memory.Tags = content, tags
+	if authority != nil && strings.TrimSpace(authority.NamespaceUID) != "" {
+		governedLegacy, ok := s.Legacy.(legacyMemoryUpdateGovernanceStore)
+		if !ok {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+				"legacy memory governance does not support atomic trust demotion")
+		}
+		actor := mutationPrincipal(mutationContext)
+		if actor == "" {
+			actor = "authenticated-memory-writer"
+		}
+		reason := strings.TrimSpace(mutationContext.Reason)
+		if reason == "" {
+			reason = "legacy memory updated"
+		}
+		updated, err := governedLegacy.UpdateLegacyMemoryWithAudit(
+			ctx, memory, authority.NamespaceUID, actor, reason, mutationContext.RequestID, s.now(),
+		)
+		if err != nil {
+			return nil, mapStoreError(err)
+		}
+		return &MutationResult{Memory: updated, StatusCode: http.StatusOK}, nil
+	}
 	if err := s.Legacy.UpdateMemory(ctx, memory); err != nil {
 		return nil, mapStoreError(err)
 	}

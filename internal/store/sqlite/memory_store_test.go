@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -166,6 +167,253 @@ func TestSetLegacyMemoryDisabledWithAuditIsAtomic(t *testing.T) {
 	if len(audits) != 1 || audits[0].Action != "memory.disable" ||
 		audits[0].PreviousState != "disabled=false" || audits[0].NewState != "disabled=true" {
 		t.Fatalf("disable audits = %#v", audits)
+	}
+}
+
+func TestUpdateLegacyMemoryWithAuditPreservesReviewedNoOp(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 7, 0, 0, 0, time.UTC)
+	proposal := &store.MemoryProposal{
+		Namespace: "ns-legacy-noop", Type: proposalTypeMemory, Title: "reviewed", Content: "reviewed guidance",
+	}
+	if err := s.CreateMemoryProposal(ctx, proposal); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReviewMemoryProposal(ctx, store.MemoryProposalReview{
+		Namespace: proposal.Namespace, ID: proposal.ID, Status: proposalStatusAccepted, Reviewer: "reviewer",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	memory, err := s.ApplyMemoryProposal(ctx, store.MemoryProposalApply{
+		Namespace: proposal.Namespace, ID: proposal.ID, AppliedBy: "reviewer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeUpdatedAt := memory.UpdatedAt
+	updated, err := s.UpdateLegacyMemoryWithAudit(
+		ctx, memory, "ns-legacy-noop-uid", "operator", "legacy memory update", "request-noop", now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Trust != store.MemoryTrustReviewed || updated.Source != memorySourceProposal ||
+		updated.SourceProposalID != proposal.ID || updated.GovernanceRevision != 1 ||
+		!updated.UpdatedAt.Equal(beforeUpdatedAt) {
+		t.Fatalf("no-op legacy update changed reviewed governance: before=%+v after=%+v", memory, updated)
+	}
+	audits, err := s.ListMemoryAudit(ctx, store.MemoryAuditFilter{
+		NamespaceUID: "ns-legacy-noop-uid", MemoryID: memory.ID, Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 0 {
+		t.Fatalf("no-op legacy update audits = %+v, want none", audits)
+	}
+}
+
+func TestUpdateLegacyMemoryWithAuditPreservesTrustedNoOp(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 7, 10, 0, 0, time.UTC)
+	memory := &store.Memory{Namespace: "ns-legacy-trusted-noop", Source: "manual", Content: "trusted guidance"}
+	if err := s.CreateMemory(ctx, memory); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendMemoryAudit(ctx, store.MemoryAuditRecord{
+		Namespace: memory.Namespace, NamespaceUID: "ns-legacy-trusted-noop-uid", Actor: "operator", Action: "memory.trust",
+		PreviousState: string(store.MemoryTrustUntrusted), NewState: string(store.MemoryTrustTrusted),
+		MemoryID: memory.ID, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.GetMemory(ctx, memory.Namespace, memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.UpdateLegacyMemoryWithAudit(
+		ctx, before, "ns-legacy-trusted-noop-uid", "editor", "legacy memory update", "request-trusted-noop", now.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Trust != store.MemoryTrustTrusted || updated.GovernanceRevision != 2 ||
+		!updated.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("trusted no-op changed governance: before=%+v after=%+v", before, updated)
+	}
+	audits, err := s.ListMemoryAudit(ctx, store.MemoryAuditFilter{
+		NamespaceUID: "ns-legacy-trusted-noop-uid", MemoryID: memory.ID, Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 1 || audits[0].NewState != string(store.MemoryTrustTrusted) {
+		t.Fatalf("trusted no-op audits = %+v", audits)
+	}
+}
+
+func TestUpdateLegacyMemoryWithAuditDemotesTrustedProvenanceChanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*store.Memory)
+	}{
+		{name: "session", mutate: func(memory *store.Memory) {
+			memory.SessionName = "session-b" //nolint:goconst
+		}},
+		{name: "agent", mutate: func(memory *store.Memory) { memory.AgentName = "agent-b" }},
+		{name: "task", mutate: func(memory *store.Memory) { memory.TaskName = "task-b" }},
+		{name: "parent task", mutate: func(memory *store.Memory) { memory.ParentTask = "parent-b" }},
+		{name: "source", mutate: func(memory *store.Memory) { memory.Source = "operator-edit" }},
+		{name: "content", mutate: func(memory *store.Memory) { memory.Content = "changed guidance" }},
+		{name: "tags", mutate: func(memory *store.Memory) { memory.Tags = []string{"changed"} }},
+	}
+	for index, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := setupTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 8, 1, 7, 15, 0, 0, time.UTC).Add(time.Duration(index) * time.Minute)
+			namespace := "ns-legacy-provenance-" + strings.ReplaceAll(tt.name, " ", "-")
+			namespaceUID := namespace + "-uid"
+			memory := &store.Memory{
+				Namespace: namespace, SessionName: "session-a", AgentName: "agent-a", TaskName: "task-a",
+				ParentTask: "parent-a", Source: "manual", Content: "trusted guidance", Tags: []string{"stable"},
+			}
+			if err := s.CreateMemory(ctx, memory); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.AppendMemoryAudit(ctx, store.MemoryAuditRecord{
+				Namespace: namespace, NamespaceUID: namespaceUID, Actor: "operator", Action: "memory.trust",
+				PreviousState: string(store.MemoryTrustUntrusted), NewState: string(store.MemoryTrustTrusted),
+				MemoryID: memory.ID, CreatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			desired, err := s.GetMemory(ctx, namespace, memory.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.mutate(desired)
+			updated, err := s.UpdateLegacyMemoryWithAudit(
+				ctx, desired, namespaceUID, "editor", "legacy memory provenance changed", "request-change", now.Add(time.Second),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updated.Trust != store.MemoryTrustUntrusted || updated.GovernanceRevision != 3 ||
+				updated.SessionName != desired.SessionName || updated.AgentName != desired.AgentName ||
+				updated.TaskName != desired.TaskName || updated.ParentTask != desired.ParentTask ||
+				updated.Source != desired.Source || updated.Content != desired.Content ||
+				!slices.Equal(updated.Tags, normalizeTags(desired.Tags)) {
+				t.Fatalf("provenance update did not atomically demote trust: desired=%+v updated=%+v", desired, updated)
+			}
+			audits, err := s.ListMemoryAudit(ctx, store.MemoryAuditFilter{
+				NamespaceUID: namespaceUID, MemoryID: memory.ID, Limit: 10,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(audits) != 2 || audits[0].Action != "memory.trust" ||
+				audits[0].PreviousState != string(store.MemoryTrustTrusted) ||
+				audits[0].NewState != string(store.MemoryTrustUntrusted) || audits[0].RequestID != "request-change" {
+				t.Fatalf("provenance demotion audits = %+v", audits)
+			}
+		})
+	}
+}
+
+func TestUpdateLegacyMemoryWithAuditClearsReviewedProposalProvenance(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		mutate func(*store.Memory)
+	}{
+		{name: "content", mutate: func(memory *store.Memory) { memory.Content = "edited reviewed guidance" }},
+		{name: "task metadata", mutate: func(memory *store.Memory) { memory.TaskName = "different-task" }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := setupTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 8, 1, 7, 30, 0, 0, time.UTC)
+			proposal := &store.MemoryProposal{
+				Namespace: "ns-reviewed-" + strings.ReplaceAll(tt.name, " ", "-"),
+				Type:      proposalTypeMemory, Title: "reviewed", Content: "reviewed guidance",
+			}
+			if err := s.CreateMemoryProposal(ctx, proposal); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.ReviewMemoryProposal(ctx, store.MemoryProposalReview{
+				Namespace: proposal.Namespace, ID: proposal.ID, Status: proposalStatusAccepted, Reviewer: "reviewer",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			memory, err := s.ApplyMemoryProposal(ctx, store.MemoryProposalApply{
+				Namespace: proposal.Namespace, ID: proposal.ID, AppliedBy: "reviewer",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.mutate(memory)
+			updated, err := s.UpdateLegacyMemoryWithAudit(
+				ctx, memory, proposal.Namespace+"-uid", "editor", "reviewed memory changed", "request-reviewed", now,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updated.Trust != store.MemoryTrustUntrusted || updated.Source != memorySourceManual ||
+				updated.SourceProposalID != "" || updated.GovernanceRevision != 2 {
+				t.Fatalf("reviewed proposal provenance retained after %s change: %+v", tt.name, updated)
+			}
+		})
+	}
+}
+
+func TestUpdateLegacyMemoryWithAuditRollsBackWhenDemotionAuditFails(t *testing.T) {
+	original := governedMemoryQuotas
+	t.Cleanup(func() { governedMemoryQuotas = original })
+	s := setupTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 7, 45, 0, 0, time.UTC)
+	memory := &store.Memory{Namespace: "ns-legacy-atomic", Source: "manual", Content: "trusted guidance"}
+	if err := s.CreateMemory(ctx, memory); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendMemoryAudit(ctx, store.MemoryAuditRecord{
+		Namespace: memory.Namespace, NamespaceUID: "ns-legacy-atomic-uid", Actor: "operator", Action: "memory.trust",
+		PreviousState: string(store.MemoryTrustUntrusted), NewState: string(store.MemoryTrustTrusted),
+		MemoryID: memory.ID, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.GetMemory(ctx, memory.Namespace, memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := *before
+	desired.Content = "changed guidance"
+	governedMemoryQuotas.NamespaceAuditRows = 1
+	governedMemoryQuotas.GlobalAuditRows = 100
+	_, err = s.UpdateLegacyMemoryWithAudit(
+		ctx, &desired, "ns-legacy-atomic-uid", "editor", "content changed", "request-atomic", now.Add(time.Second),
+	)
+	if !errors.Is(err, store.ErrCapacity) {
+		t.Fatalf("UpdateLegacyMemoryWithAudit error = %v, want ErrCapacity", err)
+	}
+	unchanged, err := s.GetMemory(ctx, memory.Namespace, memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Content != before.Content || !unchanged.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("legacy memory changed despite rolled-back demotion audit: before=%+v after=%+v", before, unchanged)
+	}
+	audits, err := s.ListMemoryAudit(ctx, store.MemoryAuditFilter{
+		NamespaceUID: "ns-legacy-atomic-uid", MemoryID: memory.ID, Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 1 || audits[0].NewState != string(store.MemoryTrustTrusted) {
+		t.Fatalf("atomic rollback audits = %+v", audits)
 	}
 }
 

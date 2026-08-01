@@ -45,7 +45,7 @@ func TestMemoryGovernanceMigrationIdempotent(t *testing.T) {
 	}
 
 	for _, table := range []string{
-		"legacy_memory_archive", "memory_legacy_fences", "controller_feature_heartbeats",
+		"memory_governance_migrations", "legacy_memory_archive", "memory_legacy_fences", "controller_feature_heartbeats",
 		"memory_backend_bindings", "remote_memory_catalog", "memory_operations",
 		"memory_idempotency", "memory_audit",
 	} {
@@ -251,11 +251,23 @@ func TestAppendMemoryAuditIsInsertOnly(t *testing.T) {
 }
 
 func TestMemoryGovernanceMigrationUpgradesLegacyProposalSchema(t *testing.T) {
-	db, err := sql.Open("sqlite", t.TempDir()+"/legacy.db")
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	defer db.Close() //nolint:errcheck
+	if _, err := db.Exec(`CREATE TABLE memories (
+		id TEXT PRIMARY KEY, namespace TEXT NOT NULL, session_name TEXT NOT NULL DEFAULT '',
+		agent_name TEXT NOT NULL DEFAULT '', task_name TEXT NOT NULL DEFAULT '', parent_task TEXT NOT NULL DEFAULT '',
+		source TEXT NOT NULL DEFAULT '', source_proposal_id TEXT NOT NULL DEFAULT '', content TEXT NOT NULL,
+		tags_json TEXT NOT NULL DEFAULT '[]', disabled BOOLEAN NOT NULL DEFAULT FALSE,
+		deleted BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_recalled_at TIMESTAMP,
+		recalled_count INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		t.Fatalf("create legacy memories: %v", err)
+	}
 	if _, err := db.Exec(`CREATE TABLE memory_proposals (
 		id TEXT PRIMARY KEY, namespace TEXT NOT NULL, task_name TEXT NOT NULL DEFAULT '', agent_name TEXT NOT NULL DEFAULT '',
 		type TEXT NOT NULL, skill_name TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
@@ -266,6 +278,39 @@ func TestMemoryGovernanceMigrationUpgradesLegacyProposalSchema(t *testing.T) {
 	)`); err != nil {
 		t.Fatalf("create legacy memory_proposals: %v", err)
 	}
+
+	appliedAt := time.Date(2026, 7, 31, 22, 0, 0, 0, time.UTC)
+	if _, err := db.Exec(`INSERT INTO memories
+		(id, namespace, source, source_proposal_id, content, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"mem-legacy-reviewed", "team-legacy", memorySourceProposal, "proposal-legacy-reviewed",
+		"reviewed legacy content", appliedAt.Add(-time.Hour), appliedAt); err != nil {
+		t.Fatalf("insert legacy reviewed memory: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO memory_proposals
+		(id, namespace, type, title, content, status, reviewer, applied_memory_id, applied_by,
+		 created_at, updated_at, reviewed_at, applied_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"proposal-legacy-reviewed", "team-legacy", proposalTypeMemory, "legacy reviewed proposal",
+		"reviewed legacy content", proposalStatusApplied, "reviewer", "mem-legacy-reviewed", "applier",
+		appliedAt.Add(-2*time.Hour), appliedAt, appliedAt.Add(-time.Hour), appliedAt); err != nil {
+		t.Fatalf("insert legacy reviewed proposal: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO memories
+		(id, namespace, source, source_proposal_id, content) VALUES (?, ?, ?, ?, ?)`,
+		"mem-legacy-mismatch", "team-legacy", memorySourceProposal, "proposal-legacy-mismatch",
+		"edited after review"); err != nil {
+		t.Fatalf("insert legacy mismatched memory: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO memory_proposals
+		(id, namespace, type, title, content, status, reviewer, applied_memory_id, applied_by, reviewed_at, applied_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"proposal-legacy-mismatch", "team-legacy", proposalTypeMemory, "legacy mismatched proposal",
+		"original reviewed content", proposalStatusApplied, "reviewer", "mem-legacy-mismatch", "applier",
+		appliedAt.Add(-time.Hour), appliedAt); err != nil {
+		t.Fatalf("insert legacy mismatched proposal: %v", err)
+	}
+
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate legacy schema: %v", err)
 	}
@@ -290,8 +335,63 @@ func TestMemoryGovernanceMigrationUpgradesLegacyProposalSchema(t *testing.T) {
 			t.Fatalf("missing migrated memory_proposals column %s", column)
 		}
 	}
+
+	var operationID string
+	if err := db.QueryRow(`SELECT apply_operation_id FROM memory_proposals WHERE id = ?`,
+		"proposal-legacy-reviewed").Scan(&operationID); err != nil {
+		t.Fatalf("read backfilled operation id: %v", err)
+	}
+	if operationID != legacyAppliedProposalBackfillPrefix+"proposal-legacy-reviewed" {
+		t.Fatalf("backfilled operation id = %q", operationID)
+	}
+	if err := db.QueryRow(`SELECT apply_operation_id FROM memory_proposals WHERE id = ?`,
+		"proposal-legacy-mismatch").Scan(&operationID); err != nil {
+		t.Fatalf("read mismatched operation id: %v", err)
+	}
+	if operationID != "" {
+		t.Fatalf("mismatched proposal operation id = %q, want empty", operationID)
+	}
+
+	storeAfterUpgrade := NewStore(db, path)
+	reviewed, err := storeAfterUpgrade.GetMemory(context.Background(), "team-legacy", "mem-legacy-reviewed")
+	if err != nil {
+		t.Fatalf("GetMemory after legacy upgrade: %v", err)
+	}
+	if reviewed.Trust != store.MemoryTrustReviewed {
+		t.Fatalf("legacy upgraded memory trust = %q, want reviewed", reviewed.Trust)
+	}
+	mismatched, err := storeAfterUpgrade.GetMemory(context.Background(), "team-legacy", "mem-legacy-mismatch")
+	if err != nil {
+		t.Fatalf("GetMemory mismatched after legacy upgrade: %v", err)
+	}
+	if mismatched.Trust != store.MemoryTrustUntrusted {
+		t.Fatalf("legacy mismatched memory trust = %q, want untrusted", mismatched.Trust)
+	}
+
+	if _, err := db.Exec(`INSERT INTO memories
+		(id, namespace, source, source_proposal_id, content) VALUES (?, ?, ?, ?, ?)`,
+		"mem-post-migration-spoof", "team-legacy", memorySourceProposal, "proposal-post-migration-spoof",
+		"post migration spoof"); err != nil {
+		t.Fatalf("insert post-migration spoofed memory: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO memory_proposals
+		(id, namespace, type, title, content, status, reviewer, applied_memory_id, apply_operation_id,
+		 applied_by, reviewed_at, applied_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`,
+		"proposal-post-migration-spoof", "team-legacy", proposalTypeMemory, "post-migration spoof",
+		"post migration spoof", proposalStatusApplied, "reviewer", "mem-post-migration-spoof", "applier",
+		appliedAt.Add(-time.Hour), appliedAt); err != nil {
+		t.Fatalf("insert post-migration spoofed proposal: %v", err)
+	}
 	if err := migrate(db); err != nil {
 		t.Fatalf("second migrate legacy schema: %v", err)
+	}
+	spoofed, err := storeAfterUpgrade.GetMemory(context.Background(), "team-legacy", "mem-post-migration-spoof")
+	if err != nil {
+		t.Fatalf("GetMemory post-migration spoof: %v", err)
+	}
+	if spoofed.Trust != store.MemoryTrustUntrusted {
+		t.Fatalf("post-migration spoof trust = %q, want untrusted", spoofed.Trust)
 	}
 }
 
@@ -1580,7 +1680,7 @@ func TestRemoteReplacementContentChangeDemotesTrustAndInvalidatesTrustCAS(t *tes
 	}
 }
 
-func TestRemoteReplacementWithoutContentChangeDemotesReviewedProvenance(t *testing.T) {
+func TestRemoteReplacementMetadataChangeDemotesReviewedProvenance(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
 	now := time.Date(2026, 7, 30, 13, 0, 0, 0, time.UTC)
@@ -1596,7 +1696,7 @@ func TestRemoteReplacementWithoutContentChangeDemotesReviewedProvenance(t *testi
 		t.Fatal(err)
 	}
 	desired := *before
-	desired.Tags = []string{"metadata-only"}
+	desired.TaskName = "metadata-only"
 	replace := store.RemoteMemoryReplaceAdmission{
 		Mutation: newCanonicalMemoryMutation(binding, now.Add(5*time.Second), before.ID, "metadata-trust", "metadata-trust-request",
 			store.MemoryOperationReplace, before.Generation+1, before.Generation, before.BackendVersion, "reviewed content"),
@@ -1614,6 +1714,84 @@ func TestRemoteReplacementWithoutContentChangeDemotesReviewedProvenance(t *testi
 	if after.Trust != store.MemoryTrustUntrusted || after.Source == memorySourceProposal || after.SourceProposalID != "" ||
 		after.GovernanceRevision != before.GovernanceRevision+1 {
 		t.Fatalf("manual replacement retained reviewed governance: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestRemoteNoOpReplacementPreservesReviewedProposalProvenance(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 6, 0, 0, 0, time.UTC)
+	binding := activateMemoryBackendForTest(t, s, "team-noop-reviewed", "team-noop-reviewed-uid", now)
+	proposal := acceptedMemoryProposalForTest(t, s, binding.Namespace, "reviewed content")
+	applied, err := s.AdmitRemoteMemoryProposalApply(ctx,
+		newRemoteProposalApplyAdmission(binding, proposal, now.Add(time.Second), "noop-reviewed-proposal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeOperationForTest(t, s, binding, applied.Operation, now.Add(2*time.Second), "proposal-v1", "proposal-memory")
+	before, err := s.GetRemoteMemory(ctx, binding.NamespaceUID, applied.Memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	desired := *before
+	replace, err := s.AdmitRemoteMemoryReplace(ctx, store.RemoteMemoryReplaceAdmission{
+		Mutation: newCanonicalMemoryMutation(binding, now.Add(5*time.Second), before.ID, "noop-reviewed", "noop-reviewed-request",
+			store.MemoryOperationReplace, before.Generation+1, before.Generation, before.BackendVersion, proposal.Content),
+		Memory: desired, ExpectedGeneration: before.Generation, ExpectedBackendVersion: before.BackendVersion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeOperationForTest(t, s, binding, replace.Operation, now.Add(6*time.Second), "proposal-v2", "proposal-memory")
+	after, err := s.GetRemoteMemory(ctx, binding.NamespaceUID, before.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Trust != store.MemoryTrustReviewed || after.Source != memorySourceProposal ||
+		after.SourceProposalID != proposal.ID || after.GovernanceRevision != before.GovernanceRevision ||
+		after.Generation != before.Generation+1 {
+		t.Fatalf("no-op replacement changed reviewed provenance: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestRemoteNoOpReplacementPreservesTrustedGovernance(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 6, 30, 0, 0, time.UTC)
+	binding := activateMemoryBackendForTest(t, s, "team-noop-trusted", "team-noop-trusted-uid", now)
+	materializedRemoteMemoryForTest(t, s, binding, now.Add(time.Second), "noop-trusted")
+	before, err := s.GetRemoteMemory(ctx, binding.NamespaceUID, "mem-noop-trusted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err = s.SetRemoteMemoryTrust(ctx, store.RemoteMemoryTrustChange{
+		NamespaceUID: binding.NamespaceUID, ID: before.ID, Trust: store.MemoryTrustTrusted,
+		ExpectedGovernanceRevision: before.GovernanceRevision, Actor: "operator", Reason: "trusted guidance",
+		Now: now.Add(3 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	desired := *before
+	replace, err := s.AdmitRemoteMemoryReplace(ctx, store.RemoteMemoryReplaceAdmission{
+		Mutation: newCanonicalMemoryMutation(binding, now.Add(5*time.Second), before.ID, "noop-trusted-replace", "noop-trusted-request",
+			store.MemoryOperationReplace, before.Generation+1, before.Generation, before.BackendVersion, `{"content":"v1"}`),
+		Memory: desired, ExpectedGeneration: before.Generation, ExpectedBackendVersion: before.BackendVersion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeOperationForTest(t, s, binding, replace.Operation, now.Add(6*time.Second), "backend-v2", "remote-noop-trusted")
+	after, err := s.GetRemoteMemory(ctx, binding.NamespaceUID, before.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Trust != store.MemoryTrustTrusted || after.Source != before.Source ||
+		after.SourceProposalID != before.SourceProposalID || after.GovernanceRevision != before.GovernanceRevision ||
+		after.Generation != before.Generation+1 {
+		t.Fatalf("no-op replacement changed trusted governance: before=%+v after=%+v", before, after)
 	}
 }
 
