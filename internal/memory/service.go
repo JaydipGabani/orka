@@ -1722,13 +1722,14 @@ func (s *Service) searchLegacy(
 			break
 		}
 	}
-	if capped && !request.AllowIncomplete {
+	incomplete := capped && len(items) < target
+	if incomplete && !request.AllowIncomplete {
 		memoryIncompleteTotal.Inc()
 		return nil, &IncompleteSearchError{Cause: apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
 			"legacy memory search reached its pre-filter scan cap and cannot prove completeness")}
 	}
 	return &SearchResponse{
-		Items: items, ActualMode: protocol.SearchModeKeyword, Exhausted: !capped, Complete: !capped,
+		Items: items, ActualMode: protocol.SearchModeKeyword, Exhausted: !capped, Complete: !incomplete,
 	}, nil
 }
 

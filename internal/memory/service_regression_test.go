@@ -1137,19 +1137,19 @@ func TestLegacySearchReportsPreFilterCapAsIncomplete(t *testing.T) {
 	memories := make([]store.Memory, maxRemoteCatalogLimit)
 	for i := range memories {
 		memories[i] = store.Memory{
-			ID: fmt.Sprintf("mem-%03d", i), Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustReviewed,
+			ID: fmt.Sprintf("mem-%03d", i), Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustUntrusted,
 		}
 	}
 	service := &Service{Legacy: cappedLegacyMemoryStore{memories: memories}}
-	_, err := service.Search(context.Background(), "team-a", SearchRequest{Query: "needle", Limit: 1}, SearchContext{})
+	request := SearchRequest{Query: "needle", Limit: 1, Trust: []store.MemoryTrust{store.MemoryTrustReviewed}}
+	_, err := service.Search(context.Background(), "team-a", request, SearchContext{})
 	var incomplete *IncompleteSearchError
 	if !errors.As(err, &incomplete) {
 		t.Fatalf("Search() error = %#v, want explicit incomplete result", err)
 	}
-	response, err := service.Search(context.Background(), "team-a", SearchRequest{
-		Query: "needle", Limit: 1, AllowIncomplete: true,
-	}, SearchContext{})
-	if err != nil || response.Complete || response.Exhausted || len(response.Items) != 1 {
+	request.AllowIncomplete = true
+	response, err := service.Search(context.Background(), "team-a", request, SearchContext{})
+	if err != nil || response.Complete || response.Exhausted || len(response.Items) != 0 {
 		t.Fatalf("allow-incomplete response=%#v err=%v", response, err)
 	}
 }
@@ -1285,5 +1285,21 @@ func TestRemoteListIncludeDeletedIncludesDisabledTombstone(t *testing.T) {
 	})
 	if err != nil || len(memories) != 1 || memories[0].ID != entry.ID || !memories[0].Deleted {
 		t.Fatalf("ListMemories(includeDeleted) = %#v, err=%v; want tombstone %q", memories, err, entry.ID)
+	}
+}
+
+func TestLegacySearchSatisfiedPageIsCompleteAtScanCap(t *testing.T) {
+	memories := make([]store.Memory, maxRemoteCatalogLimit)
+	for i := range memories {
+		memories[i] = store.Memory{
+			ID: fmt.Sprintf("mem-%03d", i), Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustReviewed,
+		}
+	}
+	service := &Service{Legacy: cappedLegacyMemoryStore{memories: memories}}
+	response, err := service.Search(context.Background(), "team-a", SearchRequest{
+		Query: "needle", Limit: 100,
+	}, SearchContext{})
+	if err != nil || len(response.Items) != 100 || !response.Complete || response.Exhausted {
+		t.Fatalf("Search() response=%#v err=%v, want complete requested page with more legacy rows", response, err)
 	}
 }
