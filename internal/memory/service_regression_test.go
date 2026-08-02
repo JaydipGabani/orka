@@ -297,9 +297,104 @@ func remoteSearchFixture(
 		MemoryID: id, UpsertKey: protocol.CanonicalUpsertKey(protocolIdentity, id), State: protocol.RecordStateLive,
 		Generation: 1, BackendVersion: entry.BackendVersion, BackendMemoryID: entry.BackendMemoryID,
 		ContentDigest: digest, Content: content, Tags: append([]string(nil), entry.Tags...),
-		Metadata: map[string]string{"source": entry.Source}, UpdatedAt: updatedAt,
+		Metadata: remoteRecordMetadataFixture(entry, content), UpdatedAt: updatedAt,
 	}
 	return entry, record
+}
+
+func remoteRecordMetadataFixture(entry store.RemoteMemoryCatalogEntry, content string) map[string]string {
+	metadata, err := protocol.NormalizeMetadata(memoryMetadataFromStore(remoteEntryToMemory(&entry, content)))
+	if err != nil {
+		panic(err)
+	}
+	return metadata
+}
+
+func TestRemoteHydrationRejectsCanonicalTagAndMetadataDrift(t *testing.T) {
+	now := time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	tests := []struct {
+		name   string
+		mutate func(*protocol.MemoryRecord)
+	}{
+		{name: "altered tags", mutate: func(record *protocol.MemoryRecord) { record.Tags = []string{"other"} }},
+		{name: "dropped tags", mutate: func(record *protocol.MemoryRecord) { record.Tags = []string{} }},
+		{name: "null tags", mutate: func(record *protocol.MemoryRecord) { record.Tags = nil }},
+		{name: "altered metadata", mutate: func(record *protocol.MemoryRecord) { record.Metadata["source"] = "cli" }},
+		{name: "dropped metadata", mutate: func(record *protocol.MemoryRecord) { delete(record.Metadata, "sessionname") }},
+		{name: "null metadata", mutate: func(record *protocol.MemoryRecord) { record.Metadata = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entry, record := remoteSearchFixture(binding, "mem-hydrate", now, "durable guidance", store.MemoryTrustReviewed)
+			test.mutate(&record)
+			service, _, activeBinding, governed := remoteSearchService(
+				t, []store.RemoteMemoryCatalogEntry{entry}, []protocol.MemoryRecord{record},
+			)
+			recordingStore := &recordingMaterializationStore{governedSearchStore: governed}
+			service.Governed = recordingStore
+
+			memory, err := service.GetMemory(context.Background(), activeBinding.Namespace, entry.ID)
+			var structured *apierror.Error
+			if memory != nil || !errors.As(err, &structured) || structured.Status != http.StatusConflict ||
+				structured.Reason != ReasonDiverged {
+				t.Fatalf("GetMemory() = (%#v, %#v), want fail-closed materialization divergence", memory, err)
+			}
+			issues := recordingStore.recordedIssues()
+			if len(issues) != 1 || issues[0].ID != entry.ID || issues[0].State != store.MemoryMaterializationDiverged {
+				t.Fatalf("materialization issues = %#v, want one divergence", issues)
+			}
+		})
+	}
+}
+
+func TestRemoteSearchRejectsCanonicalTagAndMetadataDrift(t *testing.T) {
+	now := time.Date(2026, 8, 2, 9, 30, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	tests := []struct {
+		name   string
+		mutate func(*protocol.MemoryRecord)
+	}{
+		{name: "altered tags", mutate: func(record *protocol.MemoryRecord) { record.Tags = []string{"other"} }},
+		{name: "dropped tags", mutate: func(record *protocol.MemoryRecord) { record.Tags = []string{} }},
+		{name: "null tags", mutate: func(record *protocol.MemoryRecord) { record.Tags = nil }},
+		{name: "altered metadata", mutate: func(record *protocol.MemoryRecord) { record.Metadata["source"] = "cli" }},
+		{name: "dropped metadata", mutate: func(record *protocol.MemoryRecord) { delete(record.Metadata, "sessionname") }},
+		{name: "null metadata", mutate: func(record *protocol.MemoryRecord) { record.Metadata = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entry, record := remoteSearchFixture(binding, "mem-search", now, "needle", store.MemoryTrustReviewed)
+			test.mutate(&record)
+			service, adapter, activeBinding, _ := remoteSearchService(
+				t, []store.RemoteMemoryCatalogEntry{entry}, []protocol.MemoryRecord{record},
+			)
+
+			response, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+				Query: "needle", Limit: 1,
+			}, SearchContext{RemoteAuthorized: true})
+			var structured *apierror.Error
+			if response != nil || !errors.As(err, &structured) || structured.Status != http.StatusConflict ||
+				structured.Reason != ReasonDiverged {
+				t.Fatalf("Search() = (%#v, %#v), want fail-closed materialization divergence", response, err)
+			}
+			if adapter.searchCalls != 1 {
+				t.Fatalf("search calls = %d, want one verified provider page", adapter.searchCalls)
+			}
+		})
+	}
 }
 
 func remoteSearchService(
@@ -615,6 +710,106 @@ func TestRemoteMutationAdmissionHonorsAdvertisedLimits(t *testing.T) {
 	}
 }
 
+func TestRemoteDeleteAdmissionRejectsAdvertisedRequestLimitBeforeAdmissionAndEgress(t *testing.T) {
+	storeImpl := newMemoryTestStore(t)
+	now := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
+	binding := activateServiceTestBinding(t, storeImpl, now)
+	backend := &corev1alpha1.MemoryBackend{}
+	backend.Status.EffectiveLifecycleState = corev1alpha1.MemoryBackendEffectiveLifecycleActive
+	backend.Status.Ready = true
+	backend.Status.ObservedCapabilities = &corev1alpha1.MemoryBackendObservedCapabilities{}
+	adapter := &countingGetAdapter{}
+	authority := &ResolvedAuthority{
+		Namespace: binding.Namespace, NamespaceUID: binding.NamespaceUID, Binding: &binding, Backend: backend, Adapter: adapter,
+	}
+	resolver := staticAuthorityResolver{authority: authority}
+	service := &Service{
+		Legacy: storeImpl, Governed: storeImpl, Resolver: resolver,
+		Dispatcher: &Dispatcher{Store: storeImpl, Resolver: resolver, LeaseOwner: "delete-limit-test", Now: func() time.Time {
+			return now.Add(time.Minute)
+		}},
+		Now: func() time.Time { return now.Add(time.Minute) },
+	}
+
+	created, err := service.CreateMemory(context.Background(), binding.Namespace, CreateRequest{
+		ID: "mem-delete-limit", Content: "delete me", Tags: []string{"storage"}, SessionName: "session-a",
+	}, MutationContext{
+		Actor: "alice", Principal: "alice", Route: testRemoteCreateRoute, IdempotencyKey: "create-delete-limit",
+	})
+	if err != nil || created == nil || created.Memory == nil {
+		t.Fatalf("CreateMemory() = %#v, %v", created, err)
+	}
+	entry, err := storeImpl.GetRemoteMemory(context.Background(), binding.NamespaceUID, created.Memory.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocolIdentity, err := protocolBinding(&binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := protocol.MutationEnvelope{
+		ProtocolVersion:        protocol.Version,
+		OperationID:            "mop-00000000-0000-4000-8000-000000000000",
+		Binding:                protocolIdentity,
+		MemoryID:               entry.ID,
+		Kind:                   protocol.MutationKindDelete,
+		Generation:             uint64(max(entry.Generation, entry.DesiredGeneration) + 1),
+		ExpectedGeneration:     uint64(entry.Generation),
+		ExpectedBackendVersion: entry.BackendVersion,
+		State:                  nil,
+	}
+	if err := protocol.PrepareMutation(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.Status.ObservedCapabilities.Limits.MaxRequestBytes = int64(len(payload) - 1)
+
+	operationCount := func() int {
+		t.Helper()
+		operations, err := storeImpl.ListMemoryOperations(context.Background(), store.MemoryOperationFilter{
+			NamespaceUID: binding.NamespaceUID, Limit: 20,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(operations)
+	}
+	mutationCount := func() int {
+		t.Helper()
+		adapter.mu.Lock()
+		defer adapter.mu.Unlock()
+		return adapter.mutations
+	}
+	baselineOperations := operationCount()
+	baselineMutations := mutationCount()
+
+	result, err := service.DeleteMemory(context.Background(), binding.Namespace, entry.ID, MutationContext{
+		Actor: "alice", Principal: "alice", Route: "deleteMemory", IdempotencyKey: "delete-too-large",
+	})
+	var structured *apierror.Error
+	if result != nil || !errors.As(err, &structured) || structured.Status != http.StatusRequestEntityTooLarge ||
+		structured.Reason != "" {
+		t.Errorf("DeleteMemory() = (%#v, %#v), want client request-too-large rejection", result, err)
+	}
+	if got := operationCount(); got != baselineOperations {
+		t.Errorf("delete operation count = %d, want unchanged %d", got, baselineOperations)
+	}
+	if got := mutationCount(); got != baselineMutations {
+		t.Errorf("provider mutation count = %d, want unchanged %d", got, baselineMutations)
+	}
+	after, getErr := storeImpl.GetRemoteMemory(context.Background(), binding.NamespaceUID, entry.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if after.Deleted || after.MaterializationState != entry.MaterializationState ||
+		after.DesiredGeneration != entry.DesiredGeneration || after.PendingOperationID != entry.PendingOperationID {
+		t.Errorf("catalog after rejected delete = %#v, want unchanged active entry %#v", after, entry)
+	}
+}
+
 func TestRemoteMutationAdmissionPublicLocationIncludesEncodedNamespace(t *testing.T) {
 	binding := &store.MemoryBackendBinding{
 		ClusterID: "cluster-a", BackendUID: "backend-a", AuthorityEpoch: 1, RoutingEpoch: 1,
@@ -692,6 +887,7 @@ func TestRemoteListQueryPreservesEveryFilterBeforeLimit(t *testing.T) {
 	}
 	firstEntry, firstRecord := remoteSearchFixture(binding, "mem-first", now, "needle", store.MemoryTrustReviewed)
 	firstEntry.SessionName = "other-session"
+	firstRecord.Metadata = remoteRecordMetadataFixture(firstEntry, firstRecord.Content)
 	secondEntry, secondRecord := remoteSearchFixture(binding, "mem-match", now.Add(-time.Second), "needle", store.MemoryTrustUntrusted)
 	service, _, activeBinding, _ := remoteSearchService(t,
 		[]store.RemoteMemoryCatalogEntry{firstEntry, secondEntry}, []protocol.MemoryRecord{firstRecord, secondRecord})
@@ -722,6 +918,7 @@ func TestRemoteCatalogFiltersBeforeLimitAcrossPages(t *testing.T) {
 		if i == maxRemoteCatalogLimit {
 			entry.AgentName = "wanted"
 		}
+		record.Metadata = remoteRecordMetadataFixture(entry, record.Content)
 		entries = append(entries, entry)
 		records = append(records, record)
 	}

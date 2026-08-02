@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
@@ -733,6 +734,9 @@ func (s *Service) DeleteMemory(
 		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory delete")
 	}
 	payload, _ := json.Marshal(envelope)
+	if err := validateRemoteMutationLimits(authority, nil, payload); err != nil {
+		return nil, err
+	}
 	admission, err := s.Governed.AdmitRemoteMemoryDelete(ctx, store.RemoteMemoryDeleteAdmission{
 		Mutation:               s.mutationAdmission(mutationContext, authority, id, operationID, "", requestDigest, envelope, payload, now),
 		ExpectedGeneration:     entry.Generation,
@@ -1131,7 +1135,8 @@ func (s *Service) hydrate(
 	if record.MemoryID != entry.ID || record.UpsertKey != protocol.CanonicalUpsertKey(binding, entry.ID) ||
 		int64(record.Generation) != entry.Generation || record.BackendVersion != entry.BackendVersion ||
 		record.BackendMemoryID != entry.BackendMemoryID || record.ContentDigest != entry.ContentDigest ||
-		protocol.ContentDigest(record.Content) != entry.ContentDigest || record.State != protocol.RecordStateLive {
+		protocol.ContentDigest(record.Content) != entry.ContentDigest || record.State != protocol.RecordStateLive ||
+		!remoteRecordCollectionsMatchCatalog(record, entry) {
 		s.markMaterializationIssue(ctx, entry, store.MemoryMaterializationDiverged, "provider materialization verification failed")
 		return nil, apierror.New(http.StatusConflict, ReasonDiverged, "memory backend materialization failed verification")
 	}
@@ -1491,6 +1496,26 @@ func memoryMetadataFromStore(memory store.Memory) map[string]string {
 		"parentTask": memory.ParentTask, "source": normalizeSource(memory.Source),
 		"sourceProposalId": memory.SourceProposalID,
 	})
+}
+
+func remoteRecordCollectionsMatchCatalog(record *protocol.MemoryRecord, entry *store.RemoteMemoryCatalogEntry) bool {
+	if record == nil || entry == nil {
+		return false
+	}
+	expectedTags, err := protocol.NormalizeTags(nonNilStrings(entry.Tags))
+	if err != nil {
+		return false
+	}
+	actualTags, err := protocol.NormalizeTags(record.Tags)
+	if err != nil || !slices.Equal(actualTags, record.Tags) || !slices.Equal(actualTags, expectedTags) {
+		return false
+	}
+	expectedMetadata, err := protocol.NormalizeMetadata(memoryMetadataFromStore(remoteEntryToMemory(entry, "")))
+	if err != nil {
+		return false
+	}
+	actualMetadata, err := protocol.NormalizeMetadata(record.Metadata)
+	return err == nil && maps.Equal(actualMetadata, record.Metadata) && maps.Equal(actualMetadata, expectedMetadata)
 }
 
 func compactMetadata(input map[string]string) map[string]string {
@@ -2509,7 +2534,7 @@ func (s *Service) searchHit(
 	if record.State != protocol.RecordStateLive || record.UpsertKey != protocol.CanonicalUpsertKey(binding, entry.ID) ||
 		int64(record.Generation) != entry.Generation || record.BackendVersion != entry.BackendVersion ||
 		record.BackendMemoryID != entry.BackendMemoryID || record.ContentDigest != entry.ContentDigest ||
-		protocol.ContentDigest(record.Content) != entry.ContentDigest {
+		protocol.ContentDigest(record.Content) != entry.ContentDigest || !remoteRecordCollectionsMatchCatalog(record, entry) {
 		return nil, false, apierror.New(http.StatusConflict, ReasonDiverged, "memory search result failed materialization verification")
 	}
 	if actualMode == protocol.SearchModeKeyword && !keywordRecordMatches(record, entry, request.Query) {
