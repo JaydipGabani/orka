@@ -11,10 +11,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -614,6 +616,174 @@ func TestActiveTaskTransactionTokenRefreshCapsRequeue(t *testing.T) {
 	}
 }
 
+func TestActiveTaskTransactionTokenTransientAuthorityReadFailureRetriesBeforeExpiry(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "deadline", err: context.DeadlineExceeded},
+		{name: "network", err: &net.DNSError{Err: "temporary resolver failure", Name: "kubernetes.default.svc", IsTemporary: true}},
+		{name: "EOF", err: io.EOF},
+		{name: "unexpected EOF", err: io.ErrUnexpectedEOF},
+		{name: "connection reset", err: syscall.ECONNRESET},
+		{name: "connection refused", err: syscall.ECONNREFUSED},
+		{name: "HTTP2 connection lost", err: errors.New("http2: client connection lost")},
+		{name: "timeout", err: apierrors.NewTimeoutError("request timed out", 1)},
+		{name: "server timeout", err: apierrors.NewServerTimeout(schema.GroupResource{Resource: testSecretResourceName}, "list", 1)},
+		{name: "rate limited", err: apierrors.NewTooManyRequests("rate limited", 1)},
+		{name: "internal error", err: apierrors.NewInternalError(errors.New("temporary apiserver failure"))},
+		{name: "service unavailable", err: apierrors.NewServiceUnavailable("temporary apiserver failure")},
+		{name: "bad gateway", err: apierrors.NewGenericServerResponse(
+			http.StatusBadGateway, "list", schema.GroupResource{Resource: testSecretResourceName}, "", "bad gateway", 0, false,
+		)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+			token := taskTokenJWTForTest(t, now.Add(30*time.Second), "authority-"+test.name)
+			setRenewableTaskTokenSecret(secret, token, now.Add(10*time.Second), 1)
+			r := newUnitReconciler(newTestScheme(), task, secret, authority)
+			installTaskTokenAuthorityListFailure(r, test.err, 0)
+
+			refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+			if err == nil || fatal {
+				t.Fatalf("transient authority read = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+			}
+			if refreshAfter <= 0 || refreshAfter > taskTokenTransientRetryDelay || refreshAfter >= 30*time.Second {
+				t.Fatalf("refreshAfter = %v, want a bounded retry before token expiry", refreshAfter)
+			}
+			current := currentTaskTokenSecret(t, r, task)
+			if got := string(current.Data[transactiontoken.TokenSecretKey]); got != token {
+				t.Fatal("transient authority read failure replaced the still-valid token")
+			}
+		})
+	}
+}
+
+func TestActiveTaskTransactionTokenPermanentAuthorityReadFailureRemainsFatal(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "forbidden", err: apierrors.NewForbidden(schema.GroupResource{Resource: testSecretResourceName}, "", errors.New("forbidden"))},
+		{name: "not found", err: apierrors.NewNotFound(schema.GroupResource{Resource: testSecretResourceName}, "")},
+		{name: "generic", err: errors.New("authority list failed")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+			token := taskTokenJWTForTest(t, now.Add(30*time.Second), "authority-permanent-"+test.name)
+			setRenewableTaskTokenSecret(secret, token, now.Add(10*time.Second), 1)
+			r := newUnitReconciler(newTestScheme(), task, secret, authority)
+			installTaskTokenAuthorityListFailure(r, test.err, 0)
+
+			refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+			if err == nil || !fatal || refreshAfter != 0 {
+				t.Fatalf("permanent authority read = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+			}
+		})
+	}
+}
+
+func TestActiveTaskTransactionTokenTransientAuthorityReadFailurePreservesTaskAndRequeues(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	token := taskTokenJWTForTest(t, now.Add(time.Minute), "transient-authority-handler")
+	setRenewableTaskTokenSecret(secret, token, now.Add(-time.Second), 1)
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	installTaskTokenAuthorityListFailure(r, apierrors.NewServiceUnavailable("temporary apiserver failure"), 0)
+	handlerCalled := false
+
+	result, err := r.handleWithTaskTransactionTokenRefresh(
+		t.Context(), task,
+		func(context.Context, *corev1alpha1.Task) (ctrl.Result, error) {
+			handlerCalled = true
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("handleWithTaskTransactionTokenRefresh() error = %v", err)
+	}
+	if handlerCalled {
+		t.Fatal("task execution handler ran before the renewal authority read was retried")
+	}
+	if result.RequeueAfter <= 0 || result.RequeueAfter > taskTokenTransientRetryDelay {
+		t.Fatalf("RequeueAfter = %v, want bounded transient authority-read retry", result.RequeueAfter)
+	}
+	updated := &corev1alpha1.Task{}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(task), updated); err != nil {
+		t.Fatalf("get active Task: %v", err)
+	}
+	if updated.Status.Phase != corev1alpha1.TaskPhaseRunning {
+		t.Fatalf("Task phase = %s, want Running", updated.Status.Phase)
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); err != nil {
+		t.Fatalf("still-valid workload token Secret was removed: %v", err)
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(authority), &corev1.Secret{}); err != nil {
+		t.Fatalf("renewal authority Secret was removed: %v", err)
+	}
+}
+
+func TestActiveTaskTransactionTokenTransientAuthorityReadFailureThatCrossesExpiryIsFatal(t *testing.T) {
+	expiresAt := time.Date(2026, time.August, 2, 12, 0, 1, 0, time.UTC)
+	now := expiresAt.Add(-50 * time.Millisecond)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	token := taskTokenJWTForTest(t, expiresAt, "authority-expires-during-read")
+	setRenewableTaskTokenSecret(secret, token, now.Add(-time.Second), 1)
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	installTaskTokenAuthorityListFailure(r, apierrors.NewServiceUnavailable("temporary apiserver failure"), 100*time.Millisecond)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || refreshAfter != 0 {
+		t.Fatalf("expiry-crossing authority read = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+}
+
+func TestActiveTaskTransactionTokenSuccessfulAuthorityReadThatCrossesExpiryIsFatal(t *testing.T) {
+	expiresAt := time.Date(2026, time.August, 2, 12, 0, 1, 0, time.UTC)
+	now := expiresAt.Add(-50 * time.Millisecond)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	token := taskTokenJWTForTest(t, expiresAt, "expires-during-successful-authority-read")
+	setRenewableTaskTokenSecret(secret, token, now.Add(-time.Second), 1)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{
+		taskTokenJWTForTest(t, expiresAt.Add(time.Minute), "must-not-rotate"),
+	}}
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	installTaskTokenAuthorityReadFailure(r, nil, 0, 100*time.Millisecond)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || refreshAfter != 0 {
+		t.Fatalf("expiry-crossing successful authority read = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+	if exchanger.calls != 0 {
+		t.Fatalf("exchange calls = %d, want no rotation after token expiry", exchanger.calls)
+	}
+}
+
+func TestActiveTaskTransactionTokenWorkloadReadThatCrossesExpiryIsFatal(t *testing.T) {
+	expiresAt := time.Date(2026, time.August, 2, 12, 0, 1, 0, time.UTC)
+	now := expiresAt.Add(-50 * time.Millisecond)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	token := taskTokenJWTForTest(t, expiresAt, "expires-during-workload-read")
+	setRenewableTaskTokenSecret(secret, token, now.Add(-time.Second), 1)
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	installTaskTokenAuthorityReadFailure(
+		r,
+		apierrors.NewServiceUnavailable("temporary apiserver failure"),
+		100*time.Millisecond,
+		0,
+	)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || refreshAfter != 0 {
+		t.Fatalf("expiry-crossing workload read = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+}
+
 func TestActiveTaskTransactionTokenTransientRefreshFailureRetriesBeforeExpiry(t *testing.T) {
 	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
@@ -952,6 +1122,38 @@ func currentTaskTokenSecret(t *testing.T, r *TaskReconciler, task *corev1alpha1.
 		t.Fatalf("get task token Secret: %v", err)
 	}
 	return secret
+}
+
+func installTaskTokenAuthorityListFailure(r *TaskReconciler, listErr error, delay time.Duration) {
+	installTaskTokenAuthorityReadFailure(r, listErr, 0, delay)
+}
+
+func installTaskTokenAuthorityReadFailure(
+	r *TaskReconciler,
+	listErr error,
+	getDelay, listDelay time.Duration,
+) {
+	base := r.Client.(client.WithWatch)
+	r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
+			if _, ok := object.(*corev1.Secret); ok && getDelay > 0 {
+				time.Sleep(getDelay)
+			}
+			return c.Get(ctx, key, object, opts...)
+		},
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.SecretList); !ok {
+				return c.List(ctx, list, opts...)
+			}
+			if listDelay > 0 {
+				time.Sleep(listDelay)
+			}
+			if listErr != nil {
+				return listErr
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
 }
 
 func setRenewableTaskTokenSecret(secret *corev1.Secret, token string, refreshAt time.Time, generation uint64) {

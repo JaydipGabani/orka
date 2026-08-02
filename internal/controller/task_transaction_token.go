@@ -22,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -108,6 +109,40 @@ func taskTokenTransientExchangeFailure(err error) bool {
 		return networkFailure.Timeout() || networkFailure.Temporary() //nolint:staticcheck // net.Error is the concrete transport retry signal here.
 	}
 	return exchangeFailure.err.Error() == taskTokenEndpointRequestFailed
+}
+
+func taskTokenTransientKubernetesReadFailure(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		apierrors.IsTimeout(err) ||
+		apierrors.IsServerTimeout(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsInternalError(err) ||
+		apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsUnexpectedServerError(err) {
+		return true
+	}
+	var status apierrors.APIStatus
+	if errors.As(err, &status) {
+		code := int(status.Status().Code)
+		if code >= http.StatusInternalServerError && code < 600 {
+			return true
+		}
+	}
+	var networkFailure net.Error
+	if errors.As(err, &networkFailure) {
+		if networkFailure.Timeout() || networkFailure.Temporary() { //nolint:staticcheck // net.Error is the concrete transport retry signal here.
+			return true
+		}
+	}
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		if utilnet.IsProbableEOF(cause) {
+			return true
+		}
+	}
+	return utilnet.IsConnectionReset(err) || utilnet.IsConnectionRefused(err) || utilnet.IsHTTP2ConnectionLost(err)
 }
 
 func taskTokenTransientRetryAfter(now, expiresAt time.Time) time.Duration {
@@ -533,6 +568,10 @@ func (r *TaskReconciler) reconcileActiveTaskTransactionToken(
 	task *corev1alpha1.Task,
 	now time.Time,
 ) (refreshAfter time.Duration, fatal bool, err error) {
+	reconcileStartedAt := time.Now()
+	currentTime := func() time.Time {
+		return now.Add(time.Since(reconcileStartedAt))
+	}
 	if task == nil || task.Spec.Transaction == nil || task.Annotations == nil ||
 		(task.Spec.Type != corev1alpha1.TaskTypeAI && task.Spec.Type != corev1alpha1.TaskTypeAgent &&
 			task.Spec.Type != corev1alpha1.TaskTypeContainer) {
@@ -558,24 +597,37 @@ func (r *TaskReconciler) reconcileActiveTaskTransactionToken(
 	if !directTaskTokenWorkloadSecret(task, workloadSecret) {
 		return 0, false, nil
 	}
-	authoritySecret, err := r.taskTransactionRenewalAuthoritySecret(ctx, task)
-	if err != nil {
-		return 0, true, err
-	}
 	taskToken := strings.TrimSpace(string(workloadSecret.Data[transactiontoken.TokenSecretKey]))
 	expiresAt, refreshAt, err := renewableTaskTokenState(workloadSecret, taskToken)
 	if err != nil {
 		return 0, true, err
 	}
-	if !expiresAt.After(now) {
+	observedNow := currentTime()
+	if !expiresAt.After(observedNow) {
 		return 0, true, errors.New("task-bound transaction token expired before rotation")
 	}
-	if now.Before(refreshAt) {
-		return refreshAt.Sub(now), false, nil
+	// Validate the controller-only authority on every active reconciliation,
+	// even before refresh is due. Allowing task progress while that authority is
+	// deleted, ambiguous, or unreadable would weaken the fail-closed boundary.
+	authoritySecret, err := r.taskTransactionRenewalAuthoritySecret(ctx, task)
+	observedNow = currentTime()
+	if err != nil {
+		if taskTokenTransientKubernetesReadFailure(err) {
+			retryAfter := taskTokenTransientRetryAfter(observedNow, expiresAt)
+			if retryAfter > 0 {
+				return retryAfter, false, err
+			}
+		}
+		return 0, true, err
 	}
-	rotationStartedAt := time.Now()
-	nextRefresh, err := r.rotateTaskTransactionToken(ctx, task, authoritySecret, workloadSecret, now)
-	rotationFinishedAt := now.Add(time.Since(rotationStartedAt))
+	if !expiresAt.After(observedNow) {
+		return 0, true, errors.New("task-bound transaction token expired before rotation")
+	}
+	if observedNow.Before(refreshAt) {
+		return refreshAt.Sub(observedNow), false, nil
+	}
+	nextRefresh, err := r.rotateTaskTransactionToken(ctx, task, authoritySecret, workloadSecret, observedNow)
+	rotationFinishedAt := currentTime()
 	if err != nil {
 		if taskTokenTransientExchangeFailure(err) {
 			retryAfter := taskTokenTransientRetryAfter(rotationFinishedAt, expiresAt)
@@ -585,7 +637,7 @@ func (r *TaskReconciler) reconcileActiveTaskTransactionToken(
 		}
 		return 0, !taskTokenRetryable(err), err
 	}
-	return max(nextRefresh.Sub(now), time.Nanosecond), false, nil
+	return max(nextRefresh.Sub(rotationFinishedAt), time.Nanosecond), false, nil
 }
 
 func renewableTaskTokenState(secret *corev1.Secret, taskToken string) (time.Time, time.Time, error) {
