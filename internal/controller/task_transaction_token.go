@@ -136,8 +136,21 @@ func (r *TaskReconciler) reconcilePendingTaskTransactionToken(
 	task *corev1alpha1.Task,
 	now time.Time,
 ) (ready bool, fatal bool, err error) {
+	reconcileStartedAt := time.Now()
+	pendingTimestamp := ""
+	if task != nil && task.Annotations != nil {
+		pendingTimestamp = task.Annotations[labels.AnnotationTransactionTokenPendingSince]
+	}
+	pendingSince, pendingErr := transactionTokenPendingSince(task)
+	missingPendingTimestamp := pendingTimestamp == ""
+	if pendingErr != nil && !missingPendingTimestamp {
+		return false, true, pendingErr
+	}
 	workloadSecret, wait, err := r.pendingTaskTransactionTokenSecret(ctx, task)
 	if err != nil || wait {
+		if missingPendingTimestamp {
+			return false, true, pendingErr
+		}
 		return false, false, err
 	}
 	taskToken := strings.TrimSpace(string(workloadSecret.Data[transactiontoken.TokenSecretKey]))
@@ -178,7 +191,32 @@ func (r *TaskReconciler) reconcilePendingTaskTransactionToken(
 		}
 		return true, false, nil
 	}
-	if _, err := r.rotateTaskTransactionToken(ctx, task, authoritySecret, workloadSecret, now); err != nil {
+	setupDeadline := time.Time{}
+	exchangeCtx := ctx
+	cancelExchange := func() {}
+	if pendingErr == nil {
+		setupDeadline = pendingSince.Add(taskTransactionTokenPendingTimeout)
+		remaining := setupDeadline.Sub(now.Add(time.Since(reconcileStartedAt)))
+		if remaining <= 0 {
+			return false, true, errors.New("task transaction token setup deadline elapsed before exchange")
+		}
+		exchangeCtx, cancelExchange = context.WithTimeout(ctx, remaining)
+	}
+	_, err = r.rotateTaskTransactionToken(exchangeCtx, task, authoritySecret, workloadSecret, now)
+	cancelExchange()
+	rotationFinishedAt := now.Add(time.Since(reconcileStartedAt))
+	if !setupDeadline.IsZero() && !rotationFinishedAt.Before(setupDeadline) {
+		return false, true, errors.New("task transaction token setup deadline elapsed during exchange")
+	}
+	if err != nil {
+		if taskTokenTransientExchangeFailure(err) {
+			if pendingErr != nil {
+				return false, true, pendingErr
+			}
+			// The Task has no usable workload token yet, so keep execution blocked
+			// and let the pending handler retry within its bounded setup window.
+			return false, false, nil
+		}
 		return false, !taskTokenRetryable(err), err
 	}
 	return true, false, nil

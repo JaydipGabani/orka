@@ -419,6 +419,180 @@ func TestJobBackedTaskTransactionTokenRequiresPropagationSafeLifetime(t *testing
 	}
 }
 
+func TestPendingTaskTransactionTokenTransientInitialExchangeRetriesBeforeSetupDeadline(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "timeout", err: context.DeadlineExceeded},
+		{name: "network", err: &net.DNSError{Err: "temporary resolver failure", Name: "transactions.example.test", IsTemporary: true}},
+		{name: "rate limited", err: &tokenexchange.ExchangeError{StatusCode: http.StatusTooManyRequests}},
+		{name: "server failure", err: &tokenexchange.ExchangeError{StatusCode: http.StatusServiceUnavailable}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pendingSince := time.Now().UTC().Add(-time.Second)
+			task, workload, authority := pendingDirectTaskTokenFixture(pendingSince)
+			exchanger := &queuedTaskTokenExchanger{err: test.err}
+			r := newUnitReconciler(newTestScheme(), task, workload, authority)
+			r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+			result, err := r.handleTransactionTokenPending(t.Context(), task)
+			if err != nil {
+				t.Fatalf("handleTransactionTokenPending() error = %v", err)
+			}
+			if result.RequeueAfter <= 0 || result.RequeueAfter > time.Second {
+				t.Fatalf("RequeueAfter = %v, want retry within the pending setup deadline", result.RequeueAfter)
+			}
+			if exchanger.calls != 1 {
+				t.Fatalf("exchange calls = %d, want 1", exchanger.calls)
+			}
+
+			updated := &corev1alpha1.Task{}
+			if err := r.Get(t.Context(), client.ObjectKeyFromObject(task), updated); err != nil {
+				t.Fatalf("get pending Task: %v", err)
+			}
+			if updated.Status.Phase != corev1alpha1.TaskPhasePending || !taskTransactionTokenPending(updated) {
+				t.Fatalf("Task state = %s pending:%v, want blocked Pending Task", updated.Status.Phase, taskTransactionTokenPending(updated))
+			}
+			if got := updated.Annotations[labels.AnnotationTransactionTokenPendingSince]; got != pendingSince.Format(time.RFC3339Nano) {
+				t.Fatalf("pending since = %q, want unchanged %q", got, pendingSince.Format(time.RFC3339Nano))
+			}
+			current := currentTaskTokenSecret(t, r, task)
+			if token := strings.TrimSpace(string(current.Data[transactiontoken.TokenSecretKey])); token != "" {
+				t.Fatal("transient initial exchange published a workload token")
+			}
+			if err := r.Get(t.Context(), client.ObjectKeyFromObject(authority), &corev1.Secret{}); err != nil {
+				t.Fatalf("renewal authority Secret was removed: %v", err)
+			}
+			jobs := &batchv1.JobList{}
+			if err := r.List(t.Context(), jobs, client.InNamespace(task.Namespace)); err != nil {
+				t.Fatalf("list Jobs: %v", err)
+			}
+			if len(jobs.Items) != 0 {
+				t.Fatalf("created %d Jobs while initial token exchange was retrying", len(jobs.Items))
+			}
+		})
+	}
+}
+
+func TestPendingTaskTransactionTokenSuccessfulInitialExchangeWithMalformedDeadlineFailsClosed(t *testing.T) {
+	for _, value := range []string{"not-a-time", "   "} {
+		t.Run(strconv.Quote(value), func(t *testing.T) {
+			task, workload, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+			task.Status.Phase = corev1alpha1.TaskPhasePending
+			task.Annotations[labels.AnnotationTransactionTokenPending] = scheduledRunLabelValue
+			task.Annotations[labels.AnnotationTransactionTokenPendingSince] = value
+			exchanger := &queuedTaskTokenExchanger{
+				tokens: []string{taskTokenJWTForTest(t, time.Now().UTC().Add(5*time.Minute), "malformed-deadline")},
+			}
+			r := newUnitReconciler(newTestScheme(), task, workload, authority)
+			r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+			ready, fatal, err := r.reconcilePendingTaskTransactionToken(t.Context(), task, time.Now().UTC())
+			if err == nil || !fatal || ready {
+				t.Fatalf("malformed-deadline successful exchange = ready:%v fatal:%v err:%v", ready, fatal, err)
+			}
+			if exchanger.calls != 0 {
+				t.Fatalf("exchange calls = %d, want no exchange with malformed deadline", exchanger.calls)
+			}
+		})
+	}
+}
+
+func TestPendingTaskTransactionTokenTransientInitialExchangeWithoutDeadlineFailsClosed(t *testing.T) {
+	task, workload, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	task.Status.Phase = corev1alpha1.TaskPhasePending
+	task.Annotations[labels.AnnotationTransactionTokenPending] = scheduledRunLabelValue
+	exchanger := &queuedTaskTokenExchanger{
+		err: &tokenexchange.ExchangeError{StatusCode: http.StatusServiceUnavailable},
+	}
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+	ready, fatal, err := r.reconcilePendingTaskTransactionToken(t.Context(), task, time.Now().UTC())
+	if err == nil || !fatal || ready {
+		t.Fatalf("missing-deadline transient exchange = ready:%v fatal:%v err:%v", ready, fatal, err)
+	}
+}
+
+func TestPendingTaskTransactionTokenPermanentInitialExchangeFailsClosed(t *testing.T) {
+	task, workload, authority := pendingDirectTaskTokenFixture(time.Now().UTC().Add(-time.Second))
+	exchanger := &queuedTaskTokenExchanger{
+		err: &tokenexchange.ExchangeError{StatusCode: http.StatusBadRequest, Code: "invalid_scope"},
+	}
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+	if _, err := r.handleTransactionTokenPending(t.Context(), task); err != nil {
+		t.Fatalf("handleTransactionTokenPending() error = %v", err)
+	}
+	if exchanger.calls != 1 {
+		t.Fatalf("exchange calls = %d, want 1", exchanger.calls)
+	}
+	assertPendingTaskTransactionTokenFailedClosed(t, r, task, workload, authority)
+}
+
+func TestPendingTaskTransactionTokenFailsClosedAtSetupDeadline(t *testing.T) {
+	task, workload, authority := pendingDirectTaskTokenFixture(
+		time.Now().UTC().Add(-taskTransactionTokenPendingTimeout - time.Second),
+	)
+	exchanger := &queuedTaskTokenExchanger{
+		err: &tokenexchange.ExchangeError{StatusCode: http.StatusServiceUnavailable},
+	}
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+	if _, err := r.handleTransactionTokenPending(t.Context(), task); err != nil {
+		t.Fatalf("handleTransactionTokenPending() error = %v", err)
+	}
+	if exchanger.calls != 0 {
+		t.Fatalf("exchange calls = %d, want no exchange at the setup deadline", exchanger.calls)
+	}
+	assertPendingTaskTransactionTokenFailedClosed(t, r, task, workload, authority)
+}
+
+func TestPendingTaskTransactionTokenSuccessfulInitialExchangeFailsClosedWhenSetupDeadlineElapses(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	task, workload, authority := pendingDirectTaskTokenFixture(
+		now.Add(-taskTransactionTokenPendingTimeout + 50*time.Millisecond),
+	)
+	exchanger := &queuedTaskTokenExchanger{
+		tokens: []string{taskTokenJWTForTest(t, now.Add(5*time.Minute), "late-success")},
+		delay:  100 * time.Millisecond,
+	}
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+	ready, fatal, err := r.reconcilePendingTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || ready {
+		t.Fatalf("deadline-crossing successful exchange = ready:%v fatal:%v err:%v", ready, fatal, err)
+	}
+	if exchanger.calls != 1 {
+		t.Fatalf("exchange calls = %d, want 1", exchanger.calls)
+	}
+}
+
+func TestPendingTaskTransactionTokenTransientInitialExchangeFailsClosedWhenSetupDeadlineElapses(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	task, workload, authority := pendingDirectTaskTokenFixture(
+		now.Add(-taskTransactionTokenPendingTimeout + 50*time.Millisecond),
+	)
+	exchanger := &queuedTaskTokenExchanger{
+		err: &tokenexchange.ExchangeError{StatusCode: http.StatusServiceUnavailable}, delay: 100 * time.Millisecond,
+	}
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+	ready, fatal, err := r.reconcilePendingTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || ready {
+		t.Fatalf("deadline-crossing initial exchange = ready:%v fatal:%v err:%v", ready, fatal, err)
+	}
+	if exchanger.calls != 1 {
+		t.Fatalf("exchange calls = %d, want 1", exchanger.calls)
+	}
+}
+
 func TestActiveTaskTransactionTokenRefreshCapsRequeue(t *testing.T) {
 	now := time.Now().UTC()
 	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
@@ -669,6 +843,43 @@ func renewableTaskTokenFixture(taskType corev1alpha1.TaskType) (*corev1alpha1.Ta
 	secret := directTaskTokenWorkloadSecretForTest(task, testRenewableSecretName)
 	authority := directTaskTokenAuthoritySecretForTest(task, testRenewableSubjectToken)
 	return task, secret, authority
+}
+
+func pendingDirectTaskTokenFixture(pendingSince time.Time) (*corev1alpha1.Task, *corev1.Secret, *corev1.Secret) {
+	task, workload, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	task.Status.Phase = corev1alpha1.TaskPhasePending
+	task.Annotations[labels.AnnotationTransactionTokenPending] = scheduledRunLabelValue
+	task.Annotations[labels.AnnotationTransactionTokenPendingSince] = pendingSince.Format(time.RFC3339Nano)
+	return task, workload, authority
+}
+
+func assertPendingTaskTransactionTokenFailedClosed(
+	t *testing.T,
+	r *TaskReconciler,
+	task *corev1alpha1.Task,
+	workload, authority *corev1.Secret,
+) {
+	t.Helper()
+	updated := &corev1alpha1.Task{}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(task), updated); err != nil {
+		t.Fatalf("get failed Task: %v", err)
+	}
+	if updated.Status.Phase != corev1alpha1.TaskPhaseFailed {
+		t.Fatalf("Task phase = %s, want Failed", updated.Status.Phase)
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(workload), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("workload token Secret remained after fail-closed cleanup: %v", err)
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(authority), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("renewal authority Secret remained after fail-closed cleanup: %v", err)
+	}
+	jobs := &batchv1.JobList{}
+	if err := r.List(t.Context(), jobs, client.InNamespace(task.Namespace)); err != nil {
+		t.Fatalf("list Jobs: %v", err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("created %d Jobs after fail-closed token setup", len(jobs.Items))
+	}
 }
 
 func directTaskTokenWorkloadSecretForTest(task *corev1alpha1.Task, name string) *corev1.Secret {
