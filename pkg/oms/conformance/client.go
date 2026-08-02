@@ -61,6 +61,8 @@ type contractClient struct {
 	rawBearerToken     string
 	authorizationValue string
 	http               *http.Client
+	limits             protocol.CapabilityLimits
+	limitsConfigured   bool
 }
 
 func newContractClient(target Target) (*contractClient, error) {
@@ -219,11 +221,40 @@ func validateResponseHeaders(header http.Header) error {
 }
 
 func (c *contractClient) postJSON(ctx context.Context, path string, value any) ([]byte, int, error) {
-	body, err := json.Marshal(value)
+	body, err := c.marshalJSONRequest(path, value)
 	if err != nil {
 		return nil, 0, err
 	}
 	return c.do(ctx, http.MethodPost, path, c.authorizationValue, body)
+}
+
+func (c *contractClient) configureLimits(limits protocol.CapabilityLimits) {
+	c.limits = limits
+	c.limitsConfigured = true
+}
+
+func (c *contractClient) marshalJSONRequest(name string, value any) ([]byte, error) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validateRequestBytes(name, body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func (c *contractClient) validateRequestBytes(name string, body []byte) error {
+	if !c.limitsConfigured || len(body) <= c.limits.MaxRequestBytes {
+		return nil
+	}
+	return fmt.Errorf(
+		"adapter advertises maxRequestBytes=%d, but the %s conformance request requires %d bytes; "+
+			"advertised limits are incompatible with this required proof",
+		c.limits.MaxRequestBytes,
+		strings.TrimSpace(name),
+		len(body),
+	)
 }
 
 func completeBearerAuthorizationValue(value string) string {

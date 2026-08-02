@@ -13,8 +13,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -34,6 +35,24 @@ const (
 	conformanceFailpointHeader        = "X-Orka-OMS-Conformance-Failpoint"
 	conformanceProviderCommitGapValue = "provider-commit-before-receipt-v1"
 	conformanceTag                    = "conformance"
+
+	fixtureRoleAuthentication     = "a"
+	fixtureRoleStrictCodec        = "b"
+	fixtureRoleCASBase            = "c"
+	fixtureRoleCASLeft            = "d"
+	fixtureRoleCASRight           = "e"
+	fixtureRoleMain               = "f"
+	fixtureRoleDuplicateCreate    = "g"
+	fixtureRoleWrongCAS           = "h"
+	fixtureRoleReplace            = "i"
+	fixtureRoleSearch             = "j"
+	fixtureRolePostSnapshot       = "k"
+	fixtureRoleDeleteSnapshot     = "l"
+	fixtureRoleAbsentDelete       = "m"
+	fixtureRoleStaleRouting       = "n"
+	fixtureRoleProviderCommitGap  = "o"
+	fixtureRoleStaleResurrection  = "p"
+	fixtureRoleSecondStaleRouting = "r"
 )
 
 // Checkpoint contains no credentials. It is safe to persist between prepare
@@ -66,6 +85,186 @@ type CheckResult struct {
 	Phase        string                         `json:"phase"`
 	Message      string                         `json:"message"`
 	Capabilities *protocol.CapabilitiesResponse `json:"capabilities,omitempty"`
+}
+
+type fixturePlan struct {
+	limits    protocol.CapabilityLimits
+	namespace string
+	query     string
+}
+
+func newFixturePlan(runID string, limits protocol.CapabilityLimits) (fixturePlan, error) {
+	if limits.MaxSnapshotRecords < 2 {
+		return fixturePlan{}, fmt.Errorf(
+			"adapter advertises maxSnapshotRecords=%d; "+
+				"OMS conformance requires at least 2 records to prove stable multi-page pagination",
+			limits.MaxSnapshotRecords,
+		)
+	}
+	queryBytes := min(limits.MaxContentBytes, limits.MaxQueryBytes)
+	sum := sha256.Sum256([]byte(runID))
+	namespace := hex.EncodeToString(sum[:16])
+	querySeed := "q" + base64.RawURLEncoding.EncodeToString(sum[:12])
+	if queryBytes < len(querySeed) {
+		return fixturePlan{}, fmt.Errorf(
+			"adapter advertises maxContentBytes=%d and maxQueryBytes=%d; "+
+				"OMS conformance requires at least %d shared keyword bytes for run isolation",
+			limits.MaxContentBytes,
+			limits.MaxQueryBytes,
+			len(querySeed),
+		)
+	}
+	query := querySeed
+	plan := fixturePlan{limits: limits, namespace: namespace, query: query}
+	for name, state := range map[string]*protocol.MutationState{
+		"minimal": plan.state("a"),
+		"search":  plan.state(plan.query),
+	} {
+		if err := validateFixtureState(limits, state); err != nil {
+			return fixturePlan{}, fmt.Errorf("adapter limits cannot encode the %s conformance state: %w", name, err)
+		}
+	}
+	request, err := plan.searchRequest(DefaultBinding(), protocol.SearchModeKeyword)
+	if err != nil {
+		return fixturePlan{}, err
+	}
+	if request.PageSize != 1 {
+		return fixturePlan{}, errors.New("conformance pagination fixture must use one record per page")
+	}
+	return plan, nil
+}
+
+func (p fixturePlan) operationID(role string) string {
+	return "mop-" + p.namespace + "-" + role
+}
+
+func (p fixturePlan) memoryID(role string) string {
+	return "mem-" + p.namespace + "-" + role
+}
+
+func (p fixturePlan) conflictBackendUID(role string) string {
+	return "conflict-" + p.namespace + "-" + role
+}
+
+func (p fixturePlan) state(content string, markers ...string) *protocol.MutationState {
+	marker := "t"
+	if len(markers) > 0 && markers[0] != "" {
+		marker = markers[0]
+	}
+	return &protocol.MutationState{
+		Content: content,
+		Tags:    []string{marker},
+		Metadata: map[string]string{
+			marker: marker,
+		},
+	}
+}
+
+func (p fixturePlan) mutation(
+	binding protocol.Binding,
+	operationRole string,
+	memoryID string,
+	kind string,
+	generation uint64,
+	expectedGeneration uint64,
+	expectedVersion string,
+	state *protocol.MutationState,
+) (protocol.MutationEnvelope, error) {
+	request, err := makeMutation(
+		binding,
+		p.operationID(operationRole),
+		memoryID,
+		kind,
+		generation,
+		expectedGeneration,
+		expectedVersion,
+		state,
+	)
+	if err != nil {
+		return protocol.MutationEnvelope{}, err
+	}
+	if err := validateFixtureMutation(p.limits, &request); err != nil {
+		return protocol.MutationEnvelope{}, err
+	}
+	return request, nil
+}
+
+func (p fixturePlan) searchRequest(
+	binding protocol.Binding,
+	mode string,
+) (protocol.SearchRequest, error) {
+	request := protocol.SearchRequest{
+		ProtocolVersion: protocol.Version,
+		Binding:         binding,
+		Mode:            mode,
+		Query:           p.query,
+		PageSize:        1,
+		PageToken:       "",
+	}
+	if err := validateFixtureSearch(p.limits, &request); err != nil {
+		return protocol.SearchRequest{}, err
+	}
+	return request, nil
+}
+
+func validateFixtureMutation(limits protocol.CapabilityLimits, request *protocol.MutationEnvelope) error {
+	if request == nil || request.State == nil {
+		return nil
+	}
+	if err := validateFixtureState(limits, request.State); err != nil {
+		return fmt.Errorf("mutation fixture exceeds advertised limits: %w", err)
+	}
+	return nil
+}
+
+func validateFixtureState(limits protocol.CapabilityLimits, state *protocol.MutationState) error {
+	if state == nil {
+		return nil
+	}
+	if len(state.Content) > limits.MaxContentBytes {
+		return fmt.Errorf("content uses %d bytes, maxContentBytes=%d", len(state.Content), limits.MaxContentBytes)
+	}
+	if len(state.Tags) > limits.MaxTags {
+		return fmt.Errorf("tags uses %d entries, maxTags=%d", len(state.Tags), limits.MaxTags)
+	}
+	for _, tag := range state.Tags {
+		if len(tag) > limits.MaxTagBytes {
+			return fmt.Errorf("tag uses %d bytes, maxTagBytes=%d", len(tag), limits.MaxTagBytes)
+		}
+	}
+	if len(state.Metadata) > limits.MaxMetadataEntries {
+		return fmt.Errorf(
+			"metadata uses %d entries, maxMetadataEntries=%d",
+			len(state.Metadata),
+			limits.MaxMetadataEntries,
+		)
+	}
+	for key, value := range state.Metadata {
+		if len(key) > limits.MaxMetadataKeyBytes {
+			return fmt.Errorf("metadata key uses %d bytes, maxMetadataKeyBytes=%d", len(key), limits.MaxMetadataKeyBytes)
+		}
+		if len(value) > limits.MaxMetadataValueBytes {
+			return fmt.Errorf(
+				"metadata value uses %d bytes, maxMetadataValueBytes=%d",
+				len(value),
+				limits.MaxMetadataValueBytes,
+			)
+		}
+	}
+	return nil
+}
+
+func validateFixtureSearch(limits protocol.CapabilityLimits, request *protocol.SearchRequest) error {
+	if request == nil {
+		return errors.New("search fixture is required")
+	}
+	if len(request.Query) > limits.MaxQueryBytes {
+		return fmt.Errorf("search query uses %d bytes, maxQueryBytes=%d", len(request.Query), limits.MaxQueryBytes)
+	}
+	if request.PageSize > limits.MaxPageSize {
+		return fmt.Errorf("search pageSize=%d exceeds maxPageSize=%d", request.PageSize, limits.MaxPageSize)
+	}
+	return nil
 }
 
 // Check runs prepare plus verification in one process. Release gates that need
@@ -138,17 +337,22 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		return checkpoint, result
 	}
 
-	if err := verifyStrictStoreCodec(ctx, client, storeBinding, storeName); err != nil {
-		result.Message = err.Error()
-		return checkpoint, result
-	}
 	caps, err := probe(ctx, client, binding)
 	if err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
 	}
 	result.Capabilities = caps
-	if err := verifyAuthentication(ctx, client, storeBinding, storeName, binding); err != nil {
+	fixtures, err := newFixturePlan(runID, caps.Limits)
+	if err != nil {
+		result.Message = err.Error()
+		return checkpoint, result
+	}
+	if err := verifyAuthentication(ctx, client, storeBinding, storeName, binding, fixtures); err != nil {
+		result.Message = err.Error()
+		return checkpoint, result
+	}
+	if err := verifyStrictStoreCodec(ctx, client, storeBinding, storeName); err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
 	}
@@ -169,25 +373,29 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 	if claim.MaximumRoutingEpoch > binding.RoutingEpoch {
 		binding.RoutingEpoch = claim.MaximumRoutingEpoch
 	}
-	if err := verifyExclusiveOwnership(ctx, client, binding, runID); err != nil {
+	if err := verifyExclusiveOwnership(ctx, client, binding, fixtures.conflictBackendUID("a")); err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
 	}
-	if err := verifyStrictMutationCodec(ctx, client, binding, runID); err != nil {
+	if err := verifyStrictMutationCodec(ctx, client, binding, fixtures); err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
 	}
-	if err := verifyConcurrentCAS(ctx, client, binding, runID); err != nil {
+	if err := verifyConcurrentCAS(ctx, client, binding, fixtures); err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
 	}
 
-	marker := "oms-conformance-" + runID
-	mainMutation, err := makeMutation(binding, "mop-"+runID+"-create-main", "mem-"+runID+"-main",
-		protocol.MutationKindCreate, 1, 0, "", &protocol.MutationState{
-			Content: "durable " + marker + " initial", Tags: []string{"Conformance", marker},
-			Metadata: map[string]string{"Suite": "OMS Conformance", "Run": runID},
-		})
+	mainMutation, err := fixtures.mutation(
+		binding,
+		fixtureRoleMain,
+		fixtures.memoryID(fixtureRoleMain),
+		protocol.MutationKindCreate,
+		1,
+		0,
+		"",
+		fixtures.state("a"),
+	)
 	if err != nil {
 		result.Message = safeError("could not construct create mutation", err)
 		return checkpoint, result
@@ -208,13 +416,14 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 	}
 
 	conflicting := mainMutation
-	conflicting.State = &protocol.MutationState{
-		Content: mainMutation.State.Content + " changed", Tags: append([]string(nil), mainMutation.State.Tags...),
-		Metadata: cloneMap(mainMutation.State.Metadata),
-	}
+	conflicting.State = fixtures.state("b")
 	conflicting.MutationDigest = ""
 	if err := protocol.PrepareMutation(&conflicting); err != nil {
 		result.Message = safeError("could not construct idempotency conflict", err)
+		return checkpoint, result
+	}
+	if err := validateFixtureMutation(caps.Limits, &conflicting); err != nil {
+		result.Message = err.Error()
 		return checkpoint, result
 	}
 	if _, _, err := mutation(ctx, client, conflicting, protocol.ResultIdempotencyConflict); err != nil {
@@ -222,8 +431,16 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		return checkpoint, result
 	}
 
-	duplicateCreate, err := makeMutation(binding, "mop-"+runID+"-duplicate-create", mainMutation.MemoryID,
-		protocol.MutationKindCreate, 1, 0, "", cloneState(mainMutation.State))
+	duplicateCreate, err := fixtures.mutation(
+		binding,
+		fixtureRoleDuplicateCreate,
+		mainMutation.MemoryID,
+		protocol.MutationKindCreate,
+		1,
+		0,
+		"",
+		cloneState(mainMutation.State),
+	)
 	if err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
@@ -244,10 +461,16 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		return checkpoint, result
 	}
 
-	wrongReplace, err := makeMutation(binding, "mop-"+runID+"-replace-wrong-cas", mainMutation.MemoryID,
-		protocol.MutationKindReplace, 3, 2, "", &protocol.MutationState{
-			Content: "wrong CAS " + marker, Tags: []string{marker}, Metadata: map[string]string{"run": runID},
-		})
+	wrongReplace, err := fixtures.mutation(
+		binding,
+		fixtureRoleWrongCAS,
+		mainMutation.MemoryID,
+		protocol.MutationKindReplace,
+		3,
+		2,
+		"",
+		fixtures.state("c"),
+	)
 	if err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
@@ -257,11 +480,16 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		return checkpoint, result
 	}
 
-	replaceMutation, err := makeMutation(binding, "mop-"+runID+"-replace-main", mainMutation.MemoryID,
-		protocol.MutationKindReplace, 2, 1, createReceipt.BackendVersion, &protocol.MutationState{
-			Content: "durable " + marker + " replaced", Tags: []string{marker, "Conformance"},
-			Metadata: map[string]string{"run": runID, "suite": "OMS Conformance"},
-		})
+	replaceMutation, err := fixtures.mutation(
+		binding,
+		fixtureRoleReplace,
+		mainMutation.MemoryID,
+		protocol.MutationKindReplace,
+		2,
+		1,
+		createReceipt.BackendVersion,
+		fixtures.state(fixtures.query, "r"),
+	)
 	if err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
@@ -274,46 +502,55 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 	if err != nil ||
 		liveRecord == nil ||
 		liveRecord.Generation != 2 ||
-		liveRecord.Content != replaceMutation.State.Content {
-		result.Message = "conditional replace did not materialize generation 2"
+		liveRecord.Content != replaceMutation.State.Content ||
+		!slices.Equal(liveRecord.Tags, replaceMutation.State.Tags) ||
+		!maps.Equal(liveRecord.Metadata, replaceMutation.State.Metadata) {
+		result.Message = "conditional replace did not materialize the complete generation 2 state"
 		return checkpoint, result
 	}
 	expectedSnapshotRecords := []protocol.MemoryRecord{*liveRecord}
 
-	for _, suffix := range []string{"a", "b", "c", "d"} {
-		created, createErr := makeMutation(binding, "mop-"+runID+"-search-"+suffix, "mem-"+runID+"-search-"+suffix,
-			protocol.MutationKindCreate, 1, 0, "", &protocol.MutationState{
-				Content: marker + " searchable " + suffix, Tags: []string{marker, suffix},
-				Metadata: map[string]string{"run": runID},
-			})
-		if createErr != nil {
-			result.Message = createErr.Error()
-			return checkpoint, result
-		}
-		if _, _, err := mutation(ctx, client, created, protocol.ResultApplied); err != nil {
-			result.Message = err.Error()
-			return checkpoint, result
-		}
-		record, getErr := getRecord(ctx, client, binding, created.UpsertKey)
-		if getErr != nil || record == nil {
-			result.Message = "search fixture was not readable through exact get"
-			return checkpoint, result
-		}
-		expectedSnapshotRecords = append(expectedSnapshotRecords, *record)
+	searchFixture, err := fixtures.mutation(
+		binding,
+		fixtureRoleSearch,
+		fixtures.memoryID(fixtureRoleSearch),
+		protocol.MutationKindCreate,
+		1,
+		0,
+		"",
+		fixtures.state(fixtures.query),
+	)
+	if err != nil {
+		result.Message = err.Error()
+		return checkpoint, result
 	}
+	if _, _, err := mutation(ctx, client, searchFixture, protocol.ResultApplied); err != nil {
+		result.Message = err.Error()
+		return checkpoint, result
+	}
+	searchRecord, err := getRecord(ctx, client, binding, searchFixture.UpsertKey)
+	if err != nil || searchRecord == nil {
+		result.Message = "search fixture was not readable through exact get"
+		return checkpoint, result
+	}
+	expectedSnapshotRecords = append(expectedSnapshotRecords, *searchRecord)
 	expectedSnapshotDigests, err := recordDigestByKey(binding, expectedSnapshotRecords)
 	if err != nil {
 		result.Message = safeError("could not digest exact search fixtures", err)
 		return checkpoint, result
 	}
 	if err := verifySearchModeCapabilities(
-		ctx, client, binding, marker, caps.Capabilities, caps.Limits.MaxPageSize,
+		ctx, client, binding, caps.Capabilities, fixtures,
 	); err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
 	}
 
-	searchRequest := paginationFixtureRequest(binding, marker, caps.Limits.MaxPageSize)
+	searchRequest, err := fixtures.searchRequest(binding, protocol.SearchModeKeyword)
+	if err != nil {
+		result.Message = err.Error()
+		return checkpoint, result
+	}
 	firstPage, err := search(ctx, client, searchRequest)
 	if err != nil {
 		result.Message = err.Error()
@@ -343,10 +580,16 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		return checkpoint, result
 	}
 
-	postSnapshot, err := makeMutation(binding, "mop-"+runID+"-post-snapshot", "mem-"+runID+"-search-z",
-		protocol.MutationKindCreate, 1, 0, "", &protocol.MutationState{
-			Content: marker + " created after snapshot", Tags: []string{marker}, Metadata: map[string]string{"run": runID},
-		})
+	postSnapshot, err := fixtures.mutation(
+		binding,
+		fixtureRolePostSnapshot,
+		fixtures.memoryID(fixtureRolePostSnapshot),
+		protocol.MutationKindCreate,
+		1,
+		0,
+		"",
+		fixtures.state(fixtures.query),
+	)
 	if err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
@@ -362,8 +605,16 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		result.Message = "could not load snapshot record selected for deletion"
 		return checkpoint, result
 	}
-	deleteSnapshotRecord, err := makeMutation(binding, "mop-"+runID+"-delete-snapshot-record", toDelete.MemoryID,
-		protocol.MutationKindDelete, toDelete.Generation+1, toDelete.Generation, toDelete.BackendVersion, nil)
+	deleteSnapshotRecord, err := fixtures.mutation(
+		binding,
+		fixtureRoleDeleteSnapshot,
+		toDelete.MemoryID,
+		protocol.MutationKindDelete,
+		toDelete.Generation+1,
+		toDelete.Generation,
+		toDelete.BackendVersion,
+		nil,
+	)
 	if err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
@@ -373,8 +624,16 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		return checkpoint, result
 	}
 
-	absentDelete, err := makeMutation(binding, "mop-"+runID+"-delete-absent", "mem-"+runID+"-absent",
-		protocol.MutationKindDelete, 1, 0, "", nil)
+	absentDelete, err := fixtures.mutation(
+		binding,
+		fixtureRoleAbsentDelete,
+		fixtures.memoryID(fixtureRoleAbsentDelete),
+		protocol.MutationKindDelete,
+		1,
+		0,
+		"",
+		nil,
+	)
 	if err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
@@ -402,10 +661,16 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		result.Message = "routing fence did not advance durably"
 		return checkpoint, result
 	}
-	staleMutation, err := makeMutation(staleBinding, "mop-"+runID+"-stale-routing", "mem-"+runID+"-stale-routing",
-		protocol.MutationKindCreate, 1, 0, "", &protocol.MutationState{
-			Content: marker + " stale routing", Tags: []string{marker}, Metadata: map[string]string{"run": runID},
-		})
+	staleMutation, err := fixtures.mutation(
+		staleBinding,
+		fixtureRoleStaleRouting,
+		fixtures.memoryID(fixtureRoleStaleRouting),
+		protocol.MutationKindCreate,
+		1,
+		0,
+		"",
+		fixtures.state("h"),
+	)
 	if err != nil {
 		result.Message = err.Error()
 		return checkpoint, result
@@ -432,12 +697,15 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 
 	var providerCommitGapMutation *protocol.MutationEnvelope
 	if target.ProviderCommitGapProof {
-		gapMutation, gapErr := makeMutation(
-			binding, "mop-"+runID+"-provider-commit-gap", "mem-"+runID+"-provider-commit-gap",
-			protocol.MutationKindCreate, 1, 0, "", &protocol.MutationState{
-				Content: "provider commit gap " + runID, Tags: []string{conformanceTag, "recovery"},
-				Metadata: map[string]string{"run": runID},
-			},
+		gapMutation, gapErr := fixtures.mutation(
+			binding,
+			fixtureRoleProviderCommitGap,
+			fixtures.memoryID(fixtureRoleProviderCommitGap),
+			protocol.MutationKindCreate,
+			1,
+			0,
+			"",
+			fixtures.state("i"),
 		)
 		if gapErr != nil {
 			result.Message = gapErr.Error()
@@ -504,6 +772,11 @@ func VerifyAfterRestart(ctx context.Context, target Target, checkpoint Checkpoin
 		result.Message = "capability revision changed between prepare and verify"
 		return result
 	}
+	fixtures, err := newFixturePlan(checkpoint.RunID, caps.Limits)
+	if err != nil {
+		result.Message = err.Error()
+		return result
+	}
 	claim, err := claimOwnership(ctx, client, checkpoint.Binding)
 	if err != nil ||
 		claim.Result != protocol.ResultApplied ||
@@ -511,7 +784,7 @@ func VerifyAfterRestart(ctx context.Context, target Target, checkpoint Checkpoin
 		result.Message = "exclusive ownership claim or routing fence did not survive restart"
 		return result
 	}
-	if err := verifyExclusiveOwnership(ctx, client, checkpoint.Binding, checkpoint.RunID+"-restart"); err != nil {
+	if err := verifyExclusiveOwnership(ctx, client, checkpoint.Binding, fixtures.conflictBackendUID("b")); err != nil {
 		result.Message = err.Error()
 		return result
 	}
@@ -562,11 +835,16 @@ func VerifyAfterRestart(ctx context.Context, target Target, checkpoint Checkpoin
 		return result
 	}
 
-	staleCreate, err := makeMutation(checkpoint.Binding, "mop-"+checkpoint.RunID+"-stale-resurrection-verify",
-		checkpoint.TombstoneRecord.MemoryID, protocol.MutationKindCreate, checkpoint.TombstoneRecord.Generation,
-		0, "", &protocol.MutationState{
-			Content: "stale resurrection", Tags: []string{conformanceTag}, Metadata: map[string]string{"run": checkpoint.RunID},
-		})
+	staleCreate, err := fixtures.mutation(
+		checkpoint.Binding,
+		fixtureRoleStaleResurrection,
+		checkpoint.TombstoneRecord.MemoryID,
+		protocol.MutationKindCreate,
+		checkpoint.TombstoneRecord.Generation,
+		0,
+		"",
+		fixtures.state("j"),
+	)
 	if err != nil {
 		result.Message = err.Error()
 		return result
@@ -595,12 +873,17 @@ func VerifyAfterRestart(ctx context.Context, target Target, checkpoint Checkpoin
 		result.Message = "stale routing-fence receipt did not survive restart"
 		return result
 	}
-	secondStale := checkpoint.StaleMutation
-	secondStale.OperationID = "mop-" + checkpoint.RunID + "-stale-routing-verify"
-	secondStale.MemoryID = "mem-" + checkpoint.RunID + "-stale-routing-verify"
-	secondStale.UpsertKey = ""
-	secondStale.MutationDigest = ""
-	if err := protocol.PrepareMutation(&secondStale); err != nil {
+	secondStale, err := fixtures.mutation(
+		checkpoint.StaleMutation.Binding,
+		fixtureRoleSecondStaleRouting,
+		fixtures.memoryID(fixtureRoleSecondStaleRouting),
+		protocol.MutationKindCreate,
+		1,
+		0,
+		"",
+		fixtures.state("k"),
+	)
+	if err != nil {
 		result.Message = err.Error()
 		return result
 	}
@@ -767,6 +1050,7 @@ func probe(
 	if !protocol.BindingEqual(caps.Binding, binding) {
 		return nil, errors.New("capability response did not echo the exact binding")
 	}
+	client.configureLimits(caps.Limits)
 	return caps, nil
 }
 
@@ -809,83 +1093,88 @@ func verifyAuthentication(
 	storeBinding protocol.StoreResolutionBinding,
 	storeName string,
 	binding protocol.Binding,
+	fixtures fixturePlan,
 ) error {
-	mutationRequest, err := makeMutation(
-		binding, "mop-auth-probe", "mem-auth-probe", protocol.MutationKindCreate, 1, 0, "",
-		&protocol.MutationState{Content: "authentication probe", Tags: []string{}, Metadata: map[string]string{}},
+	mutationRequest, err := fixtures.mutation(
+		binding,
+		fixtureRoleAuthentication,
+		fixtures.memoryID(fixtureRoleAuthentication),
+		protocol.MutationKindCreate,
+		1,
+		0,
+		"",
+		fixtures.state("k"),
 	)
 	if err != nil {
 		return err
 	}
-	marshal := func(value any) []byte {
-		body, marshalErr := json.Marshal(value)
-		if marshalErr != nil {
-			panic(marshalErr)
-		}
-		return body
+	searchRequest, err := fixtures.searchRequest(binding, protocol.SearchModeKeyword)
+	if err != nil {
+		return err
 	}
 	probes := []struct {
 		name, method, path string
+		value              any
 		body               []byte
 	}{
 		{name: "health", method: http.MethodGet, path: protocol.PathHealth},
 		{
 			name: "store resolution", method: http.MethodPost, path: protocol.PathStoreResolve,
-			body: marshal(protocol.StoreResolveRequest{
+			value: protocol.StoreResolveRequest{
 				ProtocolVersion: protocol.Version,
 				Binding:         storeBinding,
 				StoreName:       storeName,
-			}),
+			},
 		},
 		{
 			name: "capabilities", method: http.MethodPost, path: protocol.PathCapabilities,
-			body: marshal(protocol.CapabilitiesRequest{
+			value: protocol.CapabilitiesRequest{
 				ProtocolVersion: protocol.Version,
 				Binding:         binding,
-			}),
+			},
 		},
 		{
 			name: "ownership claim", method: http.MethodPost, path: protocol.PathOwnershipClaim,
-			body: marshal(protocol.OwnershipClaimRequest{
+			value: protocol.OwnershipClaimRequest{
 				ProtocolVersion: protocol.Version,
 				Binding:         binding,
-			}),
+			},
 		},
 		{
 			name: "routing fence", method: http.MethodPost, path: protocol.PathRoutingFence,
-			body: marshal(protocol.RoutingFenceRequest{
+			value: protocol.RoutingFenceRequest{
 				ProtocolVersion: protocol.Version,
 				Binding:         binding,
-			}),
+			},
 		},
-		{name: "mutation", method: http.MethodPost, path: protocol.PathMutations, body: marshal(mutationRequest)},
+		{name: "mutation", method: http.MethodPost, path: protocol.PathMutations, value: mutationRequest},
 		{
 			name: "exact get", method: http.MethodPost, path: protocol.PathRecordsGet,
-			body: marshal(protocol.GetRequest{
+			value: protocol.GetRequest{
 				ProtocolVersion: protocol.Version,
 				Binding:         binding,
 				UpsertKey:       mutationRequest.UpsertKey,
-			}),
+			},
 		},
 		{
 			name: "operation lookup", method: http.MethodPost, path: protocol.PathOperationsGet,
-			body: marshal(protocol.OperationLookupRequest{
+			value: protocol.OperationLookupRequest{
 				ProtocolVersion: protocol.Version,
 				Binding:         binding,
 				OperationID:     mutationRequest.OperationID,
-			}),
+			},
 		},
-		{
-			name: "search", method: http.MethodPost, path: protocol.PathSearch,
-			body: marshal(protocol.SearchRequest{
-				ProtocolVersion: protocol.Version,
-				Binding:         binding,
-				Mode:            protocol.SearchModeKeyword,
-				Query:           "",
-				PageSize:        1,
-				PageToken:       "",
-			}),
-		},
+		{name: "search", method: http.MethodPost, path: protocol.PathSearch, value: searchRequest},
+	}
+	for index := range probes {
+		if probes[index].value == nil {
+			continue
+		}
+		body, marshalErr := client.marshalJSONRequest("authentication "+probes[index].name, probes[index].value)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		probes[index].body = body
 	}
 	for _, probe := range probes {
 		for _, token := range []string{"", client.authorizationValue + "-invalid"} {
@@ -908,13 +1197,22 @@ func verifyAuthentication(
 }
 
 func verifyStrictCapabilityCodec(ctx context.Context, client *contractClient, binding protocol.Binding) error {
-	valid, _ := json.Marshal(protocol.CapabilitiesRequest{ProtocolVersion: protocol.Version, Binding: binding})
-	unknown := append([]byte(`{"unknown":true,`), valid[1:]...)
+	valid, err := client.marshalJSONRequest(
+		"capabilities codec baseline",
+		protocol.CapabilitiesRequest{ProtocolVersion: protocol.Version, Binding: binding},
+	)
+	if err != nil {
+		return err
+	}
+	unknown := append([]byte(`{"x":0,`), valid[1:]...)
 	duplicate := append([]byte(`{"protocolVersion":"orka.oms.v0alpha1",`), valid[1:]...)
-	trailing := append(append([]byte(nil), valid...), []byte(` {}`)...)
+	trailing := append(append([]byte(nil), valid...), []byte(` 0`)...)
 	unsafeRequest := protocol.CapabilitiesRequest{ProtocolVersion: protocol.Version, Binding: binding}
 	unsafeRequest.Binding.ClusterID = "unsafe\ncluster"
-	unsafeBody, _ := json.Marshal(unsafeRequest)
+	unsafeBody, err := client.marshalJSONRequest("unsafe capabilities codec", unsafeRequest)
+	if err != nil {
+		return err
+	}
 	oversized := append(
 		append([]byte(nil), valid...),
 		bytes.Repeat([]byte(" "), protocol.MaxHTTPBodyBytes+1-len(valid))...,
@@ -931,6 +1229,11 @@ func verifyStrictCapabilityCodec(ctx context.Context, client *contractClient, bi
 		{name: "oversized body", status: http.StatusRequestEntityTooLarge, body: oversized},
 	}
 	for _, probe := range probes {
+		if probe.name != "oversized body" {
+			if err := client.validateRequestBytes("capabilities "+probe.name, probe.body); err != nil {
+				return err
+			}
+		}
 		if err := expectCodecRejection(
 			ctx, client, protocol.PathCapabilities, probe.name, probe.status, probe.body,
 		); err != nil {
@@ -944,19 +1247,31 @@ func verifyStrictMutationCodec(
 	ctx context.Context,
 	client *contractClient,
 	binding protocol.Binding,
-	runID string,
+	fixtures fixturePlan,
 ) error {
-	request, err := makeMutation(binding, "mop-"+runID+"-strict-codec", "mem-"+runID+"-strict-codec",
-		protocol.MutationKindCreate, 1, 0, "", &protocol.MutationState{
-			Content: "strict codec", Tags: []string{"strict"}, Metadata: map[string]string{"run": runID},
-		})
+	request, err := fixtures.mutation(
+		binding,
+		fixtureRoleStrictCodec,
+		fixtures.memoryID(fixtureRoleStrictCodec),
+		protocol.MutationKindCreate,
+		1,
+		0,
+		"",
+		fixtures.state("g"),
+	)
 	if err != nil {
 		return err
 	}
-	valid, _ := json.Marshal(request)
-	unknown := append([]byte(`{"unknown":true,`), valid[1:]...)
-	trailing := append(append([]byte(nil), valid...), []byte(` []`)...)
+	valid, err := client.marshalJSONRequest("mutation codec baseline", request)
+	if err != nil {
+		return err
+	}
+	unknown := append([]byte(`{"x":0,`), valid[1:]...)
+	trailing := append(append([]byte(nil), valid...), []byte(` 0`)...)
 	for name, body := range map[string][]byte{"mutation unknown field": unknown, "mutation trailing JSON": trailing} {
+		if err := client.validateRequestBytes(name, body); err != nil {
+			return err
+		}
 		if err := expectCodecRejection(ctx, client, protocol.PathMutations, name, http.StatusBadRequest, body); err != nil {
 			return err
 		}
@@ -1022,14 +1337,18 @@ func verifyStrictStoreCodec(
 	binding protocol.StoreResolutionBinding,
 	storeName string,
 ) error {
-	valid, _ := json.Marshal(protocol.StoreResolveRequest{
-		ProtocolVersion: protocol.Version,
-		Binding:         binding,
-		StoreName:       storeName,
+	valid, err := client.marshalJSONRequest("store codec baseline", protocol.StoreResolveRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, StoreName: storeName,
 	})
-	unknown := append([]byte(`{"unknown":true,`), valid[1:]...)
-	trailing := append(append([]byte(nil), valid...), []byte(` {}`)...)
+	if err != nil {
+		return err
+	}
+	unknown := append([]byte(`{"x":0,`), valid[1:]...)
+	trailing := append(append([]byte(nil), valid...), []byte(` 0`)...)
 	for name, body := range map[string][]byte{"store unknown field": unknown, "store trailing JSON": trailing} {
+		if err := client.validateRequestBytes(name, body); err != nil {
+			return err
+		}
 		if err := expectCodecRejection(
 			ctx, client, protocol.PathStoreResolve, name, http.StatusBadRequest, body,
 		); err != nil {
@@ -1069,10 +1388,10 @@ func verifyExclusiveOwnership(
 	ctx context.Context,
 	client *contractClient,
 	binding protocol.Binding,
-	runID string,
+	conflictBackendUID string,
 ) error {
 	conflict := binding
-	conflict.BackendUID = "conflict-" + strings.TrimSuffix(runID, "-restart")
+	conflict.BackendUID = conflictBackendUID
 	if conflict.BackendUID == binding.BackendUID {
 		conflict.BackendUID = "conflict-owner"
 	}
@@ -1087,7 +1406,12 @@ func verifyExclusiveOwnership(
 }
 
 func induceProviderCommitGap(ctx context.Context, client *contractClient, request protocol.MutationEnvelope) error {
-	body, err := json.Marshal(request)
+	if client.limitsConfigured {
+		if err := validateFixtureMutation(client.limits, &request); err != nil {
+			return err
+		}
+	}
+	body, err := client.marshalJSONRequest("provider-commit gap mutation", request)
 	if err != nil {
 		return err
 	}
@@ -1117,14 +1441,21 @@ func induceProviderCommitGap(ctx context.Context, client *contractClient, reques
 	return nil
 }
 
-func verifyConcurrentCAS(ctx context.Context, client *contractClient, binding protocol.Binding, runID string) error {
-	base, err := makeMutation(
-		binding, "mop-"+runID+"-cas-base", "mem-"+runID+"-cas", protocol.MutationKindCreate, 1, 0, "",
-		&protocol.MutationState{
-			Content:  "concurrent CAS base",
-			Tags:     []string{"cas"},
-			Metadata: map[string]string{"run": runID},
-		},
+func verifyConcurrentCAS(
+	ctx context.Context,
+	client *contractClient,
+	binding protocol.Binding,
+	fixtures fixturePlan,
+) error {
+	base, err := fixtures.mutation(
+		binding,
+		fixtureRoleCASBase,
+		fixtures.memoryID(fixtureRoleCASBase),
+		protocol.MutationKindCreate,
+		1,
+		0,
+		"",
+		fixtures.state("d"),
 	)
 	if err != nil {
 		return err
@@ -1134,14 +1465,22 @@ func verifyConcurrentCAS(ctx context.Context, client *contractClient, binding pr
 		return err
 	}
 	replacements := make([]protocol.MutationEnvelope, 2)
-	for index, side := range []string{"left", "right"} {
-		replacements[index], err = makeMutation(
-			binding, "mop-"+runID+"-cas-"+side, base.MemoryID, protocol.MutationKindReplace, 2, 1, baseReceipt.BackendVersion,
-			&protocol.MutationState{
-				Content:  "concurrent CAS " + side,
-				Tags:     []string{"cas", side},
-				Metadata: map[string]string{"run": runID},
-			},
+	for index, replacement := range []struct {
+		role    string
+		content string
+	}{
+		{role: fixtureRoleCASLeft, content: "e"},
+		{role: fixtureRoleCASRight, content: "f"},
+	} {
+		replacements[index], err = fixtures.mutation(
+			binding,
+			replacement.role,
+			base.MemoryID,
+			protocol.MutationKindReplace,
+			2,
+			1,
+			baseReceipt.BackendVersion,
+			fixtures.state(replacement.content),
 		)
 		if err != nil {
 			return err
@@ -1229,6 +1568,11 @@ func mutation(
 	request protocol.MutationEnvelope,
 	expectedResult string,
 ) (protocol.MutationReceipt, []byte, error) {
+	if client.limitsConfigured {
+		if err := validateFixtureMutation(client.limits, &request); err != nil {
+			return protocol.MutationReceipt{}, nil, err
+		}
+	}
 	body, status, err := client.postJSON(ctx, protocol.PathMutations, request)
 	if err != nil {
 		return protocol.MutationReceipt{}, nil, err
@@ -1326,6 +1670,11 @@ func search(
 	client *contractClient,
 	request protocol.SearchRequest,
 ) (*protocol.SearchResponse, error) {
+	if client.limitsConfigured {
+		if err := validateFixtureSearch(client.limits, &request); err != nil {
+			return nil, fmt.Errorf("search fixture exceeds advertised limits: %w", err)
+		}
+	}
 	body, status, err := client.postJSON(ctx, protocol.PathSearch, request)
 	if err != nil {
 		return nil, err
@@ -1359,13 +1708,6 @@ func search(
 	return response, nil
 }
 
-func paginationFixtureRequest(binding protocol.Binding, query string, maxPageSize int) protocol.SearchRequest {
-	return protocol.SearchRequest{
-		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword,
-		Query: query, PageSize: min(2, maxPageSize), PageToken: "",
-	}
-}
-
 func nextPageTokenFollows(current, next string) bool {
 	currentParts := strings.Split(current, ".")
 	nextParts := strings.Split(next, ".")
@@ -1384,13 +1726,12 @@ func verifySearchModeCapabilities(
 	ctx context.Context,
 	client *contractClient,
 	binding protocol.Binding,
-	query string,
 	capabilities protocol.Capabilities,
-	pageSize int,
+	fixtures fixturePlan,
 ) error {
-	autoRequest := protocol.SearchRequest{
-		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeAuto,
-		Query: query, PageSize: pageSize, PageToken: "",
+	autoRequest, err := fixtures.searchRequest(binding, protocol.SearchModeAuto)
+	if err != nil {
+		return err
 	}
 	auto, err := consumeSearchProbe(ctx, client, autoRequest)
 	if err != nil {
@@ -1407,9 +1748,9 @@ func verifySearchModeCapabilities(
 		{mode: protocol.SearchModeSemantic, advertised: capabilities.SemanticSearch},
 		{mode: protocol.SearchModeHybrid, advertised: capabilities.HybridSearch},
 	} {
-		request := protocol.SearchRequest{
-			ProtocolVersion: protocol.Version, Binding: binding, Mode: probe.mode,
-			Query: query, PageSize: pageSize, PageToken: "",
+		request, requestErr := fixtures.searchRequest(binding, probe.mode)
+		if requestErr != nil {
+			return requestErr
 		}
 		if probe.advertised {
 			if _, err := consumeSearchProbe(ctx, client, request); err != nil {
@@ -1418,7 +1759,7 @@ func verifySearchModeCapabilities(
 			continue
 		}
 
-		body, err := json.Marshal(request)
+		body, err := client.marshalJSONRequest("explicit "+probe.mode+" search", request)
 		if err != nil {
 			return err
 		}

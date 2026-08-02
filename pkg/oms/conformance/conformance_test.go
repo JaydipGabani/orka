@@ -15,6 +15,147 @@ import (
 
 const validTestCase = "valid"
 
+func testCapabilityLimits() protocol.CapabilityLimits {
+	return protocol.CapabilityLimits{
+		MaxRequestBytes:       protocol.MaxHTTPBodyBytes,
+		MaxResponseBytes:      protocol.MaxAdapterResponseBytes,
+		MaxContentBytes:       protocol.MaxContentBytes,
+		MaxTags:               protocol.MaxTags,
+		MaxTagBytes:           protocol.MaxTagBytes,
+		MaxMetadataEntries:    protocol.MaxMetadataEntries,
+		MaxMetadataKeyBytes:   protocol.MaxMetadataKeyBytes,
+		MaxMetadataValueBytes: protocol.MaxMetadataValueBytes,
+		MaxQueryBytes:         protocol.MaxQueryBytes,
+		MaxPageSize:           protocol.MaxPageSize,
+		MaxSnapshotRecords:    protocol.MaxSnapshotRecords,
+		SnapshotTTLSeconds:    60,
+	}
+}
+
+func requireFixturePlan(t *testing.T, runID string, limits protocol.CapabilityLimits) fixturePlan {
+	t.Helper()
+	fixtures, err := newFixturePlan(runID, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fixtures
+}
+
+func TestFixturePlanRespectsSmallAdvertisedStateLimits(t *testing.T) {
+	limits := testCapabilityLimits()
+	limits.MaxContentBytes = 17
+	limits.MaxTags = 1
+	limits.MaxTagBytes = 1
+	limits.MaxMetadataEntries = 1
+	limits.MaxMetadataKeyBytes = 1
+	limits.MaxMetadataValueBytes = 1
+	limits.MaxQueryBytes = 17
+	limits.MaxPageSize = 1
+	limits.MaxSnapshotRecords = 2
+
+	fixtures := requireFixturePlan(t, "small-limits", limits)
+	request, err := fixtures.searchRequest(DefaultBinding(), protocol.SearchModeKeyword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Query) != 17 || request.PageSize != 1 {
+		t.Fatalf("search fixture query bytes/pageSize = %d/%d, want 17/1", len(request.Query), request.PageSize)
+	}
+
+	mutation, err := fixtures.mutation(
+		DefaultBinding(),
+		fixtureRoleMain,
+		fixtures.memoryID(fixtureRoleMain),
+		protocol.MutationKindCreate,
+		1,
+		0,
+		"",
+		fixtures.state(request.Query),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutation.State == nil {
+		t.Fatal("mutation fixture omitted state")
+	}
+	if len(mutation.State.Content) != 17 || len(mutation.State.Tags) != 1 || len(mutation.State.Metadata) != 1 {
+		t.Fatalf(
+			"mutation fixture content bytes/tags/metadata = %d/%d/%d, want 17/1/1",
+			len(mutation.State.Content),
+			len(mutation.State.Tags),
+			len(mutation.State.Metadata),
+		)
+	}
+	for _, tag := range mutation.State.Tags {
+		if len(tag) > limits.MaxTagBytes {
+			t.Fatalf("tag uses %d bytes, maxTagBytes=%d", len(tag), limits.MaxTagBytes)
+		}
+	}
+	for key, value := range mutation.State.Metadata {
+		if len(key) > limits.MaxMetadataKeyBytes || len(value) > limits.MaxMetadataValueBytes {
+			t.Fatalf(
+				"metadata key/value bytes = %d/%d, limits %d/%d",
+				len(key),
+				len(value),
+				limits.MaxMetadataKeyBytes,
+				limits.MaxMetadataValueBytes,
+			)
+		}
+	}
+}
+
+func TestFixturePlanRejectsQueryLimitsWithoutRunIsolation(t *testing.T) {
+	limits := testCapabilityLimits()
+	limits.MaxContentBytes = 1
+	limits.MaxQueryBytes = 1
+	limits.MaxSnapshotRecords = 2
+	_, err := newFixturePlan("small-query", limits)
+	if err == nil || !strings.Contains(err.Error(), "run isolation") {
+		t.Fatalf("newFixturePlan() error = %v, want precise run-isolation incompatibility", err)
+	}
+}
+
+func TestContractClientEnforcesAdvertisedMaxRequestBytesBeforeSending(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests++
+		writeConformanceJSON(writer, http.StatusOK, map[string]bool{"ok": true})
+	}))
+	t.Cleanup(server.Close)
+	client, err := newContractClient(Target{
+		BaseURL: server.URL, AuthorizationValue: testAuthorizationToken,
+		HTTPClient: server.Client(), InsecureLoopbackOnly: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.SearchRequest{
+		ProtocolVersion: protocol.Version, Binding: DefaultBinding(), Mode: protocol.SearchModeKeyword,
+		Query: "q", PageSize: 1, PageToken: "",
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := testCapabilityLimits()
+	limits.MaxRequestBytes = len(body)
+	client.configureLimits(limits)
+	if _, _, err := client.postJSON(context.Background(), protocol.PathSearch, request); err != nil {
+		t.Fatalf("request at advertised bound failed: %v", err)
+	}
+
+	limits.MaxRequestBytes--
+	client.configureLimits(limits)
+	if _, _, err := client.postJSON(context.Background(), protocol.PathSearch, request); err == nil {
+		t.Fatal("request above advertised maxRequestBytes was sent")
+	} else if !strings.Contains(err.Error(), "maxRequestBytes") {
+		t.Fatalf("request bound error = %q, want maxRequestBytes context", err)
+	}
+	if requests != 1 {
+		t.Fatalf("server received %d requests, want only the exactly bounded request", requests)
+	}
+}
+
 func TestSanitizeCheckResultRedactsConfiguredValue(t *testing.T) {
 	sensitiveValue := "marker-" + "value"
 	result := CheckResult{
@@ -55,7 +196,7 @@ func TestSearchRejectsRequestSpecificResponseViolations(t *testing.T) {
 			Tags: []string{}, Metadata: map[string]string{}, UpdatedAt: now,
 		}
 	}
-	firstToken := "oms-page-v1.0123456789abcdef0123456789abcdef.1"
+	const firstToken = "oms-page-v1.0123456789abcdef0123456789abcdef.1"
 	baseRequest := protocol.SearchRequest{
 		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword,
 		Query: "", PageSize: 1, PageToken: "",
@@ -228,7 +369,10 @@ func TestVerifyAuthenticationRequiresExactUnauthorizedVariant(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = verifyAuthentication(context.Background(), client, storeBinding, "conformance-store", binding)
+			fixtures := requireFixturePlan(t, "authentication", testCapabilityLimits())
+			err = verifyAuthentication(
+				context.Background(), client, storeBinding, "conformance-store", binding, fixtures,
+			)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("verifyAuthentication() error = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -316,9 +460,8 @@ func TestVerifySearchModeCapabilitiesFollowsAdvertisement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = verifySearchModeCapabilities(
-				context.Background(), client, binding, "conformance-query", tc.capabilities, protocol.MaxPageSize,
-			)
+			fixtures := requireFixturePlan(t, "search-modes", testCapabilityLimits())
+			err = verifySearchModeCapabilities(context.Background(), client, binding, tc.capabilities, fixtures)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("verifySearchModeCapabilities() error = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -392,9 +535,10 @@ func TestVerifySearchModeCapabilitiesConsumesEveryContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := verifySearchModeCapabilities(
-		context.Background(), client, binding, "conformance-query", capabilities, 1,
-	); err != nil {
+	limits := testCapabilityLimits()
+	limits.MaxPageSize = 1
+	fixtures := requireFixturePlan(t, "search-continuations", limits)
+	if err := verifySearchModeCapabilities(context.Background(), client, binding, capabilities, fixtures); err != nil {
 		t.Fatalf("verifySearchModeCapabilities(): %v", err)
 	}
 	mutex.Lock()
@@ -404,18 +548,14 @@ func TestVerifySearchModeCapabilitiesConsumesEveryContinuation(t *testing.T) {
 	}
 }
 
-func TestPaginationFixtureRespectsAdvertisedPageSizeAndSpansPages(t *testing.T) {
+func TestPaginationFixtureSupportsAdvertisedTwoRecordSnapshotAcrossPages(t *testing.T) {
 	binding := DefaultBinding()
 	expiresAt := time.Now().UTC().Add(time.Minute)
 	records := []protocol.MemoryRecord{
 		conformanceRecord(binding, "mem-page-a", "page a", 1),
 		conformanceRecord(binding, "mem-page-b", "page b", 2),
-		conformanceRecord(binding, "mem-page-c", "page c", 3),
 	}
-	tokens := []string{
-		"oms-page-v1.0123456789abcdef0123456789abcdef.1",
-		"oms-page-v1.0123456789abcdef0123456789abcdef.2",
-	}
+	token := "oms-page-v1.0123456789abcdef0123456789abcdef.1"
 	var mutex sync.Mutex
 	var requests []protocol.SearchRequest
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -446,14 +586,10 @@ func TestPaginationFixtureRespectsAdvertisedPageSizeAndSpansPages(t *testing.T) 
 		switch searchRequest.PageToken {
 		case "":
 			response.Records = []protocol.MemoryRecord{records[0]}
-			response.NextPageToken = tokens[0]
+			response.NextPageToken = token
 			response.Exhausted = false
-		case tokens[0]:
+		case token:
 			response.Records = []protocol.MemoryRecord{records[1]}
-			response.NextPageToken = tokens[1]
-			response.Exhausted = false
-		case tokens[1]:
-			response.Records = []protocol.MemoryRecord{records[2]}
 			response.Exhausted = true
 		default:
 			writeConformanceJSON(writer, http.StatusBadRequest, protocol.ErrorResponse{
@@ -473,7 +609,15 @@ func TestPaginationFixtureRespectsAdvertisedPageSizeAndSpansPages(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	request := paginationFixtureRequest(binding, "conformance-query", 1)
+	limits := testCapabilityLimits()
+	limits.MaxPageSize = 1
+	limits.MaxSnapshotRecords = 2
+	fixtures := requireFixturePlan(t, "pagination", limits)
+	client.configureLimits(limits)
+	request, err := fixtures.searchRequest(binding, protocol.SearchModeKeyword)
+	if err != nil {
+		t.Fatal(err)
+	}
 	first, err := search(context.Background(), client, request)
 	if err != nil {
 		t.Fatalf("search(): %v", err)
