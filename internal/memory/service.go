@@ -51,6 +51,9 @@ type Service struct {
 	Dispatcher   *Dispatcher
 	Now          func() time.Time
 	ContentLimit int
+
+	legacyCursorMu sync.Mutex
+	legacyCursors  map[string]store.MemorySearchCursorState
 }
 
 type legacyMemoryGovernanceStore interface {
@@ -1650,25 +1653,7 @@ func (s *Service) search(
 	if err := validateRemoteSearchQueryLimit(authority, request.Query); err != nil {
 		return nil, err
 	}
-	queryDigest := digestJSON(struct {
-		Query           string              `json:"query"`
-		Tags            []string            `json:"tags"`
-		IDs             []string            `json:"ids"`
-		Sources         []string            `json:"sources"`
-		Trust           []store.MemoryTrust `json:"trust"`
-		SessionName     string              `json:"sessionName"`
-		TaskName        string              `json:"taskName"`
-		ParentTask      string              `json:"parentTask"`
-		AgentName       string              `json:"agentName"`
-		Mode            string              `json:"mode"`
-		IncludeDisabled bool                `json:"includeDisabled"`
-		IncludeDeleted  bool                `json:"includeDeleted"`
-	}{
-		Query: request.Query, Tags: request.Tags, IDs: request.IDs,
-		Sources: request.Sources, Trust: request.Trust, SessionName: request.SessionName,
-		TaskName: request.TaskName, ParentTask: request.ParentTask, AgentName: request.AgentName,
-		Mode: mode, IncludeDisabled: request.IncludeDisabled, IncludeDeleted: request.IncludeDeleted,
-	})
+	queryDigest := memorySearchQueryDigest(request, mode)
 	cursorState, replayPageToken, snapshotExpiresAt, tombstones, err := loadRemoteSearchContinuation(
 		ctx, s.Governed, authority.Binding, queryDigest, request.Cursor, s.now(),
 	)
@@ -1974,11 +1959,75 @@ func (s *Service) searchLegacy(
 	mode string,
 ) (*SearchResponse, error) {
 	if mode == protocol.SearchModeSemantic || mode == protocol.SearchModeHybrid {
-		return nil, apierror.New(http.StatusUnprocessableEntity, ReasonSearchModeUnsupported, "memory search mode is unsupported")
+		return nil, apierror.New(http.StatusUnprocessableEntity, protocol.ErrorCodeSearchModeUnsupported,
+			"memory search mode is unavailable for the legacy backend")
 	}
 	if s.Legacy == nil {
 		return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
 	}
+	request.Query = strings.TrimSpace(redact.SensitiveText(request.Query))
+	queryDigest := memorySearchQueryDigest(request, protocol.SearchModeKeyword)
+	cursorStore := s.legacySearchCursorStore()
+	cursor, err := loadLegacySearchCursor(ctx, cursorStore, authority, queryDigest, request.Cursor, s.now())
+	if err != nil {
+		if errors.Is(err, errLegacySearchCursorInvalid) || errors.Is(err, store.ErrNotFound) {
+			return nil, apierror.New(http.StatusBadRequest, "", "invalid or expired memory search cursor")
+		}
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"legacy memory search cursor state is unavailable")
+	}
+	pageSize := boundedMemoryLimit(request.Limit)
+	if cursor.PageSize > 0 {
+		pageSize = min(pageSize, cursor.PageSize)
+	}
+	candidates, capped, err := s.listLegacySearchCandidates(ctx, namespace, request, cursor)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]SearchHit, 0, pageSize)
+	scanned := 0
+	var lastScanned store.Memory
+	for i := range candidates {
+		scanned++
+		lastScanned = candidates[i]
+		memory := candidates[i]
+		if err := s.applyLegacyGovernance(ctx, authority, &memory); err != nil {
+			return nil, err
+		}
+		if memoryMatchesSearchRequest(memory, request) {
+			items = append(items, SearchHit{Memory: memory})
+			if len(items) == pageSize {
+				break
+			}
+		}
+	}
+	hasMore := scanned < len(candidates) || capped
+	complete := !hasMore || len(items) >= pageSize
+	if !complete && !request.AllowIncomplete {
+		return nil, legacySearchIncompleteError("")
+	}
+	next := ""
+	if hasMore && scanned > 0 {
+		cursor.PageSize = max(cursor.PageSize, pageSize)
+		cursor.BeforeUpdatedAt = lastScanned.UpdatedAt.UTC()
+		cursor.BeforeID = lastScanned.ID
+		next, err = saveLegacySearchCursor(ctx, cursorStore, authority, queryDigest, cursor, s.now())
+		if err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+				"legacy memory search continuation could not be preserved")
+		}
+	}
+	return &SearchResponse{
+		Items: items, ActualMode: protocol.SearchModeKeyword, Cursor: next, Exhausted: !hasMore, Complete: complete,
+	}, nil
+}
+
+func (s *Service) listLegacySearchCandidates(
+	ctx context.Context,
+	namespace string,
+	request SearchRequest,
+	cursor legacySearchCursor,
+) ([]store.Memory, bool, error) {
 	filter := store.MemoryFilter{
 		Namespace: namespace, Query: request.Query, SessionName: request.SessionName,
 		AgentName: request.AgentName, TaskName: request.TaskName, ParentTask: request.ParentTask,
@@ -1986,61 +2035,86 @@ func (s *Service) searchLegacy(
 		IncludeDisabled: request.IncludeDisabled, IncludeDeleted: request.IncludeDeleted,
 		Limit: maxRemoteCatalogLimit,
 	}
-	target := boundedMemoryLimit(request.Limit)
+	if !cursor.BeforeUpdatedAt.IsZero() {
+		before := cursor.BeforeUpdatedAt.UTC()
+		filter.BeforeUpdatedAt = &before
+		filter.BeforeID = cursor.BeforeID
+	}
 	var memories []store.Memory
-	var err error
 	capped := false
 	if len(request.Sources) <= 1 {
 		if len(request.Sources) == 1 {
 			filter.Source = request.Sources[0]
 		}
-		memories, err = s.Legacy.ListMemories(ctx, filter)
+		listed, err := s.Legacy.ListMemories(ctx, filter)
 		if err != nil {
-			return nil, mapStoreError(err)
+			return nil, false, mapStoreError(err)
 		}
-		capped = len(memories) >= maxRemoteCatalogLimit
-	} else {
-		seen := make(map[string]struct{})
-		for _, source := range request.Sources {
-			filter.Source = source
-			batch, listErr := s.Legacy.ListMemories(ctx, filter)
-			if listErr != nil {
-				return nil, mapStoreError(listErr)
+		return listed, len(listed) >= maxRemoteCatalogLimit, nil
+	}
+	seen := make(map[string]struct{})
+	for _, source := range request.Sources {
+		filter.Source = source
+		batch, err := s.Legacy.ListMemories(ctx, filter)
+		if err != nil {
+			return nil, false, mapStoreError(err)
+		}
+		if len(batch) >= maxRemoteCatalogLimit {
+			capped = true
+		}
+		for _, memory := range batch {
+			if _, ok := seen[memory.ID]; ok {
+				continue
 			}
-			if len(batch) >= maxRemoteCatalogLimit {
-				capped = true
-			}
-			for _, memory := range batch {
-				if _, ok := seen[memory.ID]; ok {
-					continue
-				}
-				seen[memory.ID] = struct{}{}
-				memories = append(memories, memory)
-			}
+			seen[memory.ID] = struct{}{}
+			memories = append(memories, memory)
 		}
 	}
-	items := make([]SearchHit, 0, min(len(memories), target))
-	for _, memory := range memories {
-		if overlayErr := s.applyLegacyGovernance(ctx, authority, &memory); overlayErr != nil {
-			return nil, overlayErr
+	slices.SortFunc(memories, func(a, b store.Memory) int {
+		if a.UpdatedAt.After(b.UpdatedAt) {
+			return -1
 		}
-		if !memoryMatchesSearchRequest(memory, request) {
-			continue
+		if a.UpdatedAt.Before(b.UpdatedAt) {
+			return 1
 		}
-		items = append(items, SearchHit{Memory: memory})
-		if len(items) == target {
-			break
-		}
+		return strings.Compare(b.ID, a.ID)
+	})
+	if len(memories) > maxRemoteCatalogLimit {
+		memories = memories[:maxRemoteCatalogLimit]
+		capped = true
 	}
-	incomplete := capped && len(items) < target
-	if incomplete && !request.AllowIncomplete {
-		memoryIncompleteTotal.Inc()
-		return nil, &IncompleteSearchError{Cause: apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
-			"legacy memory search reached its pre-filter scan cap and cannot prove completeness")}
+	return memories, capped, nil
+}
+
+func legacySearchIncompleteError(cursor string) error {
+	memoryIncompleteTotal.Inc()
+	return &IncompleteSearchError{
+		Cause: apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+			"legacy memory search reached its pre-filter scan cap and cannot prove completeness"),
+		Cursor: cursor,
 	}
-	return &SearchResponse{
-		Items: items, ActualMode: protocol.SearchModeKeyword, Exhausted: !capped, Complete: !incomplete,
-	}, nil
+}
+
+func memorySearchQueryDigest(request SearchRequest, mode string) string {
+	return digestJSON(struct {
+		Query           string              `json:"query"`
+		Tags            []string            `json:"tags"`
+		IDs             []string            `json:"ids"`
+		Sources         []string            `json:"sources"`
+		Trust           []store.MemoryTrust `json:"trust"`
+		SessionName     string              `json:"sessionName"`
+		TaskName        string              `json:"taskName"`
+		ParentTask      string              `json:"parentTask"`
+		AgentName       string              `json:"agentName"`
+		Mode            string              `json:"mode"`
+		IncludeDisabled bool                `json:"includeDisabled"`
+		IncludeDeleted  bool                `json:"includeDeleted"`
+	}{
+		Query: request.Query, Tags: request.Tags, IDs: request.IDs,
+		Sources: request.Sources, Trust: request.Trust, SessionName: request.SessionName,
+		TaskName: request.TaskName, ParentTask: request.ParentTask, AgentName: request.AgentName,
+		Mode: mode, IncludeDisabled: request.IncludeDisabled, IncludeDeleted: request.IncludeDeleted,
+	})
 }
 
 func (s *Service) applyLegacyGovernanceFilter(

@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -54,6 +55,109 @@ func TestServiceLegacyCreatePreservesSynchronousBehavior(t *testing.T) {
 	}
 	if result.Memory.Trust != store.MemoryTrustUntrusted || len(result.Memory.Tags) != 1 || result.Memory.Tags[0] != "storage" {
 		t.Fatalf("memory = %#v", result.Memory)
+	}
+}
+
+func TestServiceLegacySearchPaginatesWithOpaqueCursor(t *testing.T) {
+	storeImpl := newMemoryTestStore(t)
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	for i := 1; i <= 3; i++ {
+		memory := &store.Memory{
+			ID: fmt.Sprintf("mem-legacy-page-%d", i), Namespace: "team-a",
+			Content: "legacy pagination", Source: "test",
+			CreatedAt: now.Add(time.Duration(i) * time.Second), UpdatedAt: now.Add(time.Duration(i) * time.Second),
+		}
+		if err := storeImpl.CreateMemory(t.Context(), memory); err != nil {
+			t.Fatal(err)
+		}
+	}
+	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
+	service := &Service{
+		Legacy: storeImpl, Governed: storeImpl, Resolver: staticAuthorityResolver{authority: authority},
+		Now: func() time.Time { return now },
+	}
+	request := SearchRequest{Query: "legacy", Limit: 1, Mode: protocol.SearchModeKeyword}
+	searchContext := SearchContext{PreserveEmptyTrust: true}
+	seen := make(map[string]struct{})
+	pages := make([]*SearchResponse, 0, 3)
+	for range 3 {
+		page, err := service.Search(t.Context(), authority.Namespace, request, searchContext)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Items) != 1 || page.Complete != true {
+			t.Fatalf("legacy page = %#v", page)
+		}
+		if _, duplicate := seen[page.Items[0].Memory.ID]; duplicate {
+			t.Fatalf("legacy pagination repeated %q", page.Items[0].Memory.ID)
+		}
+		seen[page.Items[0].Memory.ID] = struct{}{}
+		pages = append(pages, page)
+		request.Cursor = page.Cursor
+		if len(pages) == 1 {
+			if err := storeImpl.DeleteMemory(t.Context(), authority.Namespace, page.Items[0].Memory.ID); err != nil {
+				t.Fatal(err)
+			}
+			inserted := &store.Memory{
+				ID: "mem-legacy-page-inserted", Namespace: authority.Namespace,
+				Content: "legacy pagination", Source: "test",
+				CreatedAt: now.Add(10 * time.Second), UpdatedAt: now.Add(10 * time.Second),
+			}
+			if err := storeImpl.CreateMemory(t.Context(), inserted); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if len(seen) != 3 || !pages[2].Exhausted || pages[2].Cursor != "" ||
+		pages[0].Exhausted || pages[0].Cursor == "" || pages[1].Exhausted || pages[1].Cursor == "" {
+		t.Fatalf("legacy pagination pages = %#v", pages)
+	}
+	if _, included := seen["mem-legacy-page-inserted"]; included {
+		t.Fatal("legacy continuation included a record created after the first page")
+	}
+	replayRequest := SearchRequest{Query: "legacy", Limit: 1, Mode: protocol.SearchModeKeyword, Cursor: pages[0].Cursor}
+	replayed, err := service.Search(t.Context(), authority.Namespace, replayRequest, searchContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed.Items) != 1 || replayed.Items[0].Memory.ID != pages[1].Items[0].Memory.ID {
+		t.Fatalf("legacy cursor replay = %#v, want %#v", replayed, pages[1])
+	}
+	replayRequest.Query = "different"
+	if _, err := service.Search(t.Context(), authority.Namespace, replayRequest, searchContext); err == nil {
+		t.Fatal("legacy cursor was accepted for a different query")
+	}
+}
+
+func TestServiceLegacySearchContinuationHonorsSmallerLimit(t *testing.T) {
+	storeImpl := newMemoryTestStore(t)
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	for i := 1; i <= 4; i++ {
+		memory := &store.Memory{
+			ID: fmt.Sprintf("mem-legacy-limit-%d", i), Namespace: "team-a",
+			Content: "legacy limit", Source: "test",
+			CreatedAt: now.Add(time.Duration(i) * time.Second), UpdatedAt: now.Add(time.Duration(i) * time.Second),
+		}
+		if err := storeImpl.CreateMemory(t.Context(), memory); err != nil {
+			t.Fatal(err)
+		}
+	}
+	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
+	service := &Service{
+		Legacy: storeImpl, Governed: storeImpl, Resolver: staticAuthorityResolver{authority: authority},
+		Now: func() time.Time { return now },
+	}
+	first, err := service.Search(t.Context(), authority.Namespace, SearchRequest{
+		Query: "legacy", Limit: 2, Mode: protocol.SearchModeKeyword,
+	}, SearchContext{PreserveEmptyTrust: true})
+	if err != nil || len(first.Items) != 2 || first.Cursor == "" {
+		t.Fatalf("first page = %#v, %v", first, err)
+	}
+	second, err := service.Search(t.Context(), authority.Namespace, SearchRequest{
+		Query: "legacy", Limit: 1, Mode: protocol.SearchModeKeyword, Cursor: first.Cursor,
+	}, SearchContext{PreserveEmptyTrust: true})
+	if err != nil || len(second.Items) != 1 {
+		t.Fatalf("smaller continuation page = %#v, %v", second, err)
 	}
 }
 

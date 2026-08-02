@@ -271,8 +271,8 @@ func TestRecallMemoryToolPaginatesResponsesBeyondBodyLimit(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatal(err)
 		}
-		if request.Limit != maxRecallMemoryToolPageLimit {
-			t.Fatalf("page limit = %d, want %d", request.Limit, maxRecallMemoryToolPageLimit)
+		if request.Limit <= 0 || request.Limit > maxRecallMemoryToolPageLimit {
+			t.Fatalf("page limit = %d, want 1..%d", request.Limit, maxRecallMemoryToolPageLimit)
 		}
 		index := 0
 		if request.Cursor != "" {
@@ -282,16 +282,21 @@ func TestRecallMemoryToolPaginatesResponsesBeyondBodyLimit(t *testing.T) {
 			}
 			index = parsed
 		}
-		exhausted := index+1 >= total
+		count := min(request.Limit, total-index)
+		exhausted := index+count >= total
 		next := ""
 		if !exhausted {
-			next = strconv.Itoa(index + 1)
+			next = strconv.Itoa(index + count)
+		}
+		items := make([]any, 0, count)
+		for itemIndex := index; itemIndex < index+count; itemIndex++ {
+			items = append(items, map[string]any{"memory": map[string]any{
+				"id": "memory-" + strconv.Itoa(itemIndex), "content": content,
+			}})
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(map[string]any{
-			"items": []any{map[string]any{"memory": map[string]any{
-				"id": "memory-" + strconv.Itoa(index), "content": content,
-			}}},
+			"items":  items,
 			"cursor": next, "actualMode": "keyword", "exhausted": exhausted, "complete": true,
 		}); err != nil {
 			t.Fatal(err)
@@ -313,8 +318,9 @@ func TestRecallMemoryToolPaginatesResponsesBeyondBodyLimit(t *testing.T) {
 	if err := json.Unmarshal([]byte(result), &memories); err != nil {
 		t.Fatalf("decode result: %v", err)
 	}
-	if len(memories) != total || requests.Load() != total {
-		t.Fatalf("memories/requests = %d/%d, want %d/%d", len(memories), requests.Load(), total, total)
+	wantRequests := int32((total + maxRecallMemoryToolPageLimit - 1) / maxRecallMemoryToolPageLimit)
+	if len(memories) != total || requests.Load() != wantRequests {
+		t.Fatalf("memories/requests = %d/%d, want %d/%d", len(memories), requests.Load(), total, wantRequests)
 	}
 }
 

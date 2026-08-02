@@ -121,6 +121,8 @@ type MemoryFilter struct {
 	IncludeDeleted  bool
 	Limit           int
 	Cursor          string
+	BeforeUpdatedAt *time.Time
+	BeforeID        string
 }
 
 // TranscriptSearchFilter constrains transcript-backed recall/search.

@@ -3,6 +3,7 @@ package referenceadapter
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -209,9 +210,8 @@ func TestReferenceAdapterTerminalContinuationReleasesStableSnapshot(t *testing.T
 
 	nextPage := first.NextPageToken
 	search.PageToken = nextPage
-	last, err := protocol.DecodeSearchResponse(postTestJSON(
-		t, httpServer.Client(), httpServer.URL+protocol.PathSearch, search,
-	))
+	terminalBody := postTestJSON(t, httpServer.Client(), httpServer.URL+protocol.PathSearch, search)
+	last, err := protocol.DecodeSearchResponse(terminalBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,14 +219,92 @@ func TestReferenceAdapterTerminalContinuationReleasesStableSnapshot(t *testing.T
 		last.Records[0].Content != "original-3" || !last.Exhausted || last.NextPageToken != "" {
 		t.Fatalf("terminal page = %#v", last)
 	}
-	var snapshots, entries int
+	var snapshots, terminalSnapshots, activeSnapshots, entries int
 	if err := adapter.db.db.QueryRow(`SELECT
-		(SELECT COUNT(*) FROM pagination_snapshots),
-		(SELECT COUNT(*) FROM pagination_entries)`).Scan(&snapshots, &entries); err != nil {
+			(SELECT COUNT(*) FROM pagination_snapshots),
+			(SELECT COUNT(*) FROM pagination_snapshots WHERE terminal = 1),
+			(SELECT COUNT(*) FROM pagination_snapshots WHERE terminal = 0),
+			(SELECT COUNT(*) FROM pagination_entries)`).Scan(
+		&snapshots, &terminalSnapshots, &activeSnapshots, &entries,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if snapshots != 0 || entries != 0 {
-		t.Fatalf("terminal continuation retained snapshots=%d entries=%d", snapshots, entries)
+	if snapshots != 1 || terminalSnapshots != 1 || activeSnapshots != 0 || entries != 3 {
+		t.Fatalf("terminal continuation state snapshots=%d terminal=%d active=%d entries=%d",
+			snapshots, terminalSnapshots, activeSnapshots, entries)
+	}
+	tx, err := adapter.db.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSearchSnapshotCountCapacityInTx(t.Context(), tx, protocol.AuthorityDigest(binding)); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("terminal replay snapshot consumed active quota: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if replay := postTestJSON(t, httpServer.Client(), httpServer.URL+protocol.PathSearch, search); !bytes.Equal(replay, terminalBody) {
+		t.Fatalf("terminal page replay changed response: got %s want %s", replay, terminalBody)
+	}
+}
+
+func TestReferenceAdapterUpgradesV1PaginationSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oms.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE oms_schema (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)`,
+		`INSERT INTO oms_schema(id, version) VALUES(1, 1)`,
+		`CREATE TABLE pagination_snapshots (
+			snapshot_id TEXT PRIMARY KEY,
+			authority_digest TEXT NOT NULL,
+			request_fingerprint TEXT NOT NULL,
+			requested_mode TEXT NOT NULL,
+			actual_mode TEXT NOT NULL,
+			page_size INTEGER NOT NULL,
+			entry_count INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL
+		)`,
+	} {
+		if _, err := legacy.Exec(statement); err != nil {
+			_ = legacy.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := openDatabase(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.close() })
+	var version int
+	if err := db.db.QueryRow(`SELECT version FROM oms_schema WHERE id = 1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
+	}
+	now := time.Now().UTC()
+	if _, err := db.db.Exec(`INSERT INTO pagination_snapshots(
+		snapshot_id, authority_digest, request_fingerprint, requested_mode, actual_mode,
+		page_size, entry_count, created_at, expires_at
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, "legacy-snapshot", "authority", "fingerprint",
+		protocol.SearchModeKeyword, protocol.SearchModeKeyword, 1, 0, formatTime(now), formatTime(now.Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	var terminal int
+	if err := db.db.QueryRow(`SELECT terminal FROM pagination_snapshots WHERE snapshot_id = ?`, "legacy-snapshot").Scan(&terminal); err != nil {
+		t.Fatal(err)
+	}
+	if terminal != 0 {
+		t.Fatalf("migrated terminal state = %d, want 0", terminal)
 	}
 }
 
@@ -280,6 +358,49 @@ func TestReferenceAdapterGlobalSearchSnapshotQuota(t *testing.T) {
 	defer tx.Rollback() //nolint:errcheck
 	if err := ensureSearchSnapshotCountCapacityInTx(context.Background(), tx, "new-authority"); !errors.Is(err, errSnapshotCapacity) {
 		t.Fatalf("global snapshot admission error = %v, want %v", err, errSnapshotCapacity)
+	}
+}
+
+func TestReferenceAdapterReplaySearchSnapshotQuota(t *testing.T) {
+	adapter := openTestAdapter(t, filepath.Join(t.TempDir(), "oms.db"))
+	now := time.Now().UTC()
+	insertSnapshot := func(id, authority string, terminal int) {
+		t.Helper()
+		_, err := adapter.db.db.Exec(`INSERT INTO pagination_snapshots(
+			snapshot_id, authority_digest, request_fingerprint, requested_mode, actual_mode,
+			page_size, entry_count, created_at, expires_at, terminal
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, authority, "fingerprint",
+			protocol.SearchModeKeyword, protocol.SearchModeKeyword, 1, 0, formatTime(now), formatTime(now.Add(time.Hour)), terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	const retainedAuthority = "retained-authority"
+	for i := range maxRetainedSearchSnapshotsPerAuthority - 1 {
+		insertSnapshot(fmt.Sprintf("retained-authority-%d", i), retainedAuthority, 1)
+	}
+	insertSnapshot("reserved-active-authority", retainedAuthority, 0)
+	tx, err := adapter.db.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSearchSnapshotCountCapacityInTx(t.Context(), tx, retainedAuthority); !errors.Is(err, errSnapshotCapacity) {
+		_ = tx.Rollback()
+		t.Fatalf("authority replay snapshot admission error = %v, want %v", err, errSnapshotCapacity)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	for i := maxRetainedSearchSnapshotsPerAuthority; i < maxRetainedSearchSnapshotsGlobal; i++ {
+		insertSnapshot(fmt.Sprintf("retained-global-%d", i), fmt.Sprintf("retained-authority-%d", i), 1)
+	}
+	tx, err = adapter.db.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := ensureSearchSnapshotCountCapacityInTx(t.Context(), tx, "new-authority"); !errors.Is(err, errSnapshotCapacity) {
+		t.Fatalf("global replay snapshot admission error = %v, want %v", err, errSnapshotCapacity)
 	}
 }
 

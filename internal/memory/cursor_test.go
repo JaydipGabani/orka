@@ -52,3 +52,47 @@ func TestRemoteSearchCursorIsOpaqueAndBoundToQueryAndAuthority(t *testing.T) {
 		t.Fatal("cursor accepted after expiry")
 	}
 }
+
+func TestLegacySearchCursorIsBoundToNamespaceQueryAndExpiry(t *testing.T) {
+	governed := newMemoryTestStore(t)
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
+	state := legacySearchCursor{PageSize: 1, BeforeUpdatedAt: now, BeforeID: "mem-a"}
+	cursor, err := saveLegacySearchCursor(t.Context(), governed, authority, "query-a", state, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(cursor, legacySearchCursorPrefix) || strings.Contains(cursor, "mem-a") || strings.Contains(cursor, "query-a") {
+		t.Fatalf("legacy cursor was not opaque: %q", cursor)
+	}
+	decoded, err := loadLegacySearchCursor(t.Context(), governed, authority, "query-a", cursor, now.Add(time.Minute))
+	if err != nil || decoded.PageSize != 1 || !decoded.BeforeUpdatedAt.Equal(now) || decoded.BeforeID != "mem-a" {
+		t.Fatalf("decode = %#v, %v", decoded, err)
+	}
+	changed := *authority
+	changed.NamespaceUID = "namespace-b"
+	if _, err := loadLegacySearchCursor(t.Context(), governed, &changed, "query-a", cursor, now.Add(time.Minute)); err == nil {
+		t.Fatal("legacy cursor accepted a different namespace")
+	}
+	if _, err := loadLegacySearchCursor(t.Context(), governed, authority, "query-b", cursor, now.Add(time.Minute)); err == nil {
+		t.Fatal("legacy cursor accepted a different query")
+	}
+	if _, err := loadLegacySearchCursor(
+		t.Context(), governed, authority, "query-a", cursor, now.Add(remoteSearchCursorTTL+time.Second),
+	); err == nil {
+		t.Fatal("legacy cursor accepted after expiry")
+	}
+	if _, err := loadLegacySearchCursor(t.Context(), governed, authority, "query-a", legacySearchCursorPrefix+"forged", now); err == nil {
+		t.Fatal("legacy cursor accepted a forged identifier")
+	}
+	parts := strings.Split(cursor, ".")
+	parts[1] = "2"
+	if _, err := loadLegacySearchCursor(t.Context(), governed, authority, "query-a", strings.Join(parts, "."), now); err == nil {
+		t.Fatal("legacy cursor accepted a tampered offset")
+	}
+	if _, err := loadLegacySearchCursor(
+		t.Context(), governed, authority, "query-a", legacySearchCursorPrefix+strings.Repeat(".", 1024), now,
+	); err == nil {
+		t.Fatal("legacy cursor accepted an oversized value")
+	}
+}

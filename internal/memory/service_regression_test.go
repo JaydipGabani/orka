@@ -30,6 +30,7 @@ type governedSearchStore struct {
 	listCalls int
 	getErr    error
 	auditErr  error
+	cursorErr error
 	audits    []store.MemoryAuditRecord
 	cursors   map[string]store.MemorySearchCursorState
 }
@@ -94,6 +95,9 @@ func (s *governedSearchStore) GetMemorySearchCursor(
 	namespaceUID, id string,
 	now time.Time,
 ) (*store.MemorySearchCursorState, error) {
+	if s.cursorErr != nil {
+		return nil, s.cursorErr
+	}
 	cursor, ok := s.cursors[id]
 	if !ok || cursor.NamespaceUID != namespaceUID || !cursor.ExpiresAt.After(now) {
 		return nil, store.ErrNotFound
@@ -101,6 +105,24 @@ func (s *governedSearchStore) GetMemorySearchCursor(
 	copy := cursor
 	copy.State = append([]byte(nil), cursor.State...)
 	return &copy, nil
+}
+
+func (s *governedSearchStore) ListMemoryAudit(
+	_ context.Context,
+	filter store.MemoryAuditFilter,
+) ([]store.MemoryAuditRecord, error) {
+	if s.auditErr != nil {
+		return nil, s.auditErr
+	}
+	result := make([]store.MemoryAuditRecord, 0, len(s.audits))
+	for _, audit := range s.audits {
+		if filter.NamespaceUID != "" && audit.NamespaceUID != filter.NamespaceUID ||
+			filter.MemoryID != "" && audit.MemoryID != filter.MemoryID {
+			continue
+		}
+		result = append(result, audit)
+	}
+	return result, nil
 }
 
 func (s *governedSearchStore) AppendMemoryAudit(_ context.Context, audit store.MemoryAuditRecord) error {
@@ -1703,10 +1725,12 @@ func (s cappedLegacyMemoryStore) ListMemories(_ context.Context, filter store.Me
 }
 
 func TestLegacySearchReportsPreFilterCapAsIncomplete(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
 	memories := make([]store.Memory, maxRemoteCatalogLimit)
 	for i := range memories {
 		memories[i] = store.Memory{
 			ID: fmt.Sprintf("mem-%03d", i), Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustUntrusted,
+			UpdatedAt: now.Add(-time.Duration(i) * time.Second),
 		}
 	}
 	service := &Service{Legacy: cappedLegacyMemoryStore{memories: memories}}
@@ -2184,10 +2208,12 @@ func TestRemoteSearchIncludeDeletedPreservesCompletenessAcrossCatalogBudget(t *t
 }
 
 func TestLegacySearchSatisfiedPageIsCompleteAtScanCap(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
 	memories := make([]store.Memory, maxRemoteCatalogLimit)
 	for i := range memories {
 		memories[i] = store.Memory{
 			ID: fmt.Sprintf("mem-%03d", i), Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustReviewed,
+			UpdatedAt: now.Add(-time.Duration(i) * time.Second),
 		}
 	}
 	service := &Service{Legacy: cappedLegacyMemoryStore{memories: memories}}
@@ -2196,5 +2222,31 @@ func TestLegacySearchSatisfiedPageIsCompleteAtScanCap(t *testing.T) {
 	}, SearchContext{})
 	if err != nil || len(response.Items) != 100 || !response.Complete || response.Exhausted {
 		t.Fatalf("Search() response=%#v err=%v, want complete requested page with more legacy rows", response, err)
+	}
+}
+
+func TestLegacySearchCursorStoreFailureIsServerError(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	memories := []store.Memory{
+		{ID: "mem-2", Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustReviewed, UpdatedAt: now.Add(2 * time.Second)},
+		{ID: "mem-1", Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustReviewed, UpdatedAt: now.Add(time.Second)},
+	}
+	governed := newGovernedSearchStore(nil)
+	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
+	service := &Service{
+		Legacy: cappedLegacyMemoryStore{memories: memories}, Governed: governed,
+		Resolver: staticAuthorityResolver{authority: authority}, Now: func() time.Time { return now },
+	}
+	request := SearchRequest{Query: "needle", Limit: 1}
+	first, err := service.Search(t.Context(), authority.Namespace, request, SearchContext{})
+	if err != nil || first.Cursor == "" {
+		t.Fatalf("first Search() = %#v, %v", first, err)
+	}
+	governed.cursorErr = errors.New("cursor store unavailable")
+	request.Cursor = first.Cursor
+	_, err = service.Search(t.Context(), authority.Namespace, request, SearchContext{})
+	var structured *apierror.Error
+	if !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable {
+		t.Fatalf("cursor store error = %#v, want HTTP 503", err)
 	}
 }

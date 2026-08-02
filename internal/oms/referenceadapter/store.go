@@ -31,10 +31,12 @@ import (
 )
 
 const (
-	schemaVersion                        = 1
-	maxSearchSnapshotBytes               = protocol.MaxAdapterResponseBytes
-	maxActiveSearchSnapshotsPerAuthority = 8
-	maxActiveSearchSnapshotsGlobal       = 64
+	schemaVersion                          = 2
+	maxSearchSnapshotBytes                 = protocol.MaxAdapterResponseBytes
+	maxActiveSearchSnapshotsPerAuthority   = 8
+	maxActiveSearchSnapshotsGlobal         = 64
+	maxRetainedSearchSnapshotsPerAuthority = 8
+	maxRetainedSearchSnapshotsGlobal       = 64
 )
 
 var (
@@ -252,7 +254,7 @@ func (d *database) migrate(ctx context.Context) error {
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			version INTEGER NOT NULL
 		)`,
-		`INSERT INTO oms_schema(id, version) VALUES(1, 1)
+		`INSERT INTO oms_schema(id, version) VALUES(1, 2)
 			ON CONFLICT(id) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS store_resolutions (
 			tenant_id TEXT NOT NULL,
@@ -323,7 +325,8 @@ func (d *database) migrate(ctx context.Context) error {
 			page_size INTEGER NOT NULL,
 			entry_count INTEGER NOT NULL,
 			created_at TEXT NOT NULL,
-			expires_at TEXT NOT NULL
+			expires_at TEXT NOT NULL,
+			terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))
 		)`,
 		`CREATE TABLE IF NOT EXISTS pagination_entries (
 			snapshot_id TEXT NOT NULL,
@@ -343,6 +346,16 @@ func (d *database) migrate(ctx context.Context) error {
 	var version int
 	if err := tx.QueryRowContext(ctx, `SELECT version FROM oms_schema WHERE id = 1`).Scan(&version); err != nil {
 		return fmt.Errorf("read OMS schema version: %w", err)
+	}
+	if version == 1 {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE pagination_snapshots
+			ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))`); err != nil {
+			return fmt.Errorf("upgrade OMS pagination schema: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE oms_schema SET version = ? WHERE id = 1`, schemaVersion); err != nil {
+			return fmt.Errorf("record OMS schema upgrade: %w", err)
+		}
+		version = schemaVersion
 	}
 	if version != schemaVersion {
 		return fmt.Errorf("unsupported OMS schema version %d", version)
@@ -913,14 +926,21 @@ func deleteExpiredSearchSnapshotsInTx(ctx context.Context, tx *sql.Tx, now time.
 }
 
 func ensureSearchSnapshotCountCapacityInTx(ctx context.Context, tx *sql.Tx, authority string) error {
-	var globalCount, authorityCount int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*),
-		COALESCE(SUM(CASE WHEN authority_digest = ? THEN 1 ELSE 0 END), 0)
-		FROM pagination_snapshots`, authority).Scan(&globalCount, &authorityCount)
+	var activeGlobal, activeAuthority, replayGlobal, replayAuthority int
+	err := tx.QueryRowContext(ctx, `SELECT
+		COALESCE(SUM(CASE WHEN terminal = 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN terminal = 0 AND authority_digest = ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN terminal = 1 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN terminal = 1 AND authority_digest = ? THEN 1 ELSE 0 END), 0)
+		FROM pagination_snapshots`, authority, authority).Scan(
+		&activeGlobal, &activeAuthority, &replayGlobal, &replayAuthority,
+	)
 	if err != nil {
 		return err
 	}
-	if globalCount >= maxActiveSearchSnapshotsGlobal || authorityCount >= maxActiveSearchSnapshotsPerAuthority {
+	if activeGlobal >= maxActiveSearchSnapshotsGlobal || activeAuthority >= maxActiveSearchSnapshotsPerAuthority ||
+		activeGlobal+replayGlobal >= maxRetainedSearchSnapshotsGlobal ||
+		activeAuthority+replayAuthority >= maxRetainedSearchSnapshotsPerAuthority {
 		return errSnapshotCapacity
 	}
 	return nil
@@ -987,7 +1007,7 @@ func (d *database) readSnapshotPage(ctx context.Context, request *protocol.Searc
 	}
 	page := pageFromRecords(snapshotID, offset, entryCount, actualMode, expiresAt, records)
 	if page.exhausted {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM pagination_snapshots WHERE snapshot_id = ?`, snapshotID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE pagination_snapshots SET terminal = 1 WHERE snapshot_id = ?`, snapshotID); err != nil {
 			return searchPage{}, err
 		}
 	}

@@ -26,7 +26,7 @@ const (
 	internalMemoryTransactionTokenHeader = "Txn-Token"
 	defaultRecallMemoryToolLimit         = 100
 	maxRecallMemoryToolLimit             = 200
-	maxRecallMemoryToolPageLimit         = 1
+	maxRecallMemoryToolPageLimit         = 2
 )
 
 // RecallMemoryTool retrieves durable namespace-scoped memories relevant to the current task.

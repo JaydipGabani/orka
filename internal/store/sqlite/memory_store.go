@@ -1318,6 +1318,11 @@ func appendMemoryFilters(query string, args *[]any, filter store.MemoryFilter) s
 		}
 		query += ` AND id IN (` + strings.Join(placeholders, ",") + `)`
 	}
+	if filter.BeforeUpdatedAt != nil {
+		before := filter.BeforeUpdatedAt.UTC()
+		query += ` AND (updated_at < ? OR (updated_at = ? AND id < ?))`
+		*args = append(*args, before, before, strings.TrimSpace(filter.BeforeID))
+	}
 	return query
 }
 
