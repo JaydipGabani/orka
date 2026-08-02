@@ -11,6 +11,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,6 +32,7 @@ import (
 	"github.com/orka-agents/orka/internal/contexttoken"
 	"github.com/orka-agents/orka/internal/harness/harnesstest"
 	"github.com/orka-agents/orka/internal/labels"
+	"github.com/orka-agents/orka/internal/tokenexchange"
 	"github.com/orka-agents/orka/internal/transactiontoken"
 	workerpkg "github.com/orka-agents/orka/internal/worker"
 )
@@ -437,6 +440,164 @@ func TestActiveTaskTransactionTokenRefreshCapsRequeue(t *testing.T) {
 	}
 }
 
+func TestActiveTaskTransactionTokenTransientRefreshFailureRetriesBeforeExpiry(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "deadline", err: context.DeadlineExceeded},
+		{name: "network", err: &net.DNSError{Err: "temporary resolver failure", Name: "transactions.example.test", IsTemporary: true}},
+		{name: "redacted network", err: errors.New(taskTokenEndpointRequestFailed)},
+		{name: "HTTP timeout", err: &tokenexchange.ExchangeError{StatusCode: http.StatusRequestTimeout}},
+		{name: "rate limited", err: &tokenexchange.ExchangeError{StatusCode: http.StatusTooManyRequests}},
+		{name: "server failure", err: &tokenexchange.ExchangeError{StatusCode: http.StatusServiceUnavailable}},
+		{name: "OAuth server error", err: &tokenexchange.ExchangeError{StatusCode: http.StatusBadRequest, Code: "server_error"}},
+		{name: "OAuth temporarily unavailable", err: &tokenexchange.ExchangeError{StatusCode: http.StatusBadRequest, Code: "temporarily_unavailable"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+			token := taskTokenJWTForTest(t, now.Add(30*time.Second), "transient-"+test.name)
+			setRenewableTaskTokenSecret(secret, token, now.Add(-time.Second), 1)
+			exchanger := &queuedTaskTokenExchanger{err: test.err}
+			r := newUnitReconciler(newTestScheme(), task, secret, authority)
+			r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+			refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+			if err == nil || fatal {
+				t.Fatalf("transient refresh = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+			}
+			if refreshAfter <= 0 || refreshAfter > taskTokenTransientRetryDelay || refreshAfter >= 30*time.Second {
+				t.Fatalf("refreshAfter = %v, want a bounded retry before token expiry", refreshAfter)
+			}
+			if exchanger.calls != 1 {
+				t.Fatalf("exchange calls = %d, want 1", exchanger.calls)
+			}
+			current := currentTaskTokenSecret(t, r, task)
+			if got := string(current.Data[transactiontoken.TokenSecretKey]); got != token {
+				t.Fatal("transient refresh failure replaced the still-valid token")
+			}
+			if got := string(current.Data[taskTokenGenerationSecretKey]); got != "1" {
+				t.Fatalf("token generation = %q, want unchanged generation 1", got)
+			}
+		})
+	}
+}
+
+func TestActiveTaskTransactionTokenPermanentRefreshFailureRemainsFatal(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: context.Canceled},
+		{name: "generic", err: errors.New("exchange unavailable")},
+		{name: "permanent DNS", err: &net.DNSError{Err: "no such host", Name: "transactions.invalid", IsNotFound: true}},
+		{name: "invalid scope", err: &tokenexchange.ExchangeError{StatusCode: http.StatusBadRequest, Code: "invalid_scope"}},
+		{name: "unauthorized", err: &tokenexchange.ExchangeError{StatusCode: http.StatusUnauthorized, Code: "invalid_grant"}},
+		{name: "unauthorized transient code", err: &tokenexchange.ExchangeError{StatusCode: http.StatusUnauthorized, Code: "temporarily_unavailable"}},
+		{name: "forbidden", err: &tokenexchange.ExchangeError{StatusCode: http.StatusForbidden, Code: "access_denied"}},
+		{name: "not found", err: &tokenexchange.ExchangeError{StatusCode: http.StatusNotFound}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+			token := taskTokenJWTForTest(t, now.Add(30*time.Second), "permanent-"+test.name)
+			setRenewableTaskTokenSecret(secret, token, now.Add(-time.Second), 1)
+			r := newUnitReconciler(newTestScheme(), task, secret, authority)
+			r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(&queuedTaskTokenExchanger{err: test.err})
+
+			refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+			if err == nil || !fatal || refreshAfter != 0 {
+				t.Fatalf("permanent refresh = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+			}
+		})
+	}
+}
+
+func TestActiveTaskTransactionTokenTransientRefreshFailurePreservesTaskAndRequeues(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	token := taskTokenJWTForTest(t, now.Add(time.Minute), "transient-handler")
+	setRenewableTaskTokenSecret(secret, token, now.Add(-time.Second), 1)
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(
+		&queuedTaskTokenExchanger{err: &tokenexchange.ExchangeError{StatusCode: http.StatusServiceUnavailable}},
+	)
+	handlerCalled := false
+
+	result, err := r.handleWithTaskTransactionTokenRefresh(
+		t.Context(), task,
+		func(context.Context, *corev1alpha1.Task) (ctrl.Result, error) {
+			handlerCalled = true
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("handleWithTaskTransactionTokenRefresh() error = %v", err)
+	}
+	if handlerCalled {
+		t.Fatal("task execution handler ran before the overdue token refresh was retried")
+	}
+	if result.RequeueAfter <= 0 || result.RequeueAfter > taskTokenTransientRetryDelay {
+		t.Fatalf("RequeueAfter = %v, want bounded transient refresh retry", result.RequeueAfter)
+	}
+	updated := &corev1alpha1.Task{}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(task), updated); err != nil {
+		t.Fatalf("get active Task: %v", err)
+	}
+	if updated.Status.Phase != corev1alpha1.TaskPhaseRunning {
+		t.Fatalf("Task phase = %s, want Running", updated.Status.Phase)
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); err != nil {
+		t.Fatalf("still-valid workload token Secret was removed: %v", err)
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(authority), &corev1.Secret{}); err != nil {
+		t.Fatalf("renewal authority Secret was removed: %v", err)
+	}
+}
+
+func TestActiveTaskTransactionTokenTransientFailureThatCrossesExpiryIsFatal(t *testing.T) {
+	expiresAt := time.Date(2026, time.August, 2, 12, 0, 1, 0, time.UTC)
+	now := expiresAt.Add(-50 * time.Millisecond)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	token := taskTokenJWTForTest(t, expiresAt, "expires-during-refresh")
+	setRenewableTaskTokenSecret(secret, token, now.Add(-time.Second), 1)
+	exchanger := &queuedTaskTokenExchanger{
+		err: &tokenexchange.ExchangeError{StatusCode: http.StatusServiceUnavailable}, delay: 100 * time.Millisecond,
+	}
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || refreshAfter != 0 {
+		t.Fatalf("expiry-crossing refresh = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+}
+
+func TestActiveTaskTransactionTokenFailsClosedAtOrAfterExpiry(t *testing.T) {
+	expiresAt := time.Date(2026, time.August, 2, 12, 0, 30, 0, time.UTC)
+	for _, now := range []time.Time{expiresAt, expiresAt.Add(time.Second)} {
+		t.Run(now.Format(time.RFC3339), func(t *testing.T) {
+			task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+			token := taskTokenJWTForTest(t, expiresAt, "expired-transient")
+			setRenewableTaskTokenSecret(secret, token, expiresAt.Add(-time.Second), 1)
+			exchanger := &queuedTaskTokenExchanger{err: &tokenexchange.ExchangeError{StatusCode: http.StatusServiceUnavailable}}
+			r := newUnitReconciler(newTestScheme(), task, secret, authority)
+			r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+			refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+			if err == nil || !fatal || refreshAfter != 0 {
+				t.Fatalf("expired refresh = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+			}
+			if exchanger.calls != 0 {
+				t.Fatalf("exchange calls = %d, want no exchange at/after expiry", exchanger.calls)
+			}
+		})
+	}
+}
+
 func TestActiveTaskTransactionTokenRefreshFailureCleansUpAndFailsClosed(t *testing.T) {
 	now := time.Now().UTC()
 	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
@@ -613,11 +774,21 @@ type queuedTaskTokenExchanger struct {
 	tokens   []string
 	requests []contexttoken.ExchangeRequest
 	err      error
+	delay    time.Duration
 	calls    int
 }
 
-func (e *queuedTaskTokenExchanger) Exchange(_ context.Context, request contexttoken.ExchangeRequest) (string, error) {
+func (e *queuedTaskTokenExchanger) Exchange(ctx context.Context, request contexttoken.ExchangeRequest) (string, error) {
 	e.calls++
+	if e.delay > 0 {
+		timer := time.NewTimer(e.delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 	e.requests = append(e.requests, request)
 	if e.err != nil {
 		return "", e.err

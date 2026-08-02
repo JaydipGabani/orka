@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +29,7 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/contexttoken"
 	"github.com/orka-agents/orka/internal/labels"
+	"github.com/orka-agents/orka/internal/tokenexchange"
 	"github.com/orka-agents/orka/internal/transactiontoken"
 )
 
@@ -50,6 +53,11 @@ const (
 
 	taskTokenMinimumRotationLifetime = 3 * time.Second
 	taskTokenRefreshDivisor          = 3
+	taskTokenTransientRetryDelay     = 5 * time.Second
+
+	// tokenexchange deliberately replaces non-timeout transport details with
+	// this fixed safe error so callers can react without exposing endpoints.
+	taskTokenEndpointRequestFailed = "token endpoint request failed"
 )
 
 type taskTokenOptimisticRetryError struct {
@@ -59,9 +67,58 @@ type taskTokenOptimisticRetryError struct {
 func (e taskTokenOptimisticRetryError) Error() string { return e.err.Error() }
 func (e taskTokenOptimisticRetryError) Unwrap() error { return e.err }
 
+type taskTokenExchangeError struct {
+	err error
+}
+
+func (e *taskTokenExchangeError) Error() string {
+	return fmt.Sprintf("exchanging task-bound transaction token: %v", e.err)
+}
+
+func (e *taskTokenExchangeError) Unwrap() error { return e.err }
+
 func taskTokenRetryable(err error) bool {
 	var retry taskTokenOptimisticRetryError
 	return errors.As(err, &retry)
+}
+
+func taskTokenTransientExchangeFailure(err error) bool {
+	var exchangeFailure *taskTokenExchangeError
+	if !errors.As(err, &exchangeFailure) || exchangeFailure.err == nil {
+		return false
+	}
+	if errors.Is(exchangeFailure.err, context.DeadlineExceeded) {
+		return true
+	}
+	var endpointFailure *tokenexchange.ExchangeError
+	if errors.As(exchangeFailure.err, &endpointFailure) {
+		if endpointFailure.StatusCode == http.StatusUnauthorized || endpointFailure.StatusCode == http.StatusForbidden {
+			return false
+		}
+		if endpointFailure.StatusCode == http.StatusRequestTimeout ||
+			endpointFailure.StatusCode == http.StatusTooManyRequests ||
+			(endpointFailure.StatusCode >= http.StatusInternalServerError && endpointFailure.StatusCode < 600) {
+			return true
+		}
+		return (endpointFailure.StatusCode == 0 || endpointFailure.StatusCode == http.StatusBadRequest) &&
+			(endpointFailure.Code == "server_error" || endpointFailure.Code == "temporarily_unavailable")
+	}
+	var networkFailure net.Error
+	if errors.As(exchangeFailure.err, &networkFailure) {
+		return networkFailure.Timeout() || networkFailure.Temporary() //nolint:staticcheck // net.Error is the concrete transport retry signal here.
+	}
+	return exchangeFailure.err.Error() == taskTokenEndpointRequestFailed
+}
+
+func taskTokenTransientRetryAfter(now, expiresAt time.Time) time.Duration {
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	if remaining <= time.Nanosecond {
+		return time.Nanosecond
+	}
+	return max(min(taskTokenTransientRetryDelay, remaining/2), time.Nanosecond)
 }
 
 func (r *TaskReconciler) taskTokenReader() client.Reader {
@@ -251,7 +308,7 @@ func (r *TaskReconciler) rotateTaskTransactionToken(
 		RequestDetails:   requestDetails,
 	})
 	if err != nil {
-		return time.Time{}, fmt.Errorf("exchanging task-bound transaction token: %w", err)
+		return time.Time{}, &taskTokenExchangeError{err: err}
 	}
 	taskToken = strings.TrimSpace(taskToken)
 	if taskToken == "" || taskToken == subjectToken || taskToken == previousToken {
@@ -478,8 +535,16 @@ func (r *TaskReconciler) reconcileActiveTaskTransactionToken(
 	if now.Before(refreshAt) {
 		return refreshAt.Sub(now), false, nil
 	}
+	rotationStartedAt := time.Now()
 	nextRefresh, err := r.rotateTaskTransactionToken(ctx, task, authoritySecret, workloadSecret, now)
+	rotationFinishedAt := now.Add(time.Since(rotationStartedAt))
 	if err != nil {
+		if taskTokenTransientExchangeFailure(err) {
+			retryAfter := taskTokenTransientRetryAfter(rotationFinishedAt, expiresAt)
+			if retryAfter > 0 {
+				return retryAfter, false, err
+			}
+		}
 		return 0, !taskTokenRetryable(err), err
 	}
 	return max(nextRefresh.Sub(now), time.Nanosecond), false, nil
@@ -560,6 +625,10 @@ func (r *TaskReconciler) handleWithTaskTransactionTokenRefresh(
 	refreshAfter, fatal, refreshErr := r.reconcileActiveTaskTransactionToken(ctx, task, time.Now())
 	if refreshErr != nil {
 		if !fatal {
+			if refreshAfter > 0 {
+				logf.FromContext(ctx).Info("task-scoped transaction token refresh failed transiently; retrying before expiry", "retryAfter", refreshAfter)
+				return ctrl.Result{RequeueAfter: refreshAfter}, nil
+			}
 			return ctrl.Result{}, refreshErr
 		}
 		logf.FromContext(ctx).Info("task-scoped transaction token refresh failed; failing closed")
