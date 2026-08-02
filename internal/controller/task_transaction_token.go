@@ -202,8 +202,8 @@ func (r *TaskReconciler) rotateTaskTransactionToken(
 	workloadSecret *corev1.Secret,
 	now time.Time,
 ) (time.Time, error) {
-	subjectToken := strings.TrimSpace(string(authoritySecret.Data[transactiontoken.SubjectSecretKey]))
-	if subjectToken == "" {
+	persistedSubjectToken := strings.TrimSpace(string(authoritySecret.Data[transactiontoken.SubjectSecretKey]))
+	if persistedSubjectToken == "" {
 		return time.Time{}, errors.New("task transaction renewal authority is empty")
 	}
 	if task.Spec.Transaction == nil || strings.TrimSpace(task.Spec.Transaction.Scope) == "" {
@@ -224,6 +224,19 @@ func (r *TaskReconciler) rotateTaskTransactionToken(
 	if generation == ^uint64(0) {
 		return time.Time{}, errors.New("task transaction token generation is exhausted")
 	}
+	previousToken := strings.TrimSpace(string(workloadSecret.Data[transactiontoken.TokenSecretKey]))
+	subjectToken := persistedSubjectToken
+	if generation > 0 {
+		if previousToken == "" {
+			return time.Time{}, errors.New("task transaction token generation has no renewable subject")
+		}
+		// Chain each refresh from the current task-bound token. The original
+		// caller token is necessarily expiring and is valid only for the first
+		// exchange; reusing it would make healthy long-running Tasks fail once
+		// the caller credential expires.
+		subjectToken = previousToken
+		subjectTokenType = transactiontoken.SubjectTokenTypeTransactionToken
+	}
 	nextGeneration := generation + 1
 	requestDetails, err := taskTransactionTokenAuthorityRequestDetails(task, authoritySecret)
 	if err != nil {
@@ -241,7 +254,6 @@ func (r *TaskReconciler) rotateTaskTransactionToken(
 		return time.Time{}, fmt.Errorf("exchanging task-bound transaction token: %w", err)
 	}
 	taskToken = strings.TrimSpace(taskToken)
-	previousToken := strings.TrimSpace(string(workloadSecret.Data[transactiontoken.TokenSecretKey]))
 	if taskToken == "" || taskToken == subjectToken || taskToken == previousToken {
 		return time.Time{}, errors.New("transaction token exchange did not return a distinct task-bound token")
 	}

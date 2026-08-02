@@ -57,6 +57,8 @@ func TestDirectTaskTransactionTokenRotatesBeyondOriginalTTL(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			task, secret, authority := renewableTaskTokenFixture(test.taskType)
+			initialSubject := taskTokenJWTForTest(t, start.Add(5*time.Minute), "caller-authority")
+			authority.Data[transactiontoken.SubjectSecretKey] = []byte(initialSubject)
 			exchanger := &queuedTaskTokenExchanger{tokens: []string{
 				taskTokenJWTForTest(t, start.Add(5*time.Minute), "generation-1"),
 				taskTokenJWTForTest(t, start.Add(7*time.Minute), "generation-2"),
@@ -98,9 +100,10 @@ func TestDirectTaskTransactionTokenRotatesBeyondOriginalTTL(t *testing.T) {
 			}
 			currentAuthority := &corev1.Secret{}
 			if err := r.Get(context.Background(), client.ObjectKeyFromObject(authority), currentAuthority); err != nil ||
-				string(currentAuthority.Data[transactiontoken.SubjectSecretKey]) != testRenewableSubjectToken {
+				string(currentAuthority.Data[transactiontoken.SubjectSecretKey]) != initialSubject {
 				t.Fatal("controller-only renewal authority was not retained")
 			}
+			requireRollingTaskTokenSubjects(t, exchanger.requests, initialSubject, firstToken, secondToken)
 			if string(third.Data[taskTokenGenerationSecretKey]) != "3" || exchanger.calls != 3 {
 				t.Fatalf("rotation generation/calls = %q/%d, want 3/3",
 					third.Data[taskTokenGenerationSecretKey], exchanger.calls)
@@ -138,12 +141,33 @@ func TestDirectTaskTransactionTokenRotatesBeyondOriginalTTL(t *testing.T) {
 	}
 }
 
-func TestDelegatedServiceAccountRenewalAuthorityUsesAccessTokenSubjectType(t *testing.T) {
+func requireRollingTaskTokenSubjects(
+	t *testing.T,
+	requests []contexttoken.ExchangeRequest,
+	initialSubject, firstToken, secondToken string,
+) {
+	t.Helper()
+	if len(requests) != 3 ||
+		requests[0].SubjectToken != initialSubject ||
+		requests[1].SubjectToken != firstToken ||
+		requests[2].SubjectToken != secondToken {
+		t.Fatalf("rotation subjects = %#v, want caller then rolling task-bound tokens", requests)
+	}
+	for i := 1; i < len(requests); i++ {
+		if requests[i].SubjectTokenType != transactiontoken.SubjectTokenTypeTransactionToken {
+			t.Fatalf("rotation %d subject type = %q, want transaction token", i, requests[i].SubjectTokenType)
+		}
+	}
+}
+
+func TestDelegatedServiceAccountRenewalChainsToTransactionTokenReplacement(t *testing.T) {
 	now := time.Now().UTC()
 	task, workload, _ := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
 	authority := directTaskTokenAuthoritySecretWithTypeForTest(task, testRenewableSubjectToken, transactiontoken.SubjectTokenTypeAccessToken)
+	firstToken := taskTokenJWTForTest(t, now.Add(5*time.Minute), "service-account-child-1")
 	exchanger := &queuedTaskTokenExchanger{tokens: []string{
-		taskTokenJWTForTest(t, now.Add(5*time.Minute), "service-account-child"),
+		firstToken,
+		taskTokenJWTForTest(t, now.Add(10*time.Minute), "service-account-child-2"),
 	}}
 	r := newUnitReconciler(newTestScheme(), task, workload, authority)
 	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
@@ -152,9 +176,15 @@ func TestDelegatedServiceAccountRenewalAuthorityUsesAccessTokenSubjectType(t *te
 	if err != nil || fatal || !ready {
 		t.Fatalf("service-account delegated setup = ready:%v fatal:%v err:%v", ready, fatal, err)
 	}
-	if len(exchanger.requests) != 1 ||
-		exchanger.requests[0].SubjectTokenType != contexttoken.SubjectTokenTypeForSource(contexttoken.TTSTokenSourceServiceAccount) {
-		t.Fatal("delegated service-account authority used the wrong subject token type")
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(context.Background(), task, now.Add(2*time.Minute))
+	if err != nil || fatal || refreshAfter <= 0 {
+		t.Fatalf("service-account delegated refresh = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+	if len(exchanger.requests) != 2 ||
+		exchanger.requests[0].SubjectTokenType != contexttoken.SubjectTokenTypeForSource(contexttoken.TTSTokenSourceServiceAccount) ||
+		exchanger.requests[1].SubjectToken != firstToken ||
+		exchanger.requests[1].SubjectTokenType != transactiontoken.SubjectTokenTypeTransactionToken {
+		t.Fatalf("delegated service-account rotation subjects = %#v", exchanger.requests)
 	}
 }
 

@@ -250,6 +250,23 @@ func TestJobBuilder_WorkerServiceAccountForTask_EmptyNamesUseDefaults(t *testing
 	}
 }
 
+func TestAppendTaskEnvVars_TransactionalAICannotSelectInProcessCodeExec(t *testing.T) {
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+		Type:        corev1alpha1.TaskTypeAI,
+		Transaction: &corev1alpha1.TaskTransaction{ID: "txn-1", Scope: "orka:memory:read"},
+		Env: []corev1.EnvVar{
+			{Name: workerenv.CodeExecBackend, Value: "in-process"},
+			{Name: workerenv.CodeExecBackend + "_TENANT_DEFAULT", Value: "in-process"},
+			{Name: "TASK_SAFE_SETTING", Value: "allowed"},
+		},
+	}}
+
+	got := appendTaskEnvVars(nil, task)
+	if len(got) != 1 || got[0].Name != "TASK_SAFE_SETTING" || got[0].Value != "allowed" {
+		t.Fatalf("appendTaskEnvVars() = %#v, want only the non-reserved task setting", got)
+	}
+}
+
 func TestJobBuilder_Build_AgentTaskForExplicitJobBackend(t *testing.T) {
 	builder := setupJobBuilder()
 	task := &corev1alpha1.Task{

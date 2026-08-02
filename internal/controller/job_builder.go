@@ -874,12 +874,20 @@ func appendTaskEnvVars(envVars []corev1.EnvVar, task *corev1alpha1.Task) []corev
 		return envVars
 	}
 	for _, envVar := range task.Spec.Env {
-		if isReservedTaskTelemetryEnv(task, envVar.Name) {
+		if isReservedTaskWorkerEnv(task, envVar.Name) {
 			continue
 		}
 		envVars = append(envVars, envVar)
 	}
 	return envVars
+}
+
+func isReservedTaskWorkerEnv(task *corev1alpha1.Task, name string) bool {
+	if isReservedTaskTelemetryEnv(task, name) {
+		return true
+	}
+	return task != nil && task.Spec.Type == corev1alpha1.TaskTypeAI && task.Spec.Transaction != nil &&
+		(name == workerenv.CodeExecBackend || strings.HasPrefix(name, workerenv.CodeExecBackend+"_"))
 }
 
 func isReservedTaskTelemetryEnv(task *corev1alpha1.Task, name string) bool {
