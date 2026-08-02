@@ -27,6 +27,7 @@ func newMemoryOperationListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List memory operations",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cursorValue := strings.TrimSpace(cursor)
 			continueValue := strings.TrimSpace(continueToken)

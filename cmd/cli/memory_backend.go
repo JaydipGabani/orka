@@ -35,6 +35,7 @@ func newMemoryBackendPurgeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "purge",
 		Short: "Purge checkpoint-covered local memory retention state",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if strings.TrimSpace(checkpointID) == "" {
 				return fmt.Errorf("--checkpoint-id is required")
@@ -107,6 +108,7 @@ func newMemoryBackendCheckpointCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "checkpoint",
 		Short: "Record a matched activation recovery receipt or runtime checkpoint",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if strings.TrimSpace(manifestDigest) == "" {
 				return fmt.Errorf("--manifest-digest is required")
@@ -154,6 +156,7 @@ func newMemoryBackendListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List memory backends",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			result, err := newClientFromCmd(cmd).DoJSON(cmd.Context(), http.MethodGet, "/api/v1/memory-backends", nil, nil)
 			if err != nil {
@@ -178,6 +181,7 @@ func newMemoryBackendGetCmd(status bool) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   use,
 		Short: short,
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			result, err := newClientFromCmd(cmd).DoJSON(cmd.Context(), http.MethodGet, path, nil, nil)
 			if err != nil {
@@ -196,6 +200,7 @@ func newMemoryBackendCreateCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a staged memory backend",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if strings.TrimSpace(reason) == "" {
 				return fmt.Errorf("--reason is required")
@@ -205,9 +210,17 @@ func newMemoryBackendCreateCmd() *cobra.Command {
 			}
 			client := newClientFromCmd(cmd)
 			var body []byte
+			var query map[string]string
 			var err error
 			if file != "" {
-				body, err = manifestWithNamespaceJSON(cmd, file, client.Namespace)
+				manifest, _, manifestErr := manifestMap(file)
+				if manifestErr != nil {
+					return manifestErr
+				}
+				query, err = namespaceQueryForManifest(cmd, client.Namespace, manifest)
+				if err == nil {
+					body, err = marshalManifestWithNamespace(cmd, manifest, client.Namespace)
+				}
 			} else {
 				if strings.TrimSpace(endpoint) == "" || strings.TrimSpace(secretName) == "" || strings.TrimSpace(storeName) == "" {
 					return fmt.Errorf("--file or --endpoint, --secret, and --store are required")
@@ -231,11 +244,12 @@ func newMemoryBackendCreateCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			query = mergeQuery(query, "reason", strings.TrimSpace(reason))
 			result, err := client.DoJSON(
 				cmd.Context(),
 				http.MethodPost,
 				"/api/v1/memory-backends",
-				map[string]string{"reason": strings.TrimSpace(reason)},
+				query,
 				body,
 			)
 			if err != nil {
@@ -261,6 +275,7 @@ func newMemoryBackendUpdateCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "update",
 		Short: "Update the requested memory backend lifecycle or endpoint configuration",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if strings.TrimSpace(file) == "" {
 				return fmt.Errorf("--file is required")
@@ -311,6 +326,7 @@ func newMemoryBackendDeleteCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "delete",
 		Short: "Delete a decommissioned or never-activated memory backend",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if strings.TrimSpace(reason) == "" {
 				return fmt.Errorf("--reason is required")
@@ -344,6 +360,7 @@ func newMemoryBackendActionCmd(action string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   action,
 		Short: titleName(action) + " the namespace memory backend",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if strings.TrimSpace(reason) == "" {
 				return fmt.Errorf("--reason is required")

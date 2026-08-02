@@ -50,6 +50,7 @@ func newMemoryListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List memories",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cursorValue := strings.TrimSpace(cursor)
 			continueValue := strings.TrimSpace(continueToken)
@@ -161,6 +162,7 @@ func newMemoryCreateCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a memory",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var body []byte
 			var err error
@@ -327,6 +329,7 @@ func newMemoryProposalListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List memory proposals",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			q := mergeQuery(
 				map[string]string{},

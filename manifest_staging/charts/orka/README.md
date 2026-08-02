@@ -61,7 +61,9 @@ Helm uses release-scoped pre-install/pre-upgrade RBAC and provenance policy hook
 before rolling the controller Deployment, then installs the retained
 steady-state policies. This closes the Helm kind-ordering gap while allowing the
 old controller and Kubernetes Job controller to create legacy-format work during
-the upgrade. The raw installer likewise places the task provenance policies and
+the upgrade. A pre-delete cleanup hook removes the release-scoped preflight RBAC
+before uninstall while leaving intentionally retained steady-state controls in
+place. The raw installer likewise places the task provenance policies and
 bindings after their RBAC grants but before either Deployment.
 
 The chart-created controller store PVC is annotated `helm.sh/resource-policy:
