@@ -130,6 +130,9 @@ func (h *Handlers) UpdateMemory(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid request body")
 	}
 	explicitNamespace := c.Query("namespace", "")
+	if explicitNamespace != "" && request.Namespace != "" && request.Namespace != explicitNamespace {
+		return fiber.NewError(fiber.StatusBadRequest, "memory namespace mismatch")
+	}
 	if explicitNamespace == "" {
 		explicitNamespace = request.Namespace
 	}
