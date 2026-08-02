@@ -404,6 +404,103 @@ func TestVerifySearchModeCapabilitiesConsumesEveryContinuation(t *testing.T) {
 	}
 }
 
+func TestPaginationFixtureRespectsAdvertisedPageSizeAndSpansPages(t *testing.T) {
+	binding := DefaultBinding()
+	expiresAt := time.Now().UTC().Add(time.Minute)
+	records := []protocol.MemoryRecord{
+		conformanceRecord(binding, "mem-page-a", "page a", 1),
+		conformanceRecord(binding, "mem-page-b", "page b", 2),
+		conformanceRecord(binding, "mem-page-c", "page c", 3),
+	}
+	tokens := []string{
+		"oms-page-v1.0123456789abcdef0123456789abcdef.1",
+		"oms-page-v1.0123456789abcdef0123456789abcdef.2",
+	}
+	var mutex sync.Mutex
+	var requests []protocol.SearchRequest
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var searchRequest protocol.SearchRequest
+		if err := json.NewDecoder(request.Body).Decode(&searchRequest); err != nil {
+			writeConformanceJSON(writer, http.StatusBadRequest, protocol.ErrorResponse{
+				ProtocolVersion: protocol.Version, Code: protocol.ErrorCodeInvalidRequest,
+				Message: "invalid", Retryable: false, RetryAfterSeconds: 0,
+			})
+			return
+		}
+		mutex.Lock()
+		requests = append(requests, searchRequest)
+		mutex.Unlock()
+		if searchRequest.PageSize > 1 {
+			writeConformanceJSON(writer, http.StatusBadRequest, protocol.ErrorResponse{
+				ProtocolVersion: protocol.Version, Code: protocol.ErrorCodeInvalidRequest,
+				Message: "pageSize exceeds maxPageSize", Retryable: false, RetryAfterSeconds: 0,
+			})
+			return
+		}
+
+		response := protocol.SearchResponse{
+			ProtocolVersion: protocol.Version, Binding: binding,
+			RequestedMode: protocol.SearchModeKeyword, ActualMode: protocol.SearchModeKeyword,
+			SnapshotExpiresAt: expiresAt,
+		}
+		switch searchRequest.PageToken {
+		case "":
+			response.Records = []protocol.MemoryRecord{records[0]}
+			response.NextPageToken = tokens[0]
+			response.Exhausted = false
+		case tokens[0]:
+			response.Records = []protocol.MemoryRecord{records[1]}
+			response.NextPageToken = tokens[1]
+			response.Exhausted = false
+		case tokens[1]:
+			response.Records = []protocol.MemoryRecord{records[2]}
+			response.Exhausted = true
+		default:
+			writeConformanceJSON(writer, http.StatusBadRequest, protocol.ErrorResponse{
+				ProtocolVersion: protocol.Version, Code: protocol.ErrorCodeInvalidRequest,
+				Message: "unexpected page token", Retryable: false, RetryAfterSeconds: 0,
+			})
+			return
+		}
+		writeConformanceJSON(writer, http.StatusOK, response)
+	}))
+	t.Cleanup(server.Close)
+	client, err := newContractClient(Target{
+		BaseURL: server.URL, AuthorizationValue: testAuthorizationToken,
+		HTTPClient: server.Client(), InsecureLoopbackOnly: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := paginationFixtureRequest(binding, "conformance-query", 1)
+	first, err := search(context.Background(), client, request)
+	if err != nil {
+		t.Fatalf("search(): %v", err)
+	}
+	if first.Exhausted {
+		t.Fatal("pagination fixture exhausted on the first page")
+	}
+	snapshot, err := collectSnapshot(context.Background(), client, request, first)
+	if err != nil {
+		t.Fatalf("collectSnapshot(): %v", err)
+	}
+	if len(snapshot) != len(records) {
+		t.Fatalf("collectSnapshot() returned %d records, want %d", len(snapshot), len(records))
+	}
+
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(requests) != len(records) {
+		t.Fatalf("search request count = %d, want %d", len(requests), len(records))
+	}
+	for i := range requests {
+		if requests[i].PageSize != 1 {
+			t.Fatalf("request %d pageSize = %d, want 1", i, requests[i].PageSize)
+		}
+	}
+}
+
 func TestSnapshotProofRejectsDuplicatesAndChangedRecords(t *testing.T) {
 	binding := DefaultBinding()
 	records := []protocol.MemoryRecord{

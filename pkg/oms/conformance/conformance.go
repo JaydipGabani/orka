@@ -313,10 +313,7 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		return checkpoint, result
 	}
 
-	searchRequest := protocol.SearchRequest{
-		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword,
-		Query: marker, PageSize: 2, PageToken: "",
-	}
+	searchRequest := paginationFixtureRequest(binding, marker, caps.Limits.MaxPageSize)
 	firstPage, err := search(ctx, client, searchRequest)
 	if err != nil {
 		result.Message = err.Error()
@@ -1360,6 +1357,13 @@ func search(
 		return nil, errors.New("search continuation token did not advance within the same snapshot")
 	}
 	return response, nil
+}
+
+func paginationFixtureRequest(binding protocol.Binding, query string, maxPageSize int) protocol.SearchRequest {
+	return protocol.SearchRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword,
+		Query: query, PageSize: min(2, maxPageSize), PageToken: "",
+	}
 }
 
 func nextPageTokenFollows(current, next string) bool {
