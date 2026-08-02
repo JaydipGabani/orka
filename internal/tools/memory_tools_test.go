@@ -260,7 +260,7 @@ func TestRecallMemoryToolUsesBoundedPageWhenLimitNotProvided(t *testing.T) {
 
 func TestRecallMemoryToolPaginatesResponsesBeyondBodyLimit(t *testing.T) {
 	const total = 17
-	content := strings.Repeat("x", 64<<10)
+	content := strings.Repeat("<", 64<<10)
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -319,8 +319,54 @@ func TestRecallMemoryToolPaginatesResponsesBeyondBodyLimit(t *testing.T) {
 		t.Fatalf("decode result: %v", err)
 	}
 	wantRequests := int32((total + maxRecallMemoryToolPageLimit - 1) / maxRecallMemoryToolPageLimit)
-	if len(memories) != total || requests.Load() != wantRequests {
-		t.Fatalf("memories/requests = %d/%d, want %d/%d", len(memories), requests.Load(), total, wantRequests)
+	if len(memories) == 0 || len(memories) >= total || len(result) > internalMemoryToolResultLimit ||
+		requests.Load() <= 1 || requests.Load() > wantRequests {
+		t.Fatalf("memories/bytes/requests = %d/%d/%d, want bounded nonempty subset within %d bytes and <= %d requests",
+			len(memories), len(result), requests.Load(), internalMemoryToolResultLimit, wantRequests)
+	}
+}
+
+func TestRecallMemoryToolReloadsRotatedTransactionTokenBetweenPages(t *testing.T) {
+	credentialPath := filepath.Join(t.TempDir(), "transaction-credential")
+	firstValue := strings.Join([]string{"task", "scoped", "one"}, "-")
+	secondValue := strings.Join([]string{"task", "scoped", "two"}, "-")
+	if err := os.WriteFile(credentialPath, []byte(firstValue), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestNumber := requests.Add(1)
+		wantValue := firstValue
+		if requestNumber == 2 {
+			wantValue = secondValue
+		}
+		if got := r.Header.Get(internalMemoryTransactionTokenHeader); got != wantValue {
+			t.Fatalf("request %d credential = %q, want %q", requestNumber, got, wantValue)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if requestNumber == 1 {
+			if err := os.WriteFile(credentialPath, []byte(secondValue), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"items":[{"memory":{"id":"mem-1"}}],"cursor":"next","actualMode":"keyword","exhausted":false,"complete":true}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"items":[{"memory":{"id":"mem-2"}}],"actualMode":"keyword","exhausted":true,"complete":true}`))
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "test-ns")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, credentialPath)
+	result, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"limit":2}`))
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var memories []map[string]any
+	if err := json.Unmarshal([]byte(result), &memories); err != nil || len(memories) != 2 || requests.Load() != 2 {
+		t.Fatalf("memories/requests = %#v/%d, err=%v", memories, requests.Load(), err)
 	}
 }
 

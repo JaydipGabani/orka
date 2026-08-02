@@ -1980,46 +1980,103 @@ func (s *Service) searchLegacy(
 	if cursor.PageSize > 0 {
 		pageSize = min(pageSize, cursor.PageSize)
 	}
+	items := make([]SearchHit, 0, pageSize)
+	if err := s.appendLegacyPendingSearchHits(ctx, authority, namespace, request, pageSize, &cursor, &items); err != nil {
+		return nil, err
+	}
 	candidates, capped, err := s.listLegacySearchCandidates(ctx, namespace, request, cursor)
 	if err != nil {
 		return nil, err
 	}
-	items := make([]SearchHit, 0, pageSize)
-	scanned := 0
-	var lastScanned store.Memory
-	for i := range candidates {
-		scanned++
-		lastScanned = candidates[i]
-		memory := candidates[i]
-		if err := s.applyLegacyGovernance(ctx, authority, &memory); err != nil {
-			return nil, err
-		}
-		if memoryMatchesSearchRequest(memory, request) {
-			items = append(items, SearchHit{Memory: memory})
-			if len(items) == pageSize {
-				break
-			}
-		}
+	scanned, lastScanned, err := s.appendLegacyCandidateSearchHits(
+		ctx, authority, request, pageSize, candidates, &items,
+	)
+	if err != nil {
+		return nil, err
 	}
-	hasMore := scanned < len(candidates) || capped
+	hasMore := len(cursor.PendingIDs) > 0 || scanned < len(candidates) || capped
 	complete := !hasMore || len(items) >= pageSize
 	if !complete && !request.AllowIncomplete {
-		return nil, legacySearchIncompleteError("")
+		pending := make([]string, 0, len(items)+len(cursor.PendingIDs))
+		for _, item := range items {
+			pending = append(pending, item.Memory.ID)
+		}
+		cursor.PendingIDs = append(pending, cursor.PendingIDs...)
 	}
 	next := ""
-	if hasMore && scanned > 0 {
+	if hasMore && (scanned > 0 || !cursor.BeforeUpdatedAt.IsZero()) {
 		cursor.PageSize = max(cursor.PageSize, pageSize)
-		cursor.BeforeUpdatedAt = lastScanned.UpdatedAt.UTC()
-		cursor.BeforeID = lastScanned.ID
+		if scanned > 0 {
+			cursor.BeforeUpdatedAt = lastScanned.UpdatedAt.UTC()
+			cursor.BeforeID = lastScanned.ID
+		}
 		next, err = saveLegacySearchCursor(ctx, cursorStore, authority, queryDigest, cursor, s.now())
 		if err != nil {
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
 				"legacy memory search continuation could not be preserved")
 		}
 	}
+	if !complete && !request.AllowIncomplete {
+		return nil, legacySearchIncompleteError(next)
+	}
 	return &SearchResponse{
 		Items: items, ActualMode: protocol.SearchModeKeyword, Cursor: next, Exhausted: !hasMore, Complete: complete,
 	}, nil
+}
+
+func (s *Service) appendLegacyPendingSearchHits(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	namespace string,
+	request SearchRequest,
+	pageSize int,
+	cursor *legacySearchCursor,
+	items *[]SearchHit,
+) error {
+	pendingOffset := 0
+	for pendingOffset < len(cursor.PendingIDs) && len(*items) < pageSize {
+		id := cursor.PendingIDs[pendingOffset]
+		pendingOffset++
+		memory, err := s.Legacy.GetMemory(ctx, namespace, id)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return mapStoreError(err)
+		}
+		if err := s.applyLegacyGovernance(ctx, authority, memory); err != nil {
+			return err
+		}
+		if memoryMatchesSearchRequest(*memory, request) {
+			*items = append(*items, SearchHit{Memory: *memory})
+		}
+	}
+	cursor.PendingIDs = append([]string(nil), cursor.PendingIDs[pendingOffset:]...)
+	return nil
+}
+
+func (s *Service) appendLegacyCandidateSearchHits(
+	ctx context.Context,
+	authority *ResolvedAuthority,
+	request SearchRequest,
+	pageSize int,
+	candidates []store.Memory,
+	items *[]SearchHit,
+) (int, store.Memory, error) {
+	scanned := 0
+	var lastScanned store.Memory
+	for i := 0; i < len(candidates) && len(*items) < pageSize; i++ {
+		scanned++
+		lastScanned = candidates[i]
+		memory := candidates[i]
+		if err := s.applyLegacyGovernance(ctx, authority, &memory); err != nil {
+			return 0, store.Memory{}, err
+		}
+		if memoryMatchesSearchRequest(memory, request) {
+			*items = append(*items, SearchHit{Memory: memory})
+		}
+	}
+	return scanned, lastScanned, nil
 }
 
 func (s *Service) listLegacySearchCandidates(

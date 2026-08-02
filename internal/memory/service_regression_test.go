@@ -1716,20 +1716,45 @@ type cappedLegacyMemoryStore struct {
 	memories []store.Memory
 }
 
+func (s cappedLegacyMemoryStore) GetMemory(_ context.Context, namespace, id string) (*store.Memory, error) {
+	for _, memory := range s.memories {
+		if memory.Namespace == namespace && memory.ID == id {
+			copy := memory
+			return &copy, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
 func (s cappedLegacyMemoryStore) ListMemories(_ context.Context, filter store.MemoryFilter) ([]store.Memory, error) {
 	limit := filter.Limit
 	if limit <= 0 || limit > len(s.memories) {
 		limit = len(s.memories)
 	}
-	return append([]store.Memory(nil), s.memories[:limit]...), nil
+	result := make([]store.Memory, 0, limit)
+	for _, memory := range s.memories {
+		if filter.BeforeUpdatedAt != nil && (memory.UpdatedAt.After(*filter.BeforeUpdatedAt) ||
+			memory.UpdatedAt.Equal(*filter.BeforeUpdatedAt) && memory.ID >= filter.BeforeID) {
+			continue
+		}
+		result = append(result, memory)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result, nil
 }
 
 func TestLegacySearchReportsPreFilterCapAsIncomplete(t *testing.T) {
 	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
-	memories := make([]store.Memory, maxRemoteCatalogLimit)
+	memories := make([]store.Memory, maxRemoteCatalogLimit+1)
 	for i := range memories {
+		trust := store.MemoryTrustUntrusted
+		if i == maxRemoteCatalogLimit {
+			trust = store.MemoryTrustReviewed
+		}
 		memories[i] = store.Memory{
-			ID: fmt.Sprintf("mem-%03d", i), Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustUntrusted,
+			ID: fmt.Sprintf("mem-%03d", maxRemoteCatalogLimit-i), Namespace: "team-a", Content: "needle", Trust: trust,
 			UpdatedAt: now.Add(-time.Duration(i) * time.Second),
 		}
 	}
@@ -1737,13 +1762,52 @@ func TestLegacySearchReportsPreFilterCapAsIncomplete(t *testing.T) {
 	request := SearchRequest{Query: "needle", Limit: 1, Trust: []store.MemoryTrust{store.MemoryTrustReviewed}}
 	_, err := service.Search(context.Background(), "team-a", request, SearchContext{})
 	var incomplete *IncompleteSearchError
-	if !errors.As(err, &incomplete) {
-		t.Fatalf("Search() error = %#v, want explicit incomplete result", err)
+	if !errors.As(err, &incomplete) || incomplete.Cursor == "" {
+		t.Fatalf("Search() error = %#v, want explicit incomplete result with cursor", err)
 	}
+	request.Cursor = incomplete.Cursor
+	continued, err := service.Search(context.Background(), "team-a", request, SearchContext{})
+	if err != nil || len(continued.Items) != 1 || continued.Items[0].Memory.Trust != store.MemoryTrustReviewed ||
+		!continued.Exhausted || !continued.Complete {
+		t.Fatalf("continued response=%#v err=%v", continued, err)
+	}
+	request.Cursor = ""
 	request.AllowIncomplete = true
 	response, err := service.Search(context.Background(), "team-a", request, SearchContext{})
-	if err != nil || response.Complete || response.Exhausted || len(response.Items) != 0 {
+	if err != nil || response.Complete || response.Exhausted || len(response.Items) != 0 || response.Cursor == "" {
 		t.Fatalf("allow-incomplete response=%#v err=%v", response, err)
+	}
+}
+
+func TestLegacySearchStrictContinuationPreservesPartialMatches(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	memories := make([]store.Memory, maxRemoteCatalogLimit+1)
+	for i := range memories {
+		trust := store.MemoryTrustUntrusted
+		if i == 0 || i == maxRemoteCatalogLimit {
+			trust = store.MemoryTrustReviewed
+		}
+		memories[i] = store.Memory{
+			ID: fmt.Sprintf("mem-partial-%03d", maxRemoteCatalogLimit-i), Namespace: "team-a",
+			Content: "needle", Trust: trust, UpdatedAt: now.Add(-time.Duration(i) * time.Second),
+		}
+	}
+	service := &Service{Legacy: cappedLegacyMemoryStore{memories: memories}}
+	request := SearchRequest{Query: "needle", Limit: 2, Trust: []store.MemoryTrust{store.MemoryTrustReviewed}}
+	_, err := service.Search(t.Context(), "team-a", request, SearchContext{})
+	var incomplete *IncompleteSearchError
+	if !errors.As(err, &incomplete) || incomplete.Cursor == "" {
+		t.Fatalf("first Search() error = %#v, want partial-match continuation", err)
+	}
+	request.Cursor = incomplete.Cursor
+	continued, err := service.Search(t.Context(), "team-a", request, SearchContext{})
+	if err != nil || len(continued.Items) != 2 || !continued.Complete || !continued.Exhausted {
+		t.Fatalf("continued response=%#v err=%v", continued, err)
+	}
+	want := []string{memories[0].ID, memories[len(memories)-1].ID}
+	got := []string{continued.Items[0].Memory.ID, continued.Items[1].Memory.ID}
+	if !slices.Equal(got, want) {
+		t.Fatalf("continued ids = %v, want %v", got, want)
 	}
 }
 

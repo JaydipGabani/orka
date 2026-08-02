@@ -91,11 +91,13 @@ type legacySearchCursor struct {
 	CursorID        string    `json:"-"`
 	BeforeUpdatedAt time.Time `json:"-"`
 	BeforeID        string    `json:"-"`
+	PendingIDs      []string  `json:"-"`
 }
 
 type legacySearchCursorBoundary struct {
 	BeforeUpdatedAt time.Time `json:"t"`
 	BeforeID        string    `json:"i"`
+	PendingIDs      []string  `json:"p,omitempty"`
 }
 
 func saveLegacySearchCursor(
@@ -110,8 +112,11 @@ func saveLegacySearchCursor(
 	namespaceUID := legacySearchCursorNamespace(authority)
 	if governed == nil || authority == nil || namespaceUID == "" ||
 		strings.TrimSpace(queryDigest) == "" || state.PageSize <= 0 || state.PageSize > maxRemoteCatalogLimit ||
-		state.BeforeUpdatedAt.IsZero() || state.BeforeID == "" {
+		state.BeforeUpdatedAt.IsZero() || state.BeforeID == "" || len(state.PendingIDs) > state.PageSize {
 		return "", errLegacySearchCursorInvalid
+	}
+	if err := validateLegacySearchPendingIDs(state.PendingIDs); err != nil {
+		return "", err
 	}
 	if state.CursorID == "" {
 		state.CursorID = legacySearchCursorPrefix + uuid.NewString()
@@ -135,7 +140,7 @@ func saveLegacySearchCursor(
 	if len(state.MACKey) != sha256.Size {
 		return "", errLegacySearchCursorInvalid
 	}
-	return formatLegacySearchCursor(state), nil
+	return formatLegacySearchCursor(state)
 }
 
 func loadLegacySearchCursor(
@@ -149,7 +154,7 @@ func loadLegacySearchCursor(
 	if encoded == "" {
 		return legacySearchCursor{}, nil
 	}
-	if len(encoded) > 512 || !strings.HasPrefix(encoded, legacySearchCursorPrefix) {
+	if len(encoded) > 2*maxRemoteSearchCursorBytes || !strings.HasPrefix(encoded, legacySearchCursorPrefix) {
 		return legacySearchCursor{}, errLegacySearchCursorInvalid
 	}
 	parts := strings.SplitN(encoded, ".", 4)
@@ -184,21 +189,48 @@ func loadLegacySearchCursor(
 	}
 	var boundary legacySearchCursorBoundary
 	if err := json.Unmarshal(boundaryPayload, &boundary); err != nil || boundary.BeforeUpdatedAt.IsZero() ||
-		strings.TrimSpace(boundary.BeforeID) == "" {
+		strings.TrimSpace(boundary.BeforeID) == "" || len(boundary.PendingIDs) > cursor.PageSize {
 		return legacySearchCursor{}, errLegacySearchCursorInvalid
+	}
+	if err := validateLegacySearchPendingIDs(boundary.PendingIDs); err != nil {
+		return legacySearchCursor{}, err
 	}
 	cursor.CursorID = parts[0]
 	cursor.BeforeUpdatedAt = boundary.BeforeUpdatedAt.UTC()
 	cursor.BeforeID = strings.TrimSpace(boundary.BeforeID)
+	cursor.PendingIDs = append([]string(nil), boundary.PendingIDs...)
 	return cursor, nil
 }
 
-func formatLegacySearchCursor(state legacySearchCursor) string {
-	boundary, _ := json.Marshal(legacySearchCursorBoundary{
+func validateLegacySearchPendingIDs(ids []string) error {
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return errLegacySearchCursorInvalid
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return errLegacySearchCursorInvalid
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
+}
+
+func formatLegacySearchCursor(state legacySearchCursor) (string, error) {
+	boundary, err := json.Marshal(legacySearchCursorBoundary{
 		BeforeUpdatedAt: state.BeforeUpdatedAt.UTC(), BeforeID: strings.TrimSpace(state.BeforeID),
+		PendingIDs: append([]string(nil), state.PendingIDs...),
 	})
-	return state.CursorID + "." + base64.RawURLEncoding.EncodeToString(boundary) + "." +
+	if err != nil || len(boundary) == 0 || len(boundary) > maxRemoteSearchCursorBytes {
+		return "", errLegacySearchCursorInvalid
+	}
+	encoded := state.CursorID + "." + base64.RawURLEncoding.EncodeToString(boundary) + "." +
 		base64.RawURLEncoding.EncodeToString(legacySearchCursorMAC(state.CursorID, state.MACKey, boundary))
+	if len(encoded) > 2*maxRemoteSearchCursorBytes {
+		return "", errLegacySearchCursorInvalid
+	}
+	return encoded, nil
 }
 
 func legacySearchCursorMAC(id string, key, boundary []byte) []byte {

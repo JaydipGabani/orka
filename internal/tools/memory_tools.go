@@ -23,6 +23,7 @@ import (
 
 const (
 	internalMemoryToolBodyLimit          = 1 << 20 // 1MB
+	internalMemoryToolResultLimit        = 1 << 20 // 1MB
 	internalMemoryTransactionTokenHeader = "Txn-Token"
 	defaultRecallMemoryToolLimit         = 100
 	maxRecallMemoryToolLimit             = 200
@@ -124,14 +125,11 @@ func (t *RecallMemoryTool) Execute(ctx context.Context, args json.RawMessage) (s
 		"includeDisabled": a.IncludeDisabled || a.IncludeDisabledCamel,
 		"mode":            "keyword",
 	}
-	transactionToken, err := loadTaskTransactionToken()
-	if err != nil {
-		return "", fmt.Errorf("failed to load task transaction token: %w", err)
-	}
 	endpoint := cfg.url("/internal/v1/memories/"+url.PathEscape(cfg.Namespace)+"/search", nil)
 	memories := make([]json.RawMessage, 0, targetLimit)
 	seenCursors := make(map[string]struct{})
 	cursor := ""
+	resultBudgetReached := false
 	for len(memories) < targetLimit {
 		pageLimit := min(maxRecallMemoryToolPageLimit, targetLimit-len(memories))
 		request["limit"] = pageLimit
@@ -143,6 +141,10 @@ func (t *RecallMemoryTool) Execute(ctx context.Context, args json.RawMessage) (s
 		payload, err := json.Marshal(request)
 		if err != nil {
 			return "", fmt.Errorf("failed to encode memory search: %w", err)
+		}
+		transactionToken, err := loadTaskTransactionToken()
+		if err != nil {
+			return "", fmt.Errorf("failed to load task transaction token: %w", err)
 		}
 		body, err := doInternalControllerRequestWithTransactionToken(
 			ctx, cfg, http.MethodPost, endpoint, payload, transactionToken,
@@ -169,10 +171,21 @@ func (t *RecallMemoryTool) Execute(ctx context.Context, args json.RawMessage) (s
 		}
 		for _, item := range response.Items {
 			if len(item.Memory) > 0 {
-				memories = append(memories, item.Memory)
+				candidate := make([]json.RawMessage, len(memories)+1)
+				copy(candidate, memories)
+				candidate[len(memories)] = item.Memory
+				encodedCandidate, err := json.Marshal(candidate)
+				if err != nil {
+					return "", fmt.Errorf("failed to encode recalled memories: %w", err)
+				}
+				if len(encodedCandidate) > internalMemoryToolResultLimit {
+					resultBudgetReached = true
+					break
+				}
+				memories = candidate
 			}
 		}
-		if len(memories) >= targetLimit || response.Exhausted {
+		if resultBudgetReached || len(memories) >= targetLimit || response.Exhausted {
 			break
 		}
 		nextCursor := strings.TrimSpace(response.Cursor)

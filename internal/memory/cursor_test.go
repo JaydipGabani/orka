@@ -57,7 +57,9 @@ func TestLegacySearchCursorIsBoundToNamespaceQueryAndExpiry(t *testing.T) {
 	governed := newMemoryTestStore(t)
 	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
 	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
-	state := legacySearchCursor{PageSize: 1, BeforeUpdatedAt: now, BeforeID: "mem-a"}
+	state := legacySearchCursor{
+		PageSize: 2, BeforeUpdatedAt: now, BeforeID: "mem-a", PendingIDs: []string{"mem-pending"},
+	}
 	cursor, err := saveLegacySearchCursor(t.Context(), governed, authority, "query-a", state, now)
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +68,8 @@ func TestLegacySearchCursorIsBoundToNamespaceQueryAndExpiry(t *testing.T) {
 		t.Fatalf("legacy cursor was not opaque: %q", cursor)
 	}
 	decoded, err := loadLegacySearchCursor(t.Context(), governed, authority, "query-a", cursor, now.Add(time.Minute))
-	if err != nil || decoded.PageSize != 1 || !decoded.BeforeUpdatedAt.Equal(now) || decoded.BeforeID != "mem-a" {
+	if err != nil || decoded.PageSize != 2 || !decoded.BeforeUpdatedAt.Equal(now) ||
+		decoded.BeforeID != "mem-a" || len(decoded.PendingIDs) != 1 || decoded.PendingIDs[0] != "mem-pending" {
 		t.Fatalf("decode = %#v, %v", decoded, err)
 	}
 	changed := *authority
