@@ -196,8 +196,8 @@ func (c *contractClient) doResponse(
 		return result, err
 	}
 	result.Body = responseBody
-	if len(responseBody) > protocol.MaxAdapterResponseBytes {
-		return result, fmt.Errorf("adapter response exceeded %d bytes", protocol.MaxAdapterResponseBytes)
+	if err := c.validateResponseBytes(path, responseBody); err != nil {
+		return result, err
 	}
 	if err := validateResponseHeaders(result.Header); err != nil {
 		return result, err
@@ -231,6 +231,24 @@ func (c *contractClient) postJSON(ctx context.Context, path string, value any) (
 func (c *contractClient) configureLimits(limits protocol.CapabilityLimits) {
 	c.limits = limits
 	c.limitsConfigured = true
+}
+
+func (c *contractClient) validateResponseBytes(path string, body []byte) error {
+	if len(body) > protocol.MaxAdapterResponseBytes {
+		return fmt.Errorf(
+			"adapter response from %s exceeded hard maxResponseBytes=%d bytes",
+			strings.TrimSpace(path),
+			protocol.MaxAdapterResponseBytes,
+		)
+	}
+	if c.limitsConfigured && len(body) > c.limits.MaxResponseBytes {
+		return fmt.Errorf(
+			"adapter response from %s exceeded advertised maxResponseBytes=%d bytes",
+			strings.TrimSpace(path),
+			c.limits.MaxResponseBytes,
+		)
+	}
+	return nil
 }
 
 func (c *contractClient) marshalJSONRequest(name string, value any) ([]byte, error) {

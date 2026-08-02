@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,18 +72,7 @@ func TestReferenceAdapterStateSurvivesReopen(t *testing.T) {
 
 func TestReferenceAdapterAcceptsPlanMaximumContent(t *testing.T) {
 	t.Parallel()
-	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
-	var clock atomic.Int64
-	clock.Store(now.UnixNano())
-	adapter, err := Open(context.Background(), Config{
-		DatabasePath: filepath.Join(t.TempDir(), "oms.db"), BearerToken: testCredential(),
-		SnapshotTTL: time.Minute, MaxSnapshotRecords: 64,
-		Clock: func() time.Time { return time.Unix(0, clock.Load()).UTC() },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = adapter.Close() })
+	adapter := openTestAdapter(t, filepath.Join(t.TempDir(), "oms.db"))
 	httpServer := httptest.NewServer(adapter.Handler())
 	t.Cleanup(httpServer.Close)
 	binding := conformance.DefaultBinding()
@@ -122,34 +110,123 @@ func TestReferenceAdapterAcceptsPlanMaximumContent(t *testing.T) {
 	if err != nil || receipt.Result != protocol.ResultApplied {
 		t.Fatalf("maximum-content receipt = %#v, err = %v", receipt, err)
 	}
+	response, err := protocol.DecodeSearchResponse(postTestJSON(t, httpServer.Client(), httpServer.URL+protocol.PathSearch,
+		protocol.SearchRequest{
+			ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword,
+			Query: "", PageSize: 1, PageToken: "",
+		}))
+	if err != nil || len(response.Records) != 1 || response.Records[0].Content != mutation.State.Content {
+		t.Fatalf("maximum-content search = %#v, err = %v", response, err)
+	}
+}
+
+func TestReferenceAdapterTerminalFirstPagesDoNotConsumeSnapshotQuota(t *testing.T) {
+	adapter := openTestAdapter(t, filepath.Join(t.TempDir(), "oms.db"))
+	httpServer := httptest.NewServer(adapter.Handler())
+	t.Cleanup(httpServer.Close)
+	binding := resolveAndClaimReferenceBinding(t, httpServer, "terminal-first-page")
 	search := protocol.SearchRequest{
 		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword,
 		Query: "", PageSize: 1, PageToken: "",
 	}
-	for i := range maxActiveSearchSnapshotsPerAuthority {
-		response, decodeErr := protocol.DecodeSearchResponse(postTestJSON(
-			t, httpServer.Client(), httpServer.URL+protocol.PathSearch, search,
-		))
-		if decodeErr != nil || len(response.Records) != 1 || response.Records[0].Content != mutation.State.Content {
-			t.Fatalf("maximum-content search %d = %#v, err = %v", i, response, decodeErr)
+
+	assertTerminalSearch := func(label string, wantRecords int) {
+		t.Helper()
+		for i := 0; i <= maxActiveSearchSnapshotsPerAuthority; i++ {
+			response, err := protocol.DecodeSearchResponse(postTestJSON(
+				t, httpServer.Client(), httpServer.URL+protocol.PathSearch, search,
+			))
+			if err != nil {
+				t.Fatalf("%s search %d: %v", label, i, err)
+			}
+			if len(response.Records) != wantRecords || !response.Exhausted || response.NextPageToken != "" {
+				t.Fatalf("%s search %d = %#v", label, i, response)
+			}
+		}
+		var snapshots, entries int
+		if err := adapter.db.db.QueryRow(`SELECT
+			(SELECT COUNT(*) FROM pagination_snapshots),
+			(SELECT COUNT(*) FROM pagination_entries)`).Scan(&snapshots, &entries); err != nil {
+			t.Fatal(err)
+		}
+		if snapshots != 0 || entries != 0 {
+			t.Fatalf("%s terminal searches retained snapshots=%d entries=%d", label, snapshots, entries)
 		}
 	}
-	body, status := postTestJSONStatus(t, httpServer.Client(), httpServer.URL+protocol.PathSearch, search)
-	if status != http.StatusServiceUnavailable {
-		t.Fatalf("snapshot quota status = %d, want %d: %s", status, http.StatusServiceUnavailable, body)
+
+	assertTerminalSearch("empty", 0)
+	createReferenceMemory(t, httpServer, binding, "mop-terminal-first-page", "mem-terminal-first-page", "terminal")
+	assertTerminalSearch("single-record", 1)
+}
+
+func TestReferenceAdapterTerminalContinuationReleasesStableSnapshot(t *testing.T) {
+	adapter := openTestAdapter(t, filepath.Join(t.TempDir(), "oms.db"))
+	httpServer := httptest.NewServer(adapter.Handler())
+	t.Cleanup(httpServer.Close)
+	binding := resolveAndClaimReferenceBinding(t, httpServer, "terminal-continuation")
+	for i := 1; i <= 3; i++ {
+		createReferenceMemory(t, httpServer, binding,
+			fmt.Sprintf("mop-terminal-continuation-%d", i),
+			fmt.Sprintf("mem-terminal-continuation-%d", i),
+			fmt.Sprintf("original-%d", i))
 	}
-	capacity, err := protocol.DecodeErrorResponse(body)
-	if err != nil || capacity.Code != protocol.ErrorCodeSnapshotCapacity {
-		t.Fatalf("snapshot quota response = %#v, err = %v", capacity, err)
+	search := protocol.SearchRequest{
+		ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword,
+		Query: "", PageSize: 2, PageToken: "",
 	}
-	clock.Store(now.Add(2 * time.Minute).UnixNano())
-	postTestJSON(t, httpServer.Client(), httpServer.URL+protocol.PathSearch, search)
+	first, err := protocol.DecodeSearchResponse(postTestJSON(
+		t, httpServer.Client(), httpServer.URL+protocol.PathSearch, search,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Records) != 2 || first.Exhausted || first.NextPageToken == "" {
+		t.Fatalf("first page = %#v", first)
+	}
 	var active int
 	if err := adapter.db.db.QueryRow(`SELECT COUNT(*) FROM pagination_snapshots`).Scan(&active); err != nil {
 		t.Fatal(err)
 	}
 	if active != 1 {
-		t.Fatalf("active snapshots after expiry cleanup = %d, want 1", active)
+		t.Fatalf("active snapshots after first page = %d, want 1", active)
+	}
+
+	replacement := protocol.MutationEnvelope{
+		ProtocolVersion: protocol.Version, OperationID: "mop-terminal-continuation-replace", Binding: binding,
+		MemoryID: "mem-terminal-continuation-3", Kind: protocol.MutationKindReplace,
+		Generation: 2, ExpectedGeneration: 1, ExpectedBackendVersion: "ref-v1",
+		State: &protocol.MutationState{Content: "updated-3", Tags: []string{"snapshot"}, Metadata: map[string]string{}},
+	}
+	if err := protocol.PrepareMutation(&replacement); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := protocol.DecodeMutationReceipt(postTestJSON(
+		t, httpServer.Client(), httpServer.URL+protocol.PathMutations, replacement,
+	))
+	if err != nil || receipt.Result != protocol.ResultApplied {
+		t.Fatalf("replacement receipt = %#v, err = %v", receipt, err)
+	}
+
+	nextPage := first.NextPageToken
+	search.PageToken = nextPage
+	last, err := protocol.DecodeSearchResponse(postTestJSON(
+		t, httpServer.Client(), httpServer.URL+protocol.PathSearch, search,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(last.Records) != 1 || last.Records[0].MemoryID != "mem-terminal-continuation-3" ||
+		last.Records[0].Content != "original-3" || !last.Exhausted || last.NextPageToken != "" {
+		t.Fatalf("terminal page = %#v", last)
+	}
+	var snapshots, entries int
+	if err := adapter.db.db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM pagination_snapshots),
+		(SELECT COUNT(*) FROM pagination_entries)`).Scan(&snapshots, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 0 || entries != 0 {
+		t.Fatalf("terminal continuation retained snapshots=%d entries=%d", snapshots, entries)
 	}
 }
 
@@ -203,6 +280,24 @@ func TestReferenceAdapterGlobalSearchSnapshotQuota(t *testing.T) {
 	defer tx.Rollback() //nolint:errcheck
 	if err := ensureSearchSnapshotCountCapacityInTx(context.Background(), tx, "new-authority"); !errors.Is(err, errSnapshotCapacity) {
 		t.Fatalf("global snapshot admission error = %v, want %v", err, errSnapshotCapacity)
+	}
+}
+
+func createReferenceMemory(t *testing.T, server *httptest.Server, binding protocol.Binding, operationID, memoryID, content string) {
+	t.Helper()
+	mutation := protocol.MutationEnvelope{
+		ProtocolVersion: protocol.Version, OperationID: operationID, Binding: binding,
+		MemoryID: memoryID, Kind: protocol.MutationKindCreate, Generation: 1,
+		State: &protocol.MutationState{Content: content, Tags: []string{"snapshot"}, Metadata: map[string]string{}},
+	}
+	if err := protocol.PrepareMutation(&mutation); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := protocol.DecodeMutationReceipt(postTestJSON(
+		t, server.Client(), server.URL+protocol.PathMutations, mutation,
+	))
+	if err != nil || receipt.Result != protocol.ResultApplied {
+		t.Fatalf("create memory receipt = %#v, err = %v", receipt, err)
 	}
 }
 

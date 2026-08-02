@@ -24,7 +24,9 @@ import (
 const (
 	internalMemoryToolBodyLimit          = 1 << 20 // 1MB
 	internalMemoryTransactionTokenHeader = "Txn-Token"
+	defaultRecallMemoryToolLimit         = 100
 	maxRecallMemoryToolLimit             = 200
+	maxRecallMemoryToolPageLimit         = 1
 )
 
 // RecallMemoryTool retrieves durable namespace-scoped memories relevant to the current task.
@@ -104,6 +106,10 @@ func (t *RecallMemoryTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if a.Limit != nil && (*a.Limit <= 0 || *a.Limit > maxRecallMemoryToolLimit) {
 		return "", fmt.Errorf("limit must be between 1 and %d", maxRecallMemoryToolLimit)
 	}
+	targetLimit := defaultRecallMemoryToolLimit
+	if a.Limit != nil {
+		targetLimit = *a.Limit
+	}
 	cfg, err := loadInternalControllerConfig()
 	if err != nil {
 		return "", err
@@ -118,41 +124,66 @@ func (t *RecallMemoryTool) Execute(ctx context.Context, args json.RawMessage) (s
 		"includeDisabled": a.IncludeDisabled || a.IncludeDisabledCamel,
 		"mode":            "keyword",
 	}
-	if a.Limit != nil {
-		request["limit"] = *a.Limit
-	}
-	payload, err := json.Marshal(request)
-	if err != nil {
-		return "", fmt.Errorf("failed to encode memory search: %w", err)
-	}
 	transactionToken, err := loadTaskTransactionToken()
 	if err != nil {
 		return "", fmt.Errorf("failed to load task transaction token: %w", err)
 	}
 	endpoint := cfg.url("/internal/v1/memories/"+url.PathEscape(cfg.Namespace)+"/search", nil)
-	body, err := doInternalControllerRequestWithTransactionToken(
-		ctx, cfg, http.MethodPost, endpoint, payload, transactionToken,
-	)
-	if err != nil {
-		return "", fmt.Errorf("failed to recall memory: %w", err)
-	}
-	var response struct {
-		Items []struct {
-			Memory json.RawMessage `json:"memory"`
-		} `json:"items"`
-		Complete bool `json:"complete"`
-	}
-	if err := json.Unmarshal([]byte(body), &response); err != nil {
-		return "", fmt.Errorf("failed to decode memory search response: %w", err)
-	}
-	if !response.Complete {
-		return "", fmt.Errorf("memory search was incomplete; use a narrower query")
-	}
-	memories := make([]json.RawMessage, 0, len(response.Items))
-	for _, item := range response.Items {
-		if len(item.Memory) > 0 {
-			memories = append(memories, item.Memory)
+	memories := make([]json.RawMessage, 0, targetLimit)
+	seenCursors := make(map[string]struct{})
+	cursor := ""
+	for len(memories) < targetLimit {
+		pageLimit := min(maxRecallMemoryToolPageLimit, targetLimit-len(memories))
+		request["limit"] = pageLimit
+		if cursor == "" {
+			delete(request, "cursor")
+		} else {
+			request["cursor"] = cursor
 		}
+		payload, err := json.Marshal(request)
+		if err != nil {
+			return "", fmt.Errorf("failed to encode memory search: %w", err)
+		}
+		body, err := doInternalControllerRequestWithTransactionToken(
+			ctx, cfg, http.MethodPost, endpoint, payload, transactionToken,
+		)
+		if err != nil {
+			return "", fmt.Errorf("failed to recall memory: %w", err)
+		}
+		var response struct {
+			Items []struct {
+				Memory json.RawMessage `json:"memory"`
+			} `json:"items"`
+			Cursor    string `json:"cursor,omitempty"`
+			Exhausted bool   `json:"exhausted"`
+			Complete  bool   `json:"complete"`
+		}
+		if err := json.Unmarshal([]byte(body), &response); err != nil {
+			return "", fmt.Errorf("failed to decode memory search response: %w", err)
+		}
+		if !response.Complete {
+			return "", fmt.Errorf("memory search was incomplete; use a narrower query")
+		}
+		if len(response.Items) > pageLimit {
+			return "", fmt.Errorf("memory search returned %d items for page limit %d", len(response.Items), pageLimit)
+		}
+		for _, item := range response.Items {
+			if len(item.Memory) > 0 {
+				memories = append(memories, item.Memory)
+			}
+		}
+		if len(memories) >= targetLimit || response.Exhausted {
+			break
+		}
+		nextCursor := strings.TrimSpace(response.Cursor)
+		if nextCursor == "" {
+			return "", fmt.Errorf("memory search continuation cursor was missing")
+		}
+		if _, duplicate := seenCursors[nextCursor]; duplicate {
+			return "", fmt.Errorf("memory search continuation cursor did not advance")
+		}
+		seenCursors[nextCursor] = struct{}{}
+		cursor = nextCursor
 	}
 	encoded, err := json.Marshal(memories)
 	if err != nil {
@@ -677,9 +708,12 @@ func doInternalControllerRequestWithTransactionToken(
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, internalMemoryToolBodyLimit))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, internalMemoryToolBodyLimit+1))
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+	if len(respBody) > internalMemoryToolBodyLimit {
+		return "", fmt.Errorf("controller response exceeded %d bytes", internalMemoryToolBodyLimit)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))

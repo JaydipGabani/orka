@@ -868,11 +868,20 @@ func (d *database) createSnapshot(ctx context.Context, request *protocol.SearchR
 	if err := rows.Close(); err != nil {
 		return searchPage{}, err
 	}
-	if err := ensureSearchSnapshotCountCapacityInTx(ctx, tx, protocol.AuthorityDigest(request.Binding)); err != nil {
-		return searchPage{}, err
-	}
 	snapshotID, err := randomSnapshotID()
 	if err != nil {
+		return searchPage{}, err
+	}
+	firstEnd := min(request.PageSize, len(records))
+	firstPageRecords := append([]protocol.MemoryRecord(nil), records[:firstEnd]...)
+	firstPage := pageFromRecords(snapshotID, 0, len(records), actualMode, expiresAt, firstPageRecords)
+	if firstPage.exhausted {
+		if err := tx.Commit(); err != nil {
+			return searchPage{}, err
+		}
+		return firstPage, nil
+	}
+	if err := ensureSearchSnapshotCountCapacityInTx(ctx, tx, protocol.AuthorityDigest(request.Binding)); err != nil {
 		return searchPage{}, err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO pagination_snapshots(
@@ -892,9 +901,7 @@ func (d *database) createSnapshot(ctx context.Context, request *protocol.SearchR
 	if err := tx.Commit(); err != nil {
 		return searchPage{}, err
 	}
-	firstEnd := min(request.PageSize, len(records))
-	firstPage := append([]protocol.MemoryRecord(nil), records[:firstEnd]...)
-	return pageFromRecords(snapshotID, 0, len(records), actualMode, expiresAt, firstPage), nil
+	return firstPage, nil
 }
 
 func deleteExpiredSearchSnapshotsInTx(ctx context.Context, tx *sql.Tx, now time.Time) error {
@@ -924,7 +931,7 @@ func (d *database) readSnapshotPage(ctx context.Context, request *protocol.Searc
 	if err != nil {
 		return searchPage{}, errSnapshotInvalid
 	}
-	tx, err := d.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return searchPage{}, err
 	}
@@ -978,10 +985,16 @@ func (d *database) readSnapshotPage(ctx context.Context, request *protocol.Searc
 	if err := rows.Close(); err != nil {
 		return searchPage{}, err
 	}
+	page := pageFromRecords(snapshotID, offset, entryCount, actualMode, expiresAt, records)
+	if page.exhausted {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pagination_snapshots WHERE snapshot_id = ?`, snapshotID); err != nil {
+			return searchPage{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return searchPage{}, err
 	}
-	return pageFromRecords(snapshotID, offset, entryCount, actualMode, expiresAt, records), nil
+	return page, nil
 }
 
 func pageFromRecords(snapshotID string, offset, total int, actualMode string, expiresAt time.Time, records []protocol.MemoryRecord) searchPage {

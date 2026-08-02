@@ -569,6 +569,18 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		result.Message = err.Error()
 		return checkpoint, result
 	}
+	checkpointFirstPage, err := search(ctx, client, searchRequest)
+	if err != nil {
+		result.Message = err.Error()
+		return checkpoint, result
+	}
+	if checkpointFirstPage.ActualMode != protocol.SearchModeKeyword ||
+		checkpointFirstPage.Exhausted || checkpointFirstPage.NextPageToken == "" ||
+		!reflect.DeepEqual(checkpointFirstPage.Records, firstPage.Records) {
+		result.Message = "durable pagination checkpoint did not reproduce the verified first page"
+		return checkpoint, result
+	}
+	firstPage = checkpointFirstPage
 	remainingRecords := allSnapshotRecords[len(firstPage.Records):]
 	remainingKeys, remainingDigests, err := recordProofs(binding, remainingRecords)
 	if err != nil {
@@ -1051,6 +1063,12 @@ func probe(
 		return nil, errors.New("capability response did not echo the exact binding")
 	}
 	client.configureLimits(caps.Limits)
+	if err := client.validateResponseBytes(protocol.PathCapabilities, body); err != nil {
+		return nil, err
+	}
+	if err := client.validateResponseBytes(protocol.PathHealth, healthBody); err != nil {
+		return nil, err
+	}
 	return caps, nil
 }
 

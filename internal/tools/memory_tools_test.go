@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -155,7 +156,7 @@ func TestRecallMemoryToolUsesStrictSearchAndNormalizesMemoryArray(t *testing.T) 
 		if request["query"] != "sqlite" || request["mode"] != "keyword" {
 			t.Fatalf("search request = %#v", request)
 		}
-		if request["limit"] != float64(5) {
+		if request["limit"] != float64(maxRecallMemoryToolPageLimit) {
 			t.Fatalf("limit = %#v", request["limit"])
 		}
 		trust, _ := request["trust"].([]any)
@@ -233,14 +234,14 @@ func TestRecallMemoryToolFailsClosedWhenMountedTransactionTokenCannotBeRead(t *t
 	}
 }
 
-func TestRecallMemoryToolOmitsLimitWhenNotProvided(t *testing.T) {
+func TestRecallMemoryToolUsesBoundedPageWhenLimitNotProvided(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatal(err)
 		}
-		if _, present := request["limit"]; present {
-			t.Fatalf("omitted limit was serialized: %#v", request["limit"])
+		if request["limit"] != float64(maxRecallMemoryToolPageLimit) {
+			t.Fatalf("bounded default page limit = %#v", request["limit"])
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"items":[],"actualMode":"keyword","exhausted":true,"complete":true}`))
@@ -253,6 +254,126 @@ func TestRecallMemoryToolOmitsLimitWhenNotProvided(t *testing.T) {
 	t.Setenv("ORKA_SA_TOKEN", "test-token")
 	t.Setenv(workerenv.TransactionTokenFile, "")
 	if _, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"query":"sqlite"}`)); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+}
+
+func TestRecallMemoryToolPaginatesResponsesBeyondBodyLimit(t *testing.T) {
+	const total = 17
+	content := strings.Repeat("x", 64<<10)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		var request struct {
+			Limit  int    `json:"limit"`
+			Cursor string `json:"cursor"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Limit != maxRecallMemoryToolPageLimit {
+			t.Fatalf("page limit = %d, want %d", request.Limit, maxRecallMemoryToolPageLimit)
+		}
+		index := 0
+		if request.Cursor != "" {
+			parsed, err := strconv.Atoi(request.Cursor)
+			if err != nil {
+				t.Fatalf("cursor = %q: %v", request.Cursor, err)
+			}
+			index = parsed
+		}
+		exhausted := index+1 >= total
+		next := ""
+		if !exhausted {
+			next = strconv.Itoa(index + 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"items": []any{map[string]any{"memory": map[string]any{
+				"id": "memory-" + strconv.Itoa(index), "content": content,
+			}}},
+			"cursor": next, "actualMode": "keyword", "exhausted": exhausted, "complete": true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "test-ns")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, "")
+
+	result, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"limit":17}`))
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var memories []map[string]any
+	if err := json.Unmarshal([]byte(result), &memories); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if len(memories) != total || requests.Load() != total {
+		t.Fatalf("memories/requests = %d/%d, want %d/%d", len(memories), requests.Load(), total, total)
+	}
+}
+
+func TestRecallMemoryToolAcceptsMaximumLimitWithBoundedPages(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request["limit"] != float64(maxRecallMemoryToolPageLimit) {
+			t.Fatalf("page limit = %#v", request["limit"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"actualMode":"keyword","exhausted":true,"complete":true}`))
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "test-ns")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, "")
+	if _, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"limit":200}`)); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+}
+
+func TestRecallMemoryToolRejectsOversizedControllerPage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(strings.Repeat("x", internalMemoryToolBodyLimit+1)))
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "test-ns")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, "")
+	_, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"limit":1}`))
+	if err == nil || !strings.Contains(err.Error(), "controller response exceeded") {
+		t.Fatalf("Execute() error = %v", err)
+	}
+}
+
+func TestRecallMemoryToolRejectsNonAdvancingCursor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"cursor":"same","actualMode":"keyword","exhausted":false,"complete":true}`))
+	}))
+	defer server.Close()
+
+	t.Setenv(workerenv.ControllerURL, server.URL)
+	t.Setenv(workerenv.TaskNamespace, "test-ns")
+	t.Setenv(workerenv.TaskName, "task-a")
+	t.Setenv(workerenv.ServiceAccountToken, "service-account-token")
+	t.Setenv(workerenv.TransactionTokenFile, "")
+	_, err := NewRecallMemoryTool().Execute(context.Background(), json.RawMessage(`{"limit":2}`))
+	if err == nil || !strings.Contains(err.Error(), "did not advance") {
 		t.Fatalf("Execute() error = %v", err)
 	}
 }
