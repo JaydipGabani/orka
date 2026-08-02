@@ -601,10 +601,14 @@ jobs:
           for resource in \
             clusterrole/orka-orka-task-job-provenance-controller-preflight \
             clusterrole/orka-orka-task-pod-provenance-admitter-preflight; do
-            kubectl get "${resource}" -o json | jq -e '(.rules // []) | length == 0' >/dev/null
+            if resource_json=$(kubectl get "${resource}" -o json 2>/dev/null); then
+              jq -e '(.rules // []) | length == 0' <<<"${resource_json}" >/dev/null
+            fi
           done
           for resource in \
             clusterrolebinding/orka-orka-task-job-provenance-controller-preflight \
             clusterrolebinding/orka-orka-task-pod-provenance-admitter-preflight; do
-            kubectl get "${resource}" -o json | jq -e '(.subjects // []) | length == 0' >/dev/null
+            if resource_json=$(kubectl get "${resource}" -o json 2>/dev/null); then
+              jq -e '(.subjects // []) | length == 0' <<<"${resource_json}" >/dev/null
+            fi
           done
