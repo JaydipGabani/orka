@@ -51,7 +51,7 @@ Never copy token values into `MemoryBackend`, Tasks, status, logs, audit, or ope
 2. Roll out the foundation release. The artifact must reject activation even if
    the runtime flag or Helm value is forced.
 3. Verify the single serving/dispatching replica has a live foundation feature-epoch heartbeat.
-4. Capture a matched controller SQLite/PVC, adapter PVC, Kubernetes object, and KD6 backup set.
+4. Capture a matched controller SQLite/PVC, adapter state, Kubernetes object, and provider backup set.
 5. Create `MemoryBackend/default` as `Staged` and wait for fresh store, capability, ownership, endpoint, TLS, and Secret validation.
 6. Record the matched pre-activation receipt with
    `orka memory backend checkpoint --manifest-digest sha256:<digest> --reason ... --yes`.
@@ -90,11 +90,11 @@ A recoverable set contains:
 
 - an atomic SQLite/PVC snapshot, including WAL/SHM or a quiesced checkpoint;
 - `MemoryBackend`, Namespace UID, and referenced Secret identity metadata (Secret values only in encrypted Kubernetes backup);
-- KD6 and adapter checkpoint identities and the stable store UUID;
+- provider and adapter checkpoint identities and the stable store UUID;
 - cluster ID, authority/routing epochs, and maximum committed operation sequence;
 - a checksummed manifest tying the components together.
 
-Successful payloads must not be purged until a verified adapter/KD6 checkpoint covers their sequence and the recovery window. The initial target is RPO <= 15 minutes and RTO <= 60 minutes.
+Successful payloads must not be purged until a verified adapter/provider checkpoint covers their sequence and the recovery window. The initial target is RPO <= 15 minutes and RTO <= 60 minutes.
 
 After the checkpoint is recorded and its recovery window has elapsed, operators
 can reclaim bounded local retention capacity explicitly, for example:
@@ -113,14 +113,14 @@ not covered by the exact verified checkpoint watermark and retention gates.
 
 ## Restore procedure
 
-1. Restore the matched SQLite, adapter, Kubernetes, and KD6 set.
+1. Restore the matched SQLite, adapter, Kubernetes, and provider set.
 2. Start Orka with memory activation disabled.
 3. Keep the binding in `Recovering`; reads, recall, admission, and dispatch stay disabled.
 4. Verify namespace/backend identity, authority/routing epochs, store UUID, canonical IDs, generations, versions, digests, tombstones, trust, and proposal state.
 5. Mark missing/corrupt content `lost` or `diverged`; it remains suppressed.
 6. Resume only after reconciliation proves the matched state.
 
-A same-UUID stale snapshot is not trusted. A replacement UUID requires explicit rebind/adoption. Empty or rewound local state must never silently adopt an existing KD6 store.
+A same-UUID stale snapshot is not trusted. A replacement UUID requires explicit rebind/adoption. Empty or rewound local state must never silently adopt an existing provider store.
 
 ## Rollback
 

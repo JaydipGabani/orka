@@ -59,24 +59,3 @@ Remote memory control plane:
   - Foundation mode is active: remote authority activation is blocked.
 {{- end }}
 {{- end }}
-
-{{- if .Values.omsKd6Adapter.enabled }}
-
-OMS KD6 adapter:
-  - Deployment: {{ include "orka.omsKd6AdapterName" . }} (single replica, Recreate)
-  - PVC: {{ include "orka.omsKd6AdapterPVCName" . }} (retained on Helm uninstall)
-{{- if .Values.omsKd6Adapter.service.enabled }}
-  - Service: {{ include "orka.omsKd6AdapterName" . }}:{{ .Values.omsKd6Adapter.service.port }}
-    This Service is NOT a valid MemoryBackend external-endpoint by itself.
-    ClusterIP/private/*.svc targets are rejected. Expose it separately through
-    a public HTTPS hostname with a valid certificate.
-{{- else }}
-  - Service rendering is disabled; provide a separate public HTTPS exposure.
-{{- end }}
-  - No MemoryBackend was created. Create and activate it explicitly after the
-    public endpoint and exact bound client-auth Secret metadata are ready.
-  - Inbound auth Secret: {{ .Values.omsKd6Adapter.auth.existingSecret }}
-  - TLS Secret: {{ .Values.omsKd6Adapter.tls.existingSecret }}
-  - KD6 auth Secret: {{ .Values.omsKd6Adapter.kd6.auth.existingSecret }}
-  - Mounted bearer tokens reload per request; TLS reloads within {{ .Values.omsKd6Adapter.tls.reloadInterval }}.
-{{- end }}

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orka-agents/orka/internal/oms/conformance"
+	"github.com/orka-agents/orka/pkg/oms/conformance"
 )
 
 func TestWriteResultRedactsRawTokenAndAuthorizationValue(t *testing.T) {

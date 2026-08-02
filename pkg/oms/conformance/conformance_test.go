@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orka-agents/orka/internal/oms/protocol"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 const validTestCase = "valid"
@@ -25,7 +25,8 @@ func TestSanitizeCheckResultRedactsConfiguredValue(t *testing.T) {
 		},
 	}
 	sanitized := SanitizeCheckResult(result, sensitiveValue)
-	data := sanitized.Message + sanitized.Capabilities.AdapterName + sanitized.Capabilities.AdapterVersion + sanitized.Capabilities.Revision
+	data := sanitized.Message + sanitized.Capabilities.AdapterName +
+		sanitized.Capabilities.AdapterVersion + sanitized.Capabilities.Revision
 	if strings.Contains(data, sensitiveValue) {
 		t.Fatalf("sanitized result leaked configured value: %s", data)
 	}
@@ -50,7 +51,8 @@ func TestSearchRejectsRequestSpecificResponseViolations(t *testing.T) {
 		return protocol.MemoryRecord{
 			MemoryID: id, UpsertKey: protocol.CanonicalUpsertKey(binding, id), State: protocol.RecordStateLive,
 			Generation: 1, BackendVersion: "version-1", BackendMemoryID: "provider-" + id,
-			ContentDigest: protocol.ContentDigest(content), Content: content, Tags: []string{}, Metadata: map[string]string{}, UpdatedAt: now,
+			ContentDigest: protocol.ContentDigest(content), Content: content,
+			Tags: []string{}, Metadata: map[string]string{}, UpdatedAt: now,
 		}
 	}
 	firstToken := "oms-page-v1.0123456789abcdef0123456789abcdef.1"
@@ -107,7 +109,10 @@ func TestSearchRejectsRequestSpecificResponseViolations(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 			client, err := newContractClient(Target{
-				BaseURL: server.URL, AuthorizationValue: testAuthorizationToken, HTTPClient: server.Client(), InsecureLoopbackOnly: true,
+				BaseURL:              server.URL,
+				AuthorizationValue:   testAuthorizationToken,
+				HTTPClient:           server.Client(),
+				InsecureLoopbackOnly: true,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -151,7 +156,10 @@ func TestExpectCodecRejectionRequiresExactInvalidRequestVariant(t *testing.T) {
 			value.RetryAfterSeconds = 1
 			return value
 		}(), wantErr: true},
-		{name: "retry header", status: http.StatusBadRequest, response: valid, retryAfter: "1", setRetry: true, wantErr: true},
+		{
+			name: "retry header", status: http.StatusBadRequest, response: valid,
+			retryAfter: "1", setRetry: true, wantErr: true,
+		},
 		{name: "empty retry header", status: http.StatusBadRequest, response: valid, setRetry: true, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

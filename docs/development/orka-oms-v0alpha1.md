@@ -30,7 +30,7 @@ memory backend:
 - explicit behavior for optional semantic and hybrid search.
 
 This profile does not define Orka's public memory API, governance catalog,
-admission ledger, or KD6's native API. It is the boundary between Orka and an
+admission ledger, or a provider's native API. It is the boundary between Orka and an
 OMS adapter.
 
 ## Transport and authentication
@@ -221,7 +221,7 @@ Response:
 canonical lowercase UUID and MUST remain stable for the same `(tenantId,
 storeName)` across adapter restarts, upgrades, and matched restores. The response
 MUST echo the exact pre-authority binding and store name. The reference adapter
-creates and persists this mapping. A production KD6 bridge resolves an
+creates and persists this mapping. A production provider bridge resolves an
 operator-precreated provider store and MUST NOT silently switch the name to a
 different store UUID.
 
@@ -645,7 +645,7 @@ is authoritative.
 ## Durable reference adapter
 
 `internal/oms/referenceadapter` is the normative deterministic fixture. It is
-not the KD6 bridge. It uses its own SQLite database and persists:
+not a provider bridge. It uses its own SQLite database and persists:
 
 - schema version;
 - stable tenant/store-name to store-UUID resolutions;
@@ -662,24 +662,9 @@ for the process lifetime. A second active process cannot open the same adapter
 database; an OS/process crash releases the lock. The initial profile supports
 one active adapter process only.
 
-The KD6/proxy bridge additionally fences copied control databases in the shared
-provider authority. OMS ownership claim reserves the next durable control-DB
-writer epoch and calls `POST /v1/content/writers/claim` with that epoch, a fresh
-process holder identity, and the exact authority. Every
-`POST /v1/content/mutate` carries the accepted `writerLease`; the provider must
-validate that lease and apply the content mutation in one atomic transaction.
-Equal-epoch claims from a different holder and mutations using a superseded
-lease return `KD6_WRITER_FENCED` before any content side effect. Restarting the
-authoritative control database reserves a higher epoch and can reclaim the
-writer slot. This wire contract is advertised as `v0alpha1-kd6-proxy-2`.
-
-The adapter database and any provider/KD6 backup belong to one matched recovery
-set. Restoring provider content without receipts, claims, fences, tombstones,
-and snapshot metadata is non-conformant.
-
 ## Conformance harness
 
-The reusable library is `internal/oms/conformance`.
+The reusable library is `pkg/oms/conformance`.
 
 - `conformance.Check` runs the complete semantic suite in one adapter process.
 - `conformance.Prepare` returns a credential-free checkpoint after creating
@@ -727,65 +712,16 @@ The suite verifies, at minimum:
 - stable pagination, snapshot exclusion, exhaustion, and restart continuation;
 - explicit semantic/hybrid `422` behavior and `auto` downgrade reporting.
 
-## KD6 bridge requirement
+## Out-of-tree provider adapters
 
-The reference adapter proves OMS semantics with local deterministic storage. It
-does not implement KD6 transport or credential handling. A production
-`orka-oms-kd6-adapter` must map KD6 operations into this exact contract while
-retaining the OMS SQLite control state (or an equivalent durable store) for
-ownership, routing fences, generations/tombstones, operation receipts, and
-pagination snapshots. The exact KD6 adapter image digest must pass the same
-prepare/restart/verify conformance sequence before release against KD6 commit
-`042cff94bf82e92dea3a47f181121fd9cdcbc434`, packaged in the separately
-digest-pinned `kd6-test` image.
+Provider-specific transport, credential handling, deployment manifests, image
+publication, and live-provider release gates are maintained outside this
+repository. The KD6 implementation lives in
+[`orka-agents/orka-oms-kd6-adapter`](https://github.com/orka-agents/orka-oms-kd6-adapter).
 
-### Release workflow live KD6 gate
-
-The tag release workflow runs the `live-kd6-conformance` job in the GitHub
-Environment named `kd6-release-conformance`. Configure these values at the
-Environment level (repository-level values are also accepted):
-
-- Variable `ORKA_RELEASE_KD6_ENDPOINT`: an absolute HTTPS KD6/proxy origin or
-  base path that is directly reachable from the GitHub-hosted runner. Embedded
-  credentials, query strings, fragments, redirects, and environment proxies
-  are not supported.
-- Variable `ORKA_RELEASE_KD6_TEST_IMAGE_DIGEST`: the `sha256:...` digest of
-  `ghcr.io/<repository>/kd6-test`. The image must carry OCI label
-  `org.opencontainers.image.revision=042cff94bf82e92dea3a47f181121fd9cdcbc434`
-  and label `ai.orka.kd6-test.profile=orka-kd6-contentstore-v1`.
-- Variable `ORKA_RELEASE_KD6_STORE_ID`: a dedicated provider store identifier
-  for release conformance. The target must isolate the unique tenant IDs sent
-  by each run and tolerate retained conformance records until its test-data
-  retention policy removes them.
-- Secret `ORKA_RELEASE_KD6_BEARER_TOKEN`: the bearer credential for that
-  KD6/proxy target.
-- Optional secret `ORKA_RELEASE_KD6_CA_CERT_PEM`: a PEM-encoded CA certificate
-  when the target does not use a certificate rooted in the adapter image's
-  system trust store.
-
-Use Environment protection rules to restrict access to the live credential.
-The endpoint must be the deployment of that exact test image and expose the
-authenticated `GET /v1/release-identity` response:
-
-```json
-{
-  "commit": "042cff94bf82e92dea3a47f181121fd9cdcbc434",
-  "imageDigest": "sha256:...",
-  "profile": "orka-kd6-contentstore-v1"
-}
-```
-
-The workflow fails closed when the adapter digest, KD6 test-image digest or
-labels, release identity, required variables, secret, endpoint profile, or
-optional CA certificate is missing or invalid.
-
-The gate pulls both exact image references, verifies the pinned KD6 revision and
-test profile from the image config, and binds the live endpoint to the same
-digest through the strict release-identity response. It then runs the exact
-`oms-kd6-adapter@sha256:...` image on an ephemeral loopback TLS endpoint and
-enables the authenticated provider-commit-gap proof. It runs `prepare`, stops
-the adapter container, starts a new container from the same digest with the same
-durable control-state directory, and then runs `verify`. The conformance
-checkpoint and all generated credentials remain in the runner's temporary
-directory and are removed at job exit. Image signing, tag promotion, and Helm
-publication cannot proceed unless this live sequence succeeds.
+External adapters should import the canonical `pkg/oms/protocol` package and
+must pass the `pkg/oms/conformance` prepare/restart/verify sequence against the
+exact image digest before release. The provider and durable adapter control
+state form one matched recovery set; restoring provider content without the
+corresponding receipts, claims, fences, tombstones, and snapshot metadata is
+non-conformant.

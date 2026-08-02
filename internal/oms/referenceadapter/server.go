@@ -21,7 +21,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/orka-agents/orka/internal/oms/protocol"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 const (

@@ -277,7 +277,9 @@ func ValidateRoutingFenceResponse(response *RoutingFenceResponse) error {
 	if err := ValidateBinding(response.Binding); err != nil {
 		return err
 	}
-	if response.Result != ResultApplied && response.Result != ResultIdentityConflict && response.Result != ResultPreconditionFailed {
+	if response.Result != ResultApplied &&
+		response.Result != ResultIdentityConflict &&
+		response.Result != ResultPreconditionFailed {
 		return fmt.Errorf("unsupported routing fence result %q", response.Result)
 	}
 	if response.BindingDigest != BindingDigest(response.Binding) {
@@ -545,10 +547,14 @@ func ValidateMemoryRecord(record *MemoryRecord, binding Binding) error {
 	if record.Generation == 0 || record.Generation > math.MaxInt64 {
 		return errors.New("record generation is invalid")
 	}
-	if err := validateOptionalSafeString("backendVersion", record.BackendVersion); err != nil || record.BackendVersion == "" {
+	if err := validateOptionalSafeString(
+		"backendVersion", record.BackendVersion,
+	); err != nil || record.BackendVersion == "" {
 		return errors.New("record backendVersion is required and must be safe")
 	}
-	if err := validateOptionalSafeString("backendMemoryId", record.BackendMemoryID); err != nil || record.BackendMemoryID == "" {
+	if err := validateOptionalSafeString(
+		"backendMemoryId", record.BackendMemoryID,
+	); err != nil || record.BackendMemoryID == "" {
 		return errors.New("record backendMemoryId is required and must be safe")
 	}
 	if record.UpdatedAt.IsZero() {
@@ -562,7 +568,11 @@ func ValidateMemoryRecord(record *MemoryRecord, binding Binding) error {
 		state := &MutationState{Content: record.Content, Tags: record.Tags, Metadata: record.Metadata}
 		return validateLiveMutationState(state, record.ContentDigest)
 	case RecordStateTombstone:
-		if record.Content != "" || len(record.Tags) != 0 || len(record.Metadata) != 0 || record.Tags == nil || record.Metadata == nil {
+		if record.Content != "" ||
+			len(record.Tags) != 0 ||
+			len(record.Metadata) != 0 ||
+			record.Tags == nil ||
+			record.Metadata == nil {
 			return errors.New("tombstone content, tags, and metadata must be explicit empty values")
 		}
 		if record.ContentDigest != EmptyContentDigest() {
@@ -587,13 +597,16 @@ func ValidateSearchRequest(request *SearchRequest) error {
 	if !isSearchMode(request.Mode) {
 		return fmt.Errorf("unsupported search mode %q", request.Mode)
 	}
-	if len(request.Query) > MaxQueryBytes || !utf8.ValidString(request.Query) || containsUnsafeControl(request.Query, true) {
+	if len(request.Query) > MaxQueryBytes ||
+		!utf8.ValidString(request.Query) ||
+		containsUnsafeControl(request.Query, true) {
 		return errors.New("query is invalid")
 	}
 	if request.PageSize <= 0 || request.PageSize > MaxPageSize {
 		return fmt.Errorf("pageSize must be between 1 and %d", MaxPageSize)
 	}
-	if len(request.PageToken) > MaxPageTokenBytes || (request.PageToken != "" && !pageTokenPattern.MatchString(request.PageToken)) {
+	if len(request.PageToken) > MaxPageTokenBytes ||
+		(request.PageToken != "" && !pageTokenPattern.MatchString(request.PageToken)) {
 		return errors.New("pageToken is invalid")
 	}
 	return nil
@@ -613,7 +626,10 @@ func validateSearchResponseAt(response *SearchResponse, now time.Time) error {
 	if err := ValidateBinding(response.Binding); err != nil {
 		return err
 	}
-	if !isSearchMode(response.RequestedMode) || (response.ActualMode != SearchModeKeyword && response.ActualMode != SearchModeSemantic && response.ActualMode != SearchModeHybrid) {
+	if !isSearchMode(response.RequestedMode) ||
+		(response.ActualMode != SearchModeKeyword &&
+			response.ActualMode != SearchModeSemantic &&
+			response.ActualMode != SearchModeHybrid) {
 		return errors.New("search response mode is invalid")
 	}
 	if response.RequestedMode != SearchModeAuto && response.RequestedMode != response.ActualMode {
@@ -676,7 +692,10 @@ func ValidateErrorResponse(response *ErrorResponse) error {
 	if !isErrorCode(response.Code) {
 		return errors.New("error code is not part of the closed OMS profile")
 	}
-	if response.Message == "" || len(response.Message) > MaxErrorMessageBytes || !utf8.ValidString(response.Message) || containsUnsafeControl(response.Message, true) {
+	if response.Message == "" ||
+		len(response.Message) > MaxErrorMessageBytes ||
+		!utf8.ValidString(response.Message) ||
+		containsUnsafeControl(response.Message, true) {
 		return errors.New("error message is invalid")
 	}
 	if response.RetryAfterSeconds < 0 || (!response.Retryable && response.RetryAfterSeconds != 0) {
@@ -789,7 +808,10 @@ func validateOptionalSafeString(name, value string) error {
 	if value == "" {
 		return nil
 	}
-	if len(value) > MaxIdentityBytes || !utf8.ValidString(value) || containsUnsafeControl(value, false) || strings.TrimSpace(value) != value {
+	if len(value) > MaxIdentityBytes ||
+		!utf8.ValidString(value) ||
+		containsUnsafeControl(value, false) ||
+		strings.TrimSpace(value) != value {
 		return fmt.Errorf("%s is invalid", name)
 	}
 	return nil
@@ -810,7 +832,10 @@ func validateMemoryID(value string) error {
 }
 
 func validateUpsertKey(value string, binding Binding) error {
-	if len(value) == 0 || len(value) > 4*MaxIdentityBytes || !utf8.ValidString(value) || containsUnsafeControl(value, false) {
+	if len(value) == 0 ||
+		len(value) > 4*MaxIdentityBytes ||
+		!utf8.ValidString(value) ||
+		containsUnsafeControl(value, false) {
 		return errors.New("upsertKey is invalid")
 	}
 	prefix := "orka:" + binding.ClusterID + ":" + binding.NamespaceUID + ":" + fmt.Sprintf("%d:", binding.AuthorityEpoch)

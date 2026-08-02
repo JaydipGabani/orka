@@ -14,8 +14,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/orka-agents/orka/internal/oms/protocol"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 const (

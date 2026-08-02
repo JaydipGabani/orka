@@ -42,7 +42,8 @@ var capabilitiesShape = jsonShape{required: []string{
 
 var limitsShape = jsonShape{required: []string{
 	"maxRequestBytes", "maxResponseBytes", "maxContentBytes", "maxTags", "maxTagBytes", "maxMetadataEntries",
-	"maxMetadataKeyBytes", "maxMetadataValueBytes", "maxQueryBytes", "maxPageSize", "maxSnapshotRecords", "snapshotTtlSeconds",
+	"maxMetadataKeyBytes", "maxMetadataValueBytes", "maxQueryBytes", "maxPageSize", "maxSnapshotRecords",
+	"snapshotTtlSeconds",
 }}
 
 var stateShape = jsonShape{required: []string{"content", "tags", "metadata"}, nullable: true}
@@ -61,7 +62,12 @@ var recordShape = jsonShape{
 
 func DecodeHealthResponse(body []byte) (*HealthResponse, error) {
 	var response HealthResponse
-	if err := decodeClosed(body, MaxAdapterResponseBytes, &response, jsonShape{required: []string{"protocolVersion", "status"}}); err != nil {
+	if err := decodeClosed(
+		body,
+		MaxAdapterResponseBytes,
+		&response,
+		jsonShape{required: []string{"protocolVersion", "status"}},
+	); err != nil {
 		return nil, fmt.Errorf("invalid health response: %w", err)
 	}
 	if response.ProtocolVersion != Version || response.Status != "ok" {
@@ -102,7 +108,10 @@ func DecodeStoreResolveResponse(body []byte) (*StoreResolveResponse, error) {
 
 func DecodeCapabilitiesRequest(body []byte) (*CapabilitiesRequest, error) {
 	var request CapabilitiesRequest
-	shape := jsonShape{required: []string{"protocolVersion", "binding"}, children: map[string]jsonShape{"binding": bindingShape}}
+	shape := jsonShape{
+		required: []string{"protocolVersion", "binding"},
+		children: map[string]jsonShape{"binding": bindingShape},
+	}
 	if err := decodeClosed(body, MaxHTTPBodyBytes, &request, shape); err != nil {
 		return nil, fmt.Errorf("invalid capabilities request: %w", err)
 	}
@@ -115,7 +124,10 @@ func DecodeCapabilitiesRequest(body []byte) (*CapabilitiesRequest, error) {
 func DecodeCapabilitiesResponse(body []byte) (*CapabilitiesResponse, error) {
 	var response CapabilitiesResponse
 	shape := jsonShape{
-		required: []string{"protocolVersion", "binding", "adapterName", "adapterVersion", "revision", "expiresAt", "capabilities", "limits"},
+		required: []string{
+			"protocolVersion", "binding", "adapterName", "adapterVersion", "revision", "expiresAt", "capabilities",
+			"limits",
+		},
 		children: map[string]jsonShape{"binding": bindingShape, "capabilities": capabilitiesShape, "limits": limitsShape},
 	}
 	if err := decodeClosed(body, MaxAdapterResponseBytes, &response, shape); err != nil {
@@ -129,7 +141,10 @@ func DecodeCapabilitiesResponse(body []byte) (*CapabilitiesResponse, error) {
 
 func DecodeOwnershipClaimRequest(body []byte) (*OwnershipClaimRequest, error) {
 	var request OwnershipClaimRequest
-	shape := jsonShape{required: []string{"protocolVersion", "binding"}, children: map[string]jsonShape{"binding": bindingShape}}
+	shape := jsonShape{
+		required: []string{"protocolVersion", "binding"},
+		children: map[string]jsonShape{"binding": bindingShape},
+	}
 	if err := decodeClosed(body, MaxHTTPBodyBytes, &request, shape); err != nil {
 		return nil, fmt.Errorf("invalid ownership claim request: %w", err)
 	}
@@ -142,7 +157,9 @@ func DecodeOwnershipClaimRequest(body []byte) (*OwnershipClaimRequest, error) {
 func DecodeOwnershipClaimResponse(body []byte) (*OwnershipClaimResponse, error) {
 	var response OwnershipClaimResponse
 	shape := jsonShape{
-		required: []string{"protocolVersion", "binding", "result", "bindingDigest", "claimIdentity", "maximumRoutingEpoch", "claimedAt"},
+		required: []string{
+			"protocolVersion", "binding", "result", "bindingDigest", "claimIdentity", "maximumRoutingEpoch", "claimedAt",
+		},
 		children: map[string]jsonShape{"binding": bindingShape},
 	}
 	if err := decodeClosed(body, MaxAdapterResponseBytes, &response, shape); err != nil {
@@ -156,7 +173,10 @@ func DecodeOwnershipClaimResponse(body []byte) (*OwnershipClaimResponse, error) 
 
 func DecodeRoutingFenceRequest(body []byte) (*RoutingFenceRequest, error) {
 	var request RoutingFenceRequest
-	shape := jsonShape{required: []string{"protocolVersion", "binding"}, children: map[string]jsonShape{"binding": bindingShape}}
+	shape := jsonShape{
+		required: []string{"protocolVersion", "binding"},
+		children: map[string]jsonShape{"binding": bindingShape},
+	}
 	if err := decodeClosed(body, MaxHTTPBodyBytes, &request, shape); err != nil {
 		return nil, fmt.Errorf("invalid routing fence request: %w", err)
 	}
@@ -210,7 +230,10 @@ func DecodeMutationReceipt(body []byte) (*MutationReceipt, error) {
 
 func DecodeGetRequest(body []byte) (*GetRequest, error) {
 	var request GetRequest
-	shape := jsonShape{required: []string{"protocolVersion", "binding", "upsertKey"}, children: map[string]jsonShape{"binding": bindingShape}}
+	shape := jsonShape{
+		required: []string{"protocolVersion", "binding", "upsertKey"},
+		children: map[string]jsonShape{"binding": bindingShape},
+	}
 	if err := decodeClosed(body, MaxHTTPBodyBytes, &request, shape); err != nil {
 		return nil, fmt.Errorf("invalid get request: %w", err)
 	}
@@ -237,7 +260,10 @@ func DecodeGetResponse(body []byte) (*GetResponse, error) {
 
 func DecodeOperationLookupRequest(body []byte) (*OperationLookupRequest, error) {
 	var request OperationLookupRequest
-	shape := jsonShape{required: []string{"protocolVersion", "binding", "operationId"}, children: map[string]jsonShape{"binding": bindingShape}}
+	shape := jsonShape{
+		required: []string{"protocolVersion", "binding", "operationId"},
+		children: map[string]jsonShape{"binding": bindingShape},
+	}
 	if err := decodeClosed(body, MaxHTTPBodyBytes, &request, shape); err != nil {
 		return nil, fmt.Errorf("invalid operation lookup request: %w", err)
 	}
@@ -280,7 +306,10 @@ func DecodeSearchRequest(body []byte) (*SearchRequest, error) {
 func DecodeSearchResponse(body []byte) (*SearchResponse, error) {
 	var response SearchResponse
 	shape := jsonShape{
-		required: []string{"protocolVersion", "binding", "requestedMode", "actualMode", "records", "nextPageToken", "exhausted", "snapshotExpiresAt"},
+		required: []string{
+			"protocolVersion", "binding", "requestedMode", "actualMode", "records", "nextPageToken", "exhausted",
+			"snapshotExpiresAt",
+		},
 		children: map[string]jsonShape{"binding": bindingShape},
 		arrays:   map[string]jsonShape{"records": recordShape},
 	}

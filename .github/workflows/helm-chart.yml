@@ -105,26 +105,16 @@ jobs:
           secondary_task_provenance_rbac=$(mktemp)
           secondary_store_pvc=$(mktemp)
           external_store_render=$(mktemp)
-          oms_enabled_render=$(mktemp)
-          oms_deployment=$(mktemp)
-          oms_service=$(mktemp)
-          oms_pvc=$(mktemp)
-          oms_no_service_render=$(mktemp)
-          oms_replica_error=$(mktemp)
-          oms_persistence_error=$(mktemp)
           long_render=$(mktemp)
           long_wrapper_service=$(mktemp)
           long_wrapper_secret=$(mktemp)
-          long_oms_deployment=$(mktemp)
-          long_oms_service=$(mktemp)
-          long_oms_pvc=$(mktemp)
           memory_enabled_render=$(mktemp)
           memory_activation_error=$(mktemp)
           memory_foundation_activation_error=$(mktemp)
           memory_cluster_error=$(mktemp)
           memory_persistence_error=$(mktemp)
           memory_replica_error=$(mktemp)
-          trap 'rm -f "${default_render}" "${secondary_render}" "${secondary_rbac}" "${secondary_serviceaccounts}" "${secondary_gateway_policy}" "${secondary_memory_policy}" "${secondary_task_worker_policy}" "${secondary_task_provenance_rbac}" "${secondary_store_pvc}" "${external_store_render}" "${oms_enabled_render}" "${oms_deployment}" "${oms_service}" "${oms_pvc}" "${oms_no_service_render}" "${oms_replica_error}" "${oms_persistence_error}" "${long_render}" "${long_wrapper_service}" "${long_wrapper_secret}" "${long_oms_deployment}" "${long_oms_service}" "${long_oms_pvc}" "${memory_enabled_render}" "${memory_activation_error}" "${memory_foundation_activation_error}" "${memory_cluster_error}" "${memory_persistence_error}" "${memory_replica_error}"' EXIT
+          trap 'rm -f "${default_render}" "${secondary_render}" "${secondary_rbac}" "${secondary_serviceaccounts}" "${secondary_gateway_policy}" "${secondary_memory_policy}" "${secondary_task_worker_policy}" "${secondary_task_provenance_rbac}" "${secondary_store_pvc}" "${external_store_render}" "${long_render}" "${long_wrapper_service}" "${long_wrapper_secret}" "${memory_enabled_render}" "${memory_activation_error}" "${memory_foundation_activation_error}" "${memory_cluster_error}" "${memory_persistence_error}" "${memory_replica_error}"' EXIT
           helm template orka manifest_staging/charts/orka \
             --namespace "${NAMESPACE}" \
             --set-string workers.harnessWrapper.auth.token="${harness_wrapper_auth_value}" \
@@ -234,61 +224,6 @@ jobs:
           fi
           grep -Fq 'controller.memoryBackend.enabled requires controller.replicas=1' "${memory_replica_error}"
 
-          oms_values=(
-            --set omsKd6Adapter.enabled=true
-            --set-string omsKd6Adapter.auth.existingSecret=example
-            --set-string omsKd6Adapter.tls.existingSecret=sample
-            --set-string omsKd6Adapter.tls.reloadInterval=2s
-            --set-string omsKd6Adapter.kd6.endpoint=https://kd6.example.com
-            --set-string omsKd6Adapter.kd6.auth.existingSecret=placeholder
-            --set-string omsKd6Adapter.kd6.storeMappings.default=provider-store
-            --set-string omsKd6Adapter.resources.requests.cpu=25m
-          )
-          helm template oms manifest_staging/charts/orka \
-            --namespace "${NAMESPACE}" \
-            "${oms_values[@]}" \
-            > "${oms_enabled_render}"
-          helm template oms manifest_staging/charts/orka \
-            --namespace "${NAMESPACE}" \
-            "${oms_values[@]}" \
-            --show-only templates/oms-kd6-adapter-deployment.yaml \
-            > "${oms_deployment}"
-          helm template oms manifest_staging/charts/orka \
-            --namespace "${NAMESPACE}" \
-            "${oms_values[@]}" \
-            --show-only templates/oms-kd6-adapter-service.yaml \
-            > "${oms_service}"
-          helm template oms manifest_staging/charts/orka \
-            --namespace "${NAMESPACE}" \
-            "${oms_values[@]}" \
-            --show-only templates/oms-kd6-adapter-pvc.yaml \
-            > "${oms_pvc}"
-          helm template oms manifest_staging/charts/orka \
-            --namespace "${NAMESPACE}" \
-            "${oms_values[@]}" \
-            --set omsKd6Adapter.service.enabled=false \
-            > "${oms_no_service_render}"
-
-          if helm template oms manifest_staging/charts/orka \
-            --namespace "${NAMESPACE}" \
-            "${oms_values[@]}" \
-            --set omsKd6Adapter.replicas=2 \
-            >/dev/null 2>"${oms_replica_error}"; then
-            echo "OMS KD6 adapter unexpectedly accepted more than one replica." >&2
-            exit 1
-          fi
-          grep -Fq 'omsKd6Adapter supports exactly one active replica' "${oms_replica_error}"
-
-          if helm template oms manifest_staging/charts/orka \
-            --namespace "${NAMESPACE}" \
-            "${oms_values[@]}" \
-            --set omsKd6Adapter.persistence.enabled=false \
-            >/dev/null 2>"${oms_persistence_error}"; then
-            echo "OMS KD6 adapter unexpectedly accepted disabled persistence." >&2
-            exit 1
-          fi
-          grep -Fq 'omsKd6Adapter requires durable persistence' "${oms_persistence_error}"
-
           long_release=$(printf 'r%.0s' {1..53})
           helm template "${long_release}" manifest_staging/charts/orka \
             --namespace "${NAMESPACE}" \
@@ -304,21 +239,6 @@ jobs:
             --set-string workers.harnessWrapper.auth.token="${harness_wrapper_auth_value}" \
             --show-only templates/harness-wrapper-secret.yaml \
             > "${long_wrapper_secret}"
-          helm template "${long_release}" manifest_staging/charts/orka \
-            --namespace "${NAMESPACE}" \
-            "${oms_values[@]}" \
-            --show-only templates/oms-kd6-adapter-deployment.yaml \
-            > "${long_oms_deployment}"
-          helm template "${long_release}" manifest_staging/charts/orka \
-            --namespace "${NAMESPACE}" \
-            "${oms_values[@]}" \
-            --show-only templates/oms-kd6-adapter-service.yaml \
-            > "${long_oms_service}"
-          helm template "${long_release}" manifest_staging/charts/orka \
-            --namespace "${NAMESPACE}" \
-            "${oms_values[@]}" \
-            --show-only templates/oms-kd6-adapter-pvc.yaml \
-            > "${long_oms_pvc}"
 
           grep -Fq -- "--controller-url=http://orka.${NAMESPACE}.svc:8080" "${default_render}"
           grep -Fq -- "--controller-url=http://secondary-orka.${NAMESPACE}.svc:8080" "${secondary_render}"
@@ -370,53 +290,11 @@ jobs:
           grep -Fq -- "serviceAccountName: ${wrapper_name}" "${long_render}"
           grep -Fq -- "secretName: ${wrapper_secret_name}" "${long_render}"
 
-          if grep -Fq '# Source: orka/templates/oms-kd6-adapter-' "${default_render}"; then
-            echo "OMS KD6 adapter resources must be disabled by default." >&2
-            exit 1
-          fi
-          for source in deployment service pvc; do
-            grep -Fq "# Source: orka/templates/oms-kd6-adapter-${source}.yaml" "${oms_enabled_render}"
-          done
-          if grep -Eq '^kind: MemoryBackend$' "${oms_enabled_render}"; then
-            echo "The chart must not render a MemoryBackend automatically." >&2
-            exit 1
-          fi
-          if grep -Fq '# Source: orka/templates/oms-kd6-adapter-service.yaml' "${oms_no_service_render}"; then
-            echo "OMS KD6 adapter Service rendered while service.enabled=false." >&2
-            exit 1
-          fi
-
-          grep -Fq 'kind: Deployment' "${oms_deployment}"
-          grep -Fq 'replicas: 1' "${oms_deployment}"
-          grep -Fq 'type: Recreate' "${oms_deployment}"
-          grep -Fq 'readOnlyRootFilesystem: true' "${oms_deployment}"
-          grep -Fq 'mountPath: /data' "${oms_deployment}"
-          grep -Fq 'mountPath: /tmp' "${oms_deployment}"
-          grep -Fq 'claimName: oms-orka-oms-kd6-adapter-data' "${oms_deployment}"
-          grep -Fq 'secretName: example' "${oms_deployment}"
-          grep -Fq 'secretName: sample' "${oms_deployment}"
-          grep -Fq 'secretName: placeholder' "${oms_deployment}"
-          grep -Fq -- '--tls-reload-interval=2s' "${oms_deployment}"
-          grep -Fq -- '--inbound-token-file=/var/run/orka/oms-auth/token' "${oms_deployment}"
-          grep -Fq -- '--kd6-token-file=/var/run/orka/kd6-auth/token' "${oms_deployment}"
-          grep -Fq -- '--store-mapping=default=provider-store' "${oms_deployment}"
-          grep -Fq 'cpu: 25m' "${oms_deployment}"
-          grep -Fq 'kind: Service' "${oms_service}"
-          grep -Fq 'targetPort: https' "${oms_service}"
-          grep -Fq 'kind: PersistentVolumeClaim' "${oms_pvc}"
-          grep -Fq 'helm.sh/resource-policy: keep' "${oms_pvc}"
-
-          for rendered in "${long_oms_deployment}" "${long_oms_service}" "${long_oms_pvc}"; do
-            resource_name=$(awk '$1 == "name:" { print $2; exit }' "${rendered}")
-            [[ -n "${resource_name}" && ${#resource_name} -le 63 ]]
-          done
-
           chart_version=$(awk '$1 == "version:" { print $2; exit }' manifest_staging/charts/orka/Chart.yaml)
           grep -Fq -- "image: \"ghcr.io/orka-agents/orka:${chart_version}\"" "${secondary_render}"
           grep -Fq -- "--ai-worker-image=ghcr.io/orka-agents/orka/ai-worker:${chart_version}" "${secondary_render}"
           grep -Fq -- "--general-worker-image=ghcr.io/orka-agents/orka/general-worker:${chart_version}" "${secondary_render}"
           grep -Fq -- "image: ghcr.io/orka-agents/orka/agent-harness-wrapper:${chart_version}" "${secondary_render}"
-          grep -Fq -- "ghcr.io/orka-agents/orka/oms-kd6-adapter:${chart_version}" "${oms_deployment}"
           for resource in agentruntimes substrateactorpools; do
             grep -Eq "resources: \\[.*\"${resource}\"" "${secondary_rbac}"
             grep -Eq "resources: \\[.*\"${resource}/status\"" "${secondary_rbac}"

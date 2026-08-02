@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orka-agents/orka/internal/oms/protocol"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 func TestRemoteSearchCursorIsOpaqueAndBoundToQueryAndAuthority(t *testing.T) {

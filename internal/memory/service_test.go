@@ -10,9 +10,9 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/apierror"
-	"github.com/orka-agents/orka/internal/oms/protocol"
 	"github.com/orka-agents/orka/internal/store"
 	storesqlite "github.com/orka-agents/orka/internal/store/sqlite"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 type staticAuthorityResolver struct{ authority *ResolvedAuthority }

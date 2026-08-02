@@ -172,47 +172,25 @@ make docker-build                  # Controller image
 make docker-build-ai-worker        # AI worker
 make docker-build-general-worker   # General worker
 make docker-build-harness-wrapper  # Agent CLI harness wrapper (codex/claude/copilot/opencode)
-make docker-build-oms-kd6-adapter  # Durable OMS adapter for a KD6/proxy ContentStore
-make docker-build-all              # Controller, workers, harness wrapper, and OMS KD6 adapter
+make docker-build-all              # Controller, workers, and harness wrapper
 
 # Push images
 make docker-push
 make docker-push-ai-worker
 make docker-push-general-worker
 make docker-push-harness-wrapper
-make docker-push-oms-kd6-adapter
 make docker-push-all
 ```
 
-### Durable OMS KD6 adapter
+### Out-of-tree OMS adapters
 
-The `orka-oms-kd6-adapter` keeps only OMS control state in its SQLite database:
-store UUID mappings, operation receipts, ownership/routing fences,
-generation/delete high-watermarks, and pagination descriptors. A configured
-KD6-compatible HTTPS `ContentStore` remains authoritative for acknowledged
-content.
-
-Run a local adapter with mounted token files and a durable control database:
-
-```bash
-go run ./cmd/orka-oms-kd6-adapter \
-  --listen=:8091 \
-  --tls-cert-file=/path/to/tls.crt \
-  --tls-key-file=/path/to/tls.key \
-  --inbound-token-file=/path/to/oms-token \
-  --control-db=/path/to/oms-control.db \
-  --kd6-endpoint=https://kd6-proxy.example \
-  --kd6-token-file=/path/to/kd6-token \
-  --store-mapping=memory=provider-store-id
-```
-
-Repeat `--store-mapping` for each operator-visible OMS store name. The provider
-transport is HTTPS-only, does not follow redirects, ignores environment proxy
-variables, sends the derived tenant as `X-Tenant-Id`, and emits `X-Agent-Id`
-only as an opaque value derived from normalized Orka provenance. Do not pass
-bearer values on the command line; use token files or the
-`ORKA_OMS_INBOUND_BEARER_TOKEN` and `ORKA_KD6_BEARER_TOKEN` environment
-variables.
+Provider-specific OMS adapters are intentionally outside the Orka repository.
+The KD6 implementation, container image, Helm chart, and provider release gate
+are maintained in
+[`orka-agents/orka-oms-kd6-adapter`](https://github.com/orka-agents/orka-oms-kd6-adapter).
+This repository retains the canonical `pkg/oms/protocol` contract,
+`pkg/oms/conformance` library, and `cmd/orka-oms-conformance` command used by
+all adapters.
 
 ## Local Development with Kind
 

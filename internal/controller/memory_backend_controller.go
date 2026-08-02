@@ -45,7 +45,7 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/endpointpolicy"
 	"github.com/orka-agents/orka/internal/events"
-	omsprotocol "github.com/orka-agents/orka/internal/oms/protocol"
+	omsprotocol "github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 const (
@@ -269,7 +269,7 @@ type MemoryBackendDeletionResult struct {
 	Route                   MemoryBackendDurableRoute
 }
 
-// MemoryBackendOMSProber validates the exact internal/oms/protocol store,
+// MemoryBackendOMSProber validates the exact pkg/oms/protocol store,
 // capability, and ownership contract. Implementations must never persist or log
 // BearerToken. Store resolution is pre-authority; binding probes require durable
 // positive candidate epochs from MemoryBackendBindingCoordinator.

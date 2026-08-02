@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/orka-agents/orka/internal/oms/protocol"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite" // pure-Go SQLite driver registration
 )

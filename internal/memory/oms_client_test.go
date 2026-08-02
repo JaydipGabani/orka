@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/orka-agents/orka/internal/endpointpolicy"
-	"github.com/orka-agents/orka/internal/oms/protocol"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 type omsCountingResolver struct {

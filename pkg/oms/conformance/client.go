@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orka-agents/orka/internal/oms/protocol"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 const (
@@ -99,7 +99,12 @@ func newContractClient(target Target) (*contractClient, error) {
 		client.Transport = transport
 	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &contractClient{baseURL: strings.TrimRight(parsed.String(), "/"), rawBearerToken: rawBearerToken, authorizationValue: authorizationValue, http: client}, nil
+	return &contractClient{
+		baseURL:            strings.TrimRight(parsed.String(), "/"),
+		rawBearerToken:     rawBearerToken,
+		authorizationValue: authorizationValue,
+		http:               client,
+	}, nil
 }
 
 func validateTransportProfile(parsed *url.URL, insecureLoopbackOnly bool) (bool, error) {

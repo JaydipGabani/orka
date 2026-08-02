@@ -18,8 +18,8 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/apierror"
 	"github.com/orka-agents/orka/internal/endpointpolicy"
-	"github.com/orka-agents/orka/internal/oms/protocol"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 const (

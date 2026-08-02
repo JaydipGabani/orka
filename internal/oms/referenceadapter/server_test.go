@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orka-agents/orka/internal/oms/conformance"
-	"github.com/orka-agents/orka/internal/oms/protocol"
+	"github.com/orka-agents/orka/pkg/oms/conformance"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 func TestReferenceAdapterPassesConformance(t *testing.T) {

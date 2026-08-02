@@ -121,12 +121,14 @@ func TestValidateJSONUnicodeEscapesAdvancesAcrossEscapedDelimiters(t *testing.T)
 func TestValidateMutationEnvelopeRejectsDigestAndCanonicalizationTampering(t *testing.T) {
 	base := testMutation(t)
 	tests := map[string]func(*MutationEnvelope){
-		"content":         func(value *MutationEnvelope) { value.State.Content += "tampered" },
-		"content digest":  func(value *MutationEnvelope) { value.ContentDigest = EmptyContentDigest() },
-		"mutation digest": func(value *MutationEnvelope) { value.MutationDigest = strings.Repeat("a", len(value.MutationDigest)) },
-		"tag order":       func(value *MutationEnvelope) { value.State.Tags = []string{"z", "a"} },
-		"metadata key":    func(value *MutationEnvelope) { value.State.Metadata = map[string]string{" Owner ": "value"} },
-		"upsert key":      func(value *MutationEnvelope) { value.UpsertKey += "-other" },
+		"content":        func(value *MutationEnvelope) { value.State.Content += "tampered" },
+		"content digest": func(value *MutationEnvelope) { value.ContentDigest = EmptyContentDigest() },
+		"mutation digest": func(value *MutationEnvelope) {
+			value.MutationDigest = strings.Repeat("a", len(value.MutationDigest))
+		},
+		"tag order":    func(value *MutationEnvelope) { value.State.Tags = []string{"z", "a"} },
+		"metadata key": func(value *MutationEnvelope) { value.State.Metadata = map[string]string{" Owner ": "value"} },
+		"upsert key":   func(value *MutationEnvelope) { value.UpsertKey += "-other" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -493,7 +495,8 @@ func TestDecodeSearchResponseClosesEveryRecordAndBoundsNextPageToken(t *testing.
 		return MemoryRecord{
 			MemoryID: id, UpsertKey: CanonicalUpsertKey(binding, id), State: RecordStateLive,
 			Generation: 1, BackendVersion: "version-1", BackendMemoryID: "provider-" + id,
-			ContentDigest: ContentDigest(content), Content: content, Tags: []string{}, Metadata: map[string]string{}, UpdatedAt: now,
+			ContentDigest: ContentDigest(content), Content: content,
+			Tags: []string{}, Metadata: map[string]string{}, UpdatedAt: now,
 		}
 	}
 	response := SearchResponse{
@@ -619,7 +622,10 @@ func TestClosedJSONRejectsNullForNonNullableTypedValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	searchWire["pageToken"] = nil
-	assertNullError("optional-looking required scalar", searchWire, func(body []byte) error { _, err := DecodeSearchRequest(body); return err })
+	assertNullError("optional-looking required scalar", searchWire, func(body []byte) error {
+		_, err := DecodeSearchRequest(body)
+		return err
+	})
 
 	deleteMutation := mutation
 	deleteMutation.OperationID = "mop-nullability-delete"
@@ -664,7 +670,12 @@ func TestMaximumContentFitsBoundedOMSRequestEncoding(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(canonical) >= len(htmlEscaped) || len(canonical) > MaxHTTPBodyBytes {
-		t.Fatalf("canonical request bytes = %d, HTML-escaped = %d, limit = %d", len(canonical), len(htmlEscaped), MaxHTTPBodyBytes)
+		t.Fatalf(
+			"canonical request bytes = %d, HTML-escaped = %d, limit = %d",
+			len(canonical),
+			len(htmlEscaped),
+			MaxHTTPBodyBytes,
+		)
 	}
 	if _, err := DecodeMutationEnvelope(canonical); err != nil {
 		t.Fatalf("DecodeMutationEnvelope(max canonical content): %v", err)

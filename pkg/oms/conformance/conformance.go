@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orka-agents/orka/internal/oms/protocol"
+	"github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 const (
@@ -271,7 +271,10 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		return checkpoint, result
 	}
 	liveRecord, err := getRecord(ctx, client, binding, mainMutation.UpsertKey)
-	if err != nil || liveRecord == nil || liveRecord.Generation != 2 || liveRecord.Content != replaceMutation.State.Content {
+	if err != nil ||
+		liveRecord == nil ||
+		liveRecord.Generation != 2 ||
+		liveRecord.Content != replaceMutation.State.Content {
 		result.Message = "conditional replace did not materialize generation 2"
 		return checkpoint, result
 	}
@@ -384,7 +387,10 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		return checkpoint, result
 	}
 	tombstoneRecord, err := getRecord(ctx, client, binding, absentDelete.UpsertKey)
-	if err != nil || tombstoneRecord == nil || tombstoneRecord.State != protocol.RecordStateTombstone || tombstoneRecord.Generation != 1 {
+	if err != nil ||
+		tombstoneRecord == nil ||
+		tombstoneRecord.State != protocol.RecordStateTombstone ||
+		tombstoneRecord.Generation != 1 {
 		result.Message = "delete-if-absent did not persist a generation high-watermark tombstone"
 		return checkpoint, result
 	}
@@ -412,7 +418,9 @@ func Prepare(ctx context.Context, target Target) (checkpoint Checkpoint, result 
 		result.Message = err.Error()
 		return checkpoint, result
 	}
-	if staleRecord, getErr := getRecord(ctx, client, binding, staleMutation.UpsertKey); getErr != nil || staleRecord != nil {
+	if staleRecord, getErr := getRecord(
+		ctx, client, binding, staleMutation.UpsertKey,
+	); getErr != nil || staleRecord != nil {
 		result.Message = "stale routing mutation changed provider content"
 		return checkpoint, result
 	}
@@ -500,7 +508,9 @@ func VerifyAfterRestart(ctx context.Context, target Target, checkpoint Checkpoin
 		return result
 	}
 	claim, err := claimOwnership(ctx, client, checkpoint.Binding)
-	if err != nil || claim.Result != protocol.ResultApplied || claim.MaximumRoutingEpoch < checkpoint.Binding.RoutingEpoch {
+	if err != nil ||
+		claim.Result != protocol.ResultApplied ||
+		claim.MaximumRoutingEpoch < checkpoint.Binding.RoutingEpoch {
 		result.Message = "exclusive ownership claim or routing fence did not survive restart"
 		return result
 	}
@@ -514,14 +524,22 @@ func VerifyAfterRestart(ctx context.Context, target Target, checkpoint Checkpoin
 			result.Message = "provider-commit gap did not recover through operation lookup after restart"
 			return result
 		}
-		gapLookup, lookupErr := lookupOperation(ctx, client, checkpoint.Binding, checkpoint.ProviderCommitGapMutation.OperationID)
+		gapLookup, lookupErr := lookupOperation(
+			ctx,
+			client,
+			checkpoint.Binding,
+			checkpoint.ProviderCommitGapMutation.OperationID,
+		)
 		if lookupErr != nil || gapLookup == nil || !reflect.DeepEqual(*gapLookup, gapReceipt) {
 			result.Message = "recovered provider-commit gap receipt was not durable after restart"
 			return result
 		}
 		gapRecord, getErr := getRecord(ctx, client, checkpoint.Binding, checkpoint.ProviderCommitGapMutation.UpsertKey)
-		if getErr != nil || gapRecord == nil || gapRecord.Generation != checkpoint.ProviderCommitGapMutation.Generation ||
-			checkpoint.ProviderCommitGapMutation.State == nil || gapRecord.Content != checkpoint.ProviderCommitGapMutation.State.Content {
+		if getErr != nil ||
+			gapRecord == nil ||
+			gapRecord.Generation != checkpoint.ProviderCommitGapMutation.Generation ||
+			checkpoint.ProviderCommitGapMutation.State == nil ||
+			gapRecord.Content != checkpoint.ProviderCommitGapMutation.State.Content {
 			result.Message = "recovered provider-commit gap record is missing or divergent"
 			return result
 		}
@@ -593,7 +611,9 @@ func VerifyAfterRestart(ctx context.Context, target Target, checkpoint Checkpoin
 		result.Message = "durable routing fence accepted a new stale mutation after restart"
 		return result
 	}
-	if record, getErr := getRecord(ctx, client, checkpoint.Binding, secondStale.UpsertKey); getErr != nil || record != nil {
+	if record, getErr := getRecord(
+		ctx, client, checkpoint.Binding, secondStale.UpsertKey,
+	); getErr != nil || record != nil {
 		result.Message = "new stale routing mutation changed content after restart"
 		return result
 	}
@@ -678,10 +698,12 @@ func validateCheckpointPagination(checkpoint Checkpoint) error {
 	if err := protocol.ValidateSearchRequest(&checkpoint.PaginationRequest); err != nil {
 		return err
 	}
-	if checkpoint.PaginationRequest.PageToken == "" || !protocol.BindingEqual(checkpoint.PaginationRequest.Binding, checkpoint.Binding) {
+	if checkpoint.PaginationRequest.PageToken == "" ||
+		!protocol.BindingEqual(checkpoint.PaginationRequest.Binding, checkpoint.Binding) {
 		return errors.New("pagination continuation is not bound to the checkpoint")
 	}
-	if checkpoint.PaginationRequest.Mode != protocol.SearchModeKeyword || checkpoint.PaginationActualMode != protocol.SearchModeKeyword {
+	if checkpoint.PaginationRequest.Mode != protocol.SearchModeKeyword ||
+		checkpoint.PaginationActualMode != protocol.SearchModeKeyword {
 		return errors.New("pagination proof must use explicit keyword mode")
 	}
 	if checkpoint.PaginationSnapshotExpiry.IsZero() {
@@ -709,7 +731,11 @@ func validateCheckpointPagination(checkpoint Checkpoint) error {
 	return nil
 }
 
-func probe(ctx context.Context, client *contractClient, binding protocol.Binding) (*protocol.CapabilitiesResponse, error) {
+func probe(
+	ctx context.Context,
+	client *contractClient,
+	binding protocol.Binding,
+) (*protocol.CapabilitiesResponse, error) {
 	healthBody, status, err := client.do(ctx, http.MethodGet, protocol.PathHealth, client.authorizationValue, nil)
 	if err != nil {
 		return nil, fmt.Errorf("health probe failed: %w", err)
@@ -723,7 +749,11 @@ func probe(ctx context.Context, client *contractClient, binding protocol.Binding
 	if _, err := protocol.DecodeHealthResponse(healthBody); err != nil {
 		return nil, err
 	}
-	body, status, err := client.postJSON(ctx, protocol.PathCapabilities, protocol.CapabilitiesRequest{ProtocolVersion: protocol.Version, Binding: binding})
+	body, status, err := client.postJSON(
+		ctx,
+		protocol.PathCapabilities,
+		protocol.CapabilitiesRequest{ProtocolVersion: protocol.Version, Binding: binding},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("capability probe failed: %w", err)
 	}
@@ -802,14 +832,63 @@ func verifyAuthentication(
 		body               []byte
 	}{
 		{name: "health", method: http.MethodGet, path: protocol.PathHealth},
-		{name: "store resolution", method: http.MethodPost, path: protocol.PathStoreResolve, body: marshal(protocol.StoreResolveRequest{ProtocolVersion: protocol.Version, Binding: storeBinding, StoreName: storeName})},
-		{name: "capabilities", method: http.MethodPost, path: protocol.PathCapabilities, body: marshal(protocol.CapabilitiesRequest{ProtocolVersion: protocol.Version, Binding: binding})},
-		{name: "ownership claim", method: http.MethodPost, path: protocol.PathOwnershipClaim, body: marshal(protocol.OwnershipClaimRequest{ProtocolVersion: protocol.Version, Binding: binding})},
-		{name: "routing fence", method: http.MethodPost, path: protocol.PathRoutingFence, body: marshal(protocol.RoutingFenceRequest{ProtocolVersion: protocol.Version, Binding: binding})},
+		{
+			name: "store resolution", method: http.MethodPost, path: protocol.PathStoreResolve,
+			body: marshal(protocol.StoreResolveRequest{
+				ProtocolVersion: protocol.Version,
+				Binding:         storeBinding,
+				StoreName:       storeName,
+			}),
+		},
+		{
+			name: "capabilities", method: http.MethodPost, path: protocol.PathCapabilities,
+			body: marshal(protocol.CapabilitiesRequest{
+				ProtocolVersion: protocol.Version,
+				Binding:         binding,
+			}),
+		},
+		{
+			name: "ownership claim", method: http.MethodPost, path: protocol.PathOwnershipClaim,
+			body: marshal(protocol.OwnershipClaimRequest{
+				ProtocolVersion: protocol.Version,
+				Binding:         binding,
+			}),
+		},
+		{
+			name: "routing fence", method: http.MethodPost, path: protocol.PathRoutingFence,
+			body: marshal(protocol.RoutingFenceRequest{
+				ProtocolVersion: protocol.Version,
+				Binding:         binding,
+			}),
+		},
 		{name: "mutation", method: http.MethodPost, path: protocol.PathMutations, body: marshal(mutationRequest)},
-		{name: "exact get", method: http.MethodPost, path: protocol.PathRecordsGet, body: marshal(protocol.GetRequest{ProtocolVersion: protocol.Version, Binding: binding, UpsertKey: mutationRequest.UpsertKey})},
-		{name: "operation lookup", method: http.MethodPost, path: protocol.PathOperationsGet, body: marshal(protocol.OperationLookupRequest{ProtocolVersion: protocol.Version, Binding: binding, OperationID: mutationRequest.OperationID})},
-		{name: "search", method: http.MethodPost, path: protocol.PathSearch, body: marshal(protocol.SearchRequest{ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword, Query: "", PageSize: 1, PageToken: ""})},
+		{
+			name: "exact get", method: http.MethodPost, path: protocol.PathRecordsGet,
+			body: marshal(protocol.GetRequest{
+				ProtocolVersion: protocol.Version,
+				Binding:         binding,
+				UpsertKey:       mutationRequest.UpsertKey,
+			}),
+		},
+		{
+			name: "operation lookup", method: http.MethodPost, path: protocol.PathOperationsGet,
+			body: marshal(protocol.OperationLookupRequest{
+				ProtocolVersion: protocol.Version,
+				Binding:         binding,
+				OperationID:     mutationRequest.OperationID,
+			}),
+		},
+		{
+			name: "search", method: http.MethodPost, path: protocol.PathSearch,
+			body: marshal(protocol.SearchRequest{
+				ProtocolVersion: protocol.Version,
+				Binding:         binding,
+				Mode:            protocol.SearchModeKeyword,
+				Query:           "",
+				PageSize:        1,
+				PageToken:       "",
+			}),
+		},
 	}
 	for _, probe := range probes {
 		for _, token := range []string{"", client.authorizationValue + "-invalid"} {
@@ -839,7 +918,10 @@ func verifyStrictCapabilityCodec(ctx context.Context, client *contractClient, bi
 	unsafeRequest := protocol.CapabilitiesRequest{ProtocolVersion: protocol.Version, Binding: binding}
 	unsafeRequest.Binding.ClusterID = "unsafe\ncluster"
 	unsafeBody, _ := json.Marshal(unsafeRequest)
-	oversized := append(append([]byte(nil), valid...), bytes.Repeat([]byte(" "), protocol.MaxHTTPBodyBytes+1-len(valid))...)
+	oversized := append(
+		append([]byte(nil), valid...),
+		bytes.Repeat([]byte(" "), protocol.MaxHTTPBodyBytes+1-len(valid))...,
+	)
 	probes := []struct {
 		name   string
 		status int
@@ -852,14 +934,21 @@ func verifyStrictCapabilityCodec(ctx context.Context, client *contractClient, bi
 		{name: "oversized body", status: http.StatusRequestEntityTooLarge, body: oversized},
 	}
 	for _, probe := range probes {
-		if err := expectCodecRejection(ctx, client, protocol.PathCapabilities, probe.name, probe.status, probe.body); err != nil {
+		if err := expectCodecRejection(
+			ctx, client, protocol.PathCapabilities, probe.name, probe.status, probe.body,
+		); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func verifyStrictMutationCodec(ctx context.Context, client *contractClient, binding protocol.Binding, runID string) error {
+func verifyStrictMutationCodec(
+	ctx context.Context,
+	client *contractClient,
+	binding protocol.Binding,
+	runID string,
+) error {
 	request, err := makeMutation(binding, "mop-"+runID+"-strict-codec", "mem-"+runID+"-strict-codec",
 		protocol.MutationKindCreate, 1, 0, "", &protocol.MutationState{
 			Content: "strict codec", Tags: []string{"strict"}, Metadata: map[string]string{"run": runID},
@@ -881,7 +970,14 @@ func verifyStrictMutationCodec(ctx context.Context, client *contractClient, bind
 	return nil
 }
 
-func expectCodecRejection(ctx context.Context, client *contractClient, path, name string, expectedStatus int, body []byte) error {
+func expectCodecRejection(
+	ctx context.Context,
+	client *contractClient,
+	path string,
+	name string,
+	expectedStatus int,
+	body []byte,
+) error {
 	response, err := client.doResponse(ctx, http.MethodPost, path, client.authorizationValue, body, nil)
 	if err != nil {
 		return fmt.Errorf("%s probe failed: %w", name, err)
@@ -898,7 +994,12 @@ func expectCodecRejection(ctx context.Context, client *contractClient, path, nam
 	return nil
 }
 
-func resolveStore(ctx context.Context, client *contractClient, binding protocol.StoreResolutionBinding, storeName string) (*protocol.StoreResolveResponse, error) {
+func resolveStore(
+	ctx context.Context,
+	client *contractClient,
+	binding protocol.StoreResolutionBinding,
+	storeName string,
+) (*protocol.StoreResolveResponse, error) {
 	body, status, err := client.postJSON(ctx, protocol.PathStoreResolve, protocol.StoreResolveRequest{
 		ProtocolVersion: protocol.Version, Binding: binding, StoreName: storeName,
 	})
@@ -918,20 +1019,39 @@ func resolveStore(ctx context.Context, client *contractClient, binding protocol.
 	return response, nil
 }
 
-func verifyStrictStoreCodec(ctx context.Context, client *contractClient, binding protocol.StoreResolutionBinding, storeName string) error {
-	valid, _ := json.Marshal(protocol.StoreResolveRequest{ProtocolVersion: protocol.Version, Binding: binding, StoreName: storeName})
+func verifyStrictStoreCodec(
+	ctx context.Context,
+	client *contractClient,
+	binding protocol.StoreResolutionBinding,
+	storeName string,
+) error {
+	valid, _ := json.Marshal(protocol.StoreResolveRequest{
+		ProtocolVersion: protocol.Version,
+		Binding:         binding,
+		StoreName:       storeName,
+	})
 	unknown := append([]byte(`{"unknown":true,`), valid[1:]...)
 	trailing := append(append([]byte(nil), valid...), []byte(` {}`)...)
 	for name, body := range map[string][]byte{"store unknown field": unknown, "store trailing JSON": trailing} {
-		if err := expectCodecRejection(ctx, client, protocol.PathStoreResolve, name, http.StatusBadRequest, body); err != nil {
+		if err := expectCodecRejection(
+			ctx, client, protocol.PathStoreResolve, name, http.StatusBadRequest, body,
+		); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func claimOwnership(ctx context.Context, client *contractClient, binding protocol.Binding) (*protocol.OwnershipClaimResponse, error) {
-	body, status, err := client.postJSON(ctx, protocol.PathOwnershipClaim, protocol.OwnershipClaimRequest{ProtocolVersion: protocol.Version, Binding: binding})
+func claimOwnership(
+	ctx context.Context,
+	client *contractClient,
+	binding protocol.Binding,
+) (*protocol.OwnershipClaimResponse, error) {
+	body, status, err := client.postJSON(
+		ctx,
+		protocol.PathOwnershipClaim,
+		protocol.OwnershipClaimRequest{ProtocolVersion: protocol.Version, Binding: binding},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -948,7 +1068,12 @@ func claimOwnership(ctx context.Context, client *contractClient, binding protoco
 	return response, nil
 }
 
-func verifyExclusiveOwnership(ctx context.Context, client *contractClient, binding protocol.Binding, runID string) error {
+func verifyExclusiveOwnership(
+	ctx context.Context,
+	client *contractClient,
+	binding protocol.Binding,
+	runID string,
+) error {
 	conflict := binding
 	conflict.BackendUID = "conflict-" + strings.TrimSuffix(runID, "-restart")
 	if conflict.BackendUID == binding.BackendUID {
@@ -998,7 +1123,11 @@ func induceProviderCommitGap(ctx context.Context, client *contractClient, reques
 func verifyConcurrentCAS(ctx context.Context, client *contractClient, binding protocol.Binding, runID string) error {
 	base, err := makeMutation(
 		binding, "mop-"+runID+"-cas-base", "mem-"+runID+"-cas", protocol.MutationKindCreate, 1, 0, "",
-		&protocol.MutationState{Content: "concurrent CAS base", Tags: []string{"cas"}, Metadata: map[string]string{"run": runID}},
+		&protocol.MutationState{
+			Content:  "concurrent CAS base",
+			Tags:     []string{"cas"},
+			Metadata: map[string]string{"run": runID},
+		},
 	)
 	if err != nil {
 		return err
@@ -1011,7 +1140,11 @@ func verifyConcurrentCAS(ctx context.Context, client *contractClient, binding pr
 	for index, side := range []string{"left", "right"} {
 		replacements[index], err = makeMutation(
 			binding, "mop-"+runID+"-cas-"+side, base.MemoryID, protocol.MutationKindReplace, 2, 1, baseReceipt.BackendVersion,
-			&protocol.MutationState{Content: "concurrent CAS " + side, Tags: []string{"cas", side}, Metadata: map[string]string{"run": runID}},
+			&protocol.MutationState{
+				Content:  "concurrent CAS " + side,
+				Tags:     []string{"cas", side},
+				Metadata: map[string]string{"run": runID},
+			},
 		)
 		if err != nil {
 			return err
@@ -1054,7 +1187,10 @@ func verifyConcurrentCAS(ctx context.Context, client *contractClient, binding pr
 		counts[result.receipt.Result]++
 	}
 	if counts[protocol.ResultApplied] != 1 || counts[protocol.ResultPreconditionFailed] != 1 || len(counts) != 2 {
-		return fmt.Errorf("concurrent same-generation replacements produced results %#v, want one applied and one preconditionFailed", counts)
+		return fmt.Errorf(
+			"concurrent same-generation replacements produced results %#v, want one applied and one preconditionFailed",
+			counts,
+		)
 	}
 	record, err := getRecord(ctx, client, binding, base.UpsertKey)
 	if err != nil || record == nil || record.Generation != 2 ||
@@ -1064,8 +1200,16 @@ func verifyConcurrentCAS(ctx context.Context, client *contractClient, binding pr
 	return nil
 }
 
-func advanceFence(ctx context.Context, client *contractClient, binding protocol.Binding) (*protocol.RoutingFenceResponse, error) {
-	body, status, err := client.postJSON(ctx, protocol.PathRoutingFence, protocol.RoutingFenceRequest{ProtocolVersion: protocol.Version, Binding: binding})
+func advanceFence(
+	ctx context.Context,
+	client *contractClient,
+	binding protocol.Binding,
+) (*protocol.RoutingFenceResponse, error) {
+	body, status, err := client.postJSON(
+		ctx,
+		protocol.PathRoutingFence,
+		protocol.RoutingFenceRequest{ProtocolVersion: protocol.Version, Binding: binding},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1082,7 +1226,12 @@ func advanceFence(ctx context.Context, client *contractClient, binding protocol.
 	return response, nil
 }
 
-func mutation(ctx context.Context, client *contractClient, request protocol.MutationEnvelope, expectedResult string) (protocol.MutationReceipt, []byte, error) {
+func mutation(
+	ctx context.Context,
+	client *contractClient,
+	request protocol.MutationEnvelope,
+	expectedResult string,
+) (protocol.MutationReceipt, []byte, error) {
 	body, status, err := client.postJSON(ctx, protocol.PathMutations, request)
 	if err != nil {
 		return protocol.MutationReceipt{}, nil, err
@@ -1095,20 +1244,45 @@ func mutation(ctx context.Context, client *contractClient, request protocol.Muta
 		return protocol.MutationReceipt{}, nil, err
 	}
 	if receipt.Result != expectedResult {
-		return protocol.MutationReceipt{}, nil, fmt.Errorf("mutation %s result = %s, want %s", request.OperationID, receipt.Result, expectedResult)
+		return protocol.MutationReceipt{}, nil, fmt.Errorf(
+			"mutation %s result = %s, want %s",
+			request.OperationID,
+			receipt.Result,
+			expectedResult,
+		)
 	}
-	if !protocol.BindingEqual(receipt.Binding, request.Binding) || receipt.OperationID != request.OperationID || receipt.MutationDigest != request.MutationDigest {
+	if !protocol.BindingEqual(receipt.Binding, request.Binding) ||
+		receipt.OperationID != request.OperationID ||
+		receipt.MutationDigest != request.MutationDigest {
 		return protocol.MutationReceipt{}, nil, errors.New("mutation receipt did not echo the request identity")
 	}
 	wantStatus := resultHTTPStatus(expectedResult)
 	if status != wantStatus {
-		return protocol.MutationReceipt{}, nil, fmt.Errorf("mutation result %s returned HTTP %d, want %d", expectedResult, status, wantStatus)
+		return protocol.MutationReceipt{}, nil, fmt.Errorf(
+			"mutation result %s returned HTTP %d, want %d",
+			expectedResult,
+			status,
+			wantStatus,
+		)
 	}
 	return *receipt, body, nil
 }
 
-func getRecord(ctx context.Context, client *contractClient, binding protocol.Binding, upsertKey string) (*protocol.MemoryRecord, error) {
-	body, status, err := client.postJSON(ctx, protocol.PathRecordsGet, protocol.GetRequest{ProtocolVersion: protocol.Version, Binding: binding, UpsertKey: upsertKey})
+func getRecord(
+	ctx context.Context,
+	client *contractClient,
+	binding protocol.Binding,
+	upsertKey string,
+) (*protocol.MemoryRecord, error) {
+	body, status, err := client.postJSON(
+		ctx,
+		protocol.PathRecordsGet,
+		protocol.GetRequest{
+			ProtocolVersion: protocol.Version,
+			Binding:         binding,
+			UpsertKey:       upsertKey,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1125,7 +1299,12 @@ func getRecord(ctx context.Context, client *contractClient, binding protocol.Bin
 	return response.Record, nil
 }
 
-func lookupOperation(ctx context.Context, client *contractClient, binding protocol.Binding, operationID string) (*protocol.MutationReceipt, error) {
+func lookupOperation(
+	ctx context.Context,
+	client *contractClient,
+	binding protocol.Binding,
+	operationID string,
+) (*protocol.MutationReceipt, error) {
 	body, status, err := client.postJSON(ctx, protocol.PathOperationsGet, protocol.OperationLookupRequest{
 		ProtocolVersion: protocol.Version, Binding: binding, OperationID: operationID,
 	})
@@ -1145,7 +1324,11 @@ func lookupOperation(ctx context.Context, client *contractClient, binding protoc
 	return response.Receipt, nil
 }
 
-func search(ctx context.Context, client *contractClient, request protocol.SearchRequest) (*protocol.SearchResponse, error) {
+func search(
+	ctx context.Context,
+	client *contractClient,
+	request protocol.SearchRequest,
+) (*protocol.SearchResponse, error) {
 	body, status, err := client.postJSON(ctx, protocol.PathSearch, request)
 	if err != nil {
 		return nil, err
@@ -1167,7 +1350,11 @@ func search(ctx context.Context, client *contractClient, request protocol.Search
 		return nil, errors.New("search changed an explicit requested mode")
 	}
 	if len(response.Records) > request.PageSize {
-		return nil, fmt.Errorf("search returned %d records for requested pageSize %d", len(response.Records), request.PageSize)
+		return nil, fmt.Errorf(
+			"search returned %d records for requested pageSize %d",
+			len(response.Records),
+			request.PageSize,
+		)
 	}
 	if request.PageToken != "" && !response.Exhausted && !nextPageTokenFollows(request.PageToken, response.NextPageToken) {
 		return nil, errors.New("search continuation token did not advance within the same snapshot")
@@ -1178,7 +1365,10 @@ func search(ctx context.Context, client *contractClient, request protocol.Search
 func nextPageTokenFollows(current, next string) bool {
 	currentParts := strings.Split(current, ".")
 	nextParts := strings.Split(next, ".")
-	if len(currentParts) != 3 || len(nextParts) != 3 || currentParts[0] != nextParts[0] || currentParts[1] != nextParts[1] {
+	if len(currentParts) != 3 ||
+		len(nextParts) != 3 ||
+		currentParts[0] != nextParts[0] ||
+		currentParts[1] != nextParts[1] {
 		return false
 	}
 	currentOffset, currentErr := strconv.Atoi(currentParts[2])
@@ -1273,7 +1463,12 @@ func searchModeAdvertised(capabilities protocol.Capabilities, mode string) bool 
 	}
 }
 
-func collectSnapshot(ctx context.Context, client *contractClient, request protocol.SearchRequest, first *protocol.SearchResponse) ([]protocol.MemoryRecord, error) {
+func collectSnapshot(
+	ctx context.Context,
+	client *contractClient,
+	request protocol.SearchRequest,
+	first *protocol.SearchResponse,
+) ([]protocol.MemoryRecord, error) {
 	result := make([]protocol.MemoryRecord, 0, len(first.Records))
 	seenRecords := make(map[string]struct{}, len(first.Records))
 	if err := appendUniqueSnapshotRecords(&result, seenRecords, first.Records); err != nil {
@@ -1311,7 +1506,11 @@ type snapshotContinuation struct {
 	SnapshotExpiresAt time.Time
 }
 
-func collectContinuation(ctx context.Context, client *contractClient, request protocol.SearchRequest) (snapshotContinuation, error) {
+func collectContinuation(
+	ctx context.Context,
+	client *contractClient,
+	request protocol.SearchRequest,
+) (snapshotContinuation, error) {
 	result := make([]protocol.MemoryRecord, 0)
 	seenTokens := map[string]struct{}{request.PageToken: {}}
 	seenRecords := make(map[string]struct{})
@@ -1364,7 +1563,16 @@ func appendUniqueSnapshotRecords(
 	return nil
 }
 
-func makeMutation(binding protocol.Binding, operationID, memoryID, kind string, generation, expectedGeneration uint64, expectedVersion string, state *protocol.MutationState) (protocol.MutationEnvelope, error) {
+func makeMutation(
+	binding protocol.Binding,
+	operationID string,
+	memoryID string,
+	kind string,
+	generation uint64,
+	expectedGeneration uint64,
+	expectedVersion string,
+	state *protocol.MutationState,
+) (protocol.MutationEnvelope, error) {
 	request := protocol.MutationEnvelope{
 		ProtocolVersion: protocol.Version, OperationID: operationID, Binding: binding,
 		MemoryID: memoryID, Kind: kind, Generation: generation, ExpectedGeneration: expectedGeneration,
@@ -1482,7 +1690,11 @@ func cloneState(state *protocol.MutationState) *protocol.MutationState {
 	if state == nil {
 		return nil
 	}
-	return &protocol.MutationState{Content: state.Content, Tags: append([]string(nil), state.Tags...), Metadata: cloneMap(state.Metadata)}
+	return &protocol.MutationState{
+		Content:  state.Content,
+		Tags:     append([]string(nil), state.Tags...),
+		Metadata: cloneMap(state.Metadata),
+	}
 }
 
 func cloneMap(input map[string]string) map[string]string {

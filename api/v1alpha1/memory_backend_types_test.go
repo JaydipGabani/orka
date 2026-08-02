@@ -9,7 +9,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	omsprotocol "github.com/orka-agents/orka/internal/oms/protocol"
+	omsprotocol "github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 func TestMemoryBackendRequestedLifecycleDefaultsToStaged(t *testing.T) {

@@ -9,21 +9,18 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 VERSION_RE = re.compile(r"^v\d+\.\d+\.\d+(?:-(?:beta|rc)\.\d+)?$")
-PINNED_KD6_COMMIT = "042cff94bf82e92dea3a47f181121fd9cdcbc434"
 MEMORY_RELEASE_STAGE = "foundation"
 PUBLISHED_IMAGES = (
     ("controller", ""),
     ("ai-worker", "/ai-worker"),
     ("general-worker", "/general-worker"),
     ("agent-harness-wrapper", "/agent-harness-wrapper"),
-    ("oms-kd6-adapter", "/oms-kd6-adapter"),
 )
 HELM_IMAGE_REPOSITORIES = (
     "ghcr.io/orka-agents/orka",
     "ghcr.io/orka-agents/orka/ai-worker",
     "ghcr.io/orka-agents/orka/general-worker",
     "ghcr.io/orka-agents/orka/agent-harness-wrapper",
-    "ghcr.io/orka-agents/orka/oms-kd6-adapter",
 )
 HELM_IMAGE_TAG_REPLACEMENTS = len(PUBLISHED_IMAGES)
 
@@ -53,19 +50,6 @@ def parse_image_suffixes(block: str) -> list[tuple[str, str]]:
 
 
 def validate_release_image_contract(release_workflow: str) -> None:
-    pinned_commit_match = re.search(
-        r"^\s+KD6_PINNED_COMMIT:\s*([0-9a-f]{40})\s*$",
-        release_workflow,
-        flags=re.MULTILINE,
-    )
-    if pinned_commit_match is None or pinned_commit_match.group(1) != PINNED_KD6_COMMIT:
-        raise RuntimeError(f"release workflow must pin KD6 commit {PINNED_KD6_COMMIT}")
-    expected_kd6_image_binding = (
-        "ORKA_RELEASE_KD6_TEST_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}"
-        "/kd6-test@${{ vars.ORKA_RELEASE_KD6_TEST_IMAGE_DIGEST }}"
-    )
-    if expected_kd6_image_binding not in release_workflow:
-        raise RuntimeError("release workflow must bind KD6 conformance to the digest-pinned kd6-test image")
     release_stage_match = re.search(
         r"^\s+MEMORY_RELEASE_STAGE:\s*([^\s]+)\s*$",
         release_workflow,
@@ -171,7 +155,7 @@ def main() -> int:
         )
 
     # Keep the exact image names/suffixes in every publication stage synchronized
-    # with the chart's five-image release contract.
+    # with the chart's four-image release contract.
     release_workflow = (ROOT / ".github/workflows/release.yml").read_text()
     validate_release_image_contract(release_workflow)
 

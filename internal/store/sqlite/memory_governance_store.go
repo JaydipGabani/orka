@@ -20,9 +20,9 @@ import (
 
 	"github.com/google/uuid"
 
-	omsprotocol "github.com/orka-agents/orka/internal/oms/protocol"
 	"github.com/orka-agents/orka/internal/redact"
 	"github.com/orka-agents/orka/internal/store"
+	omsprotocol "github.com/orka-agents/orka/pkg/oms/protocol"
 )
 
 var _ store.GovernedMemoryStore = (*Store)(nil)

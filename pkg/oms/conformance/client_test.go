@@ -97,12 +97,17 @@ func TestContractClientPreservesAndValidatesClosedResponseHeaders(t *testing.T) 
 			}))
 			t.Cleanup(server.Close)
 			client, err := newContractClient(Target{
-				BaseURL: server.URL, AuthorizationValue: testAuthorizationToken, HTTPClient: server.Client(), InsecureLoopbackOnly: true,
+				BaseURL:              server.URL,
+				AuthorizationValue:   testAuthorizationToken,
+				HTTPClient:           server.Client(),
+				InsecureLoopbackOnly: true,
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			response, err := client.doResponse(context.Background(), http.MethodGet, "/v1/health", client.authorizationValue, nil, nil)
+			response, err := client.doResponse(
+				context.Background(), http.MethodGet, "/v1/health", client.authorizationValue, nil, nil,
+			)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("doResponse() error = %v, wantErr %v", err, tc.wantErr)
 			}
