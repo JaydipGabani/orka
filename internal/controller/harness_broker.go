@@ -481,9 +481,7 @@ func (r *TaskReconciler) handleHarnessBrokeredToolCall(
 			)
 		}
 	}
-	transactionIdentity, err := r.harnessBrokeredTransactionAuthorityIdentityFromSnapshot(
-		ctx, task, transactionToken, transactionScopes,
-	)
+	transactionIdentity, err := r.harnessBrokeredTransactionAuthorityIdentityFromSnapshot(ctx, task, transactionScopes)
 	if err != nil {
 		result.Error = brokeredToolError("transaction_authority_unavailable", err)
 		return result, r.recordHarnessBrokeredToolEvent(
@@ -681,17 +679,16 @@ func (r *TaskReconciler) harnessBrokeredTransactionAuthorityIdentity(
 	ctx context.Context,
 	task *corev1alpha1.Task,
 ) (map[string]any, error) {
-	token, scopes, err := r.harnessBrokeredTransactionAuthority(ctx, task)
+	_, scopes, err := r.harnessBrokeredTransactionAuthority(ctx, task)
 	if err != nil {
 		return nil, err
 	}
-	return r.harnessBrokeredTransactionAuthorityIdentityFromSnapshot(ctx, task, token, scopes)
+	return r.harnessBrokeredTransactionAuthorityIdentityFromSnapshot(ctx, task, scopes)
 }
 
 func (r *TaskReconciler) harnessBrokeredTransactionAuthorityIdentityFromSnapshot(
 	ctx context.Context,
 	task *corev1alpha1.Task,
-	token string,
 	scopes []string,
 ) (map[string]any, error) {
 	if task == nil || task.Spec.Transaction == nil {
@@ -704,10 +701,6 @@ func (r *TaskReconciler) harnessBrokeredTransactionAuthorityIdentityFromSnapshot
 		"contextDigest":          task.Spec.Transaction.ContextDigest,
 		"requesterContextDigest": task.Spec.Transaction.RequesterContextDigest,
 	}
-	if token != "" {
-		sum := sha256.Sum256([]byte(token))
-		identity["tokenDigest"] = hex.EncodeToString(sum[:])
-	}
 	if task.Annotations != nil {
 		if secretName := strings.TrimSpace(task.Annotations[labels.AnnotationTransactionTokenSecret]); secretName != "" {
 			secret := &corev1.Secret{}
@@ -719,7 +712,6 @@ func (r *TaskReconciler) harnessBrokeredTransactionAuthorityIdentityFromSnapshot
 				return nil, fmt.Errorf("resolve task transaction authority approval identity: %w", err)
 			}
 			identity["secretUID"] = string(secret.UID)
-			identity["secretResourceVersion"] = secret.ResourceVersion
 		}
 	}
 	if config := r.BrokeredTransactionExchange; config != nil {

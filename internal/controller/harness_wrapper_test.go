@@ -1190,6 +1190,80 @@ func TestHarnessWrapperBrokeredWriteToolRequestsApprovalThenExecutesAfterApprova
 	}
 }
 
+func TestHarnessWrapperBrokeredWriteApprovalSurvivesTaskTokenRotation(t *testing.T) {
+	var executions atomic.Int32
+	var transactionHeader atomic.Value
+	toolServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		executions.Add(1)
+		transactionHeader.Store(r.Header.Get(transactiontoken.HeaderName))
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer toolServer.Close()
+
+	task, agent := harnessWrapperTaskAndAgent()
+	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "runtime"}}
+	task.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"dispatch_work_order"}}
+	task.Spec.Transaction = &corev1alpha1.TaskTransaction{
+		ID: "txn-brokered-approval", Scope: "orka:tools:http", Scopes: []string{"orka:tools:http"},
+	}
+	const transactionSecretName = "brokered-task-token"
+	task.Annotations = map[string]string{labels.AnnotationTransactionTokenSecret: transactionSecretName}
+	transactionSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: transactionSecretName, Namespace: task.Namespace, UID: types.UID("uid-brokered-task-token"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: corev1alpha1.GroupVersion.String(), Kind: taskTransactionTokenOwnerKind,
+				Name: task.Name, UID: task.UID,
+			}},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{transactiontoken.TokenSecretKey: []byte("task-token-before-rotation")},
+	}
+	tool := &corev1alpha1.Tool{
+		ObjectMeta: metav1.ObjectMeta{Name: "dispatch_work_order", Namespace: task.Namespace, ResourceVersion: "1"},
+		Spec: corev1alpha1.ToolSpec{
+			Description:       "Dispatch technician",
+			BrokeredToolClass: corev1alpha1.AgentRuntimeBrokeredToolClassWrite,
+			HTTP:              &corev1alpha1.HTTPExecution{URL: toolServer.URL},
+		},
+	}
+	r := newUnitReconciler(newTestScheme(), task, agent, transactionSecret, tool)
+	frame := brokeredWriteFrame()
+
+	_, err := r.handleHarnessBrokeredToolCall(context.Background(), task, agent, frame)
+	if !errors.Is(err, errHarnessBrokeredApprovalPending) {
+		t.Fatalf("first handleHarnessBrokeredToolCall() error = %v, want pending", err)
+	}
+	approvalID := brokeredApprovalIDForTest(t, r, task)
+
+	rotated := &corev1.Secret{}
+	if err := r.Get(context.Background(), ctrlclient.ObjectKeyFromObject(transactionSecret), rotated); err != nil {
+		t.Fatal(err)
+	}
+	rotated.Data[transactiontoken.TokenSecretKey] = []byte("task-token-after-rotation")
+	if err := r.Update(context.Background(), rotated); err != nil {
+		t.Fatal(err)
+	}
+	appendApprovalDecisionForTest(t, r, task, approvalID, events.ExecutionEventTypeApprovalApproved)
+
+	result, err := r.handleHarnessBrokeredToolCall(context.Background(), task, agent, frame)
+	if err != nil || result.Error != nil {
+		t.Fatalf("approved handleHarnessBrokeredToolCall() = result:%#v err:%v", result, err)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("executions = %d, want 1", executions.Load())
+	}
+	if got, _ := transactionHeader.Load().(string); got != "task-token-after-rotation" {
+		t.Fatalf("Txn-Token header = %q, want rotated task token", got)
+	}
+	listed, err := r.ExecutionEventStore.ListExecutionEvents(context.Background(), store.ExecutionEventFilter{
+		Namespace: task.Namespace, StreamID: task.Name, EventTypes: []string{events.ExecutionEventTypeApprovalRequested},
+	})
+	if err != nil || len(listed) != 1 || listed[0].ToolCallID != approvalID {
+		t.Fatalf("approval requests after rotation = %#v, err = %v", listed, err)
+	}
+}
+
 func TestHarnessWrapperBrokeredWriteToolFailsClosedForUnresolvedExecutionLedger(t *testing.T) {
 	var executions atomic.Int32
 	toolServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
