@@ -62,6 +62,7 @@ func TestDirectTaskTransactionTokenRotatesBeyondOriginalTTL(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			task, secret, authority := renewableTaskTokenFixture(test.taskType)
+			markTaskTokenPendingForTest(task, start)
 			initialSubject := taskTokenJWTForTest(t, start.Add(5*time.Minute), "caller-authority")
 			authority.Data[transactiontoken.SubjectSecretKey] = []byte(initialSubject)
 			exchanger := &queuedTaskTokenExchanger{tokens: []string{
@@ -168,6 +169,7 @@ func requireRollingTaskTokenSubjects(
 func TestDelegatedServiceAccountRenewalChainsToTransactionTokenReplacement(t *testing.T) {
 	now := time.Now().UTC()
 	task, workload, _ := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	markTaskTokenPendingForTest(task, now)
 	authority := directTaskTokenAuthoritySecretWithTypeForTest(task, testRenewableSubjectToken, transactiontoken.SubjectTokenTypeAccessToken)
 	firstToken := taskTokenJWTForTest(t, now.Add(5*time.Minute), "service-account-child-1")
 	exchanger := &queuedTaskTokenExchanger{tokens: []string{
@@ -200,6 +202,7 @@ func TestDelegatedChildTransactionTokenRotatesBeyondTTL(t *testing.T) {
 	} {
 		t.Run(string(taskType), func(t *testing.T) {
 			task, _, _ := renewableTaskTokenFixture(taskType)
+			markTaskTokenPendingForTest(task, start)
 			task.Name = "delegated-" + string(taskType)
 			task.UID = types.UID("delegated-" + string(taskType) + "-uid")
 			const parentTaskName = "parent-task"
@@ -402,6 +405,7 @@ func TestJobBackedTaskTransactionTokenRequiresPropagationSafeLifetime(t *testing
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			task, workload, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+			markTaskTokenPendingForTest(task, now)
 			exchanger := &queuedTaskTokenExchanger{tokens: []string{
 				taskTokenJWTForTest(t, now.Add(test.lifetime), "projected-"+test.name),
 			}}
@@ -478,6 +482,175 @@ func TestPendingTaskTransactionTokenTransientInitialExchangeRetriesBeforeSetupDe
 	}
 }
 
+func TestPendingTaskTransactionTokenTransientAuthorityReadRetriesBeforeSetupDeadline(t *testing.T) {
+	pendingSince := time.Now().UTC().Add(-time.Second)
+	task, workload, authority := pendingDirectTaskTokenFixture(pendingSince)
+	exchanger := &queuedTaskTokenExchanger{}
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	installTaskTokenAuthorityListFailure(r, apierrors.NewServiceUnavailable("temporary apiserver failure"), 0)
+
+	result, err := r.handleTransactionTokenPending(t.Context(), task)
+	if err != nil {
+		t.Fatalf("handleTransactionTokenPending() error = %v", err)
+	}
+	if result.RequeueAfter <= 0 || result.RequeueAfter > time.Second {
+		t.Fatalf("RequeueAfter = %v, want retry within the pending setup deadline", result.RequeueAfter)
+	}
+	if exchanger.calls != 0 {
+		t.Fatalf("exchange calls = %d, want no exchange before authority validation", exchanger.calls)
+	}
+	updated := &corev1alpha1.Task{}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(task), updated); err != nil {
+		t.Fatalf("get pending Task: %v", err)
+	}
+	if updated.Status.Phase != corev1alpha1.TaskPhasePending || !taskTransactionTokenPending(updated) {
+		t.Fatalf("Task state = %s pending:%v, want blocked Pending Task", updated.Status.Phase, taskTransactionTokenPending(updated))
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(workload), &corev1.Secret{}); err != nil {
+		t.Fatalf("workload token Secret was removed: %v", err)
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(authority), &corev1.Secret{}); err != nil {
+		t.Fatalf("renewal authority Secret was removed: %v", err)
+	}
+}
+
+func TestPendingTaskTransactionTokenTransientAuthorityReadThatCrossesSetupDeadlineIsFatal(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	task, workload, authority := pendingDirectTaskTokenFixture(
+		now.Add(-taskTransactionTokenPendingTimeout + 50*time.Millisecond),
+	)
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	installTaskTokenAuthorityListFailure(r, apierrors.NewServiceUnavailable("temporary apiserver failure"), 100*time.Millisecond)
+
+	ready, fatal, err := r.reconcilePendingTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || ready {
+		t.Fatalf("deadline-crossing authority read = ready:%v fatal:%v err:%v", ready, fatal, err)
+	}
+}
+
+func TestPendingTaskTransactionTokenPermanentAuthorityReadFailsClosed(t *testing.T) {
+	task, workload, authority := pendingDirectTaskTokenFixture(time.Now().UTC().Add(-time.Second))
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	installTaskTokenAuthorityListFailure(
+		r,
+		apierrors.NewForbidden(schema.GroupResource{Resource: testSecretResourceName}, "", errors.New("forbidden")),
+		0,
+	)
+
+	if _, err := r.handleTransactionTokenPending(t.Context(), task); err != nil {
+		t.Fatalf("handleTransactionTokenPending() error = %v", err)
+	}
+	assertPendingTaskTransactionTokenFailedClosed(t, r, task, workload, authority)
+}
+
+func TestPendingTaskTransactionTokenTransientWorkloadReadRetriesBeforeSetupDeadline(t *testing.T) {
+	pendingSince := time.Now().UTC().Add(-time.Second)
+	task, workload, authority := pendingDirectTaskTokenFixture(pendingSince)
+	exchanger := &queuedTaskTokenExchanger{}
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	installTaskTokenPendingWorkloadReadFailure(
+		r, workload.Name, apierrors.NewServiceUnavailable("temporary apiserver failure"), 0,
+	)
+
+	result, err := r.handleTransactionTokenPending(t.Context(), task)
+	if err != nil {
+		t.Fatalf("handleTransactionTokenPending() error = %v", err)
+	}
+	if result.RequeueAfter <= 0 || result.RequeueAfter > time.Second {
+		t.Fatalf("RequeueAfter = %v, want retry within the pending setup deadline", result.RequeueAfter)
+	}
+	if exchanger.calls != 0 {
+		t.Fatalf("exchange calls = %d, want no exchange before workload Secret read", exchanger.calls)
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(workload), &corev1.Secret{}); err != nil {
+		t.Fatalf("workload token Secret was removed: %v", err)
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(authority), &corev1.Secret{}); err != nil {
+		t.Fatalf("renewal authority Secret was removed: %v", err)
+	}
+}
+
+func TestPendingTaskTransactionTokenPermanentWorkloadReadFailsClosed(t *testing.T) {
+	task, workload, authority := pendingDirectTaskTokenFixture(time.Now().UTC().Add(-time.Second))
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	installTaskTokenPendingWorkloadReadFailure(
+		r,
+		workload.Name,
+		apierrors.NewForbidden(schema.GroupResource{Resource: testSecretResourceName}, workload.Name, errors.New("forbidden")),
+		0,
+	)
+
+	if _, err := r.handleTransactionTokenPending(t.Context(), task); err != nil {
+		t.Fatalf("handleTransactionTokenPending() error = %v", err)
+	}
+	assertPendingTaskTransactionTokenFailedClosed(t, r, task, workload, authority)
+}
+
+func TestPendingTaskTransactionTokenWorkloadReadThatCrossesSetupDeadlineIsFatal(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	task, workload, authority := pendingDirectTaskTokenFixture(
+		now.Add(-taskTransactionTokenPendingTimeout + 50*time.Millisecond),
+	)
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	installTaskTokenPendingWorkloadReadFailure(
+		r, workload.Name, apierrors.NewServiceUnavailable("temporary apiserver failure"), 100*time.Millisecond,
+	)
+
+	ready, fatal, err := r.reconcilePendingTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || ready {
+		t.Fatalf("deadline-crossing workload read = ready:%v fatal:%v err:%v", ready, fatal, err)
+	}
+}
+
+func TestPendingTaskTransactionTokenRequeueUsesPostReadDeadline(t *testing.T) {
+	pendingSince := time.Now().UTC().Add(-taskTransactionTokenPendingTimeout + 2*time.Second)
+	task, workload, authority := pendingDirectTaskTokenFixture(pendingSince)
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	installTaskTokenPendingWorkloadReadFailure(
+		r, workload.Name, apierrors.NewServiceUnavailable("temporary apiserver failure"), 1200*time.Millisecond,
+	)
+
+	result, err := r.handleTransactionTokenPending(t.Context(), task)
+	if err != nil {
+		t.Fatalf("handleTransactionTokenPending() error = %v", err)
+	}
+	if result.RequeueAfter <= 0 || result.RequeueAfter > 900*time.Millisecond {
+		t.Fatalf("RequeueAfter = %v, want post-read remainder of the setup deadline", result.RequeueAfter)
+	}
+}
+
+func TestPendingTaskTransactionTokenTransientInitialPersistenceRetriesBeforeSetupDeadline(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	pendingSince := now.Add(-time.Second)
+	task, workload, authority := pendingDirectTaskTokenFixture(pendingSince)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{
+		taskTokenJWTForTest(t, now.Add(5*time.Minute), "transient-initial-persistence"),
+	}}
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	installTaskTokenWorkloadUpdateFailure(r, workload.Name, apierrors.NewServiceUnavailable("temporary apiserver failure"), 0, false)
+
+	result, err := r.handleTransactionTokenPending(t.Context(), task)
+	if err != nil {
+		t.Fatalf("handleTransactionTokenPending() error = %v", err)
+	}
+	if result.RequeueAfter <= 0 || result.RequeueAfter > time.Second {
+		t.Fatalf("RequeueAfter = %v, want retry within the pending setup deadline", result.RequeueAfter)
+	}
+	if exchanger.calls != 1 {
+		t.Fatalf("exchange calls = %d, want 1", exchanger.calls)
+	}
+	current := currentTaskTokenSecret(t, r, task)
+	if token := strings.TrimSpace(string(current.Data[transactiontoken.TokenSecretKey])); token != "" {
+		t.Fatal("transient initial persistence failure published a workload token")
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(authority), &corev1.Secret{}); err != nil {
+		t.Fatalf("renewal authority Secret was removed: %v", err)
+	}
+}
+
 func TestPendingTaskTransactionTokenSuccessfulInitialExchangeWithMalformedDeadlineFailsClosed(t *testing.T) {
 	for _, value := range []string{"not-a-time", "   "} {
 		t.Run(strconv.Quote(value), func(t *testing.T) {
@@ -515,6 +688,54 @@ func TestPendingTaskTransactionTokenTransientInitialExchangeWithoutDeadlineFails
 	ready, fatal, err := r.reconcilePendingTaskTransactionToken(t.Context(), task, time.Now().UTC())
 	if err == nil || !fatal || ready {
 		t.Fatalf("missing-deadline transient exchange = ready:%v fatal:%v err:%v", ready, fatal, err)
+	}
+	if exchanger.calls != 0 {
+		t.Fatalf("exchange calls = %d, want no exchange without a setup deadline", exchanger.calls)
+	}
+}
+
+func TestPendingTaskTransactionTokenExistingTokenWithoutDeadlineFailsClosed(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	task, workload, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	task.Status.Phase = corev1alpha1.TaskPhasePending
+	task.Annotations[labels.AnnotationTransactionTokenPending] = scheduledRunLabelValue
+	delete(task.Annotations, labels.AnnotationTransactionTokenPendingSince)
+	setRenewableTaskTokenSecret(
+		workload,
+		taskTokenJWTForTest(t, now.Add(5*time.Minute), task.Name),
+		now.Add(time.Minute),
+		1,
+	)
+	exchanger := &queuedTaskTokenExchanger{}
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+
+	ready, fatal, err := r.reconcilePendingTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || ready {
+		t.Fatalf("missing-deadline existing-token state: ready:%v fatal:%v err:%v", ready, fatal, err)
+	}
+	if exchanger.calls != 0 {
+		t.Fatalf("exchange calls = %d, want no rotation without a setup deadline", exchanger.calls)
+	}
+}
+
+func TestPendingExistingTaskTransactionTokenFailsClosedAtSetupDeadline(t *testing.T) {
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	task, workload, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	setRenewableTaskTokenSecret(
+		workload,
+		taskTokenJWTForTest(t, now.Add(5*time.Minute), task.Name),
+		now.Add(time.Minute),
+		1,
+	)
+	taskToken := string(workload.Data[transactiontoken.TokenSecretKey])
+	r := newUnitReconciler(newTestScheme(), task, workload, authority)
+
+	ready, fatal, err := r.reconcilePendingExistingTaskTransactionToken(
+		t.Context(), task, authority, workload, taskToken, now, func() time.Time { return now },
+	)
+	if err == nil || !fatal || ready {
+		t.Fatalf("deadline existing-token state: ready:%v fatal:%v err:%v", ready, fatal, err)
 	}
 }
 
@@ -902,6 +1123,234 @@ func TestActiveTaskTransactionTokenTransientRefreshFailurePreservesTaskAndRequeu
 	}
 }
 
+func TestActiveTaskTransactionTokenTransientPersistenceFailurePreservesTaskAndRequeues(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	previousToken := taskTokenJWTForTest(t, now.Add(time.Minute), "transient-persistence-previous")
+	setRenewableTaskTokenSecret(secret, previousToken, now.Add(-time.Second), 1)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{
+		taskTokenJWTForTest(t, now.Add(5*time.Minute), "transient-persistence-intended"),
+	}}
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	installTaskTokenWorkloadUpdateFailure(r, secret.Name, apierrors.NewServiceUnavailable("temporary apiserver failure"), 0, false)
+	handlerCalled := false
+
+	result, err := r.handleWithTaskTransactionTokenRefresh(
+		t.Context(), task,
+		func(context.Context, *corev1alpha1.Task) (ctrl.Result, error) {
+			handlerCalled = true
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("handleWithTaskTransactionTokenRefresh() error = %v", err)
+	}
+	if handlerCalled {
+		t.Fatal("task execution handler ran before transient token persistence was retried")
+	}
+	if result.RequeueAfter <= 0 || result.RequeueAfter > taskTokenTransientRetryDelay {
+		t.Fatalf("RequeueAfter = %v, want bounded transient persistence retry", result.RequeueAfter)
+	}
+	current := currentTaskTokenSecret(t, r, task)
+	if got := string(current.Data[transactiontoken.TokenSecretKey]); got != previousToken {
+		t.Fatal("transient persistence failure replaced the still-valid token")
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(authority), &corev1.Secret{}); err != nil {
+		t.Fatalf("renewal authority Secret was removed: %v", err)
+	}
+}
+
+func TestActiveTaskTransactionTokenAmbiguousPersistenceConfirmsCompletedRotation(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	previousToken := taskTokenJWTForTest(t, now.Add(time.Minute), "ambiguous-persistence-previous")
+	intendedToken := taskTokenJWTForTest(t, now.Add(5*time.Minute), "ambiguous-persistence-intended")
+	setRenewableTaskTokenSecret(secret, previousToken, now.Add(-time.Second), 1)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{intendedToken}}
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	installTaskTokenWorkloadUpdateFailure(r, secret.Name, io.ErrUnexpectedEOF, 0, true)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err != nil || fatal || refreshAfter <= 0 {
+		t.Fatalf("ambiguous completed persistence = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+	current := currentTaskTokenSecret(t, r, task)
+	if got := string(current.Data[transactiontoken.TokenSecretKey]); got != intendedToken {
+		t.Fatal("ambiguous persistence confirmation did not preserve the completed rotation")
+	}
+	if got := string(current.Data[taskTokenGenerationSecretKey]); got != "2" {
+		t.Fatalf("token generation = %q, want confirmed generation 2", got)
+	}
+}
+
+func TestActiveTaskTransactionTokenTransientPersistenceThatCrossesExpiryIsFatal(t *testing.T) {
+	expiresAt := time.Date(2026, time.August, 2, 12, 0, 1, 0, time.UTC)
+	now := expiresAt.Add(-50 * time.Millisecond)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	previousToken := taskTokenJWTForTest(t, expiresAt, "persistence-expires-previous")
+	setRenewableTaskTokenSecret(secret, previousToken, now.Add(-time.Second), 1)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{
+		taskTokenJWTForTest(t, expiresAt.Add(5*time.Minute), "persistence-expires-intended"),
+	}}
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	installTaskTokenWorkloadUpdateFailure(r, secret.Name, apierrors.NewServiceUnavailable("temporary apiserver failure"), 100*time.Millisecond, false)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || refreshAfter != 0 {
+		t.Fatalf("expiry-crossing persistence = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+	current := currentTaskTokenSecret(t, r, task)
+	if got := string(current.Data[transactiontoken.TokenSecretKey]); got != previousToken {
+		t.Fatal("expiry-crossing persistence failure replaced the previous token")
+	}
+}
+
+func TestActiveTaskTransactionTokenSecondPersistenceFailureRetriesBeforeExpiry(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	previousToken := taskTokenJWTForTest(t, now.Add(time.Minute), "second-persistence-previous")
+	setRenewableTaskTokenSecret(secret, previousToken, now.Add(-time.Second), 1)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{
+		taskTokenJWTForTest(t, now.Add(5*time.Minute), "second-persistence-intended"),
+	}}
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	installTaskTokenWorkloadUpdateOutcomes(
+		r,
+		secret.Name,
+		taskTokenUpdateOutcome{err: apierrors.NewConflict(
+			schema.GroupResource{Resource: testSecretResourceName}, secret.Name, errors.New("resource version changed"),
+		)},
+		taskTokenUpdateOutcome{err: apierrors.NewServiceUnavailable("temporary apiserver failure")},
+	)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err == nil || fatal || refreshAfter <= 0 || refreshAfter > taskTokenTransientRetryDelay {
+		t.Fatalf("second persistence failure = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+	current := currentTaskTokenSecret(t, r, task)
+	if got := string(current.Data[transactiontoken.TokenSecretKey]); got != previousToken {
+		t.Fatal("second persistence failure replaced the previous token")
+	}
+}
+
+func TestActiveTaskTransactionTokenAmbiguousSecondPersistenceConfirmsCompletedRotation(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	previousToken := taskTokenJWTForTest(t, now.Add(time.Minute), "ambiguous-second-previous")
+	intendedToken := taskTokenJWTForTest(t, now.Add(5*time.Minute), "ambiguous-second-intended")
+	setRenewableTaskTokenSecret(secret, previousToken, now.Add(-time.Second), 1)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{intendedToken}}
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	installTaskTokenWorkloadUpdateOutcomes(
+		r,
+		secret.Name,
+		taskTokenUpdateOutcome{err: apierrors.NewConflict(
+			schema.GroupResource{Resource: testSecretResourceName}, secret.Name, errors.New("resource version changed"),
+		)},
+		taskTokenUpdateOutcome{err: io.ErrUnexpectedEOF, applyBeforeError: true},
+	)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err != nil || fatal || refreshAfter <= 0 {
+		t.Fatalf("ambiguous second persistence = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+	current := currentTaskTokenSecret(t, r, task)
+	if got := string(current.Data[transactiontoken.TokenSecretKey]); got != intendedToken {
+		t.Fatal("ambiguous second persistence confirmation did not preserve the completed rotation")
+	}
+}
+
+func TestActiveTaskTransactionTokenRepeatedConflictRetriesBeforeExpiry(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	previousToken := taskTokenJWTForTest(t, now.Add(time.Minute), "repeated-conflict-previous")
+	setRenewableTaskTokenSecret(secret, previousToken, now.Add(-time.Second), 1)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{
+		taskTokenJWTForTest(t, now.Add(5*time.Minute), "repeated-conflict-intended"),
+	}}
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	conflict := func() error {
+		return apierrors.NewConflict(
+			schema.GroupResource{Resource: testSecretResourceName}, secret.Name, errors.New("resource version changed"),
+		)
+	}
+	installTaskTokenWorkloadUpdateOutcomes(
+		r,
+		secret.Name,
+		taskTokenUpdateOutcome{err: conflict()},
+		taskTokenUpdateOutcome{err: conflict()},
+	)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err == nil || fatal || refreshAfter <= 0 || refreshAfter > taskTokenTransientRetryDelay {
+		t.Fatalf("repeated conflict = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+}
+
+func TestActiveTaskTransactionTokenPermanentFinalConflictReadRemainsFatal(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	previousToken := taskTokenJWTForTest(t, now.Add(time.Minute), "permanent-final-read-previous")
+	setRenewableTaskTokenSecret(secret, previousToken, now.Add(-time.Second), 1)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{
+		taskTokenJWTForTest(t, now.Add(5*time.Minute), "permanent-final-read-intended"),
+	}}
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	conflict := func() error {
+		return apierrors.NewConflict(
+			schema.GroupResource{Resource: testSecretResourceName}, secret.Name, errors.New("resource version changed"),
+		)
+	}
+	installTaskTokenWorkloadUpdateOutcomes(
+		r,
+		secret.Name,
+		taskTokenUpdateOutcome{err: conflict()},
+		taskTokenUpdateOutcome{err: conflict()},
+	)
+	installTaskTokenFreshReadFailure(
+		r,
+		secret.Name,
+		3,
+		apierrors.NewForbidden(schema.GroupResource{Resource: testSecretResourceName}, secret.Name, errors.New("forbidden")),
+	)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || refreshAfter != 0 {
+		t.Fatalf("permanent final conflict read = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+}
+
+func TestActiveTaskTransactionTokenPermanentPersistenceFailureRemainsFatal(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	task, secret, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	previousToken := taskTokenJWTForTest(t, now.Add(time.Minute), "permanent-persistence-previous")
+	setRenewableTaskTokenSecret(secret, previousToken, now.Add(-time.Second), 1)
+	exchanger := &queuedTaskTokenExchanger{tokens: []string{
+		taskTokenJWTForTest(t, now.Add(5*time.Minute), "permanent-persistence-intended"),
+	}}
+	r := newUnitReconciler(newTestScheme(), task, secret, authority)
+	r.BrokeredTransactionExchange = testTaskTransactionExchangeConfig(exchanger)
+	installTaskTokenWorkloadUpdateFailure(
+		r,
+		secret.Name,
+		apierrors.NewForbidden(schema.GroupResource{Resource: testSecretResourceName}, secret.Name, errors.New("forbidden")),
+		0,
+		false,
+	)
+
+	refreshAfter, fatal, err := r.reconcileActiveTaskTransactionToken(t.Context(), task, now)
+	if err == nil || !fatal || refreshAfter != 0 {
+		t.Fatalf("permanent persistence failure = after:%v fatal:%v err:%v", refreshAfter, fatal, err)
+	}
+}
+
 func TestActiveTaskTransactionTokenTransientFailureThatCrossesExpiryIsFatal(t *testing.T) {
 	expiresAt := time.Date(2026, time.August, 2, 12, 0, 1, 0, time.UTC)
 	now := expiresAt.Add(-50 * time.Millisecond)
@@ -1017,10 +1466,17 @@ func renewableTaskTokenFixture(taskType corev1alpha1.TaskType) (*corev1alpha1.Ta
 
 func pendingDirectTaskTokenFixture(pendingSince time.Time) (*corev1alpha1.Task, *corev1.Secret, *corev1.Secret) {
 	task, workload, authority := renewableTaskTokenFixture(corev1alpha1.TaskTypeAI)
+	markTaskTokenPendingForTest(task, pendingSince)
+	return task, workload, authority
+}
+
+func markTaskTokenPendingForTest(task *corev1alpha1.Task, pendingSince time.Time) {
 	task.Status.Phase = corev1alpha1.TaskPhasePending
+	if task.Annotations == nil {
+		task.Annotations = map[string]string{}
+	}
 	task.Annotations[labels.AnnotationTransactionTokenPending] = scheduledRunLabelValue
 	task.Annotations[labels.AnnotationTransactionTokenPendingSince] = pendingSince.Format(time.RFC3339Nano)
-	return task, workload, authority
 }
 
 func assertPendingTaskTransactionTokenFailedClosed(
@@ -1134,6 +1590,7 @@ func installTaskTokenAuthorityReadFailure(
 	getDelay, listDelay time.Duration,
 ) {
 	base := r.Client.(client.WithWatch)
+	interceptedList := false
 	r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
 			if _, ok := object.(*corev1.Secret); ok && getDelay > 0 {
@@ -1142,9 +1599,10 @@ func installTaskTokenAuthorityReadFailure(
 			return c.Get(ctx, key, object, opts...)
 		},
 		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if _, ok := list.(*corev1.SecretList); !ok {
+			if _, ok := list.(*corev1.SecretList); !ok || interceptedList {
 				return c.List(ctx, list, opts...)
 			}
+			interceptedList = true
 			if listDelay > 0 {
 				time.Sleep(listDelay)
 			}
@@ -1152,6 +1610,106 @@ func installTaskTokenAuthorityReadFailure(
 				return listErr
 			}
 			return c.List(ctx, list, opts...)
+		},
+	})
+}
+
+func installTaskTokenPendingWorkloadReadFailure(
+	r *TaskReconciler,
+	secretName string,
+	getErr error,
+	delay time.Duration,
+) {
+	base := r.Client.(client.WithWatch)
+	interceptedGet := false
+	r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
+			if _, ok := object.(*corev1.Secret); !ok || key.Name != secretName || interceptedGet {
+				return c.Get(ctx, key, object, opts...)
+			}
+			interceptedGet = true
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			if getErr != nil {
+				return getErr
+			}
+			return c.Get(ctx, key, object, opts...)
+		},
+	})
+}
+
+func installTaskTokenWorkloadUpdateFailure(
+	r *TaskReconciler,
+	secretName string,
+	updateErr error,
+	delay time.Duration,
+	applyBeforeError bool,
+) {
+	installTaskTokenWorkloadUpdateOutcomes(r, secretName, taskTokenUpdateOutcome{
+		err: updateErr, delay: delay, applyBeforeError: applyBeforeError,
+	})
+}
+
+type taskTokenUpdateOutcome struct {
+	err              error
+	delay            time.Duration
+	applyBeforeError bool
+}
+
+func installTaskTokenWorkloadUpdateOutcomes(
+	r *TaskReconciler,
+	secretName string,
+	outcomes ...taskTokenUpdateOutcome,
+) {
+	base := r.Client.(client.WithWatch)
+	r.APIReader = base
+	attempt := 0
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, object client.Object, opts ...client.UpdateOption) error {
+			secret, ok := object.(*corev1.Secret)
+			if !ok || secret.Name != secretName || attempt >= len(outcomes) {
+				return c.Update(ctx, object, opts...)
+			}
+			outcome := outcomes[attempt]
+			attempt++
+			if outcome.delay > 0 {
+				time.Sleep(outcome.delay)
+			}
+			if outcome.applyBeforeError {
+				if err := c.Update(ctx, object, opts...); err != nil {
+					return err
+				}
+			}
+			return outcome.err
+		},
+	})
+}
+
+func installTaskTokenFreshReadFailure(
+	r *TaskReconciler,
+	secretName string,
+	failAt int,
+	readErr error,
+) {
+	base := r.APIReader.(client.WithWatch)
+	reads := 0
+	r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
+			if _, ok := object.(*corev1.Secret); !ok || key.Name != secretName {
+				return c.Get(ctx, key, object, opts...)
+			}
+			reads++
+			if reads == failAt {
+				return readErr
+			}
+			return c.Get(ctx, key, object, opts...)
 		},
 	})
 }
@@ -1227,6 +1785,7 @@ func TestTaskTransactionTokenRotationUsesPersistedSubjectTypeAcrossRollout(t *te
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			task, workload, _ := renewableTaskTokenFixture(corev1alpha1.TaskTypeAgent)
+			markTaskTokenPendingForTest(task, now)
 			authority := directTaskTokenAuthoritySecretWithTypeForTest(task, testRenewableSubjectToken, tt.persistedType)
 			exchanger := &queuedTaskTokenExchanger{tokens: []string{taskTokenJWTForTest(t, now.Add(5*time.Minute), tt.name)}}
 			// A new reconciler models controller restart after the global tokenSource rollout.

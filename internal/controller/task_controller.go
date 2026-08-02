@@ -743,7 +743,8 @@ func (r *TaskReconciler) handleTransactionTokenPending(ctx context.Context, task
 		return r.handlePending(ctx, task)
 	}
 
-	requeueAfter := min(taskTransactionTokenPendingTimeout-elapsed, time.Second)
+	remaining := time.Until(since.Add(taskTransactionTokenPendingTimeout))
+	requeueAfter := max(min(remaining, time.Second), time.Nanosecond)
 	log.Info("task is waiting for transaction token setup", "pendingSince", since)
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }

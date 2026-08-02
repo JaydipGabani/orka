@@ -111,7 +111,7 @@ func taskTokenTransientExchangeFailure(err error) bool {
 	return exchangeFailure.err.Error() == taskTokenEndpointRequestFailed
 }
 
-func taskTokenTransientKubernetesReadFailure(err error) bool {
+func taskTokenTransientKubernetesFailure(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false
 	}
@@ -172,21 +172,33 @@ func (r *TaskReconciler) reconcilePendingTaskTransactionToken(
 	now time.Time,
 ) (ready bool, fatal bool, err error) {
 	reconcileStartedAt := time.Now()
-	pendingTimestamp := ""
-	if task != nil && task.Annotations != nil {
-		pendingTimestamp = task.Annotations[labels.AnnotationTransactionTokenPendingSince]
+	currentTime := func() time.Time {
+		return now.Add(time.Since(reconcileStartedAt))
 	}
 	pendingSince, pendingErr := transactionTokenPendingSince(task)
-	missingPendingTimestamp := pendingTimestamp == ""
-	if pendingErr != nil && !missingPendingTimestamp {
+	if pendingErr != nil {
 		return false, true, pendingErr
 	}
-	workloadSecret, wait, err := r.pendingTaskTransactionTokenSecret(ctx, task)
-	if err != nil || wait {
-		if missingPendingTimestamp {
-			return false, true, pendingErr
+	setupDeadline := pendingSince.Add(taskTransactionTokenPendingTimeout)
+	remaining := setupDeadline.Sub(currentTime())
+	if remaining <= 0 {
+		return false, true, errors.New("task transaction token setup deadline elapsed before reading workload token")
+	}
+	setupCtx, cancelSetup := context.WithTimeout(ctx, remaining)
+	defer cancelSetup()
+	workloadSecret, wait, err := r.pendingTaskTransactionTokenSecret(setupCtx, task)
+	observedNow := currentTime()
+	if !observedNow.Before(setupDeadline) {
+		return false, true, errors.New("task transaction token setup deadline elapsed while reading workload token")
+	}
+	if err != nil {
+		if taskTokenTransientKubernetesFailure(err) {
+			return false, false, nil
 		}
-		return false, false, err
+		return false, true, err
+	}
+	if wait {
+		return false, false, nil
 	}
 	taskToken := strings.TrimSpace(string(workloadSecret.Data[transactiontoken.TokenSecretKey]))
 	directWorkload := directTaskTokenWorkloadSecret(task, workloadSecret)
@@ -205,56 +217,118 @@ func (r *TaskReconciler) reconcilePendingTaskTransactionToken(
 		return false, true, errors.New("task transaction token Secret has an invalid type")
 	}
 	if !directWorkload {
+		if !currentTime().Before(setupDeadline) {
+			return false, true, errors.New("task transaction token setup deadline elapsed before delegated token became ready")
+		}
 		return taskToken != "", false, nil
 	}
-	authoritySecret, err := r.taskTransactionRenewalAuthoritySecret(ctx, task)
+	authoritySecret, retry, err := r.pendingTaskTransactionRenewalAuthority(
+		setupCtx, task, setupDeadline, currentTime,
+	)
 	if err != nil {
 		return false, true, err
 	}
+	if retry {
+		return false, false, nil
+	}
 	if taskToken != "" {
-		expiresAt, refreshAt, stateErr := renewableTaskTokenState(workloadSecret, taskToken)
-		if stateErr != nil {
-			return false, true, stateErr
+		return r.reconcilePendingExistingTaskTransactionToken(
+			setupCtx, task, authoritySecret, workloadSecret, taskToken, setupDeadline, currentTime,
+		)
+	}
+	return r.reconcilePendingInitialTaskTransactionToken(
+		setupCtx, task, authoritySecret, workloadSecret, setupDeadline, currentTime,
+	)
+}
+
+func (r *TaskReconciler) pendingTaskTransactionRenewalAuthority(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	setupDeadline time.Time,
+	currentTime func() time.Time,
+) (*corev1.Secret, bool, error) {
+	authoritySecret, err := r.taskTransactionRenewalAuthoritySecret(ctx, task)
+	observedNow := currentTime()
+	if err != nil {
+		if taskTokenTransientKubernetesFailure(err) && observedNow.Before(setupDeadline) {
+			// The Task has no usable or refreshable workload token until the
+			// controller-only authority is validated, so keep execution blocked
+			// and retry within the bounded setup window.
+			return nil, true, nil
 		}
-		if !expiresAt.After(now) {
-			return false, true, errors.New("task-bound transaction token expired before setup completed")
+		if !observedNow.Before(setupDeadline) {
+			return nil, false, errors.New("task transaction token setup deadline elapsed while reading renewal authority")
 		}
-		if !now.Before(refreshAt) {
-			if _, rotateErr := r.rotateTaskTransactionToken(ctx, task, authoritySecret, workloadSecret, now); rotateErr != nil {
-				return false, !taskTokenRetryable(rotateErr), rotateErr
-			}
-		}
+		return nil, false, err
+	}
+	if !observedNow.Before(setupDeadline) {
+		return nil, false, errors.New("task transaction token setup deadline elapsed while reading renewal authority")
+	}
+	return authoritySecret, false, nil
+}
+
+func (r *TaskReconciler) reconcilePendingExistingTaskTransactionToken(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	authoritySecret, workloadSecret *corev1.Secret,
+	taskToken string,
+	setupDeadline time.Time,
+	currentTime func() time.Time,
+) (bool, bool, error) {
+	expiresAt, refreshAt, err := renewableTaskTokenState(workloadSecret, taskToken)
+	if err != nil {
+		return false, true, err
+	}
+	observedNow := currentTime()
+	if !observedNow.Before(setupDeadline) {
+		return false, true, errors.New("task transaction token setup deadline elapsed before existing token became ready")
+	}
+	if !expiresAt.After(observedNow) {
+		return false, true, errors.New("task-bound transaction token expired before setup completed")
+	}
+	if observedNow.Before(refreshAt) {
 		return true, false, nil
 	}
-	setupDeadline := time.Time{}
-	exchangeCtx := ctx
-	cancelExchange := func() {}
-	if pendingErr == nil {
-		setupDeadline = pendingSince.Add(taskTransactionTokenPendingTimeout)
-		remaining := setupDeadline.Sub(now.Add(time.Since(reconcileStartedAt)))
-		if remaining <= 0 {
-			return false, true, errors.New("task transaction token setup deadline elapsed before exchange")
-		}
-		exchangeCtx, cancelExchange = context.WithTimeout(ctx, remaining)
-	}
-	_, err = r.rotateTaskTransactionToken(exchangeCtx, task, authoritySecret, workloadSecret, now)
-	cancelExchange()
-	rotationFinishedAt := now.Add(time.Since(reconcileStartedAt))
+	_, err = r.rotateTaskTransactionToken(ctx, task, authoritySecret, workloadSecret, observedNow)
+	rotationFinishedAt := currentTime()
 	if !setupDeadline.IsZero() && !rotationFinishedAt.Before(setupDeadline) {
+		return false, true, errors.New("task transaction token setup deadline elapsed during rotation")
+	}
+	if err == nil {
+		return true, false, nil
+	}
+	if (taskTokenTransientExchangeFailure(err) || taskTokenTransientKubernetesFailure(err) || taskTokenRetryable(err)) &&
+		expiresAt.After(rotationFinishedAt) &&
+		(setupDeadline.IsZero() || rotationFinishedAt.Before(setupDeadline)) {
+		return false, false, nil
+	}
+	return false, true, err
+}
+
+func (r *TaskReconciler) reconcilePendingInitialTaskTransactionToken(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	authoritySecret, workloadSecret *corev1.Secret,
+	setupDeadline time.Time,
+	currentTime func() time.Time,
+) (bool, bool, error) {
+	if !currentTime().Before(setupDeadline) {
+		return false, true, errors.New("task transaction token setup deadline elapsed before exchange")
+	}
+	_, err := r.rotateTaskTransactionToken(ctx, task, authoritySecret, workloadSecret, currentTime())
+	rotationFinishedAt := currentTime()
+	if !rotationFinishedAt.Before(setupDeadline) {
 		return false, true, errors.New("task transaction token setup deadline elapsed during exchange")
 	}
-	if err != nil {
-		if taskTokenTransientExchangeFailure(err) {
-			if pendingErr != nil {
-				return false, true, pendingErr
-			}
-			// The Task has no usable workload token yet, so keep execution blocked
-			// and let the pending handler retry within its bounded setup window.
-			return false, false, nil
-		}
-		return false, !taskTokenRetryable(err), err
+	if err == nil {
+		return true, false, nil
 	}
-	return true, false, nil
+	if taskTokenTransientExchangeFailure(err) || taskTokenTransientKubernetesFailure(err) || taskTokenRetryable(err) {
+		// The Task has no usable workload token yet, so keep execution blocked
+		// and let the pending handler retry within its bounded setup window.
+		return false, false, nil
+	}
+	return false, true, err
 }
 
 func (r *TaskReconciler) pendingTaskTransactionTokenSecret(
@@ -502,6 +576,15 @@ func (r *TaskReconciler) persistTaskTokenRotation(
 	if err := r.Update(ctx, intended); err == nil {
 		return intendedRefresh, nil
 	} else if !apierrors.IsConflict(err) {
+		if taskTokenTransientKubernetesFailure(err) {
+			refreshAt, complete, readErr := r.confirmTaskTokenRotation(ctx, task, intended.Name, intendedGeneration)
+			if readErr == nil && complete {
+				return refreshAt, nil
+			}
+			if readErr != nil && !taskTokenTransientKubernetesFailure(readErr) {
+				return time.Time{}, fmt.Errorf("confirming task-bound transaction token persistence: %w", readErr)
+			}
+		}
 		return time.Time{}, fmt.Errorf("persisting task-bound transaction token: %w", err)
 	}
 	fresh, err := r.freshTaskTokenWorkloadSecret(ctx, task, intended.Name)
@@ -519,15 +602,42 @@ func (r *TaskReconciler) persistTaskTokenRotation(
 	if err := r.Update(ctx, fresh); err == nil {
 		return intendedRefresh, nil
 	} else if !apierrors.IsConflict(err) {
+		if taskTokenTransientKubernetesFailure(err) {
+			refreshAt, complete, readErr := r.confirmTaskTokenRotation(ctx, task, intended.Name, intendedGeneration)
+			if readErr == nil && complete {
+				return refreshAt, nil
+			}
+			if readErr != nil && !taskTokenTransientKubernetesFailure(readErr) {
+				return time.Time{}, fmt.Errorf("confirming retried task-bound transaction token persistence: %w", readErr)
+			}
+		}
 		return time.Time{}, fmt.Errorf("retrying task-bound transaction token persistence: %w", err)
 	}
 	latest, readErr := r.freshTaskTokenWorkloadSecret(ctx, task, intended.Name)
-	if readErr == nil {
-		if refreshAt, complete := completedTaskTokenRotation(latest, intendedGeneration); complete {
-			return refreshAt, nil
+	if readErr != nil {
+		if taskTokenTransientKubernetesFailure(readErr) {
+			return time.Time{}, taskTokenOptimisticRetryError{err: readErr}
 		}
+		return time.Time{}, fmt.Errorf("confirming task token rotation after repeated conflict: %w", readErr)
+	}
+	if refreshAt, complete := completedTaskTokenRotation(latest, intendedGeneration); complete {
+		return refreshAt, nil
 	}
 	return time.Time{}, taskTokenOptimisticRetryError{err: errors.New("task token rotation conflict requires retry")}
+}
+
+func (r *TaskReconciler) confirmTaskTokenRotation(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	name string,
+	intendedGeneration uint64,
+) (time.Time, bool, error) {
+	fresh, err := r.freshTaskTokenWorkloadSecret(ctx, task, name)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	refreshAt, complete := completedTaskTokenRotation(fresh, intendedGeneration)
+	return refreshAt, complete, nil
 }
 
 func (r *TaskReconciler) freshTaskTokenWorkloadSecret(
@@ -612,7 +722,7 @@ func (r *TaskReconciler) reconcileActiveTaskTransactionToken(
 	authoritySecret, err := r.taskTransactionRenewalAuthoritySecret(ctx, task)
 	observedNow = currentTime()
 	if err != nil {
-		if taskTokenTransientKubernetesReadFailure(err) {
+		if taskTokenTransientKubernetesFailure(err) {
 			retryAfter := taskTokenTransientRetryAfter(observedNow, expiresAt)
 			if retryAfter > 0 {
 				return retryAfter, false, err
@@ -629,13 +739,13 @@ func (r *TaskReconciler) reconcileActiveTaskTransactionToken(
 	nextRefresh, err := r.rotateTaskTransactionToken(ctx, task, authoritySecret, workloadSecret, observedNow)
 	rotationFinishedAt := currentTime()
 	if err != nil {
-		if taskTokenTransientExchangeFailure(err) {
+		if taskTokenTransientExchangeFailure(err) || taskTokenTransientKubernetesFailure(err) || taskTokenRetryable(err) {
 			retryAfter := taskTokenTransientRetryAfter(rotationFinishedAt, expiresAt)
 			if retryAfter > 0 {
 				return retryAfter, false, err
 			}
 		}
-		return 0, !taskTokenRetryable(err), err
+		return 0, true, err
 	}
 	return max(nextRefresh.Sub(rotationFinishedAt), time.Nanosecond), false, nil
 }
