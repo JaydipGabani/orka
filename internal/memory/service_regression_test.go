@@ -152,7 +152,11 @@ func (a *pagedSearchAdapter) Search(_ context.Context, request protocol.SearchRe
 	a.queries = append(a.queries, request.Query)
 	offset := 0
 	if request.PageToken != "" {
-		parsed, err := strconv.Atoi(strings.TrimPrefix(request.PageToken, "page-"))
+		parts := strings.Split(request.PageToken, ".")
+		if len(parts) != 3 || parts[0] != "oms-page-v1" || parts[1] != "0123456789abcdef0123456789abcdef" {
+			return nil, errors.New("invalid test page token")
+		}
+		parsed, err := strconv.Atoi(parts[2])
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +166,7 @@ func (a *pagedSearchAdapter) Search(_ context.Context, request protocol.SearchRe
 	records := append([]protocol.MemoryRecord{}, a.records[offset:end]...)
 	next := ""
 	if end < len(a.records) {
-		next = fmt.Sprintf("page-%d", end)
+		next = fmt.Sprintf("oms-page-v1.0123456789abcdef0123456789abcdef.%d", end)
 	}
 	actualMode := request.Mode
 	if actualMode == protocol.SearchModeAuto {
@@ -1400,6 +1404,62 @@ func TestRemoteSearchRedactsQueryAndRequiresDurableAuditBeforeEgress(t *testing.
 	}
 	if len(governed.audits) != 1 || governed.audits[0].RequestDigest == "" {
 		t.Fatalf("audits = %#v, want one digest-only audit", governed.audits)
+	}
+}
+
+func TestRemoteSearchRejectsAdvertisedInputLimitsBeforeAuditAndEgress(t *testing.T) {
+	t.Run("query bytes", func(t *testing.T) {
+		service, adapter, activeBinding, governed := remoteSearchService(t, nil, nil)
+		service.Resolver.(staticAuthorityResolver).authority.Backend.Status.ObservedCapabilities.Limits.MaxQueryBytes = 8
+		query := "ééééa"
+		if got := len([]byte(query)); got != 9 {
+			t.Fatalf("query bytes = %d, want 9", got)
+		}
+
+		_, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+			Query: query, Limit: 1,
+		}, SearchContext{RemoteAuthorized: true})
+		assertRemoteSearchAdmissionTooLarge(t, err, adapter, governed)
+	})
+
+	t.Run("request envelope bytes", func(t *testing.T) {
+		service, adapter, activeBinding, governed := remoteSearchService(t, nil, nil)
+		binding, err := protocolBinding(&activeBinding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := json.Marshal(protocol.SearchRequest{
+			ProtocolVersion: protocol.Version, Binding: binding, Mode: protocol.SearchModeKeyword,
+			Query: "q", PageSize: 1, PageToken: "",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		limits := &service.Resolver.(staticAuthorityResolver).authority.Backend.Status.ObservedCapabilities.Limits
+		limits.MaxQueryBytes = protocol.MaxQueryBytes
+		limits.MaxRequestBytes = int64(len(payload) - 1)
+
+		_, err = service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+			Query: "q", Limit: 1,
+		}, SearchContext{RemoteAuthorized: true})
+		assertRemoteSearchAdmissionTooLarge(t, err, adapter, governed)
+	})
+}
+
+func assertRemoteSearchAdmissionTooLarge(
+	t *testing.T,
+	err error,
+	adapter *pagedSearchAdapter,
+	governed *governedSearchStore,
+) {
+	t.Helper()
+	var structured *apierror.Error
+	if !errors.As(err, &structured) || structured.Status != http.StatusRequestEntityTooLarge ||
+		structured.Reason != "" {
+		t.Fatalf("Search() error = %#v, want client request-too-large classification", err)
+	}
+	if adapter.searchCalls != 0 || len(governed.audits) != 0 {
+		t.Fatalf("rejected search side effects: provider calls=%d audits=%d, want zero", adapter.searchCalls, len(governed.audits))
 	}
 }
 

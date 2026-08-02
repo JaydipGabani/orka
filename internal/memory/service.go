@@ -1233,6 +1233,44 @@ func validateRemoteMutationLimits(
 	return nil
 }
 
+func validateRemoteSearchQueryLimit(authority *ResolvedAuthority, query string) error {
+	if authority == nil || authority.Backend == nil || authority.Backend.Status.ObservedCapabilities == nil {
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search capabilities are unavailable")
+	}
+	maxQueryBytes := protocol.MaxQueryBytes
+	if advertised := authority.Backend.Status.ObservedCapabilities.Limits.MaxQueryBytes; advertised > 0 {
+		maxQueryBytes = min(maxQueryBytes, int(advertised))
+	}
+	if len(query) > maxQueryBytes {
+		return apierror.New(http.StatusRequestEntityTooLarge, "",
+			"memory search exceeds the active backend's advertised limits")
+	}
+	return nil
+}
+
+func validateRemoteSearchLimits(authority *ResolvedAuthority, request *protocol.SearchRequest) error {
+	if err := protocol.ValidateSearchRequest(request); err != nil {
+		return apierror.New(http.StatusBadRequest, "", "memory search query is invalid")
+	}
+	if err := validateRemoteSearchQueryLimit(authority, request.Query); err != nil {
+		return err
+	}
+	maxRequestBytes := int64(protocol.MaxHTTPBodyBytes)
+	if advertised := authority.Backend.Status.ObservedCapabilities.Limits.MaxRequestBytes; advertised > 0 {
+		maxRequestBytes = min(maxRequestBytes, advertised)
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return apierror.New(http.StatusBadRequest, "", "memory search request is invalid")
+	}
+	if int64(len(payload)) > maxRequestBytes {
+		return apierror.New(http.StatusRequestEntityTooLarge, "",
+			"memory search exceeds the active backend's advertised limits")
+	}
+	return nil
+}
+
 func (s *Service) resolve(ctx context.Context, namespace string, fresh bool) (*ResolvedAuthority, error) {
 	if s.Resolver == nil || s.Governed == nil {
 		return &ResolvedAuthority{Namespace: namespace}, nil
@@ -1584,11 +1622,8 @@ func (s *Service) search(
 		return nil, identityError()
 	}
 	request.Query = strings.TrimSpace(redact.SensitiveText(request.Query))
-	if err := protocol.ValidateSearchRequest(&protocol.SearchRequest{
-		ProtocolVersion: protocol.Version, Binding: binding, Mode: mode,
-		Query: request.Query, PageSize: 1, PageToken: "",
-	}); err != nil {
-		return nil, apierror.New(http.StatusBadRequest, "", "memory search query is invalid")
+	if err := validateRemoteSearchQueryLimit(authority, request.Query); err != nil {
+		return nil, err
 	}
 	queryDigest := digestJSON(struct {
 		Query           string              `json:"query"`
@@ -1609,19 +1644,6 @@ func (s *Service) search(
 		TaskName: request.TaskName, ParentTask: request.ParentTask, AgentName: request.AgentName,
 		Mode: mode, IncludeDisabled: request.IncludeDisabled, IncludeDeleted: request.IncludeDeleted,
 	})
-	actor := strings.TrimSpace(searchContext.Actor)
-	if actor == "" {
-		actor = "authenticated-memory-search"
-	}
-	if err := s.Governed.AppendMemoryAudit(ctx, store.MemoryAuditRecord{
-		Namespace: namespace, NamespaceUID: authority.NamespaceUID, Actor: actor,
-		Action: "memory.search", AuthorityEpoch: authority.Binding.AuthorityEpoch,
-		RoutingEpoch: authority.Binding.RoutingEpoch, RequestDigest: queryDigest,
-		RequestID: searchContext.RequestID, CreatedAt: s.now(),
-	}); err != nil {
-		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
-			"memory search audit could not be committed")
-	}
 	cursorState, replayPageToken, snapshotExpiresAt, tombstones, err := loadRemoteSearchContinuation(
 		ctx, s.Governed, authority.Binding, queryDigest, request.Cursor, s.now(),
 	)
@@ -1642,6 +1664,36 @@ func (s *Service) search(
 		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
 			"memory search page size exceeds the active backend capability")
 	}
+	var firstOutbound *protocol.SearchRequest
+	if len(cursorState.Pending) > 0 {
+		firstOutbound = &protocol.SearchRequest{
+			ProtocolVersion: protocol.Version, Binding: binding, Mode: mode,
+			Query: request.Query, PageSize: cursorState.PageSize, PageToken: replayPageToken,
+		}
+	} else if !cursorState.ProviderExhausted {
+		firstOutbound = &protocol.SearchRequest{
+			ProtocolVersion: protocol.Version, Binding: binding, Mode: mode,
+			Query: request.Query, PageSize: cursorState.PageSize, PageToken: cursorState.ProviderToken,
+		}
+	}
+	if firstOutbound != nil {
+		if err := validateRemoteSearchLimits(authority, firstOutbound); err != nil {
+			return nil, err
+		}
+	}
+	actor := strings.TrimSpace(searchContext.Actor)
+	if actor == "" {
+		actor = "authenticated-memory-search"
+	}
+	if err := s.Governed.AppendMemoryAudit(ctx, store.MemoryAuditRecord{
+		Namespace: namespace, NamespaceUID: authority.NamespaceUID, Actor: actor,
+		Action: "memory.search", AuthorityEpoch: authority.Binding.AuthorityEpoch,
+		RoutingEpoch: authority.Binding.RoutingEpoch, RequestDigest: queryDigest,
+		RequestID: searchContext.RequestID, CreatedAt: s.now(),
+	}); err != nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search audit could not be committed")
+	}
 	items := make([]SearchHit, 0, target)
 	seen := make(map[string]struct{}, target)
 	actualMode := cursorState.ActualMode
@@ -1652,10 +1704,14 @@ func (s *Service) search(
 	pages := 0
 
 	if len(cursorState.Pending) > 0 && len(items) < target && candidates < maxRemoteSearchCandidates {
-		response, searchErr := authority.Adapter.Search(ctx, protocol.SearchRequest{
+		outbound := protocol.SearchRequest{
 			ProtocolVersion: protocol.Version, Binding: binding, Mode: mode,
 			Query: request.Query, PageSize: cursorState.PageSize, PageToken: replayPageToken,
-		})
+		}
+		if err := validateRemoteSearchLimits(authority, &outbound); err != nil {
+			return nil, err
+		}
+		response, searchErr := authority.Adapter.Search(ctx, outbound)
 		pages++
 		if searchErr != nil {
 			var adapterErr *AdapterError
@@ -1706,10 +1762,14 @@ func (s *Service) search(
 	for pages < maxRemoteSearchPages && len(items) < target && candidates < maxRemoteSearchCandidates &&
 		len(cursorState.Pending) == 0 && !cursorState.ProviderExhausted {
 		requestPageToken := cursorState.ProviderToken
-		response, searchErr := authority.Adapter.Search(ctx, protocol.SearchRequest{
+		outbound := protocol.SearchRequest{
 			ProtocolVersion: protocol.Version, Binding: binding, Mode: mode,
 			Query: request.Query, PageSize: cursorState.PageSize, PageToken: requestPageToken,
-		})
+		}
+		if err := validateRemoteSearchLimits(authority, &outbound); err != nil {
+			return nil, err
+		}
+		response, searchErr := authority.Adapter.Search(ctx, outbound)
 		pages++
 		if searchErr != nil {
 			var adapterErr *AdapterError
