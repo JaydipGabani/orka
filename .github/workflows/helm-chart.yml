@@ -351,10 +351,11 @@ jobs:
           grep -Fq 'name: secondary-orka-task-pod-provenance-admitter-preflight' "${secondary_task_provenance_rbac}"
           test "$(grep -Fc 'helm.sh/hook: pre-install,pre-upgrade' "${secondary_task_provenance_rbac}")" -eq 4
           test "$(grep -Fc 'helm.sh/hook-weight: "-40"' "${secondary_task_provenance_rbac}")" -eq 4
+          test "$(grep -Fc 'helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed' "${secondary_task_provenance_rbac}")" -eq 4
           test "$(grep -Fc 'helm.sh/hook: pre-delete' "${secondary_task_provenance_rbac}")" -eq 4
           test "$(grep -Fc 'helm.sh/hook-weight: "40"' "${secondary_task_provenance_rbac}")" -eq 2
           test "$(grep -Fc 'helm.sh/hook-weight: "41"' "${secondary_task_provenance_rbac}")" -eq 2
-          test "$(grep -Fc 'helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed' "${secondary_task_provenance_rbac}")" -eq 4
+          test "$(grep -Fc 'helm.sh/hook-delete-policy: before-hook-creation' "${secondary_task_provenance_rbac}")" -eq 8
           grep -Fq 'helm.sh/resource-policy: keep' "${secondary_store_pvc}"
           grep -Fq 'claimName: operator-store' "${external_store_render}"
           if grep -Fq '# Source: orka/templates/store-pvc.yaml' "${external_store_render}"; then
@@ -575,7 +576,10 @@ jobs:
             clusterrolebinding/orka-orka-task-pod-provenance-admitter-preflight
           )
           for resource in "${preflight_rbac[@]}"; do
-            kubectl get "${resource}" >/dev/null
+            if kubectl get "${resource}" >/dev/null 2>&1; then
+              echo "Helm install retained completed preflight RBAC ${resource}." >&2
+              exit 1
+            fi
           done
 
           kubectl patch crd tasks.core.orka.ai --type=json -p='[
@@ -594,9 +598,13 @@ jobs:
 
           helm uninstall orka --namespace "${NAMESPACE}"
           assert_all_orka_crds "after helm uninstall"
-          for resource in "${preflight_rbac[@]}"; do
-            if kubectl get "${resource}" >/dev/null 2>&1; then
-              echo "Helm uninstall retained preflight RBAC ${resource}." >&2
-              exit 1
-            fi
+          for resource in \
+            clusterrole/orka-orka-task-job-provenance-controller-preflight \
+            clusterrole/orka-orka-task-pod-provenance-admitter-preflight; do
+            kubectl get "${resource}" -o json | jq -e '(.rules // []) | length == 0' >/dev/null
+          done
+          for resource in \
+            clusterrolebinding/orka-orka-task-job-provenance-controller-preflight \
+            clusterrolebinding/orka-orka-task-pod-provenance-admitter-preflight; do
+            kubectl get "${resource}" -o json | jq -e '(.subjects // []) | length == 0' >/dev/null
           done
