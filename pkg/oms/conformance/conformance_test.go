@@ -241,6 +241,14 @@ func TestSearchRejectsRequestSpecificResponseViolations(t *testing.T) {
 				return value
 			}(),
 		},
+		{
+			name: "snapshot expiry exceeds advertised TTL", request: baseRequest,
+			response: func() protocol.SearchResponse {
+				value := baseResponse
+				value.SnapshotExpiresAt = now.Add(2 * time.Minute)
+				return value
+			}(),
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -258,6 +266,8 @@ func TestSearchRejectsRequestSpecificResponseViolations(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			client.limits = testCapabilityLimits()
+			client.limitsConfigured = true
 			if _, err := search(context.Background(), client, tc.request); err == nil {
 				t.Fatalf("search() accepted %s", tc.name)
 			}

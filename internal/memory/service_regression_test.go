@@ -503,7 +503,9 @@ func remoteSearchService(
 	backend.Status.Ready = true
 	backend.Status.ObservedCapabilities = &corev1alpha1.MemoryBackendObservedCapabilities{
 		Effective: []corev1alpha1.MemoryBackendCapability{corev1alpha1.MemoryBackendCapabilityKeywordSearch},
-		Limits:    corev1alpha1.MemoryBackendCapabilityLimits{MaxPageSize: protocol.MaxPageSize},
+		Limits: corev1alpha1.MemoryBackendCapabilityLimits{
+			MaxPageSize: protocol.MaxPageSize, MaxSnapshotRecords: protocol.MaxSnapshotRecords,
+		},
 	}
 	governed := newGovernedSearchStore(entries)
 	authority := &ResolvedAuthority{
@@ -2849,6 +2851,71 @@ func TestRemoteSearchDoesNotMatchTombstoneByMemoryID(t *testing.T) {
 	}, SearchContext{RemoteAuthorized: true})
 	if err != nil || response == nil || len(response.Items) != 0 || !response.Exhausted {
 		t.Fatalf("ID-only tombstone Search() = %#v, %v", response, err)
+	}
+}
+
+func TestSearchRejectsOversizedLegacyQueryBeforeResolution(t *testing.T) {
+	response, err := (&Service{}).Search(t.Context(), "team-legacy", SearchRequest{
+		Query: strings.Repeat("q", protocol.MaxQueryBytes+1), Limit: 1,
+	}, SearchContext{})
+	var structured *apierror.Error
+	if response != nil || !errors.As(err, &structured) || structured.Status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized legacy Search() = %#v, %#v; want HTTP 413", response, err)
+	}
+}
+
+func TestRemoteSearchAllowsEmptySnapshotWithinAdvertisedLimit(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 19, 5, 0, 0, time.UTC)
+	service, adapter, activeBinding, _ := remoteSearchService(t, nil, nil)
+	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now.Add(time.Minute)
+	authority := service.Resolver.(staticAuthorityResolver).authority
+	authority.Backend.Status.ObservedCapabilities.Limits.MaxSnapshotRecords = 1
+
+	response, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "no-match", Limit: 1,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || response == nil || len(response.Items) != 0 || !response.Exhausted || !response.Complete {
+		t.Fatalf("empty snapshot Search() = %#v, %v", response, err)
+	}
+}
+
+func TestRemoteSearchRejectsSnapshotAboveAdvertisedRecordLimit(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 19, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, 3)
+	records := make([]protocol.MemoryRecord, 0, 3)
+	for i := range 3 {
+		entry, record := remoteSearchFixture(
+			binding, fmt.Sprintf("mem-advertised-limit-%d", i), now.Add(-time.Duration(i)*time.Second),
+			"needle", store.MemoryTrustReviewed,
+		)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	service, adapter, activeBinding, _ := remoteSearchService(t, entries, records)
+	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now.Add(time.Minute)
+	authority := service.Resolver.(staticAuthorityResolver).authority
+	authority.Backend.Status.ObservedCapabilities.Limits.MaxPageSize = 1
+	authority.Backend.Status.ObservedCapabilities.Limits.MaxSnapshotRecords = 2
+
+	response, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 3,
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if response != nil || !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable ||
+		structured.Reason != ReasonBackendUnavailable {
+		t.Fatalf("over-limit snapshot Search() = %#v, %#v; want fail-closed backend error", response, err)
+	}
+	if adapter.searchCalls != 3 {
+		t.Fatalf("provider search calls = %d, want 3 through first over-limit record", adapter.searchCalls)
 	}
 }
 

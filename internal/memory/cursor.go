@@ -366,6 +366,16 @@ func remoteSearchSeenRecordStatePresent(state []byte) bool {
 	return len(state) > 0
 }
 
+func remoteSearchSeenRecordCount(state []byte) (int, bool) {
+	if len(state) == 0 {
+		return 0, true
+	}
+	if !validRemoteSearchSeenRecordState(state) {
+		return 0, false
+	}
+	return (len(state) - 1) / remoteSearchSeenRecordDigestBytes, true
+}
+
 func cloneRemoteSearchSeenRecordState(state []byte) []byte {
 	return append([]byte(nil), state...)
 }

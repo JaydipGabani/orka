@@ -1699,6 +1699,10 @@ func (s *Service) search(
 		mode != protocol.SearchModeHybrid && mode != protocol.SearchModeAuto {
 		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory search mode")
 	}
+	request.Query = strings.TrimSpace(redact.SensitiveText(request.Query))
+	if len(request.Query) > protocol.MaxQueryBytes {
+		return nil, apierror.New(http.StatusRequestEntityTooLarge, "", "memory search exceeds the protocol query limit")
+	}
 	authority, err := s.resolve(ctx, namespace, true)
 	if err != nil {
 		return nil, err
@@ -1719,7 +1723,6 @@ func (s *Service) search(
 	if err != nil {
 		return nil, identityError()
 	}
-	request.Query = strings.TrimSpace(redact.SensitiveText(request.Query))
 	if err := validateRemoteSearchQueryLimit(authority, request.Query); err != nil {
 		return nil, err
 	}
@@ -1744,6 +1747,16 @@ func (s *Service) search(
 	providerPageSize, err := remoteSearchPageSize(authority)
 	if err != nil {
 		return nil, err
+	}
+	snapshotRecordLimit, err := remoteSearchSnapshotRecordLimit(authority)
+	if err != nil {
+		return nil, err
+	}
+	if remoteSearchSeenRecordStatePresent(cursorState.SeenRecordState) {
+		if seenCount, ok := remoteSearchSeenRecordCount(cursorState.SeenRecordState); !ok || seenCount > snapshotRecordLimit {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+				"memory search cursor exceeds the active backend snapshot limit")
+		}
 	}
 	if cursorState.PageSize == 0 {
 		cursorState.PageSize = min(target, providerPageSize)
@@ -1839,7 +1852,7 @@ func (s *Service) search(
 			return nil, identityErr
 		}
 		if identityErr := validateRemoteSearchRecordIdentities(
-			cursorState.SeenRecordState, response.Records[pendingOffset:],
+			cursorState.SeenRecordState, response.Records[pendingOffset:], snapshotRecordLimit,
 		); identityErr != nil {
 			return nil, identityErr
 		}
@@ -1895,7 +1908,9 @@ func (s *Service) search(
 		if !response.Exhausted && response.NextPageToken == requestPageToken {
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete, "memory search pagination did not advance")
 		}
-		if identityErr := validateRemoteSearchRecordIdentities(cursorState.SeenRecordState, response.Records); identityErr != nil {
+		if identityErr := validateRemoteSearchRecordIdentities(
+			cursorState.SeenRecordState, response.Records, snapshotRecordLimit,
+		); identityErr != nil {
 			return nil, identityErr
 		}
 		snapshotExpiresAt = responseExpiry
@@ -2413,6 +2428,19 @@ func remoteSearchPageSize(authority *ResolvedAuthority) (int, error) {
 	return pageSize, nil
 }
 
+func remoteSearchSnapshotRecordLimit(authority *ResolvedAuthority) (int, error) {
+	if authority == nil || authority.Backend == nil || authority.Backend.Status.ObservedCapabilities == nil {
+		return 0, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search capabilities are unavailable")
+	}
+	limit := int(authority.Backend.Status.ObservedCapabilities.Limits.MaxSnapshotRecords)
+	if limit <= 0 || limit > protocol.MaxSnapshotRecords {
+		return 0, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search snapshot record capability is invalid")
+	}
+	return limit, nil
+}
+
 func ensureSearchCapability(backend *corev1alpha1.MemoryBackend, mode string) error {
 	if backend == nil || backend.Status.ObservedCapabilities == nil {
 		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search capabilities are unavailable")
@@ -2794,12 +2822,17 @@ func validateRemoteSearchReplayPrefixIdentities(
 func validateRemoteSearchRecordIdentities(
 	seenRecordState []byte,
 	records []protocol.MemoryRecord,
+	maximumRecords int,
 ) error {
 	candidateState := cloneRemoteSearchSeenRecordState(seenRecordState)
 	for i := range records {
 		if err := trackRemoteSearchRecordIdentity(&candidateState, records[i].UpsertKey); err != nil {
 			return err
 		}
+	}
+	if count, ok := remoteSearchSeenRecordCount(candidateState); !ok || count > maximumRecords {
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search backend exceeded its advertised snapshot record limit")
 	}
 	return nil
 }

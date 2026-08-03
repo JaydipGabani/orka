@@ -1694,6 +1694,7 @@ func search(
 		}
 	}
 	body, status, err := client.postJSON(ctx, protocol.PathSearch, request)
+	receivedAt := time.Now().UTC()
 	if err != nil {
 		return nil, err
 	}
@@ -1712,6 +1713,12 @@ func search(
 	}
 	if request.Mode != protocol.SearchModeAuto && response.ActualMode != request.Mode {
 		return nil, errors.New("search changed an explicit requested mode")
+	}
+	if client.limitsConfigured && request.PageToken == "" {
+		maximumExpiry := receivedAt.Add(time.Duration(client.limits.SnapshotTTLSeconds) * time.Second)
+		if response.SnapshotExpiresAt.After(maximumExpiry) {
+			return nil, errors.New("search snapshot expiry exceeds the advertised TTL")
+		}
 	}
 	if len(response.Records) > request.PageSize {
 		return nil, fmt.Errorf(
