@@ -2242,6 +2242,35 @@ func (r *replayBeforeFreshResolver) Resolve(context.Context, string) (*ResolvedA
 	return nil, errors.New("fresh backend unavailable")
 }
 
+func TestCreateMemoryRejectsReservedProposalSource(t *testing.T) {
+	service := &Service{}
+	result, err := service.CreateMemory(t.Context(), "team-a", CreateRequest{
+		Content: "content", Source: memorySourceProposal,
+	}, MutationContext{})
+	var structured *apierror.Error
+	if result != nil || !errors.As(err, &structured) || structured.Status != http.StatusBadRequest {
+		t.Fatalf("CreateMemory() = %#v, %#v; want reserved-source HTTP 400", result, err)
+	}
+}
+
+func TestRemoteReplacementDemotesChangedProposalMetadata(t *testing.T) {
+	entry := store.RemoteMemoryCatalogEntry{
+		ContentDigest: protocol.ContentDigest("original"), Tags: []string{"reviewed"},
+		SessionName: "session-a", AgentName: "agent-a", TaskName: "task-a", ParentTask: "parent-a",
+		Source: memorySourceProposal, SourceProposalID: "proposal-a",
+	}
+	memory := remoteEntryToMemory(&entry, "changed")
+	metadata := replacementMemoryMetadata(&entry, memory, "changed", entry.Tags)
+	if metadata["source"] != memorySourceManual || metadata["sourceProposalId"] != "" {
+		t.Fatalf("changed proposal replacement metadata = %#v", metadata)
+	}
+	unchanged := remoteEntryToMemory(&entry, "original")
+	metadata = replacementMemoryMetadata(&entry, unchanged, "original", entry.Tags)
+	if metadata["source"] != memorySourceProposal || metadata["sourceProposalId"] != entry.SourceProposalID {
+		t.Fatalf("unchanged proposal replacement metadata = %#v", metadata)
+	}
+}
+
 func TestRemoteCreateRedactsCatalogProvenanceAndTags(t *testing.T) {
 	binding := &store.MemoryBackendBinding{
 		Namespace: "team-a", NamespaceUID: "11111111-1111-4111-8111-111111111111", Mode: store.MemoryBackendModeRemote,

@@ -64,6 +64,7 @@ func (m *Manager) RecordIntent(ctx context.Context, namespace, actor, action, re
 	})
 }
 
+//nolint:gocyclo // Lifecycle admission mirrors the coordinator state-transition matrix.
 func validateManagedLifecycleSource(
 	binding *store.MemoryBackendBinding,
 	lifecycle corev1alpha1.MemoryBackendLifecycleState,
@@ -74,7 +75,8 @@ func validateManagedLifecycleSource(
 			return nil
 		}
 		if binding.Mode == store.MemoryBackendModeRemote &&
-			(binding.State == store.MemoryBackendBindingAccepting || binding.State == store.MemoryBackendBindingDraining) {
+			(binding.State == store.MemoryBackendBindingAccepting || binding.State == store.MemoryBackendBindingDraining ||
+				binding.State == store.MemoryBackendBindingRecovering) {
 			return nil
 		}
 	case corev1alpha1.MemoryBackendLifecycleReadOnly:

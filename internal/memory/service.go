@@ -40,6 +40,8 @@ const (
 	maxRemoteListCursorBytes          = 4 << 10
 	legacyMemoryDisableAuditAction    = "memory.disable"
 	legacyMemoryTrustAuditAction      = "memory.trust"
+	memorySourceProposal              = "memory_proposal"
+	memorySourceManual                = "manual"
 )
 
 // Service is the single governed entry point for legacy and remote memory.
@@ -508,6 +510,9 @@ func (s *Service) CreateMemory(
 	request CreateRequest,
 	mutationContext MutationContext,
 ) (*MutationResult, error) {
+	if err := validateDirectMemorySource(request.Source); err != nil {
+		return nil, err
+	}
 	localAuthority, err := s.resolve(ctx, namespace, false)
 	if err != nil {
 		return nil, err
@@ -670,7 +675,7 @@ func (s *Service) UpdateMemory(
 	now := s.now()
 	desired := max(entry.Generation, entry.DesiredGeneration) + 1
 	operationID := "mop-" + uuid.NewString()
-	metadata := memoryMetadataFromStore(*current)
+	metadata := replacementMemoryMetadata(entry, *current, content, tags)
 	envelope := protocol.MutationEnvelope{
 		ProtocolVersion: protocol.Version, OperationID: operationID, Binding: binding,
 		MemoryID: id, Kind: protocol.MutationKindReplace, Generation: uint64(desired),
@@ -1519,6 +1524,36 @@ func remoteEntryToMemory(entry *store.RemoteMemoryCatalogEntry, content string) 
 		PendingOperationID: entry.PendingOperationID, Trust: entry.Trust,
 		ContentDigest: entry.ContentDigest, ContentAvailable: content != "" && entry.ContentAvailable,
 	}
+}
+
+func validateDirectMemorySource(source string) error {
+	if normalizeSource(source) == memorySourceProposal {
+		return apierror.New(http.StatusBadRequest, "", "memory_proposal is reserved for accepted proposal application")
+	}
+	return nil
+}
+
+func replacementMemoryMetadata(
+	entry *store.RemoteMemoryCatalogEntry,
+	memory store.Memory,
+	content string,
+	tags []string,
+) map[string]string {
+	metadata := memoryMetadataFromStore(memory)
+	if entry == nil {
+		return metadata
+	}
+	changed := entry.ContentDigest != protocol.ContentDigest(content) || !slices.Equal(entry.Tags, tags) ||
+		entry.SessionName != metadata["sessionName"] || entry.AgentName != metadata["agentName"] ||
+		entry.TaskName != metadata["taskName"] || entry.ParentTask != metadata["parentTask"] ||
+		normalizeSource(entry.Source) != metadata["source"] || entry.SourceProposalID != metadata["sourceProposalId"]
+	if changed {
+		delete(metadata, "sourceProposalId")
+		if metadata["source"] == memorySourceProposal {
+			metadata["source"] = memorySourceManual
+		}
+	}
+	return metadata
 }
 
 func memoryMetadata(request CreateRequest) map[string]string {
@@ -2935,7 +2970,7 @@ func (s *Service) ApplyMemoryProposal(
 	operationID := "mop-" + uuid.NewString()
 	metadata := compactMetadata(map[string]string{
 		"agentName": proposal.AgentName, "taskName": proposal.TaskName,
-		"source": "memory_proposal", "sourceProposalId": proposal.ID,
+		"source": memorySourceProposal, "sourceProposalId": proposal.ID,
 	})
 	envelope := protocol.MutationEnvelope{
 		ProtocolVersion: protocol.Version, OperationID: operationID, Binding: binding,

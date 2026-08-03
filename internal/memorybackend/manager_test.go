@@ -491,7 +491,7 @@ func TestValidateManagedLifecycleSourceMatchesCoordinatorMatrix(t *testing.T) {
 		{name: "new active", lifecycle: corev1alpha1.MemoryBackendLifecycleActive},
 		{name: "legacy active", binding: legacy, lifecycle: corev1alpha1.MemoryBackendLifecycleActive},
 		{name: "draining active", binding: remote(store.MemoryBackendBindingDraining), lifecycle: corev1alpha1.MemoryBackendLifecycleActive},
-		{name: "recovering active rejected", binding: remote(store.MemoryBackendBindingRecovering), lifecycle: corev1alpha1.MemoryBackendLifecycleActive, wantErr: true},
+		{name: "recovering active", binding: remote(store.MemoryBackendBindingRecovering), lifecycle: corev1alpha1.MemoryBackendLifecycleActive},
 		{name: "accepting read only", binding: remote(store.MemoryBackendBindingAccepting), lifecycle: corev1alpha1.MemoryBackendLifecycleReadOnly},
 		{name: "recovering read only rejected", binding: remote(store.MemoryBackendBindingRecovering), lifecycle: corev1alpha1.MemoryBackendLifecycleReadOnly, wantErr: true},
 		{name: "draining disabled", binding: remote(store.MemoryBackendBindingDraining), lifecycle: corev1alpha1.MemoryBackendLifecycleDisabled},
