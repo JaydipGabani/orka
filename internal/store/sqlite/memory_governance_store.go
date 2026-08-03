@@ -154,7 +154,7 @@ var governedMemoryQuotas = memoryGovernanceQuotaConfig{
 	GlobalSearchCursorBytes:       64 << 20,
 	NamespaceSearchReplayRows:     1_024,
 	GlobalSearchReplayRows:        32_768,
-	NamespaceSearchReplayBytes:    16 << 20,
+	NamespaceSearchReplayBytes:    32 << 20,
 	GlobalSearchReplayBytes:       512 << 20,
 	SafetyReserveRows:             1_000,
 }

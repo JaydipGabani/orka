@@ -32,6 +32,7 @@ type governedSearchStore struct {
 	getErr           error
 	auditErr         error
 	cursorErr        error
+	retireErr        error
 	audits           []store.MemoryAuditRecord
 	cursors          map[string]store.MemorySearchCursorState
 	retired          map[string]bool
@@ -146,6 +147,9 @@ func (s *governedSearchStore) GetMemorySearchCursor(
 }
 
 func (s *governedSearchStore) RetireMemorySearchCursor(_ context.Context, namespaceUID, id string, _ time.Time) error {
+	if s.retireErr != nil {
+		return s.retireErr
+	}
 	stored, ok := s.cursors[id]
 	if !ok || stored.NamespaceUID != namespaceUID {
 		return store.ErrNotFound
@@ -2649,6 +2653,66 @@ func TestLegacySearchSatisfiedPageIsCompleteAtScanCap(t *testing.T) {
 	}
 }
 
+func TestLegacySearchRetiresCompletedRootCursors(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 17, 30, 0, 0, time.UTC)
+	memories := []store.Memory{
+		{ID: "mem-2", Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustReviewed, UpdatedAt: now.Add(2 * time.Second)},
+		{ID: "mem-1", Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustReviewed, UpdatedAt: now.Add(time.Second)},
+	}
+	governed := newGovernedSearchStore(nil)
+	governed.maxActiveCursors = 128
+	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
+	service := &Service{
+		Legacy: cappedLegacyMemoryStore{memories: memories}, Governed: governed,
+		Resolver: staticAuthorityResolver{authority: authority}, Now: func() time.Time { return now },
+	}
+	for search := range 130 {
+		first, err := service.Search(t.Context(), authority.Namespace, SearchRequest{
+			Query: "needle", Limit: 1,
+		}, SearchContext{})
+		if err != nil || first == nil || first.Cursor == "" || first.Exhausted {
+			t.Fatalf("search %d first page = %#v, %v", search, first, err)
+		}
+		terminal, err := service.Search(t.Context(), authority.Namespace, SearchRequest{
+			Query: "needle", Limit: 1, Cursor: first.Cursor,
+		}, SearchContext{})
+		if err != nil || terminal == nil || terminal.Cursor != "" || !terminal.Exhausted {
+			t.Fatalf("search %d terminal page = %#v, %v", search, terminal, err)
+		}
+		if !governed.retired[strings.SplitN(first.Cursor, ".", 2)[0]] {
+			t.Fatalf("search %d root cursor was not retired", search)
+		}
+	}
+	if active := governed.activeCursorCount(); active != 0 {
+		t.Fatalf("active legacy cursors = %d, want 0", active)
+	}
+}
+
+func TestLegacySearchTerminalIgnoresExpiredRetirement(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 18, 5, 0, 0, time.UTC)
+	memories := []store.Memory{
+		{ID: "mem-2", Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustReviewed, UpdatedAt: now.Add(2 * time.Second)},
+		{ID: "mem-1", Namespace: "team-a", Content: "needle", Trust: store.MemoryTrustReviewed, UpdatedAt: now.Add(time.Second)},
+	}
+	governed := newGovernedSearchStore(nil)
+	authority := &ResolvedAuthority{Namespace: "team-a", NamespaceUID: "namespace-a"}
+	service := &Service{
+		Legacy: cappedLegacyMemoryStore{memories: memories}, Governed: governed,
+		Resolver: staticAuthorityResolver{authority: authority}, Now: func() time.Time { return now },
+	}
+	first, err := service.Search(t.Context(), authority.Namespace, SearchRequest{Query: "needle", Limit: 1}, SearchContext{})
+	if err != nil || first == nil || first.Cursor == "" {
+		t.Fatalf("first Search() = %#v, %v", first, err)
+	}
+	governed.retireErr = store.ErrNotFound
+	terminal, err := service.Search(t.Context(), authority.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: first.Cursor,
+	}, SearchContext{})
+	if err != nil || terminal == nil || !terminal.Exhausted || terminal.Cursor != "" {
+		t.Fatalf("terminal Search() = %#v, %v", terminal, err)
+	}
+}
+
 func TestLegacySearchCursorStoreFailureIsServerError(t *testing.T) {
 	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
 	memories := []store.Memory{
@@ -2672,6 +2736,33 @@ func TestLegacySearchCursorStoreFailureIsServerError(t *testing.T) {
 	var structured *apierror.Error
 	if !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable {
 		t.Fatalf("cursor store error = %#v, want HTTP 503", err)
+	}
+}
+
+func TestRemoteSearchDoesNotMatchTombstoneByMemoryID(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 17, 35, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entry, _ := remoteSearchFixture(
+		binding, "mem-example-1", now, "", store.MemoryTrustReviewed,
+	)
+	entry.Deleted = true
+	entry.ContentAvailable = false
+	entry.MaterializationState = store.MemoryMaterializationDeleted
+	service, adapter, activeBinding, _ := remoteSearchService(t, []store.RemoteMemoryCatalogEntry{entry}, nil)
+	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now.Add(time.Minute)
+
+	response, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "example", Limit: 1, IncludeDeleted: true,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || response == nil || len(response.Items) != 0 || !response.Exhausted {
+		t.Fatalf("ID-only tombstone Search() = %#v, %v", response, err)
 	}
 }
 

@@ -27,6 +27,10 @@ const (
 	remoteSearchCursorPrefix            = "msc1-"
 	legacyRemoteSearchCursorPrefix      = "msc-"
 	legacySearchCursorPrefix            = "lsc-"
+	legacySearchCursorActiveRows        = 128
+	legacySearchCursorActiveBytes       = 2 << 20
+	legacySearchCursorReplayRows        = 1_024
+	legacySearchCursorReplayBytes       = 32 << 20
 )
 
 var (
@@ -38,6 +42,7 @@ var (
 type memorySearchCursorStore interface {
 	SaveMemorySearchCursor(context.Context, store.MemorySearchCursorState) error
 	GetMemorySearchCursor(context.Context, string, string, time.Time) (*store.MemorySearchCursorState, error)
+	RetireMemorySearchCursor(context.Context, string, string, time.Time) error
 }
 
 type serviceLegacyCursorStore struct{ service *Service }
@@ -59,20 +64,68 @@ func (s serviceLegacyCursorStore) SaveMemorySearchCursor(_ context.Context, curs
 	if s.service.legacyCursors == nil {
 		s.service.legacyCursors = make(map[string]store.MemorySearchCursorState)
 	}
-	totalBytes := 0
+	if s.service.legacyCursorRetired == nil {
+		s.service.legacyCursorRetired = make(map[string]bool)
+	}
+	activeRows, activeBytes := 0, 0
 	for id, existing := range s.service.legacyCursors {
 		if !existing.ExpiresAt.After(cursor.CreatedAt) {
 			delete(s.service.legacyCursors, id)
+			delete(s.service.legacyCursorRetired, id)
 			continue
 		}
-		totalBytes += len(existing.State)
+		if !s.service.legacyCursorRetired[id] {
+			activeRows++
+			activeBytes += len(existing.State)
+		}
 	}
-	if len(s.service.legacyCursors) >= 128 || totalBytes+len(cursor.State) > 2<<20 {
+	if activeRows >= legacySearchCursorActiveRows ||
+		activeBytes+len(cursor.State) > legacySearchCursorActiveBytes {
 		return store.ErrCapacity
 	}
 	copy := cursor
 	copy.State = append([]byte(nil), cursor.State...)
 	s.service.legacyCursors[cursor.ID] = copy
+	return nil
+}
+
+func (s serviceLegacyCursorStore) RetireMemorySearchCursor(
+	_ context.Context,
+	namespaceUID, id string,
+	now time.Time,
+) error {
+	if s.service == nil || strings.TrimSpace(namespaceUID) == "" || strings.TrimSpace(id) == "" {
+		return store.ErrValidation
+	}
+	s.service.legacyCursorMu.Lock()
+	defer s.service.legacyCursorMu.Unlock()
+	if s.service.legacyCursorRetired == nil {
+		s.service.legacyCursorRetired = make(map[string]bool)
+	}
+	replayRows, replayBytes := 0, 0
+	for cursorID, existing := range s.service.legacyCursors {
+		if !existing.ExpiresAt.After(now) {
+			delete(s.service.legacyCursors, cursorID)
+			delete(s.service.legacyCursorRetired, cursorID)
+			continue
+		}
+		if s.service.legacyCursorRetired[cursorID] {
+			replayRows++
+			replayBytes += len(existing.State)
+		}
+	}
+	cursor, ok := s.service.legacyCursors[id]
+	if !ok || cursor.NamespaceUID != namespaceUID {
+		return store.ErrNotFound
+	}
+	if s.service.legacyCursorRetired[id] {
+		return nil
+	}
+	if replayRows >= legacySearchCursorReplayRows ||
+		replayBytes+len(cursor.State) > legacySearchCursorReplayBytes {
+		return store.ErrCapacity
+	}
+	s.service.legacyCursorRetired[id] = true
 	return nil
 }
 

@@ -3,7 +3,9 @@ package sqlite
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -4693,6 +4695,23 @@ func TestRetainedTerminalPayloadsCountTowardAdmissionQuota(t *testing.T) {
 		binding, now.Add(5*time.Second), "retained-payload-second", "second-request", []byte("second"),
 	)); !errors.Is(err, store.ErrCapacity) {
 		t.Fatalf("retained payload quota error = %v, want ErrCapacity", err)
+	}
+}
+
+func TestMemorySearchReplayQuotaCoversMaximumSnapshot(t *testing.T) {
+	const maximumPerCursorOverhead = 4 << 10
+	var requiredBytes int64
+	for seen := 1; seen < protocol.MaxSnapshotRecords; seen++ {
+		rawIdentityBytes := 1 + seen*sha256.Size
+		requiredBytes += int64(base64.StdEncoding.EncodedLen(rawIdentityBytes) + maximumPerCursorOverhead)
+	}
+	if governedMemoryQuotas.NamespaceSearchReplayRows < int64(protocol.MaxSnapshotRecords-1) {
+		t.Fatalf("namespace replay rows = %d, want at least %d",
+			governedMemoryQuotas.NamespaceSearchReplayRows, protocol.MaxSnapshotRecords-1)
+	}
+	if governedMemoryQuotas.NamespaceSearchReplayBytes < requiredBytes {
+		t.Fatalf("namespace replay bytes = %d, want at least conservative maximum %d",
+			governedMemoryQuotas.NamespaceSearchReplayBytes, requiredBytes)
 	}
 }
 

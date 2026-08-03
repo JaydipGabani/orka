@@ -52,8 +52,9 @@ type Service struct {
 	Now          func() time.Time
 	ContentLimit int
 
-	legacyCursorMu sync.Mutex
-	legacyCursors  map[string]store.MemorySearchCursorState
+	legacyCursorMu      sync.Mutex
+	legacyCursors       map[string]store.MemorySearchCursorState
+	legacyCursorRetired map[string]bool
 }
 
 type legacyMemoryGovernanceStore interface {
@@ -2077,6 +2078,13 @@ func (s *Service) searchLegacy(
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
 				"legacy memory search continuation could not be preserved")
 		}
+	} else if !hasMore && cursor.CursorID != "" {
+		if err := cursorStore.RetireMemorySearchCursor(
+			ctx, legacySearchCursorNamespace(authority), cursor.CursorID, s.now(),
+		); err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+				"legacy memory search cursor could not be retired")
+		}
 	}
 	if !complete && !request.AllowIncomplete {
 		return nil, legacySearchIncompleteError(next)
@@ -2458,7 +2466,7 @@ func keywordCatalogEntryMatches(entry *store.RemoteMemoryCatalogEntry, query str
 			return true
 		}
 	}
-	return contains(entry.ID)
+	return false
 }
 
 func keywordRecordMatches(record *protocol.MemoryRecord, entry *store.RemoteMemoryCatalogEntry, query string) bool {
