@@ -33,6 +33,7 @@ type governedSearchStore struct {
 	cursorErr error
 	audits    []store.MemoryAuditRecord
 	cursors   map[string]store.MemorySearchCursorState
+	retired   map[string]bool
 }
 
 func newGovernedSearchStore(entries []store.RemoteMemoryCatalogEntry) *governedSearchStore {
@@ -40,7 +41,9 @@ func newGovernedSearchStore(entries []store.RemoteMemoryCatalogEntry) *governedS
 	for _, entry := range entries {
 		byID[entry.ID] = entry
 	}
-	return &governedSearchStore{entries: entries, byID: byID, cursors: make(map[string]store.MemorySearchCursorState)}
+	return &governedSearchStore{
+		entries: entries, byID: byID, cursors: make(map[string]store.MemorySearchCursorState), retired: make(map[string]bool),
+	}
 }
 
 func (s *governedSearchStore) GetRemoteMemory(_ context.Context, _, id string) (*store.RemoteMemoryCatalogEntry, error) {
@@ -105,6 +108,15 @@ func (s *governedSearchStore) GetMemorySearchCursor(
 	copy := cursor
 	copy.State = append([]byte(nil), cursor.State...)
 	return &copy, nil
+}
+
+func (s *governedSearchStore) RetireMemorySearchCursor(_ context.Context, namespaceUID, id string, _ time.Time) error {
+	stored, ok := s.cursors[id]
+	if !ok || stored.NamespaceUID != namespaceUID {
+		return store.ErrNotFound
+	}
+	s.retired[id] = true
+	return nil
 }
 
 func (s *governedSearchStore) ListMemoryAudit(
@@ -1183,8 +1195,17 @@ func TestRemoteSearchPersistsAdvertisedMaximumPageSize(t *testing.T) {
 	if err != nil || second == nil || len(second.Items) != 2 || !second.Exhausted {
 		t.Fatalf("second Search() = %#v, %v", second, err)
 	}
-	if adapter.searchCalls != 4 || len(adapter.pageSizes) != 4 {
-		t.Fatalf("provider calls=%d page sizes=%v, want four single-record pages", adapter.searchCalls, adapter.pageSizes)
+	if !governed.retired[first.Cursor] {
+		t.Fatal("consumed remote cursor was not retired")
+	}
+	replayed, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 2, Cursor: first.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || replayed == nil || len(replayed.Items) != len(second.Items) || !replayed.Exhausted {
+		t.Fatalf("retired cursor replay = %#v, %v", replayed, err)
+	}
+	if adapter.searchCalls != 6 || len(adapter.pageSizes) != 6 {
+		t.Fatalf("provider calls=%d page sizes=%v, want six single-record pages including replay", adapter.searchCalls, adapter.pageSizes)
 	}
 	for i, pageSize := range adapter.pageSizes {
 		if pageSize != 1 {

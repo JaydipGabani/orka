@@ -4719,6 +4719,99 @@ func TestMemorySearchCursorCapacityIsBounded(t *testing.T) {
 	}
 }
 
+func TestMemorySearchCursorRetirementSeparatesActiveAndReplayCapacity(t *testing.T) {
+	original := governedMemoryQuotas
+	t.Cleanup(func() { governedMemoryQuotas = original })
+	governedMemoryQuotas.NamespaceSearchCursorRows = 1
+	governedMemoryQuotas.GlobalSearchCursorRows = 10
+	governedMemoryQuotas.NamespaceSearchCursorBytes = 1024
+	governedMemoryQuotas.GlobalSearchCursorBytes = 10240
+	governedMemoryQuotas.NamespaceSearchReplayRows = 1
+	governedMemoryQuotas.GlobalSearchReplayRows = 10
+	governedMemoryQuotas.NamespaceSearchReplayBytes = 1024
+	governedMemoryQuotas.GlobalSearchReplayBytes = 10240
+	s := setupTestStore(t)
+	now := time.Date(2026, time.August, 2, 19, 30, 0, 0, time.UTC)
+	first := store.MemorySearchCursorState{
+		ID: "msc-retire-one", NamespaceUID: "namespace-a", BindingDigest: "binding", QueryDigest: "query",
+		State: []byte(`{"page":1}`), CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := s.SaveMemorySearchCursor(t.Context(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RetireMemorySearchCursor(t.Context(), first.NamespaceUID, first.ID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetMemorySearchCursor(t.Context(), first.NamespaceUID, first.ID, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("retired cursor was not replayable: %v", err)
+	}
+	second := first
+	second.ID = "msc-retire-two"
+	if err := s.SaveMemorySearchCursor(t.Context(), second); err != nil {
+		t.Fatalf("retired cursor still consumed active quota: %v", err)
+	}
+	if err := s.RetireMemorySearchCursor(t.Context(), second.NamespaceUID, second.ID, now.Add(3*time.Second)); !errors.Is(err, store.ErrCapacity) {
+		t.Fatalf("second retirement error = %v, want replay ErrCapacity", err)
+	}
+	third := first
+	third.ID = "msc-retire-three"
+	if err := s.SaveMemorySearchCursor(t.Context(), third); !errors.Is(err, store.ErrCapacity) {
+		t.Fatalf("active cursor after failed retirement error = %v, want ErrCapacity", err)
+	}
+}
+
+func TestMemorySearchCursorRetirementAllowsLongPagination(t *testing.T) {
+	original := governedMemoryQuotas
+	t.Cleanup(func() { governedMemoryQuotas = original })
+	governedMemoryQuotas.NamespaceSearchCursorRows = 1
+	governedMemoryQuotas.GlobalSearchCursorRows = 10
+	governedMemoryQuotas.NamespaceSearchCursorBytes = 1024
+	governedMemoryQuotas.GlobalSearchCursorBytes = 10240
+	governedMemoryQuotas.NamespaceSearchReplayRows = 256
+	governedMemoryQuotas.GlobalSearchReplayRows = 256
+	governedMemoryQuotas.NamespaceSearchReplayBytes = 1 << 20
+	governedMemoryQuotas.GlobalSearchReplayBytes = 1 << 20
+	s := setupTestStore(t)
+	now := time.Date(2026, time.August, 2, 20, 0, 0, 0, time.UTC)
+	current := store.MemorySearchCursorState{
+		ID: "msc-page-000", NamespaceUID: "namespace-a", BindingDigest: "binding", QueryDigest: "query",
+		State: []byte(`{"page":0}`), CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := s.SaveMemorySearchCursor(t.Context(), current); err != nil {
+		t.Fatal(err)
+	}
+	first := current
+	for page := 1; page <= 150; page++ {
+		stepNow := now.Add(time.Duration(page) * time.Millisecond)
+		if err := s.RetireMemorySearchCursor(t.Context(), current.NamespaceUID, current.ID, stepNow); err != nil {
+			t.Fatalf("retire page %d: %v", page-1, err)
+		}
+		current = store.MemorySearchCursorState{
+			ID: fmt.Sprintf("msc-page-%03d", page), NamespaceUID: first.NamespaceUID,
+			BindingDigest: first.BindingDigest, QueryDigest: first.QueryDigest,
+			State: fmt.Appendf(nil, `{"page":%d}`, page), CreatedAt: stepNow, ExpiresAt: first.ExpiresAt,
+		}
+		if err := s.SaveMemorySearchCursor(t.Context(), current); err != nil {
+			t.Fatalf("save page %d: %v", page, err)
+		}
+	}
+	if _, err := s.GetMemorySearchCursor(t.Context(), first.NamespaceUID, first.ID, now.Add(time.Second)); err != nil {
+		t.Fatalf("first retired page was not replayable: %v", err)
+	}
+	if err := s.RetireMemorySearchCursor(t.Context(), current.NamespaceUID, current.ID, now.Add(time.Second)); err != nil {
+		t.Fatalf("retire terminal page: %v", err)
+	}
+	governedMemoryQuotas.NamespaceSearchCursorRows = 0
+	failed := current
+	failed.ID = "msc-successor-fails"
+	if err := s.SaveMemorySearchCursor(t.Context(), failed); !errors.Is(err, store.ErrCapacity) {
+		t.Fatalf("successor error = %v, want active ErrCapacity", err)
+	}
+	if _, err := s.GetMemorySearchCursor(t.Context(), current.NamespaceUID, current.ID, now.Add(time.Second)); err != nil {
+		t.Fatalf("terminal retired page was not replayable after successor failure: %v", err)
+	}
+}
+
 func TestMaterializationIssueRequiresCurrentRoutingBinding(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()

@@ -1844,11 +1844,16 @@ func (s *Service) search(
 		}
 		cursor, err = saveRemoteSearchContinuation(
 			ctx, s.Governed, authority.Binding, queryDigest, cursorState, replayPageToken,
-			snapshotExpiresAt, persistedTombstones, s.now(),
+			snapshotExpiresAt, persistedTombstones, request.Cursor, s.now(),
 		)
 		if err != nil {
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
 				"memory search continuation could not be preserved")
+		}
+	} else if request.Cursor != "" {
+		if err := s.Governed.RetireMemorySearchCursor(ctx, authority.NamespaceUID, request.Cursor, s.now()); err != nil {
+			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+				"memory search cursor could not be retired")
 		}
 	}
 	if !pageComplete && !request.AllowIncomplete {
@@ -2444,6 +2449,7 @@ func saveRemoteSearchContinuation(
 	replayPageToken string,
 	snapshotExpiresAt time.Time,
 	tombstones *remoteSearchTombstoneCursor,
+	consumedCursor string,
 	now time.Time,
 ) (string, error) {
 	now = now.UTC()
@@ -2504,6 +2510,11 @@ func saveRemoteSearchContinuation(
 		}
 	}
 	id := "msc-" + uuid.NewString()
+	if consumedCursor = strings.TrimSpace(consumedCursor); consumedCursor != "" {
+		if err := governed.RetireMemorySearchCursor(ctx, binding.NamespaceUID, consumedCursor, now); err != nil {
+			return "", err
+		}
+	}
 	if err := governed.SaveMemorySearchCursor(ctx, store.MemorySearchCursorState{
 		ID: id, NamespaceUID: binding.NamespaceUID,
 		BindingDigest: protocol.BindingDigest(identity), QueryDigest: queryDigest,

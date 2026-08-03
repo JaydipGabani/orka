@@ -56,9 +56,10 @@ type OMSAdapter interface {
 
 // OMSClient calls one strict authenticated public HTTPS adapter endpoint.
 type OMSClient struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	baseURL          string
+	token            string
+	client           *http.Client
+	maxResponseBytes int64
 }
 
 // NewOMSClient constructs a no-proxy, no-redirect client pinned to the exact
@@ -69,10 +70,14 @@ func NewOMSClient(
 	resolution endpointpolicy.Resolution,
 	expectedCertificateDigest string,
 	token string,
+	maxResponseBytes int64,
 	timeout time.Duration,
 ) (*OMSClient, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, fmt.Errorf("OMS bearer token is empty")
+	}
+	if maxResponseBytes <= 0 {
+		return nil, fmt.Errorf("OMS maximum response size is invalid")
 	}
 	if timeout <= 0 || timeout > time.Minute {
 		timeout = defaultOMSRequestTimeout
@@ -111,9 +116,10 @@ func NewOMSClient(
 	transport.MaxConnsPerHost = omsHTTPMaxConnsPerHost
 	client.Transport = transport
 	return &OMSClient{
-		baseURL: strings.TrimRight(resolution.Identity, "/"),
-		token:   token,
-		client:  client,
+		baseURL:          strings.TrimRight(resolution.Identity, "/"),
+		token:            token,
+		client:           client,
+		maxResponseBytes: effectiveOMSResponseLimit(maxResponseBytes),
 	}, nil
 }
 
@@ -125,6 +131,9 @@ func (c *OMSClient) Capabilities(ctx context.Context, request protocol.Capabilit
 	response, err := protocol.DecodeCapabilitiesResponse(body)
 	if err != nil || !protocol.BindingEqual(response.Binding, request.Binding) {
 		return nil, invalidOMSResponse("capabilities response did not match the request")
+	}
+	if int64(len(body)) > effectiveOMSResponseLimit(int64(response.Limits.MaxResponseBytes)) {
+		return nil, oversizedOMSResponse(http.StatusOK, "", false)
 	}
 	return response, nil
 }
@@ -248,14 +257,14 @@ func (c *OMSClient) post(
 	}
 	defer response.Body.Close() //nolint:errcheck
 
-	limited := io.LimitReader(response.Body, int64(protocol.MaxAdapterResponseBytes)+1)
+	maxResponseBytes := effectiveOMSResponseLimit(c.maxResponseBytes)
+	limited := io.LimitReader(response.Body, maxResponseBytes+1)
 	responseBody, err := io.ReadAll(limited)
 	if err != nil {
 		return nil, fmt.Errorf("read OMS response: %w", err)
 	}
-	if len(responseBody) > protocol.MaxAdapterResponseBytes {
-		return nil, malformedOMSAdapterError(response.StatusCode, response.Header.Get("Retry-After"),
-			protocol.ErrorCodeResponseTooLarge, "OMS response exceeded the configured limit", malformedAmbiguous)
+	if int64(len(responseBody)) > maxResponseBytes {
+		return nil, oversizedOMSResponse(response.StatusCode, response.Header.Get("Retry-After"), malformedAmbiguous)
 	}
 	mediaType, _, mediaErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if mediaErr != nil || mediaType != "application/json" {
@@ -269,6 +278,19 @@ func (c *OMSClient) post(
 		return nil, decodeOMSAdapterError(response.StatusCode, response.Header.Get("Retry-After"), responseBody, expectedBinding, malformedAmbiguous)
 	}
 	return responseBody, nil
+}
+
+func effectiveOMSResponseLimit(advertised int64) int64 {
+	hardLimit := int64(protocol.MaxAdapterResponseBytes)
+	if advertised > 0 && advertised < hardLimit {
+		return advertised
+	}
+	return hardLimit
+}
+
+func oversizedOMSResponse(status int, retryAfter string, malformedAmbiguous bool) error {
+	return malformedOMSAdapterError(status, retryAfter,
+		protocol.ErrorCodeResponseTooLarge, "OMS response exceeded the configured limit", malformedAmbiguous)
 }
 
 func isOwnershipConflictResponse(body []byte) bool {

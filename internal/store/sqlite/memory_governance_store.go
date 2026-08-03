@@ -119,6 +119,10 @@ type memoryGovernanceQuotaConfig struct {
 	GlobalSearchCursorRows        int64
 	NamespaceSearchCursorBytes    int64
 	GlobalSearchCursorBytes       int64
+	NamespaceSearchReplayRows     int64
+	GlobalSearchReplayRows        int64
+	NamespaceSearchReplayBytes    int64
+	GlobalSearchReplayBytes       int64
 	SafetyReserveRows             int64
 }
 
@@ -148,6 +152,10 @@ var governedMemoryQuotas = memoryGovernanceQuotaConfig{
 	GlobalSearchCursorRows:        4_096,
 	NamespaceSearchCursorBytes:    2 << 20,
 	GlobalSearchCursorBytes:       64 << 20,
+	NamespaceSearchReplayRows:     1_024,
+	GlobalSearchReplayRows:        32_768,
+	NamespaceSearchReplayBytes:    16 << 20,
+	GlobalSearchReplayBytes:       512 << 20,
 	SafetyReserveRows:             1_000,
 }
 
@@ -406,7 +414,8 @@ func migrateMemoryGovernance(db *sql.DB) error {
 			query_digest   TEXT NOT NULL,
 			state_json     BLOB NOT NULL,
 			expires_at     TIMESTAMP NOT NULL,
-			created_at     TIMESTAMP NOT NULL
+			created_at     TIMESTAMP NOT NULL,
+			retired_at     TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_memory_search_cursors_expiry
 			ON memory_search_cursors(expires_at, namespace_uid)`,
@@ -577,6 +586,15 @@ func migrateMemoryGovernance(db *sql.DB) error {
 		{Name: "response_snapshot", Definition: "response_snapshot BLOB NOT NULL DEFAULT X'' CHECK (length(response_snapshot) <= 524288)"},
 	}); err != nil {
 		return err
+	}
+	if err := ensureSQLiteColumns(db, "memory_search_cursors", []sqliteColumnMigration{
+		{Name: "retired_at", Definition: "retired_at TIMESTAMP"},
+	}); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_memory_search_cursors_active
+		ON memory_search_cursors(namespace_uid, retired_at, expires_at)`); err != nil {
+		return fmt.Errorf("create memory search cursor active index: %w", err)
 	}
 	if err := ensureMemoryOperationPayloadCapacity(db); err != nil {
 		return err
@@ -3658,14 +3676,15 @@ func (s *Store) SaveMemorySearchCursor(ctx context.Context, cursor store.MemoryS
 	limits := governedMemoryQuotas
 	var namespaceCount, namespaceBytes, globalCount, globalBytes int64
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(length(state_json)), 0)
-		FROM memory_search_cursors WHERE namespace_uid = ?`, cursor.NamespaceUID).Scan(&namespaceCount, &namespaceBytes); err != nil {
+		FROM memory_search_cursors WHERE namespace_uid = ? AND retired_at IS NULL`, cursor.NamespaceUID).
+		Scan(&namespaceCount, &namespaceBytes); err != nil {
 		return err
 	}
 	if namespaceCount >= limits.NamespaceSearchCursorRows || namespaceBytes+int64(len(cursor.State)) > limits.NamespaceSearchCursorBytes {
 		return fmt.Errorf("%w: namespace memory search cursor capacity reached", store.ErrCapacity)
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(length(state_json)), 0)
-		FROM memory_search_cursors`).Scan(&globalCount, &globalBytes); err != nil {
+		FROM memory_search_cursors WHERE retired_at IS NULL`).Scan(&globalCount, &globalBytes); err != nil {
 		return err
 	}
 	if globalCount >= limits.GlobalSearchCursorRows || globalBytes+int64(len(cursor.State)) > limits.GlobalSearchCursorBytes {
@@ -3702,6 +3721,74 @@ func (s *Store) GetMemorySearchCursor(
 	}
 	cursor.State = append([]byte(nil), cursor.State...)
 	return &cursor, nil
+}
+
+// RetireMemorySearchCursor removes one consumed cursor from active admission
+// accounting while retaining it until expiry for deterministic replay.
+func (s *Store) RetireMemorySearchCursor(
+	ctx context.Context,
+	namespaceUID, id string,
+	now time.Time,
+) error {
+	namespaceUID = strings.TrimSpace(namespaceUID)
+	id = strings.TrimSpace(id)
+	now = normalizeMemoryNow(now)
+	if namespaceUID == "" || id == "" {
+		return store.ValidationErrorf("memory search cursor identity is invalid")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM memory_search_cursors WHERE expires_at <= ?`, now); err != nil {
+		return err
+	}
+	var retiredAt sql.NullTime
+	var stateBytes int64
+	err = tx.QueryRowContext(ctx, `SELECT retired_at, length(state_json)
+		FROM memory_search_cursors WHERE namespace_uid = ? AND id = ? AND expires_at > ?`, namespaceUID, id, now).
+		Scan(&retiredAt, &stateBytes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if retiredAt.Valid {
+		return tx.Commit()
+	}
+	limits := governedMemoryQuotas
+	var namespaceCount, namespaceBytes, globalCount, globalBytes int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(length(state_json)), 0)
+		FROM memory_search_cursors WHERE namespace_uid = ? AND retired_at IS NOT NULL`, namespaceUID).
+		Scan(&namespaceCount, &namespaceBytes); err != nil {
+		return err
+	}
+	if namespaceCount >= limits.NamespaceSearchReplayRows ||
+		namespaceBytes+stateBytes > limits.NamespaceSearchReplayBytes {
+		return fmt.Errorf("%w: namespace memory search cursor replay capacity reached", store.ErrCapacity)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(length(state_json)), 0)
+		FROM memory_search_cursors WHERE retired_at IS NOT NULL`).Scan(&globalCount, &globalBytes); err != nil {
+		return err
+	}
+	if globalCount >= limits.GlobalSearchReplayRows || globalBytes+stateBytes > limits.GlobalSearchReplayBytes {
+		return fmt.Errorf("%w: global memory search cursor replay capacity reached", store.ErrCapacity)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE memory_search_cursors SET retired_at = ?
+		WHERE namespace_uid = ? AND id = ? AND retired_at IS NULL AND expires_at > ?`, now, namespaceUID, id, now)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return store.ErrConflict
+	}
+	return tx.Commit()
 }
 
 // AppendMemoryAudit commits an insert-only administrative intent or completion record.

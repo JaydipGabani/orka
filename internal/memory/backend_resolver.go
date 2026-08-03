@@ -179,7 +179,15 @@ func (r *BackendResolver) Resolve(ctx context.Context, namespace string) (*Resol
 	if err != nil {
 		return nil, err
 	}
-	adapter, err := NewOMSClient(r.Policy, r.HTTPClient, resolution, binding.ServerCertificateDigest, token, r.requestTimeout())
+	adapter, err := NewOMSClient(
+		r.Policy,
+		r.HTTPClient,
+		resolution,
+		binding.ServerCertificateDigest,
+		token,
+		backend.Status.ObservedCapabilities.Limits.MaxResponseBytes,
+		r.requestTimeout(),
+	)
 	if err != nil {
 		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory backend client could not be created")
 	}

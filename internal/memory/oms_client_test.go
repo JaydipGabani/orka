@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -155,7 +156,15 @@ func TestNewOMSClientUsesExactPinnedResolutionWithoutDNSReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := NewOMSClient(policy, nil, resolution, "sha256:"+strings.Repeat("0", 64), "secret", time.Second)
+	client, err := NewOMSClient(
+		policy,
+		nil,
+		resolution,
+		"sha256:"+strings.Repeat("0", 64),
+		"secret",
+		protocol.MaxAdapterResponseBytes,
+		time.Second,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,6 +195,132 @@ func testOMSBinding() protocol.Binding {
 }
 
 func testOMSTime() time.Time { return time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC) }
+
+func testOMSCapabilitiesResponse(binding protocol.Binding, maxResponseBytes int) protocol.CapabilitiesResponse {
+	return protocol.CapabilitiesResponse{
+		ProtocolVersion: protocol.Version,
+		Binding:         binding,
+		AdapterName:     "test-adapter",
+		AdapterVersion:  "v1",
+		Revision:        "revision-1",
+		ExpiresAt:       time.Now().Add(time.Hour),
+		Capabilities: protocol.Capabilities{
+			DurableIdempotency:         true,
+			IdempotencyDigestConflicts: true,
+			CreateIfAbsent:             true,
+			ConditionalMutation:        true,
+			MonotonicGenerations:       true,
+			DeleteHighWatermark:        true,
+			DurableRoutingFence:        true,
+			OperationLookup:            true,
+			ExactGet:                   true,
+			StablePagination:           true,
+			ExclusiveOwnership:         true,
+			KeywordSearch:              true,
+			AuditVersionVisibility:     true,
+		},
+		Limits: protocol.CapabilityLimits{
+			MaxRequestBytes:       protocol.MaxHTTPBodyBytes,
+			MaxResponseBytes:      maxResponseBytes,
+			MaxContentBytes:       protocol.MaxContentBytes,
+			MaxTags:               protocol.MaxTags,
+			MaxTagBytes:           protocol.MaxTagBytes,
+			MaxMetadataEntries:    protocol.MaxMetadataEntries,
+			MaxMetadataKeyBytes:   protocol.MaxMetadataKeyBytes,
+			MaxMetadataValueBytes: protocol.MaxMetadataValueBytes,
+			MaxQueryBytes:         protocol.MaxQueryBytes,
+			MaxPageSize:           protocol.MaxPageSize,
+			MaxSnapshotRecords:    protocol.MaxSnapshotRecords,
+			SnapshotTTLSeconds:    60,
+		},
+	}
+}
+
+func TestOMSClientEnforcesConfiguredMaxResponseBytesForEveryStatus(t *testing.T) {
+	const advertisedLimit = 32
+	responseBody := append([]byte(`{"ok":true}`), bytes.Repeat([]byte(" "), advertisedLimit)...)
+
+	for _, status := range []int{http.StatusOK, http.StatusConflict, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				_, _ = w.Write(responseBody)
+			}))
+			defer server.Close()
+
+			client := &OMSClient{
+				baseURL: server.URL, token: "secret", client: server.Client(), maxResponseBytes: advertisedLimit,
+			}
+			_, err := client.post(context.Background(), "/test", struct{}{}, nil, nil, false)
+			var adapterErr *AdapterError
+			if !errors.As(err, &adapterErr) || adapterErr.Code != protocol.ErrorCodeResponseTooLarge {
+				t.Fatalf("post() error = %#v, want response-too-large AdapterError", err)
+			}
+		})
+	}
+}
+
+func TestOMSClientResponseLimitAcceptsExactBoundAndKeepsHardMaximum(t *testing.T) {
+	exactBody := []byte(`{"ok":true}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(exactBody)
+	}))
+	defer server.Close()
+
+	client := &OMSClient{
+		baseURL: server.URL, token: "secret", client: server.Client(), maxResponseBytes: int64(len(exactBody)),
+	}
+	if _, err := client.post(context.Background(), "/test", struct{}{}, nil, nil, false); err != nil {
+		t.Fatalf("post() rejected response at advertised bound: %v", err)
+	}
+
+	client.maxResponseBytes = int64(protocol.MaxAdapterResponseBytes) + 1
+	if got := effectiveOMSResponseLimit(client.maxResponseBytes); got != protocol.MaxAdapterResponseBytes {
+		t.Fatalf("effective response limit = %d, want hard limit %d", got, protocol.MaxAdapterResponseBytes)
+	}
+
+	hardLimitBody := bytes.Repeat([]byte(" "), protocol.MaxAdapterResponseBytes+1)
+	hardLimitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(hardLimitBody)
+	}))
+	defer hardLimitServer.Close()
+	client.baseURL = hardLimitServer.URL
+	client.client = hardLimitServer.Client()
+	_, err := client.post(context.Background(), "/test", struct{}{}, nil, nil, false)
+	var adapterErr *AdapterError
+	if !errors.As(err, &adapterErr) || adapterErr.Code != protocol.ErrorCodeResponseTooLarge {
+		t.Fatalf("post() error = %#v, want hard response limit enforcement", err)
+	}
+}
+
+func TestOMSClientCapabilitiesRetroactivelyEnforcesAdvertisedMaxResponseBytes(t *testing.T) {
+	binding := testOMSBinding()
+	capabilities := testOMSCapabilitiesResponse(binding, 1)
+	responseBody, err := json.Marshal(capabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(responseBody)
+	}))
+	defer server.Close()
+
+	client := &OMSClient{
+		baseURL: server.URL, token: "secret", client: server.Client(), maxResponseBytes: protocol.MaxAdapterResponseBytes,
+	}
+	_, err = client.Capabilities(context.Background(), protocol.CapabilitiesRequest{
+		ProtocolVersion: protocol.Version,
+		Binding:         binding,
+	})
+	var adapterErr *AdapterError
+	if !errors.As(err, &adapterErr) || adapterErr.Code != protocol.ErrorCodeResponseTooLarge {
+		t.Fatalf("Capabilities() error = %#v, want retroactive response-too-large rejection", err)
+	}
+}
 
 func TestOMSClientDecodesTypedSemanticConflictBodies(t *testing.T) {
 	binding := testOMSBinding()
@@ -521,7 +656,15 @@ func TestNewOMSClientPinsValidatedServerCertificateDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := NewOMSClient(policy, nil, resolution, digest, "secret", time.Second)
+	client, err := NewOMSClient(
+		policy,
+		nil,
+		resolution,
+		digest,
+		"secret",
+		protocol.MaxAdapterResponseBytes,
+		time.Second,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

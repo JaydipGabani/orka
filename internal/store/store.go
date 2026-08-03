@@ -185,6 +185,7 @@ type GovernedMemoryStore interface {
 	GetMemoryIdempotency(ctx context.Context, namespaceUID, principal, route, callerKey string) (*MemoryIdempotencyRecord, error)
 	SaveMemorySearchCursor(ctx context.Context, cursor MemorySearchCursorState) error
 	GetMemorySearchCursor(ctx context.Context, namespaceUID, id string, now time.Time) (*MemorySearchCursorState, error)
+	RetireMemorySearchCursor(ctx context.Context, namespaceUID, id string, now time.Time) error
 	AppendMemoryAudit(ctx context.Context, audit MemoryAuditRecord) error
 	ListMemoryAudit(ctx context.Context, filter MemoryAuditFilter) ([]MemoryAuditRecord, error)
 }

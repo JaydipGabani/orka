@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,6 +132,106 @@ func TestBackendResolverRemoteDisabledFailsClosed(t *testing.T) {
 	var structured *apierror.Error
 	if !errors.As(err, &structured) || structured.Reason != ReasonBackendUnavailable {
 		t.Fatalf("ResolveLocal() error = %#v, want fail-closed feature-off error", err)
+	}
+}
+
+func TestBackendResolverConfiguresAdvertisedOMSResponseLimit(t *testing.T) {
+	const (
+		namespace          = "team-a"
+		advertisedResponse = int64(2048)
+	)
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	policy := endpointpolicy.PublicHTTPSPolicy{Resolver: backendResolverStaticDNS{
+		"memory.example.com": {netip.MustParseAddr("8.8.8.8")},
+	}}
+	resolution, err := policy.Resolve(context.Background(), "https://memory.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := store.MemoryBackendBinding{
+		Namespace: namespace, NamespaceUID: "namespace-a", ClusterID: "cluster-a",
+		Mode: store.MemoryBackendModeRemote, State: store.MemoryBackendBindingAccepting,
+		BackendUID: "backend-a", BackendGeneration: 1, AuthorityEpoch: 1, RoutingEpoch: 1,
+		SpecDigest: "sha256:" + strings.Repeat("1", 64), EndpointDigest: resolution.EndpointDigest,
+		ResolvedAddressDigest:   resolution.ResolvedAddressDigest,
+		ServerCertificateDigest: "sha256:" + strings.Repeat("2", 64),
+		SecretName:              "backend-auth", SecretKey: "token", SecretUID: "secret-a", SecretResourceVersion: "1",
+		TenantID: "tenant-a", StoreName: "store-a", StoreUUID: "00000000-0000-4000-8000-000000000001",
+		CapabilityRevision: "revision-1", ValidationExpiresAt: now.Add(time.Hour),
+	}
+	backend := &corev1alpha1.MemoryBackend{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: corev1alpha1.MemoryBackendDefaultName,
+			UID: types.UID(binding.BackendUID), Generation: binding.BackendGeneration,
+		},
+	}
+	backend.Spec.Deployment.Endpoint = resolution.Identity
+	backend.Spec.ClientAuth.BearerTokenSecretRef.Name = binding.SecretName
+	backend.Spec.ClientAuth.BearerTokenSecretRef.Key = binding.SecretKey
+	backend.Status = corev1alpha1.MemoryBackendStatus{
+		ObservedGeneration:      binding.BackendGeneration,
+		ValidatedSpecDigest:     binding.SpecDigest,
+		NamespaceUID:            binding.NamespaceUID,
+		BackendUID:              binding.BackendUID,
+		AuthorityEpoch:          binding.AuthorityEpoch,
+		RoutingEpoch:            binding.RoutingEpoch,
+		SecretUID:               binding.SecretUID,
+		SecretResourceVersion:   binding.SecretResourceVersion,
+		EndpointIdentity:        resolution.Identity,
+		EndpointDigest:          resolution.EndpointDigest,
+		ResolvedAddressDigest:   resolution.ResolvedAddressDigest,
+		ServerCertificateDigest: binding.ServerCertificateDigest,
+		StoreUUID:               binding.StoreUUID,
+		ObservedCapabilities: &corev1alpha1.MemoryBackendObservedCapabilities{
+			Revision: binding.CapabilityRevision,
+			Limits: corev1alpha1.MemoryBackendCapabilityLimits{
+				MaxResponseBytes: advertisedResponse,
+			},
+		},
+		ValidationExpiresAt: &metav1.Time{Time: binding.ValidationExpiresAt},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: binding.SecretName,
+			UID: types.UID(binding.SecretUID), ResourceVersion: binding.SecretResourceVersion,
+			Labels: map[string]string{memoryBackendAuthLabel: memoryBackendAuthEnabled},
+			Annotations: map[string]string{
+				memoryBackendAuthBackendUID:   binding.BackendUID,
+				memoryBackendAuthEndpoint:     resolution.Identity,
+				memoryBackendAuthStoreName:    binding.StoreName,
+				memoryBackendAuthNamespaceUID: binding.NamespaceUID,
+				memoryBackendAuthTenantID:     binding.TenantID,
+			},
+		},
+		Data: map[string][]byte{binding.SecretKey: []byte("secret")},
+	}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace, UID: types.UID(binding.NamespaceUID)}},
+		backend,
+		secret,
+	).Build()
+	resolver := &BackendResolver{
+		Reader: reader, Store: &backendResolverBindingStore{binding: binding},
+		ClusterIdentity: binding.ClusterID, Policy: policy, Now: func() time.Time { return now },
+	}
+
+	authority, err := resolver.Resolve(context.Background(), namespace)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	client, ok := authority.Adapter.(*OMSClient)
+	if !ok {
+		t.Fatalf("Resolve() adapter = %T, want *OMSClient", authority.Adapter)
+	}
+	if client.maxResponseBytes != advertisedResponse {
+		t.Fatalf("OMS maxResponseBytes = %d, want advertised %d", client.maxResponseBytes, advertisedResponse)
 	}
 }
 

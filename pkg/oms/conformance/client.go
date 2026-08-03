@@ -24,10 +24,11 @@ import (
 )
 
 const (
-	defaultTimeout          = 15 * time.Second
-	conformanceMessageLimit = 1024
-	redactedValue           = "[REDACTED]"
-	jsonMediaType           = "application/json"
+	defaultTimeout                = 15 * time.Second
+	conformanceMessageLimit       = 1024
+	minimumRawCredentialLeakBytes = 8
+	redactedValue                 = "[REDACTED]"
+	jsonMediaType                 = "application/json"
 )
 
 // Target describes one authenticated OMS endpoint and exact binding fixture.
@@ -311,12 +312,22 @@ func credentialVariants(value string) []string {
 }
 
 func containsCredential(body []byte, authorizationValue string) bool {
-	for _, credential := range credentialVariants(authorizationValue) {
-		if bytes.Contains(body, []byte(credential)) {
-			return true
+	raw, complete, err := normalizeBearerAuthorization(authorizationValue)
+	if err != nil {
+		for _, credential := range credentialVariants(authorizationValue) {
+			if bytes.Contains(body, []byte(credential)) {
+				return true
+			}
 		}
+		return false
 	}
-	return false
+	if bytes.Contains(body, []byte(complete)) {
+		return true
+	}
+	// Short raw tokens are indistinguishable from ordinary JSON text. Keep them
+	// valid for adapters that accept them, but only treat the unambiguous full
+	// Authorization value as a leak.
+	return len(raw) >= minimumRawCredentialLeakBytes && bytes.Contains(body, []byte(raw))
 }
 
 func sanitizeOutputText(value, authorizationValue string, limit int) string {
