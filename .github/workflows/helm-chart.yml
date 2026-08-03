@@ -107,14 +107,14 @@ jobs:
           external_store_render=$(mktemp)
           long_render=$(mktemp)
           long_wrapper_service=$(mktemp)
-          long_wrapper_secret=$(mktemp)
+          long_wrapper_manifest=$(mktemp)
           memory_enabled_render=$(mktemp)
           memory_activation_error=$(mktemp)
           memory_foundation_activation_error=$(mktemp)
           memory_cluster_error=$(mktemp)
           memory_persistence_error=$(mktemp)
           memory_replica_error=$(mktemp)
-          trap 'rm -f "${default_render}" "${secondary_render}" "${secondary_rbac}" "${secondary_serviceaccounts}" "${secondary_gateway_policy}" "${secondary_memory_policy}" "${secondary_task_worker_policy}" "${secondary_task_provenance_rbac}" "${secondary_store_pvc}" "${external_store_render}" "${long_render}" "${long_wrapper_service}" "${long_wrapper_secret}" "${memory_enabled_render}" "${memory_activation_error}" "${memory_foundation_activation_error}" "${memory_cluster_error}" "${memory_persistence_error}" "${memory_replica_error}"' EXIT
+          trap 'rm -f "${default_render}" "${secondary_render}" "${secondary_rbac}" "${secondary_serviceaccounts}" "${secondary_gateway_policy}" "${secondary_memory_policy}" "${secondary_task_worker_policy}" "${secondary_task_provenance_rbac}" "${secondary_store_pvc}" "${external_store_render}" "${long_render}" "${long_wrapper_service}" "${long_wrapper_manifest}" "${memory_enabled_render}" "${memory_activation_error}" "${memory_foundation_activation_error}" "${memory_cluster_error}" "${memory_persistence_error}" "${memory_replica_error}"' EXIT
           helm template orka manifest_staging/charts/orka \
             --namespace "${NAMESPACE}" \
             --set-string workers.harnessWrapper.auth.token="${harness_wrapper_auth_value}" \
@@ -238,7 +238,7 @@ jobs:
             --namespace "${NAMESPACE}" \
             --set-string workers.harnessWrapper.auth.token="${harness_wrapper_auth_value}" \
             --show-only templates/harness-wrapper-secret.yaml \
-            > "${long_wrapper_secret}"
+            > "${long_wrapper_manifest}"
 
           grep -Fq -- "--controller-url=http://orka.${NAMESPACE}.svc:8080" "${default_render}"
           grep -Fq -- "--controller-url=http://secondary-orka.${NAMESPACE}.svc:8080" "${secondary_render}"
@@ -283,7 +283,7 @@ jobs:
             exit 1
           fi
           wrapper_name=$(awk '$1 == "name:" { print $2; exit }' "${long_wrapper_service}")
-          wrapper_secret_name=$(awk '$1 == "name:" { print $2; exit }' "${long_wrapper_secret}")
+          wrapper_secret_name=$(awk '$1 == "name:" { print $2; exit }' "${long_wrapper_manifest}")
           [[ -n "${wrapper_name}" && ${#wrapper_name} -le 63 ]]
           [[ -n "${wrapper_secret_name}" && ${#wrapper_secret_name} -le 63 ]]
           grep -Fq -- "http://${wrapper_name}:8080" "${long_render}"
