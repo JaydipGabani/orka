@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -18,12 +19,21 @@ import (
 )
 
 const (
-	remoteSearchCursorTTL      = 5 * time.Minute
-	maxRemoteSearchCursorBytes = 16 << 10
-	legacySearchCursorPrefix   = "lsc-"
+	remoteSearchCursorTTL               = 5 * time.Minute
+	maxRemoteSearchCursorBytes          = store.MaxMemorySearchCursorStateBytes
+	remoteSearchSeenRecordStateVersion  = byte(1)
+	remoteSearchSeenRecordDigestBytes   = sha256.Size
+	remoteSearchSeenRecordDigestMaximum = protocol.MaxSnapshotRecords
+	remoteSearchCursorPrefix            = "msc1-"
+	legacyRemoteSearchCursorPrefix      = "msc-"
+	legacySearchCursorPrefix            = "lsc-"
 )
 
-var errLegacySearchCursorInvalid = errors.New("invalid legacy memory search cursor")
+var (
+	errLegacySearchCursorInvalid    = errors.New("invalid legacy memory search cursor")
+	errLegacyRemoteSearchCursor     = errors.New("memory search cursor predates exact identity tracking")
+	errRemoteSearchIdentityCapacity = errors.New("memory search identity tracking capacity reached")
+)
 
 type memorySearchCursorStore interface {
 	SaveMemorySearchCursor(context.Context, store.MemorySearchCursorState) error
@@ -49,15 +59,15 @@ func (s serviceLegacyCursorStore) SaveMemorySearchCursor(_ context.Context, curs
 	if s.service.legacyCursors == nil {
 		s.service.legacyCursors = make(map[string]store.MemorySearchCursorState)
 	}
-	bytes := 0
+	totalBytes := 0
 	for id, existing := range s.service.legacyCursors {
 		if !existing.ExpiresAt.After(cursor.CreatedAt) {
 			delete(s.service.legacyCursors, id)
 			continue
 		}
-		bytes += len(existing.State)
+		totalBytes += len(existing.State)
 	}
-	if len(s.service.legacyCursors) >= 128 || bytes+len(cursor.State) > 2<<20 {
+	if len(s.service.legacyCursors) >= 128 || totalBytes+len(cursor.State) > 2<<20 {
 		return store.ErrCapacity
 	}
 	copy := cursor
@@ -267,6 +277,7 @@ func legacySearchCursorNamespace(authority *ResolvedAuthority) string {
 
 type remoteSearchCursorRecord struct {
 	MemoryID        string  `json:"m"`
+	UpsertKey       string  `json:"u"`
 	Generation      uint64  `json:"g"`
 	BackendVersion  string  `json:"v"`
 	BackendMemoryID string  `json:"i"`
@@ -280,6 +291,58 @@ type remoteSearchCursor struct {
 	PageSize          int                        `json:"z"`
 	ActualMode        string                     `json:"m,omitempty"`
 	Pending           []remoteSearchCursorRecord `json:"n,omitempty"`
+	ReplayPrefix      []remoteSearchCursorRecord `json:"f,omitempty"`
+	SeenRecordState   []byte                     `json:"s,omitempty"`
+}
+
+func newRemoteSearchSeenRecordState() []byte {
+	return []byte{remoteSearchSeenRecordStateVersion}
+}
+
+func validRemoteSearchSeenRecordState(state []byte) bool {
+	if len(state) == 0 {
+		return true
+	}
+	payloadBytes := len(state) - 1
+	return state[0] == remoteSearchSeenRecordStateVersion &&
+		payloadBytes%remoteSearchSeenRecordDigestBytes == 0 &&
+		payloadBytes/remoteSearchSeenRecordDigestBytes <= remoteSearchSeenRecordDigestMaximum
+}
+
+func remoteSearchSeenRecordStatePresent(state []byte) bool {
+	return len(state) > 0
+}
+
+func cloneRemoteSearchSeenRecordState(state []byte) []byte {
+	return append([]byte(nil), state...)
+}
+
+// rememberRemoteSearchRecordIdentity records one canonical upsert key as a
+// complete SHA-256 digest. The state is exact within the protocol's bounded
+// snapshot cardinality; reaching that hard bound returns capacity rather than
+// probabilistically classifying a fresh provider record as a duplicate.
+func rememberRemoteSearchRecordIdentity(state *[]byte, upsertKey string) (bool, error) {
+	if state == nil || strings.TrimSpace(upsertKey) == "" {
+		return false, errors.New("memory search record identity is invalid")
+	}
+	if len(*state) == 0 {
+		*state = newRemoteSearchSeenRecordState()
+	}
+	if !validRemoteSearchSeenRecordState(*state) || !remoteSearchSeenRecordStatePresent(*state) {
+		return false, errors.New("memory search identity state is invalid")
+	}
+	digest := sha256.Sum256([]byte(upsertKey))
+	for offset := 1; offset < len(*state); offset += remoteSearchSeenRecordDigestBytes {
+		if bytes.Equal((*state)[offset:offset+remoteSearchSeenRecordDigestBytes], digest[:]) {
+			return true, nil
+		}
+	}
+	count := (len(*state) - 1) / remoteSearchSeenRecordDigestBytes
+	if count >= remoteSearchSeenRecordDigestMaximum {
+		return false, errRemoteSearchIdentityCapacity
+	}
+	*state = append(*state, digest[:]...)
+	return false, nil
 }
 
 func saveRemoteSearchCursor(
@@ -290,7 +353,8 @@ func saveRemoteSearchCursor(
 	state remoteSearchCursor,
 	now time.Time,
 ) (string, error) {
-	if governed == nil || binding == nil || (state.ProviderToken == "" && len(state.Pending) == 0) {
+	if governed == nil || binding == nil || (state.ProviderToken == "" && len(state.Pending) == 0) ||
+		!remoteSearchSeenRecordStatePresent(state.SeenRecordState) {
 		return "", errors.New("memory search cursor state is unavailable")
 	}
 	identity, err := protocolBinding(binding)
@@ -301,7 +365,7 @@ func saveRemoteSearchCursor(
 	if err != nil || len(payload) == 0 || len(payload) > maxRemoteSearchCursorBytes {
 		return "", errors.New("memory search cursor state is invalid")
 	}
-	id := "msc-" + uuid.NewString()
+	id := remoteSearchCursorPrefix + uuid.NewString()
 	err = governed.SaveMemorySearchCursor(ctx, store.MemorySearchCursorState{
 		ID: id, NamespaceUID: binding.NamespaceUID,
 		BindingDigest: protocol.BindingDigest(identity), QueryDigest: queryDigest,
@@ -323,7 +387,11 @@ func loadRemoteSearchCursor(
 	if strings.TrimSpace(encoded) == "" {
 		return remoteSearchCursor{}, nil
 	}
-	if governed == nil || binding == nil || !strings.HasPrefix(encoded, "msc-") || len(encoded) > 128 {
+	encoded = strings.TrimSpace(encoded)
+	if strings.HasPrefix(encoded, legacyRemoteSearchCursorPrefix) && !strings.HasPrefix(encoded, remoteSearchCursorPrefix) {
+		return remoteSearchCursor{}, errLegacyRemoteSearchCursor
+	}
+	if governed == nil || binding == nil || !strings.HasPrefix(encoded, remoteSearchCursorPrefix) || len(encoded) > 128 {
 		return remoteSearchCursor{}, errors.New("invalid memory search cursor")
 	}
 	identity, err := protocolBinding(binding)
@@ -343,7 +411,9 @@ func loadRemoteSearchCursor(
 		cursor.PageSize > protocol.MaxPageSize ||
 		(cursor.ActualMode != protocol.SearchModeKeyword && cursor.ActualMode != protocol.SearchModeSemantic &&
 			cursor.ActualMode != protocol.SearchModeHybrid) ||
-		(cursor.ProviderToken == "" && len(cursor.Pending) == 0) || len(cursor.Pending) > protocol.MaxPageSize {
+		(cursor.ProviderToken == "" && len(cursor.Pending) == 0) || len(cursor.Pending) > protocol.MaxPageSize ||
+		!validRemoteSearchSeenRecordState(cursor.SeenRecordState) ||
+		!remoteSearchSeenRecordStatePresent(cursor.SeenRecordState) {
 		return remoteSearchCursor{}, errors.New("invalid memory search cursor state")
 	}
 	return cursor, nil

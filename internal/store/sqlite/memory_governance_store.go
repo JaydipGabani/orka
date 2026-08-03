@@ -3661,8 +3661,8 @@ func (s *Store) SaveMemorySearchCursor(ctx context.Context, cursor store.MemoryS
 	cursor.CreatedAt = normalizeMemoryNow(cursor.CreatedAt)
 	cursor.ExpiresAt = cursor.ExpiresAt.UTC()
 	if cursor.ID == "" || cursor.NamespaceUID == "" || cursor.BindingDigest == "" || cursor.QueryDigest == "" ||
-		len(cursor.State) == 0 || len(cursor.State) > 16<<10 || !cursor.ExpiresAt.After(cursor.CreatedAt) ||
-		cursor.ExpiresAt.Sub(cursor.CreatedAt) > 10*time.Minute {
+		len(cursor.State) == 0 || len(cursor.State) > store.MaxMemorySearchCursorStateBytes ||
+		!cursor.ExpiresAt.After(cursor.CreatedAt) || cursor.ExpiresAt.Sub(cursor.CreatedAt) > 10*time.Minute {
 		return store.ValidationErrorf("memory search cursor state is invalid")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)

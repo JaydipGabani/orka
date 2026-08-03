@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -25,15 +26,16 @@ const testRemoteCreateRoute = "createMemory"
 
 type governedSearchStore struct {
 	store.GovernedMemoryStore
-	entries   []store.RemoteMemoryCatalogEntry
-	byID      map[string]store.RemoteMemoryCatalogEntry
-	listCalls int
-	getErr    error
-	auditErr  error
-	cursorErr error
-	audits    []store.MemoryAuditRecord
-	cursors   map[string]store.MemorySearchCursorState
-	retired   map[string]bool
+	entries          []store.RemoteMemoryCatalogEntry
+	byID             map[string]store.RemoteMemoryCatalogEntry
+	listCalls        int
+	getErr           error
+	auditErr         error
+	cursorErr        error
+	audits           []store.MemoryAuditRecord
+	cursors          map[string]store.MemorySearchCursorState
+	retired          map[string]bool
+	maxActiveCursors int
 }
 
 func newGovernedSearchStore(entries []store.RemoteMemoryCatalogEntry) *governedSearchStore {
@@ -89,6 +91,39 @@ func (s *governedSearchStore) ListRemoteMemories(
 }
 
 func (s *governedSearchStore) SaveMemorySearchCursor(_ context.Context, cursor store.MemorySearchCursorState) error {
+	if _, exists := s.cursors[cursor.ID]; !exists && s.maxActiveCursors > 0 &&
+		s.activeCursorCount() >= s.maxActiveCursors {
+		return fmt.Errorf("%w: test memory search cursor capacity reached", store.ErrCapacity)
+	}
+	s.cursors[cursor.ID] = cursor
+	return nil
+}
+
+func (s *governedSearchStore) activeCursorCount() int {
+	active := 0
+	for id := range s.cursors {
+		if !s.retired[id] {
+			active++
+		}
+	}
+	return active
+}
+
+type conflictCheckingSearchStore struct {
+	*governedSearchStore
+}
+
+func (s *conflictCheckingSearchStore) SaveMemorySearchCursor(
+	_ context.Context,
+	cursor store.MemorySearchCursorState,
+) error {
+	if existing, ok := s.cursors[cursor.ID]; ok {
+		if existing.NamespaceUID == cursor.NamespaceUID && existing.BindingDigest == cursor.BindingDigest &&
+			existing.QueryDigest == cursor.QueryDigest && slices.Equal(existing.State, cursor.State) {
+			return nil
+		}
+		return store.ErrConflict
+	}
 	s.cursors[cursor.ID] = cursor
 	return nil
 }
@@ -935,6 +970,170 @@ func TestRemoteListQueryPreservesEveryFilterBeforeLimit(t *testing.T) {
 	}
 }
 
+func TestRemoteListRetiresConsumedCursorsAndPreservesReplay(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, 3)
+	records := make([]protocol.MemoryRecord, 0, 3)
+	for i := range 3 {
+		entry, record := remoteSearchFixture(
+			binding, fmt.Sprintf("mem-list-replay-%d", i), now.Add(-time.Duration(i)*time.Second),
+			"content", store.MemoryTrustReviewed,
+		)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	service, _, activeBinding, governed := remoteSearchService(t, entries, records)
+	service.Now = func() time.Time { return now.Add(time.Minute) }
+	filter := store.MemoryFilter{Namespace: activeBinding.Namespace, Limit: 1}
+
+	first, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+	if err != nil || len(first.Items) != 1 || first.Items[0].ID != entries[0].ID || first.Cursor == "" || first.Exhausted {
+		t.Fatalf("first list page = %#v, %v", first, err)
+	}
+	filter.Cursor = first.Cursor
+	second, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+	if err != nil || len(second.Items) != 1 || second.Items[0].ID != entries[1].ID || second.Cursor == "" || second.Exhausted {
+		t.Fatalf("second list page = %#v, %v", second, err)
+	}
+	if !governed.retired[first.Cursor] {
+		t.Fatal("consumed list cursor was not retired when its successor was persisted")
+	}
+	replayedSecond, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+	if err != nil || len(replayedSecond.Items) != 1 || replayedSecond.Items[0].ID != second.Items[0].ID ||
+		replayedSecond.Cursor != second.Cursor || replayedSecond.Exhausted {
+		t.Fatalf("replayed second list page = %#v, %v; want deterministic successor %#v", replayedSecond, err, second)
+	}
+
+	filter.Cursor = second.Cursor
+	terminal, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+	if err != nil || len(terminal.Items) != 1 || terminal.Items[0].ID != entries[2].ID || terminal.Cursor != "" || !terminal.Exhausted {
+		t.Fatalf("terminal list page = %#v, %v", terminal, err)
+	}
+	if !governed.retired[second.Cursor] {
+		t.Fatal("consumed list cursor was not retired on the terminal page")
+	}
+	replayedTerminal, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+	if err != nil || len(replayedTerminal.Items) != 1 || replayedTerminal.Items[0].ID != terminal.Items[0].ID ||
+		replayedTerminal.Cursor != "" || !replayedTerminal.Exhausted {
+		t.Fatalf("replayed terminal list page = %#v, %v; want %#v", replayedTerminal, err, terminal)
+	}
+	if active := governed.activeCursorCount(); active != 0 {
+		t.Fatalf("active list cursors after terminal replay = %d, want 0", active)
+	}
+}
+
+func TestRemoteListReplaySuccessorTracksChangedBoundary(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 12, 30, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, 3)
+	records := make([]protocol.MemoryRecord, 0, 3)
+	for i := range 3 {
+		entry, record := remoteSearchFixture(
+			binding, fmt.Sprintf("mem-list-changing-%d", i), now.Add(-time.Duration(i)*time.Second),
+			"content", store.MemoryTrustReviewed,
+		)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	secondID, changedID := entries[1].ID, entries[2].ID
+	service, _, activeBinding, governed := remoteSearchService(t, entries, records)
+	service.Now = func() time.Time { return now.Add(time.Minute) }
+	service.Governed = &conflictCheckingSearchStore{governedSearchStore: governed}
+	filter := store.MemoryFilter{Namespace: activeBinding.Namespace, Limit: 1}
+
+	first, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+	if err != nil || len(first.Items) != 1 || first.Cursor == "" {
+		t.Fatalf("first list page = %#v, %v", first, err)
+	}
+	filter.Cursor = first.Cursor
+	second, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+	if err != nil || len(second.Items) != 1 || second.Items[0].ID != secondID || second.Cursor == "" {
+		t.Fatalf("second list page = %#v, %v", second, err)
+	}
+
+	governed.entries[1], governed.entries[2] = governed.entries[2], governed.entries[1]
+	replayed, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+	if err != nil || len(replayed.Items) != 1 || replayed.Items[0].ID != changedID || replayed.Cursor == "" {
+		t.Fatalf("replayed changed list page = %#v, %v", replayed, err)
+	}
+	if replayed.Cursor == second.Cursor {
+		t.Fatalf("changed list boundary reused successor cursor %q", replayed.Cursor)
+	}
+}
+
+func TestRemoteListCursorRetirementAllowsPaginationBeyondActiveQuota(t *testing.T) {
+	const recordCount = 130
+	now := time.Date(2026, 8, 3, 13, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, recordCount)
+	records := make([]protocol.MemoryRecord, 0, recordCount)
+	for i := range recordCount {
+		entry, record := remoteSearchFixture(
+			binding, fmt.Sprintf("mem-list-quota-%03d", i), now.Add(-time.Duration(i)*time.Second),
+			"content", store.MemoryTrustReviewed,
+		)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	service, _, activeBinding, governed := remoteSearchService(t, entries, records)
+	service.Now = func() time.Time { return now.Add(time.Minute) }
+	governed.maxActiveCursors = 128
+	filter := store.MemoryFilter{Namespace: activeBinding.Namespace, Limit: 1}
+	seen := make(map[string]struct{}, recordCount)
+
+	for pageNumber := range recordCount {
+		page, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+		if err != nil {
+			t.Fatalf("list page %d: %v", pageNumber+1, err)
+		}
+		if len(page.Items) != 1 {
+			t.Fatalf("list page %d = %#v, want one item", pageNumber+1, page)
+		}
+		if _, duplicate := seen[page.Items[0].ID]; duplicate {
+			t.Fatalf("list page %d repeated %q", pageNumber+1, page.Items[0].ID)
+		}
+		seen[page.Items[0].ID] = struct{}{}
+		if pageNumber < recordCount-1 {
+			if page.Cursor == "" || page.Exhausted {
+				t.Fatalf("list page %d = %#v, want continuation", pageNumber+1, page)
+			}
+			filter.Cursor = page.Cursor
+			continue
+		}
+		if page.Cursor != "" || !page.Exhausted {
+			t.Fatalf("terminal list page = %#v", page)
+		}
+	}
+	if len(seen) != recordCount {
+		t.Fatalf("listed %d unique records, want %d", len(seen), recordCount)
+	}
+	if active := governed.activeCursorCount(); active != 0 {
+		t.Fatalf("active list cursors after %d pages = %d, want 0", recordCount, active)
+	}
+	if retired := len(governed.retired); retired != recordCount-1 {
+		t.Fatalf("retired list cursors = %d, want %d", retired, recordCount-1)
+	}
+}
+
 func TestRemoteCatalogFiltersBeforeLimitAcrossPages(t *testing.T) {
 	now := time.Date(2026, 7, 29, 1, 0, 0, 0, time.UTC)
 	binding := store.MemoryBackendBinding{
@@ -1211,6 +1410,137 @@ func TestRemoteSearchPersistsAdvertisedMaximumPageSize(t *testing.T) {
 		if pageSize != 1 {
 			t.Fatalf("provider page size[%d] = %d, want 1", i, pageSize)
 		}
+	}
+}
+
+func TestRemoteSearchPendingReplayRejectsChangedConsumedPrefix(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 17, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, 16)
+	records := make([]protocol.MemoryRecord, 0, 16)
+	for i := range 16 {
+		entry, record := remoteSearchFixture(
+			binding, fmt.Sprintf("mem-prefix-%02d", i), now.Add(-time.Duration(i)*time.Second),
+			"needle", store.MemoryTrustReviewed,
+		)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	service, adapter, activeBinding, governed := remoteSearchService(t, entries, records)
+	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now.Add(time.Minute)
+
+	first, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 9,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || first == nil || len(first.Items) != 9 || first.Cursor == "" {
+		t.Fatalf("first Search() = %#v, %v", first, err)
+	}
+	var firstState persistedRemoteSearchCursor
+	if err := json.Unmarshal(governed.cursors[first.Cursor].State, &firstState); err != nil ||
+		len(firstState.ReplayPrefix) != 1 || len(firstState.Pending) != 7 {
+		t.Fatalf("first pending state = %#v, %v", firstState, err)
+	}
+
+	second, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: first.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || second == nil || len(second.Items) != 1 || second.Cursor == "" {
+		t.Fatalf("second Search() = %#v, %v", second, err)
+	}
+	var secondState persistedRemoteSearchCursor
+	if err := json.Unmarshal(governed.cursors[second.Cursor].State, &secondState); err != nil ||
+		len(secondState.ReplayPrefix) != 2 || len(secondState.Pending) != 6 {
+		t.Fatalf("second pending state = %#v, %v", secondState, err)
+	}
+
+	_, changed := remoteSearchFixture(
+		binding, "mem-prefix-changed", now.Add(-time.Hour), "needle", store.MemoryTrustReviewed,
+	)
+	adapter.records[8] = changed
+	response, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: second.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if response != nil || !errors.As(err, &structured) || structured.Status != http.StatusConflict ||
+		structured.Reason != ReasonDiverged {
+		t.Fatalf("changed-prefix Search() = %#v, %#v; want fail-closed divergence", response, err)
+	}
+}
+
+func TestRemoteSearchReplaySuccessorsAreKeyedByNormalizedPageLimit(t *testing.T) {
+	now := time.Date(2026, 8, 3, 8, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entries := make([]store.RemoteMemoryCatalogEntry, 0, 25)
+	records := make([]protocol.MemoryRecord, 0, 25)
+	for i := 1; i <= 25; i++ {
+		entry, record := remoteSearchFixture(
+			binding, fmt.Sprintf("mem-shape-%02d", i), now.Add(-time.Duration(i)*time.Second), "needle", store.MemoryTrustReviewed,
+		)
+		entries = append(entries, entry)
+		records = append(records, record)
+	}
+	service, _, activeBinding, governed := remoteSearchService(t, entries, records)
+	authority := service.Resolver.(staticAuthorityResolver).authority
+	authority.Backend.Status.ObservedCapabilities.Limits.MaxPageSize = 1
+	service.Governed = &conflictCheckingSearchStore{governedSearchStore: governed}
+
+	first, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || first == nil || len(first.Items) != 1 || first.Cursor == "" || first.Exhausted {
+		t.Fatalf("first Search() = %#v, %v", first, err)
+	}
+
+	replay := func(limit int, allowIncomplete bool) *SearchResponse {
+		t.Helper()
+		response, replayErr := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+			Query: "needle", Limit: limit, Cursor: first.Cursor, AllowIncomplete: allowIncomplete,
+		}, SearchContext{RemoteAuthorized: true})
+		if replayErr != nil || response == nil || response.Cursor == "" || response.Exhausted {
+			t.Fatalf("replay limit=%d = %#v, %v", limit, response, replayErr)
+		}
+		return response
+	}
+
+	one := replay(1, false)
+	two := replay(2, false)
+	if len(one.Items) != 1 || one.Items[0].Memory.ID != "mem-shape-02" {
+		t.Fatalf("limit-one replay = %#v", one)
+	}
+	if len(two.Items) != 2 || two.Items[0].Memory.ID != "mem-shape-02" || two.Items[1].Memory.ID != "mem-shape-03" {
+		t.Fatalf("limit-two replay = %#v", two)
+	}
+	if one.Cursor == two.Cursor {
+		t.Fatalf("different normalized page limits reused successor %q", one.Cursor)
+	}
+	if replayed := replay(1, false); replayed.Cursor != one.Cursor {
+		t.Fatalf("limit-one replay cursor = %q, want idempotent %q", replayed.Cursor, one.Cursor)
+	}
+	if replayed := replay(2, false); replayed.Cursor != two.Cursor {
+		t.Fatalf("limit-two replay cursor = %q, want idempotent %q", replayed.Cursor, two.Cursor)
+	}
+
+	defaulted := replay(0, true)
+	explicitDefault := replay(defaultRemoteCatalogLimit, true)
+	if len(defaulted.Items) != maxRemoteSearchPages || defaulted.Complete ||
+		len(explicitDefault.Items) != len(defaulted.Items) || explicitDefault.Complete {
+		t.Fatalf("normalized default replays = default %#v, explicit %#v", defaulted, explicitDefault)
+	}
+	if explicitDefault.Cursor != defaulted.Cursor {
+		t.Fatalf("equivalent normalized page limits produced %q and %q", defaulted.Cursor, explicitDefault.Cursor)
 	}
 }
 
@@ -1495,7 +1825,7 @@ func TestKeywordRecordMatchesContentAndLocalCatalogMetadata(t *testing.T) {
 	entry := &store.RemoteMemoryCatalogEntry{
 		ID: "mem-1", SessionName: "session-a", Source: "api", Tags: []string{"storage"},
 	}
-	for _, query := range []string{"guidance", "storage", "session-a", "api"} {
+	for _, query := range []string{"guidance", "storage", "session-a", "sessionname", "api", "source"} {
 		if !keywordRecordMatches(record, entry, query) {
 			t.Fatalf("keywordRecordMatches(%q) = false", query)
 		}
@@ -2342,5 +2672,219 @@ func TestLegacySearchCursorStoreFailureIsServerError(t *testing.T) {
 	var structured *apierror.Error
 	if !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable {
 		t.Fatalf("cursor store error = %#v, want HTTP 503", err)
+	}
+}
+
+func TestRemoteSearchContinuationRejectsLegacyFormat(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 16, 5, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entry, record := remoteSearchFixture(binding, "mem-legacy-format", now, "needle", store.MemoryTrustReviewed)
+	service, _, activeBinding, _ := remoteSearchService(t, []store.RemoteMemoryCatalogEntry{entry}, []protocol.MemoryRecord{record})
+	service.Now = func() time.Time { return now }
+
+	response, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: "msc-legacy-format",
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if response != nil || !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable ||
+		structured.Reason != ReasonResultSetIncomplete {
+		t.Fatalf("legacy Search() = %#v, %#v; want HTTP 503 %s", response, err, ReasonResultSetIncomplete)
+	}
+}
+
+func TestRemoteSearchIdentityTrackingCapacityIsIncomplete(t *testing.T) {
+	state := newRemoteSearchSeenRecordState()
+	for i := range remoteSearchSeenRecordDigestMaximum {
+		seen, err := rememberRemoteSearchRecordIdentity(&state, fmt.Sprintf("identity-%04d", i))
+		if err != nil || seen {
+			t.Fatalf("remember identity %d: seen=%v err=%v", i, seen, err)
+		}
+	}
+	err := trackRemoteSearchRecordIdentity(&state, "identity-over-capacity")
+	var structured *apierror.Error
+	if !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable ||
+		structured.Reason != ReasonResultSetIncomplete {
+		t.Fatalf("capacity error = %#v, want HTTP 503 %s", err, ReasonResultSetIncomplete)
+	}
+}
+
+func assertPersistedSearchIdentities(
+	t *testing.T,
+	governed *governedSearchStore,
+	cursor string,
+	identities ...string,
+) {
+	t.Helper()
+	stored, ok := governed.cursors[cursor]
+	if !ok {
+		t.Fatalf("cursor %q was not persisted", cursor)
+	}
+	if len(stored.State) == 0 || len(stored.State) > maxRemoteSearchCursorBytes {
+		t.Fatalf("cursor %q state bytes = %d, want 1..%d", cursor, len(stored.State), maxRemoteSearchCursorBytes)
+	}
+	var persisted persistedRemoteSearchCursor
+	if err := json.Unmarshal(stored.State, &persisted); err != nil {
+		t.Fatalf("decode cursor %q: %v", cursor, err)
+	}
+	if !remoteSearchSeenRecordStatePresent(persisted.SeenRecordState) ||
+		!validRemoteSearchSeenRecordState(persisted.SeenRecordState) {
+		t.Fatalf("cursor %q persisted invalid seen-record state", cursor)
+	}
+	for _, identity := range identities {
+		probe := cloneRemoteSearchSeenRecordState(persisted.SeenRecordState)
+		seen, err := rememberRemoteSearchRecordIdentity(&probe, identity)
+		if err != nil || !seen {
+			t.Fatalf("cursor %q did not retain record identity %q: seen=%v err=%v", cursor, identity, seen, err)
+		}
+	}
+}
+
+func TestRemoteSearchContinuationRejectsRepeatedProviderRecordAcrossCursors(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 14, 0, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	firstEntry, firstRecord := remoteSearchFixture(
+		binding, "mem-repeat-1", now.Add(-time.Second), "needle one", store.MemoryTrustReviewed,
+	)
+	secondEntry, secondRecord := remoteSearchFixture(
+		binding, "mem-repeat-2", now.Add(-2*time.Second), "needle two", store.MemoryTrustReviewed,
+	)
+	service, adapter, activeBinding, governed := remoteSearchService(
+		t, []store.RemoteMemoryCatalogEntry{firstEntry, secondEntry},
+		[]protocol.MemoryRecord{firstRecord, secondRecord, firstRecord},
+	)
+	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now.Add(time.Minute)
+	authority := service.Resolver.(staticAuthorityResolver).authority
+	authority.Backend.Status.ObservedCapabilities.Limits.MaxPageSize = 1
+	service.Governed = &conflictCheckingSearchStore{governedSearchStore: governed}
+
+	first, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || first == nil || len(first.Items) != 1 || first.Items[0].Memory.ID != firstEntry.ID ||
+		first.Cursor == "" || first.Exhausted {
+		t.Fatalf("first Search() = %#v, %v", first, err)
+	}
+	assertPersistedSearchIdentities(t, governed, first.Cursor, firstRecord.UpsertKey)
+
+	second, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: first.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || second == nil || len(second.Items) != 1 || second.Items[0].Memory.ID != secondEntry.ID ||
+		second.Cursor == "" || second.Exhausted {
+		t.Fatalf("second Search() = %#v, %v", second, err)
+	}
+	assertPersistedSearchIdentities(t, governed, second.Cursor, firstRecord.UpsertKey, secondRecord.UpsertKey)
+
+	replayed, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: first.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || replayed == nil || len(replayed.Items) != 1 ||
+		replayed.Items[0].Memory.ID != secondEntry.ID || replayed.Cursor != second.Cursor {
+		t.Fatalf("replayed Search() = %#v, %v; want deterministic successor %q", replayed, err, second.Cursor)
+	}
+
+	repeated, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: second.Cursor,
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if repeated != nil || !errors.As(err, &structured) || structured.Status != http.StatusConflict ||
+		structured.Reason != ReasonDiverged {
+		t.Fatalf("repeated Search() = %#v, %#v; want fail-closed provider divergence", repeated, err)
+	}
+}
+
+func TestRemoteSearchRejectsRepeatedProviderRecordWithinPage(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 14, 5, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entry, record := remoteSearchFixture(binding, "mem-repeat-page", now, "needle", store.MemoryTrustReviewed)
+	service, adapter, activeBinding, _ := remoteSearchService(
+		t, []store.RemoteMemoryCatalogEntry{entry}, []protocol.MemoryRecord{record, record},
+	)
+	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now.Add(time.Minute)
+
+	response, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 2,
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if response != nil || !errors.As(err, &structured) || structured.Status != http.StatusConflict ||
+		structured.Reason != ReasonDiverged {
+		t.Fatalf("Search() = %#v, %#v; want fail-closed duplicate-page divergence", response, err)
+	}
+}
+
+func TestRemoteSearchContinuationFitsWorstCasePendingState(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 15, 0, 0, 0, time.UTC)
+	binding := &store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	identity, err := protocolBinding(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := func(prefix string) remoteSearchCursorRecord {
+		memoryID := prefix + strings.Repeat("m", protocol.MaxIdentityBytes-len(prefix))
+		return remoteSearchCursorRecord{
+			MemoryID: memoryID, UpsertKey: protocol.CanonicalUpsertKey(identity, memoryID),
+			Generation: math.MaxInt64, BackendVersion: strings.Repeat("<", protocol.MaxIdentityBytes),
+			BackendMemoryID: strings.Repeat(">", protocol.MaxIdentityBytes),
+			ContentDigest:   protocol.ContentDigest("worst-case-cursor"), Score: math.MaxFloat64,
+		}
+	}
+	pending := make([]remoteSearchCursorRecord, protocol.MaxPageSize-1)
+	for i := range pending {
+		pending[i] = descriptor(fmt.Sprintf("p%02d", i))
+	}
+	replayPrefix := []remoteSearchCursorRecord{descriptor("r00")}
+	seenState := newRemoteSearchSeenRecordState()
+	seenCount := protocol.MaxSnapshotRecords - len(pending)
+	for i := range seenCount {
+		key := protocol.CanonicalUpsertKey(identity, fmt.Sprintf("seen-%04d", i))
+		seen, rememberErr := rememberRemoteSearchRecordIdentity(&seenState, key)
+		if rememberErr != nil || seen {
+			t.Fatalf("remember seen identity %d: seen=%v err=%v", i, seen, rememberErr)
+		}
+	}
+	governed := newGovernedSearchStore(nil)
+	cursor, err := saveRemoteSearchContinuation(
+		t.Context(), governed, binding, "query-digest",
+		remoteSearchCursor{
+			ProviderToken: strings.Repeat("a", protocol.MaxPageTokenBytes),
+			PageSize:      protocol.MaxPageSize, ActualMode: protocol.SearchModeKeyword,
+			Pending: pending, ReplayPrefix: replayPrefix, SeenRecordState: seenState,
+		},
+		strings.Repeat("b", protocol.MaxPageTokenBytes), now.Add(time.Minute), nil, "",
+		maxRemoteCatalogLimit, now,
+	)
+	if err != nil || cursor == "" {
+		t.Fatalf("saveRemoteSearchContinuation() cursor=%q err=%v", cursor, err)
+	}
+	stored := governed.cursors[cursor]
+	if got := len(stored.State); got <= 64<<10 || got > store.MaxMemorySearchCursorStateBytes {
+		t.Fatalf("worst-case cursor state bytes = %d, want >%d and <=%d",
+			got, 64<<10, store.MaxMemorySearchCursorStateBytes)
 	}
 }

@@ -4696,6 +4696,24 @@ func TestRetainedTerminalPayloadsCountTowardAdmissionQuota(t *testing.T) {
 	}
 }
 
+func TestMemorySearchCursorStateByteLimit(t *testing.T) {
+	s := setupTestStore(t)
+	now := time.Date(2026, time.August, 3, 15, 5, 0, 0, time.UTC)
+	cursor := store.MemorySearchCursorState{
+		ID: "msc-state-limit", NamespaceUID: "namespace-a", BindingDigest: "binding", QueryDigest: "query",
+		State:     bytes.Repeat([]byte{'x'}, store.MaxMemorySearchCursorStateBytes),
+		CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := s.SaveMemorySearchCursor(t.Context(), cursor); err != nil {
+		t.Fatalf("SaveMemorySearchCursor(maximum) error = %v", err)
+	}
+	cursor.ID = "msc-state-oversized"
+	cursor.State = append(cursor.State, 'x')
+	if err := s.SaveMemorySearchCursor(t.Context(), cursor); !errors.Is(err, store.ErrValidation) {
+		t.Fatalf("SaveMemorySearchCursor(oversized) error = %v, want ErrValidation", err)
+	}
+}
+
 func TestMemorySearchCursorCapacityIsBounded(t *testing.T) {
 	original := governedMemoryQuotas
 	t.Cleanup(func() { governedMemoryQuotas = original })

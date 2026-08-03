@@ -945,6 +945,11 @@ type RemoteMemoryTrustChange struct {
 	Now                        time.Time
 }
 
+// MaxMemorySearchCursorStateBytes is the immutable hard cap for opaque,
+// short-lived server-side pagination state. Namespace and global byte quotas
+// remain the primary aggregate admission bounds.
+const MaxMemorySearchCursorStateBytes = 128 << 10
+
 // MemorySearchCursorState is opaque, short-lived server-side pagination state.
 type MemorySearchCursorState struct {
 	ID            string
