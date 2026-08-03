@@ -3673,6 +3673,21 @@ func (s *Store) SaveMemorySearchCursor(ctx context.Context, cursor store.MemoryS
 	if _, err := tx.ExecContext(ctx, `DELETE FROM memory_search_cursors WHERE expires_at <= ?`, cursor.CreatedAt); err != nil {
 		return err
 	}
+	var existingNamespace, existingBinding, existingQuery string
+	var existingState []byte
+	err = tx.QueryRowContext(ctx, `SELECT namespace_uid, binding_digest, query_digest, state_json
+		FROM memory_search_cursors WHERE id = ?`, cursor.ID).
+		Scan(&existingNamespace, &existingBinding, &existingQuery, &existingState)
+	if err == nil {
+		if existingNamespace == cursor.NamespaceUID && existingBinding == cursor.BindingDigest &&
+			existingQuery == cursor.QueryDigest && bytes.Equal(existingState, cursor.State) {
+			return tx.Commit()
+		}
+		return store.ErrConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	limits := governedMemoryQuotas
 	var namespaceCount, namespaceBytes, globalCount, globalBytes int64
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(length(state_json)), 0)

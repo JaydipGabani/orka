@@ -2218,6 +2218,7 @@ func TestRemoteSearchIncludeDeletedContinuationKeepsStableTombstoneOrder(t *test
 
 	cursor := ""
 	wantIDs := []string{"mem-live", "mem-tomb-b", "mem-tomb-a"}
+	pageCursors := make([]string, 0, len(wantIDs)-1)
 	for i, wantID := range wantIDs {
 		response, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
 			Query: "needle", Limit: 1, Cursor: cursor, IncludeDeleted: true,
@@ -2233,10 +2234,18 @@ func TestRemoteSearchIncludeDeletedContinuationKeepsStableTombstoneOrder(t *test
 			if len(stored.State) == 0 || len(stored.State) > maxRemoteSearchCursorBytes {
 				t.Fatalf("page %d cursor state bytes = %d", i+1, len(stored.State))
 			}
+			pageCursors = append(pageCursors, response.Cursor)
 		} else if !response.Exhausted || response.Cursor != "" {
 			t.Fatalf("final continuation = %#v", response)
 		}
 		cursor = response.Cursor
+	}
+	replayed, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Cursor: pageCursors[0], IncludeDeleted: true,
+	}, SearchContext{RemoteAuthorized: true})
+	if err != nil || replayed == nil || len(replayed.Items) != 1 || replayed.Items[0].Memory.ID != wantIDs[1] ||
+		replayed.Cursor != pageCursors[1] {
+		t.Fatalf("replayed successor = %#v, err=%v; want cursor %q", replayed, err, pageCursors[1])
 	}
 	if adapter.searchCalls != 1 || adapter.getCalls != 0 {
 		t.Fatalf("provider calls search=%d get=%d, want 1/0", adapter.searchCalls, adapter.getCalls)

@@ -209,7 +209,8 @@ func validateCapabilityLimits(limits CapabilityLimits) error {
 		limits.MaxContentBytes > MaxContentBytes || limits.MaxTags > MaxTags || limits.MaxTagBytes > MaxTagBytes ||
 		limits.MaxMetadataEntries > MaxMetadataEntries || limits.MaxMetadataKeyBytes > MaxMetadataKeyBytes ||
 		limits.MaxMetadataValueBytes > MaxMetadataValueBytes || limits.MaxQueryBytes > MaxQueryBytes ||
-		limits.MaxPageSize > MaxPageSize || limits.MaxSnapshotRecords > MaxSnapshotRecords {
+		limits.MaxPageSize > MaxPageSize || limits.MaxSnapshotRecords > MaxSnapshotRecords ||
+		limits.SnapshotTTLSeconds > MaxSnapshotTTLSeconds {
 		return errors.New("capability limits exceed the profile hard limits")
 	}
 	return nil

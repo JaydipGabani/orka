@@ -234,6 +234,11 @@ func TestCapabilitiesRequireAllWritableSemanticsAndFiniteLimits(t *testing.T) {
 		t.Fatal("capabilities above the 2 MiB request hard cap were accepted")
 	}
 	response.Limits.MaxRequestBytes = MaxHTTPBodyBytes
+	response.Limits.SnapshotTTLSeconds = MaxSnapshotTTLSeconds + 1
+	if err := ValidateCapabilitiesResponse(&response, time.Now()); err == nil {
+		t.Fatal("capabilities above the snapshot TTL hard cap were accepted")
+	}
+	response.Limits.SnapshotTTLSeconds = 60
 	response.Capabilities.DeleteHighWatermark = false
 	if err := ValidateCapabilitiesResponse(&response, time.Now()); err == nil {
 		t.Fatal("capabilities without delete high-watermark were accepted")

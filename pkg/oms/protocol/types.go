@@ -75,6 +75,7 @@ const (
 	MaxPageTokenBytes       = 256
 	MaxPageSize             = 8
 	MaxSnapshotRecords      = 1024
+	MaxSnapshotTTLSeconds   = 24 * 60 * 60
 	MaxErrorMessageBytes    = 512
 )
 

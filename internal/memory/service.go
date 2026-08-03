@@ -2511,6 +2511,7 @@ func saveRemoteSearchContinuation(
 	}
 	id := "msc-" + uuid.NewString()
 	if consumedCursor = strings.TrimSpace(consumedCursor); consumedCursor != "" {
+		id = "msc-" + uuid.NewSHA1(uuid.NameSpaceOID, []byte(consumedCursor)).String()
 		if err := governed.RetireMemorySearchCursor(ctx, binding.NamespaceUID, consumedCursor, now); err != nil {
 			return "", err
 		}

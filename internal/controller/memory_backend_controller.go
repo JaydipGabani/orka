@@ -2072,7 +2072,7 @@ func validateMemoryBackendCapabilityLimits(limits corev1alpha1.MemoryBackendCapa
 		limits.MaxQueryBytes < 1 || limits.MaxQueryBytes > 1024 ||
 		limits.MaxPageSize < 1 || limits.MaxPageSize > 8 ||
 		limits.MaxSnapshotRecords < 1 || limits.MaxSnapshotRecords > 1024 ||
-		limits.SnapshotTTLSeconds < 1 || limits.SnapshotTTLSeconds > 86400 {
+		limits.SnapshotTTLSeconds < 1 || limits.SnapshotTTLSeconds > omsprotocol.MaxSnapshotTTLSeconds {
 		return fmt.Errorf("OMS capability limits are invalid")
 	}
 	return nil

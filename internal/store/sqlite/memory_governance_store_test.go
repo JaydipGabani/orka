@@ -4712,6 +4712,14 @@ func TestMemorySearchCursorCapacityIsBounded(t *testing.T) {
 	if err := s.SaveMemorySearchCursor(context.Background(), first); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.SaveMemorySearchCursor(context.Background(), first); err != nil {
+		t.Fatalf("exact cursor replay was not idempotent: %v", err)
+	}
+	mismatch := first
+	mismatch.State = []byte(`{"page":"different"}`)
+	if err := s.SaveMemorySearchCursor(context.Background(), mismatch); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("mismatched cursor replay error = %v, want ErrConflict", err)
+	}
 	second := first
 	second.ID = "msc-two"
 	if err := s.SaveMemorySearchCursor(context.Background(), second); !errors.Is(err, store.ErrCapacity) {
