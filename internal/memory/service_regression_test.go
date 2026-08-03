@@ -505,6 +505,7 @@ func remoteSearchService(
 		Effective: []corev1alpha1.MemoryBackendCapability{corev1alpha1.MemoryBackendCapabilityKeywordSearch},
 		Limits: corev1alpha1.MemoryBackendCapabilityLimits{
 			MaxPageSize: protocol.MaxPageSize, MaxSnapshotRecords: protocol.MaxSnapshotRecords,
+			SnapshotTTLSeconds: 60,
 		},
 	}
 	governed := newGovernedSearchStore(entries)
@@ -2103,6 +2104,43 @@ func (s cappedLegacyMemoryStore) ListMemories(_ context.Context, filter store.Me
 	return result, nil
 }
 
+func TestStrictListPageItemsRejectsIncompletePageWithoutCursor(t *testing.T) {
+	items, err := strictListPageItems(&ListPage{Items: []store.Memory{{ID: "partial"}}, Complete: false})
+	var incomplete *IncompleteSearchError
+	if items != nil || !errors.As(err, &incomplete) || incomplete.Cursor != "" {
+		t.Fatalf("strictListPageItems() = %#v, %#v; want incomplete error without cursor", items, err)
+	}
+}
+
+func TestLegacyListTrustFilterReturnsContinuationPastPreFilterCap(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 19, 20, 0, 0, time.UTC)
+	memories := make([]store.Memory, maxRemoteCatalogLimit+1)
+	for i := range memories {
+		trust := store.MemoryTrustUntrusted
+		if i == maxRemoteCatalogLimit {
+			trust = store.MemoryTrustReviewed
+		}
+		memories[i] = store.Memory{
+			ID: fmt.Sprintf("mem-list-trust-%03d", maxRemoteCatalogLimit-i), Namespace: "team-a",
+			Content: "content", Trust: trust, UpdatedAt: now.Add(-time.Duration(i) * time.Second),
+		}
+	}
+	service := &Service{Legacy: cappedLegacyMemoryStore{memories: memories}}
+	filter := store.MemoryFilter{
+		Namespace: "team-a", Limit: 1, Trust: []store.MemoryTrust{store.MemoryTrustReviewed},
+	}
+	first, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+	if err != nil || first == nil || len(first.Items) != 0 || first.Cursor == "" || first.Complete || first.Exhausted {
+		t.Fatalf("first trust-filtered list page = %#v, %v", first, err)
+	}
+	filter.Cursor = first.Cursor
+	second, err := service.ListMemoriesPageWithSearchContext(t.Context(), filter, SearchContext{})
+	if err != nil || second == nil || len(second.Items) != 1 || second.Items[0].Trust != store.MemoryTrustReviewed ||
+		second.Cursor != "" || !second.Complete || !second.Exhausted {
+		t.Fatalf("continued trust-filtered list page = %#v, %v", second, err)
+	}
+}
+
 func TestLegacySearchReportsPreFilterCapAsIncomplete(t *testing.T) {
 	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
 	memories := make([]store.Memory, maxRemoteCatalogLimit+1)
@@ -2698,6 +2736,7 @@ func TestRemoteSearchIncludeDeletedPreservesCompletenessAcrossCatalogBudget(t *t
 	}
 	service, adapter, activeBinding, governed := remoteSearchService(t, entries, nil)
 	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now.Add(time.Minute)
 
 	_, err := service.Search(context.Background(), activeBinding.Namespace, SearchRequest{
 		Query: "needle", Limit: 1, IncludeDeleted: true,
@@ -2877,6 +2916,55 @@ func TestRemoteSearchAllowsEmptySnapshotWithinAdvertisedLimit(t *testing.T) {
 	}, SearchContext{RemoteAuthorized: true})
 	if err != nil || response == nil || len(response.Items) != 0 || !response.Exhausted || !response.Complete {
 		t.Fatalf("empty snapshot Search() = %#v, %v", response, err)
+	}
+}
+
+func TestRemoteSearchRejectsUnadvertisedAutoResolvedMode(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 19, 10, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entry, record := remoteSearchFixture(binding, "mem-auto-mode", now, "needle", store.MemoryTrustReviewed)
+	service, adapter, activeBinding, _ := remoteSearchService(t, []store.RemoteMemoryCatalogEntry{entry}, []protocol.MemoryRecord{record})
+	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now.Add(time.Minute)
+	adapter.actualModes = []string{protocol.SearchModeSemantic}
+
+	response, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{
+		Query: "needle", Limit: 1, Mode: protocol.SearchModeAuto,
+	}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if response != nil || !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable ||
+		structured.Reason != ReasonBackendUnavailable {
+		t.Fatalf("unadvertised auto Search() = %#v, %#v", response, err)
+	}
+}
+
+func TestRemoteSearchRejectsSnapshotAboveAdvertisedTTL(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 19, 15, 0, 0, time.UTC)
+	binding := store.MemoryBackendBinding{
+		Namespace: "team-remote", NamespaceUID: "11111111-1111-4111-8111-111111111111",
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222",
+		AuthorityEpoch: 1, RoutingEpoch: 1,
+		TenantID:  protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"),
+		StoreUUID: "44444444-4444-4444-8444-444444444444",
+	}
+	entry, record := remoteSearchFixture(binding, "mem-snapshot-ttl", now, "needle", store.MemoryTrustReviewed)
+	service, adapter, activeBinding, _ := remoteSearchService(t, []store.RemoteMemoryCatalogEntry{entry}, []protocol.MemoryRecord{record})
+	service.Now = func() time.Time { return now }
+	adapter.snapshotExpiresAt = now.Add(2 * time.Minute)
+	authority := service.Resolver.(staticAuthorityResolver).authority
+	authority.Backend.Status.ObservedCapabilities.Limits.SnapshotTTLSeconds = 60
+
+	response, err := service.Search(t.Context(), activeBinding.Namespace, SearchRequest{Query: "needle", Limit: 1}, SearchContext{RemoteAuthorized: true})
+	var structured *apierror.Error
+	if response != nil || !errors.As(err, &structured) || structured.Status != http.StatusServiceUnavailable ||
+		structured.Reason != ReasonBackendUnavailable {
+		t.Fatalf("overlong snapshot TTL Search() = %#v, %#v", response, err)
 	}
 }
 

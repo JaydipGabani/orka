@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -162,6 +163,7 @@ func TestNewOMSClientUsesExactPinnedResolutionWithoutDNSReplay(t *testing.T) {
 		resolution,
 		"sha256:"+strings.Repeat("0", 64),
 		"secret",
+		protocol.MaxHTTPBodyBytes,
 		protocol.MaxAdapterResponseBytes,
 		time.Second,
 	)
@@ -233,6 +235,37 @@ func testOMSCapabilitiesResponse(binding protocol.Binding, maxResponseBytes int)
 			MaxSnapshotRecords:    protocol.MaxSnapshotRecords,
 			SnapshotTTLSeconds:    60,
 		},
+	}
+}
+
+func TestOMSClientEnforcesConfiguredMaxRequestBytesBeforeEgress(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	payload := struct {
+		Value string `json:"value"`
+	}{Value: strings.Repeat("x", 64)}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &OMSClient{
+		baseURL: server.URL, token: "secret", client: server.Client(),
+		maxRequestBytes: int64(len(body) - 1), maxResponseBytes: protocol.MaxAdapterResponseBytes,
+	}
+	if _, err := client.post(t.Context(), "/test", payload, nil, nil, false); err == nil {
+		t.Fatal("post() accepted a request above the advertised limit")
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("adapter requests = %d, want zero before oversized request egress", requests.Load())
+	}
+	client.maxRequestBytes = int64(protocol.MaxHTTPBodyBytes) + 1
+	if got := effectiveOMSRequestLimit(client.maxRequestBytes); got != protocol.MaxHTTPBodyBytes {
+		t.Fatalf("effective request limit = %d, want hard limit %d", got, protocol.MaxHTTPBodyBytes)
 	}
 }
 
@@ -662,6 +695,7 @@ func TestNewOMSClientPinsValidatedServerCertificateDigest(t *testing.T) {
 		resolution,
 		digest,
 		"secret",
+		protocol.MaxHTTPBodyBytes,
 		protocol.MaxAdapterResponseBytes,
 		time.Second,
 	)

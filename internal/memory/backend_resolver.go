@@ -185,6 +185,7 @@ func (r *BackendResolver) Resolve(ctx context.Context, namespace string) (*Resol
 		resolution,
 		binding.ServerCertificateDigest,
 		token,
+		backend.Status.ObservedCapabilities.Limits.MaxRequestBytes,
 		backend.Status.ObservedCapabilities.Limits.MaxResponseBytes,
 		r.requestTimeout(),
 	)

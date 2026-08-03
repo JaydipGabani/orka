@@ -112,7 +112,7 @@ func (s *Service) ListMemories(ctx context.Context, filter store.MemoryFilter) (
 	if err != nil {
 		return nil, err
 	}
-	return page.Items, nil
+	return strictListPageItems(page)
 }
 
 // ListMemoriesWithSearchContext lists memories while carrying server-derived
@@ -125,6 +125,21 @@ func (s *Service) ListMemoriesWithSearchContext(
 	page, err := s.listMemoriesPage(ctx, filter, searchContext)
 	if err != nil {
 		return nil, err
+	}
+	return strictListPageItems(page)
+}
+
+func strictListPageItems(page *ListPage) ([]store.Memory, error) {
+	if page == nil {
+		return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory list returned no page")
+	}
+	if !page.Complete {
+		memoryIncompleteTotal.Inc()
+		return nil, &IncompleteSearchError{
+			Cause: apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
+				"memory list scan budget was exhausted"),
+			Cursor: page.Cursor,
+		}
 	}
 	return page.Items, nil
 }
@@ -152,24 +167,32 @@ func (s *Service) listMemoriesPage(
 		if s.Legacy == nil {
 			return nil, apierror.New(http.StatusNotImplemented, ReasonBackendUnavailable, "memory store is not configured")
 		}
-		legacyFilter := filter
-		legacyFilter.Trust = nil
 		if len(filter.Trust) > 0 {
-			legacyFilter.Limit = maxRemoteCatalogLimit
+			response, searchErr := s.searchLegacy(ctx, authority, filter.Namespace, SearchRequest{
+				Query: filter.Query, Tags: filter.Tags, IDs: filter.IDs, Sources: sourceFilterValues(filter.Source),
+				SessionName: filter.SessionName, TaskName: filter.TaskName, ParentTask: filter.ParentTask, AgentName: filter.AgentName,
+				Trust: filter.Trust, Limit: filter.Limit, Cursor: filter.Cursor,
+				IncludeDisabled: filter.IncludeDisabled, IncludeDeleted: filter.IncludeDeleted, AllowIncomplete: true,
+			}, protocol.SearchModeKeyword)
+			if searchErr != nil {
+				return nil, searchErr
+			}
+			memories := make([]store.Memory, 0, len(response.Items))
+			for _, item := range response.Items {
+				memories = append(memories, item.Memory)
+			}
+			return &ListPage{
+				Items: memories, Cursor: response.Cursor, Exhausted: response.Exhausted,
+				Complete: response.Complete, Paginated: true,
+			}, nil
 		}
-		memories, listErr := s.Legacy.ListMemories(ctx, legacyFilter)
+		memories, listErr := s.Legacy.ListMemories(ctx, filter)
 		if listErr != nil {
 			return nil, mapStoreError(listErr)
 		}
-		limit := boundedMemoryLimit(filter.Limit)
-		filtered, filterErr := s.applyLegacyGovernanceFilter(ctx, authority, memories, filter.Trust, limit)
+		filtered, filterErr := s.applyLegacyGovernanceFilter(ctx, authority, memories, nil, boundedMemoryLimit(filter.Limit))
 		if filterErr != nil {
 			return nil, filterErr
-		}
-		if len(filter.Trust) > 0 && len(memories) >= maxRemoteCatalogLimit && len(filtered) < limit {
-			memoryIncompleteTotal.Inc()
-			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete,
-				"legacy memory trust filtering reached its pre-filter scan cap and cannot prove completeness")
 		}
 		return &ListPage{Items: filtered, Complete: true}, nil
 	}
@@ -1635,6 +1658,29 @@ func entryMatchesAuthority(entry *store.RemoteMemoryCatalogEntry, binding *store
 		entry.AuthorityEpoch == binding.AuthorityEpoch && entry.TenantID == binding.TenantID && entry.StoreUUID == binding.StoreUUID
 }
 
+func ensureResolvedSearchCapability(backend *corev1alpha1.MemoryBackend, actualMode string) error {
+	if backend == nil || backend.Status.ObservedCapabilities == nil {
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search capabilities are unavailable")
+	}
+	capability := corev1alpha1.MemoryBackendCapabilityKeywordSearch
+	switch actualMode {
+	case protocol.SearchModeKeyword:
+	case protocol.SearchModeSemantic:
+		capability = corev1alpha1.MemoryBackendCapabilitySemanticSearch
+	case protocol.SearchModeHybrid:
+		capability = corev1alpha1.MemoryBackendCapabilityHybridSearch
+	default:
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search backend selected an invalid mode")
+	}
+	if !slices.Contains(backend.Status.ObservedCapabilities.Effective, capability) {
+		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search backend selected an unadvertised mode")
+	}
+	return nil
+}
+
 func sourceFilterValues(source string) []string {
 	if source = strings.TrimSpace(source); source != "" {
 		return []string{source}
@@ -1752,6 +1798,10 @@ func (s *Service) search(
 	if err != nil {
 		return nil, err
 	}
+	snapshotTTL, err := remoteSearchSnapshotTTL(authority)
+	if err != nil {
+		return nil, err
+	}
 	if remoteSearchSeenRecordStatePresent(cursorState.SeenRecordState) {
 		if seenCount, ok := remoteSearchSeenRecordCount(cursorState.SeenRecordState); !ok || seenCount > snapshotRecordLimit {
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
@@ -1821,10 +1871,14 @@ func (s *Service) search(
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search backend is unavailable")
 		}
 		responseExpiry, responseErr := validateRemoteSearchPage(
-			response, binding, mode, cursorState.PageSize, cursorState.ActualMode, snapshotExpiresAt, s.now(),
+			response, binding, mode, cursorState.PageSize, cursorState.ActualMode,
+			snapshotExpiresAt, snapshotTTL, s.now(),
 		)
 		if responseErr != nil {
 			return nil, responseErr
+		}
+		if err := ensureResolvedSearchCapability(authority.Backend, response.ActualMode); err != nil {
+			return nil, err
 		}
 		if response.NextPageToken != cursorState.ProviderToken || response.Exhausted != cursorState.ProviderExhausted ||
 			len(response.Records) != len(cursorState.ReplayPrefix)+len(cursorState.Pending) {
@@ -1900,10 +1954,14 @@ func (s *Service) search(
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search backend is unavailable")
 		}
 		responseExpiry, responseErr := validateRemoteSearchPage(
-			response, binding, mode, cursorState.PageSize, cursorState.ActualMode, snapshotExpiresAt, s.now(),
+			response, binding, mode, cursorState.PageSize, cursorState.ActualMode,
+			snapshotExpiresAt, snapshotTTL, s.now(),
 		)
 		if responseErr != nil {
 			return nil, responseErr
+		}
+		if err := ensureResolvedSearchCapability(authority.Backend, response.ActualMode); err != nil {
+			return nil, err
 		}
 		if !response.Exhausted && response.NextPageToken == requestPageToken {
 			return nil, apierror.New(http.StatusServiceUnavailable, ReasonResultSetIncomplete, "memory search pagination did not advance")
@@ -2441,6 +2499,19 @@ func remoteSearchSnapshotRecordLimit(authority *ResolvedAuthority) (int, error) 
 	return limit, nil
 }
 
+func remoteSearchSnapshotTTL(authority *ResolvedAuthority) (time.Duration, error) {
+	if authority == nil || authority.Backend == nil || authority.Backend.Status.ObservedCapabilities == nil {
+		return 0, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search capabilities are unavailable")
+	}
+	seconds := authority.Backend.Status.ObservedCapabilities.Limits.SnapshotTTLSeconds
+	if seconds <= 0 || seconds > protocol.MaxSnapshotTTLSeconds {
+		return 0, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search snapshot TTL capability is invalid")
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
 func ensureSearchCapability(backend *corev1alpha1.MemoryBackend, mode string) error {
 	if backend == nil || backend.Status.ObservedCapabilities == nil {
 		return apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable, "memory search capabilities are unavailable")
@@ -2771,6 +2842,7 @@ func validateRemoteSearchPage(
 	pageSize int,
 	expectedActualMode string,
 	expectedSnapshotExpiresAt time.Time,
+	maximumSnapshotTTL time.Duration,
 	now time.Time,
 ) (time.Time, error) {
 	if response == nil {
@@ -2793,6 +2865,10 @@ func validateRemoteSearchPage(
 			"memory search backend changed the resolved mode across pages")
 	}
 	snapshotExpiresAt := response.SnapshotExpiresAt.UTC()
+	if !snapshotExpiresAt.IsZero() && (maximumSnapshotTTL <= 0 || snapshotExpiresAt.After(now.UTC().Add(maximumSnapshotTTL))) {
+		return time.Time{}, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
+			"memory search backend exceeded its advertised snapshot TTL")
+	}
 	if (!response.Exhausted || !expectedSnapshotExpiresAt.IsZero()) && !snapshotExpiresAt.After(now.UTC()) {
 		return time.Time{}, apierror.New(http.StatusServiceUnavailable, ReasonBackendUnavailable,
 			"memory search backend returned an expired continuation snapshot")

@@ -138,6 +138,7 @@ func TestBackendResolverRemoteDisabledFailsClosed(t *testing.T) {
 func TestBackendResolverConfiguresAdvertisedOMSResponseLimit(t *testing.T) {
 	const (
 		namespace          = "team-a"
+		advertisedRequest  = int64(1024)
 		advertisedResponse = int64(2048)
 	)
 	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
@@ -185,7 +186,7 @@ func TestBackendResolverConfiguresAdvertisedOMSResponseLimit(t *testing.T) {
 		ObservedCapabilities: &corev1alpha1.MemoryBackendObservedCapabilities{
 			Revision: binding.CapabilityRevision,
 			Limits: corev1alpha1.MemoryBackendCapabilityLimits{
-				MaxResponseBytes: advertisedResponse,
+				MaxRequestBytes: advertisedRequest, MaxResponseBytes: advertisedResponse,
 			},
 		},
 		ValidationExpiresAt: &metav1.Time{Time: binding.ValidationExpiresAt},
@@ -229,6 +230,9 @@ func TestBackendResolverConfiguresAdvertisedOMSResponseLimit(t *testing.T) {
 	client, ok := authority.Adapter.(*OMSClient)
 	if !ok {
 		t.Fatalf("Resolve() adapter = %T, want *OMSClient", authority.Adapter)
+	}
+	if client.maxRequestBytes != advertisedRequest {
+		t.Fatalf("OMS maxRequestBytes = %d, want advertised %d", client.maxRequestBytes, advertisedRequest)
 	}
 	if client.maxResponseBytes != advertisedResponse {
 		t.Fatalf("OMS maxResponseBytes = %d, want advertised %d", client.maxResponseBytes, advertisedResponse)

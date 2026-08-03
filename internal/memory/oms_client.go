@@ -59,6 +59,7 @@ type OMSClient struct {
 	baseURL          string
 	token            string
 	client           *http.Client
+	maxRequestBytes  int64
 	maxResponseBytes int64
 }
 
@@ -70,11 +71,15 @@ func NewOMSClient(
 	resolution endpointpolicy.Resolution,
 	expectedCertificateDigest string,
 	token string,
+	maxRequestBytes int64,
 	maxResponseBytes int64,
 	timeout time.Duration,
 ) (*OMSClient, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, fmt.Errorf("OMS bearer token is empty")
+	}
+	if maxRequestBytes <= 0 {
+		return nil, fmt.Errorf("OMS maximum request size is invalid")
 	}
 	if maxResponseBytes <= 0 {
 		return nil, fmt.Errorf("OMS maximum response size is invalid")
@@ -119,6 +124,7 @@ func NewOMSClient(
 		baseURL:          strings.TrimRight(resolution.Identity, "/"),
 		token:            token,
 		client:           client,
+		maxRequestBytes:  effectiveOMSRequestLimit(maxRequestBytes),
 		maxResponseBytes: effectiveOMSResponseLimit(maxResponseBytes),
 	}, nil
 }
@@ -240,8 +246,9 @@ func (c *OMSClient) post(
 	if err != nil {
 		return nil, fmt.Errorf("encode OMS request: %w", err)
 	}
-	if len(body) > protocol.MaxHTTPBodyBytes {
-		return nil, fmt.Errorf("OMS request exceeds %d bytes", protocol.MaxHTTPBodyBytes)
+	maxRequestBytes := effectiveOMSRequestLimit(c.maxRequestBytes)
+	if int64(len(body)) > maxRequestBytes {
+		return nil, fmt.Errorf("OMS request exceeds the configured %d-byte limit", maxRequestBytes)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+endpointPath, bytes.NewReader(body))
 	if err != nil {
@@ -278,6 +285,14 @@ func (c *OMSClient) post(
 		return nil, decodeOMSAdapterError(response.StatusCode, response.Header.Get("Retry-After"), responseBody, expectedBinding, malformedAmbiguous)
 	}
 	return responseBody, nil
+}
+
+func effectiveOMSRequestLimit(advertised int64) int64 {
+	hardLimit := int64(protocol.MaxHTTPBodyBytes)
+	if advertised > 0 && advertised < hardLimit {
+		return advertised
+	}
+	return hardLimit
 }
 
 func effectiveOMSResponseLimit(advertised int64) int64 {
