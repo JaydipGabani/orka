@@ -108,6 +108,40 @@ func TestRemoteSearchSeenRecordStateTracksExactBoundedDigests(t *testing.T) {
 	}
 }
 
+func TestServiceLegacyCursorStoreBoundsReplayState(t *testing.T) {
+	service := &Service{}
+	cursorStore := serviceLegacyCursorStore{service: service}
+	now := time.Date(2026, time.August, 3, 18, 0, 0, 0, time.UTC)
+	for index := range legacySearchCursorReplayRows {
+		cursor := store.MemorySearchCursorState{
+			ID: fmt.Sprintf("lsc-replay-%04d", index), NamespaceUID: "namespace-a",
+			State: []byte{byte(index)}, CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+		}
+		if err := cursorStore.SaveMemorySearchCursor(t.Context(), cursor); err != nil {
+			t.Fatalf("save replay cursor %d: %v", index, err)
+		}
+		if err := cursorStore.RetireMemorySearchCursor(t.Context(), cursor.NamespaceUID, cursor.ID, now); err != nil {
+			t.Fatalf("retire replay cursor %d: %v", index, err)
+		}
+	}
+	overflow := store.MemorySearchCursorState{
+		ID: "lsc-replay-overflow", NamespaceUID: "namespace-a", State: []byte("overflow"),
+		CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := cursorStore.SaveMemorySearchCursor(t.Context(), overflow); err != nil {
+		t.Fatalf("save active overflow cursor: %v", err)
+	}
+	if err := cursorStore.RetireMemorySearchCursor(
+		t.Context(), overflow.NamespaceUID, overflow.ID, now,
+	); !errors.Is(err, store.ErrCapacity) {
+		t.Fatalf("retire overflow cursor error = %v, want ErrCapacity", err)
+	}
+	if len(service.legacyCursorRetired) != legacySearchCursorReplayRows {
+		t.Fatalf("retired fallback cursor rows = %d, want %d",
+			len(service.legacyCursorRetired), legacySearchCursorReplayRows)
+	}
+}
+
 func TestLegacySearchCursorIsBoundToNamespaceQueryAndExpiry(t *testing.T) {
 	governed := newMemoryTestStore(t)
 	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
