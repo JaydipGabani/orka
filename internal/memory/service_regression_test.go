@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -2239,6 +2240,62 @@ func (r *replayBeforeFreshResolver) ResolveLocal(context.Context, string) (*Reso
 func (r *replayBeforeFreshResolver) Resolve(context.Context, string) (*ResolvedAuthority, error) {
 	r.freshCalls++
 	return nil, errors.New("fresh backend unavailable")
+}
+
+func TestRemoteCreateRedactsCatalogProvenanceAndTags(t *testing.T) {
+	binding := &store.MemoryBackendBinding{
+		Namespace: "team-a", NamespaceUID: "11111111-1111-4111-8111-111111111111", Mode: store.MemoryBackendModeRemote,
+		ClusterID: "cluster-a", BackendUID: "22222222-2222-4222-8222-222222222222", AuthorityEpoch: 1, RoutingEpoch: 3,
+		TenantID: protocol.DeriveTenantID("cluster-a", "11111111-1111-4111-8111-111111111111"), StoreUUID: "44444444-4444-4444-8444-444444444444",
+		State: store.MemoryBackendBindingAccepting,
+	}
+	backend := &corev1alpha1.MemoryBackend{}
+	backend.Status.EffectiveLifecycleState = corev1alpha1.MemoryBackendEffectiveLifecycleActive
+	backend.Status.Ready = true
+	authority := &ResolvedAuthority{
+		Namespace: binding.Namespace, NamespaceUID: binding.NamespaceUID, Binding: binding, Backend: backend,
+	}
+	governed := &generationWatermarkAdmissionStore{}
+	service := &Service{Governed: governed, Resolver: staticAuthorityResolver{authority: authority}}
+	request := CreateRequest{
+		Content: "safe content", SessionName: "token=secret-token", AgentName: "api_key=changeme",
+		TaskName: "password=dummy", ParentTask: "credential=example",
+		Source: "client_secret=placeholder", Tags: []string{"safe", "token=secret-token"},
+	}
+	result, err := service.CreateMemory(t.Context(), binding.Namespace, request, MutationContext{
+		Actor: "alice", Principal: "alice", Route: testRemoteCreateRoute, IdempotencyKey: "redaction-key",
+	})
+	if err != nil || result == nil || governed.admission == nil {
+		t.Fatalf("CreateMemory() = %#v, admission=%#v, err=%v", result, governed.admission, err)
+	}
+	envelope, err := protocol.DecodeMutationEnvelope(governed.admission.Mutation.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMetadata := map[string]string{
+		"sessionname": "token=[REDACTED]", "agentname": "api_key=[REDACTED]",
+		"taskname": "password=[REDACTED]", "parenttask": "credential=[REDACTED]",
+		"source": "client_secret=[REDACTED]",
+	}
+	if !maps.Equal(envelope.State.Metadata, wantMetadata) {
+		t.Fatalf("provider metadata = %#v, want %#v", envelope.State.Metadata, wantMetadata)
+	}
+	catalog := governed.admission.Memory
+	if catalog.SessionName != wantMetadata["sessionname"] || catalog.AgentName != wantMetadata["agentname"] ||
+		catalog.TaskName != wantMetadata["taskname"] || catalog.ParentTask != wantMetadata["parenttask"] ||
+		catalog.Source != wantMetadata["source"] {
+		t.Fatalf("catalog provenance = %#v", catalog)
+	}
+	wantTags := []string{"safe", "token=[redacted]"}
+	if !slices.Equal(envelope.State.Tags, wantTags) || !slices.Equal(catalog.Tags, wantTags) {
+		t.Fatalf("provider/catalog tags = %#v / %#v, want %#v", envelope.State.Tags, catalog.Tags, wantTags)
+	}
+	encoded := fmt.Sprintf("%#v %#v", envelope.State, catalog)
+	for _, raw := range []string{"secret-token", "changeme", "dummy", "example", "placeholder"} {
+		if strings.Contains(encoded, raw) {
+			t.Fatalf("durable admission retained raw caller metadata %q: %s", raw, encoded)
+		}
+	}
 }
 
 func TestRemoteCreateUsesRetainedGenerationWatermark(t *testing.T) {

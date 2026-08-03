@@ -548,6 +548,7 @@ func (s *Service) CreateMemory(
 	}
 	now := s.now()
 	operationID := "mop-" + uuid.NewString()
+	metadata := memoryMetadata(request)
 	envelope := protocol.MutationEnvelope{
 		ProtocolVersion:        protocol.Version,
 		OperationID:            operationID,
@@ -557,7 +558,7 @@ func (s *Service) CreateMemory(
 		Generation:             uint64(desiredGeneration),
 		ExpectedGeneration:     uint64(expectedGeneration),
 		ExpectedBackendVersion: "",
-		State:                  &protocol.MutationState{Content: content, Tags: tags, Metadata: memoryMetadata(request)},
+		State:                  &protocol.MutationState{Content: content, Tags: tags, Metadata: metadata},
 	}
 	if err := protocol.PrepareMutation(&envelope); err != nil {
 		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory mutation")
@@ -573,8 +574,8 @@ func (s *Service) CreateMemory(
 		TenantID: authority.Binding.TenantID, StoreUUID: authority.Binding.StoreUUID,
 		Generation: expectedGeneration, DesiredGeneration: desiredGeneration, GovernanceRevision: 1,
 		MaterializationState: store.MemoryMaterializationPending,
-		Trust:                store.MemoryTrustUntrusted, SessionName: request.SessionName, AgentName: request.AgentName,
-		TaskName: request.TaskName, ParentTask: request.ParentTask, Source: normalizeSource(request.Source), Tags: tags,
+		Trust:                store.MemoryTrustUntrusted, SessionName: metadata["sessionName"], AgentName: metadata["agentName"],
+		TaskName: metadata["taskName"], ParentTask: metadata["parentTask"], Source: metadata["source"], Tags: tags,
 		ContentDigest: envelope.ContentDigest, ContentAvailable: false, PendingOperationID: operationID,
 		CreatedAt: now, UpdatedAt: now,
 	}
@@ -669,11 +670,12 @@ func (s *Service) UpdateMemory(
 	now := s.now()
 	desired := max(entry.Generation, entry.DesiredGeneration) + 1
 	operationID := "mop-" + uuid.NewString()
+	metadata := memoryMetadataFromStore(*current)
 	envelope := protocol.MutationEnvelope{
 		ProtocolVersion: protocol.Version, OperationID: operationID, Binding: binding,
 		MemoryID: id, Kind: protocol.MutationKindReplace, Generation: uint64(desired),
 		ExpectedGeneration: uint64(entry.Generation), ExpectedBackendVersion: entry.BackendVersion,
-		State: &protocol.MutationState{Content: content, Tags: tags, Metadata: memoryMetadataFromStore(*current)},
+		State: &protocol.MutationState{Content: content, Tags: tags, Metadata: metadata},
 	}
 	if err := protocol.PrepareMutation(&envelope); err != nil {
 		return nil, apierror.New(http.StatusBadRequest, "", "invalid memory mutation")
@@ -686,11 +688,12 @@ func (s *Service) UpdateMemory(
 	updatedEntry.DesiredGeneration = desired
 	updatedEntry.PendingOperationID = operationID
 	updatedEntry.Tags = tags
-	updatedEntry.SessionName = current.SessionName
-	updatedEntry.AgentName = current.AgentName
-	updatedEntry.TaskName = current.TaskName
-	updatedEntry.ParentTask = current.ParentTask
-	updatedEntry.Source = normalizeSource(current.Source)
+	updatedEntry.SessionName = metadata["sessionName"]
+	updatedEntry.AgentName = metadata["agentName"]
+	updatedEntry.TaskName = metadata["taskName"]
+	updatedEntry.ParentTask = metadata["parentTask"]
+	updatedEntry.Source = metadata["source"]
+	updatedEntry.SourceProposalID = metadata["sourceProposalId"]
 	updatedEntry.ContentDigest = envelope.ContentDigest
 	updatedEntry.UpdatedAt = now
 	admission, err := s.Governed.AdmitRemoteMemoryReplace(ctx, store.RemoteMemoryReplaceAdmission{
@@ -938,10 +941,11 @@ func (s *Service) createLegacy(ctx context.Context, namespace string, request Cr
 	if err != nil {
 		return nil, err
 	}
+	metadata := memoryMetadata(request)
 	memory := &store.Memory{
-		ID: strings.TrimSpace(request.ID), Namespace: namespace, SessionName: request.SessionName,
-		AgentName: request.AgentName, TaskName: request.TaskName, ParentTask: request.ParentTask,
-		Source: normalizeSource(request.Source), Content: content, Tags: tags,
+		ID: strings.TrimSpace(request.ID), Namespace: namespace, SessionName: metadata["sessionName"],
+		AgentName: metadata["agentName"], TaskName: metadata["taskName"], ParentTask: metadata["parentTask"],
+		Source: metadata["source"], Content: content, Tags: tags,
 		Trust: store.MemoryTrustUntrusted,
 	}
 	if err := s.Legacy.CreateMemory(ctx, memory); err != nil {
@@ -993,6 +997,13 @@ func (s *Service) updateLegacy(
 		return nil, err
 	}
 	memory.Content, memory.Tags = content, tags
+	metadata := memoryMetadataFromStore(*memory)
+	memory.SessionName = metadata["sessionName"]
+	memory.AgentName = metadata["agentName"]
+	memory.TaskName = metadata["taskName"]
+	memory.ParentTask = metadata["parentTask"]
+	memory.Source = metadata["source"]
+	memory.SourceProposalID = metadata["sourceProposalId"]
 	if authority != nil && strings.TrimSpace(authority.NamespaceUID) != "" {
 		governedLegacy, ok := s.Legacy.(legacyMemoryUpdateGovernanceStore)
 		if !ok {
@@ -1228,7 +1239,8 @@ func (s *Service) normalizeContent(content string, tags []string) (string, []str
 	if len([]byte(content)) > limit {
 		return "", nil, apierror.New(http.StatusRequestEntityTooLarge, "", "memory content exceeds the configured limit")
 	}
-	normalized, err := protocol.NormalizeTags(nonNilStrings(tags))
+	safeTags := redact.SensitiveStringSlice(append([]string{}, nonNilStrings(tags)...))
+	normalized, err := protocol.NormalizeTags(safeTags)
 	if err != nil {
 		return "", nil, apierror.New(http.StatusBadRequest, "", "invalid memory tags")
 	}
@@ -2921,14 +2933,15 @@ func (s *Service) ApplyMemoryProposal(
 		return nil, err
 	}
 	operationID := "mop-" + uuid.NewString()
+	metadata := compactMetadata(map[string]string{
+		"agentName": proposal.AgentName, "taskName": proposal.TaskName,
+		"source": "memory_proposal", "sourceProposalId": proposal.ID,
+	})
 	envelope := protocol.MutationEnvelope{
 		ProtocolVersion: protocol.Version, OperationID: operationID, Binding: binding,
 		MemoryID: memoryID, Kind: protocol.MutationKindCreate,
 		Generation: uint64(desiredGeneration), ExpectedGeneration: uint64(expectedGeneration),
-		State: &protocol.MutationState{Content: content, Tags: tags, Metadata: compactMetadata(map[string]string{
-			"agentName": proposal.AgentName, "taskName": proposal.TaskName,
-			"source": "memory_proposal", "sourceProposalId": proposal.ID,
-		})},
+		State: &protocol.MutationState{Content: content, Tags: tags, Metadata: metadata},
 	}
 	if err := protocol.PrepareMutation(&envelope); err != nil {
 		return nil, apierror.New(http.StatusBadRequest, "", "invalid proposal memory mutation")
@@ -2944,8 +2957,8 @@ func (s *Service) ApplyMemoryProposal(
 		TenantID: authority.Binding.TenantID, StoreUUID: authority.Binding.StoreUUID,
 		Generation: expectedGeneration, DesiredGeneration: desiredGeneration, GovernanceRevision: 1,
 		MaterializationState: store.MemoryMaterializationPending, Trust: store.MemoryTrustReviewed,
-		AgentName: proposal.AgentName, TaskName: proposal.TaskName, Source: "memory_proposal",
-		SourceProposalID: proposal.ID, Tags: tags, ContentDigest: envelope.ContentDigest,
+		AgentName: metadata["agentName"], TaskName: metadata["taskName"], Source: metadata["source"],
+		SourceProposalID: metadata["sourceProposalId"], Tags: tags, ContentDigest: envelope.ContentDigest,
 		PendingOperationID: operationID, CreatedAt: now, UpdatedAt: now,
 	}
 	admission, err := s.Governed.AdmitRemoteMemoryProposalApply(ctx, store.RemoteMemoryProposalApplyAdmission{
