@@ -113,6 +113,7 @@ func (c *level1Checker) run(name string, check func() error) bool {
 func (c *level1Checker) runPrelude() bool {
 	return c.run("authentication", func() error { return checkAuthentication(c.ctx, c.client) }) &&
 		c.run("identity headers", func() error { return checkIdentityHeaders(c.ctx, c.client) }) &&
+		c.run("credential identity binding", func() error { return checkBoundIdentity(c.ctx, c.client) }) &&
 		c.run("health", c.checkHealth) &&
 		c.run("capabilities", c.checkCapabilities)
 }
@@ -458,6 +459,32 @@ func checkIdentityHeaders(ctx context.Context, client *Client) error {
 		return fmt.Errorf("missing agent request returned HTTP %d", status)
 	}
 	return requireJSONErrorBody(body, "missing agent request")
+}
+
+func checkBoundIdentity(ctx context.Context, client *Client) error {
+	tests := []struct {
+		name     string
+		tenantID string
+		agentID  string
+	}{
+		{name: "tenant switch", tenantID: client.tenantID + "-other", agentID: client.agentID},
+		{name: "agent switch", tenantID: client.tenantID, agentID: client.agentID + "-other"},
+	}
+	for _, test := range tests {
+		status, body, err := client.DoRaw(
+			ctx, http.MethodGet, PathStores, nil, client.authorizationValue, test.tenantID, test.agentID,
+		)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusUnauthorized && status != http.StatusForbidden {
+			return fmt.Errorf("%s returned HTTP %d", test.name, status)
+		}
+		if err := requireJSONErrorBody(body, test.name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func requireErrorResponse(status int, body []byte, expected int, name string) error {
