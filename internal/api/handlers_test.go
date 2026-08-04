@@ -672,6 +672,41 @@ func TestHandlers_CreateTask_ContextTokenAuthorizationRejectsProviderModelResolv
 	require.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
 
+func TestHandlers_CreateTask_ContextTokenAuthorizationUsesOpenCodeAgentIdentityOverAIOverrides(t *testing.T) {
+	provider := newTestOIDCProvider(t)
+	ctxTokenConfig := testContextTokenConfig(t, provider, "")
+	agent := testAgentFromJSON(t, `{
+		"metadata": {"name": "opencode-agent", "namespace": "default"},
+		"spec": {
+			"model": {"name": "openai/gpt-5.4", "contextWindow": 32768, "maxTokens": 4096},
+			"runtime": {"type": "opencode"}
+		}
+	}`)
+	app := setupTestHandlersWithAuthz(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, agent)
+	token := issueTestContextToken(t, provider, nil, map[string]any{
+		"scope": ContextTokenScopeTaskCreate,
+		"tctx": map[string]any{
+			"namespace":        "default",
+			"allowedProviders": []string{string(corev1alpha1.ProviderTypeAnthropic)},
+			"allowedModels":    []string{"claude-sonnet-4"},
+		},
+	})
+
+	resp := postCreateTaskWithContextToken(t, app, token, CreateTaskRequest{
+		Name:      "opencode-ai-override-denied",
+		Namespace: "default",
+		Type:      corev1alpha1.TaskTypeAgent,
+		AgentRef:  &corev1alpha1.AgentReference{Name: "opencode-agent"},
+		Prompt:    "review this change",
+		AI: &corev1alpha1.AISpec{
+			Provider: string(corev1alpha1.ProviderTypeAnthropic),
+			Model:    "claude-sonnet-4",
+		},
+	})
+
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
 func TestHandlers_CreateTask_ContextTokenAuthorizationRejectsCrossNamespaceProviderRefMatches(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")

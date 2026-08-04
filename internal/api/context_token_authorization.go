@@ -1193,6 +1193,9 @@ func contextTokenTaskCreateFallbackProviderModels(ctx context.Context, c client.
 }
 
 func contextTokenTaskCreateProviderRef(req CreateTaskRequest, agent *corev1alpha1.Agent) *corev1alpha1.ProviderReference {
+	if contextTokenOpenCodeAgentTask(req, agent) {
+		return nil
+	}
 	if req.AI != nil && req.AI.ProviderRef != nil {
 		return req.AI.ProviderRef
 	}
@@ -1205,26 +1208,29 @@ func contextTokenTaskCreateProviderRef(req CreateTaskRequest, agent *corev1alpha
 func contextTokenTaskCreateEffectiveProviderModel(req CreateTaskRequest, agent *corev1alpha1.Agent, provider *corev1alpha1.Provider) (ProviderResolutionInfo, string) {
 	providerInfo := ProviderResolutionInfo{}
 	model := ""
+	openCodeAgent := contextTokenOpenCodeAgent(agent)
+	openCodeAgentTask := contextTokenOpenCodeAgentTask(req, agent)
 
-	if provider != nil {
+	if provider != nil && !openCodeAgent {
 		providerInfo = providerResolutionInfo(provider)
 		model = provider.Spec.DefaultModel
 	}
 
 	if agent != nil && agent.Spec.Model != nil {
-		if strings.TrimSpace(agent.Spec.Model.Provider) != "" {
+		if openCodeAgent {
+			providerInfo = ProviderResolutionInfo{Type: contextTokenOpenCodeModelProvider(agent)}
+		} else if strings.TrimSpace(agent.Spec.Model.Provider) != "" {
 			providerInfo = ProviderResolutionInfo{Type: agent.Spec.Model.Provider}
-		} else if provider == nil {
-			if providerType := contextTokenOpenCodeModelProvider(agent); providerType != "" {
-				providerInfo = ProviderResolutionInfo{Type: providerType}
-			}
 		}
 		if strings.TrimSpace(agent.Spec.Model.Name) != "" {
 			model = agent.Spec.Model.Name
 		}
 	}
 
-	if req.AI != nil {
+	// Built-in OpenCode executes the immutable Agent model identity. Task AI
+	// fields are not part of that runtime profile and must not authorize a
+	// different provider/model than the one that will execute.
+	if req.AI != nil && !openCodeAgentTask {
 		if strings.TrimSpace(req.AI.Provider) != "" {
 			providerInfo = ProviderResolutionInfo{Type: req.AI.Provider}
 		}
@@ -1233,17 +1239,25 @@ func contextTokenTaskCreateEffectiveProviderModel(req CreateTaskRequest, agent *
 		}
 	}
 
-	// Provider CRD type is authoritative when a ProviderRef resolves; direct provider
-	// strings on the task or agent must not override the loaded Provider type.
-	if provider != nil {
+	// Provider CRD type is authoritative for provider-backed execution. OpenCode
+	// instead derives its immutable provider identity from the qualified model ID.
+	if provider != nil && !openCodeAgent {
 		providerInfo = providerResolutionInfo(provider)
 	}
 
 	return providerInfo, model
 }
 
+func contextTokenOpenCodeAgentTask(req CreateTaskRequest, agent *corev1alpha1.Agent) bool {
+	return req.Type == corev1alpha1.TaskTypeAgent && contextTokenOpenCodeAgent(agent)
+}
+
+func contextTokenOpenCodeAgent(agent *corev1alpha1.Agent) bool {
+	return agent != nil && agent.Spec.Runtime != nil && agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode
+}
+
 func contextTokenOpenCodeModelProvider(agent *corev1alpha1.Agent) string {
-	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode || agent.Spec.Model == nil {
+	if !contextTokenOpenCodeAgent(agent) || agent.Spec.Model == nil {
 		return ""
 	}
 	provider, model, ok := strings.Cut(strings.TrimSpace(agent.Spec.Model.Name), "/")
@@ -1338,10 +1352,14 @@ func contextTokenAgentRuntimeAuthorizationPolicy(agent *corev1alpha1.Agent) ([]s
 		return allowedTools, allowBash
 	}
 	if agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+		if len(allowedTools) > 0 && !hasNonEmptyToolNames(allowedTools) {
+			return allowedTools, allowBash
+		}
 		allowedTools, _, allowBash = acp.NormalizeBuiltInRuntimeToolPolicy(
 			string(agent.Spec.Runtime.Type), allowedTools, nil, allowBash,
 		)
 		allowedTools = acp.BuiltInRuntimeEffectiveAllowedTools(allowedTools, nil, allowBash)
+		allowBash = acp.BuiltInRuntimeEffectiveAllowBash(nil, allowBash)
 		return allowedTools, allowBash
 	}
 	allowedTools, disallowedTools, allowBash := acp.NormalizeOpenCodeToolPolicy(false, allowedTools, nil, allowBash)
@@ -1366,10 +1384,14 @@ func contextTokenTaskCreateEffectiveRuntimePolicy(req CreateTaskRequest, agent *
 		return allowedTools, allowBash
 	}
 	if agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+		if len(allowedTools) > 0 && !hasNonEmptyToolNames(allowedTools) {
+			return allowedTools, allowBash
+		}
 		allowedTools, disallowedTools, allowBash = acp.NormalizeBuiltInRuntimeToolPolicy(
 			string(agent.Spec.Runtime.Type), allowedTools, disallowedTools, allowBash,
 		)
 		allowedTools = acp.BuiltInRuntimeEffectiveAllowedTools(allowedTools, disallowedTools, allowBash)
+		allowBash = acp.BuiltInRuntimeEffectiveAllowBash(disallowedTools, allowBash)
 		return allowedTools, allowBash
 	}
 	workspace := taskRequestWorkspace(req)

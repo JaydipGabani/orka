@@ -104,4 +104,10 @@ func TestNormalizeBuiltInRuntimeToolPolicy(t *testing.T) {
 	if got := BuiltInRuntimeEffectiveAllowedTools(nil, []string{"Write"}, true); got != nil {
 		t.Fatalf("unrestricted effective tools = %#v, want nil sentinel", got)
 	}
+	if BuiltInRuntimeEffectiveAllowBash([]string{"bAsH"}, true) {
+		t.Fatal("case-insensitive Bash deny did not close the effective Bash gate")
+	}
+	if !BuiltInRuntimeEffectiveAllowBash([]string{"Write"}, true) {
+		t.Fatal("non-Bash deny unexpectedly closed the effective Bash gate")
+	}
 }

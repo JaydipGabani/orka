@@ -100,6 +100,20 @@ func BuiltInRuntimeEffectiveAllowedTools(allowed, disallowed []string, allowBash
 	return sortedUniqueToolNames(result)
 }
 
+// BuiltInRuntimeEffectiveAllowBash applies explicit Bash denies to the
+// separate Bash gate used by authorization subset checks.
+func BuiltInRuntimeEffectiveAllowBash(disallowed []string, allowBash bool) bool {
+	if !allowBash {
+		return false
+	}
+	for _, denied := range disallowed {
+		if strings.EqualFold(strings.TrimSpace(denied), "bash") {
+			return false
+		}
+	}
+	return true
+}
+
 // OpenCodeDefaultAllowedTools returns the governed provider-native tool defaults
 // used when an OpenCode Agent omits runtime.defaultAllowedTools.
 func OpenCodeDefaultAllowedTools() []string {

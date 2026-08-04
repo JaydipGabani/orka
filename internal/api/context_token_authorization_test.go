@@ -271,12 +271,31 @@ func TestContextTokenTaskCreateAuthorizationDerivesOpenCodeProviderFromModelName
 			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
 		},
 	}
-	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build()
+	overrideProvider := &corev1alpha1.Provider{
+		ObjectMeta: metav1.ObjectMeta{Name: "override-provider", Namespace: "team-a"},
+		Spec: corev1alpha1.ProviderSpec{
+			Type:         corev1alpha1.ProviderTypeAnthropic,
+			SecretRef:    corev1alpha1.ProviderSecretRef{Name: "override-secret"},
+			DefaultModel: "claude-sonnet-4",
+		},
+	}
+	agent.Spec.Model.Provider = string(corev1alpha1.ProviderTypeAnthropic)
+	agent.Spec.ProviderRef = &corev1alpha1.ProviderReference{Name: overrideProvider.Name}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, overrideProvider).Build()
 	authzCtx, err := resolveContextTokenTaskCreateAuthorizationContext(context.Background(), client, CreateTaskRequest{
 		Type:     corev1alpha1.TaskTypeAgent,
 		AgentRef: &corev1alpha1.AgentReference{Name: "coder"},
+		AI: &corev1alpha1.AISpec{
+			ProviderRef: &corev1alpha1.ProviderReference{Name: "override-provider"},
+			Provider:    string(corev1alpha1.ProviderTypeAnthropic),
+			Model:       "claude-sonnet-4",
+		},
 	}, "team-a")
 	require.NoError(t, err)
+	require.Empty(t, authzCtx.ProviderRef)
+	require.Nil(t, authzCtx.Provider)
+	require.Equal(t, ProviderResolutionInfo{Type: "openai"}, authzCtx.EffectiveProvider)
+	require.Equal(t, "openai/gpt-5.4", authzCtx.EffectiveModel)
 
 	token := &ContextToken{TransactionContext: map[string]any{
 		"allowedProviders": []any{"openai"},
@@ -286,6 +305,15 @@ func TestContextTokenTaskCreateAuthorizationDerivesOpenCodeProviderFromModelName
 		token, authzCtx.EffectiveProvider, authzCtx.EffectiveModel, "", false, "",
 	)
 	require.Empty(t, failures)
+
+	overrideOnlyToken := &ContextToken{TransactionContext: map[string]any{
+		"allowedProviders": []any{string(corev1alpha1.ProviderTypeAnthropic)},
+		"allowedModels":    []any{"claude-sonnet-4"},
+	}}
+	failures = contextTokenProviderModelConstraintFailures(
+		overrideOnlyToken, authzCtx.EffectiveProvider, authzCtx.EffectiveModel, "", false, "",
+	)
+	require.NotEmpty(t, failures)
 }
 
 func TestContextTokenTaskReadFailures(t *testing.T) {
@@ -833,6 +861,22 @@ func TestContextTokenRuntimeAuthorizationPolicyExpandsGenericNarrowing(t *testin
 	}}})
 	require.Equal(t, []string{"Read"}, gotTools)
 	require.True(t, gotBash)
+
+	gotTools, gotBash = contextTokenAgentRuntimeAuthorizationPolicy(&corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
+		Runtime: &corev1alpha1.AgentCLIRuntime{
+			Type: corev1alpha1.AgentRuntimeClaude, DefaultAllowedTools: []string{" "},
+		},
+	}})
+	require.Equal(t, []string{" "}, gotTools)
+	require.True(t, gotBash)
+
+	gotTools, gotBash = contextTokenTaskCreateEffectiveRuntimePolicy(CreateTaskRequest{
+		AgentRuntime: &corev1alpha1.AgentRuntimeSpec{DisallowedTools: []string{"bAsH"}},
+	}, &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeClaude,
+	}}})
+	require.Equal(t, []string{"Edit", "Glob", "Grep", "Read", "WebFetch", "WebSearch", "Write"}, gotTools)
+	require.False(t, gotBash)
 }
 
 func TestContextTokenRuntimeToolConstraintsDoesNotDuplicateOpenCodeBash(t *testing.T) {

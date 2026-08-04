@@ -187,6 +187,9 @@ func resolveChildTransactionContext(ctx context.Context, k8sClient client.Client
 }
 
 func childTransactionProviderRef(child *corev1alpha1.Task, agent *corev1alpha1.Agent) *corev1alpha1.ProviderReference {
+	if childTransactionOpenCodeAgentTask(child, agent) {
+		return nil
+	}
 	if child.Spec.AI != nil && child.Spec.AI.ProviderRef != nil {
 		return child.Spec.AI.ProviderRef
 	}
@@ -198,7 +201,9 @@ func childTransactionProviderRef(child *corev1alpha1.Task, agent *corev1alpha1.A
 
 func childTransactionEffectiveProviderModel(child *corev1alpha1.Task, agent *corev1alpha1.Agent, provider *corev1alpha1.Provider, providerInfo transactionProviderInfo) (transactionProviderInfo, string) {
 	model := ""
-	if provider != nil {
+	openCodeAgent := childTransactionOpenCodeAgent(agent)
+	openCodeAgentTask := childTransactionOpenCodeAgentTask(child, agent)
+	if provider != nil && !openCodeAgent {
 		providerInfo = transactionProviderInfo{
 			Name:      provider.Name,
 			Namespace: provider.Namespace,
@@ -207,18 +212,16 @@ func childTransactionEffectiveProviderModel(child *corev1alpha1.Task, agent *cor
 		model = provider.Spec.DefaultModel
 	}
 	if agent != nil && agent.Spec.Model != nil {
-		if strings.TrimSpace(agent.Spec.Model.Provider) != "" {
+		if openCodeAgent {
+			providerInfo = transactionProviderInfo{Type: childTransactionOpenCodeModelProvider(agent)}
+		} else if strings.TrimSpace(agent.Spec.Model.Provider) != "" {
 			providerInfo = transactionProviderInfo{Type: agent.Spec.Model.Provider}
-		} else if provider == nil {
-			if providerType := childTransactionOpenCodeModelProvider(agent); providerType != "" {
-				providerInfo = transactionProviderInfo{Type: providerType}
-			}
 		}
 		if strings.TrimSpace(agent.Spec.Model.Name) != "" {
 			model = agent.Spec.Model.Name
 		}
 	}
-	if child.Spec.AI != nil {
+	if child.Spec.AI != nil && !openCodeAgentTask {
 		if strings.TrimSpace(child.Spec.AI.Provider) != "" {
 			providerInfo = transactionProviderInfo{Type: child.Spec.AI.Provider}
 		}
@@ -226,7 +229,7 @@ func childTransactionEffectiveProviderModel(child *corev1alpha1.Task, agent *cor
 			model = child.Spec.AI.Model
 		}
 	}
-	if provider != nil {
+	if provider != nil && !openCodeAgent {
 		providerInfo = transactionProviderInfo{
 			Name:      provider.Name,
 			Namespace: provider.Namespace,
@@ -236,8 +239,16 @@ func childTransactionEffectiveProviderModel(child *corev1alpha1.Task, agent *cor
 	return providerInfo, model
 }
 
+func childTransactionOpenCodeAgentTask(child *corev1alpha1.Task, agent *corev1alpha1.Agent) bool {
+	return child != nil && child.Spec.Type == corev1alpha1.TaskTypeAgent && childTransactionOpenCodeAgent(agent)
+}
+
+func childTransactionOpenCodeAgent(agent *corev1alpha1.Agent) bool {
+	return agent != nil && agent.Spec.Runtime != nil && agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode
+}
+
 func childTransactionOpenCodeModelProvider(agent *corev1alpha1.Agent) string {
-	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode || agent.Spec.Model == nil {
+	if !childTransactionOpenCodeAgent(agent) || agent.Spec.Model == nil {
 		return ""
 	}
 	provider, model, ok := strings.Cut(strings.TrimSpace(agent.Spec.Model.Name), "/")
@@ -676,11 +687,7 @@ func childTransactionEffectiveRuntimePolicy(child *corev1alpha1.Task, agent *cor
 				string(agent.Spec.Runtime.Type), allowedTools, disallowedTools, allowBash,
 			)
 			allowedTools = acp.BuiltInRuntimeEffectiveAllowedTools(allowedTools, disallowedTools, allowBash)
-			if slices.ContainsFunc(disallowedTools, func(name string) bool {
-				return strings.EqualFold(strings.TrimSpace(name), "Bash")
-			}) {
-				allowBash = false
-			}
+			allowBash = acp.BuiltInRuntimeEffectiveAllowBash(disallowedTools, allowBash)
 		}
 		return allowedTools, allowBash
 	}

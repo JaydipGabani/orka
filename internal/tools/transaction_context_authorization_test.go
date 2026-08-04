@@ -170,10 +170,25 @@ func TestValidateChildTaskAgainstParentTransactionDerivesOpenCodeProviderFromMod
 	agent := researcherAgent()
 	agent.Spec.Model = &corev1alpha1.ModelConfig{Name: model}
 	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode}
+	overrideProvider := &corev1alpha1.Provider{
+		ObjectMeta: metav1.ObjectMeta{Name: "override-provider", Namespace: defaultNamespace},
+		Spec: corev1alpha1.ProviderSpec{
+			Type:         corev1alpha1.ProviderTypeAnthropic,
+			SecretRef:    corev1alpha1.ProviderSecretRef{Name: "override-secret"},
+			DefaultModel: "claude-sonnet-4",
+		},
+	}
+	agent.Spec.Model.Provider = string(corev1alpha1.ProviderTypeAnthropic)
+	agent.Spec.ProviderRef = &corev1alpha1.ProviderReference{Name: overrideProvider.Name}
 	child := childTaskForResearcherAgent()
 	child.Spec.Type = corev1alpha1.TaskTypeAgent
+	child.Spec.AI = &corev1alpha1.AISpec{
+		ProviderRef: &corev1alpha1.ProviderReference{Name: overrideProvider.Name},
+		Provider:    string(corev1alpha1.ProviderTypeAnthropic),
+		Model:       "claude-sonnet-4",
+	}
 
-	if err := validateChildTaskAgainstParentTransaction(context.Background(), newFakeClient(agent), parent, child, testResearcherAgentName); err != nil {
+	if err := validateChildTaskAgainstParentTransaction(context.Background(), newFakeClient(agent, overrideProvider), parent, child, testResearcherAgentName); err != nil {
 		t.Fatalf("validateChildTaskAgainstParentTransaction() rejected provider-qualified OpenCode model: %v", err)
 	}
 }
