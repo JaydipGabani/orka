@@ -14,7 +14,7 @@ import (
 	sqlitestore "github.com/orka-agents/orka/internal/store/sqlite"
 )
 
-func TestSecurityRunBoundToRepositoryScanAllowsPriorGenerationOfSameUID(t *testing.T) {
+func TestSecurityRunBoundToRepositoryScanRequiresCurrentGeneration(t *testing.T) {
 	db, err := sqlitestore.NewDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -35,8 +35,13 @@ func TestSecurityRunBoundToRepositoryScanAllowsPriorGenerationOfSameUID(t *testi
 		Name: "repo", Namespace: "ns", UID: types.UID("scan-uid"), Generation: 2,
 	}}
 	bound, err := handlers.securityRunBoundToRepositoryScan(context.Background(), scan, run.ID)
+	if err != nil || bound {
+		t.Fatalf("securityRunBoundToRepositoryScan(stale generation) = %v, %v, want false", bound, err)
+	}
+	scan.Generation = run.RepositoryScanGeneration
+	bound, err = handlers.securityRunBoundToRepositoryScan(context.Background(), scan, run.ID)
 	if err != nil || !bound {
-		t.Fatalf("securityRunBoundToRepositoryScan() = %v, %v, want true", bound, err)
+		t.Fatalf("securityRunBoundToRepositoryScan(current generation) = %v, %v, want true", bound, err)
 	}
 	scan.UID = types.UID("recreated-uid")
 	bound, err = handlers.securityRunBoundToRepositoryScan(context.Background(), scan, run.ID)

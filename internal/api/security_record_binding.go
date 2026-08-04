@@ -25,7 +25,7 @@ func (h *Handlers) securityRunBoundToRepositoryScan(
 	}
 	return run.RepositoryScan == scan.Name &&
 		run.RepositoryScanUID != "" && run.RepositoryScanGeneration > 0 &&
-		run.RepositoryScanUID == string(scan.UID), nil
+		run.RepositoryScanUID == string(scan.UID) && run.RepositoryScanGeneration == scan.Generation, nil
 }
 
 func threatModelBoundToRepositoryScan(model *store.ThreatModel, scan *corev1alpha1.RepositoryScan) bool {
