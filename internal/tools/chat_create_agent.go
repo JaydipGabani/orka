@@ -33,7 +33,7 @@ func (t *ChatCreateAgentTool) Description() string {
 }
 
 func (t *ChatCreateAgentTool) Parameters() json.RawMessage {
-	return mustMarshalSchema(map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaPropertiesField: map[string]any{nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: agentNameDescription}, namespaceField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: namespaceDescription}, providerRefField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Optional Provider CRD reference name. Omit for runtime Agents; provide explicitly for AI/coordinator Agents when a specific provider is required."}, systemPromptField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "System prompt for the agent"}, toolsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeArray, itemsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}, jsonSchemaDescriptionField: "Tool names to attach"}, "resources": map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaDescriptionField: `Optional Kubernetes resource requests/limits for tasks using this agent, e.g. {requests:{cpu:"100m",memory:"512Mi"},limits:{cpu:"1",memory:"2Gi"}}`, jsonSchemaPropertiesField: map[string]any{
+	return mustMarshalSchema(map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaPropertiesField: map[string]any{nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: agentNameDescription}, namespaceField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: namespaceDescription}, providerRefField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Optional Provider CRD reference name. Omit for runtime Agents; provide explicitly for AI/coordinator Agents when a specific provider is required."}, systemPromptField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "System prompt for the agent. Omit for OpenCode runtime Agents because OpenCode cannot enforce Agent system prompts; use initialPrompt or Task prompts instead."}, toolsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeArray, itemsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}, jsonSchemaDescriptionField: "Tool names to attach"}, "resources": map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaDescriptionField: `Optional Kubernetes resource requests/limits for tasks using this agent, e.g. {requests:{cpu:"100m",memory:"512Mi"},limits:{cpu:"1",memory:"2Gi"}}`, jsonSchemaPropertiesField: map[string]any{
 		"requests": map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, "additionalProperties": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}},
 		"limits":   map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, "additionalProperties": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}},
 	},
@@ -317,6 +317,14 @@ func parseRuntimeConfig(a map[string]any, agent *corev1alpha1.Agent) (string, bo
 		return result, false
 	}
 	if resolvedRuntimeType == corev1alpha1.AgentRuntimeOpencode {
+		if agent.Spec.SystemPrompt != nil && strings.TrimSpace(agent.Spec.SystemPrompt.Inline) != "" {
+			result, _ := ChatToolErrorResult(
+				"invalid_arguments",
+				"opencode runtime does not support systemPrompt",
+				"Omit systemPrompt for OpenCode Agents and use initialPrompt or Task prompts for instructions.",
+			)
+			return result, false
+		}
 		if secretRef := strings.TrimSpace(chatGetStringArg(rtMap, secretRefField)); secretRef != "" {
 			result, _ := ChatToolErrorResult(
 				"invalid_arguments",

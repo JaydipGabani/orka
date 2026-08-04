@@ -467,7 +467,7 @@ spec:
   systemPrompt:
     inline: "You are a senior software engineer."
   runtime:
-    type: claude         # or "codex" / "copilot" / "opencode"
+    type: claude         # or "codex" / "copilot"
     defaultMaxTurns: 50
     defaultAllowBash: true
     defaultAllowedTools:
@@ -477,7 +477,10 @@ spec:
       - Bash
 ```
 
-OpenCode model IDs use provider/model form, for example `openai/gpt-5.4`.
+OpenCode Agents must omit `spec.systemPrompt` because the runtime cannot enforce
+Agent-level prompts; put instructions in each Task's `spec.prompt` instead. OpenCode
+model IDs use provider/model form, for example `openai/gpt-5.4`, and require reviewed
+`contextWindow` and `maxTokens` values.
 
 Operator-owned runtimes outside the built-in set can use `orka.harness.v2`
 `AgentRuntime` registration and conformance, but Task planning through

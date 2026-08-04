@@ -112,6 +112,16 @@ describe('agentSpecSchema', () => {
     expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', maxTokens: 4096 }, runtime: { type: 'opencode' } })).toThrow()
     expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', contextWindow: 32768 }, runtime: { type: 'opencode' } })).toThrow()
     expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', contextWindow: 4096, maxTokens: 4096 }, runtime: { type: 'opencode' } })).toThrow()
+    expect(() => agentSpecSchema.parse({
+      model: { name: 'openai/gpt-5.4', contextWindow: 32768, maxTokens: 4096 },
+      systemPrompt: { inline: 'You write code' },
+      runtime: { type: 'opencode' },
+    })).toThrow('OpenCode does not support Agent systemPrompt')
+    expect(() => agentSpecSchema.parse({
+      model: { name: 'openai/gpt-5.4', contextWindow: 32768, maxTokens: 4096 },
+      systemPrompt: { configMapRef: { name: 'prompt', key: 'system.txt' } },
+      runtime: { type: 'opencode' },
+    })).toThrow('OpenCode does not support Agent systemPrompt')
   })
 })
 

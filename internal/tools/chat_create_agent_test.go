@@ -24,7 +24,7 @@ const testProviderOpenAI = "openai"
 
 func TestChatCreateAgentTool_ParametersDescribeOpenCodeACP(t *testing.T) {
 	params := string((&ChatCreateAgentTool{}).Parameters())
-	for _, want := range []string{"copilot, claude, codex, or opencode", "OpenCode defaults to Read, Write, Edit, Bash, Glob, and Grep", "OpenCode defaults to true"} {
+	for _, want := range []string{"copilot, claude, codex, or opencode", "OpenCode defaults to Read, Write, Edit, Bash, Glob, and Grep", "OpenCode defaults to true", "Omit for OpenCode runtime Agents"} {
 		if !strings.Contains(params, want) {
 			t.Errorf("Parameters() missing %q", want)
 		}
@@ -70,6 +70,32 @@ func TestChatCreateAgentTool_Execute_OmittedProviderRefLeavesNil(t *testing.T) {
 		t.Fatalf("model.provider = %q, want openai when no providerRef is set", created.Spec.Model.Provider)
 	}
 }
+
+func TestChatCreateAgentTool_Execute_RejectsOpenCodeSystemPrompt(t *testing.T) {
+	fc := newFakeClient()
+	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
+	result, err := (&ChatCreateAgentTool{}).Execute(ctx, json.RawMessage(`{
+		"name":"opencode-prompt-agent",
+		"systemPrompt":"You write code",
+		"model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},
+		"runtime":{"type":"opencode"}
+	}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if response.Success || response.ErrorType != errTypeInvalidArgs || !strings.Contains(response.Error, "does not support systemPrompt") {
+		t.Fatalf("response = %#v, want OpenCode systemPrompt rejection", response)
+	}
+	var created corev1alpha1.Agent
+	if err := fc.Get(context.Background(), client.ObjectKey{Name: "opencode-prompt-agent", Namespace: defaultNamespace}, &created); !apierrors.IsNotFound(err) {
+		t.Fatalf("invalid OpenCode Agent should not be created, get err=%v", err)
+	}
+}
+
 func TestChatCreateAgentTool_Execute_RejectsOpenCodeLegacySecret(t *testing.T) {
 	fc := newFakeClient()
 	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
@@ -122,6 +148,9 @@ func TestChatCreateAgentTool_Execute_UsesBuiltInOpenCode(t *testing.T) {
 	}
 	if agent.Spec.Model == nil || agent.Spec.Model.Name != "moonshotai/Kimi-K2-Instruct-0905" || agent.Spec.Model.Provider != "" {
 		t.Fatalf("model = %#v, want provider-qualified OpenCode model", agent.Spec.Model)
+	}
+	if agent.Spec.SystemPrompt != nil {
+		t.Fatalf("systemPrompt = %#v, want nil for OpenCode runtime", agent.Spec.SystemPrompt)
 	}
 }
 

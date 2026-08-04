@@ -48,6 +48,22 @@ func TestCreateAgentTool_Parameters(t *testing.T) {
 	if schema[jsonSchemaTypeField] != typeObject {
 		t.Error("Parameters schema should have type: object")
 	}
+	required, ok := schema["required"].([]any)
+	if !ok {
+		t.Fatal("Parameters schema required field is not an array")
+	}
+	if slices.Contains(required, any("systemPrompt")) {
+		t.Error("Parameters schema must not require systemPrompt for OpenCode")
+	}
+	properties, ok := schema[jsonSchemaPropertiesField].(map[string]any)
+	if !ok {
+		t.Fatal("Parameters schema properties field is not an object")
+	}
+	systemPrompt, ok := properties["systemPrompt"].(map[string]any)
+	description, _ := systemPrompt[jsonSchemaDescriptionField].(string)
+	if !ok || !strings.Contains(description, "Required unless runtime.type is opencode") {
+		t.Fatalf("systemPrompt schema = %#v, want OpenCode omission guidance", systemPrompt)
+	}
 }
 
 func TestCreateAgentTool_Execute(t *testing.T) {
@@ -496,7 +512,6 @@ func TestCreateAgentTool_Execute_UsesBuiltInOpenCode(t *testing.T) {
 
 	result, err := tool.Execute(context.Background(), json.RawMessage(`{
 		"role":"coder",
-		"systemPrompt":"You write code",
 		"model":{"provider":"moonshotai","name":"Kimi-K2-Instruct-0905","contextWindow":32768,"maxTokens":4096},
 		"runtime":{"type":"opencode"}
 	}`))
@@ -527,6 +542,9 @@ func TestCreateAgentTool_Execute_UsesBuiltInOpenCode(t *testing.T) {
 	if agent.Spec.ProviderRef != nil || agent.Spec.SecretRef != nil {
 		t.Fatalf("providerRef=%#v secretRef=%#v, want credential-free runtime", agent.Spec.ProviderRef, agent.Spec.SecretRef)
 	}
+	if agent.Spec.SystemPrompt != nil {
+		t.Fatalf("systemPrompt = %#v, want nil for OpenCode runtime", agent.Spec.SystemPrompt)
+	}
 }
 
 func TestCreateAgentTool_Execute_PreservesExplicitEmptyOpenCodeTools(t *testing.T) {
@@ -534,7 +552,7 @@ func TestCreateAgentTool_Execute_PreservesExplicitEmptyOpenCodeTools(t *testing.
 	t.Setenv(envOrkaTaskNamespace, defaultNamespace)
 	k8sClient := newFakeClient(parentTask())
 	result, err := NewCreateAgentTool(k8sClient).Execute(context.Background(), json.RawMessage(`{
-		"role":"coder","systemPrompt":"You write code","model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},
+		"role":"coder","model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},
 		"runtime":{"type":"opencode","defaultAllowedTools":[],"defaultAllowBash":false}
 	}`))
 	if err != nil {
@@ -553,15 +571,29 @@ func TestCreateAgentTool_Execute_PreservesExplicitEmptyOpenCodeTools(t *testing.
 	}
 }
 
+func TestCreateAgentTool_Execute_RejectsOpenCodeSystemPrompt(t *testing.T) {
+	t.Setenv(envOrkaTaskName, parentTaskName)
+	t.Setenv(envOrkaTaskNamespace, defaultNamespace)
+	_, err := NewCreateAgentTool(newFakeClient(parentTask())).Execute(context.Background(), json.RawMessage(`{
+		"role":"coder",
+		"systemPrompt":"You write code",
+		"model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},
+		"runtime":{"type":"opencode"}
+	}`))
+	if err == nil || !strings.Contains(err.Error(), "does not support systemPrompt") {
+		t.Fatalf("Execute() error = %v, want OpenCode systemPrompt rejection", err)
+	}
+}
+
 func TestCreateAgentTool_Execute_RejectsInvalidOpenCodeConfiguration(t *testing.T) {
 	for name, args := range map[string]string{
-		"missing model":   `{"role":"coder","systemPrompt":"x","runtime":{"type":"opencode"}}`,
-		"bare model":      `{"role":"coder","systemPrompt":"x","model":{"name":"gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
-		"substitution":    `{"role":"coder","systemPrompt":"x","model":{"name":"{env:PROVIDER}/gpt","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
-		"missing context": `{"role":"coder","systemPrompt":"x","model":{"name":"openai/gpt-5.4","maxTokens":4096},"runtime":{"type":"opencode"}}`,
-		"missing output":  `{"role":"coder","systemPrompt":"x","model":{"name":"openai/gpt-5.4","contextWindow":32768},"runtime":{"type":"opencode"}}`,
-		"inverted limits": `{"role":"coder","systemPrompt":"x","model":{"name":"openai/gpt-5.4","contextWindow":4096,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
-		"legacy secret":   `{"role":"coder","systemPrompt":"x","model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode","secretRef":"legacy"}}`,
+		"missing model":   `{"role":"coder","runtime":{"type":"opencode"}}`,
+		"bare model":      `{"role":"coder","model":{"name":"gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"substitution":    `{"role":"coder","model":{"name":"{env:PROVIDER}/gpt","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"missing context": `{"role":"coder","model":{"name":"openai/gpt-5.4","maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"missing output":  `{"role":"coder","model":{"name":"openai/gpt-5.4","contextWindow":32768},"runtime":{"type":"opencode"}}`,
+		"inverted limits": `{"role":"coder","model":{"name":"openai/gpt-5.4","contextWindow":4096,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"legacy secret":   `{"role":"coder","model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode","secretRef":"legacy"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(envOrkaTaskName, parentTaskName)

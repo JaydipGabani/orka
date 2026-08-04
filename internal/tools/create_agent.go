@@ -121,7 +121,7 @@ func (t *CreateAgentTool) Parameters() json.RawMessage {
 			},
 			"systemPrompt": {
 				"type": "string",
-				"description": "System prompt for the agent"
+				"description": "System prompt for the agent. Required unless runtime.type is opencode; OpenCode cannot enforce Agent system prompts, so omit this field and use task prompts instead."
 			},
 			"model": {
 				"type": "object",
@@ -215,7 +215,7 @@ func (t *CreateAgentTool) Parameters() json.RawMessage {
 				}
 			}
 		},
-		"required": ["role", "systemPrompt"]
+		"required": ["role"]
 	}`)
 }
 
@@ -304,9 +304,6 @@ func (t *CreateAgentTool) Execute(ctx context.Context, args json.RawMessage) (st
 	if a.Role == "" {
 		return "", fmt.Errorf("role is required")
 	}
-	if a.SystemPrompt == "" {
-		return "", fmt.Errorf("systemPrompt is required")
-	}
 	runtimeType := ""
 	if a.Runtime != nil {
 		runtimeType = strings.TrimSpace(a.Runtime.Type)
@@ -316,6 +313,13 @@ func (t *CreateAgentTool) Execute(ctx context.Context, args json.RawMessage) (st
 		if !isBuiltInACPRuntime(corev1alpha1.AgentRuntimeType(runtimeType)) {
 			return "", fmt.Errorf("unsupported runtime type %q; supported built-in runtimes are copilot, claude, codex, and opencode", runtimeType)
 		}
+	}
+	if runtimeType == string(corev1alpha1.AgentRuntimeOpencode) {
+		if strings.TrimSpace(a.SystemPrompt) != "" {
+			return "", fmt.Errorf("opencode runtime does not support systemPrompt; omit it and use task prompts for instructions")
+		}
+	} else if strings.TrimSpace(a.SystemPrompt) == "" {
+		return "", fmt.Errorf("systemPrompt is required")
 	}
 	requestedModel, err := normalizedCreateAgentModel(a.Runtime, a.Model)
 	if err != nil {
@@ -407,12 +411,12 @@ func (t *CreateAgentTool) Execute(ctx context.Context, args json.RawMessage) (st
 		Spec: corev1alpha1.AgentSpec{
 			ProviderRef: &corev1alpha1.ProviderReference{Name: providerRefName},
 			Model:       model,
-			SystemPrompt: &corev1alpha1.PromptSource{
-				Inline: a.SystemPrompt,
-			},
-			Tools:  toolRefs,
-			Skills: skillRefs,
+			Tools:       toolRefs,
+			Skills:      skillRefs,
 		},
+	}
+	if strings.TrimSpace(a.SystemPrompt) != "" {
+		agent.Spec.SystemPrompt = &corev1alpha1.PromptSource{Inline: a.SystemPrompt}
 	}
 
 	// Set coordination config if provided

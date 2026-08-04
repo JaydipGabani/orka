@@ -69,6 +69,13 @@ export const agentSpecSchema = z.object({
   runtime: agentRuntimeSchema.optional(),
 }).superRefine((spec, ctx) => {
   if (spec.runtime && 'type' in spec.runtime && spec.runtime.type === 'opencode') {
+    if (spec.systemPrompt?.inline?.trim() || spec.systemPrompt?.configMapRef) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'OpenCode does not support Agent systemPrompt; use Task prompts instead',
+        path: ['systemPrompt'],
+      })
+    }
     if (!spec.model?.name?.trim()) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

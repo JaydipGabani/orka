@@ -9,6 +9,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -52,6 +53,11 @@ func TestUpdateAgentTool_Parameters(t *testing.T) {
 		if _, ok := props[key]; !ok {
 			t.Errorf("missing %s property", key)
 		}
+	}
+	systemPrompt, ok := props[systemPromptField].(map[string]any)
+	description, _ := systemPrompt[jsonSchemaDescriptionField].(string)
+	if !ok || !strings.Contains(description, "OpenCode runtime Agents do not support") {
+		t.Fatalf("systemPrompt schema = %#v, want OpenCode restriction guidance", systemPrompt)
 	}
 }
 
@@ -196,6 +202,35 @@ func TestUpdateAgentTool_Execute_VerifyUpdatedFields(t *testing.T) {
 	}
 	if len(updated.Spec.Tools) != 1 || updated.Spec.Tools[0].Name != webSearchToolName {
 		t.Errorf("tools not updated, got %v", updated.Spec.Tools)
+	}
+}
+
+func TestUpdateAgentTool_Execute_RejectsOpenCodeSystemPrompt(t *testing.T) {
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: testMyAgentName, Namespace: defaultNamespace},
+		Spec: corev1alpha1.AgentSpec{
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	fc := newFakeClient(agent)
+	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
+	result, err := (&UpdateAgentTool{}).Execute(ctx, json.RawMessage(`{"name":"my-agent","systemPrompt":"You write code"}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if response.Success || response.ErrorType != errTypeInvalidArgs || !strings.Contains(response.Error, "does not support systemPrompt") {
+		t.Fatalf("response = %#v, want OpenCode systemPrompt rejection", response)
+	}
+	var updated corev1alpha1.Agent
+	if err := fc.Get(context.Background(), apitypes.NamespacedName{Name: testMyAgentName, Namespace: defaultNamespace}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Spec.SystemPrompt != nil {
+		t.Fatalf("systemPrompt = %#v, want unchanged nil value", updated.Spec.SystemPrompt)
 	}
 }
 
