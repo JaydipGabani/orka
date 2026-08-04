@@ -498,6 +498,9 @@ func TestDownstreamStageReceiptDoesNotFabricateTargetObservation(t *testing.T) {
 			Name: "review", Namespace: "ns", UID: types.UID("task-uid"),
 			Labels: map[string]string{labels.LabelSecurityStage: security.StageReview},
 		},
+		Spec: corev1alpha1.TaskSpec{
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit}},
+		},
 		Status: corev1alpha1.TaskStatus{Attempts: 1},
 	}
 	if err := r.appendStageReceipt(context.Background(), task, run, security.ArtifactFindingsV2,
@@ -874,6 +877,9 @@ func TestImmutableValidationRetryAppendsCorrectiveAttemptAndReplaysExactly(t *te
 			Name: "review", Namespace: run.Namespace, UID: types.UID("review-uid"),
 			Labels: map[string]string{labels.LabelSecurityStage: security.StageReview, labels.LabelSecuritySliceID: "slice-1"},
 		},
+		Spec: corev1alpha1.TaskSpec{
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit}},
+		},
 		Status: corev1alpha1.TaskStatus{Attempts: 1},
 	}
 	finding := store.Finding{
@@ -937,6 +943,9 @@ func TestImmutableValidationRetryAppendsCorrectiveAttemptAndReplaysExactly(t *te
 				labels.LabelSecurityScanID: run.ID, labels.LabelSecurityOccurrenceID: occurrenceID,
 			},
 			Annotations: map[string]string{security.AnnotationValidationBindingVersion: security.ValidationBindingVersion},
+		},
+		Spec: corev1alpha1.TaskSpec{
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit}},
 		},
 		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseSucceeded, Attempts: 1},
 	}
@@ -1082,6 +1091,9 @@ func TestHistoricalValidationIsRejectedAfterRepositoryScanGenerationChange(t *te
 		ObjectMeta: metav1.ObjectMeta{Name: "review", Namespace: "ns", UID: types.UID("review-uid"), Labels: map[string]string{
 			labels.LabelSecurityStage: security.StageReview, labels.LabelSecuritySliceID: "slice-1",
 		}},
+		Spec: corev1alpha1.TaskSpec{
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit}},
+		},
 		Status: corev1alpha1.TaskStatus{Attempts: 1},
 	}
 	finding := store.Finding{
@@ -1148,6 +1160,9 @@ func TestHistoricalValidationIsRejectedAfterRepositoryScanGenerationChange(t *te
 				labels.LabelSecurityScanID: run.ID, labels.LabelSecurityOccurrenceID: occurrenceID,
 			},
 			Annotations: map[string]string{security.AnnotationValidationBindingVersion: security.ValidationBindingVersion},
+		},
+		Spec: corev1alpha1.TaskSpec{
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit}},
 		},
 		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseSucceeded, Attempts: 1},
 	}

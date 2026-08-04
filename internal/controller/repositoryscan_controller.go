@@ -1957,6 +1957,72 @@ func (r *RepositoryScanReconciler) stageReceiptIDFor(
 	)
 }
 
+func securityTargetReceiptID(runUID, targetDigest string) string {
+	targetIDSum := sha256.Sum256([]byte(runUID + "\x00" + targetDigest))
+	return "target_" + hex.EncodeToString(targetIDSum[:])
+}
+
+func stageReceiptExpectedTargetSHA(task *corev1alpha1.Task) string {
+	if task == nil {
+		return ""
+	}
+	workspaceRef := ""
+	if task.Spec.Workspace != nil {
+		workspaceRef = task.Spec.Workspace.Ref
+	} else if task.Spec.AgentRuntime != nil && task.Spec.AgentRuntime.Workspace != nil {
+		workspaceRef = task.Spec.AgentRuntime.Workspace.Ref
+	}
+	objectID, _ := security.NormalizeFullGitObjectID(workspaceRef)
+	return objectID
+}
+
+func stageReceiptTargetBinding(
+	task *corev1alpha1.Task,
+	run *store.ScanRun,
+	artifactName string,
+	normalized []byte,
+) (expectedTargetSHA, observedTargetSHA, targetReceiptID string, err error) {
+	if task == nil || run == nil {
+		return "", "", "", nil
+	}
+	expectedTargetSHA = stageReceiptExpectedTargetSHA(task)
+	switch taskSecurityStage(task) {
+	case security.StageThreatModel:
+		// Threat modeling runs before trusted mapper target resolution. Never
+		// project a later run-level target receipt back onto this attempt.
+		return expectedTargetSHA, "", "", nil
+	case security.StageMapper:
+		if artifactName != security.ArtifactSlices || len(normalized) == 0 {
+			return expectedTargetSHA, "", "", nil
+		}
+		var artifact security.ReviewSlicesArtifact
+		if err := json.Unmarshal(normalized, &artifact); err != nil {
+			return "", "", "", fmt.Errorf("decode normalized mapper target binding: %w", err)
+		}
+		observed := strings.TrimSpace(artifact.HeadCommit)
+		if artifact.TargetReceipt != nil {
+			observed = strings.TrimSpace(artifact.TargetReceipt.HeadOID)
+			targetBytes, err := json.Marshal(artifact.TargetReceipt)
+			if err != nil {
+				return "", "", "", fmt.Errorf("encode mapper target receipt binding: %w", err)
+			}
+			targetReceiptID = securityTargetReceiptID(run.RunUID, securityDigest(targetBytes))
+		}
+		if observed != "" {
+			var ok bool
+			observedTargetSHA, ok = security.NormalizeFullGitObjectID(observed)
+			if !ok {
+				return "", "", "", fmt.Errorf("mapper observed target %q is not a full Git object ID", observed)
+			}
+		}
+		return expectedTargetSHA, observedTargetSHA, targetReceiptID, nil
+	default:
+		// Post-mapper tasks are created only after this run-level receipt is
+		// fixed, and their workspace ref pins expectedTargetSHA independently.
+		return expectedTargetSHA, "", run.TargetReceiptID, nil
+	}
+}
+
 func (r *RepositoryScanReconciler) appendStageReceiptCreated(
 	ctx context.Context,
 	task *corev1alpha1.Task,
@@ -2028,10 +2094,12 @@ func (r *RepositoryScanReconciler) appendStageReceiptCreated(
 		}
 	}
 	attestation := store.AnalysisAttestationDelivered
-	observedTargetSHA := ""
 	if taskSecurityStage(task) == security.StageMapper {
 		attestation = store.AnalysisAttestationToolObserved
-		observedTargetSHA = run.HeadCommit
+	}
+	expectedTargetSHA, observedTargetSHA, targetReceiptID, err := stageReceiptTargetBinding(task, run, artifactName, normalized)
+	if err != nil {
+		return false, err
 	}
 	rawDigest := sourceDigest
 	if rawDigest == "" && len(raw) > 0 {
@@ -2051,9 +2119,9 @@ func (r *RepositoryScanReconciler) appendStageReceiptCreated(
 		ScopeKind:                  securityScopeKind(task),
 		ScopeID:                    firstNonEmptySecurityScope(task),
 		Provenance:                 provenance,
-		ExpectedTargetSHA:          run.HeadCommit,
+		ExpectedTargetSHA:          expectedTargetSHA,
 		ObservedTargetSHA:          observedTargetSHA,
-		TargetReceiptID:            run.TargetReceiptID,
+		TargetReceiptID:            targetReceiptID,
 		AttestationLevel:           attestation,
 		ScannerPolicyDigest:        run.PolicyDigest,
 		SourceArtifactName:         artifactName,
@@ -5104,8 +5172,7 @@ func (r *RepositoryScanReconciler) ingestMapperTask(ctx context.Context, scan *c
 				}
 				targetDigest := securityDigest(targetBytes)
 				run.HeadCommit = resolvedHead
-				targetIDSum := sha256.Sum256([]byte(run.RunUID + "\x00" + targetDigest))
-				run.TargetReceiptID = "target_" + hex.EncodeToString(targetIDSum[:])
+				run.TargetReceiptID = securityTargetReceiptID(run.RunUID, targetDigest)
 				if r.TargetReceiptStore != nil {
 					if _, err := r.TargetReceiptStore.SaveSecurityTargetReceipt(ctx, &store.SecurityTargetReceipt{
 						ID:              run.TargetReceiptID,
