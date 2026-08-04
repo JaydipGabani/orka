@@ -268,6 +268,49 @@ func TestUpdateAgentTool_Execute_UpdatesNestedModelFields(t *testing.T) {
 	}
 }
 
+func TestUpdateAgentTool_Execute_RejectsModelLimitsForNonOpenCodeBuiltIns(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		runtime   corev1alpha1.AgentRuntimeType
+		modelJSON string
+		wantError string
+	}{
+		{name: "codex context window", runtime: corev1alpha1.AgentRuntimeCodex, modelJSON: `{"contextWindow":32768}`, wantError: "contextWindow"},
+		{name: "claude max tokens", runtime: corev1alpha1.AgentRuntimeClaude, modelJSON: `{"maxTokens":4096}`, wantError: "maxTokens"},
+		{name: "copilot context window", runtime: corev1alpha1.AgentRuntimeCopilot, modelJSON: `{"contextWindow":32768}`, wantError: "contextWindow"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			original := &corev1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{Name: testMyAgentName, Namespace: defaultNamespace},
+				Spec: corev1alpha1.AgentSpec{
+					Runtime: &corev1alpha1.AgentCLIRuntime{Type: tt.runtime},
+					Model:   &corev1alpha1.ModelConfig{Name: "model"},
+				},
+			}
+			fc := newFakeClient(original.DeepCopy())
+			ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
+			result, err := (&UpdateAgentTool{}).Execute(ctx, json.RawMessage(`{"name":"my-agent","model":`+tt.modelJSON+`}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var response ChatToolResult
+			if err := json.Unmarshal([]byte(result), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.Success || !strings.Contains(response.Error, tt.wantError) {
+				t.Fatalf("response = %#v, want %q rejection", response, tt.wantError)
+			}
+			var persisted corev1alpha1.Agent
+			if err := fc.Get(context.Background(), apitypes.NamespacedName{Name: testMyAgentName, Namespace: defaultNamespace}, &persisted); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(persisted.Spec, original.Spec) {
+				t.Fatalf("persisted spec changed after rejection: got %#v want %#v", persisted.Spec, original.Spec)
+			}
+		})
+	}
+}
+
 func TestUpdateAgentTool_Execute_NormalizesOpenCodeModelAndPreservesOmittedFields(t *testing.T) {
 	temperature := 0.7
 	contextWindow := int32(32768)

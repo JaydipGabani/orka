@@ -233,7 +233,19 @@ func normalizedCreateAgentModel(runtime *RuntimeArgs, model *ModelArgs) (string,
 	if model != nil {
 		requested = strings.TrimSpace(model.Name)
 	}
-	if runtime == nil || strings.TrimSpace(runtime.Type) != string(corev1alpha1.AgentRuntimeOpencode) {
+	if runtime == nil {
+		return requested, nil
+	}
+	runtimeType := corev1alpha1.AgentRuntimeType(strings.TrimSpace(runtime.Type))
+	if model != nil {
+		if err := validateBuiltInRuntimeModelLimits(runtimeType, &corev1alpha1.ModelConfig{
+			ContextWindow: model.ContextWindow,
+			MaxTokens:     model.MaxTokens,
+		}); err != nil {
+			return "", err
+		}
+	}
+	if runtimeType != corev1alpha1.AgentRuntimeOpencode {
 		return requested, nil
 	}
 	if requested == "" {

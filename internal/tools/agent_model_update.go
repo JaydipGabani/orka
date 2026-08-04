@@ -109,9 +109,39 @@ func parsePositiveAgentModelInt32(field string, raw any) (int32, error) {
 	return int32(value), nil
 }
 
+func validateBuiltInRuntimeModelLimits(runtimeType corev1alpha1.AgentRuntimeType, model *corev1alpha1.ModelConfig) error {
+	if !isBuiltInACPRuntime(runtimeType) || runtimeType == corev1alpha1.AgentRuntimeOpencode || model == nil {
+		return nil
+	}
+	if model.ContextWindow != nil {
+		return fmt.Errorf("built-in ACP runtime %q does not support model.contextWindow", runtimeType)
+	}
+	if model.MaxTokens != nil {
+		return fmt.Errorf("built-in ACP runtime %q does not support model.maxTokens", runtimeType)
+	}
+	return nil
+}
+
+func validateAgentModelUpdateForRuntime(agent *corev1alpha1.Agent, update agentModelUpdate) error {
+	if agent == nil || agent.Spec.Runtime == nil || !isBuiltInACPRuntime(agent.Spec.Runtime.Type) ||
+		agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
+		return nil
+	}
+	if update.contextSet {
+		return fmt.Errorf("built-in ACP runtime %q does not support model.contextWindow", agent.Spec.Runtime.Type)
+	}
+	if update.maxTokensSet {
+		return fmt.Errorf("built-in ACP runtime %q does not support model.maxTokens", agent.Spec.Runtime.Type)
+	}
+	return nil
+}
+
 func applyAgentModelUpdate(agent *corev1alpha1.Agent, update agentModelUpdate) error {
 	if !update.hasChanges() {
 		return nil
+	}
+	if err := validateAgentModelUpdateForRuntime(agent, update); err != nil {
+		return err
 	}
 	if agent.Spec.Model == nil {
 		agent.Spec.Model = &corev1alpha1.ModelConfig{}

@@ -504,6 +504,30 @@ func TestCreateAgentTool_Execute_BuiltInRuntimesAreCredentialFree(t *testing.T) 
 	}
 }
 
+func TestCreateAgentTool_Execute_RejectsModelLimitsForNonOpenCodeBuiltIns(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		runtime   string
+		modelJSON string
+		wantError string
+	}{
+		{name: "codex context window", runtime: "codex", modelJSON: `{"name":"gpt-5.4","contextWindow":32768}`, wantError: "contextWindow"},
+		{name: "claude max tokens", runtime: "claude", modelJSON: `{"name":"claude-sonnet","maxTokens":4096}`, wantError: "maxTokens"},
+		{name: "copilot context window", runtime: "copilot", modelJSON: `{"name":"gpt-5.3-codex","contextWindow":32768}`, wantError: "contextWindow"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(envOrkaTaskName, parentTaskName)
+			t.Setenv(envOrkaTaskNamespace, defaultNamespace)
+			_, err := NewCreateAgentTool(newFakeClient(parentTask())).Execute(context.Background(), json.RawMessage(
+				`{"role":"coder","systemPrompt":"You write code","model":`+tt.modelJSON+`,"runtime":{"type":"`+tt.runtime+`"}}`,
+			))
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("Execute() error = %v, want %q rejection", err, tt.wantError)
+			}
+		})
+	}
+}
+
 func TestCreateAgentTool_Execute_UsesBuiltInOpenCode(t *testing.T) {
 	t.Setenv(envOrkaTaskName, parentTaskName)
 	t.Setenv(envOrkaTaskNamespace, defaultNamespace)

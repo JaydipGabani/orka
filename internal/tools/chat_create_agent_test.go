@@ -330,6 +330,36 @@ func TestParseRuntimeConfig_BuiltInRuntimesAreCredentialFree(t *testing.T) {
 	})
 }
 
+func TestParseRuntimeConfig_RejectsModelLimitsForNonOpenCodeBuiltIns(t *testing.T) {
+	contextWindow := int32(32768)
+	maxTokens := int32(4096)
+	for _, tt := range []struct {
+		name      string
+		runtime   corev1alpha1.AgentRuntimeType
+		model     *corev1alpha1.ModelConfig
+		wantError string
+	}{
+		{name: "codex context window", runtime: corev1alpha1.AgentRuntimeCodex, model: &corev1alpha1.ModelConfig{ContextWindow: &contextWindow}, wantError: "contextWindow"},
+		{name: "claude max tokens", runtime: corev1alpha1.AgentRuntimeClaude, model: &corev1alpha1.ModelConfig{MaxTokens: &maxTokens}, wantError: "maxTokens"},
+		{name: "copilot context window", runtime: corev1alpha1.AgentRuntimeCopilot, model: &corev1alpha1.ModelConfig{ContextWindow: &contextWindow}, wantError: "contextWindow"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Model: tt.model}}
+			result, ok := parseRuntimeConfig(map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: string(tt.runtime)}}, agent)
+			if ok {
+				t.Fatal("parseRuntimeConfig accepted ignored built-in model limits")
+			}
+			var response ChatToolResult
+			if err := json.Unmarshal([]byte(result), &response); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(response.Error, tt.wantError) {
+				t.Fatalf("response = %#v, want %q rejection", response, tt.wantError)
+			}
+		})
+	}
+}
+
 func TestParseRuntimeConfig_RejectsUnsupportedRuntime(t *testing.T) {
 	for _, runtimeType := range []string{"unknown", "", "   "} {
 		t.Run(runtimeType, func(t *testing.T) {

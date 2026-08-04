@@ -316,6 +316,14 @@ func parseRuntimeConfig(a map[string]any, agent *corev1alpha1.Agent) (string, bo
 		)
 		return result, false
 	}
+	if err := validateBuiltInRuntimeModelLimits(resolvedRuntimeType, agent.Spec.Model); err != nil {
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			err.Error(),
+			"Remove contextWindow/maxTokens for Codex, Claude, or Copilot; those reviewed limits are OpenCode-only.",
+		)
+		return result, false
+	}
 	if resolvedRuntimeType == corev1alpha1.AgentRuntimeOpencode {
 		if agent.Spec.SystemPrompt != nil && strings.TrimSpace(agent.Spec.SystemPrompt.Inline) != "" {
 			result, _ := ChatToolErrorResult(
