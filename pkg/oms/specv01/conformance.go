@@ -61,7 +61,7 @@ func CheckLevel1(ctx context.Context, target Target) CheckResult {
 		return checker.result
 	}
 	checker.result.Passed = true
-	checker.result.Message = "KD6 OMS draft v0.1.0 Level 1 conformance passed"
+	checker.result.Message = "KD6 OMS draft v0.1.0 Level 1 API compatibility passed"
 	return checker.result
 }
 
@@ -84,7 +84,7 @@ func newLevel1Checker(ctx context.Context, target Target) (*level1Checker, error
 		ctx: ctx, target: target, client: client, otherClient: otherClient,
 		result: CheckResult{
 			SpecVersion: Version, SourceRevision: SourceRevision,
-			Message: "KD6 OMS Level 1 conformance failed",
+			Message: "KD6 OMS Level 1 API compatibility failed",
 		},
 		storeName: "orka-level1-" + suffix,
 		memoryIDs: make([]string, 0, 2),

@@ -6,7 +6,7 @@ Orka targets the KD6 Open Memory Service draft at immutable source revision
 `042cff94bf82e92dea3a47f181121fd9cdcbc434` (document version `0.1.0`,
 dated May 24, 2026).
 
-The compatibility surface follows the JSON models and HTTP behavior of the KD6
+The API compatibility surface follows the JSON models and HTTP behavior of the KD6
 reference server at that revision where the prose specification is incomplete.
 A compatibility claim always names this revision; it never follows mutable
 `main` implicitly.
@@ -24,6 +24,14 @@ OMS endpoint. It forwards only the pinned Level 1 route set and identity headers
 and never forwards the caller's bearer token downstream. This keeps the public
 interoperability surface separate from the private governance surface while
 allowing both to share one deployment and trust boundary.
+
+This profile proves API and behavior compatibility. It does not claim OAuth 2.1
+resource-server certification: the adapter binds a dedicated rotating bearer
+Secret to one configured tenant and agent. OAuth or mTLS claim validation may be
+provided by a trusted ingress.
+
+The private `/v1/stores/resolve` path remains reserved, so `resolve` is not an
+available Level 1 store name on the combined listener.
 
 The facade is disabled by default. Enabling it is an explicit statement that
 the configured downstream KD6 service implements the pinned Level 1 contract.
@@ -63,7 +71,7 @@ Level 2/3 route is included in the Level 1 allowlist.
 
 ## Required behavior
 
-The black-box Level 1 suite proves at least:
+The black-box Level 1 API compatibility suite proves at least:
 
 1. authentication is required;
 2. tenant and agent identity are required for data routes;
@@ -79,7 +87,7 @@ The black-box Level 1 suite proves at least:
 
 A transparent facade passes only when the configured downstream KD6 service
 passes the same suite. Passing the private `orka.oms.v0alpha1` suite is not
-substituted for this proof.
+substituted for this proof. This proof does not certify OAuth 2.1 behavior.
 
 ## Non-goals
 
