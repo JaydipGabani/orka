@@ -38,6 +38,68 @@ func IsBuiltInRuntimeNativeTool(provider, name string) bool {
 	return false
 }
 
+// NormalizeBuiltInRuntimeToolPolicy expands an implicit provider-native tool
+// surface only when deny-only metadata or the Bash gate narrows it. Explicit
+// allowlists, including an explicit empty deny-all list, remain authoritative.
+func NormalizeBuiltInRuntimeToolPolicy(
+	provider string,
+	allowed, disallowed []string,
+	allowBash bool,
+) ([]string, []string, bool) {
+	if allowed != nil || (len(disallowed) == 0 && allowBash) {
+		return allowed, disallowed, allowBash
+	}
+	native := BuiltInRuntimeNativeToolNames(provider)
+	if len(native) == 0 {
+		return allowed, disallowed, allowBash
+	}
+	denied := make(map[string]struct{}, len(disallowed)+1)
+	for _, name := range disallowed {
+		if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
+			denied[name] = struct{}{}
+		}
+	}
+	if !allowBash {
+		denied["bash"] = struct{}{}
+	}
+	normalizedAllowed := make([]string, 0, len(native))
+	for _, name := range native {
+		if _, blocked := denied[strings.ToLower(name)]; blocked {
+			continue
+		}
+		normalizedAllowed = append(normalizedAllowed, name)
+	}
+	sort.Strings(normalizedAllowed)
+	return normalizedAllowed, disallowed, allowBash
+}
+
+// BuiltInRuntimeEffectiveAllowedTools returns the tools that a normalized
+// non-OpenCode policy can execute after deny metadata and the Bash gate apply.
+// A nil allowlist remains nil so callers can preserve the unrestricted sentinel.
+func BuiltInRuntimeEffectiveAllowedTools(allowed, disallowed []string, allowBash bool) []string {
+	if allowed == nil {
+		return nil
+	}
+	result := make([]string, 0, len(allowed))
+	for _, name := range allowed {
+		name = strings.TrimSpace(name)
+		if name == "" || (!allowBash && strings.EqualFold(name, "bash")) {
+			continue
+		}
+		blocked := false
+		for _, denied := range disallowed {
+			if strings.TrimSpace(denied) == name {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			result = append(result, name)
+		}
+	}
+	return sortedUniqueToolNames(result)
+}
+
 // OpenCodeDefaultAllowedTools returns the governed provider-native tool defaults
 // used when an OpenCode Agent omits runtime.defaultAllowedTools.
 func OpenCodeDefaultAllowedTools() []string {

@@ -1214,6 +1214,10 @@ func contextTokenTaskCreateEffectiveProviderModel(req CreateTaskRequest, agent *
 	if agent != nil && agent.Spec.Model != nil {
 		if strings.TrimSpace(agent.Spec.Model.Provider) != "" {
 			providerInfo = ProviderResolutionInfo{Type: agent.Spec.Model.Provider}
+		} else if provider == nil {
+			if providerType := contextTokenOpenCodeModelProvider(agent); providerType != "" {
+				providerInfo = ProviderResolutionInfo{Type: providerType}
+			}
 		}
 		if strings.TrimSpace(agent.Spec.Model.Name) != "" {
 			model = agent.Spec.Model.Name
@@ -1236,6 +1240,17 @@ func contextTokenTaskCreateEffectiveProviderModel(req CreateTaskRequest, agent *
 	}
 
 	return providerInfo, model
+}
+
+func contextTokenOpenCodeModelProvider(agent *corev1alpha1.Agent) string {
+	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode || agent.Spec.Model == nil {
+		return ""
+	}
+	provider, model, ok := strings.Cut(strings.TrimSpace(agent.Spec.Model.Name), "/")
+	if !ok || strings.TrimSpace(model) == "" {
+		return ""
+	}
+	return strings.TrimSpace(provider)
 }
 
 func contextTokenTaskCreateEffectiveAITools(req CreateTaskRequest, agent *corev1alpha1.Agent) []string {
@@ -1319,7 +1334,14 @@ func contextTokenAgentRuntimeAllowBash(agent *corev1alpha1.Agent) bool {
 func contextTokenAgentRuntimeAuthorizationPolicy(agent *corev1alpha1.Agent) ([]string, bool) {
 	allowedTools := contextTokenAgentRuntimeAllowedTools(agent)
 	allowBash := contextTokenAgentRuntimeAllowBash(agent)
-	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+	if agent == nil || agent.Spec.Runtime == nil {
+		return allowedTools, allowBash
+	}
+	if agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+		allowedTools, _, allowBash = acp.NormalizeBuiltInRuntimeToolPolicy(
+			string(agent.Spec.Runtime.Type), allowedTools, nil, allowBash,
+		)
+		allowedTools = acp.BuiltInRuntimeEffectiveAllowedTools(allowedTools, nil, allowBash)
 		return allowedTools, allowBash
 	}
 	allowedTools, disallowedTools, allowBash := acp.NormalizeOpenCodeToolPolicy(false, allowedTools, nil, allowBash)
@@ -1340,7 +1362,14 @@ func contextTokenTaskCreateEffectiveRuntimePolicy(req CreateTaskRequest, agent *
 	if req.AgentRuntime != nil {
 		disallowedTools = append(disallowedTools, req.AgentRuntime.DisallowedTools...)
 	}
-	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+	if agent == nil || agent.Spec.Runtime == nil {
+		return allowedTools, allowBash
+	}
+	if agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+		allowedTools, disallowedTools, allowBash = acp.NormalizeBuiltInRuntimeToolPolicy(
+			string(agent.Spec.Runtime.Type), allowedTools, disallowedTools, allowBash,
+		)
+		allowedTools = acp.BuiltInRuntimeEffectiveAllowedTools(allowedTools, disallowedTools, allowBash)
 		return allowedTools, allowBash
 	}
 	workspace := taskRequestWorkspace(req)

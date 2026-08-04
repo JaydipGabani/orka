@@ -69,31 +69,7 @@ func normalizeACPProviderNativeToolPolicy(
 	allowed, disallowed []string,
 	allowBash bool,
 ) ([]string, []string, bool) {
-	if allowed != nil || (len(disallowed) == 0 && allowBash) {
-		return allowed, disallowed, allowBash
-	}
-	native := providerNativeTools[strings.ToLower(strings.TrimSpace(provider))]
-	if len(native) == 0 {
-		return allowed, disallowed, allowBash
-	}
-	denied := make(map[string]struct{}, len(disallowed)+1)
-	for _, name := range disallowed {
-		if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
-			denied[name] = struct{}{}
-		}
-	}
-	if !allowBash {
-		denied["bash"] = struct{}{}
-	}
-	normalizedAllowed := make([]string, 0, len(native))
-	for canonicalName, name := range native {
-		if _, denied := denied[canonicalName]; denied {
-			continue
-		}
-		normalizedAllowed = append(normalizedAllowed, name)
-	}
-	sort.Strings(normalizedAllowed)
-	return normalizedAllowed, disallowed, allowBash
+	return acp.NormalizeBuiltInRuntimeToolPolicy(provider, allowed, disallowed, allowBash)
 }
 
 func buildRuntimeSessionMCPConfiguration(

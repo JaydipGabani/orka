@@ -77,3 +77,31 @@ func TestBuiltInRuntimeNativeToolPolicy(t *testing.T) {
 		t.Fatal("BuiltInRuntimeNativeToolNames returned mutable policy storage")
 	}
 }
+
+func TestNormalizeBuiltInRuntimeToolPolicy(t *testing.T) {
+	allowed, disallowed, allowBash := NormalizeBuiltInRuntimeToolPolicy("claude", nil, []string{"Write"}, true)
+	if !slices.Equal(allowed, []string{"Bash", "Edit", "Glob", "Grep", "Read", "WebFetch", "WebSearch"}) {
+		t.Fatalf("deny-only allowed tools = %#v", allowed)
+	}
+	if !slices.Equal(disallowed, []string{"Write"}) || !allowBash {
+		t.Fatalf("deny-only metadata changed: disallowed=%#v allowBash=%v", disallowed, allowBash)
+	}
+
+	allowed, _, allowBash = NormalizeBuiltInRuntimeToolPolicy("claude", nil, nil, false)
+	if !slices.Equal(allowed, []string{"Edit", "Glob", "Grep", "Read", "WebFetch", "WebSearch", "Write"}) || allowBash {
+		t.Fatalf("bash-disabled policy = %#v allowBash=%v", allowed, allowBash)
+	}
+
+	explicitEmpty := []string{}
+	allowed, _, _ = NormalizeBuiltInRuntimeToolPolicy("claude", explicitEmpty, nil, true)
+	if allowed == nil || len(allowed) != 0 {
+		t.Fatalf("explicit empty allowlist = %#v, want explicit deny-all", allowed)
+	}
+
+	if got := BuiltInRuntimeEffectiveAllowedTools([]string{"Read", "Write", "Bash"}, []string{"Write"}, false); !slices.Equal(got, []string{"Read"}) {
+		t.Fatalf("effective narrowed tools = %#v, want Read only", got)
+	}
+	if got := BuiltInRuntimeEffectiveAllowedTools(nil, []string{"Write"}, true); got != nil {
+		t.Fatalf("unrestricted effective tools = %#v, want nil sentinel", got)
+	}
+}

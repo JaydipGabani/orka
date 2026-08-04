@@ -243,6 +243,51 @@ func TestContextTokenAgentSpecFailuresRejectsCrossNamespaceProviderRef(t *testin
 	require.Contains(t, strings.Join(failures, "\n"), `agent provider namespace "team-b" does not match token context "team-a"`)
 }
 
+func TestContextTokenAgentSpecFailuresDerivesOpenCodeProviderFromModelName(t *testing.T) {
+	token := &ContextToken{TransactionContext: map[string]any{
+		"allowedProviders": []any{"openai"},
+		"allowedModels":    []any{"openai/gpt-5.4"},
+	}}
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "coder", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   &corev1alpha1.ModelConfig{Name: "openai/gpt-5.4"},
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+
+	failures, err := contextTokenAgentSpecFailures(context.Background(), nil, token, agent)
+	require.NoError(t, err)
+	require.Empty(t, failures)
+}
+
+func TestContextTokenTaskCreateAuthorizationDerivesOpenCodeProviderFromModelName(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "coder", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   &corev1alpha1.ModelConfig{Name: "openai/gpt-5.4"},
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build()
+	authzCtx, err := resolveContextTokenTaskCreateAuthorizationContext(context.Background(), client, CreateTaskRequest{
+		Type:     corev1alpha1.TaskTypeAgent,
+		AgentRef: &corev1alpha1.AgentReference{Name: "coder"},
+	}, "team-a")
+	require.NoError(t, err)
+
+	token := &ContextToken{TransactionContext: map[string]any{
+		"allowedProviders": []any{"openai"},
+		"allowedModels":    []any{"openai/gpt-5.4"},
+	}}
+	failures := contextTokenProviderModelConstraintFailures(
+		token, authzCtx.EffectiveProvider, authzCtx.EffectiveModel, "", false, "",
+	)
+	require.Empty(t, failures)
+}
+
 func TestContextTokenTaskReadFailures(t *testing.T) {
 	cfg := enforceContextTokenAuthorizationConfig()
 
@@ -742,6 +787,52 @@ func TestContextTokenTaskCreateEffectiveRuntimePolicyNormalizesOpenCode(t *testi
 			}
 		})
 	}
+}
+
+func TestContextTokenRuntimeAuthorizationPolicyExpandsGenericNarrowing(t *testing.T) {
+	allowBash := false
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeClaude, DefaultAllowBash: &allowBash,
+	}}}
+
+	gotTools, gotBash := contextTokenAgentRuntimeAuthorizationPolicy(agent)
+	require.Equal(t, []string{"Edit", "Glob", "Grep", "Read", "WebFetch", "WebSearch", "Write"}, gotTools)
+	require.False(t, gotBash)
+
+	gotTools, gotBash = contextTokenTaskCreateEffectiveRuntimePolicy(CreateTaskRequest{
+		AgentRuntime: &corev1alpha1.AgentRuntimeSpec{DisallowedTools: []string{"Write"}},
+	}, &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeClaude,
+	}}})
+	require.Equal(t, []string{"Bash", "Edit", "Glob", "Grep", "Read", "WebFetch", "WebSearch"}, gotTools)
+	require.True(t, gotBash)
+	require.Empty(t, contextTokenTaskToolFailures(&ContextToken{TransactionContext: map[string]any{
+		"allowedTools": []any{"Bash", "Edit", "Glob", "Grep", "Read", "WebFetch", "WebSearch"},
+	}}, contextTokenTaskCreateAuthorizationContext{
+		Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent},
+		Agent: &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			Type: corev1alpha1.AgentRuntimeClaude,
+		}}},
+		RuntimeAllowedTools: gotTools,
+		RuntimeAllowBash:    gotBash,
+	}))
+
+	allowBash = false
+	gotTools, gotBash = contextTokenAgentRuntimeAuthorizationPolicy(&corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
+		Runtime: &corev1alpha1.AgentCLIRuntime{
+			Type: corev1alpha1.AgentRuntimeClaude, DefaultAllowedTools: []string{"Read", "Bash"}, DefaultAllowBash: &allowBash,
+		},
+	}})
+	require.Equal(t, []string{"Read"}, gotTools)
+	require.False(t, gotBash)
+
+	gotTools, gotBash = contextTokenTaskCreateEffectiveRuntimePolicy(CreateTaskRequest{
+		AgentRuntime: &corev1alpha1.AgentRuntimeSpec{DisallowedTools: []string{"Write"}},
+	}, &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeClaude, DefaultAllowedTools: []string{"Read", "Write"},
+	}}})
+	require.Equal(t, []string{"Read"}, gotTools)
+	require.True(t, gotBash)
 }
 
 func TestContextTokenRuntimeToolConstraintsDoesNotDuplicateOpenCodeBash(t *testing.T) {
