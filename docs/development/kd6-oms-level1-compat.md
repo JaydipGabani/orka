@@ -49,6 +49,8 @@ Level 2/3 route is included in the Level 1 allowlist.
 
 - Every request to the facade first passes a dedicated Level 1 inbound
   bearer-token authentication realm; the private Orka token is not accepted.
+- One facade credential is bound at startup to one canonical tenant and agent
+  identity. Caller-supplied identity headers must match that binding exactly.
 - Store, memory, and search routes require safe, non-empty `X-Tenant-ID` and
   `X-Agent-ID` values.
 - The adapter injects a separately configured downstream KD6 bearer token on
