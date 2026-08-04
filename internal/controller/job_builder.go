@@ -334,6 +334,9 @@ func (b *JobBuilder) Build(ctx context.Context, task *corev1alpha1.Task, agent *
 
 // BuildWithOptions creates a Job for the given Task using additional resolved options.
 func (b *JobBuilder) BuildWithOptions(ctx context.Context, task *corev1alpha1.Task, agent *corev1alpha1.Agent, provider *corev1alpha1.Provider, opts JobBuildOptions) (*batchv1.Job, error) {
+	if err := validateContainerPublicationWorkspace(task); err != nil {
+		return nil, err
+	}
 	if err := validateReadOnlyAgentRuntime(task, agent); err != nil {
 		return nil, err
 	}
@@ -392,7 +395,7 @@ func (b *JobBuilder) BuildWithOptions(ctx context.Context, task *corev1alpha1.Ta
 		b.addWorkspaceVolumes(job, task)
 	}
 
-	if effectiveWorkspace(task) != nil && (taskUsesWorkspaceInitContainer(task) || (task.Spec.Type == corev1alpha1.TaskTypeContainer && task.Spec.Image != "")) {
+	if taskNeedsWorkspaceInitContainer(task) {
 		b.addWorkspaceInitContainer(job, task)
 	}
 
@@ -1490,13 +1493,14 @@ func validateReadOnlyAgentRuntime(task *corev1alpha1.Task, agent *corev1alpha1.A
 	if agent.Spec.Runtime.RuntimeRef != nil && strings.TrimSpace(agent.Spec.Runtime.RuntimeRef.Name) != "" {
 		return fmt.Errorf("read-only agent tasks do not support external runtimeRef %q", agent.Spec.Runtime.RuntimeRef.Name)
 	}
-	if agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeCopilot {
+	switch agent.Spec.Runtime.Type {
+	case corev1alpha1.AgentRuntimeCopilot:
 		return fmt.Errorf("read-only agent tasks do not support copilot runtime credentials because GITHUB_TOKEN can mutate GitHub")
-	}
-	if agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
+	case corev1alpha1.AgentRuntimeOpencode:
 		return fmt.Errorf("read-only agent tasks do not support opencode runtime because the OpenCode adapter pre-approves file edits")
+	default:
+		return validateReadOnlyBuiltInAgentRuntime(task, agent.Spec.Runtime.Type)
 	}
-	return nil
 }
 
 func scopedAgentRuntimeSecretCoordinates(task *corev1alpha1.Task, agent *corev1alpha1.Agent) (namespace, name string, err error) {
@@ -2208,9 +2212,9 @@ func (b *JobBuilder) addWorkspaceEnvVars(
 			Name: workerenv.WorkspaceSubpath, Value: ws.SubPath,
 		})
 	}
-	if ws.ForkRepo != "" {
+	if ws.PublicationGitRepo != "" {
 		envVars = append(envVars, corev1.EnvVar{
-			Name: workerenv.ForkRepo, Value: ws.ForkRepo,
+			Name: workerenv.ForkRepo, Value: ws.PublicationGitRepo,
 		})
 	}
 	if ws.PRBaseBranch != "" {
@@ -2267,32 +2271,117 @@ func (b *JobBuilder) addWorkspaceVolumes(job *batchv1.Job, task *corev1alpha1.Ta
 		},
 	)
 
-	// Git secret volume if explicitly referenced
 	ws := effectiveWorkspace(task)
-	if ws != nil && ws.GitSecretRef != nil {
-		job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name: "git-credentials",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: ws.GitSecretRef.Name,
-				},
-			},
-		})
-		if b.directGitCredentialsAllowed(task) && !taskUsesWorkspaceInitContainer(task) {
+	if ws == nil {
+		return
+	}
+	if ws.ReadCredentialRef != nil {
+		job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, workspaceCredentialVolume("git-read-credentials", ws.ReadCredentialRef.Name, ws.ReadCredentialRef.Key))
+	}
+	if ws.PublicationCredentialRef != nil {
+		job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, workspaceCredentialVolume("git-publication-credentials", ws.PublicationCredentialRef.Name, ws.PublicationCredentialRef.Key))
+	}
+	if b.directGitCredentialsAllowed(task) && !taskUsesWorkspaceInitContainer(task) {
+		if volumeName := mainWorkspaceCredentialVolume(task, ws); volumeName != "" {
 			job.Spec.Template.Spec.Containers[0].VolumeMounts = append(
 				job.Spec.Template.Spec.Containers[0].VolumeMounts,
-				corev1.VolumeMount{
-					Name:      "git-credentials",
-					MountPath: "/secrets/git",
-					ReadOnly:  true,
-				},
+				corev1.VolumeMount{Name: volumeName, MountPath: "/secrets/git", ReadOnly: true},
 			)
 		}
 	}
 }
 
+func workspaceCredentialVolume(name, secretName, key string) corev1.Volume {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		key = defaultACPWorkspaceCredentialKey
+	}
+	volume := corev1.Volume{
+		Name:         name,
+		VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName}},
+	}
+	volume.Secret.Items = []corev1.KeyToPath{{Key: key, Path: defaultACPWorkspaceCredentialKey}}
+	return volume
+}
+
+func mainWorkspaceCredentialVolume(task *corev1alpha1.Task, workspace *corev1alpha1.WorkspaceConfig) string {
+	if workspace == nil {
+		return ""
+	}
+	if mainContainerNeedsGitCredentials(task) && workspace.PushBranch != "" {
+		if workspace.PublicationCredentialRef != nil {
+			return "git-publication-credentials"
+		}
+		return ""
+	}
+	if workspace.ReadCredentialRef != nil {
+		return "git-read-credentials"
+	}
+	return ""
+}
+
 func taskNeedsWorkspace(task *corev1alpha1.Task) bool {
 	return task != nil && (task.Spec.Type == corev1alpha1.TaskTypeAgent || effectiveWorkspace(task) != nil)
+}
+
+func validateContainerPublicationWorkspace(task *corev1alpha1.Task) error {
+	if task == nil || task.Spec.Type != corev1alpha1.TaskTypeContainer {
+		return nil
+	}
+	workspace := effectiveWorkspace(task)
+	if workspace == nil {
+		return nil
+	}
+
+	if strings.TrimSpace(workspace.ExpectedRemoteSHA) != "" {
+		return fmt.Errorf("container Tasks do not support workspace.expectedRemoteSHA")
+	}
+	if workspace.CreatePR {
+		return fmt.Errorf("container Tasks do not support workspace.createPR")
+	}
+	if field := unsupportedContainerWorkspacePolicyField(workspace); field != "" {
+		return fmt.Errorf("container Tasks do not support clean-room workspace publication policy field %s", field)
+	}
+	if strings.TrimSpace(workspace.PushBranch) == "" {
+		return nil
+	}
+	if strings.TrimSpace(task.Spec.Image) != "" {
+		return fmt.Errorf("custom-image container Tasks do not support workspace.pushBranch publication")
+	}
+	if workspace.PublicationCredentialRef == nil || strings.TrimSpace(workspace.PublicationCredentialRef.Name) == "" {
+		return fmt.Errorf("container workspace pushBranch requires publicationCredentialRef")
+	}
+	return nil
+}
+
+func unsupportedContainerWorkspacePolicyField(workspace *corev1alpha1.WorkspaceConfig) string {
+	switch {
+	case workspace == nil:
+		return ""
+	case workspace.MaxChangedFiles != nil:
+		return "workspace.maxChangedFiles"
+	case len(workspace.AllowedPaths) > 0:
+		return "workspace.allowedPaths"
+	case workspace.DenyRepositoryControlPaths:
+		return "workspace.denyRepositoryControlPaths"
+	case workspace.RejectBinaryFiles:
+		return "workspace.rejectBinaryFiles"
+	case workspace.RejectSecretLikeContent:
+		return "workspace.rejectSecretLikeContent"
+	default:
+		return ""
+	}
+}
+
+func taskNeedsWorkspaceInitContainer(task *corev1alpha1.Task) bool {
+	workspace := effectiveWorkspace(task)
+	if workspace == nil {
+		return false
+	}
+	if taskUsesWorkspaceInitContainer(task) {
+		return true
+	}
+	return task != nil && task.Spec.Type == corev1alpha1.TaskTypeContainer && (task.Spec.Image != "" || workspace.PushBranch != "")
 }
 
 func taskUsesWorkspaceInitContainer(task *corev1alpha1.Task) bool {
@@ -2336,13 +2425,7 @@ func effectiveWorkspace(task *corev1alpha1.Task) *corev1alpha1.WorkspaceConfig {
 	if task == nil {
 		return nil
 	}
-	if task.Spec.Workspace != nil {
-		return task.Spec.Workspace
-	}
-	if task.Spec.AgentRuntime != nil {
-		return task.Spec.AgentRuntime.Workspace
-	}
-	return nil
+	return task.Spec.Workspace
 }
 
 func (b *JobBuilder) addWorkspaceInitContainer(job *batchv1.Job, task *corev1alpha1.Task) {
@@ -2360,9 +2443,9 @@ func (b *JobBuilder) addWorkspaceInitContainer(job *batchv1.Job, task *corev1alp
 			{Name: "tmp", MountPath: "/tmp"},
 		},
 	}
-	if effectiveWorkspace(task).GitSecretRef != nil {
+	if workspace := effectiveWorkspace(task); workspace != nil && workspace.ReadCredentialRef != nil {
 		initContainer.VolumeMounts = append(initContainer.VolumeMounts, corev1.VolumeMount{
-			Name:      "git-credentials",
+			Name:      "git-read-credentials",
 			MountPath: "/secrets/git",
 			ReadOnly:  true,
 		})

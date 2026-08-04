@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -59,7 +60,7 @@ func TestContextTokenTaskCreateFailures(t *testing.T) {
 			},
 		}
 		authzCtx := testTaskCreateAuthorizationContext()
-		authzCtx.Request.AgentRuntime.Workspace.Branch = ""
+		authzCtx.Request.Workspace.Branch = ""
 
 		failures := contextTokenTaskCreateFailures(token, cfg, authzCtx)
 		require.Empty(t, failures)
@@ -142,6 +143,46 @@ func TestContextTokenTaskCreateFailures(t *testing.T) {
 		failures := contextTokenTaskCreateFailures(token, cfg, authzCtx)
 		require.Contains(t, strings.Join(failures, "\n"), `tool "Bash" is not allowed by token context`)
 	})
+}
+
+func TestContextTokenWorkspaceCredentialFailuresAuthorizeAllRoles(t *testing.T) {
+	firstName := "workspace-a"
+	secondName := "workspace-b"
+	cfg := enforceContextTokenAuthorizationConfig()
+	cfg.SecretCredentialReadScopeList = []string{ContextTokenScopeSecretsCredentialsRead}
+
+	tests := []struct {
+		name string
+		role string
+		set  func(*corev1alpha1.WorkspaceConfig)
+	}{
+		{name: "source read", role: "source-read", set: func(workspace *corev1alpha1.WorkspaceConfig) {
+			workspace.ReadCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: secondName}
+		}},
+		{name: "target read", role: "target-read", set: func(workspace *corev1alpha1.WorkspaceConfig) {
+			workspace.PublicationReadCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: secondName}
+		}},
+		{name: "target write", role: "target-write", set: func(workspace *corev1alpha1.WorkspaceConfig) {
+			workspace.PublicationCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: secondName}
+		}},
+		{name: "forge", role: "forge", set: func(workspace *corev1alpha1.WorkspaceConfig) {
+			workspace.ForgeCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: secondName}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := &corev1alpha1.WorkspaceConfig{}
+			test.set(workspace)
+			token := &ContextToken{
+				Scopes:             []string{ContextTokenScopeTaskCreate},
+				TransactionContext: map[string]any{"secret": firstName},
+			}
+
+			failures := strings.Join(contextTokenWorkspaceCredentialFailures(token, cfg, workspace), "\n")
+			require.Contains(t, failures, `workspace credentials require one of scopes "orka:secrets:credentials:read"`)
+			require.Contains(t, failures, fmt.Sprintf(`workspace %s credential %q does not match token context %q`, test.role, secondName, firstName))
+		})
+	}
 }
 
 func TestAuthorizeContextTokenToolAgentCreateRejectsSpecOutsideTokenConstraints(t *testing.T) {
@@ -550,13 +591,11 @@ func testTaskCreateAuthorizationContext() contextTokenTaskCreateAuthorizationCon
 				Model:    "gpt-4o",
 				Tools:    []string{"search"},
 			},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					GitRepo: "https://github.com/example/repo",
-					Branch:  "main",
-					Ref:     "abc123",
-				},
-				AllowedTools: []string{"Bash"},
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"Bash"}},
+			Workspace: &corev1alpha1.WorkspaceConfig{
+				GitRepo: "https://github.com/example/repo",
+				Branch:  "main",
+				Ref:     "abc123",
 			},
 		},
 		Namespace:           "team-a",

@@ -12,13 +12,11 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
@@ -39,12 +37,12 @@ func (t *ChatCreateAgentTool) Parameters() json.RawMessage {
 		"requests": map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, "additionalProperties": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}},
 		"limits":   map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, "additionalProperties": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}},
 	},
-	}, modelField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaDescriptionField: "Model configuration; model.name is required for OpenCode runtimes", jsonSchemaPropertiesField: map[string]any{
-		"provider": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model provider (e.g. anthropic, openai)"}, nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model name; required endpoint model ID for OpenCode"}, "temperature": map[string]any{jsonSchemaTypeField: "number", jsonSchemaDescriptionField: "Sampling temperature"},
+	}, modelField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaDescriptionField: "Model configuration; model.name is optional for built-in ACP runtimes", jsonSchemaPropertiesField: map[string]any{
+		"provider": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model provider (e.g. anthropic, openai)"}, nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model name"}, "temperature": map[string]any{jsonSchemaTypeField: "number", jsonSchemaDescriptionField: "Sampling temperature"},
 	},
-	}, runtimeField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaPropertiesField: map[string]any{jsonSchemaTypeField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Runtime type: copilot, claude, codex, or opencode"}, "defaultMaxTurns": map[string]any{jsonSchemaTypeField: jsonSchemaTypeInteger, jsonSchemaDescriptionField: "Default max agent loop iterations"},
+	}, runtimeField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaPropertiesField: map[string]any{jsonSchemaTypeField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Runtime type: copilot, claude, or codex"}, "defaultMaxTurns": map[string]any{jsonSchemaTypeField: jsonSchemaTypeInteger, jsonSchemaDescriptionField: "Default max agent loop iterations"},
 		"defaultAllowedTools": map[string]any{jsonSchemaTypeField: jsonSchemaTypeArray, itemsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}, jsonSchemaDescriptionField: "Default CLI tools allowed for tasks using this runtime agent"},
-		"defaultAllowBash":    map[string]any{jsonSchemaTypeField: jsonSchemaTypeBoolean, jsonSchemaDescriptionField: "Whether bash is allowed by default for tasks using this runtime agent"}, secretRefField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Optional secret name containing runtime credentials. Omit to auto-discover the standard secret for this runtime."},
+		"defaultAllowBash":    map[string]any{jsonSchemaTypeField: jsonSchemaTypeBoolean, jsonSchemaDescriptionField: "Whether bash is allowed by default for tasks using this runtime agent"}, secretRefField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Deprecated legacy field. Built-in ACP runtimes are credential-free at the Agent boundary and ignore it."},
 	},
 	}, "initialPrompt": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "When provided, automatically create and start a Task using this agent with this prompt. One tool call = agent + task. Leave empty to only create the agent config without running it."},
 		"coordination": map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaDescriptionField: "Enable multi-agent coordination so this agent can delegate tasks to other agents via delegate_task/wait_for_tasks tools", jsonSchemaPropertiesField: map[string]any{
@@ -98,19 +96,6 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 		case map[string]any:
 			name := chatGetStringArg(m, nameField)
 			provider := chatGetStringArg(m, "provider")
-			if chatRuntimeTypeArg(a) == corev1alpha1.AgentRuntimeOpencode {
-				name = strings.TrimSpace(name)
-				provider = strings.TrimFunc(provider, func(r rune) bool {
-					return r == '/' || unicode.IsSpace(r)
-				})
-				if name != "" && provider != "" {
-					providerPrefix := provider + "/"
-					if !strings.HasPrefix(name, providerPrefix) {
-						name = providerPrefix + strings.TrimPrefix(name, "/")
-					}
-				}
-				provider = ""
-			}
 			agent.Spec.Model = &corev1alpha1.ModelConfig{Name: name, Provider: provider}
 			if temp, ok := m["temperature"]; ok {
 				if tempF, ok := temp.(float64); ok {
@@ -118,10 +103,6 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 				}
 			}
 		case string:
-			if chatRuntimeTypeArg(a) == corev1alpha1.AgentRuntimeOpencode {
-				agent.Spec.Model = &corev1alpha1.ModelConfig{Name: m}
-				break
-			}
 			provider, modelName := splitModelString(m)
 			if provider != "" {
 				agent.Spec.Model = &corev1alpha1.ModelConfig{Provider: provider, Name: modelName}
@@ -158,7 +139,7 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 		agent.Spec.Resources = resources
 	}
 
-	if errResult, ok := parseRuntimeConfig(ctx, tc.Client, namespace, a, agent); !ok {
+	if errResult, ok := parseRuntimeConfig(a, agent); !ok {
 		return errResult, nil
 	}
 	parseCoordinationConfig(a, agent)
@@ -292,16 +273,8 @@ func parseResourceListArg(resourcesMap map[string]any, key string) (corev1.Resou
 	return resourceList, "", true
 }
 
-func chatRuntimeTypeArg(a map[string]any) corev1alpha1.AgentRuntimeType {
-	runtimeArgs, ok := a[runtimeField].(map[string]any)
-	if !ok {
-		return ""
-	}
-	return corev1alpha1.AgentRuntimeType(chatGetStringArg(runtimeArgs, jsonSchemaTypeField))
-}
-
 // parseRuntimeConfig extracts runtime configuration from chat args into the agent spec.
-func parseRuntimeConfig(ctx context.Context, k8sClient client.Reader, namespace string, a map[string]any, agent *corev1alpha1.Agent) (string, bool) {
+func parseRuntimeConfig(a map[string]any, agent *corev1alpha1.Agent) (string, bool) {
 	if coord, ok := a["coordination"].(map[string]any); ok {
 		if enabled, ok := coord[enabledString].(bool); ok && enabled {
 			return "", true
@@ -315,23 +288,25 @@ func parseRuntimeConfig(ctx context.Context, k8sClient client.Reader, namespace 
 	if !ok {
 		return "", true
 	}
-	runtimeType := chatGetStringArg(rtMap, jsonSchemaTypeField)
+	runtimeType := strings.TrimSpace(chatGetStringArg(rtMap, jsonSchemaTypeField))
 	if runtimeType == "" {
-		return "", true
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			"runtime.type is required when runtime is provided",
+			"Use one of the built-in ACP runtimes: copilot, claude, or codex.",
+		)
+		return result, false
 	}
-	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
-		Type: corev1alpha1.AgentRuntimeType(runtimeType),
+	resolvedRuntimeType := corev1alpha1.AgentRuntimeType(runtimeType)
+	if !isBuiltInACPRuntime(resolvedRuntimeType) {
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			fmt.Sprintf("unsupported runtime type %q", runtimeType),
+			"Use one of the built-in ACP runtimes: copilot, claude, or codex.",
+		)
+		return result, false
 	}
-	if agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
-		if agent.Spec.Model == nil || strings.TrimSpace(agent.Spec.Model.Name) == "" {
-			result, _ := ChatToolErrorResult(
-				"invalid_arguments",
-				"model.name is required for opencode runtime",
-				"Set model.name to the endpoint-specific OpenCode model ID.",
-			)
-			return result, false
-		}
-	}
+	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{Type: resolvedRuntimeType}
 	if agent.Spec.Model != nil {
 		agent.Spec.Model.Provider = ""
 	}
@@ -345,22 +320,9 @@ func parseRuntimeConfig(ctx context.Context, k8sClient client.Reader, namespace 
 	if allowBash, ok := rtMap["defaultAllowBash"].(bool); ok {
 		agent.Spec.Runtime.DefaultAllowBash = &allowBash
 	}
-	secretRef, err := resolveRuntimeSecretRef(ctx, k8sClient, namespace, agent.Spec.Runtime.Type, chatGetRuntimeSecretRefArg(a))
-	if err != nil {
-		result, _ := ChatToolErrorResult("invalid_arguments", err.Error(), "Create one of the supported runtime credential secrets or choose an AI agent without runtime")
-		return result, false
-	}
-	agent.Spec.SecretRef = secretRef
+	agent.Spec.SecretRef = nil
 	agent.Spec.ProviderRef = nil
 	return "", true
-}
-
-func chatGetRuntimeSecretRefArg(a map[string]any) string {
-	rt, ok := a[runtimeField].(map[string]any)
-	if !ok {
-		return ""
-	}
-	return chatGetStringArg(rt, secretRefField)
 }
 
 // parseCoordinationConfig extracts coordination configuration from chat args into the agent spec.

@@ -690,7 +690,7 @@ func effectiveRepositoryMonitorBranch(monitor *corev1alpha1.RepositoryMonitor) s
 	if monitor.Spec.Branch != "" {
 		return monitor.Spec.Branch
 	}
-	return "main"
+	return defaultACPSourceBranch
 }
 
 func (r *RepositoryMonitorReconciler) enqueueScheduledRunIfDue(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, schedule cron.Schedule) (*store.MonitorRun, time.Duration, error) {

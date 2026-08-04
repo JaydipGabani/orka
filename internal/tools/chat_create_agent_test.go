@@ -14,11 +14,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
-	"github.com/orka-agents/orka/internal/workerenv"
 )
 
 const testProviderOpenAI = "openai"
@@ -62,219 +60,26 @@ func TestChatCreateAgentTool_Execute_OmittedProviderRefLeavesNil(t *testing.T) {
 		t.Fatalf("model.provider = %q, want openai when no providerRef is set", created.Spec.Model.Provider)
 	}
 }
-
-func TestChatCreateAgentTool_Execute_PreservesSlashQualifiedOpencodeModel(t *testing.T) {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "opencode-credentials", Namespace: defaultNamespace},
-		Data: map[string][]byte{
-			workerenv.OpenAIBaseURL: []byte("https://models.example.invalid/v1"),
-			workerenv.OpenAIAPIKey:  []byte("credential"),
-		},
-	}
-	fc := newFakeClient(secret)
-	ctx := WithToolContext(context.Background(), &ToolContext{
-		Client:    fc,
-		Namespace: defaultNamespace,
-	})
-
-	tool := &ChatCreateAgentTool{}
-	result, err := tool.Execute(ctx, json.RawMessage(`{
-		"name":"opencode-slash-model",
-		"model":"moonshotai/Kimi-K2-Instruct-0905",
-		"runtime":{"type":"opencode"}
-	}`))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	var response ChatToolResult
-	if err := json.Unmarshal([]byte(result), &response); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
-	if !response.Success {
-		t.Fatalf("expected success, got error: %s", response.Error)
-	}
-
-	var created corev1alpha1.Agent
-	if err := fc.Get(context.Background(), client.ObjectKey{Name: "opencode-slash-model", Namespace: defaultNamespace}, &created); err != nil {
-		t.Fatalf("failed to get created agent: %v", err)
-	}
-	if created.Spec.Model == nil || created.Spec.Model.Name != "moonshotai/Kimi-K2-Instruct-0905" || created.Spec.Model.Provider != "" {
-		t.Fatalf("model = %#v, want exact slash-qualified OpenCode model", created.Spec.Model)
-	}
-}
-
-func TestChatCreateAgentTool_Execute_PreservesObjectOpencodeModel(t *testing.T) {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "opencode-credentials", Namespace: defaultNamespace},
-		Data: map[string][]byte{
-			workerenv.OpenAIBaseURL: []byte("https://models.example.invalid/v1"),
-			workerenv.OpenAIAPIKey:  []byte("credential"),
-		},
-	}
-	fc := newFakeClient(secret)
+func TestChatCreateAgentTool_Execute_RejectsUnsupportedRuntime(t *testing.T) {
+	fc := newFakeClient()
 	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
-
-	tool := &ChatCreateAgentTool{}
-	result, err := tool.Execute(ctx, json.RawMessage(`{
-		"name":"opencode-object-model",
-		"model":{"provider":"google","name":"google/gemma-3n-e4b"},
-		"runtime":{"type":"opencode"}
+	result, err := (&ChatCreateAgentTool{}).Execute(ctx, json.RawMessage(`{
+		"name": "legacy-runtime-agent",
+		"runtime": {"type": "opencode", "secretRef": "legacy-runtime"}
 	}`))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 	var response ChatToolResult
 	if err := json.Unmarshal([]byte(result), &response); err != nil {
 		t.Fatalf("failed to parse result: %v", err)
 	}
-	if !response.Success {
-		t.Fatalf("expected success, got error: %s", response.Error)
+	if response.Success || response.ErrorType != errTypeInvalidArgs || !strings.Contains(response.Error, "unsupported runtime type") {
+		t.Fatalf("response = %#v, want unsupported runtime rejection", response)
 	}
-
 	var created corev1alpha1.Agent
-	if err := fc.Get(context.Background(), client.ObjectKey{Name: "opencode-object-model", Namespace: defaultNamespace}, &created); err != nil {
-		t.Fatalf("failed to get created agent: %v", err)
-	}
-	if created.Spec.Model == nil || created.Spec.Model.Name != "google/gemma-3n-e4b" || created.Spec.Model.Provider != "" {
-		t.Fatalf("model = %#v, want reconstructed slash-qualified OpenCode model", created.Spec.Model)
-	}
-}
-
-func TestChatCreateAgentTool_Execute_NormalizesObjectOpencodeModel(t *testing.T) {
-	tests := []struct {
-		name      string
-		agentName string
-		provider  string
-		modelName string
-		wantName  string
-	}{
-		{
-			name:      "padded name and provider",
-			agentName: "opencode-padded-model",
-			provider:  " / /google/ / ",
-			modelName: " gemma-3n-e4b ",
-			wantName:  "google/gemma-3n-e4b",
-		},
-		{
-			name:      "whitespace provider",
-			agentName: "opencode-whitespace-provider",
-			provider:  " \t\n ",
-			modelName: " gemma-3n-e4b ",
-			wantName:  "gemma-3n-e4b",
-		},
-		{
-			name:      "slash-only provider",
-			agentName: "opencode-slash-only-provider",
-			provider:  " / / / ",
-			modelName: "gemma-3n-e4b",
-			wantName:  "gemma-3n-e4b",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			secret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "opencode-credentials", Namespace: defaultNamespace},
-				Data: map[string][]byte{
-					workerenv.OpenAIBaseURL: []byte("https://models.example.invalid/v1"),
-					workerenv.OpenAIAPIKey:  []byte("credential"),
-				},
-			}
-			fc := newFakeClient(secret)
-			ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
-			args, err := json.Marshal(map[string]any{
-				nameField: tt.agentName,
-				modelField: map[string]any{
-					"provider": tt.provider,
-					nameField:  tt.modelName,
-				},
-				runtimeField: map[string]any{jsonSchemaTypeField: string(corev1alpha1.AgentRuntimeOpencode)},
-			})
-			if err != nil {
-				t.Fatalf("marshal args: %v", err)
-			}
-
-			result, err := (&ChatCreateAgentTool{}).Execute(ctx, args)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			var response ChatToolResult
-			if err := json.Unmarshal([]byte(result), &response); err != nil {
-				t.Fatalf("failed to parse result: %v", err)
-			}
-			if !response.Success {
-				t.Fatalf("expected success, got error: %s", response.Error)
-			}
-
-			var created corev1alpha1.Agent
-			if err := fc.Get(context.Background(), client.ObjectKey{Name: tt.agentName, Namespace: defaultNamespace}, &created); err != nil {
-				t.Fatalf("failed to get created agent: %v", err)
-			}
-			if created.Spec.Model == nil || created.Spec.Model.Name != tt.wantName || created.Spec.Model.Provider != "" {
-				t.Fatalf("model = %#v, want OpenCode model name %q without provider field", created.Spec.Model, tt.wantName)
-			}
-		})
-	}
-}
-
-func TestChatCreateAgentTool_Execute_RejectsBlankObjectOpencodeModelNames(t *testing.T) {
-	tests := []struct {
-		name      string
-		agentName string
-		modelName string
-	}{
-		{name: "empty", agentName: "opencode-empty-model", modelName: ""},
-		{name: "whitespace", agentName: "opencode-whitespace-model", modelName: " \t\n"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			secret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "opencode-credentials", Namespace: defaultNamespace},
-				Data: map[string][]byte{
-					workerenv.OpenAIBaseURL: []byte("https://models.example.invalid/v1"),
-					workerenv.OpenAIAPIKey:  []byte("credential"),
-				},
-			}
-			fc := newFakeClient(secret)
-			ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
-			args, err := json.Marshal(map[string]any{
-				nameField: tt.agentName,
-				modelField: map[string]any{
-					"provider": testProviderOpenAI,
-					nameField:  tt.modelName,
-				},
-				runtimeField: map[string]any{jsonSchemaTypeField: string(corev1alpha1.AgentRuntimeOpencode)},
-			})
-			if err != nil {
-				t.Fatalf("marshal args: %v", err)
-			}
-
-			result, err := (&ChatCreateAgentTool{}).Execute(ctx, args)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			var response ChatToolResult
-			if err := json.Unmarshal([]byte(result), &response); err != nil {
-				t.Fatalf("failed to parse result: %v", err)
-			}
-			if response.Success {
-				t.Fatalf("expected blank OpenCode model name to be rejected, got success: %#v", response)
-			}
-			if response.ErrorType != errTypeInvalidArgs || !strings.Contains(response.Error, "model.name is required for opencode") {
-				t.Fatalf("error result = %#v, want invalid_arguments for blank model.name", response)
-			}
-
-			var created corev1alpha1.Agent
-			err = fc.Get(context.Background(), client.ObjectKey{Name: tt.agentName, Namespace: defaultNamespace}, &created)
-			if !apierrors.IsNotFound(err) {
-				t.Fatalf("agent should not be created for blank model.name, get err=%v", err)
-			}
-		})
+	if err := fc.Get(context.Background(), client.ObjectKey{Name: "legacy-runtime-agent", Namespace: defaultNamespace}, &created); !apierrors.IsNotFound(err) {
+		t.Fatalf("unsupported runtime Agent should not be created, get err=%v", err)
 	}
 }
 
@@ -347,204 +152,65 @@ func TestChatCreateAgentTool_Execute_AuthorizesAgentBeforeCreate(t *testing.T) {
 		t.Fatalf("agent should not have been created, get err=%v", err)
 	}
 }
-
-func TestParseRuntimeConfig_ResolvesExplicitSecretRef(t *testing.T) {
-	fc := newFakeClient(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      claudeCredentialsSecretName,
-			Namespace: defaultNamespace,
-		},
+func TestParseRuntimeConfig_BuiltInRuntimesAreCredentialFree(t *testing.T) {
+	for _, runtimeType := range []corev1alpha1.AgentRuntimeType{
+		corev1alpha1.AgentRuntimeCopilot,
+		corev1alpha1.AgentRuntimeClaude,
+		corev1alpha1.AgentRuntimeCodex,
+	} {
+		t.Run(string(runtimeType), func(t *testing.T) {
+			agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
+				ProviderRef: &corev1alpha1.ProviderReference{Name: testProviderOpenAI},
+				SecretRef:   &corev1.LocalObjectReference{Name: "legacy-runtime"},
+			}}
+			args := map[string]any{runtimeField: map[string]any{
+				jsonSchemaTypeField: string(runtimeType),
+				secretRefField:      "missing-legacy-runtime",
+			}}
+			if errResult, ok := parseRuntimeConfig(args, agent); !ok {
+				t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
+			}
+			if agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != runtimeType {
+				t.Fatalf("runtime = %#v, want %q", agent.Spec.Runtime, runtimeType)
+			}
+			if agent.Spec.ProviderRef != nil || agent.Spec.SecretRef != nil {
+				t.Fatalf("providerRef=%#v secretRef=%#v, want credential-free runtime", agent.Spec.ProviderRef, agent.Spec.SecretRef)
+			}
+		})
+	}
+	t.Run("normalizes runtime type", func(t *testing.T) {
+		agent := &corev1alpha1.Agent{}
+		args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: "  claude  "}}
+		if errResult, ok := parseRuntimeConfig(args, agent); !ok {
+			t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
+		}
+		if agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeClaude {
+			t.Fatalf("runtime = %#v, want normalized claude", agent.Spec.Runtime)
+		}
 	})
-	agent := &corev1alpha1.Agent{
-		Spec: corev1alpha1.AgentSpec{
-			ProviderRef: &corev1alpha1.ProviderReference{Name: testProviderOpenAI},
-		},
-	}
-
-	args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: runtimeTypeClaude, secretRefField: claudeCredentialsSecretName}}
-
-	if errResult, ok := parseRuntimeConfig(context.Background(), fc, defaultNamespace, args, agent); !ok {
-		t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
-	}
-
-	if agent.Spec.Runtime == nil {
-		t.Fatal("agent.Spec.Runtime is nil")
-	}
-	if agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeType(runtimeTypeClaude) {
-		t.Errorf("runtime.type = %q, want %q", agent.Spec.Runtime.Type, runtimeTypeClaude)
-	}
-	if agent.Spec.SecretRef == nil {
-		t.Fatal("agent.Spec.SecretRef is nil")
-	}
-	if agent.Spec.SecretRef.Name != claudeCredentialsSecretName {
-		t.Errorf("secretRef.name = %q, want %q", agent.Spec.SecretRef.Name, claudeCredentialsSecretName)
-	}
-	if agent.Spec.ProviderRef != nil {
-		t.Errorf("providerRef = %v, want nil", agent.Spec.ProviderRef)
-	}
 }
 
-func TestParseRuntimeConfig_ResolvesOpencodeSecretRef(t *testing.T) {
-	fc := newFakeClient(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      testRuntimeCredsSecretName,
-			Namespace: defaultNamespace,
-		},
-		Data: map[string][]byte{
-			workerenv.OpenAIBaseURL: []byte("https://models.example.invalid/v1"),
-			workerenv.OpenAIAPIKey:  []byte("credential"),
-		},
-	})
-	agent := &corev1alpha1.Agent{
-		Spec: corev1alpha1.AgentSpec{
-			ProviderRef: &corev1alpha1.ProviderReference{Name: testProviderOpenAI},
-			Model:       &corev1alpha1.ModelConfig{Name: "kimi-k2", Provider: testProviderOpenAI},
-		},
-	}
-
-	runtimeArgs := map[string]any{jsonSchemaTypeField: string(corev1alpha1.AgentRuntimeOpencode)}
-	runtimeArgs[secretRefField] = testRuntimeCredsSecretName
-	args := map[string]any{runtimeField: runtimeArgs}
-
-	if errResult, ok := parseRuntimeConfig(context.Background(), fc, defaultNamespace, args, agent); !ok {
-		t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
-	}
-	if agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
-		t.Fatalf("runtime = %#v, want opencode", agent.Spec.Runtime)
-	}
-	if agent.Spec.SecretRef == nil || agent.Spec.SecretRef.Name != testRuntimeCredsSecretName {
-		t.Fatalf("secretRef = %#v, want %q", agent.Spec.SecretRef, testRuntimeCredsSecretName)
-	}
-	if agent.Spec.ProviderRef != nil {
-		t.Fatalf("providerRef = %#v, want nil", agent.Spec.ProviderRef)
-	}
-	if agent.Spec.Model == nil || agent.Spec.Model.Name != "kimi-k2" || agent.Spec.Model.Provider != "" {
-		t.Fatalf("model = %#v, want runtime model name without provider field", agent.Spec.Model)
-	}
-}
-
-func TestParseRuntimeConfig_AutoDiscoversOpencodeEndpointSecret(t *testing.T) {
-	fc := newFakeClient(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "opencode-api-key", Namespace: defaultNamespace},
-		Data: map[string][]byte{
-			workerenv.OpenAIBaseURL: []byte("https://models.example.invalid/v1"),
-		},
-	})
-	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Model: &corev1alpha1.ModelConfig{Name: "kimi-k2"}}}
-	args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: string(corev1alpha1.AgentRuntimeOpencode)}}
-
-	if errResult, ok := parseRuntimeConfig(context.Background(), fc, defaultNamespace, args, agent); !ok {
-		t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
-	}
-	if agent.Spec.SecretRef == nil || agent.Spec.SecretRef.Name != "opencode-api-key" {
-		t.Fatalf("secretRef = %#v, want complete OpenCode secret", agent.Spec.SecretRef)
-	}
-}
-
-func TestParseRuntimeConfig_RejectsIncompleteOpencodeSecret(t *testing.T) {
-	fc := newFakeClient(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "opencode-api-key", Namespace: defaultNamespace},
-		Data: map[string][]byte{
-			workerenv.OpenAIAPIKey: []byte("credential"),
-		},
-	})
-	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Model: &corev1alpha1.ModelConfig{Name: "kimi-k2"}}}
-	args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: string(corev1alpha1.AgentRuntimeOpencode)}}
-
-	errResult, ok := parseRuntimeConfig(context.Background(), fc, defaultNamespace, args, agent)
-	if ok {
-		t.Fatal("parseRuntimeConfig accepted incomplete OpenCode credentials")
-	}
-	if !strings.Contains(errResult, workerenv.OpenAIBaseURL) {
-		t.Fatalf("error = %q, want missing %s", errResult, workerenv.OpenAIBaseURL)
-	}
-}
-
-func TestParseRuntimeConfig_RejectsOpencodeWithoutModel(t *testing.T) {
-	agent := &corev1alpha1.Agent{}
-	runtimeArgs := map[string]any{jsonSchemaTypeField: string(corev1alpha1.AgentRuntimeOpencode)}
-	args := map[string]any{runtimeField: runtimeArgs}
-
-	errResult, ok := parseRuntimeConfig(context.Background(), newFakeClient(), defaultNamespace, args, agent)
-	if ok {
-		t.Fatal("parseRuntimeConfig() accepted OpenCode without model.name")
-	}
-	var result ChatToolResult
-	if err := json.Unmarshal([]byte(errResult), &result); err != nil {
-		t.Fatalf("unmarshal error result: %v", err)
-	}
-	if result.ErrorType != "invalid_arguments" || !strings.Contains(result.Error, "model.name is required for opencode") {
-		t.Fatalf("error result = %#v, want invalid_arguments for missing model", result)
-	}
-}
-
-func TestParseRuntimeConfig_AutoDiscoversSecretRef(t *testing.T) {
-	fc := newFakeClient(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      claudeAPIKeySecretName,
-			Namespace: defaultNamespace,
-		},
-	})
-	agent := &corev1alpha1.Agent{
-		Spec: corev1alpha1.AgentSpec{
-			ProviderRef: &corev1alpha1.ProviderReference{Name: testProviderOpenAI},
-		},
-	}
-
-	args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: runtimeTypeClaude}}
-
-	if errResult, ok := parseRuntimeConfig(context.Background(), fc, defaultNamespace, args, agent); !ok {
-		t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
-	}
-
-	if agent.Spec.SecretRef == nil {
-		t.Fatal("agent.Spec.SecretRef is nil")
-	}
-	if agent.Spec.SecretRef.Name != claudeAPIKeySecretName {
-		t.Errorf("secretRef.name = %q, want %q", agent.Spec.SecretRef.Name, claudeAPIKeySecretName)
-	}
-}
-
-func TestParseRuntimeConfig_AutoDiscoversCodexSecretRef(t *testing.T) {
-	fc := newFakeClient(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      codexRuntimeCopilotSecretName,
-			Namespace: defaultNamespace,
-		},
-	})
-	agent := &corev1alpha1.Agent{
-		Spec: corev1alpha1.AgentSpec{
-			ProviderRef: &corev1alpha1.ProviderReference{Name: testProviderOpenAI},
-		},
-	}
-
-	args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: "codex"}}
-
-	if errResult, ok := parseRuntimeConfig(context.Background(), fc, defaultNamespace, args, agent); !ok {
-		t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
-	}
-
-	if agent.Spec.Runtime == nil {
-		t.Fatal("agent.Spec.Runtime is nil")
-	}
-	if agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeType("codex") {
-		t.Errorf("runtime.type = %q, want %q", agent.Spec.Runtime.Type, "codex")
-	}
-	if agent.Spec.SecretRef == nil {
-		t.Fatal("agent.Spec.SecretRef is nil")
-	}
-	if agent.Spec.SecretRef.Name != codexRuntimeCopilotSecretName {
-		t.Errorf("secretRef.name = %q, want %q", agent.Spec.SecretRef.Name, codexRuntimeCopilotSecretName)
+func TestParseRuntimeConfig_RejectsUnsupportedRuntime(t *testing.T) {
+	for _, runtimeType := range []string{"opencode", "", "   "} {
+		t.Run(runtimeType, func(t *testing.T) {
+			agent := &corev1alpha1.Agent{}
+			args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: runtimeType}}
+			errResult, ok := parseRuntimeConfig(args, agent)
+			if ok {
+				t.Fatal("parseRuntimeConfig accepted invalid runtime")
+			}
+			var response ChatToolResult
+			if err := json.Unmarshal([]byte(errResult), &response); err != nil {
+				t.Fatalf("unmarshal error result: %v", err)
+			}
+			if response.ErrorType != errTypeInvalidArgs || (!strings.Contains(response.Error, "unsupported runtime type") && !strings.Contains(response.Error, "runtime.type is required")) {
+				t.Fatalf("response = %#v, want invalid runtime rejection", response)
+			}
+		})
 	}
 }
 
 func TestParseRuntimeConfig_AppliesRuntimeDefaults(t *testing.T) {
-	fc := newFakeClient(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      claudeAPIKeySecretName,
-			Namespace: defaultNamespace,
-		},
-	})
 	agent := &corev1alpha1.Agent{
 		Spec: corev1alpha1.AgentSpec{
 			ProviderRef: &corev1alpha1.ProviderReference{Name: testProviderOpenAI},
@@ -557,7 +223,7 @@ func TestParseRuntimeConfig_AppliesRuntimeDefaults(t *testing.T) {
 	},
 	}
 
-	if errResult, ok := parseRuntimeConfig(context.Background(), fc, defaultNamespace, args, agent); !ok {
+	if errResult, ok := parseRuntimeConfig(args, agent); !ok {
 		t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
 	}
 
@@ -574,52 +240,6 @@ func TestParseRuntimeConfig_AppliesRuntimeDefaults(t *testing.T) {
 		t.Fatalf("defaultAllowBash = %v, want false", agent.Spec.Runtime.DefaultAllowBash)
 	}
 }
-
-func TestParseRuntimeConfig_AcceptsCustomSecretRef(t *testing.T) {
-	fc := newFakeClient(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      testRuntimeCredsSecretName,
-			Namespace: defaultNamespace,
-		},
-	})
-	agent := &corev1alpha1.Agent{
-		Spec: corev1alpha1.AgentSpec{
-			ProviderRef: &corev1alpha1.ProviderReference{Name: testProviderOpenAI},
-		},
-	}
-
-	args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: runtimeTypeClaude, secretRefField: testRuntimeCredsSecretName}}
-
-	if errResult, ok := parseRuntimeConfig(context.Background(), fc, defaultNamespace, args, agent); !ok {
-		t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
-	}
-	if agent.Spec.SecretRef == nil {
-		t.Fatal("agent.Spec.SecretRef is nil")
-	}
-	if agent.Spec.SecretRef.Name != testRuntimeCredsSecretName {
-		t.Errorf("secretRef.name = %q, want %q", agent.Spec.SecretRef.Name, testRuntimeCredsSecretName)
-	}
-}
-
-func TestParseRuntimeConfig_RejectsMissingSecretRef(t *testing.T) {
-	fc := newFakeClient()
-	agent := &corev1alpha1.Agent{
-		Spec: corev1alpha1.AgentSpec{
-			ProviderRef: &corev1alpha1.ProviderReference{Name: testProviderOpenAI},
-		},
-	}
-
-	args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: runtimeTypeClaude, secretRefField: testRuntimeCredsSecretName}}
-
-	errResult, ok := parseRuntimeConfig(context.Background(), fc, defaultNamespace, args, agent)
-	if ok {
-		t.Fatal("expected parseRuntimeConfig to fail")
-	}
-	if !strings.Contains(errResult, notFoundMessage) {
-		t.Fatalf("error = %q, want it to mention not found", errResult)
-	}
-}
-
 func TestParseCoordinationConfig_EnabledClearsRuntimeAndSecretRef(t *testing.T) {
 	agent := &corev1alpha1.Agent{
 		Spec: corev1alpha1.AgentSpec{

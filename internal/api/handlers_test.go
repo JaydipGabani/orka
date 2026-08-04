@@ -510,16 +510,14 @@ func TestHandlers_CreateTask_ContextTokenAuthorizationEnforceAllowsMatchingToken
 		},
 	})
 	body := CreateTaskRequest{
-		Name:      "authorized-context-token-task",
-		Namespace: "default",
-		Type:      corev1alpha1.TaskTypeAgent,
-		AgentRef:  &corev1alpha1.AgentReference{Name: "reviewer"},
-		AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-			Workspace: &corev1alpha1.WorkspaceConfig{
-				GitRepo: "https://github.com/orka-agents/orka.git",
-				Branch:  "feature-branch",
-			},
-			AllowedTools: []string{"file_read"},
+		Name:         "authorized-context-token-task",
+		Namespace:    "default",
+		Type:         corev1alpha1.TaskTypeAgent,
+		AgentRef:     &corev1alpha1.AgentReference{Name: "reviewer"},
+		AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"file_read"}},
+		Workspace: &corev1alpha1.WorkspaceConfig{
+			GitRepo: "https://github.com/orka-agents/orka.git",
+			Branch:  "feature-branch",
 		},
 	}
 	bodyBytes, _ := json.Marshal(body)
@@ -1085,10 +1083,8 @@ func TestHandlers_GetTask_ContextTokenAuthorizationEnforcesLoadedTaskRepoContext
 		Spec: corev1alpha1.TaskSpec{
 			Type:     corev1alpha1.TaskTypeAgent,
 			AgentRef: &corev1alpha1.AgentReference{Name: "reviewer"},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					GitRepo: "https://github.com/acme/allowed.git",
-				},
+			Workspace: &corev1alpha1.WorkspaceConfig{
+				GitRepo: "https://github.com/acme/allowed.git",
 			},
 		},
 	}
@@ -1116,10 +1112,8 @@ func TestHandlers_ListTasks_ContextTokenAuthorizationFiltersLoadedTaskContext(t 
 		Spec: corev1alpha1.TaskSpec{
 			Type:     corev1alpha1.TaskTypeAgent,
 			AgentRef: &corev1alpha1.AgentReference{Name: "reviewer"},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					GitRepo: "https://github.com/acme/allowed.git",
-				},
+			Workspace: &corev1alpha1.WorkspaceConfig{
+				GitRepo: "https://github.com/acme/allowed.git",
 			},
 		},
 	}
@@ -1128,10 +1122,8 @@ func TestHandlers_ListTasks_ContextTokenAuthorizationFiltersLoadedTaskContext(t 
 		Spec: corev1alpha1.TaskSpec{
 			Type:     corev1alpha1.TaskTypeAgent,
 			AgentRef: &corev1alpha1.AgentReference{Name: "reviewer"},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					GitRepo: "https://github.com/acme/other.git",
-				},
+			Workspace: &corev1alpha1.WorkspaceConfig{
+				GitRepo: "https://github.com/acme/other.git",
 			},
 		},
 	}
@@ -1168,10 +1160,8 @@ func TestHandlers_GetTaskChildren_ContextTokenAuthorizationFiltersLoadedTaskCont
 		Spec: corev1alpha1.TaskSpec{
 			Type:     corev1alpha1.TaskTypeAgent,
 			AgentRef: &corev1alpha1.AgentReference{Name: "reviewer"},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					GitRepo: "https://github.com/acme/allowed.git",
-				},
+			Workspace: &corev1alpha1.WorkspaceConfig{
+				GitRepo: "https://github.com/acme/allowed.git",
 			},
 		},
 	}
@@ -1186,10 +1176,8 @@ func TestHandlers_GetTaskChildren_ContextTokenAuthorizationFiltersLoadedTaskCont
 		Spec: corev1alpha1.TaskSpec{
 			Type:     corev1alpha1.TaskTypeAgent,
 			AgentRef: &corev1alpha1.AgentReference{Name: "reviewer"},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					GitRepo: "https://github.com/acme/allowed.git",
-				},
+			Workspace: &corev1alpha1.WorkspaceConfig{
+				GitRepo: "https://github.com/acme/allowed.git",
 			},
 		},
 	}
@@ -1204,10 +1192,8 @@ func TestHandlers_GetTaskChildren_ContextTokenAuthorizationFiltersLoadedTaskCont
 		Spec: corev1alpha1.TaskSpec{
 			Type:     corev1alpha1.TaskTypeAgent,
 			AgentRef: &corev1alpha1.AgentReference{Name: "reviewer"},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					GitRepo: "https://github.com/acme/other.git",
-				},
+			Workspace: &corev1alpha1.WorkspaceConfig{
+				GitRepo: "https://github.com/acme/other.git",
 			},
 		},
 	}
@@ -1246,10 +1232,8 @@ func TestHandlers_DeleteTask_ContextTokenAuthorizationEnforcesLoadedTaskRepoCont
 		Spec: corev1alpha1.TaskSpec{
 			Type:     corev1alpha1.TaskTypeAgent,
 			AgentRef: &corev1alpha1.AgentReference{Name: "reviewer"},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					GitRepo: "https://github.com/acme/allowed.git",
-				},
+			Workspace: &corev1alpha1.WorkspaceConfig{
+				GitRepo: "https://github.com/acme/allowed.git",
 			},
 		},
 	}

@@ -97,8 +97,16 @@ func (r *AgentReconciler) validateAgent(ctx context.Context, agent *corev1alpha1
 		if agent.Spec.ProviderRef == nil && (agent.Spec.Model == nil || agent.Spec.Model.Provider == "") {
 			return fmt.Errorf("either providerRef or model.provider must be specified")
 		}
-	} else if err := validateAgentRuntimeReasoningEffort(agent.Spec.Runtime); err != nil {
-		return err
+	} else {
+		if err := validateACPAgentModelControls(agent.Spec.Runtime, agent.Spec.Model); err != nil {
+			return err
+		}
+		if err := validateAgentRuntimeReasoningEffort(agent.Spec.Runtime); err != nil {
+			return err
+		}
+		if err := validateBuiltInACPAgentCredentialSecretRef(agent); err != nil {
+			return err
+		}
 	}
 
 	if err := r.validateProviderRef(ctx, agent); err != nil {
@@ -117,6 +125,23 @@ func (r *AgentReconciler) validateAgent(ctx context.Context, agent *corev1alpha1
 		return err
 	}
 	return r.validateCoordination(ctx, agent)
+}
+
+func isBuiltInACPProviderRuntime(runtimeType corev1alpha1.AgentRuntimeType) bool {
+	switch runtimeType {
+	case corev1alpha1.AgentRuntimeCodex, corev1alpha1.AgentRuntimeClaude, corev1alpha1.AgentRuntimeCopilot:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateBuiltInACPAgentCredentialSecretRef(agent *corev1alpha1.Agent) error {
+	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.SecretRef == nil ||
+		!isBuiltInACPProviderRuntime(agent.Spec.Runtime.Type) {
+		return nil
+	}
+	return fmt.Errorf("built-in ACP runtime %q does not support agent secretRef; provider credentials are controller-managed", agent.Spec.Runtime.Type)
 }
 
 func validateAgentRuntimeReasoningEffort(runtimeCfg *corev1alpha1.AgentCLIRuntime) error {

@@ -214,7 +214,7 @@ func buildTaskTypesSection(mode PromptMode) string {
 func buildValidationSection() string {
 	return `<validation>
 When validating code changes, determine the validation environment from repository evidence rather than demo- or scenario-specific defaults.
-Every validation or discovery container task that inspects repository files MUST include a workspace with workspace.gitRepo, workspace.gitSecretRef when credentials are needed, and the exact branch/ref under test. Prefer workspace.ref = the implementation headSHA; otherwise use workspace.branch = the pushed branch. Do not validate repo changes from an empty container filesystem.
+Every validation or discovery container task that inspects repository files MUST include a workspace with workspace.gitRepo, workspace.readCredentialRef when clone credentials are needed, and the exact branch/ref under test. Prefer workspace.ref = the implementation headSHA; otherwise use workspace.branch = the pushed branch. Do not validate repo changes from an empty container filesystem.
 Before running full validation, inspect the workspace or run a read-only discovery container task with that workspace when needed. Prefer evidence in this order: CI workflow files, language/toolchain files (go.mod, package.json, pyproject.toml, Cargo.toml, etc.), Dockerfile/devcontainer files, Makefile targets, and project documentation.
 For Go repositories, read go.mod and prefer a toolchain directive when present; otherwise use the go directive. Choose a matching golang:<major.minor> image. With golang:<major.minor>, commands MUST export:
   export PATH=/usr/local/go/bin:$PATH

@@ -25,7 +25,7 @@ upstream revision, and Orka modification notes.
 
 ## GitHub Copilot CLI
 
-Orka embeds the GitHub Copilot CLI in the `agent-harness-wrapper` binary using `github.com/github/copilot-sdk/go/cmd/bundler`. The embedded CLI version is resolved at build time by the bundler based on the `github.com/github/copilot-sdk/go` version in `go.mod`.
+The digest-pinned Copilot ACP runtime image redistributes the unmodified official GitHub Copilot CLI executable as one component of Orka's fenced RuntimePool service. The image includes this license at `/usr/share/licenses/github-copilot-cli/LICENSE.md`; the controller and Publisher images do not include Copilot CLI.
 
 GitHub Copilot CLI License
 
@@ -65,7 +65,7 @@ GitHub Copilot CLI License
 
 ## GitHub Copilot SDK for Go
 
-Orka uses `github.com/github/copilot-sdk/go` to integrate with GitHub Copilot CLI.
+The source dependency graph includes `github.com/github/copilot-sdk/go` for compatibility and integration work. The supported built-in ACP runtime profiles are Codex, Claude, and Copilot.
 
 MIT License
 
@@ -91,13 +91,13 @@ SOFTWARE.
 
 ## Anthropic Claude Code
 
-Orka installs `@anthropic-ai/claude-code` and the corresponding Linux platform package in the agent harness image.
+The digest-pinned Claude ACP runtime image installs `@anthropic-ai/claude-code` and the corresponding Linux platform package. The controller and Publisher images do not include Claude Code.
 
 © Anthropic PBC. All rights reserved. Use is subject to the Legal Agreements outlined here: https://code.claude.com/docs/en/legal-and-compliance.
 
 ## OpenAI Codex CLI
 
-Orka installs `@openai/codex` and the corresponding Linux platform package in the agent harness image. The npm package declares the Apache License 2.0.
+The digest-pinned Codex ACP runtime image installs `@openai/codex` and the corresponding Linux platform package. The controller and Publisher images do not include Codex. The npm package declares the Apache License 2.0.
 
 Apache License
 Version 2.0, January 2004

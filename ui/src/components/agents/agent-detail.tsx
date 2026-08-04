@@ -67,18 +67,18 @@ export function AgentDetail({ agentId }: { agentId: string }) {
 
         {agent.spec.runtime && (
           <Card>
-            <CardHeader><CardTitle>CLI Runtime</CardTitle></CardHeader>
+            <CardHeader><CardTitle>Agent Runtime</CardTitle></CardHeader>
             <CardContent className="space-y-2 text-sm">
-              <div><span className="text-muted-foreground">Type:</span> <Badge variant="secondary">{agent.spec.runtime.type}</Badge></div>
-              {agent.spec.runtime.defaultMaxTurns && <div><span className="text-muted-foreground">Max Turns:</span> {agent.spec.runtime.defaultMaxTurns}</div>}
-              <div><span className="text-muted-foreground">Allow Bash:</span> {agent.spec.runtime.defaultAllowBash ? 'Yes' : 'No'}</div>
-              {(agent.spec.runtime.defaultAllowedTools?.length ?? 0) > 0 && (
-                <div>
-                  <span className="text-muted-foreground">Allowed Tools:</span>
-                  <div className="mt-1 flex flex-wrap gap-1">
-                    {agent.spec.runtime.defaultAllowedTools!.map(t => <Badge key={t} variant="outline" className="text-xs">{t}</Badge>)}
-                  </div>
-                </div>
+              {'type' in agent.spec.runtime ? (
+                <>
+                  <div><span className="text-muted-foreground">Source:</span> Orka-managed RuntimePool</div>
+                  <div><span className="text-muted-foreground">Profile:</span> <Badge variant="secondary">{agent.spec.runtime.type} ACP</Badge></div>
+                </>
+              ) : (
+                <>
+                  <div><span className="text-muted-foreground">Source:</span> External v2 AgentRuntime</div>
+                  <div><span className="text-muted-foreground">Registration:</span> <Badge variant="secondary">{agent.spec.runtime.runtimeRef.name}</Badge></div>
+                </>
               )}
             </CardContent>
           </Card>

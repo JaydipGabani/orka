@@ -54,36 +54,6 @@ func FirstPresentSecretName(present map[string]bool, candidates []string) string
 	return ""
 }
 
-func resolveRuntimeSecretRef(ctx context.Context, k8sClient client.Reader, namespace string, runtimeType corev1alpha1.AgentRuntimeType, requested string) (*corev1.LocalObjectReference, error) {
-	candidates := RuntimeSecretCandidates(runtimeType)
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("unsupported runtime type %q", runtimeType)
-	}
-
-	if requested != "" {
-		secret, exists, err := getSecret(ctx, k8sClient, namespace, requested)
-		if err != nil {
-			return nil, err
-		}
-		if !exists {
-			return nil, fmt.Errorf("runtime secretRef %q not found in namespace %q", requested, namespace)
-		}
-		if err := validateRuntimeSecret(runtimeType, secret); err != nil {
-			return nil, fmt.Errorf("runtime secretRef %q in namespace %q %w", requested, namespace, err)
-		}
-		return &corev1.LocalObjectReference{Name: requested}, nil
-	}
-
-	name, err := firstUsableRuntimeSecretName(ctx, k8sClient, namespace, runtimeType, candidates)
-	if err != nil {
-		return nil, err
-	}
-	if name == "" {
-		return nil, fmt.Errorf("no supported %s runtime credentials found in namespace %q; expected one of %s", runtimeType, namespace, strings.Join(candidates, ", "))
-	}
-	return &corev1.LocalObjectReference{Name: name}, nil
-}
-
 func FirstUsableRuntimeSecretName(secrets []corev1.Secret, runtimeType corev1alpha1.AgentRuntimeType) string {
 	for _, candidate := range RuntimeSecretCandidates(runtimeType) {
 		for i := range secrets {
@@ -98,28 +68,6 @@ func FirstUsableRuntimeSecretName(secrets []corev1.Secret, runtimeType corev1alp
 	return ""
 }
 
-func firstUsableRuntimeSecretName(ctx context.Context, k8sClient client.Reader, namespace string, runtimeType corev1alpha1.AgentRuntimeType, candidates []string) (string, error) {
-	invalid := make([]string, 0)
-	for _, name := range candidates {
-		secret, exists, err := getSecret(ctx, k8sClient, namespace, name)
-		if err != nil {
-			return "", err
-		}
-		if !exists {
-			continue
-		}
-		if err := validateRuntimeSecret(runtimeType, secret); err != nil {
-			invalid = append(invalid, fmt.Sprintf("%q %v", name, err))
-			continue
-		}
-		return name, nil
-	}
-	if len(invalid) > 0 {
-		return "", fmt.Errorf("no valid %s runtime credentials found in namespace %q: %s", runtimeType, namespace, strings.Join(invalid, "; "))
-	}
-	return "", nil
-}
-
 func validateRuntimeSecret(runtimeType corev1alpha1.AgentRuntimeType, secret *corev1.Secret) error {
 	if runtimeType != corev1alpha1.AgentRuntimeOpencode {
 		return nil
@@ -130,9 +78,9 @@ func validateRuntimeSecret(runtimeType corev1alpha1.AgentRuntimeType, secret *co
 	return nil
 }
 
-func resolveWorkspaceGitSecretRef(ctx context.Context, k8sClient client.Reader, namespace string, agent *corev1alpha1.Agent, requested string) (*corev1.LocalObjectReference, error) {
+func resolveWorkspaceCredentialRef(ctx context.Context, k8sClient client.Reader, namespace string, agent *corev1alpha1.Agent, requested string) (*corev1alpha1.WorkspaceCredentialReference, error) {
 	if requested != "" {
-		return &corev1.LocalObjectReference{Name: requested}, nil
+		return &corev1alpha1.WorkspaceCredentialReference{Name: requested}, nil
 	}
 
 	if agent != nil &&
@@ -140,7 +88,7 @@ func resolveWorkspaceGitSecretRef(ctx context.Context, k8sClient client.Reader, 
 		agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeCopilot &&
 		agent.Spec.SecretRef != nil &&
 		agent.Spec.SecretRef.Name != "" {
-		return &corev1.LocalObjectReference{Name: agent.Spec.SecretRef.Name}, nil
+		return &corev1alpha1.WorkspaceCredentialReference{Name: agent.Spec.SecretRef.Name}, nil
 	}
 
 	name, err := firstExistingSecretName(ctx, k8sClient, namespace, append([]string(nil), gitCredentialSecretCandidates...))
@@ -150,7 +98,7 @@ func resolveWorkspaceGitSecretRef(ctx context.Context, k8sClient client.Reader, 
 	if name == "" {
 		return nil, nil
 	}
-	return &corev1.LocalObjectReference{Name: name}, nil
+	return &corev1alpha1.WorkspaceCredentialReference{Name: name}, nil
 }
 
 func validateGitCredentialSecret(ctx context.Context, k8sClient client.Reader, namespace, name string) error {
@@ -190,13 +138,7 @@ func taskWorkspace(task *corev1alpha1.Task) *corev1alpha1.WorkspaceConfig {
 	if task == nil {
 		return nil
 	}
-	if task.Spec.Workspace != nil {
-		return task.Spec.Workspace
-	}
-	if task.Spec.AgentRuntime != nil {
-		return task.Spec.AgentRuntime.Workspace
-	}
-	return nil
+	return task.Spec.Workspace
 }
 
 func loadAgent(ctx context.Context, k8sClient client.Reader, namespace, agentName string) (*corev1alpha1.Agent, error) {

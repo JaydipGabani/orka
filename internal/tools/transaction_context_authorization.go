@@ -70,13 +70,26 @@ func validateChildTaskAgainstParentTransaction(ctx context.Context, k8sClient cl
 	}
 
 	workspace := taskWorkspace(child)
-	if workspace != nil && workspace.GitSecretRef != nil && strings.TrimSpace(workspace.GitSecretRef.Name) != "" {
+	if workspace != nil {
 		const secretCredentialReadScope = "orka:secrets:credentials:read"
-		if !TransactionHasScope(parent.Spec.Transaction, secretCredentialReadScope) {
-			return fmt.Errorf("child task git secret %q requires transaction scope %q", workspace.GitSecretRef.Name, secretCredentialReadScope)
-		}
-		if want := strings.TrimSpace(txCtx["secret"]); want != "" && workspace.GitSecretRef.Name != want {
-			return fmt.Errorf("child task git secret %q does not match transaction context %q", workspace.GitSecretRef.Name, want)
+		for _, credential := range []struct {
+			role string
+			ref  *corev1alpha1.WorkspaceCredentialReference
+		}{
+			{role: "source-read", ref: workspace.ReadCredentialRef},
+			{role: "target-read", ref: workspace.PublicationReadCredentialRef},
+			{role: "target-write", ref: workspace.PublicationCredentialRef},
+			{role: "forge", ref: workspace.ForgeCredentialRef},
+		} {
+			if credential.ref == nil || strings.TrimSpace(credential.ref.Name) == "" {
+				continue
+			}
+			if !TransactionHasScope(parent.Spec.Transaction, secretCredentialReadScope) {
+				return fmt.Errorf("child task %s credential %q requires transaction scope %q", credential.role, credential.ref.Name, secretCredentialReadScope)
+			}
+			if want := strings.TrimSpace(txCtx["secret"]); want != "" && credential.ref.Name != want {
+				return fmt.Errorf("child task %s credential %q does not match transaction context %q", credential.role, credential.ref.Name, want)
+			}
 		}
 	}
 	if len(txCtx) == 0 {

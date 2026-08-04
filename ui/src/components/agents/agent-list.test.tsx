@@ -55,7 +55,7 @@ describe('AgentList', () => {
             },
             {
               metadata: { name: 'agent-b', namespace: 'default', uid: 'uid-b' },
-              spec: { runtime: { type: 'copilot' } },
+              spec: { runtime: { type: 'codex' } },
               status: { activeTasks: 0 },
             },
           ],
@@ -78,7 +78,7 @@ describe('AgentList', () => {
 
     // Agent B: name, runtime badge
     expect(screen.getByText('agent-b')).toBeInTheDocument()
-    expect(screen.getByText('copilot runtime')).toBeInTheDocument()
+    expect(screen.getByText('codex ACP')).toBeInTheDocument()
   })
 
   it('agent card shows namespace', async () => {

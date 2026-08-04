@@ -133,7 +133,6 @@ type ModelConfig struct {
 	// Temperature controls randomness in generation
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=2
-	// +kubebuilder:default=0.7
 	// +optional
 	Temperature *float64 `json:"temperature,omitempty"`
 
@@ -148,6 +147,7 @@ type ModelConfig struct {
 }
 
 // PromptSource defines where to get a prompt from
+// +kubebuilder:validation:XValidation:rule="!(has(self.inline) && self.inline.size() > 0 && has(self.configMapRef))",message="system prompt must use only one of inline or configMapRef"
 type PromptSource struct {
 	// Inline is the inline prompt text
 	// +optional

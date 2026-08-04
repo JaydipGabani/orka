@@ -1490,27 +1490,47 @@ func contextTokenWorkspaceCredentialFailures(token *ContextToken, cfg ContextTok
 	if workspace == nil {
 		return nil
 	}
-	requiredScopes := cfg.SecretCredentialReadScopes()
-	if len(requiredScopes) == 0 {
+	credentials := []struct {
+		role string
+		ref  *corev1alpha1.WorkspaceCredentialReference
+	}{
+		{role: "source-read", ref: workspace.ReadCredentialRef},
+		{role: "target-read", ref: workspace.PublicationReadCredentialRef},
+		{role: "target-write", ref: workspace.PublicationCredentialRef},
+		{role: "forge", ref: workspace.ForgeCredentialRef},
+	}
+	hasCredential := false
+	for _, credential := range credentials {
+		if credential.ref != nil && strings.TrimSpace(credential.ref.Name) != "" {
+			hasCredential = true
+			break
+		}
+	}
+	if !hasCredential {
 		return nil
 	}
-	if workspace.GitSecretRef == nil || strings.TrimSpace(workspace.GitSecretRef.Name) == "" {
+	requiredScopes := cfg.SecretCredentialReadScopes()
+	if len(requiredScopes) == 0 {
 		return nil
 	}
 	failures := []string{}
 	if !hasAnyScope(token.Scopes, requiredScopes) {
 		failures = append(failures, fmt.Sprintf(
-			"workspace git credentials require one of scopes %q",
+			"workspace credentials require one of scopes %q",
 			strings.Join(requiredScopes, ","),
 		))
 	}
-	if want, ok := contextString(token.TransactionContext, "secret"); ok && workspace.GitSecretRef.Name != want {
-		failures = append(failures, fmt.Sprintf("git secret %q does not match token context %q", workspace.GitSecretRef.Name, want))
+	if want, ok := contextString(token.TransactionContext, "secret"); ok {
+		for _, credential := range credentials {
+			if credential.ref == nil || strings.TrimSpace(credential.ref.Name) == "" {
+				continue
+			}
+			if credential.ref.Name != want {
+				failures = append(failures, fmt.Sprintf("workspace %s credential %q does not match token context %q", credential.role, credential.ref.Name, want))
+			}
+		}
 	}
-	if len(failures) > 0 {
-		return failures
-	}
-	return nil
+	return failures
 }
 
 func contextTokenTaskContextFailures(token *ContextToken, authzCtx contextTokenTaskCreateAuthorizationContext, includeTaskIdentity bool) []string {
@@ -1991,13 +2011,7 @@ func contextValueStringSlice(value any) ([]string, bool) {
 }
 
 func taskRequestWorkspace(req CreateTaskRequest) *corev1alpha1.WorkspaceConfig {
-	if req.Workspace != nil {
-		return req.Workspace
-	}
-	if req.AgentRuntime == nil {
-		return nil
-	}
-	return req.AgentRuntime.Workspace
+	return req.Workspace
 }
 
 func workspaceGitRepo(workspace *corev1alpha1.WorkspaceConfig) string {

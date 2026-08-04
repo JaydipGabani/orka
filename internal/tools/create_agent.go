@@ -107,7 +107,7 @@ func (t *CreateAgentTool) Parameters() json.RawMessage {
 			},
 			"model": {
 				"type": "object",
-				"description": "LLM model config; model.name is required for OpenCode runtimes and otherwise inherited from the coordinator when omitted",
+				"description": "LLM model config; model.name is inherited from the coordinator when omitted",
 				"properties": {
 					"provider": {
 						"type": "string",
@@ -165,21 +165,30 @@ func (t *CreateAgentTool) Parameters() json.RawMessage {
 			},
 			"runtime": {
 				"type": "object",
-				"description": "Set to make this a CLI runtime agent (copilot, claude, codex, or opencode). Runtime agents run code, edit files, and use git. Do NOT set runtime on coordinator agents.",
+					"description": "Set to make this a built-in ACP runtime agent (copilot, claude, or codex). Runtime agents run code, edit files, and use git. Do NOT set runtime on coordinator agents.",
 				"properties": {
 					"type": {
 						"type": "string",
-						"description": "Runtime type: copilot, claude, codex, or opencode"
+							"description": "Runtime type: copilot, claude, or codex"
 					},
 					"secretRef": {
 						"type": "string",
-						"description": "Optional secret name containing runtime credentials. Omit to auto-discover the standard secret for this runtime."
+						"description": "Deprecated legacy field. Built-in copilot, claude, and codex ACP runtimes are credential-free at the Agent boundary and ignore it."
 					}
 				}
 			}
 		},
 		"required": ["role", "systemPrompt"]
 	}`)
+}
+
+func isBuiltInACPRuntime(runtimeType corev1alpha1.AgentRuntimeType) bool {
+	switch runtimeType {
+	case corev1alpha1.AgentRuntimeCopilot, corev1alpha1.AgentRuntimeClaude, corev1alpha1.AgentRuntimeCodex:
+		return true
+	default:
+		return false
+	}
 }
 
 // Execute creates an Agent CRD dynamically
@@ -198,21 +207,16 @@ func (t *CreateAgentTool) Execute(ctx context.Context, args json.RawMessage) (st
 	runtimeType := ""
 	if a.Runtime != nil {
 		runtimeType = strings.TrimSpace(a.Runtime.Type)
+		if runtimeType == "" {
+			return "", fmt.Errorf("runtime.type is required when runtime is provided")
+		}
+		if !isBuiltInACPRuntime(corev1alpha1.AgentRuntimeType(runtimeType)) {
+			return "", fmt.Errorf("unsupported runtime type %q; supported built-in runtimes are copilot, claude, and codex", runtimeType)
+		}
 	}
 	requestedModel := ""
 	if a.Model != nil {
 		requestedModel = strings.TrimSpace(a.Model.Name)
-	}
-	if runtimeType == string(corev1alpha1.AgentRuntimeOpencode) {
-		if requestedModel == "" {
-			return "", fmt.Errorf("model.name is required for opencode runtime")
-		}
-		if provider := strings.TrimSpace(a.Model.Provider); provider != "" {
-			providerPrefix := strings.TrimSuffix(provider, "/") + "/"
-			if !strings.HasPrefix(requestedModel, providerPrefix) {
-				requestedModel = providerPrefix + strings.TrimPrefix(requestedModel, "/")
-			}
-		}
 	}
 
 	parentName := os.Getenv(envOrkaTaskName)
@@ -322,18 +326,16 @@ func (t *CreateAgentTool) Execute(ctx context.Context, args json.RawMessage) (st
 		agent.Spec.Coordination = coord
 	}
 
-	// Set runtime if provided (makes this a CLI agent like copilot/claude/codex/opencode)
-	if a.Runtime != nil && a.Runtime.Type != "" {
+	// Set the normalized built-in runtime when provided.
+	if a.Runtime != nil {
 		agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
-			Type: corev1alpha1.AgentRuntimeType(a.Runtime.Type),
+			Type: corev1alpha1.AgentRuntimeType(runtimeType),
 		}
-		// Runtime agents don't use providerRef
+		// Runtime agents don't use providerRef. Built-in ACP v2 runtimes are
+		// authenticated at the provider proxy and must not retain legacy
+		// per-Agent credentials.
 		agent.Spec.ProviderRef = nil
-		secretRef, err := resolveRuntimeSecretRef(ctx, t.k8sClient, ns, agent.Spec.Runtime.Type, a.Runtime.SecretRef)
-		if err != nil {
-			return "", err
-		}
-		agent.Spec.SecretRef = secretRef
+		agent.Spec.SecretRef = nil
 	}
 
 	// Set owner reference to parent task for auto-cleanup

@@ -46,6 +46,63 @@ func TestValidateChildTaskAgainstParentTransactionRejectsDisallowedAgent(t *test
 	}
 }
 
+func TestValidateChildTaskAgainstParentTransactionAuthorizesAllWorkspaceCredentialRoles(t *testing.T) {
+	firstName := "workspace-a"
+	secondName := "workspace-b"
+	tests := []struct {
+		name string
+		role string
+		set  func(*corev1alpha1.WorkspaceConfig)
+	}{
+		{name: "source read", role: "source-read", set: func(workspace *corev1alpha1.WorkspaceConfig) {
+			workspace.ReadCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: secondName}
+		}},
+		{name: "target read", role: "target-read", set: func(workspace *corev1alpha1.WorkspaceConfig) {
+			workspace.PublicationReadCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: secondName}
+		}},
+		{name: "target write", role: "target-write", set: func(workspace *corev1alpha1.WorkspaceConfig) {
+			workspace.PublicationCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: secondName}
+		}},
+		{name: "forge", role: "forge", set: func(workspace *corev1alpha1.WorkspaceConfig) {
+			workspace.ForgeCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: secondName}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name+" requires scope", func(t *testing.T) {
+			parent := parentTask()
+			parent.Spec.Transaction.Scope = ""
+			parent.Spec.Transaction.Scopes = nil
+			parent.Spec.Transaction.Context = map[string]string{}
+			child := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Name: "child", Namespace: defaultNamespace},
+				Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeContainer, Workspace: &corev1alpha1.WorkspaceConfig{}},
+			}
+			test.set(child.Spec.Workspace)
+
+			err := validateChildTaskAgainstParentTransaction(context.Background(), newFakeClient(), parent, child, "")
+			if err == nil || !strings.Contains(err.Error(), "child task "+test.role+" credential") || !strings.Contains(err.Error(), "requires transaction scope") {
+				t.Fatalf("validateChildTaskAgainstParentTransaction() error = %v, want %s scope denial", err, test.role)
+			}
+		})
+
+		t.Run(test.name+" enforces secret subset", func(t *testing.T) {
+			parent := parentTask()
+			parent.Spec.Transaction.Scopes = []string{"orka:secrets:credentials:read"}
+			parent.Spec.Transaction.Context = map[string]string{"secret": firstName}
+			child := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Name: "child", Namespace: defaultNamespace},
+				Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeContainer, Workspace: &corev1alpha1.WorkspaceConfig{}},
+			}
+			test.set(child.Spec.Workspace)
+
+			err := validateChildTaskAgainstParentTransaction(context.Background(), newFakeClient(), parent, child, "")
+			if err == nil || !strings.Contains(err.Error(), "child task "+test.role+" credential") || !strings.Contains(err.Error(), "does not match transaction context") {
+				t.Fatalf("validateChildTaskAgainstParentTransaction() error = %v, want %s subset denial", err, test.role)
+			}
+		})
+	}
+}
+
 func TestValidateChildTaskAgainstParentTransactionRejectsDisallowedProviderModelAndTool(t *testing.T) {
 	parent := parentTask()
 	parent.Spec.Transaction.Context = map[string]string{

@@ -13,13 +13,28 @@ export const toolRefSchema = z.object({
   enabled: z.boolean().optional(),
 })
 
-export const agentCLIRuntimeSchema = z.object({
-  type: z.enum(['copilot', 'claude', 'codex', 'opencode']),
+const agentRuntimeDefaultsSchema = {
   defaultMaxTurns: z.number().optional(),
   defaultAllowedTools: z.array(z.string()).optional(),
   defaultAllowBash: z.boolean().optional(),
   defaultReasoningEffort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
-})
+}
+
+export const builtInAgentRuntimeSchema = z.object({
+  type: z.enum(['claude', 'codex', 'copilot']),
+  ...agentRuntimeDefaultsSchema,
+}).strict()
+
+export const externalAgentRuntimeSchema = z.object({
+  runtimeRef: z.object({
+    name: z.string(),
+  }),
+  ...agentRuntimeDefaultsSchema,
+}).strict()
+
+export const agentRuntimeSchema = z.union([builtInAgentRuntimeSchema, externalAgentRuntimeSchema])
+export const agentCLIRuntimeSchema = agentRuntimeSchema
+
 
 export const agentSpecSchema = z.object({
   providerRef: z.object({ name: z.string(), namespace: z.string().optional() }).optional(),
@@ -47,7 +62,7 @@ export const agentSpecSchema = z.object({
     maxConcurrentChildren: z.number().optional(),
     maxDepth: z.number().optional(),
   }).optional(),
-  runtime: agentCLIRuntimeSchema.optional(),
+  runtime: agentRuntimeSchema.optional(),
 })
 
 export const agentStatusSchema = z.object({

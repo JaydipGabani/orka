@@ -4,21 +4,13 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/layout/page-header'
 import { useCreateAgent } from '@/hooks/use-agents'
 import { useSecretNames } from '@/hooks/use-secrets'
 import { useUIStore } from '@/stores/ui'
 import { toast } from 'sonner'
 
-type AgentRuntimeType = 'claude' | 'copilot' | 'codex' | 'opencode'
-
-const defaultAllowedTools = 'Read,Glob,Grep,Bash,LS'
-const openCodeDefaultAllowedTools = `${defaultAllowedTools},Edit`
-
-function allowedToolsForRuntime(runtimeType: AgentRuntimeType) {
-  return runtimeType === 'opencode' ? openCodeDefaultAllowedTools : defaultAllowedTools
-}
+type BuiltInRuntime = 'claude' | 'codex' | 'copilot'
 
 export function AgentCreateForm() {
   const navigate = useNavigate()
@@ -29,7 +21,7 @@ export function AgentCreateForm() {
   const [name, setName] = useState('')
   const [mode, setMode] = useState<'ai' | 'runtime'>('ai')
 
-  // AI mode fields
+  // Native AI mode fields remain unchanged by the ACP runtime cutover.
   const [provider, setProvider] = useState('')
   const [model, setModel] = useState('')
   const [temperature, setTemperature] = useState('0.7')
@@ -37,27 +29,20 @@ export function AgentCreateForm() {
   const [secretRef, setSecretRef] = useState('')
   const [systemPrompt, setSystemPrompt] = useState('')
 
-  // Runtime mode fields
-  const [runtimeType, setRuntimeType] = useState<AgentRuntimeType>('claude')
-  const [maxTurns, setMaxTurns] = useState('50')
-  const [allowBash, setAllowBash] = useState(true)
-  const [allowedTools, setAllowedTools] = useState(defaultAllowedTools)
-  const [allowedToolsEdited, setAllowedToolsEdited] = useState(false)
-
-  const handleRuntimeTypeChange = (value: string) => {
-    const nextRuntimeType = value as AgentRuntimeType
-    if (!allowedToolsEdited) {
-      setAllowedTools(allowedToolsForRuntime(nextRuntimeType))
-    }
-    setRuntimeType(nextRuntimeType)
-  }
+  // ACP runtime mode selects either an Orka-managed profile or a registered v2 runtime.
+  const [runtimeSource, setRuntimeSource] = useState<'built-in' | 'external'>('built-in')
+  const [runtimeType, setRuntimeType] = useState<BuiltInRuntime>('claude')
+  const [runtimeRef, setRuntimeRef] = useState('')
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
 
-    const trimmedModel = model.trim()
-    if (mode === 'runtime' && runtimeType === 'opencode' && !trimmedModel) {
-      toast.error('OpenCode requires an endpoint model ID')
+    if (mode === 'runtime' && runtimeSource === 'built-in' && !model.trim()) {
+      toast.error('Model is required for built-in ACP runtimes')
+      return
+    }
+    if (mode === 'runtime' && runtimeSource === 'external' && !runtimeRef.trim()) {
+      toast.error('AgentRuntime name is required')
       return
     }
 
@@ -73,20 +58,16 @@ export function AgentCreateForm() {
       if (systemPrompt) {
         spec.systemPrompt = { inline: systemPrompt }
       }
+      if (secretRef && secretRef !== '__none__') {
+        spec.secretRef = { name: secretRef }
+      }
     } else {
-      spec.runtime = {
-        type: runtimeType,
-        defaultMaxTurns: parseInt(maxTurns),
-        defaultAllowBash: allowBash,
-        ...(allowedTools.trim() ? { defaultAllowedTools: allowedTools.split(',').map(t => t.trim()).filter(Boolean) } : {}),
+      spec.runtime = runtimeSource === 'built-in'
+        ? { type: runtimeType }
+        : { runtimeRef: { name: runtimeRef.trim() } }
+      if (model.trim()) {
+        spec.model = { name: model.trim() }
       }
-      if (trimmedModel) {
-        spec.model = { name: trimmedModel }
-      }
-    }
-
-    if (secretRef && secretRef !== '__none__') {
-      spec.secretRef = { name: secretRef }
     }
 
     try {
@@ -100,7 +81,7 @@ export function AgentCreateForm() {
 
   return (
     <div className="space-y-4">
-      <PageHeader title="Create Agent" description="Configure a new AI agent" />
+      <PageHeader title="Create Agent" description="Configure a native AI agent or an ACP runtime profile" />
       <Card>
         <CardHeader>
           <CardTitle>Agent Configuration</CardTitle>
@@ -109,16 +90,16 @@ export function AgentCreateForm() {
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
-                <label className="text-sm font-medium">Name</label>
-                <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="my-agent" required />
+                <label htmlFor="agent-name" className="text-sm font-medium">Name</label>
+                <Input id="agent-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="my-agent" required />
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-medium">Mode</label>
-                <Select value={mode} onValueChange={(v) => setMode(v as 'ai' | 'runtime')}>
+                <Select value={mode} onValueChange={(value) => setMode(value as 'ai' | 'runtime')}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="ai">AI (LLM Provider)</SelectItem>
-                    <SelectItem value="runtime">CLI Runtime (Copilot / Claude / Codex / OpenCode)</SelectItem>
+                    <SelectItem value="ai">Native AI (LLM provider)</SelectItem>
+                    <SelectItem value="runtime">ACP agent runtime</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -128,9 +109,9 @@ export function AgentCreateForm() {
               <div className="space-y-4">
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">Provider</label>
+                    <label htmlFor="agent-provider" className="text-sm font-medium">Provider</label>
                     <Select value={provider} onValueChange={setProvider}>
-                      <SelectTrigger><SelectValue placeholder="Select provider" /></SelectTrigger>
+                      <SelectTrigger id="agent-provider"><SelectValue placeholder="Select provider" /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="anthropic">Anthropic</SelectItem>
                         <SelectItem value="openai">OpenAI</SelectItem>
@@ -138,96 +119,102 @@ export function AgentCreateForm() {
                     </Select>
                   </div>
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">Model</label>
-                    <Input value={model} onChange={(e) => setModel(e.target.value)} placeholder="claude-opus-4-5-20250514" />
+                    <label htmlFor="agent-model" className="text-sm font-medium">Model</label>
+                    <Input id="agent-model" value={model} onChange={(e) => setModel(e.target.value)} placeholder="claude-sonnet-4-20250514" />
                   </div>
                 </div>
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">Temperature</label>
-                    <Input type="number" step="0.1" min="0" max="2" value={temperature} onChange={(e) => setTemperature(e.target.value)} />
+                    <label htmlFor="agent-temperature" className="text-sm font-medium">Temperature</label>
+                    <Input id="agent-temperature" type="number" step="0.1" min="0" max="2" value={temperature} onChange={(e) => setTemperature(e.target.value)} />
                   </div>
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">Max Tokens</label>
-                    <Input type="number" value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} placeholder="Optional" />
+                    <label htmlFor="agent-max-tokens" className="text-sm font-medium">Max Tokens</label>
+                    <Input id="agent-max-tokens" type="number" value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} />
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">System Prompt</label>
+                  <label htmlFor="agent-system-prompt" className="text-sm font-medium">System Prompt</label>
                   <textarea
+                    id="agent-system-prompt"
                     className="flex min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     value={systemPrompt}
                     onChange={(e) => setSystemPrompt(e.target.value)}
                     placeholder="Optional system prompt..."
                   />
                 </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Secret Reference</label>
+                  <Select value={secretRef} onValueChange={setSecretRef}>
+                    <SelectTrigger><SelectValue placeholder="Select a secret..." /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">None</SelectItem>
+                      {(secretsData?.items ?? []).map((secret) => (
+                        <SelectItem key={secret.name} value={secret.name}>{secret.name}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">Kubernetes Secret containing native AI provider credentials</p>
+                </div>
               </div>
             )}
 
             {mode === 'runtime' && (
-              <div className="space-y-4">
-                <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-4 rounded-md border bg-muted/20 p-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Runtime source</label>
+                  <Select value={runtimeSource} onValueChange={(value) => setRuntimeSource(value as 'built-in' | 'external')}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="built-in">Orka-managed RuntimePool</SelectItem>
+                      <SelectItem value="external">External v2 AgentRuntime</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    Runtime credentials and publication credentials are never copied into the ACP process tree.
+                  </p>
+                </div>
+
+                {runtimeSource === 'built-in' ? (
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">Runtime Type</label>
-                    <Select value={runtimeType} onValueChange={handleRuntimeTypeChange}>
+                    <label className="text-sm font-medium">Runtime profile</label>
+                    <Select value={runtimeType} onValueChange={(value) => setRuntimeType(value as BuiltInRuntime)}>
                       <SelectTrigger><SelectValue /></SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="claude">Claude Code</SelectItem>
-                        <SelectItem value="copilot">GitHub Copilot</SelectItem>
-                        <SelectItem value="codex">OpenAI Codex</SelectItem>
-                        <SelectItem value="opencode">OpenCode</SelectItem>
+                        <SelectItem value="claude">Claude ACP</SelectItem>
+                        <SelectItem value="codex">OpenAI Codex ACP</SelectItem>
+                        <SelectItem value="copilot">GitHub Copilot ACP</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
+                ) : (
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">Max Turns</label>
-                    <Input type="number" min="1" max="1000" value={maxTurns} onChange={(e) => setMaxTurns(e.target.value)} />
+                    <label htmlFor="agent-runtime-ref" className="text-sm font-medium">AgentRuntime name</label>
+                    <Input
+                      id="agent-runtime-ref"
+                      value={runtimeRef}
+                      onChange={(e) => setRuntimeRef(e.target.value)}
+                      placeholder="external-codex"
+                      required
+                    />
+                    <p className="text-xs text-muted-foreground">The registration must pass the orka.harness.v2 conformance profile.</p>
                   </div>
-                </div>
+                )}
+
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">Model</label>
+                  <label htmlFor="runtime-model" className="text-sm font-medium">
+                    {runtimeSource === 'built-in' ? 'Model' : 'Model override'}
+                  </label>
                   <Input
+                    id="runtime-model"
                     value={model}
                     onChange={(e) => setModel(e.target.value)}
-                    placeholder="Endpoint model ID"
-                    required={runtimeType === 'opencode'}
+                    placeholder={runtimeSource === 'built-in' ? 'Enter model identifier' : 'Optional model override'}
+                    required={runtimeSource === 'built-in'}
                   />
-                  <p className="text-xs text-muted-foreground">
-                    Required for OpenCode; optional for runtimes with a configured default model
-                  </p>
-                </div>
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Allowed Tools</label>
-                  <Input
-                    value={allowedTools}
-                    onChange={(e) => {
-                      setAllowedTools(e.target.value)
-                      setAllowedToolsEdited(true)
-                    }}
-                    placeholder={allowedToolsForRuntime(runtimeType)}
-                  />
-                  <p className="text-xs text-muted-foreground">Comma-separated list of tool names</p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Switch checked={allowBash} onCheckedChange={setAllowBash} />
-                  <label className="text-sm font-medium">Allow Bash</label>
                 </div>
               </div>
             )}
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Secret Reference</label>
-              <Select value={secretRef} onValueChange={setSecretRef}>
-                <SelectTrigger><SelectValue placeholder="Select a secret..." /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__none__">None</SelectItem>
-                  {(secretsData?.items ?? []).map((s) => (
-                    <SelectItem key={s.name} value={s.name}>{s.name}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className="text-xs text-muted-foreground">Kubernetes Secret containing API keys</p>
-            </div>
 
             <div className="flex gap-2">
               <Button type="submit" disabled={createAgent.isPending}>
