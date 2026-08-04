@@ -1728,6 +1728,35 @@ func TestHandlers_CreateTask_RejectsClientSuppliedTransaction(t *testing.T) {
 	}
 }
 
+func TestHandlers_CreateTask_RejectsReservedLabels(t *testing.T) {
+	for _, labelName := range []string{labels.LabelParentTask, labels.LabelCoordinator} {
+		t.Run(labelName, func(t *testing.T) {
+			handlers, app := setupTestHandlers()
+			app.Post("/tasks", handlers.CreateTask)
+
+			body := CreateTaskRequest{
+				Name:      "reserved-label-task",
+				Namespace: "default",
+				Metadata: MetadataRequest{Labels: map[string]string{
+					labelName: "reserved-value",
+				}},
+				Type:  corev1alpha1.TaskTypeContainer,
+				Image: "busybox",
+			}
+			bodyBytes, _ := json.Marshal(body)
+			req := httptest.NewRequest(http.MethodPost, "/tasks", bytes.NewReader(bodyBytes))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("Test request failed: %v", err)
+			}
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("StatusCode = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			}
+		})
+	}
+}
+
 func TestHandlers_CreateTask_RejectsReservedAnnotations(t *testing.T) {
 	tests := []struct {
 		name       string

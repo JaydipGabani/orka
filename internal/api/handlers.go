@@ -440,6 +440,15 @@ func rejectReservedTaskAnnotations(annotations map[string]string) error {
 	return nil
 }
 
+func rejectReservedTaskLabels(taskLabels map[string]string) error {
+	for key := range taskLabels {
+		if strings.HasPrefix(key, "orka.ai/") {
+			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("label %q is reserved", key))
+		}
+	}
+	return nil
+}
+
 // CreateTask creates a new task
 func (h *Handlers) CreateTask(c fiber.Ctx) error {
 	if err := rejectRequestedByTampering(c.Body()); err != nil {
@@ -464,6 +473,9 @@ func (h *Handlers) CreateTask(c fiber.Ctx) error {
 		annotations = req.Metadata.Annotations
 	}
 	if err := rejectReservedTaskAnnotations(annotations); err != nil {
+		return err
+	}
+	if err := rejectReservedTaskLabels(req.Metadata.Labels); err != nil {
 		return err
 	}
 

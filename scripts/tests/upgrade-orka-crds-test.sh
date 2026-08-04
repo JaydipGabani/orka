@@ -563,13 +563,32 @@ test_legacy_builtin_opencode_agent_blocks_cutover() {
     {"kind":"Agent","metadata":{"namespace":"work","name":"custom-runtime"},"spec":{"runtime":{"runtimeRef":{"name":"custom"}}}}
   ]'
 
-  expect_failure "${case_dir}" 'Agent work/legacy-opencode still uses legacy built-in runtime type opencode' run_upgrade "${case_dir}"
-  grep -F 'spec.runtime.type set to claude, codex, or copilot' "${case_dir}/output" >/dev/null
-  grep -F 'spec.runtime.runtimeRef for an admin-registered runtime' "${case_dir}/output" >/dev/null
+  expect_failure "${case_dir}" 'Agent work/legacy-opencode still uses a legacy or invalid built-in OpenCode configuration' run_upgrade "${case_dir}"
+  grep -F 'supported OpenCode provider/model plus reviewed contextWindow/maxTokens' "${case_dir}/output" >/dev/null
+  grep -F 'use spec.runtime.runtimeRef' "${case_dir}/output" >/dev/null
   ! grep -F 'Agent work/current-codex' "${case_dir}/output" >/dev/null
   ! grep -F 'Agent work/custom-runtime' "${case_dir}/output" >/dev/null
   assert_no_live_apply "${case_dir}"
   [[ ! -s "${case_dir}/apply.log" ]]
+}
+
+test_supported_opencode_agent_does_not_block_cutover() {
+  local case_dir
+  case_dir="$(new_case supported-opencode-agent)"
+  write_list "${case_dir}/agents.json" '[
+    {
+      "kind":"Agent",
+      "metadata":{"namespace":"work","name":"supported-opencode"},
+      "spec":{
+        "model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},
+        "runtime":{"type":"opencode","defaultAllowedTools":["Read","Write","Edit","Bash","Glob","Grep"],"defaultAllowBash":true}
+      }
+    }
+  ]'
+
+  run_upgrade "${case_dir}" >"${case_dir}/output" 2>&1
+  ! grep -F 'Agent work/supported-opencode' "${case_dir}/output" >/dev/null
+  assert_one_dry_run_and_one_live_apply "${case_dir}"
 }
 
 test_post_dry_run_legacy_builtin_opencode_agent_blocks_live_apply() {
@@ -578,7 +597,7 @@ test_post_dry_run_legacy_builtin_opencode_agent_blocks_live_apply() {
   write_list "${case_dir}/post-dry-run-agents.json" '[{"kind":"Agent","metadata":{"namespace":"work","name":"late-opencode"},"spec":{"runtime":{"type":"opencode"}}}]'
 
   expect_failure "${case_dir}" 'hard-cutover state changed after dry-run; no CRDs were applied' run_upgrade "${case_dir}"
-  grep -F 'Agent work/late-opencode still uses legacy built-in runtime type opencode' "${case_dir}/output" >/dev/null
+  grep -F 'Agent work/late-opencode still uses a legacy or invalid built-in OpenCode configuration' "${case_dir}/output" >/dev/null
   assert_one_dry_run_no_live_apply "${case_dir}"
   [[ "$(grep -Fc 'get agents.core.orka.ai -A -o json' "${case_dir}/kubectl.log")" == "2" ]]
 }
@@ -644,6 +663,7 @@ run_test 'enforces every scale-to-zero status invariant' test_gateway_scale_to_z
 run_test 'never deletes wrapper without opt-in' test_wrapper_requires_explicit_cleanup
 run_test 'deletes only exact legacy wrapper targets with opt-in' test_explicit_wrapper_cleanup_targets_only_legacy_resources
 run_test 'blocks legacy built-in OpenCode Agents before cutover' test_legacy_builtin_opencode_agent_blocks_cutover
+run_test 'allows supported built-in OpenCode Agents during cutover' test_supported_opencode_agent_does_not_block_cutover
 run_test 'rechecks legacy built-in OpenCode Agents after server dry-run' test_post_dry_run_legacy_builtin_opencode_agent_blocks_live_apply
 run_test 'blocks legacy Task workspace credentials before cutover' test_legacy_task_workspace_credentials_block_cutover
 run_test 'rechecks legacy Tasks after server dry-run' test_post_dry_run_legacy_task_blocks_live_apply

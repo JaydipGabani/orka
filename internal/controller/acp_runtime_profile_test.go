@@ -154,6 +154,29 @@ func TestPlanACPRuntimeHashesNormalizedDenyOnlyProviderNativePolicy(t *testing.T
 	}
 }
 
+func TestPlanACPRuntimeRejectsCodexExplicitEmptyProviderNativePolicy(t *testing.T) {
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+		Type: corev1alpha1.TaskTypeAgent,
+		AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
+			AllowedTools: []string{},
+		},
+	}}
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID("agent-uid"), Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   &corev1alpha1.ModelConfig{Name: acpTestModel},
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeCodex},
+		},
+	}
+	_, err := PlanACPRuntime(
+		task, agent,
+		ACPRuntimeImages{Codex: "docker.io/example/codex@sha256:" + strings.Repeat("c", 64)},
+	)
+	if err == nil || !strings.Contains(err.Error(), "cannot exactly enforce") {
+		t.Fatalf("Codex explicit-empty policy error = %v, want fail-closed rejection", err)
+	}
+}
+
 func TestPlanACPRuntimeRejectsCodexDenyOnlyProviderNativePolicy(t *testing.T) {
 	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
 		Type: corev1alpha1.TaskTypeAgent,
