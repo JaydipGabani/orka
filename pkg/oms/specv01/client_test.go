@@ -37,6 +37,7 @@ func TestClientCreateMemoryUsesPinnedDefaultsAndIdentityHeaders(t *testing.T) {
 			t.Fatalf("request defaults = %#v", request)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, `{
 			"id":"11111111-1111-4111-8111-111111111111",
 			"store_id":"22222222-2222-4222-8222-222222222222",
@@ -77,6 +78,7 @@ func TestNewClientRejectsUnsafeEndpointAuthorizationAndIdentity(t *testing.T) {
 		{BaseURL: "https://example.com", AuthorizationValue: "token", TenantID: "tenant", AgentID: "agent"},
 		{BaseURL: "https://example.com", AuthorizationValue: "Bearer token extra", TenantID: "tenant", AgentID: "agent"},
 		{BaseURL: "https://example.com", AuthorizationValue: "Bearer token", TenantID: "tenant value", AgentID: "agent"},
+		{BaseURL: "https://example.com", AuthorizationValue: "Bearer token", TenantID: " tenant", AgentID: "agent"},
 		{BaseURL: "https://example.com", AuthorizationValue: "Bearer token", TenantID: "tenant", AgentID: "agent/value"},
 	}
 	for index, target := range tests {
@@ -93,5 +95,28 @@ func TestPathHelpersEscapeNames(t *testing.T) {
 	got := MemoryPath("store one", "id/value")
 	if !strings.Contains(got, "store%20one") || !strings.Contains(got, "id%2Fvalue") {
 		t.Fatalf("MemoryPath = %q", got)
+	}
+}
+
+func TestClientRejectsSuccessfulWrongStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"11111111-1111-4111-8111-111111111111",
+			"name":"store","tenant_id":"tenant-a","config":{},
+			"sovereignty":{"mode":"","region":"","replication":{"enabled":false,"target_regions":null,"consistency":""}},
+			"metadata":{},"created_at":"2026-08-04T00:00:00Z","updated_at":"2026-08-04T00:00:00Z"
+		}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(Target{
+		BaseURL: server.URL, AuthorizationValue: "Bearer caller-token",
+		TenantID: "tenant-a", AgentID: "agent-a", InsecureLoopbackOnly: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CreateStore(context.Background(), CreateStoreRequest{Name: "store"}); err == nil {
+		t.Fatal("CreateStore accepted HTTP 200 instead of 201")
 	}
 }

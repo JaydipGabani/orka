@@ -122,8 +122,8 @@ func (c *level1Checker) checkHealth() error {
 	if err != nil {
 		return err
 	}
-	if health.Status != "ok" || strings.TrimSpace(health.Version) == "" {
-		return errors.New("health response is incomplete")
+	if health.Status != "ok" || health.Version != Version {
+		return fmt.Errorf("health response must report version %s", Version)
 	}
 	return nil
 }
@@ -136,8 +136,11 @@ func (c *level1Checker) checkCapabilities() error {
 	if !capabilities.VectorSearch {
 		return errors.New("vector_search must be advertised")
 	}
-	if len(capabilities.SupportedLayers) == 0 {
-		return errors.New("supported_layers must not be empty")
+	if !slices.Contains(capabilities.SupportedLayers, LayerWorking) {
+		return errors.New("supported_layers must include working")
+	}
+	if capabilities.MaxEmbeddingDimensions != nil && *capabilities.MaxEmbeddingDimensions < 4 {
+		return errors.New("max_embedding_dimensions is below the conformance vector size")
 	}
 	return nil
 }
@@ -205,7 +208,8 @@ func (c *level1Checker) checkStoreUpdate() error {
 
 func (c *level1Checker) checkStoreTenantIsolation() error {
 	_, err := c.otherClient.GetStore(c.ctx, c.storeName)
-	if isHTTPStatus(err, http.StatusNotFound) {
+	if isHTTPStatus(err, http.StatusNotFound) || isHTTPStatus(err, http.StatusUnauthorized) ||
+		isHTTPStatus(err, http.StatusForbidden) {
 		return nil
 	}
 	if err == nil {
@@ -271,7 +275,7 @@ func (c *level1Checker) checkMemoryUpsert() error {
 
 func (c *level1Checker) checkSecondMemoryCreate() error {
 	request := c.baseMemoryRequest("Unrelated lunch note.", "", []string{"level1-excluded"})
-	request.Embedding = []float32{0, 1, 0, 0}
+	request.Embedding = []float32{1, 0, 0, 0}
 	entry, err := c.client.CreateMemory(c.ctx, c.storeName, request)
 	if err != nil {
 		return err
@@ -413,36 +417,60 @@ func (c *level1Checker) checkStoreDeleteVisibility() error {
 }
 
 func checkAuthentication(ctx context.Context, client *Client) error {
-	status, _, err := client.DoRaw(
+	status, body, err := client.DoRaw(
 		ctx, http.MethodGet, PathStores, nil, "", client.tenantID, client.agentID,
 	)
 	if err != nil {
 		return err
 	}
-	if status != http.StatusUnauthorized {
-		return fmt.Errorf("unauthenticated request returned HTTP %d, want 401", status)
+	if err := requireErrorResponse(status, body, http.StatusUnauthorized, "unauthenticated request"); err != nil {
+		return err
 	}
-	return nil
+	status, body, err = client.DoRaw(
+		ctx, http.MethodGet, PathStores, nil, "Bearer invalid-level1-token", client.tenantID, client.agentID,
+	)
+	if err != nil {
+		return err
+	}
+	return requireErrorResponse(status, body, http.StatusUnauthorized, "invalid-token request")
 }
 
 func checkIdentityHeaders(ctx context.Context, client *Client) error {
-	status, _, err := client.DoRaw(
+	status, body, err := client.DoRaw(
 		ctx, http.MethodGet, PathStores, nil, client.authorizationValue, "", client.agentID,
 	)
 	if err != nil {
 		return err
 	}
-	if status != http.StatusUnauthorized && status != http.StatusBadRequest {
+	if status != http.StatusUnauthorized && status != http.StatusBadRequest && status != http.StatusForbidden {
 		return fmt.Errorf("missing tenant request returned HTTP %d", status)
 	}
-	status, _, err = client.DoRaw(
+	if err := requireJSONErrorBody(body, "missing tenant request"); err != nil {
+		return err
+	}
+	status, body, err = client.DoRaw(
 		ctx, http.MethodGet, PathStores, nil, client.authorizationValue, client.tenantID, "",
 	)
 	if err != nil {
 		return err
 	}
-	if status != http.StatusUnauthorized && status != http.StatusBadRequest {
+	if status != http.StatusUnauthorized && status != http.StatusBadRequest && status != http.StatusForbidden {
 		return fmt.Errorf("missing agent request returned HTTP %d", status)
+	}
+	return requireJSONErrorBody(body, "missing agent request")
+}
+
+func requireErrorResponse(status int, body []byte, expected int, name string) error {
+	if status != expected {
+		return fmt.Errorf("%s returned HTTP %d, want %d", name, status, expected)
+	}
+	return requireJSONErrorBody(body, name)
+}
+
+func requireJSONErrorBody(body []byte, name string) error {
+	var response ErrorResponse
+	if len(body) == 0 || json.Unmarshal(body, &response) != nil || strings.TrimSpace(response.Error) == "" {
+		return fmt.Errorf("%s did not return a JSON error object", name)
 	}
 	return nil
 }

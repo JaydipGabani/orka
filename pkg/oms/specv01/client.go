@@ -71,10 +71,18 @@ func NewClient(target Target) (*Client, error) {
 		return nil, errors.New("authorization value must be a safe Bearer value")
 	}
 	authorization = "Bearer " + rawToken
-	if err := validateIdentity("tenant ID", target.TenantID); err != nil {
+	tenantID := strings.TrimSpace(target.TenantID)
+	agentID := strings.TrimSpace(target.AgentID)
+	if tenantID != target.TenantID {
+		return nil, errors.New("tenant ID must use canonical whitespace-free form")
+	}
+	if agentID != target.AgentID {
+		return nil, errors.New("agent ID must use canonical whitespace-free form")
+	}
+	if err := validateIdentity("tenant ID", tenantID); err != nil {
 		return nil, err
 	}
-	if err := validateIdentity("agent ID", target.AgentID); err != nil {
+	if err := validateIdentity("agent ID", agentID); err != nil {
 		return nil, err
 	}
 	timeout := target.Timeout
@@ -104,7 +112,7 @@ func NewClient(target Target) (*Client, error) {
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Client{
 		baseURL: strings.TrimRight(baseURL.String(), "/"), authorizationValue: authorization,
-		tenantID: target.TenantID, agentID: target.AgentID, http: client,
+		tenantID: tenantID, agentID: agentID, http: client,
 	}, nil
 }
 
@@ -142,7 +150,7 @@ func validateIdentity(name, value string) error {
 
 func (c *Client) Health(ctx context.Context) (*HealthResponse, error) {
 	var response HealthResponse
-	if err := c.doJSON(ctx, http.MethodGet, PathHealth, nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, PathHealth, nil, &response, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return &response, nil
@@ -150,7 +158,7 @@ func (c *Client) Health(ctx context.Context) (*HealthResponse, error) {
 
 func (c *Client) Capabilities(ctx context.Context) (*ProviderCapabilities, error) {
 	var response ProviderCapabilities
-	if err := c.doJSON(ctx, http.MethodGet, PathCapabilities, nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, PathCapabilities, nil, &response, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return &response, nil
@@ -158,7 +166,7 @@ func (c *Client) Capabilities(ctx context.Context) (*ProviderCapabilities, error
 
 func (c *Client) CreateStore(ctx context.Context, request CreateStoreRequest) (*MemoryStore, error) {
 	var response MemoryStore
-	if err := c.doJSON(ctx, http.MethodPost, PathStores, request, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, PathStores, request, &response, http.StatusCreated); err != nil {
 		return nil, err
 	}
 	return &response, nil
@@ -166,7 +174,7 @@ func (c *Client) CreateStore(ctx context.Context, request CreateStoreRequest) (*
 
 func (c *Client) GetStore(ctx context.Context, name string) (*MemoryStore, error) {
 	var response MemoryStore
-	if err := c.doJSON(ctx, http.MethodGet, StorePath(name), nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, StorePath(name), nil, &response, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return &response, nil
@@ -174,7 +182,7 @@ func (c *Client) GetStore(ctx context.Context, name string) (*MemoryStore, error
 
 func (c *Client) ListStores(ctx context.Context) ([]MemoryStore, error) {
 	var response []MemoryStore
-	if err := c.doJSON(ctx, http.MethodGet, PathStores, nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, PathStores, nil, &response, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return response, nil
@@ -182,14 +190,14 @@ func (c *Client) ListStores(ctx context.Context) ([]MemoryStore, error) {
 
 func (c *Client) UpdateStore(ctx context.Context, name string, request UpdateStoreRequest) (*MemoryStore, error) {
 	var response MemoryStore
-	if err := c.doJSON(ctx, http.MethodPatch, StorePath(name), request, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPatch, StorePath(name), request, &response, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return &response, nil
 }
 
 func (c *Client) DeleteStore(ctx context.Context, name string) error {
-	return c.doJSON(ctx, http.MethodDelete, StorePath(name), nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, StorePath(name), nil, nil, http.StatusNoContent)
 }
 
 func (c *Client) CreateMemory(
@@ -202,7 +210,7 @@ func (c *Client) CreateMemory(
 		request.AccessControl.Policy = AccessPrivate
 	}
 	var response MemoryEntry
-	if err := c.doJSON(ctx, http.MethodPost, MemoriesPath(storeName), request, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, MemoriesPath(storeName), request, &response, http.StatusCreated); err != nil {
 		return nil, err
 	}
 	return &response, nil
@@ -210,7 +218,7 @@ func (c *Client) CreateMemory(
 
 func (c *Client) GetMemory(ctx context.Context, storeName, memoryID string) (*MemoryEntry, error) {
 	var response MemoryEntry
-	if err := c.doJSON(ctx, http.MethodGet, MemoryPath(storeName, memoryID), nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, MemoryPath(storeName, memoryID), nil, &response, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return &response, nil
@@ -248,7 +256,7 @@ func (c *Client) ListMemories(ctx context.Context, storeName string, filter List
 		path += "?" + encoded
 	}
 	var response MemoryPage
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return &response, nil
@@ -260,19 +268,21 @@ func (c *Client) UpdateMemory(
 	request UpdateMemoryRequest,
 ) (*MemoryEntry, error) {
 	var response MemoryEntry
-	if err := c.doJSON(ctx, http.MethodPatch, MemoryPath(storeName, memoryID), request, &response); err != nil {
+	if err := c.doJSON(
+		ctx, http.MethodPatch, MemoryPath(storeName, memoryID), request, &response, http.StatusOK,
+	); err != nil {
 		return nil, err
 	}
 	return &response, nil
 }
 
 func (c *Client) DeleteMemory(ctx context.Context, storeName, memoryID string) error {
-	return c.doJSON(ctx, http.MethodDelete, MemoryPath(storeName, memoryID), nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, MemoryPath(storeName, memoryID), nil, nil, http.StatusNoContent)
 }
 
 func (c *Client) Search(ctx context.Context, storeName string, request SearchQuery) ([]SearchResult, error) {
 	var response []SearchResult
-	if err := c.doJSON(ctx, http.MethodPost, SearchPath(storeName), request, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, SearchPath(storeName), request, &response, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return response, nil
@@ -289,7 +299,9 @@ func (c *Client) DoRaw(
 	return c.do(ctx, method, path, body, authorizationValue, tenantID, agentID)
 }
 
-func (c *Client) doJSON(ctx context.Context, method, path string, request, response any) error {
+func (c *Client) doJSON(
+	ctx context.Context, method, path string, request, response any, expectedStatus int,
+) error {
 	var body []byte
 	var err error
 	if request != nil {
@@ -307,7 +319,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, request, respo
 	if err != nil {
 		return err
 	}
-	if status < 200 || status >= 300 {
+	if status != expectedStatus {
 		return &HTTPError{StatusCode: status, Message: http.StatusText(status)}
 	}
 	if response == nil {

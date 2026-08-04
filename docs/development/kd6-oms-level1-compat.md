@@ -56,8 +56,8 @@ Level 2/3 route is included in the Level 1 allowlist.
 - The inbound `Authorization` value, cookies, forwarding headers, and arbitrary
   caller headers are never relayed downstream.
 - Missing or malformed identity fails before any downstream request.
-- Tenant isolation is proven by black-box conformance tests using the same store
-  name in two tenants.
+- Tenant isolation is proven by black-box conformance tests showing that a
+  credential cannot select a tenant other than its configured binding.
 
 ## Required behavior
 
