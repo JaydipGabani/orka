@@ -209,6 +209,10 @@ func childTransactionEffectiveProviderModel(child *corev1alpha1.Task, agent *cor
 	if agent != nil && agent.Spec.Model != nil {
 		if strings.TrimSpace(agent.Spec.Model.Provider) != "" {
 			providerInfo = transactionProviderInfo{Type: agent.Spec.Model.Provider}
+		} else if provider == nil {
+			if providerType := childTransactionOpenCodeModelProvider(agent); providerType != "" {
+				providerInfo = transactionProviderInfo{Type: providerType}
+			}
 		}
 		if strings.TrimSpace(agent.Spec.Model.Name) != "" {
 			model = agent.Spec.Model.Name
@@ -230,6 +234,17 @@ func childTransactionEffectiveProviderModel(child *corev1alpha1.Task, agent *cor
 		}
 	}
 	return providerInfo, model
+}
+
+func childTransactionOpenCodeModelProvider(agent *corev1alpha1.Agent) string {
+	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode || agent.Spec.Model == nil {
+		return ""
+	}
+	provider, model, ok := strings.Cut(strings.TrimSpace(agent.Spec.Model.Name), "/")
+	if !ok || strings.TrimSpace(model) == "" {
+		return ""
+	}
+	return strings.TrimSpace(provider)
 }
 
 func childTransactionFallbackProviderModels(ctx context.Context, k8sClient client.Client, namespace string, agent *corev1alpha1.Agent) []transactionProviderModel {
@@ -646,7 +661,27 @@ func childTransactionEffectiveRuntimePolicy(child *corev1alpha1.Task, agent *cor
 	if child.Spec.AgentRuntime != nil {
 		disallowedTools = append(disallowedTools, child.Spec.AgentRuntime.DisallowedTools...)
 	}
-	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+	if agent == nil || agent.Spec.Runtime == nil {
+		return allowedTools, allowBash
+	}
+	if agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+		switch agent.Spec.Runtime.Type {
+		case corev1alpha1.AgentRuntimeClaude, corev1alpha1.AgentRuntimeCodex, corev1alpha1.AgentRuntimeCopilot:
+			// Preserve a non-empty all-blank allowlist as the existing fail-closed
+			// unrestricted sentinel instead of collapsing it into explicit deny-all.
+			if len(allowedTools) > 0 && !hasNonEmptyTransactionTools(allowedTools) {
+				return allowedTools, allowBash
+			}
+			allowedTools, disallowedTools, allowBash = acp.NormalizeBuiltInRuntimeToolPolicy(
+				string(agent.Spec.Runtime.Type), allowedTools, disallowedTools, allowBash,
+			)
+			allowedTools = acp.BuiltInRuntimeEffectiveAllowedTools(allowedTools, disallowedTools, allowBash)
+			if slices.ContainsFunc(disallowedTools, func(name string) bool {
+				return strings.EqualFold(strings.TrimSpace(name), "Bash")
+			}) {
+				allowBash = false
+			}
+		}
 		return allowedTools, allowBash
 	}
 	workspace := child.Spec.Workspace

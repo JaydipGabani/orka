@@ -158,6 +158,26 @@ func TestValidateChildTaskAgainstParentTransactionRejectsProviderlessChildUnderP
 	}
 }
 
+func TestValidateChildTaskAgainstParentTransactionDerivesOpenCodeProviderFromModelName(t *testing.T) {
+	const model = "openrouter/anthropic/claude-sonnet-4"
+	parent := parentTask()
+	parent.Spec.Transaction.Context = map[string]string{
+		"namespace":        defaultNamespace,
+		"allowedAgents":    `["researcher"]`,
+		"allowedProviders": `["openrouter"]`,
+		"allowedModels":    `["` + model + `"]`,
+	}
+	agent := researcherAgent()
+	agent.Spec.Model = &corev1alpha1.ModelConfig{Name: model}
+	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode}
+	child := childTaskForResearcherAgent()
+	child.Spec.Type = corev1alpha1.TaskTypeAgent
+
+	if err := validateChildTaskAgainstParentTransaction(context.Background(), newFakeClient(agent), parent, child, testResearcherAgentName); err != nil {
+		t.Fatalf("validateChildTaskAgainstParentTransaction() rejected provider-qualified OpenCode model: %v", err)
+	}
+}
+
 func TestValidateChildTaskAgainstParentTransactionRejectsUnrestrictedAgentRuntimeTools(t *testing.T) {
 	parent := parentTask()
 	parent.Spec.Transaction.Context = map[string]string{
@@ -621,6 +641,100 @@ func TestChildTransactionEffectiveRuntimePolicyNormalizesOpenCode(t *testing.T) 
 	tools, _ = childTransactionEffectiveRuntimePolicy(child, agent)
 	if tools == nil || len(tools) != 0 {
 		t.Fatalf("explicit empty task override = %#v, want non-nil empty", tools)
+	}
+}
+
+func TestChildTransactionEffectiveRuntimePolicyNormalizesBuiltInNarrowing(t *testing.T) {
+	allowBash := false
+	runtimes := []corev1alpha1.AgentRuntimeType{
+		corev1alpha1.AgentRuntimeClaude,
+		corev1alpha1.AgentRuntimeCodex,
+		corev1alpha1.AgentRuntimeCopilot,
+	}
+	for _, runtimeType := range runtimes {
+		t.Run(string(runtimeType), func(t *testing.T) {
+			agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{Type: runtimeType}}}
+
+			t.Run("unrestricted remains nil", func(t *testing.T) {
+				tools, bash := childTransactionEffectiveRuntimePolicy(&corev1alpha1.Task{}, agent)
+				if tools != nil || !bash {
+					t.Fatalf("unrestricted policy = %#v allowBash=%v, want nil allowBash=true", tools, bash)
+				}
+			})
+
+			t.Run("explicit empty remains deny all", func(t *testing.T) {
+				child := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+					Type:         corev1alpha1.TaskTypeAgent,
+					AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{}, AllowBash: &allowBash},
+				}}
+				tools, bash := childTransactionEffectiveRuntimePolicy(child, agent)
+				if tools == nil || len(tools) != 0 || bash {
+					t.Fatalf("explicit deny-all policy = %#v allowBash=%v, want non-nil empty allowBash=false", tools, bash)
+				}
+				if err := validateChildToolConstraints(map[string]string{"allowedTools": `[]`}, childTransactionContext{
+					childType: child.Spec.Type, agent: agent, runtimeTools: tools, runtimeBash: bash,
+				}); err != nil {
+					t.Fatalf("explicit deny-all subset rejected: %v", err)
+				}
+			})
+
+			t.Run("deny only expands implicit native tools", func(t *testing.T) {
+				child := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+					Type:         corev1alpha1.TaskTypeAgent,
+					AgentRuntime: &corev1alpha1.AgentRuntimeSpec{DisallowedTools: []string{"Write"}},
+				}}
+				tools, bash := childTransactionEffectiveRuntimePolicy(child, agent)
+				want := []string{"Bash", "Edit", "Glob", "Grep", "Read", "WebFetch", "WebSearch"}
+				if !slices.Equal(tools, want) || !bash {
+					t.Fatalf("deny-only policy = %#v allowBash=%v, want %#v allowBash=true", tools, bash, want)
+				}
+				if err := validateChildToolConstraints(map[string]string{
+					"allowedTools": `["Bash","Edit","Glob","Grep","Read","WebFetch","WebSearch"]`,
+				}, childTransactionContext{
+					childType: child.Spec.Type, agent: agent, runtimeTools: tools, runtimeBash: bash,
+				}); err != nil {
+					t.Fatalf("deny-only subset rejected: %v", err)
+				}
+			})
+
+			t.Run("bash disabled expands implicit native tools", func(t *testing.T) {
+				child := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+					Type:         corev1alpha1.TaskTypeAgent,
+					AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowBash: &allowBash},
+				}}
+				tools, bash := childTransactionEffectiveRuntimePolicy(child, agent)
+				want := []string{"Edit", "Glob", "Grep", "Read", "WebFetch", "WebSearch", "Write"}
+				if !slices.Equal(tools, want) || bash {
+					t.Fatalf("bash-disabled policy = %#v allowBash=%v, want %#v allowBash=false", tools, bash, want)
+				}
+				if err := validateChildToolConstraints(map[string]string{
+					"allowedTools": `["Edit","Glob","Grep","Read","WebFetch","WebSearch","Write"]`,
+				}, childTransactionContext{
+					childType: child.Spec.Type, agent: agent, runtimeTools: tools, runtimeBash: bash,
+				}); err != nil {
+					t.Fatalf("bash-disabled subset rejected: %v", err)
+				}
+			})
+
+			t.Run("disallowed bash is removed before subset checks", func(t *testing.T) {
+				child := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+					Type:         corev1alpha1.TaskTypeAgent,
+					AgentRuntime: &corev1alpha1.AgentRuntimeSpec{DisallowedTools: []string{"bAsH"}},
+				}}
+				tools, bash := childTransactionEffectiveRuntimePolicy(child, agent)
+				want := []string{"Edit", "Glob", "Grep", "Read", "WebFetch", "WebSearch", "Write"}
+				if !slices.Equal(tools, want) || bash {
+					t.Fatalf("bash-denied policy = %#v allowBash=%v, want %#v allowBash=false", tools, bash, want)
+				}
+				if err := validateChildToolConstraints(map[string]string{
+					"allowedTools": `["Edit","Glob","Grep","Read","WebFetch","WebSearch","Write"]`,
+				}, childTransactionContext{
+					childType: child.Spec.Type, agent: agent, runtimeTools: tools, runtimeBash: bash,
+				}); err != nil {
+					t.Fatalf("bash-denied subset rejected: %v", err)
+				}
+			})
+		})
 	}
 }
 
