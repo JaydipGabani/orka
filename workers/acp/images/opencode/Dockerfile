@@ -19,18 +19,23 @@ RUN set -eu; \
         native_url="https://registry.npmjs.org/opencode-linux-x64-baseline/-/opencode-linux-x64-baseline-1.18.9.tgz"; \
         native_sha="59bf22db1f20c6c9836c926800a8e6416228330c2b518ade3d431d315cd76366"; \
         ripgrep_url="https://snapshot.debian.org/file/096560a159a8be70155f16209d91777019011677"; \
+        ripgrep_fallback_url="https://deb.debian.org/debian/pool/main/r/rust-ripgrep/ripgrep_15.2.0-1_amd64.deb"; \
         ripgrep_deb_sha="d9d86586969e925b8627936ec4387d10cc65baf7d42195258743a49e711b6157" ;; \
       arm64) \
         native_url="https://registry.npmjs.org/opencode-linux-arm64/-/opencode-linux-arm64-1.18.9.tgz"; \
         native_sha="4846a7e470797950f209126442a291cc06574fd44ddbb96c89d730017f60aae7"; \
         ripgrep_url="https://snapshot.debian.org/file/482bbe93dc82997d7d84c901990e8d9f4327457c"; \
+        ripgrep_fallback_url="https://deb.debian.org/debian/pool/main/r/rust-ripgrep/ripgrep_15.2.0-1_arm64.deb"; \
         ripgrep_deb_sha="8f18379cd499dd890d27190a359fe194d0bce92d7efad8e47b0f636e64bf4b46" ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     artifact-tool download \
       "$native_url" "$native_sha" /artifacts/opencode-native.tgz 100663296; \
-    artifact-tool download \
-      "$ripgrep_url" "$ripgrep_deb_sha" /artifacts/ripgrep.deb 16777216; \
+    if ! artifact-tool download \
+      "$ripgrep_url" "$ripgrep_deb_sha" /artifacts/ripgrep.deb 16777216; then \
+      artifact-tool download \
+        "$ripgrep_fallback_url" "$ripgrep_deb_sha" /artifacts/ripgrep.deb 16777216; \
+    fi; \
     tar -xzf /artifacts/opencode-source.tgz -C /src --strip-components=1; \
     grep -Eq '"name":[[:space:]]*"opencode"' /src/packages/opencode/package.json; \
     grep -Eq '"version":[[:space:]]*"1\.18\.9"' /src/packages/opencode/package.json; \

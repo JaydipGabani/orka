@@ -38,6 +38,8 @@ func TestDockerfilePinsOpenCodeArtifactsAndRuntime(t *testing.T) {
 		acp.OpenCodeRipgrepLinuxARM64BinarySHA256,
 		"https://snapshot.debian.org/file/096560a159a8be70155f16209d91777019011677",
 		"https://snapshot.debian.org/file/482bbe93dc82997d7d84c901990e8d9f4327457c",
+		"https://deb.debian.org/debian/pool/main/r/rust-ripgrep/ripgrep_15.2.0-1_amd64.deb",
+		"https://deb.debian.org/debian/pool/main/r/rust-ripgrep/ripgrep_15.2.0-1_arm64.deb",
 		acp.OpenCodeRootInstructionSHA256,
 		acp.OpenCodeImageNoticeSHA256,
 		"ORKA_ACP_PROVIDER=opencode",

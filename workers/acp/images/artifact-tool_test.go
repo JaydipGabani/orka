@@ -14,6 +14,7 @@ func TestValidatedURLAllowsPinnedGitHubReleaseRedirects(t *testing.T) {
 		"https://release-assets.githubusercontent.com/github-production-release-asset/object?sig=ephemeral",
 		"https://raw.githubusercontent.com/github/copilot-cli/commit/LICENSE.md",
 		"https://snapshot.debian.org/file/096560a159a8be70155f16209d91777019011677",
+		"https://deb.debian.org/debian/pool/main/r/rust-ripgrep/ripgrep_15.2.0-1_amd64.deb",
 	}
 	for _, rawURL := range accepted {
 		if _, err := validatedURL(rawURL); err != nil {
@@ -34,6 +35,8 @@ func TestValidatedURLAllowsPinnedGitHubReleaseRedirects(t *testing.T) {
 		"https://snapshot.debian.org/file/not-a-digest",
 		"https://snapshot.debian.org/file/096560a159a8be70155f16209d91777019011677/extra",
 		"https://snapshot.debian.org/file/096560a159a8be70155f16209d91777019011677?download=1",
+		"https://deb.debian.org/debian/pool/main/r/other/package.deb",
+		"https://deb.debian.org/debian/pool/main/r/rust-ripgrep/not-ripgrep.txt",
 	}
 	for _, rawURL := range rejected {
 		if _, err := validatedURL(rawURL); err == nil {

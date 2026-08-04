@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -290,6 +291,48 @@ func TestPrepareOpenCodeConfigPreventsDependencyInstall(t *testing.T) {
 	locked := root["dependencies"].(map[string]any)
 	if locked["@opencode-ai/plugin"] != acp.OpenCodeVersion {
 		t.Fatalf("package-lock.json root dependencies = %#v", locked)
+	}
+}
+
+func TestOpenCodeBrokeredPermissionsUseDisjointNativeNamespace(t *testing.T) {
+	policy := harnessv2.MCPToolPolicy{
+		AllowedToolNames: []string{"bash"}, AllowBash: true,
+		Tools: []harnessv2.MCPToolDescriptor{{
+			Name: "bash", Source: harnessv2.MCPToolSourceBrokeredBuiltin, Effect: harnessv2.MCPToolEffectConsequential,
+		}},
+	}
+	permissions, err := openCodeBrokeredPermissions(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !permissions["orka_bash"] {
+		t.Fatalf("brokered Bash permission = %#v, want namespaced allow", permissions)
+	}
+	if _, exists := permissions["bash"]; exists {
+		t.Fatalf("brokered permission overwrote native Bash key: %#v", permissions)
+	}
+}
+
+func TestOpenCodeSessionConfigRejectsCollidingBrokeredPermissionNames(t *testing.T) {
+	paths := acp.SessionPaths{Workspace: "/sessions/private/workspace"}
+	proxy := ProviderProxyBinding{BaseURL: "http://127.0.0.1:43210/_orka/provider/session", Credential: "placeholder"}
+	tools := []harnessv2.MCPToolDescriptor{
+		{Name: "web.search", Source: harnessv2.MCPToolSourceBrokeredCustom, Effect: harnessv2.MCPToolEffectReadOnly, DefinitionDigest: "sha256:" + strings.Repeat("a", 64), InputSchema: json.RawMessage(`{"type":"object"}`)},
+		{Name: "web_search", Source: harnessv2.MCPToolSourceBrokeredBuiltin, Effect: harnessv2.MCPToolEffectReadOnly, InputSchema: json.RawMessage(`{"type":"object"}`)},
+	}
+	slices.SortFunc(tools, func(a, b harnessv2.MCPToolDescriptor) int { return strings.Compare(a.Name, b.Name) })
+	descriptorDigest, err := harnessv2.CanonicalMCPToolDescriptorDigest(tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := harnessv2.MCPToolPolicy{
+		AllowedToolNames: []string{"web.search", "web_search"},
+		Tools:            tools, DescriptorDigest: descriptorDigest,
+	}
+	request := harnessv2.CreateRuntimeSessionRequest{MCPConfiguration: harnessv2.MCPPolicyConfiguration{ToolPolicy: policy}}
+	_, err = openCodeSessionConfig("openai/gpt-test", testOpenCodeModelLimits(), harnessv2.WorkspaceIntentWrite, request, paths, proxy)
+	if err == nil || !strings.Contains(err.Error(), "collide in OpenCode permission name") {
+		t.Fatalf("openCodeSessionConfig() error = %v, want sanitized permission collision rejection", err)
 	}
 }
 

@@ -528,6 +528,21 @@ func TestCreateAgentTool_Execute_RejectsModelLimitsForNonOpenCodeBuiltIns(t *tes
 	}
 }
 
+func TestNormalizedCreateAgentModelAcceptsQualifiedIDWithNestedSlashes(t *testing.T) {
+	contextWindow := int32(32768)
+	maxTokens := int32(4096)
+	got, err := normalizedCreateAgentModel(
+		&RuntimeArgs{Type: string(corev1alpha1.AgentRuntimeOpencode)},
+		&ModelArgs{Name: "openrouter/anthropic/claude-sonnet-4", ContextWindow: &contextWindow, MaxTokens: &maxTokens},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "openrouter/anthropic/claude-sonnet-4" {
+		t.Fatalf("normalized model = %q, want full provider-scoped ID", got)
+	}
+}
+
 func TestCreateAgentTool_Execute_UsesBuiltInOpenCode(t *testing.T) {
 	t.Setenv(envOrkaTaskName, parentTaskName)
 	t.Setenv(envOrkaTaskNamespace, defaultNamespace)
@@ -611,13 +626,14 @@ func TestCreateAgentTool_Execute_RejectsOpenCodeSystemPrompt(t *testing.T) {
 
 func TestCreateAgentTool_Execute_RejectsInvalidOpenCodeConfiguration(t *testing.T) {
 	for name, args := range map[string]string{
-		"missing model":   `{"role":"coder","runtime":{"type":"opencode"}}`,
-		"bare model":      `{"role":"coder","model":{"name":"gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
-		"substitution":    `{"role":"coder","model":{"name":"{env:PROVIDER}/gpt","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
-		"missing context": `{"role":"coder","model":{"name":"openai/gpt-5.4","maxTokens":4096},"runtime":{"type":"opencode"}}`,
-		"missing output":  `{"role":"coder","model":{"name":"openai/gpt-5.4","contextWindow":32768},"runtime":{"type":"opencode"}}`,
-		"inverted limits": `{"role":"coder","model":{"name":"openai/gpt-5.4","contextWindow":4096,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
-		"legacy secret":   `{"role":"coder","model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode","secretRef":"legacy"}}`,
+		"missing model":     `{"role":"coder","runtime":{"type":"opencode"}}`,
+		"bare model":        `{"role":"coder","model":{"name":"gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"substitution":      `{"role":"coder","model":{"name":"{env:PROVIDER}/gpt","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"provider conflict": `{"role":"coder","model":{"provider":"anthropic","name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"missing context":   `{"role":"coder","model":{"name":"openai/gpt-5.4","maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"missing output":    `{"role":"coder","model":{"name":"openai/gpt-5.4","contextWindow":32768},"runtime":{"type":"opencode"}}`,
+		"inverted limits":   `{"role":"coder","model":{"name":"openai/gpt-5.4","contextWindow":4096,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"legacy secret":     `{"role":"coder","model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode","secretRef":"legacy"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(envOrkaTaskName, parentTaskName)

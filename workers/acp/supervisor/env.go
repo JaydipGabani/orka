@@ -317,7 +317,7 @@ func providerSessionPolicy(
 		return providerNativePolicy{}, fmt.Errorf("provider session configuration does not match runtime profile")
 	}
 	toolPolicy := request.MCPConfiguration.ToolPolicy
-	unrestricted := toolPolicy.AllowedToolNames == nil && toolPolicy.DisallowedToolNames == nil && toolPolicy.AllowBash
+	unrestricted := toolPolicy.AllowedToolNames == nil && len(toolPolicy.DisallowedToolNames) == 0 && toolPolicy.AllowBash
 	policy := providerNativePolicy{unrestricted: unrestricted, allowed: make(map[string]struct{}, len(providerNativeToolNames))}
 	for _, descriptor := range toolPolicy.Tools {
 		if descriptor.Source != harnessv2.MCPToolSourceProviderNative {
@@ -710,7 +710,11 @@ func openCodeSessionConfig(
 	for _, permission := range []string{"apply_patch", "edit", "write"} {
 		permissions[permission] = mutationAction
 	}
-	for permission, allowed := range openCodeBrokeredPermissions(toolPolicy) {
+	brokeredPermissions, err := openCodeBrokeredPermissions(toolPolicy)
+	if err != nil {
+		return nil, err
+	}
+	for permission, allowed := range brokeredPermissions {
 		if allowed {
 			permissions[permission] = openCodePermissionAllow
 		} else {
@@ -770,12 +774,15 @@ func openCodeSessionConfig(
 	})
 }
 
-func openCodeBrokeredPermissions(policy harnessv2.MCPToolPolicy) map[string]bool {
+func openCodeBrokeredPermissions(policy harnessv2.MCPToolPolicy) (map[string]bool, error) {
 	permissions := make(map[string]bool)
+	owners := make(map[string]string)
 	for _, descriptor := range policy.Tools {
 		if !descriptor.Source.Brokered() {
 			continue
 		}
+		// OpenCode prefixes tools from the controller MCP server with `orka_`,
+		// keeping brokered permissions disjoint from unprefixed native keys.
 		name := "orka_" + strings.Map(func(value rune) rune {
 			if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' ||
 				value >= '0' && value <= '9' || value == '_' || value == '-' {
@@ -783,14 +790,13 @@ func openCodeBrokeredPermissions(policy harnessv2.MCPToolPolicy) map[string]bool
 			}
 			return '_'
 		}, descriptor.Name)
-		allowed := openCodeToolPolicyAllows(policy, descriptor.Name)
-		if existing, ok := permissions[name]; ok {
-			permissions[name] = existing && allowed
-			continue
+		if owner, exists := owners[name]; exists && owner != descriptor.Name {
+			return nil, fmt.Errorf("brokered tools %q and %q collide in OpenCode permission name %q", owner, descriptor.Name, name)
 		}
-		permissions[name] = allowed
+		owners[name] = descriptor.Name
+		permissions[name] = openCodeToolPolicyAllows(policy, descriptor.Name)
 	}
-	return permissions
+	return permissions, nil
 }
 
 // openCodeMutationPolicyAllows consumes the controller-normalized mutation

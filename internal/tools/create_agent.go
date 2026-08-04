@@ -129,7 +129,7 @@ func (t *CreateAgentTool) Parameters() json.RawMessage {
 				"properties": {
 					"provider": {
 						"type": "string",
-						"description": "LLM provider (e.g. anthropic, openai)"
+						"description": "LLM provider (e.g. anthropic, openai). For OpenCode, use only with a provider-relative bare model name; omit it when model.name already contains the full provider/model ID."
 					},
 					"name": {
 						"type": "string",
@@ -251,19 +251,26 @@ func normalizedCreateAgentModel(runtime *RuntimeArgs, model *ModelArgs) (string,
 	if requested == "" {
 		return "", fmt.Errorf("model.name is required for opencode runtime")
 	}
-	provider := strings.TrimSpace(model.Provider)
-	composed := requested
-	if provider != "" {
-		prefix := strings.TrimSuffix(provider, "/") + "/"
-		if !strings.HasPrefix(composed, prefix) {
-			composed = prefix + strings.TrimPrefix(composed, "/")
-		}
+	providerHint := strings.Trim(strings.TrimSpace(model.Provider), "/")
+	if strings.ContainsAny(requested, "{}") || strings.ContainsAny(providerHint, "{}") {
+		return "", fmt.Errorf("model.name for opencode runtime must not contain substitution braces")
 	}
+	providerID, modelID, qualified := strings.Cut(requested, "/")
+	if qualified {
+		providerID = strings.TrimSpace(providerID)
+		modelID = strings.TrimSpace(modelID)
+		if providerHint != "" && providerHint != providerID {
+			return "", fmt.Errorf("model.provider %q does not match provider %q in model.name for opencode runtime", providerHint, providerID)
+		}
+	} else {
+		providerID = providerHint
+		modelID = requested
+	}
+	composed := providerID + "/" + modelID
 	if strings.ContainsAny(composed, "{}") {
 		return "", fmt.Errorf("model.name for opencode runtime must not contain substitution braces")
 	}
-	providerID, modelID, ok := strings.Cut(composed, "/")
-	if !ok || strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "" {
+	if providerID == "" || modelID == "" {
 		return "", fmt.Errorf("model.name for opencode runtime must use provider/model form")
 	}
 	if model.ContextWindow == nil || *model.ContextWindow <= 0 {

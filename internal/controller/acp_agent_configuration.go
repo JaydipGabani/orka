@@ -194,7 +194,7 @@ func effectiveACPReasoningEffort(agent *corev1alpha1.Agent) string {
 }
 
 func validateACPProviderNativePolicy(provider string, allowed, disallowed []string, allowBash bool) error {
-	unrestricted := allowed == nil && disallowed == nil && allowBash
+	unrestricted := allowed == nil && len(disallowed) == 0 && allowBash
 	switch provider {
 	case string(corev1alpha1.AgentRuntimeClaude):
 		return nil

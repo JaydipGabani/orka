@@ -24,6 +24,7 @@ import (
 
 var allowedDownloadHosts = map[string]struct{}{
 	"codeload.github.com":                  {},
+	"deb.debian.org":                       {},
 	"github.com":                           {},
 	"raw.githubusercontent.com":            {},
 	"registry.npmjs.org":                   {},
@@ -188,6 +189,11 @@ func validatedURL(rawURL string) (*url.URL, error) {
 	case "release-assets.githubusercontent.com":
 		if !strings.HasPrefix(parsed.EscapedPath(), "/github-production-release-asset/") {
 			return nil, errors.New("GitHub release asset path is not allowlisted")
+		}
+	case "deb.debian.org":
+		if !strings.HasPrefix(parsed.EscapedPath(), "/debian/pool/main/r/rust-ripgrep/ripgrep_") ||
+			!strings.HasSuffix(parsed.EscapedPath(), ".deb") {
+			return nil, errors.New("debian ripgrep package path is not allowlisted")
 		}
 	case "snapshot.debian.org":
 		fileID := strings.TrimPrefix(parsed.EscapedPath(), "/file/")

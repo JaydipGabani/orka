@@ -154,6 +154,32 @@ func TestPlanACPRuntimeHashesNormalizedDenyOnlyProviderNativePolicy(t *testing.T
 	}
 }
 
+func TestPlanACPRuntimeTreatsExplicitEmptyDisallowedAsUnrestricted(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		runtime corev1alpha1.AgentRuntimeType
+		images  ACPRuntimeImages
+	}{
+		{name: "codex", runtime: corev1alpha1.AgentRuntimeCodex, images: ACPRuntimeImages{Codex: "docker.io/example/codex@sha256:" + strings.Repeat("a", 64)}},
+		{name: "claude", runtime: corev1alpha1.AgentRuntimeClaude, images: ACPRuntimeImages{Claude: "docker.io/example/claude@sha256:" + strings.Repeat("b", 64)}},
+		{name: "copilot", runtime: corev1alpha1.AgentRuntimeCopilot, images: ACPRuntimeImages{Copilot: "docker.io/example/copilot@sha256:" + strings.Repeat("c", 64)}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+				Type:         corev1alpha1.TaskTypeAgent,
+				AgentRuntime: &corev1alpha1.AgentRuntimeSpec{DisallowedTools: []string{}},
+			}}
+			agent := &corev1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID("agent-uid"), Generation: 1},
+				Spec:       corev1alpha1.AgentSpec{Model: &corev1alpha1.ModelConfig{Name: acpTestModel}, Runtime: &corev1alpha1.AgentCLIRuntime{Type: tt.runtime}},
+			}
+			if _, err := PlanACPRuntime(task, agent, tt.images); err != nil {
+				t.Fatalf("PlanACPRuntime() rejected explicit deny-none policy: %v", err)
+			}
+		})
+	}
+}
+
 func TestPlanACPRuntimeRejectsCodexExplicitEmptyProviderNativePolicy(t *testing.T) {
 	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
 		Type: corev1alpha1.TaskTypeAgent,
@@ -410,6 +436,12 @@ func TestPlanACPRuntimeOpenCodeUsesNativeACPImage(t *testing.T) {
 	fallbackAgent.Spec.Model.Fallbacks = []corev1alpha1.ModelFallback{{ProviderRef: "fallback-provider", Model: "fallback-model"}}
 	if _, err := PlanACPRuntime(task, fallbackAgent, ACPRuntimeImages{Opencode: image}); err == nil || !strings.Contains(err.Error(), "spec.model.fallbacks") {
 		t.Fatalf("OpenCode fallbacks error = %v, want unsupported fallbacks rejection", err)
+	}
+
+	providerRefAgent := agent.DeepCopy()
+	providerRefAgent.Spec.ProviderRef = &corev1alpha1.ProviderReference{Name: "allowed-provider"}
+	if _, err := PlanACPRuntime(task, providerRefAgent, ACPRuntimeImages{Opencode: image}); err == nil || !strings.Contains(err.Error(), "does not accept spec.providerRef") {
+		t.Fatalf("OpenCode providerRef error = %v, want providerRef rejection", err)
 	}
 
 	changedAgent := agent.DeepCopy()

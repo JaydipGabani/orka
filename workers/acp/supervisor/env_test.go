@@ -267,6 +267,15 @@ func TestProviderSessionPolicyDistinguishesOmittedAndExplicitEmptyToolPolicies(t
 			if policy.unrestricted {
 				t.Fatal("explicit-empty provider-native tool policy was unrestricted")
 			}
+
+			emptyDisallowed := testProviderProjectionRequest(t, test.provider, test.model, "", "", nil, []string{}, true)
+			policy, err = providerSessionPolicy(emptyDisallowed, test.provider, test.model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !policy.unrestricted {
+				t.Fatal("explicit-empty disallowlist was not treated as deny-none")
+			}
 		})
 	}
 }
