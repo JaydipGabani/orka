@@ -208,7 +208,7 @@ var _ = Describe("Live Agent Runtime Matrix", Ordered, func() {
 		})
 
 		By("creating an OpenCode agent with native mutation and shell tools requested")
-		err := applyManifestJSON(runtimeAgentManifest(opencodeAgentName, "opencode", opencodeModel, 5, true))
+		err := applyManifestJSON(runtimeAgentManifest(opencodeAgentName, "opencode", opencodeModel, 5, boolPtr(true)))
 		Expect(err).NotTo(HaveOccurred())
 
 		By("creating a read-intent OpenCode task that attempts forbidden mutation before reading")
