@@ -28,6 +28,7 @@ var allowedDownloadHosts = map[string]struct{}{
 	"raw.githubusercontent.com":            {},
 	"registry.npmjs.org":                   {},
 	"release-assets.githubusercontent.com": {},
+	"snapshot.debian.org":                  {},
 }
 
 var allowedDownloadQueryHosts = map[string]struct{}{
@@ -187,6 +188,12 @@ func validatedURL(rawURL string) (*url.URL, error) {
 	case "release-assets.githubusercontent.com":
 		if !strings.HasPrefix(parsed.EscapedPath(), "/github-production-release-asset/") {
 			return nil, errors.New("GitHub release asset path is not allowlisted")
+		}
+	case "snapshot.debian.org":
+		fileID := strings.TrimPrefix(parsed.EscapedPath(), "/file/")
+		decoded, decodeErr := hex.DecodeString(fileID)
+		if decodeErr != nil || len(decoded) != 20 || parsed.EscapedPath() != "/file/"+fileID {
+			return nil, errors.New("debian snapshot file path is not allowlisted")
 		}
 	}
 	return parsed, nil

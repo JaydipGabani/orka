@@ -13,6 +13,7 @@ func TestValidatedURLAllowsPinnedGitHubReleaseRedirects(t *testing.T) {
 		"https://github.com/github/copilot-cli/releases/download/v1.0.74/copilot-linux-x64.tar.gz",
 		"https://release-assets.githubusercontent.com/github-production-release-asset/object?sig=ephemeral",
 		"https://raw.githubusercontent.com/github/copilot-cli/commit/LICENSE.md",
+		"https://snapshot.debian.org/file/096560a159a8be70155f16209d91777019011677",
 	}
 	for _, rawURL := range accepted {
 		if _, err := validatedURL(rawURL); err != nil {
@@ -30,6 +31,9 @@ func TestValidatedURLAllowsPinnedGitHubReleaseRedirects(t *testing.T) {
 		"https://github.com/github/copilot-cli/releases/download/%2e%2e/%2e%2e/a",
 		"https://github.com/github/copilot-cli/releases/download/a%2Fb",
 		"https://user@github.com/github/copilot-cli/releases/download/v1/copilot.tar.gz",
+		"https://snapshot.debian.org/file/not-a-digest",
+		"https://snapshot.debian.org/file/096560a159a8be70155f16209d91777019011677/extra",
+		"https://snapshot.debian.org/file/096560a159a8be70155f16209d91777019011677?download=1",
 	}
 	for _, rawURL := range rejected {
 		if _, err := validatedURL(rawURL); err == nil {
