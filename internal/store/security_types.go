@@ -145,6 +145,13 @@ func LegacyScanQuality() ScanQuality {
 	}
 }
 
+// RepositoryScanIdentity identifies one immutable RepositoryScan incarnation.
+type RepositoryScanIdentity struct {
+	Name       string
+	UID        string
+	Generation int64
+}
+
 // ScanRun represents a single repository security scan execution.
 type ScanRun struct {
 	ID                       string      `json:"id"`

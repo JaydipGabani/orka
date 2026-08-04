@@ -193,14 +193,14 @@ func TestSecurityRunTaskInputRejectsInvalidAndOversizedInput(t *testing.T) {
 	}
 }
 
-func TestCreateScanRunWithTaskInputRollsBackInputOnRunConflict(t *testing.T) {
+func TestCreateScanRunWithTaskInputReservesRepositoryAcrossRequestKeys(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
-	requestKey := "req_" + strings.Repeat("a", 64)
+	firstRequestKey := "req_" + strings.Repeat("a", 64)
 	firstRun := &store.ScanRun{
 		ID: "scan_first", RunUID: testSecurityRunTaskInputUID, Namespace: "ns", RepositoryScan: "repo",
 		RepositoryScanUID: "repo-uid", RepositoryScanGeneration: 1, TaskName: "task-first",
-		Mode: "manual", Phase: "pending", RequestIdempotencyKey: requestKey, IdempotencyKey: requestKey,
+		Mode: "manual", Phase: "pending", RequestIdempotencyKey: firstRequestKey, IdempotencyKey: firstRequestKey,
 		StartedAt: time.Now().UTC(), Quality: store.LegacyScanQuality(),
 	}
 	firstInput := testSecurityRunTaskInput()
@@ -210,10 +210,13 @@ func TestCreateScanRunWithTaskInputRollsBackInputOnRunConflict(t *testing.T) {
 	}
 
 	secondUID := "run_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	secondRequestKey := "req_" + strings.Repeat("b", 64)
 	secondRun := *firstRun
 	secondRun.ID = "scan_second"
 	secondRun.RunUID = secondUID
 	secondRun.TaskName = "task-second"
+	secondRun.RequestIdempotencyKey = secondRequestKey
+	secondRun.IdempotencyKey = secondRequestKey
 	secondRun.StartedAt = firstRun.StartedAt.Add(time.Second)
 	secondInput := *firstInput
 	secondInput.RunUID = secondUID
@@ -226,12 +229,27 @@ func TestCreateScanRunWithTaskInputRollsBackInputOnRunConflict(t *testing.T) {
 	if _, err := s.GetSecurityRunTaskInput(ctx, secondInput.Namespace, secondUID, secondInput.Stage); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("GetSecurityRunTaskInput(conflicting run) error = %v, want ErrNotFound", err)
 	}
+
+	completed, err := s.GetScanRun(ctx, firstRun.Namespace, firstRun.ID)
+	if err != nil {
+		t.Fatalf("GetScanRun(first) error = %v", err)
+	}
+	now := time.Now().UTC()
+	completed.Phase = "succeeded"
+	completed.CompletedAt = &now
+	if err := s.UpdateScanRun(ctx, completed); err != nil {
+		t.Fatalf("UpdateScanRun(first terminal) error = %v", err)
+	}
+	if err := s.CreateScanRunWithTaskInput(ctx, &secondRun, &secondInput); err != nil {
+		t.Fatalf("CreateScanRunWithTaskInput(after terminal) error = %v", err)
+	}
+
 	runs, _, err := s.ListScanRuns(ctx, firstRun.Namespace, firstRun.RepositoryScan, 10, "")
 	if err != nil {
 		t.Fatalf("ListScanRuns() error = %v", err)
 	}
-	if len(runs) != 1 || runs[0].ID != firstRun.ID {
-		t.Fatalf("runs = %#v, want first run only", runs)
+	if len(runs) != 2 {
+		t.Fatalf("runs = %#v, want both sequential repository runs", runs)
 	}
 }
 
@@ -305,14 +323,14 @@ func TestCreateScanRunWithTaskInputRequiresPendingInitialState(t *testing.T) {
 	}
 }
 
-func TestActiveRequestIndexRetainsSealingRunUntilTerminalBundleState(t *testing.T) {
+func TestActiveRepositoryIndexRetainsSealingRunUntilTerminalBundleState(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
-	requestKey := "req_sealing"
+	firstRequestKey := "req_sealing_first"
 	sealingRun := &store.ScanRun{
 		ID: "scan-sealing", RunUID: testSecurityRunTaskInputUID, Namespace: "ns", RepositoryScan: "repo",
 		RepositoryScanUID: "repo-uid", RepositoryScanGeneration: 1, TaskName: "task-sealing",
-		Mode: "manual", Phase: "succeeded", RequestIdempotencyKey: requestKey, IdempotencyKey: requestKey,
+		Mode: "manual", Phase: "succeeded", RequestIdempotencyKey: firstRequestKey, IdempotencyKey: firstRequestKey,
 		StartedAt: time.Now().UTC(), Quality: store.LegacyScanQuality(),
 	}
 	sealingRun.Quality.BundleStatus = store.BundleStatusSealing
@@ -324,7 +342,7 @@ func TestActiveRequestIndexRetainsSealingRunUntilTerminalBundleState(t *testing.
 	secondRun := &store.ScanRun{
 		ID: "scan-second", RunUID: secondUID, Namespace: "ns", RepositoryScan: "repo",
 		RepositoryScanUID: "repo-uid", RepositoryScanGeneration: 1, TaskName: "task-second",
-		Mode: "manual", Phase: "pending", RequestIdempotencyKey: requestKey, IdempotencyKey: requestKey,
+		Mode: "manual", Phase: "pending", RequestIdempotencyKey: "req_sealing_second", IdempotencyKey: "req_sealing_second",
 		StartedAt: sealingRun.StartedAt.Add(time.Second), Quality: store.LegacyScanQuality(),
 	}
 	secondInput := testSecurityRunTaskInput()
@@ -347,10 +365,10 @@ func TestActiveRequestIndexRetainsSealingRunUntilTerminalBundleState(t *testing.
 	}
 
 	var indexSQL string
-	if err := s.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_security_scan_runs_active_request'`).Scan(&indexSQL); err != nil {
-		t.Fatalf("load active-request index: %v", err)
+	if err := s.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_security_scan_runs_active_repository'`).Scan(&indexSQL); err != nil {
+		t.Fatalf("load active-repository index: %v", err)
 	}
 	if !strings.Contains(indexSQL, "bundle_status = 'sealing'") {
-		t.Fatalf("active-request index = %q, want sealing predicate", indexSQL)
+		t.Fatalf("active-repository index = %q, want sealing predicate", indexSQL)
 	}
 }

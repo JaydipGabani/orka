@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -19,6 +20,69 @@ import (
 	"github.com/orka-agents/orka/internal/store"
 	sqlitestore "github.com/orka-agents/orka/internal/store/sqlite"
 )
+
+func TestTaskSecurityIDsUseExactEnvironmentBindings(t *testing.T) {
+	findingID := "fnd_" + strings.Repeat("a", 64)
+	occurrenceID := "occ_" + strings.Repeat("b", 64)
+	valid := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+			labels.LabelSecurityFindingID:    labels.SelectorValue(findingID),
+			labels.LabelSecurityOccurrenceID: labels.SelectorValue(occurrenceID),
+		}},
+		Spec: corev1alpha1.TaskSpec{Env: []corev1.EnvVar{
+			{Name: security.EnvFindingID, Value: findingID},
+			{Name: security.EnvOccurrenceID, Value: occurrenceID},
+		}},
+	}
+	gotFinding, err := taskSecurityFindingID(valid)
+	if err != nil || gotFinding != findingID {
+		t.Fatalf("taskSecurityFindingID() = (%q, %v), want exact ID", gotFinding, err)
+	}
+	gotOccurrence, err := taskSecurityOccurrenceID(valid)
+	if err != nil || gotOccurrence != occurrenceID {
+		t.Fatalf("taskSecurityOccurrenceID() = (%q, %v), want exact ID", gotOccurrence, err)
+	}
+	kind, scopeID, err := securityTaskScope(valid)
+	if err != nil || kind != "occurrence" || scopeID != occurrenceID {
+		t.Fatalf("securityTaskScope() = (%q, %q, %v)", kind, scopeID, err)
+	}
+
+	legacy := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		labels.LabelSecurityFindingID: "legacy-finding",
+	}}}
+	if got, err := taskSecurityFindingID(legacy); err != nil || got != "legacy-finding" {
+		t.Fatalf("legacy taskSecurityFindingID() = (%q, %v)", got, err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*corev1alpha1.Task)
+	}{
+		{name: "mismatched label", mutate: func(task *corev1alpha1.Task) {
+			task.Labels[labels.LabelSecurityFindingID] = labels.SelectorValue("fnd_" + strings.Repeat("c", 64))
+		}},
+		{name: "duplicate environment", mutate: func(task *corev1alpha1.Task) {
+			task.Spec.Env = append(task.Spec.Env, corev1.EnvVar{Name: security.EnvFindingID, Value: findingID})
+		}},
+		{name: "value from environment", mutate: func(task *corev1alpha1.Task) {
+			for i := range task.Spec.Env {
+				if task.Spec.Env[i].Name == security.EnvFindingID {
+					task.Spec.Env[i].Value = ""
+					task.Spec.Env[i].ValueFrom = &corev1.EnvVarSource{}
+				}
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := valid.DeepCopy()
+			tt.mutate(task)
+			if _, err := taskSecurityFindingID(task); err == nil {
+				t.Fatal("taskSecurityFindingID() error = nil, want fail-closed rejection")
+			}
+		})
+	}
+}
 
 func TestCreateOrValidateSecurityTaskRejectsForgedExistingTask(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -478,5 +542,42 @@ func TestLegacyMapperStageReceiptBindingIgnoresLaterRunProjection(t *testing.T) 
 			secondExpected, secondObserved, secondTargetReceipt,
 			firstExpected, firstObserved, firstTargetReceipt,
 		)
+	}
+}
+
+func TestHasActiveValidationTaskIgnoresUncontrolledMalformedBinding(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	const findingID = "fnd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "repo", Namespace: "ns", UID: types.UID("scan-uid")},
+	}
+	uncontrolled := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "forged-validation", Namespace: scan.Namespace,
+			Labels: map[string]string{
+				labels.LabelSecurityTarget:    labels.SelectorValue(scan.Name),
+				labels.LabelSecurityFindingID: labels.SelectorValue(findingID),
+				labels.LabelSecurityStage:     security.StageValidation,
+			},
+		},
+		Spec: corev1alpha1.TaskSpec{Env: []corev1.EnvVar{
+			{Name: security.EnvFindingID, Value: findingID},
+			{Name: security.EnvFindingID, Value: findingID},
+		}},
+		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseRunning},
+	}
+	r := &RepositoryScanReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, uncontrolled).Build(),
+		Scheme: scheme,
+	}
+	active, err := r.hasActiveValidationTask(context.Background(), scan, findingID)
+	if err != nil {
+		t.Fatalf("hasActiveValidationTask() error = %v", err)
+	}
+	if active {
+		t.Fatal("hasActiveValidationTask() = true for uncontrolled task")
 	}
 }

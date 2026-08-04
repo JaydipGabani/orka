@@ -941,8 +941,8 @@ func (h *Handlers) createSecurityValidationTask(ctx context.Context, ui *UserInf
 				labels.LabelSecurityScanID:       finding.ScanRunID,
 				labels.LabelSecurityMode:         security.StageValidation,
 				labels.LabelSecurityStage:        security.StageValidation,
-				labels.LabelSecurityFindingID:    finding.ID,
-				labels.LabelSecurityOccurrenceID: finding.CurrentOccurrenceID,
+				labels.LabelSecurityFindingID:    labels.SelectorValue(finding.ID),
+				labels.LabelSecurityOccurrenceID: labels.SelectorValue(finding.CurrentOccurrenceID),
 			},
 			OwnerReferences: []metav1.OwnerReference{h.ownerRefForRepositoryScan(scan)},
 		},
@@ -1205,8 +1205,8 @@ func (h *Handlers) createSecurityPatchTask(ctx context.Context, ui *UserInfo, sc
 				labels.LabelSecurityScanID:       finding.ScanRunID,
 				labels.LabelSecurityMode:         "patch",
 				labels.LabelSecurityStage:        security.StagePatch,
-				labels.LabelSecurityFindingID:    finding.ID,
-				labels.LabelSecurityOccurrenceID: finding.CurrentOccurrenceID,
+				labels.LabelSecurityFindingID:    labels.SelectorValue(finding.ID),
+				labels.LabelSecurityOccurrenceID: labels.SelectorValue(finding.CurrentOccurrenceID),
 			},
 			OwnerReferences: []metav1.OwnerReference{h.ownerRefForRepositoryScan(scan)},
 		},
@@ -1271,6 +1271,12 @@ func (h *Handlers) createSecurityPatchTask(ctx context.Context, ui *UserInfo, sc
 	return proposal, nil
 }
 
+type repositoryScanListResponse struct {
+	Items          []corev1alpha1.RepositoryScan `json:"items"`
+	LatestScanRuns *[]store.ScanRun              `json:"latestScanRuns,omitempty"`
+	Metadata       ListMeta                      `json:"metadata"`
+}
+
 // ListRepositoryScans lists configured repository scans.
 func (h *Handlers) ListRepositoryScans(c fiber.Ctx) error {
 	namespace, err := h.resolveNamespace(c, c.Query("namespace", ""))
@@ -1314,8 +1320,33 @@ func (h *Handlers) ListRepositoryScans(c fiber.Ctx) error {
 		remainingItemCount = nil
 	}
 
-	return c.JSON(ListResponse{
-		Items: items,
+	var latestScanRuns *[]store.ScanRun
+	if c.Query("includeLatestRuns") == queryTrue {
+		if err := h.ensureSecurityStore(); err != nil {
+			return err
+		}
+		identities := make([]store.RepositoryScanIdentity, 0, len(items))
+		for i := range items {
+			if items[i].UID == "" || items[i].Generation <= 0 {
+				continue
+			}
+			identities = append(identities, store.RepositoryScanIdentity{
+				Name: items[i].Name, UID: string(items[i].UID), Generation: items[i].Generation,
+			})
+		}
+		runs, err := h.securityStore.ListLatestScanRuns(c.Context(), namespace, identities)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list latest security scan runs: %v", err))
+		}
+		if runs == nil {
+			runs = []store.ScanRun{}
+		}
+		latestScanRuns = &runs
+	}
+
+	return c.JSON(repositoryScanListResponse{
+		Items:          items,
+		LatestScanRuns: latestScanRuns,
 		Metadata: ListMeta{
 			Continue:           list.Continue,
 			RemainingItemCount: remainingItemCount,
@@ -2232,20 +2263,24 @@ const (
 	findingHistoryScanBudget      = 2000
 )
 
-func parseFindingHistoryPagination(c fiber.Ctx) (*Pagination, error) {
+type findingHistoryPagination struct {
+	Limit    int
+	Continue string
+}
+
+func parseFindingHistoryPagination(c fiber.Ctx) (*findingHistoryPagination, error) {
 	rawLimit := c.Query("limit", findingHistoryDefaultLimit)
-	pagination, err := ParsePagination(rawLimit, c.Query("cursor"))
-	if err != nil {
-		return nil, err
-	}
-	requestedLimit, err := strconv.ParseInt(rawLimit, 10, 64)
+	limit, err := strconv.Atoi(rawLimit)
 	if err != nil {
 		return nil, fmt.Errorf("invalid limit parameter: %w", err)
 	}
-	if requestedLimit > int64(MaxLimit) {
+	if limit < 1 {
+		return nil, fmt.Errorf("limit must be at least 1")
+	}
+	if limit > MaxLimit {
 		return nil, fmt.Errorf("limit must not exceed %d", MaxLimit)
 	}
-	return pagination, nil
+	return &findingHistoryPagination{Limit: limit, Continue: c.Query("cursor")}, nil
 }
 
 // listAuthorizedFindingHistory returns up to limit authorized records while
@@ -2349,7 +2384,7 @@ func (h *Handlers) ListSecurityFindingOccurrences(c fiber.Ctx) error {
 	finding := authorized.finding
 	runAuthorization := make(map[string]bool)
 	items, next, err := listAuthorizedFindingHistory(
-		int(pagination.Limit),
+		pagination.Limit,
 		pagination.Continue,
 		func(limit int, cursor string) ([]store.FindingOccurrence, string, error) {
 			return h.securityIntegrityStore.ListFindingOccurrences(c.Context(), store.FindingOccurrenceFilter{
@@ -2384,7 +2419,7 @@ func (h *Handlers) ListSecurityFindingDecisions(c fiber.Ctx) error {
 	runAuthorization := make(map[string]bool)
 	occurrences := make(map[string]*store.FindingOccurrence)
 	items, next, err := listAuthorizedFindingHistory(
-		int(pagination.Limit),
+		pagination.Limit,
 		pagination.Continue,
 		func(limit int, cursor string) ([]store.FindingDecision, string, error) {
 			return h.securityIntegrityStore.ListFindingDecisions(c.Context(), store.FindingDecisionFilter{
@@ -2439,7 +2474,7 @@ func (h *Handlers) ListSecurityFindingAssessments(c fiber.Ctx) error {
 	finding := authorized.finding
 	runAuthorization := make(map[string]bool)
 	items, next, err := listAuthorizedFindingHistory(
-		int(pagination.Limit),
+		pagination.Limit,
 		pagination.Continue,
 		func(limit int, cursor string) ([]store.FindingAssessment, string, error) {
 			return h.securityIntegrityStore.ListFindingAssessments(c.Context(), store.FindingAssessmentFilter{

@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 const mockUseRepositoryScans = vi.fn();
 const mockUseRunSecurityScan = vi.fn();
-const mockUseScanRuns = vi.fn();
 
 vi.mock("@tanstack/react-router", async () => {
   const actual = await vi.importActual("@tanstack/react-router");
@@ -23,10 +22,9 @@ vi.mock("@tanstack/react-router", async () => {
 vi.mock("@/hooks/use-security", () => ({
   useRepositoryScans: () => mockUseRepositoryScans(),
   useRunSecurityScan: (...args: unknown[]) => mockUseRunSecurityScan(...args),
-  useScanRuns: (...args: unknown[]) => mockUseScanRuns(...args),
 }));
 
-import { act, fireEvent, render, screen } from "@/test/test-utils";
+import { act, fireEvent, render, screen, within } from "@/test/test-utils";
 import type { RepositoryScan, ScanRun } from "@/schemas/security";
 import { RepositoryList } from "./repository-list";
 
@@ -150,18 +148,22 @@ function settledScanRuns(item: RepositoryScan, run = latestScanRun(item)) {
 
 function renderRepository(
   item: RepositoryScan,
-  scanRunsResult: Record<string, unknown> = settledScanRuns(item),
-  repositoryResultOverrides: Record<string, unknown> = {},
+  latestRunsResult: Record<string, any> = settledScanRuns(item),
+  repositoryResultOverrides: Record<string, any> = {},
 ) {
+  const latestScanRuns = latestRunsResult.data?.items;
   mockUseRepositoryScans.mockReturnValue({
     isLoading: false,
-    isSuccess: true,
-    isFetching: false,
-    isError: false,
-    data: { items: [item] },
+    isSuccess: latestRunsResult.isSuccess ?? true,
+    isFetching: latestRunsResult.isFetching ?? false,
+    isError: latestRunsResult.isError ?? false,
+    dataUpdatedAt: latestRunsResult.dataUpdatedAt,
+    data: {
+      items: [item],
+      ...(latestScanRuns === undefined ? {} : { latestScanRuns }),
+    },
     ...repositoryResultOverrides,
   });
-  mockUseScanRuns.mockReturnValue(scanRunsResult);
   return render(<RepositoryList />);
 }
 
@@ -190,7 +192,6 @@ describe("RepositoryList", () => {
     vi.setSystemTime(new Date("2026-05-08T00:00:00Z"));
     mockUseRepositoryScans.mockReset();
     mockUseRunSecurityScan.mockReset();
-    mockUseScanRuns.mockReset();
     mockUseRunSecurityScan.mockReturnValue({
       mutate: vi.fn(),
       reset: vi.fn(),
@@ -200,6 +201,67 @@ describe("RepositoryList", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("uses the batched latest runs for multiple repository cards", () => {
+    const first = repository({
+      metadata: { name: "repo-a", namespace: "default", uid: "uid-a", generation: 1 },
+      spec: {
+        repoURL: "https://github.com/example/repo-a",
+        owner: "example",
+        repository: "repo-a",
+        branch: "main",
+        analysisAgentRef: { name: "security-agent" },
+      },
+      status: {
+        phase: "Ready",
+        lastScanID: "scan-a",
+        quality: currentQuality({ observedRepositoryScanUID: "uid-a", observedGeneration: 1 }),
+      },
+    });
+    const second = repository({
+      metadata: { name: "repo-b", namespace: "default", uid: "uid-b", generation: 2 },
+      spec: {
+        repoURL: "https://github.com/example/repo-b",
+        owner: "example",
+        repository: "repo-b",
+        branch: "main",
+        analysisAgentRef: { name: "security-agent" },
+      },
+      status: {
+        phase: "Ready",
+        lastScanID: "scan-b",
+        quality: currentQuality({
+          observedRepositoryScanUID: "uid-b",
+          observedGeneration: 2,
+          inventoryCoverageStatus: "partial",
+        }),
+      },
+    });
+    mockUseRepositoryScans.mockReturnValue({
+      isLoading: false,
+      isSuccess: true,
+      isFetching: false,
+      isError: false,
+      data: {
+        items: [first, second],
+        latestScanRuns: [
+          latestScanRun(second, { id: "scan-b" }),
+          latestScanRun(first, { id: "scan-a" }),
+          latestScanRun(first, { id: "scan-stale", repositoryScanUID: "old-uid" }),
+        ],
+      },
+    });
+
+    render(<RepositoryList />);
+
+    const firstCard = screen.getByRole("link", { name: "repo-a" }).closest("[class*=transition-colors]");
+    const secondCard = screen.getByRole("link", { name: "repo-b" }).closest("[class*=transition-colors]");
+    expect(firstCard).not.toBeNull();
+    expect(secondCard).not.toBeNull();
+    expect(within(firstCard as HTMLElement).getByText("Quality current")).toBeInTheDocument();
+    expect(within(secondCard as HTMLElement).getByText("Degraded")).toBeInTheDocument();
+    expect(mockUseRunSecurityScan).toHaveBeenCalledTimes(2);
   });
 
   it("falls back to lastSuccessfulScanAt for repositories without lastScanAt", () => {
@@ -548,7 +610,7 @@ describe("RepositoryList", () => {
 
     expect(screen.getByText("Quality unverified")).toBeInTheDocument();
     expect(screen.getByLabelText("Quality details")).toHaveTextContent(
-      "Latest scan run metadata is not available yet",
+      "Latest scan run metadata is missing from the repository response",
     );
     expectCurrentQualityDimensionsSuppressed();
   });
@@ -600,16 +662,14 @@ describe("RepositoryList", () => {
     expect(screen.getByRole("button", { name: "Scan Now" })).toBeEnabled();
   });
 
-  it("waits for both repository and run observations made after a mutation error", () => {
+  it("waits for a combined repository/latest-run observation made after a mutation error", () => {
     const failedAt = Date.parse("2026-05-08T00:00:00Z");
     const cachedAt = failedAt - 1;
     const freshAt = failedAt + 1;
     const item = repository({
       status: { phase: "Ready", quality: currentQuality() },
     });
-    let mutationCallbacks:
-      | { onError?: () => void; onSuccess?: () => void }
-      | undefined;
+    let mutationCallbacks: { onError?: () => void } | undefined;
     let mutationState: Record<string, unknown> = {
       isPending: false,
       isSuccess: false,
@@ -617,10 +677,7 @@ describe("RepositoryList", () => {
       submittedAt: 0,
     };
     const mutate = vi.fn(
-      (
-        _variables: undefined,
-        callbacks?: { onError?: () => void; onSuccess?: () => void },
-      ) => {
+      (_variables: undefined, callbacks?: { onError?: () => void }) => {
         mutationCallbacks = callbacks;
       },
     );
@@ -643,9 +700,7 @@ describe("RepositoryList", () => {
       submittedAt: failedAt - 100,
     };
     act(() => mutationCallbacks?.onError?.());
-
     expect(screen.getByText("Quality unverified")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Scan Now" })).toBeEnabled();
 
     mockUseRepositoryScans.mockReturnValue({
       isLoading: false,
@@ -653,16 +708,7 @@ describe("RepositoryList", () => {
       isFetching: false,
       isError: false,
       dataUpdatedAt: freshAt,
-      data: { items: [item] },
-    });
-    rerender(<RepositoryList />);
-
-    expect(screen.getByText("Quality unverified")).toBeInTheDocument();
-    expectCurrentQualityDimensionsSuppressed();
-
-    mockUseScanRuns.mockReturnValue({
-      ...settledScanRuns(item),
-      dataUpdatedAt: freshAt,
+      data: { items: [item], latestScanRuns: [latestScanRun(item)] },
     });
     rerender(<RepositoryList />);
 
@@ -789,9 +835,8 @@ describe("RepositoryList", () => {
         isSuccess: true,
         isFetching: false,
         isError: false,
-        data: { items: [current] },
+        data: { items: [current], latestScanRuns: [latestScanRun(current)] },
       });
-      mockUseScanRuns.mockReturnValue(settledScanRuns(current));
       rerender(<RepositoryList />);
 
       expect(screen.getByText("Quality current")).toBeInTheDocument();
@@ -875,14 +920,8 @@ describe("RepositoryList", () => {
         isSuccess: true,
         isFetching: false,
         isError: false,
-        data: { items: [item] },
+        data: { items: [item], latestScanRuns: [externalRun] },
       });
-      rerender(<RepositoryList />);
-
-      expect(screen.getByText("Quality unverified")).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Scan Now" })).toBeDisabled();
-
-      mockUseScanRuns.mockReturnValue(settledScanRuns(item, externalRun));
       rerender(<RepositoryList />);
 
       expect(screen.getByText("Quality current")).toBeInTheDocument();
@@ -941,7 +980,7 @@ describe("RepositoryList", () => {
 
     expect(screen.getByText("Quality unverified")).toBeInTheDocument();
     expect(screen.getByLabelText("Quality details")).toHaveTextContent(
-      "metadata is refreshing; cached run data cannot verify freshness",
+      "Repository metadata is refreshing; cached repository status cannot verify freshness",
     );
     expect(screen.queryByText("Quality current")).not.toBeInTheDocument();
     expectCurrentQualityDimensionsSuppressed();
@@ -961,7 +1000,7 @@ describe("RepositoryList", () => {
 
     expect(screen.getByText("Quality unverified")).toBeInTheDocument();
     expect(screen.getByLabelText("Quality details")).toHaveTextContent(
-      "metadata refresh failed; cached run data cannot verify freshness",
+      "Repository metadata refresh failed; cached repository status cannot verify freshness",
     );
     expect(screen.queryByText("Quality current")).not.toBeInTheDocument();
     expectCurrentQualityDimensionsSuppressed();

@@ -24,7 +24,7 @@ func integrityTestRawDigest(value string) string {
 	return strings.TrimPrefix(integrityTestDigest(value), "sha256:")
 }
 
-func activeRequestMigrationRun(
+func activeRepositoryMigrationRun(
 	id string,
 	ordinal int,
 	requestKey string,
@@ -57,7 +57,7 @@ const (
 	testSecondScanID = "scan_second"
 )
 
-func TestActiveRequestIndexMigrationFailsDuplicateSealingRunsClosed(t *testing.T) {
+func TestActiveRepositoryIndexMigrationFailsDuplicateSealingRunsClosed(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "duplicate-sealing.db")
 	db, err := NewDB(dbPath)
 	if err != nil {
@@ -65,18 +65,21 @@ func TestActiveRequestIndexMigrationFailsDuplicateSealingRunsClosed(t *testing.T
 	}
 	s := NewStore(db, dbPath)
 	ctx := context.Background()
-	if _, err := db.Exec(`DROP INDEX idx_security_scan_runs_active_request`); err != nil {
+	if _, err := db.Exec(`DROP INDEX idx_security_scan_runs_active_repository`); err != nil {
 		_ = db.Close()
-		t.Fatalf("drop active-request index: %v", err)
+		t.Fatalf("drop active-repository index: %v", err)
 	}
 
 	started := time.Date(2026, time.August, 2, 8, 0, 0, 0, time.UTC)
-	running := activeRequestMigrationRun("run-active", 1, "request-a", "running", store.BundleStatusNotStarted, started)
-	sealingWithActive := activeRequestMigrationRun("run-sealing-with-active", 2, "request-a", "succeeded", store.BundleStatusSealing, started.Add(time.Minute))
+	running := activeRepositoryMigrationRun("run-active", 1, "request-a", "running", store.BundleStatusNotStarted, started)
+	sealingWithActive := activeRepositoryMigrationRun("run-sealing-with-active", 2, "request-b", "succeeded", store.BundleStatusSealing, started.Add(time.Minute))
 	sealingWithActive.ErrorMessage = "existing audit detail"
-	firstSealing := activeRequestMigrationRun("run-sealing-first", 3, "request-b", "succeeded", store.BundleStatusSealing, started.Add(2*time.Minute))
-	secondSealing := activeRequestMigrationRun("run-sealing-second", 4, "request-b", "running", store.BundleStatusSealing, started.Add(3*time.Minute))
-	uniqueSealing := activeRequestMigrationRun("run-sealing-unique", 5, "request-c", "succeeded", store.BundleStatusSealing, started.Add(4*time.Minute))
+	firstSealing := activeRepositoryMigrationRun("run-sealing-first", 3, "request-c", "succeeded", store.BundleStatusSealing, started.Add(2*time.Minute))
+	firstSealing.RepositoryScan = "repo-migration-sealing"
+	secondSealing := activeRepositoryMigrationRun("run-sealing-second", 4, "request-d", "running", store.BundleStatusSealing, started.Add(3*time.Minute))
+	secondSealing.RepositoryScan = firstSealing.RepositoryScan
+	uniqueSealing := activeRepositoryMigrationRun("run-sealing-unique", 5, "request-e", "succeeded", store.BundleStatusSealing, started.Add(4*time.Minute))
+	uniqueSealing.RepositoryScan = "repo-migration-unique"
 	for _, run := range []*store.ScanRun{running, sealingWithActive, firstSealing, secondSealing, uniqueSealing} {
 		if err := s.CreateScanRun(ctx, run); err != nil {
 			_ = db.Close()
@@ -149,7 +152,8 @@ func TestActiveRequestIndexMigrationFailsDuplicateSealingRunsClosed(t *testing.T
 		t.Fatalf("migrated scan run count = %d, want 5", runCount)
 	}
 
-	conflict := activeRequestMigrationRun("run-conflict", 6, uniqueSealing.RequestIdempotencyKey, "pending", store.BundleStatusNotStarted, started.Add(5*time.Minute))
+	conflict := activeRepositoryMigrationRun("run-conflict", 6, "request-f", "pending", store.BundleStatusNotStarted, started.Add(5*time.Minute))
+	conflict.RepositoryScan = uniqueSealing.RepositoryScan
 	if err := migrated.CreateScanRun(ctx, conflict); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("CreateScanRun(conflicting with retained sealing run) error = %v, want ErrConflict", err)
 	}
@@ -172,20 +176,20 @@ func TestActiveRequestIndexMigrationFailsDuplicateSealingRunsClosed(t *testing.T
 	}
 }
 
-func TestActiveRequestIndexMigrationRejectsUnresolvedNonSealingDuplicates(t *testing.T) {
+func TestActiveRepositoryIndexMigrationRejectsUnresolvedNonSealingDuplicates(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "duplicate-active.db")
 	db, err := NewDB(dbPath)
 	if err != nil {
 		t.Fatalf("NewDB() error = %v", err)
 	}
 	s := NewStore(db, dbPath)
-	if _, err := db.Exec(`DROP INDEX idx_security_scan_runs_active_request`); err != nil {
+	if _, err := db.Exec(`DROP INDEX idx_security_scan_runs_active_repository`); err != nil {
 		_ = db.Close()
-		t.Fatalf("drop active-request index: %v", err)
+		t.Fatalf("drop active-repository index: %v", err)
 	}
 	started := time.Date(2026, time.August, 2, 9, 0, 0, 0, time.UTC)
 	for i, phase := range []string{"pending", "running"} {
-		run := activeRequestMigrationRun("duplicate-active-"+phase, 20+i, "request-duplicate-active", phase, store.BundleStatusNotStarted, started.Add(time.Duration(i)*time.Minute))
+		run := activeRepositoryMigrationRun("duplicate-active-"+phase, 20+i, fmt.Sprintf("request-duplicate-active-%d", i), phase, store.BundleStatusNotStarted, started.Add(time.Duration(i)*time.Minute))
 		if err := s.CreateScanRun(context.Background(), run); err != nil {
 			_ = db.Close()
 			t.Fatalf("CreateScanRun(%s) error = %v", phase, err)
@@ -198,7 +202,7 @@ func TestActiveRequestIndexMigrationRejectsUnresolvedNonSealingDuplicates(t *tes
 	if reopened, err := NewDB(dbPath); err == nil {
 		_ = reopened.Close()
 		t.Fatal("NewDB() error = nil, want unresolved duplicate preflight failure")
-	} else if !strings.Contains(err.Error(), "duplicate active scan request groups remain") {
+	} else if !strings.Contains(err.Error(), "duplicate active repository groups remain") {
 		t.Fatalf("NewDB() error = %v, want duplicate-group preflight failure", err)
 	}
 }

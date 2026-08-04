@@ -535,6 +535,9 @@ func (r *RepositoryScanReconciler) createScanRun(ctx context.Context, scan *core
 		if err != nil {
 			return err
 		}
+		if run == nil {
+			return nil
+		}
 	}
 
 	if r.IntegrityConfig.PinnedScanTargetsEnabled {
@@ -582,6 +585,7 @@ func (r *RepositoryScanReconciler) loadConflictingActiveScanRun(
 	requestKey, mode, baseCommit, headCommit, policyDigest string,
 ) (*store.ScanRun, error) {
 	cursor := ""
+	unrelatedReservation := false
 	for {
 		runs, next, err := r.SecurityStore.ListScanRuns(ctx, scan.Namespace, scan.Name, 100, cursor)
 		if err != nil {
@@ -589,9 +593,15 @@ func (r *RepositoryScanReconciler) loadConflictingActiveScanRun(
 		}
 		for i := range runs {
 			run := &runs[i]
-			if !activeScanRunPhase(run.Phase) ||
-				(run.RequestIdempotencyKey != requestKey && run.IdempotencyKey != requestKey) {
+			if !scanRunReservesRepository(run) {
 				continue
+			}
+			if run.RequestIdempotencyKey != requestKey && run.IdempotencyKey != requestKey {
+				unrelatedReservation = true
+				continue
+			}
+			if !activeScanRunPhase(run.Phase) {
+				return nil, nil
 			}
 			failure := error(nil)
 			switch {
@@ -627,7 +637,10 @@ func (r *RepositoryScanReconciler) loadConflictingActiveScanRun(
 		}
 		cursor = next
 	}
-	return nil, fmt.Errorf("%w: matching active scan run was not found", store.ErrConflict)
+	if unrelatedReservation {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("%w: active repository reservation was not found", store.ErrConflict)
 }
 
 func initialScanQuality(scan *corev1alpha1.RepositoryScan, targetResolutionPending bool) store.ScanQuality {
@@ -895,6 +908,10 @@ func (r *RepositoryScanReconciler) scanRunHasActivePipelineTask(ctx context.Cont
 
 func activeScanRunPhase(phase string) bool {
 	return phase == scanRunPhasePending || phase == scanRunPhaseRunning
+}
+
+func scanRunReservesRepository(run *store.ScanRun) bool {
+	return run != nil && (activeScanRunPhase(run.Phase) || run.Quality.BundleStatus == store.BundleStatusSealing)
 }
 
 func scanRunUsesPinnedTarget(run *store.ScanRun) bool {
@@ -2109,6 +2126,10 @@ func (r *RepositoryScanReconciler) appendStageReceiptCreated(
 	if len(normalized) > 0 {
 		normalizedDigest = securityDigest(normalized)
 	}
+	scopeKind, scopeID, err := securityTaskScope(task)
+	if err != nil {
+		return false, err
+	}
 	receipt := &store.StageReceipt{
 		ID:                         r.stageReceiptIDFor(ctx, run, task, artifactName, raw, disposition),
 		Namespace:                  run.Namespace,
@@ -2116,8 +2137,8 @@ func (r *RepositoryScanReconciler) appendStageReceiptCreated(
 		ScanRunID:                  run.ID,
 		RunUID:                     run.RunUID,
 		Stage:                      taskSecurityStage(task),
-		ScopeKind:                  securityScopeKind(task),
-		ScopeID:                    firstNonEmptySecurityScope(task),
+		ScopeKind:                  scopeKind,
+		ScopeID:                    scopeID,
 		Provenance:                 provenance,
 		ExpectedTargetSHA:          expectedTargetSHA,
 		ObservedTargetSHA:          observedTargetSHA,
@@ -2169,32 +2190,66 @@ func securityArtifactMediaType(name string) string {
 	}
 }
 
-func securityScopeKind(task *corev1alpha1.Task) string {
+func taskSecurityBoundID(task *corev1alpha1.Task, labelKey, envName, kind string) (string, error) {
 	if task == nil {
-		return ""
+		return "", nil
 	}
-	if strings.TrimSpace(task.Labels[labels.LabelSecurityOccurrenceID]) != "" {
-		return "occurrence"
+	labelValue := strings.TrimSpace(task.Labels[labelKey])
+	var binding *corev1.EnvVar
+	for i := range task.Spec.Env {
+		if task.Spec.Env[i].Name != envName {
+			continue
+		}
+		if binding != nil {
+			return "", fmt.Errorf("security task has duplicate %s environment bindings", kind)
+		}
+		binding = &task.Spec.Env[i]
 	}
-	if strings.TrimSpace(task.Labels[labels.LabelSecuritySliceID]) != "" {
-		return "slice"
+	if binding == nil {
+		return labelValue, nil
 	}
-	if strings.TrimSpace(task.Labels[labels.LabelSecurityFindingID]) != "" {
-		return "finding"
+	if binding.ValueFrom != nil {
+		return "", fmt.Errorf("security task %s environment binding must be literal", kind)
 	}
-	return "run"
+	fullID := strings.TrimSpace(binding.Value)
+	if binding.Value != fullID {
+		return "", fmt.Errorf("security task %s environment binding is not canonical", kind)
+	}
+	if labelValue != labels.SelectorValue(fullID) {
+		return "", fmt.Errorf("security task %s label does not match its environment binding", kind)
+	}
+	return fullID, nil
 }
 
-func firstNonEmptySecurityScope(task *corev1alpha1.Task) string {
-	if task == nil {
-		return ""
+func taskSecurityFindingID(task *corev1alpha1.Task) (string, error) {
+	return taskSecurityBoundID(task, labels.LabelSecurityFindingID, security.EnvFindingID, "finding ID")
+}
+
+func taskSecurityOccurrenceID(task *corev1alpha1.Task) (string, error) {
+	return taskSecurityBoundID(task, labels.LabelSecurityOccurrenceID, security.EnvOccurrenceID, "occurrence ID")
+}
+
+func securityTaskScope(task *corev1alpha1.Task) (string, string, error) {
+	occurrenceID, err := taskSecurityOccurrenceID(task)
+	if err != nil {
+		return "", "", err
 	}
-	for _, key := range []string{labels.LabelSecurityOccurrenceID, labels.LabelSecuritySliceID, labels.LabelSecurityFindingID} {
-		if value := strings.TrimSpace(task.Labels[key]); value != "" {
-			return value
+	if occurrenceID != "" {
+		return "occurrence", occurrenceID, nil
+	}
+	if task != nil {
+		if sliceID := strings.TrimSpace(task.Labels[labels.LabelSecuritySliceID]); sliceID != "" {
+			return "slice", sliceID, nil
 		}
 	}
-	return ""
+	findingID, err := taskSecurityFindingID(task)
+	if err != nil {
+		return "", "", err
+	}
+	if findingID != "" {
+		return "finding", findingID, nil
+	}
+	return "run", "", nil
 }
 
 func (r *RepositoryScanReconciler) saveControllerArtifact(
@@ -2582,9 +2637,15 @@ func (r *RepositoryScanReconciler) loadValidationTaskArtifacts(
 		return nil, "", err
 	}
 
-	trustedFindingID := strings.TrimSpace(task.Labels[labels.LabelSecurityFindingID])
+	trustedFindingID, err := taskSecurityFindingID(task)
+	if err != nil {
+		return nil, "", err
+	}
+	trustedOccurrenceID, err := taskSecurityOccurrenceID(task)
+	if err != nil {
+		return nil, "", err
+	}
 	trustedScanRunID := strings.TrimSpace(task.Labels[labels.LabelSecurityScanID])
-	trustedOccurrenceID := strings.TrimSpace(task.Labels[labels.LabelSecurityOccurrenceID])
 	if finding == nil || trustedFindingID == "" || trustedFindingID != finding.ID {
 		return nil, "validation task finding binding is missing or stale", nil
 	}
@@ -3403,14 +3464,22 @@ func (r *RepositoryScanReconciler) hasActiveValidationTask(ctx context.Context, 
 		client.InNamespace(scan.Namespace),
 		client.MatchingLabels(map[string]string{
 			labels.LabelSecurityTarget:    labels.SelectorValue(scan.Name),
-			labels.LabelSecurityFindingID: findingID,
+			labels.LabelSecurityFindingID: labels.SelectorValue(findingID),
 			labels.LabelSecurityStage:     security.StageValidation,
 		}),
 	); err != nil {
 		return false, err
 	}
 	for i := range tasks.Items {
-		if repositoryScanControlsTask(scan, &tasks.Items[i]) && isActiveTaskPhase(tasks.Items[i].Status.Phase) {
+		task := &tasks.Items[i]
+		if !repositoryScanControlsTask(scan, task) || !isActiveTaskPhase(task.Status.Phase) {
+			continue
+		}
+		taskFindingID, err := taskSecurityFindingID(task)
+		if err != nil {
+			return false, err
+		}
+		if taskFindingID == findingID {
 			return true, nil
 		}
 	}
@@ -3486,8 +3555,8 @@ func (r *RepositoryScanReconciler) createValidationTask(ctx context.Context, sca
 				labels.LabelSecurityScanID:       finding.ScanRunID,
 				labels.LabelSecurityMode:         security.StageValidation,
 				labels.LabelSecurityStage:        security.StageValidation,
-				labels.LabelSecurityFindingID:    finding.ID,
-				labels.LabelSecurityOccurrenceID: finding.CurrentOccurrenceID,
+				labels.LabelSecurityFindingID:    labels.SelectorValue(finding.ID),
+				labels.LabelSecurityOccurrenceID: labels.SelectorValue(finding.CurrentOccurrenceID),
 			},
 		},
 		Spec: corev1alpha1.TaskSpec{
@@ -5467,9 +5536,16 @@ func (r *RepositoryScanReconciler) ingestReservedScanTask(
 
 //nolint:gocyclo // integrity flow keeps ordered fail-closed validation branches
 func (r *RepositoryScanReconciler) ingestValidationTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, task *corev1alpha1.Task) error {
-	findingID := task.Labels[labels.LabelSecurityFindingID]
+	findingID, err := taskSecurityFindingID(task)
+	if err != nil {
+		return err
+	}
 	if findingID == "" {
 		return nil
+	}
+	taskOccurrenceID, err := taskSecurityOccurrenceID(task)
+	if err != nil {
+		return err
 	}
 	requireRunBinding, supportedBinding := validationTaskRunBinding(task)
 	if !supportedBinding {
@@ -5484,7 +5560,6 @@ func (r *RepositoryScanReconciler) ingestValidationTask(ctx context.Context, sca
 		return err
 	}
 	taskRunID := strings.TrimSpace(task.Labels[labels.LabelSecurityScanID])
-	taskOccurrenceID := strings.TrimSpace(task.Labels[labels.LabelSecurityOccurrenceID])
 	if requireRunBinding && taskRunID == "" {
 		return nil
 	}
@@ -5982,6 +6057,31 @@ func patchTaskWorkspaceRef(task *corev1alpha1.Task) string {
 	return ""
 }
 
+func legacyPatchProposalTaskBindingMatches(
+	scan *corev1alpha1.RepositoryScan,
+	task *corev1alpha1.Task,
+	finding *store.Finding,
+	proposal *store.PatchProposal,
+	taskFindingID string,
+	taskOccurrenceID string,
+) bool {
+	if scan == nil || scan.UID == "" || task == nil || finding == nil ||
+		!metav1.IsControlledBy(task, scan) ||
+		strings.TrimSpace(task.Labels[labels.LabelSecurityTarget]) != labels.SelectorValue(scan.Name) ||
+		strings.TrimSpace(task.Labels[labels.LabelSecurityScanID]) == "" ||
+		strings.TrimSpace(task.Labels[labels.LabelSecurityScanID]) != strings.TrimSpace(finding.ScanRunID) ||
+		taskFindingID != finding.ID {
+		return false
+	}
+	findingOccurrenceID := strings.TrimSpace(finding.CurrentOccurrenceID)
+	proposalOccurrenceID := strings.TrimSpace(proposal.OccurrenceID)
+	if findingOccurrenceID == "" {
+		return taskOccurrenceID == "" && proposalOccurrenceID == ""
+	}
+	return taskOccurrenceID == findingOccurrenceID &&
+		(proposalOccurrenceID == "" || proposalOccurrenceID == findingOccurrenceID)
+}
+
 func (r *RepositoryScanReconciler) backfillLegacyPatchProposalSource(
 	ctx context.Context,
 	scan *corev1alpha1.RepositoryScan,
@@ -5992,24 +6092,18 @@ func (r *RepositoryScanReconciler) backfillLegacyPatchProposalSource(
 	if proposal == nil || strings.TrimSpace(proposal.SourceScanRunID) != "" {
 		return true, nil
 	}
-	if scan == nil || scan.UID == "" || task == nil || finding == nil ||
-		!metav1.IsControlledBy(task, scan) ||
-		strings.TrimSpace(task.Labels[labels.LabelSecurityTarget]) != labels.SelectorValue(scan.Name) ||
-		strings.TrimSpace(task.Labels[labels.LabelSecurityScanID]) == "" ||
-		strings.TrimSpace(task.Labels[labels.LabelSecurityScanID]) != strings.TrimSpace(finding.ScanRunID) {
+	taskFindingID, err := taskSecurityFindingID(task)
+	if err != nil {
+		return false, err
+	}
+	taskOccurrenceID, err := taskSecurityOccurrenceID(task)
+	if err != nil {
+		return false, err
+	}
+	if !legacyPatchProposalTaskBindingMatches(scan, task, finding, proposal, taskFindingID, taskOccurrenceID) {
 		return false, nil
 	}
-	taskOccurrenceID := strings.TrimSpace(task.Labels[labels.LabelSecurityOccurrenceID])
 	findingOccurrenceID := strings.TrimSpace(finding.CurrentOccurrenceID)
-	proposalOccurrenceID := strings.TrimSpace(proposal.OccurrenceID)
-	if findingOccurrenceID == "" {
-		if taskOccurrenceID != "" || proposalOccurrenceID != "" {
-			return false, nil
-		}
-	} else if taskOccurrenceID != findingOccurrenceID ||
-		(proposalOccurrenceID != "" && proposalOccurrenceID != findingOccurrenceID) {
-		return false, nil
-	}
 	run, err := r.SecurityStore.GetScanRun(ctx, scan.Namespace, finding.ScanRunID)
 	if errors.Is(err, store.ErrNotFound) {
 		return false, nil
@@ -6047,9 +6141,16 @@ func (r *RepositoryScanReconciler) backfillLegacyPatchProposalSource(
 
 //nolint:gocyclo // integrity flow keeps ordered fail-closed validation branches
 func (r *RepositoryScanReconciler) ingestPatchTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, task *corev1alpha1.Task) error {
-	findingID := task.Labels[labels.LabelSecurityFindingID]
+	findingID, err := taskSecurityFindingID(task)
+	if err != nil {
+		return err
+	}
 	if findingID == "" {
 		return nil
+	}
+	taskOccurrenceID, err := taskSecurityOccurrenceID(task)
+	if err != nil {
+		return err
 	}
 
 	proposals, err := r.SecurityStore.ListPatchProposals(ctx, scan.Namespace, findingID)
@@ -6078,7 +6179,6 @@ func (r *RepositoryScanReconciler) ingestPatchTask(ctx context.Context, scan *co
 	if !verifiedSource {
 		return nil
 	}
-	taskOccurrenceID := strings.TrimSpace(task.Labels[labels.LabelSecurityOccurrenceID])
 	staleSourceRun := strings.TrimSpace(proposal.SourceScanRunID) != strings.TrimSpace(finding.ScanRunID)
 	staleOccurrence := proposal.OccurrenceID != "" &&
 		(taskOccurrenceID != proposal.OccurrenceID || finding.CurrentOccurrenceID != proposal.OccurrenceID)

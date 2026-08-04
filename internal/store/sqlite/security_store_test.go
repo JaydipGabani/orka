@@ -43,6 +43,106 @@ func bundleStatusTestScanRun(id string, status store.BundleStatus) *store.ScanRu
 	}
 }
 
+func latestRunListTestRun(
+	id, namespace, repository, repositoryUID string,
+	repositoryGeneration int64,
+	startedAt time.Time,
+) *store.ScanRun {
+	return &store.ScanRun{
+		ID:                       id,
+		Namespace:                namespace,
+		RepositoryScan:           repository,
+		RepositoryScanUID:        repositoryUID,
+		RepositoryScanGeneration: repositoryGeneration,
+		TaskName:                 "task-" + id,
+		Mode:                     "manual",
+		Phase:                    "succeeded",
+		StartedAt:                startedAt,
+		Quality:                  store.LegacyScanQuality(),
+	}
+}
+
+func TestListLatestScanRunsBatchesByCurrentRepositoryIncarnation(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	baseTime := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+
+	runs := []*store.ScanRun{
+		latestRunListTestRun("scan-repo-a-older", "ns1", "repo-a", "repo-a-uid", 3, baseTime),
+		latestRunListTestRun("scan-repo-a-tie-a", "ns1", "repo-a", "repo-a-uid", 3, baseTime.Add(time.Minute)),
+		latestRunListTestRun("scan-repo-a-tie-z", "ns1", "repo-a", "repo-a-uid", 3, baseTime.Add(time.Minute)),
+		latestRunListTestRun("scan-repo-a-stale-incarnation", "ns1", "repo-a", "repo-a-old-uid", 9, baseTime.Add(2*time.Minute)),
+		latestRunListTestRun("scan-repo-b-latest", "ns1", "repo-b", "repo-b-uid", 1, baseTime.Add(3*time.Minute)),
+		latestRunListTestRun("scan-repo-b-other-namespace", "ns2", "repo-b", "repo-b-uid", 1, baseTime.Add(4*time.Minute)),
+	}
+	for _, run := range runs {
+		if err := s.CreateScanRun(ctx, run); err != nil {
+			t.Fatalf("CreateScanRun(%s) error = %v", run.ID, err)
+		}
+	}
+
+	requested := []store.RepositoryScanIdentity{
+		{Name: "repo-b", UID: "repo-b-uid", Generation: 1},
+		{Name: "repo-a", UID: "repo-a-uid", Generation: 3},
+		{Name: "repo-a", UID: "repo-a-uid", Generation: 3},
+		{Name: "repo-without-runs", UID: "repo-empty-uid", Generation: 1},
+	}
+	got, err := s.ListLatestScanRuns(ctx, "ns1", requested)
+	if err != nil {
+		t.Fatalf("ListLatestScanRuns() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListLatestScanRuns() returned %d runs, want 2: %#v", len(got), got)
+	}
+
+	gotByIdentity := make(map[store.RepositoryScanIdentity]store.ScanRun, len(got))
+	for _, run := range got {
+		identity := store.RepositoryScanIdentity{
+			Name:       run.RepositoryScan,
+			UID:        run.RepositoryScanUID,
+			Generation: run.RepositoryScanGeneration,
+		}
+		gotByIdentity[identity] = run
+	}
+	if run := gotByIdentity[(store.RepositoryScanIdentity{Name: "repo-a", UID: "repo-a-uid", Generation: 3})]; run.ID != "scan-repo-a-tie-z" {
+		t.Fatalf("latest repo-a run = %q, want scan-repo-a-tie-z", run.ID)
+	}
+	if run := gotByIdentity[(store.RepositoryScanIdentity{Name: "repo-b", UID: "repo-b-uid", Generation: 1})]; run.ID != "scan-repo-b-latest" {
+		t.Fatalf("latest repo-b run = %q, want scan-repo-b-latest", run.ID)
+	}
+}
+
+func TestListLatestScanRunsValidatesRepositoryIdentities(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+
+	runs, err := s.ListLatestScanRuns(ctx, "ns1", nil)
+	if err != nil {
+		t.Fatalf("ListLatestScanRuns(empty) error = %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("ListLatestScanRuns(empty) = %#v, want empty", runs)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		identity store.RepositoryScanIdentity
+	}{
+		{name: "missing name", identity: store.RepositoryScanIdentity{UID: "repo-uid", Generation: 1}},
+		{name: "name whitespace", identity: store.RepositoryScanIdentity{Name: " repo", UID: "repo-uid", Generation: 1}},
+		{name: "missing UID", identity: store.RepositoryScanIdentity{Name: "repo", Generation: 1}},
+		{name: "UID whitespace", identity: store.RepositoryScanIdentity{Name: "repo", UID: "repo-uid ", Generation: 1}},
+		{name: "zero generation", identity: store.RepositoryScanIdentity{Name: "repo", UID: "repo-uid"}},
+		{name: "negative generation", identity: store.RepositoryScanIdentity{Name: "repo", UID: "repo-uid", Generation: -1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := s.ListLatestScanRuns(ctx, "ns1", []store.RepositoryScanIdentity{tc.identity}); !errors.Is(err, store.ErrValidation) {
+				t.Fatalf("ListLatestScanRuns() error = %v, want ErrValidation", err)
+			}
+		})
+	}
+}
+
 func TestValidateScanRunBundleStatusTransitionGraph(t *testing.T) {
 	statuses := []store.BundleStatus{
 		store.BundleStatusNotStarted,

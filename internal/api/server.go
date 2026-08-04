@@ -149,10 +149,13 @@ func NewServer(c client.Client, sessionManager *controller.SessionManager, confi
 	})
 	resolver := NewProviderResolver(c, config.Chat)
 	server.chatHandler = NewChatHandler(c, sessionManager, config.Chat, config.WatchNamespace, config.EnforceNamespaceIsolation, config.SessionStore, config.ResultStore, resolver, config.Clientset)
+	server.chatHandler.workerOutputBindingMode = config.SecurityIntegrity.WorkerOutputBindingMode
 	server.chatHandler.contextTokenAuthorization = config.ContextTokenAuthorization
 	server.openaiHandler = NewOpenAICompatHandler(c, config.WatchNamespace, config.EnforceNamespaceIsolation, config.Chat, resolver, config.ResultStore, config.Clientset)
+	server.openaiHandler.workerOutputBindingMode = config.SecurityIntegrity.WorkerOutputBindingMode
 	server.openaiHandler.contextTokenAuthorization = config.ContextTokenAuthorization
 	server.anthropicHandler = NewAnthropicCompatHandler(c, config.WatchNamespace, config.EnforceNamespaceIsolation, config.Chat, resolver, config.ResultStore, config.Clientset)
+	server.anthropicHandler.workerOutputBindingMode = config.SecurityIntegrity.WorkerOutputBindingMode
 	server.anthropicHandler.contextTokenAuthorization = config.ContextTokenAuthorization
 	server.setupMiddleware()
 	server.setupRoutes()

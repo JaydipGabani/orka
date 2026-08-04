@@ -73,7 +73,7 @@ func ensureSecurityIntegritySchema(db *sql.DB) error {
 		return err
 	}
 
-	if err := ensureSecurityActiveRequestIndex(db); err != nil {
+	if err := ensureSecurityActiveRepositoryIndex(db); err != nil {
 		return err
 	}
 
@@ -290,7 +290,7 @@ func ensureSecurityIntegritySchema(db *sql.DB) error {
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE TABLE IF NOT EXISTS security_finding_decisions (
-			id TEXT PRIMARY KEY,
+			id TEXT NOT NULL,
 			namespace TEXT NOT NULL,
 			repository_scan TEXT NOT NULL,
 			public_finding_id TEXT NOT NULL,
@@ -311,6 +311,7 @@ func ensureSecurityIntegritySchema(db *sql.DB) error {
 			feedback_eligible BOOLEAN NOT NULL DEFAULT FALSE,
 			record_digest TEXT NOT NULL,
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY(namespace, id),
 			UNIQUE(namespace, public_finding_id, decision_version)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_security_stage_receipts_run
@@ -386,35 +387,41 @@ func ensureSecurityIntegritySchema(db *sql.DB) error {
 	return nil
 }
 
-const duplicateSealingMigrationMessage = "migration failed closed: duplicate active request included a sealing run"
+const duplicateSealingMigrationMessage = "migration failed closed: duplicate active repository reservation included a sealing run"
 
-func ensureSecurityActiveRequestIndex(db *sql.DB) error {
+func ensureSecurityActiveRepositoryIndex(db *sql.DB) error {
 	tx, err := db.Begin()
 	if err != nil {
-		return fmt.Errorf("migration failed: begin active-request index migration: %w", err)
+		return fmt.Errorf("migration failed: begin active-repository index migration: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_security_scan_runs_active_request`); err != nil {
-		return fmt.Errorf("migration failed: drop active-request index: %w", err)
+	for _, indexName := range []string{
+		"idx_security_scan_runs_active_request",
+		"idx_security_scan_runs_active_repository",
+	} {
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + indexName); err != nil {
+			return fmt.Errorf("migration failed: drop %s index: %w", indexName, err)
+		}
 	}
 	if _, err := tx.Exec(`UPDATE security_scan_runs
 		SET request_idempotency_key = idempotency_key
 		WHERE request_idempotency_key = '' AND idempotency_key <> ''`); err != nil {
-		return fmt.Errorf("migration failed: backfill active-request keys: %w", err)
+		return fmt.Errorf("migration failed: backfill active-repository request keys: %w", err)
 	}
 
-	// The legacy index did not retain sealing runs. If a pending/running run was
-	// admitted while one or more older runs were sealing, the stricter index
-	// cannot be created. Preserve every row and its immutable evidence, but fail
-	// every ambiguous sealing participant closed. Any active phase on such a row
-	// is terminalized as well so it cannot remain in the new index predicate.
+	// The legacy index scoped reservations by request key and did not retain
+	// sealing runs. If a pending/running run was admitted while another request
+	// for the repository was active or sealing, the repository-wide index cannot
+	// be created. Preserve every row and its immutable evidence, but fail every
+	// ambiguous sealing participant closed. Any active phase on such a row is
+	// terminalized as well so it cannot remain in the new index predicate.
 	if _, err := tx.Exec(`WITH duplicate_groups AS (
-		SELECT namespace, repository_scan, request_idempotency_key
+		SELECT namespace, repository_scan
 		FROM security_scan_runs
 		WHERE run_uid <> '' AND request_idempotency_key <> ''
 		  AND (phase IN ('pending', 'running') OR bundle_status = 'sealing')
-		GROUP BY namespace, repository_scan, request_idempotency_key
+		GROUP BY namespace, repository_scan
 		HAVING COUNT(*) > 1
 		   AND SUM(CASE WHEN bundle_status = 'sealing' THEN 1 ELSE 0 END) > 0
 	)
@@ -432,9 +439,8 @@ func ensureSecurityActiveRequestIndex(db *sql.DB) error {
 	    SELECT 1 FROM duplicate_groups
 	    WHERE duplicate_groups.namespace = security_scan_runs.namespace
 	      AND duplicate_groups.repository_scan = security_scan_runs.repository_scan
-	      AND duplicate_groups.request_idempotency_key = security_scan_runs.request_idempotency_key
 	  )`, duplicateSealingMigrationMessage, duplicateSealingMigrationMessage, duplicateSealingMigrationMessage); err != nil {
-		return fmt.Errorf("migration failed: reconcile duplicate sealing requests: %w", err)
+		return fmt.Errorf("migration failed: reconcile duplicate sealing repository reservations: %w", err)
 	}
 
 	var duplicateGroups int
@@ -443,23 +449,23 @@ func ensureSecurityActiveRequestIndex(db *sql.DB) error {
 		FROM security_scan_runs
 		WHERE run_uid <> '' AND request_idempotency_key <> ''
 		  AND (phase IN ('pending', 'running') OR bundle_status = 'sealing')
-		GROUP BY namespace, repository_scan, request_idempotency_key
+		GROUP BY namespace, repository_scan
 		HAVING COUNT(*) > 1
 	)`).Scan(&duplicateGroups); err != nil {
-		return fmt.Errorf("migration failed: preflight active-request index: %w", err)
+		return fmt.Errorf("migration failed: preflight active-repository index: %w", err)
 	}
 	if duplicateGroups != 0 {
-		return fmt.Errorf("migration failed: %d duplicate active scan request groups remain after sealing reconciliation", duplicateGroups)
+		return fmt.Errorf("migration failed: %d duplicate active repository groups remain after sealing reconciliation", duplicateGroups)
 	}
 
-	if _, err := tx.Exec(`CREATE UNIQUE INDEX idx_security_scan_runs_active_request
-		ON security_scan_runs(namespace, repository_scan, request_idempotency_key)
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX idx_security_scan_runs_active_repository
+		ON security_scan_runs(namespace, repository_scan)
 		WHERE run_uid <> '' AND request_idempotency_key <> ''
 		  AND (phase IN ('pending', 'running') OR bundle_status = 'sealing')`); err != nil {
-		return fmt.Errorf("migration failed: create active-request index: %w", err)
+		return fmt.Errorf("migration failed: create active-repository index: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("migration failed: commit active-request index migration: %w", err)
+		return fmt.Errorf("migration failed: commit active-repository index migration: %w", err)
 	}
 	return nil
 }

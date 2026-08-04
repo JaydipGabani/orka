@@ -156,6 +156,7 @@ type SecurityStore interface {
 	UpdateScanRun(ctx context.Context, run *ScanRun) error
 	GetScanRun(ctx context.Context, namespace, id string) (*ScanRun, error)
 	ListScanRuns(ctx context.Context, namespace, repositoryScan string, limit int, cursor string) ([]ScanRun, string, error)
+	ListLatestScanRuns(ctx context.Context, namespace string, repositories []RepositoryScanIdentity) ([]ScanRun, error)
 
 	UpsertReviewSlice(ctx context.Context, slice *ReviewSlice) error
 	ListReviewSlices(ctx context.Context, filter ReviewSliceFilter) ([]ReviewSlice, string, error)

@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -66,6 +67,36 @@ func (s *scanRunRecoveryErrorStore) ListScanRuns(context.Context, string, string
 type delayedScanRunListStore struct {
 	store.SecurityStore
 	hideNext bool
+}
+
+type competingRepositoryReservationStore struct {
+	store.SecurityStore
+	store.SecurityRunTaskInputStore
+	injectedRun *store.ScanRun
+}
+
+func (s *competingRepositoryReservationStore) CreateScanRunWithTaskInput(
+	ctx context.Context, requested *store.ScanRun, input *store.SecurityRunTaskInput,
+) error {
+	runUID := "run_8888888888888888888888888888888888888888888888888888888888888888"
+	competing := *requested
+	competing.ID = security.PublicScanRunID(runUID)
+	competing.RunUID = runUID
+	competing.TaskName = security.ScanStageTaskNameForRun(
+		requested.RepositoryScan, requested.Mode, security.StageThreatModel, "", runUID,
+	)
+	competing.RequestIdempotencyKey = "req_unrelated_api_reservation"
+	competing.IdempotencyKey = competing.RequestIdempotencyKey
+	competingInput := *input
+	competingInput.RunUID = runUID
+	competingInput.ScanRunID = competing.ID
+	competingInput.RecordDigest = ""
+	competingInput.CreatedAt = time.Time{}
+	if err := s.SecurityRunTaskInputStore.CreateScanRunWithTaskInput(ctx, &competing, &competingInput); err != nil {
+		return err
+	}
+	s.injectedRun = &competing
+	return fmt.Errorf("%w: injected unrelated repository reservation", store.ErrConflict)
 }
 
 func (s *delayedScanRunListStore) ListScanRuns(
@@ -677,6 +708,54 @@ func TestCreateSecurityScanRunRechecksIdempotencyAfterActiveTaskObserved(t *test
 	require.NoError(t, err)
 	require.Equal(t, created.ID, recovered.ID)
 	require.Equal(t, created.RunUID, recovered.RunUID)
+}
+
+func TestCreateSecurityScanRunReturnsConflictForUnrelatedAtomicReservation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "atomic-reservation", Namespace: "demo", UID: types.UID("atomic-reservation-uid"), Generation: 1,
+		},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL: "https://github.com/example/repo", Branch: "main",
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.RepositoryScan{}).
+		WithObjects(scan).
+		Build()
+	db, err := sqlite.NewDB(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	baseStore := sqlite.NewStore(db, ":memory:")
+	reservationStore := &competingRepositoryReservationStore{
+		SecurityStore: baseStore, SecurityRunTaskInputStore: baseStore,
+	}
+	handlers := NewHandlers(HandlersConfig{
+		Client: cl, SecurityStore: reservationStore, SecurityRunTaskInputStore: reservationStore,
+	})
+	current := &corev1alpha1.RepositoryScan{}
+	require.NoError(t, cl.Get(context.Background(), client.ObjectKeyFromObject(scan), current))
+
+	run, createErr := handlers.createSecurityScanRun(context.Background(), nil, current, "")
+	require.Nil(t, run)
+	var fiberErr *fiber.Error
+	require.ErrorAs(t, createErr, &fiberErr)
+	require.Equal(t, fiber.StatusConflict, fiberErr.Code)
+	require.NotNil(t, reservationStore.injectedRun)
+	task := &corev1alpha1.Task{}
+	err = cl.Get(context.Background(), types.NamespacedName{
+		Namespace: scan.Namespace, Name: reservationStore.injectedRun.TaskName,
+	}, task)
+	require.True(t, apierrors.IsNotFound(err), "losing request created a Task: %v", err)
+	runs, _, err := baseStore.ListScanRuns(context.Background(), scan.Namespace, scan.Name, 10, "")
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	require.Equal(t, reservationStore.injectedRun.ID, runs[0].ID)
 }
 
 func TestCreateSecurityScanRunReturnsConflictWhenCompetingRunCannotBeRecovered(t *testing.T) {
@@ -1683,35 +1762,125 @@ func TestUpdateRepositoryScan_ContextTokenAuthorizesExistingScanBeforeRequestBod
 	require.Equal(t, "https://github.com/sozercan/other", got.Spec.RepoURL)
 }
 
+func TestListRepositoryScansLatestRunsEnrichment(t *testing.T) {
+	provider := newTestOIDCProvider(t)
+	ctxTokenConfig := testContextTokenConfig(t, provider, "")
+	token := issueTestContextToken(t, provider, nil, map[string]any{"scope": ContextTokenScopeSecurityRead})
+	scanA := securityAuthzTestRepositoryScan("scan-a", securityTestRepoURL)
+	scanA.UID = types.UID("scan-a-uid")
+	scanA.Generation = 2
+	scanB := securityAuthzTestRepositoryScan("scan-b", "https://github.com/sozercan/other")
+	scanB.UID = types.UID("scan-b-uid")
+	scanB.Generation = 3
+	app, handlers := setupSecurityHandlersWithAuthzFixture(
+		t, ctxTokenConfig, ContextTokenAuthorizationModeOff, scanA, scanB,
+	)
+	now := time.Now().UTC()
+	for _, run := range []*store.ScanRun{
+		{
+			ID: "scan-a-current", Namespace: "demo", RepositoryScan: scanA.Name,
+			RepositoryScanUID: string(scanA.UID), RepositoryScanGeneration: scanA.Generation,
+			Mode: "initial", Phase: "succeeded", StartedAt: now, Quality: store.LegacyScanQuality(),
+		},
+		{
+			ID: "scan-a-old-incarnation", Namespace: "demo", RepositoryScan: scanA.Name,
+			RepositoryScanUID: "old-scan-a-uid", RepositoryScanGeneration: 1,
+			Mode: "initial", Phase: "succeeded", StartedAt: now.Add(time.Minute), Quality: store.LegacyScanQuality(),
+		},
+		{
+			ID: "scan-b-current", Namespace: "demo", RepositoryScan: scanB.Name,
+			RepositoryScanUID: string(scanB.UID), RepositoryScanGeneration: scanB.Generation,
+			Mode: "initial", Phase: "succeeded", StartedAt: now.Add(-time.Minute), Quality: store.LegacyScanQuality(),
+		},
+	} {
+		require.NoError(t, handlers.securityStore.CreateScanRun(context.Background(), run))
+	}
+
+	plainReq := httptest.NewRequest(http.MethodGet, "/security/repositories?namespace=demo", nil)
+	plainReq.Header.Set(TransactionTokenHeaderName, token)
+	resp, err := app.Test(plainReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var plain map[string]json.RawMessage
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&plain))
+	_, enriched := plain["latestScanRuns"]
+	require.False(t, enriched)
+
+	enrichedReq := httptest.NewRequest(
+		http.MethodGet, "/security/repositories?namespace=demo&includeLatestRuns=true", nil,
+	)
+	enrichedReq.Header.Set(TransactionTokenHeaderName, token)
+	resp, err = app.Test(enrichedReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var got struct {
+		Items          []corev1alpha1.RepositoryScan `json:"items"`
+		LatestScanRuns []store.ScanRun               `json:"latestScanRuns"`
+		Metadata       ListMeta                      `json:"metadata"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	require.Len(t, got.Items, 2)
+	require.Len(t, got.LatestScanRuns, 2)
+	latestByRepository := make(map[string]string, len(got.LatestScanRuns))
+	for i := range got.LatestScanRuns {
+		latestByRepository[got.LatestScanRuns[i].RepositoryScan] = got.LatestScanRuns[i].ID
+	}
+	require.Equal(t, "scan-a-current", latestByRepository[scanA.Name])
+	require.Equal(t, "scan-b-current", latestByRepository[scanB.Name])
+}
+
 func TestListRepositoryScans_ContextTokenFiltersMismatchedScansInEnforceMode(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")
-	app := setupSecurityHandlersWithAuthz(
+	matching := securityAuthzTestRepositoryScan("scan-match", securityTestRepoURL)
+	matching.UID = types.UID("scan-match-uid")
+	matching.Generation = 1
+	mismatched := securityAuthzTestRepositoryScan("scan-mismatch", "https://github.com/sozercan/other")
+	mismatched.UID = types.UID("scan-mismatch-uid")
+	mismatched.Generation = 1
+	app, handlers := setupSecurityHandlersWithAuthzFixture(
 		t,
 		ctxTokenConfig,
 		ContextTokenAuthorizationModeEnforce,
-		securityAuthzTestRepositoryScan("scan-match", securityTestRepoURL),
-		securityAuthzTestRepositoryScan("scan-mismatch", "https://github.com/sozercan/other"),
+		matching,
+		mismatched,
 	)
+	for _, run := range []*store.ScanRun{
+		{
+			ID: "scan-match-run", Namespace: "demo", RepositoryScan: matching.Name,
+			RepositoryScanUID: string(matching.UID), RepositoryScanGeneration: matching.Generation,
+			Mode: "initial", Phase: "succeeded", StartedAt: time.Now().UTC(), Quality: store.LegacyScanQuality(),
+		},
+		{
+			ID: "scan-mismatch-run", Namespace: "demo", RepositoryScan: mismatched.Name,
+			RepositoryScanUID: string(mismatched.UID), RepositoryScanGeneration: mismatched.Generation,
+			Mode: "initial", Phase: "succeeded", StartedAt: time.Now().UTC(), Quality: store.LegacyScanQuality(),
+		},
+	} {
+		require.NoError(t, handlers.securityStore.CreateScanRun(context.Background(), run))
+	}
 	token := issueTestContextToken(t, provider, nil, map[string]any{
 		"scope": ContextTokenScopeSecurityRead,
 		"tctx":  securityAuthzTestTctx(securityTestRepoURL),
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/security/repositories?namespace=demo", nil)
+	req := httptest.NewRequest(http.MethodGet, "/security/repositories?namespace=demo&includeLatestRuns=true", nil)
 	req.Header.Set(TransactionTokenHeaderName, token)
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var got struct {
-		Items    []corev1alpha1.RepositoryScan `json:"items"`
-		Metadata ListMeta                      `json:"metadata"`
+		Items          []corev1alpha1.RepositoryScan `json:"items"`
+		LatestScanRuns []store.ScanRun               `json:"latestScanRuns"`
+		Metadata       ListMeta                      `json:"metadata"`
 	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
 	require.Len(t, got.Items, 1)
 	require.Equal(t, "scan-match", got.Items[0].Name)
 	require.Equal(t, securityTestRepoURL, got.Items[0].Spec.RepoURL)
+	require.Len(t, got.LatestScanRuns, 1)
+	require.Equal(t, "scan-match-run", got.LatestScanRuns[0].ID)
 }
 
 func TestRepositoryScanReadDelete_ContextTokenObjectAuthorizationDenials(t *testing.T) {
@@ -2842,8 +3011,8 @@ func TestCreateSecurityPatchTaskRequiresPushedBranch(t *testing.T) {
 	})
 
 	finding := &store.Finding{
-		ID: "fnd_123", Namespace: "demo", RepositoryScan: scan.Name,
-		ScanRunID: "scan-run-patch", CurrentOccurrenceID: "occurrence-patch",
+		ID: "fnd_" + strings.Repeat("a", 64), Namespace: "demo", RepositoryScan: scan.Name,
+		ScanRunID: "scan-run-patch", CurrentOccurrenceID: "occ_" + strings.Repeat("b", 64),
 		Title: "Command injection", Severity: "high", Confidence: "high",
 	}
 	headSHA := strings.Repeat("f", 40)
@@ -2864,7 +3033,7 @@ func TestCreateSecurityPatchTaskRequiresPushedBranch(t *testing.T) {
 	require.Equal(t, security.PatchProposalIDForOccurrence(
 		"run_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", finding.CurrentOccurrenceID,
 	), proposal.ID)
-	require.Regexp(t, `^orka/security/fnd-123-[a-f0-9]{12}$`, proposal.Branch)
+	require.Regexp(t, `^orka/security/.+-[a-f0-9]{12}$`, proposal.Branch)
 
 	task := &corev1alpha1.Task{}
 	require.NoError(t, fakeClient.Get(context.Background(), clientObjectKey(proposal.TaskName), task))
@@ -2873,7 +3042,14 @@ func TestCreateSecurityPatchTaskRequiresPushedBranch(t *testing.T) {
 	require.NotNil(t, task.Spec.AgentRuntime.Workspace)
 	require.Equal(t, security.StagePatch, envValue(task.Spec.Env, security.EnvStage))
 	require.Equal(t, "scan-1", envValue(task.Spec.Env, security.EnvRepositoryScanName))
-	require.Equal(t, "fnd_123", envValue(task.Spec.Env, security.EnvFindingID))
+	require.Equal(t, finding.ID, envValue(task.Spec.Env, security.EnvFindingID))
+	require.Equal(t, finding.CurrentOccurrenceID, envValue(task.Spec.Env, security.EnvOccurrenceID))
+	require.Equal(t, labels.SelectorValue(finding.ID), task.Labels[labels.LabelSecurityFindingID])
+	require.Equal(t, labels.SelectorValue(finding.CurrentOccurrenceID), task.Labels[labels.LabelSecurityOccurrenceID])
+	require.LessOrEqual(t, len(task.Labels[labels.LabelSecurityFindingID]), 63)
+	require.LessOrEqual(t, len(task.Labels[labels.LabelSecurityOccurrenceID]), 63)
+	require.Empty(t, k8svalidation.IsValidLabelValue(task.Labels[labels.LabelSecurityFindingID]))
+	require.Empty(t, k8svalidation.IsValidLabelValue(task.Labels[labels.LabelSecurityOccurrenceID]))
 	require.Equal(t, proposal.Branch, envValue(task.Spec.Env, security.EnvPatchBranch))
 	require.Empty(t, task.Spec.AgentRuntime.Workspace.Branch)
 	require.Equal(t, headSHA, task.Spec.AgentRuntime.Workspace.Ref)
@@ -3322,6 +3498,47 @@ func TestFindingHistoryReturnsOnlyCurrentGenerationWithSafePagination(t *testing
 				require.Empty(t, body.Items)
 				require.Empty(t, body.Metadata.Continue)
 			}
+		})
+	}
+}
+
+func TestParseFindingHistoryPagination(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantLimit  int
+		wantCursor string
+		wantError  string
+	}{
+		{name: "default", query: "?cursor=next-page", wantLimit: 50, wantCursor: "next-page"},
+		{name: "minimum", query: "?limit=1", wantLimit: 1},
+		{name: "maximum", query: "?limit=500&cursor=max-page", wantLimit: MaxLimit, wantCursor: "max-page"},
+		{name: "zero", query: "?limit=0", wantError: "limit must be at least 1"},
+		{name: "negative", query: "?limit=-1", wantError: "limit must be at least 1"},
+		{name: "above maximum", query: "?limit=501", wantError: "limit must not exceed 500"},
+		{name: "malformed", query: "?limit=invalid", wantError: "invalid limit parameter"},
+		{name: "integer overflow", query: "?limit=999999999999999999999999999999999", wantError: "invalid limit parameter"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := fiber.New()
+			var got *findingHistoryPagination
+			var parseErr error
+			app.Get("/", func(c fiber.Ctx) error {
+				got, parseErr = parseFindingHistoryPagination(c)
+				return c.SendStatus(fiber.StatusNoContent)
+			})
+
+			resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/"+tt.query, nil))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = resp.Body.Close() })
+			if tt.wantError != "" {
+				require.ErrorContains(t, parseErr, tt.wantError)
+				require.Nil(t, got)
+				return
+			}
+			require.NoError(t, parseErr)
+			require.Equal(t, &findingHistoryPagination{Limit: tt.wantLimit, Continue: tt.wantCursor}, got)
 		})
 	}
 }

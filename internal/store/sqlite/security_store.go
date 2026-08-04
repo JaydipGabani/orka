@@ -255,6 +255,14 @@ const scanRunSelectColumns = `id, run_uid, namespace, repository_scan, repositor
 	target_verification, bundle_status, authorization_status, isolation_status, quality_reason_codes_json,
 	summary, error_message`
 
+func qualifiedScanRunSelectColumns(alias string) string {
+	columns := strings.Split(scanRunSelectColumns, ",")
+	for i := range columns {
+		columns[i] = alias + "." + strings.TrimSpace(columns[i])
+	}
+	return strings.Join(columns, ", ")
+}
+
 func scanScanRun(scanner interface{ Scan(dest ...any) error }) (*store.ScanRun, error) {
 	var run store.ScanRun
 	var reasonCodesJSON string
@@ -324,6 +332,89 @@ func (s *Store) ListScanRuns(ctx context.Context, namespace, repositoryScan stri
 		return nil, "", err
 	}
 	return runs, nextOffsetCursor(offset, len(runs), limit), nil
+}
+
+// ListLatestScanRuns returns the newest run for each requested RepositoryScan incarnation.
+func (s *Store) ListLatestScanRuns(
+	ctx context.Context,
+	namespace string,
+	repositories []store.RepositoryScanIdentity,
+) ([]store.ScanRun, error) {
+	if len(repositories) == 0 {
+		return []store.ScanRun{}, nil
+	}
+
+	identities := make([]store.RepositoryScanIdentity, 0, len(repositories))
+	seen := make(map[store.RepositoryScanIdentity]struct{}, len(repositories))
+	for _, identity := range repositories {
+		if identity.Name != strings.TrimSpace(identity.Name) {
+			return nil, store.ValidationErrorf("repository scan name must not contain surrounding whitespace")
+		}
+		if identity.UID != strings.TrimSpace(identity.UID) {
+			return nil, store.ValidationErrorf("repository scan UID must not contain surrounding whitespace")
+		}
+		if identity.Name == "" {
+			return nil, store.ValidationErrorf("repository scan name is required")
+		}
+		if identity.UID == "" {
+			return nil, store.ValidationErrorf("repository scan UID is required")
+		}
+		if identity.Generation <= 0 {
+			return nil, store.ValidationErrorf("repository scan generation must be positive")
+		}
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		identities = append(identities, identity)
+	}
+
+	placeholders := make([]string, 0, len(identities))
+	args := make([]any, 0, len(identities)*3+1)
+	for _, identity := range identities {
+		placeholders = append(placeholders, "(?, ?, ?)")
+		args = append(args, identity.Name, identity.UID, identity.Generation)
+	}
+	args = append(args, namespace)
+
+	query := `WITH requested(repository_scan, repository_scan_uid, repository_scan_generation) AS (
+		VALUES ` + strings.Join(placeholders, ", ") + `
+	), ranked AS (
+		SELECT ` + qualifiedScanRunSelectColumns("runs") + `,
+			ROW_NUMBER() OVER (
+				PARTITION BY runs.repository_scan, runs.repository_scan_uid, runs.repository_scan_generation
+				ORDER BY runs.started_at DESC, runs.id DESC
+			) AS latest_rank
+		FROM security_scan_runs AS runs
+		INNER JOIN requested
+			ON requested.repository_scan = runs.repository_scan
+			AND requested.repository_scan_uid = runs.repository_scan_uid
+			AND requested.repository_scan_generation = runs.repository_scan_generation
+		WHERE runs.namespace = ?
+	)
+	SELECT ` + scanRunSelectColumns + `
+	FROM ranked
+	WHERE latest_rank = 1
+	ORDER BY repository_scan, repository_scan_uid, repository_scan_generation`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+
+	runs := make([]store.ScanRun, 0, len(identities))
+	for rows.Next() {
+		run, err := scanScanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, *run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return runs, nil
 }
 
 // UpsertReviewSlice inserts or updates a deterministic review slice.

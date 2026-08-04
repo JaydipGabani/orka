@@ -9,7 +9,6 @@ import { PageHeader } from "@/components/layout/page-header";
 import {
   useRepositoryScans,
   useRunSecurityScan,
-  useScanRuns,
 } from "@/hooks/use-security";
 import type { RepositoryScan, ScanRun } from "@/schemas/security";
 
@@ -370,6 +369,19 @@ function repositoryIncarnation(repo: RepositoryScan) {
   ]);
 }
 
+function latestRunIncarnationKey(
+  repositoryName: string,
+  repositoryUID?: string,
+  repositoryGeneration?: number,
+) {
+  const name = repositoryName.trim();
+  const uid = repositoryUID?.trim();
+  if (!name || !uid || typeof repositoryGeneration !== "number") {
+    return undefined;
+  }
+  return JSON.stringify([name, uid, repositoryGeneration]);
+}
+
 export function RepositoryList() {
   const repositories = useRepositoryScans();
   const { data, isLoading } = repositories;
@@ -391,6 +403,24 @@ export function RepositoryList() {
         ? "Repository metadata is refreshing; cached repository status cannot verify freshness."
         : undefined,
   };
+  const latestRunsByRepository = new Map<string, ScanRun>();
+  for (const run of data?.latestScanRuns ?? []) {
+    const key = latestRunIncarnationKey(
+      run.repositoryScan,
+      run.repositoryScanUID,
+      run.repositoryScanGeneration,
+    );
+    if (key) latestRunsByRepository.set(key, run);
+  }
+  const latestRunQueryBinding: LatestRunBinding =
+    repositoryQueryIsSettled && data?.latestScanRuns === undefined
+      ? {
+          state: "unverified",
+          observedAt: repositories.dataUpdatedAt,
+          unavailableDetail:
+            "Latest scan run metadata is missing from the repository response.",
+        }
+      : repositoryQueryBinding;
 
   return (
     <div className="space-y-4">
@@ -429,13 +459,36 @@ export function RepositoryList() {
         </Card>
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
-          {(data?.items ?? []).map((repo) => (
-            <RepositoryCard
-              key={repo.metadata.name}
-              repo={repo}
-              repositoryQueryBinding={repositoryQueryBinding}
-            />
-          ))}
+          {(data?.items ?? []).map((repo) => {
+            const key = latestRunIncarnationKey(
+              repo.metadata.name,
+              repo.metadata.uid,
+              repo.metadata.generation,
+            );
+            return (
+              <RepositoryCard
+                key={repo.metadata.name}
+                repo={repo}
+                repositoryQueryBinding={repositoryQueryBinding}
+                latestRunBinding={
+                  latestRunQueryBinding.state === "resolved" && !key
+                    ? {
+                        state: "unverified",
+                        observedAt: latestRunQueryBinding.observedAt,
+                        unavailableDetail:
+                          "Repository UID or generation is unavailable; latest-run quality cannot be verified.",
+                      }
+                    : {
+                        ...latestRunQueryBinding,
+                        run:
+                          latestRunQueryBinding.state === "resolved" && key
+                            ? latestRunsByRepository.get(key)
+                            : undefined,
+                      }
+                }
+              />
+            );
+          })}
         </div>
       )}
     </div>
@@ -445,12 +498,13 @@ export function RepositoryList() {
 function RepositoryCard({
   repo,
   repositoryQueryBinding,
+  latestRunBinding,
 }: {
   repo: RepositoryScan;
   repositoryQueryBinding: LatestRunBinding;
+  latestRunBinding: LatestRunBinding;
 }) {
   const runScan = useRunSecurityScan(repo.metadata.name);
-  const scanRuns = useScanRuns(repo.metadata.name);
   const currentRepositoryIncarnation = repositoryIncarnation(repo);
   const [mutationRepositoryIncarnation, setMutationRepositoryIncarnation] =
     useState(currentRepositoryIncarnation);
@@ -463,23 +517,6 @@ function RepositoryCard({
   const mutationIsError = mutationStateIsCurrent && runScan.isError;
   const lastScanAt =
     repo.status?.lastScanAt ?? repo.status?.lastSuccessfulScanAt;
-  const latestRunIsSettled =
-    scanRuns.isSuccess && !scanRuns.isFetching && !scanRuns.isError;
-  const latestRunHasCachedData = scanRuns.data !== undefined;
-  const latestRunBinding: LatestRunBinding = {
-    state: latestRunIsSettled
-      ? "resolved"
-      : latestRunHasCachedData || scanRuns.isError
-        ? "unverified"
-        : "pending",
-    run: latestRunIsSettled ? scanRuns.data?.items[0] : undefined,
-    observedAt: latestRunIsSettled ? scanRuns.dataUpdatedAt : undefined,
-    unavailableDetail: scanRuns.isError
-      ? "Latest scan run metadata refresh failed; cached run data cannot verify freshness."
-      : scanRuns.isFetching && latestRunHasCachedData
-        ? "Latest scan run metadata is refreshing; cached run data cannot verify freshness."
-        : undefined,
-  };
   const latestObservedRunID = latestRunBinding.run?.id?.trim();
   const currentMutationQueryObservations = {
     repositoryIncarnation: currentRepositoryIncarnation,

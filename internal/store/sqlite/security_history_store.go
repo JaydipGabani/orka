@@ -1289,7 +1289,7 @@ func (s *Store) AppendFindingDecision(ctx context.Context, decision *store.Findi
 	if repositoryScan != decision.RepositoryScan {
 		return nil, store.ValidationErrorf("decision repositoryScan does not match public finding")
 	}
-	if existing, err := getFindingDecisionTx(ctx, tx, decision.ID); err == nil {
+	if existing, err := getFindingDecisionTx(ctx, tx, decision.Namespace, decision.ID); err == nil {
 		decision.FeedbackEligible = existing.FeedbackEligible
 		digest, digestErr := findingDecisionDigest(*decision)
 		if digestErr != nil {
@@ -1459,9 +1459,10 @@ func scanFindingDecision(scanner interface{ Scan(dest ...any) error }) (*store.F
 	return &decision, nil
 }
 
-func getFindingDecisionTx(ctx context.Context, tx *sql.Tx, id string) (*store.FindingDecision, error) {
+func getFindingDecisionTx(ctx context.Context, tx *sql.Tx, namespace, id string) (*store.FindingDecision, error) {
 	decision, err := scanFindingDecision(tx.QueryRowContext(ctx,
-		`SELECT `+findingDecisionSelectColumns+` FROM security_finding_decisions WHERE id = ?`, id))
+		`SELECT `+findingDecisionSelectColumns+` FROM security_finding_decisions WHERE namespace = ? AND id = ?`,
+		namespace, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}

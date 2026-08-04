@@ -581,6 +581,87 @@ func TestValidatorMethodWhitespaceCannotBypassReceiptPolicy(t *testing.T) {
 	}
 }
 
+func TestFindingDecisionIDsAreScopedByNamespace(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	const sharedDecisionID = "decision_shared"
+
+	fixtures := []struct {
+		namespace    string
+		findingID    string
+		occurrenceID string
+		action       store.FindingDecisionAction
+	}{
+		{namespace: "tenant-a", findingID: "finding-a", occurrenceID: "occurrence-a", action: store.FindingDecisionReopen},
+		{namespace: "tenant-b", findingID: "finding-b", occurrenceID: "occurrence-b", action: store.FindingDecisionCloseFixed},
+	}
+	decisions := make(map[string]*store.FindingDecision, len(fixtures))
+	for _, fixture := range fixtures {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO security_findings
+			(id, namespace, repository_scan, scan_run_id, fingerprint, title, summary, severity,
+			 confidence, validation_status, state, current_occurrence_id)
+			VALUES (?, ?, 'repo1', ?, ?, 'Finding', 'Summary', 'medium', 'high', 'unvalidated', 'open', ?)`,
+			fixture.findingID, fixture.namespace, "run-"+fixture.namespace, "fingerprint-"+fixture.namespace,
+			fixture.occurrenceID); err != nil {
+			t.Fatalf("insert finding for %s: %v", fixture.namespace, err)
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO security_finding_occurrences
+			(id, namespace, repository_scan, scan_run_id, run_uid, public_finding_id, semantic_finding_id,
+			 semantic_fingerprint, identity_quality, identity_algorithm_version, record_digest)
+			VALUES (?, ?, 'repo1', ?, ?, ?, ?, ?, ?, ?, ?)`,
+			fixture.occurrenceID, fixture.namespace, "run-"+fixture.namespace, "run-uid-"+fixture.namespace,
+			fixture.findingID, "semantic-"+fixture.namespace, "semantic-fingerprint-"+fixture.namespace,
+			store.IdentityQualityCanonical, semanticIdentityAlgorithmV1, "digest-"+fixture.namespace); err != nil {
+			t.Fatalf("insert occurrence for %s: %v", fixture.namespace, err)
+		}
+
+		decision := &store.FindingDecision{
+			ID:                      sharedDecisionID,
+			Namespace:               fixture.namespace,
+			RepositoryScan:          "repo1",
+			PublicFindingID:         fixture.findingID,
+			Scope:                   store.FindingDecisionOccurrence,
+			OccurrenceID:            fixture.occurrenceID,
+			Action:                  fixture.action,
+			ExpectedDecisionVersion: 0,
+			ActorSubject:            "user:reviewer",
+			AuthenticationSource:    "oidc",
+			Source:                  "api",
+		}
+		appended, err := s.AppendFindingDecision(ctx, decision)
+		if err != nil {
+			t.Fatalf("AppendFindingDecision(%s) error = %v", fixture.namespace, err)
+		}
+		if appended.Namespace != fixture.namespace || appended.PublicFindingID != fixture.findingID || appended.DecisionVersion != 1 {
+			t.Fatalf("AppendFindingDecision(%s) = %#v", fixture.namespace, appended)
+		}
+		decisions[fixture.namespace] = decision
+	}
+
+	for _, fixture := range fixtures {
+		got, err := s.GetFindingDecision(ctx, fixture.namespace, sharedDecisionID)
+		if err != nil {
+			t.Fatalf("GetFindingDecision(%s) error = %v", fixture.namespace, err)
+		}
+		if got.Namespace != fixture.namespace || got.PublicFindingID != fixture.findingID || got.Action != fixture.action {
+			t.Fatalf("GetFindingDecision(%s) = %#v", fixture.namespace, got)
+		}
+		replayed, err := s.AppendFindingDecision(ctx, decisions[fixture.namespace])
+		if err != nil {
+			t.Fatalf("AppendFindingDecision(%s replay) error = %v", fixture.namespace, err)
+		}
+		if replayed.Namespace != fixture.namespace || replayed.PublicFindingID != fixture.findingID || replayed.DecisionVersion != 1 {
+			t.Fatalf("AppendFindingDecision(%s replay) = %#v", fixture.namespace, replayed)
+		}
+	}
+
+	mismatch := *decisions[fixtures[0].namespace]
+	mismatch.Action = store.FindingDecisionCloseFixed
+	if _, err := s.AppendFindingDecision(ctx, &mismatch); !errors.Is(err, store.ErrDuplicateMismatch) {
+		t.Fatalf("AppendFindingDecision(same-namespace mismatch) error = %v, want ErrDuplicateMismatch", err)
+	}
+}
+
 func TestFindingDecisionFeedbackEligibilityUsesScopedOccurrenceIdentity(t *testing.T) {
 	for _, tc := range []struct {
 		name                      string

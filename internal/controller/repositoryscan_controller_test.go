@@ -2185,7 +2185,7 @@ func TestIngestReviewTaskSkipsStaleSliceRun(t *testing.T) {
 		RepositoryScan: "kaset",
 		TaskName:       "kaset-review-slice-old",
 		Mode:           "initial",
-		Phase:          scanRunPhaseRunning,
+		Phase:          scanRunPhaseSucceeded,
 		BaseCommit:     "old-base",
 		HeadCommit:     "old-head",
 		StartedAt:      time.Now().Add(-1 * time.Hour),
@@ -2948,6 +2948,60 @@ func TestCreateScanRunRepairsRunCreatedByIdempotencyConflict(t *testing.T) {
 	}
 	if current.Status.LastScanID != run.ID || current.Status.LastScanTaskName != run.TaskName {
 		t.Fatalf("scan status = %#v, want repaired run/task", current.Status)
+	}
+}
+
+func TestCreateScanRunTreatsUnrelatedRepositoryReservationAsContention(t *testing.T) {
+	ctx := context.Background()
+	baseStore := setupControllerSQLiteStore(t)
+	securityStore := &conflictInjectingSecurityStore{
+		SecurityStore: baseStore, SecurityRunTaskInputStore: baseStore,
+		mutateCompeting: func(run *storepkg.ScanRun) {
+			run.RequestIdempotencyKey = "req_unrelated_repository_reservation"
+			run.IdempotencyKey = run.RequestIdempotencyKey
+		},
+	}
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "conflict-unrelated", Namespace: defaultNS, UID: types.UID("conflict-unrelated-uid"), Generation: 2,
+		},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL: "https://github.com/example/repo", AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.RepositoryScan{}).WithObjects(scan).Build()
+	reconciler := &RepositoryScanReconciler{
+		Client: cl, Scheme: scheme, SecurityStore: securityStore, RunTaskInputStore: securityStore,
+	}
+
+	if err := reconciler.createScanRun(ctx, scan, "initial", "", ""); err != nil {
+		t.Fatalf("createScanRun() error = %v, want expected contention", err)
+	}
+	if securityStore.injectedRun == nil {
+		t.Fatal("expected an unrelated competing scan run")
+	}
+	stored, err := baseStore.GetScanRun(ctx, scan.Namespace, securityStore.injectedRun.ID)
+	if err != nil {
+		t.Fatalf("GetScanRun(competing) error = %v", err)
+	}
+	if stored.Phase != scanRunPhasePending || stored.RequestIdempotencyKey != "req_unrelated_repository_reservation" {
+		t.Fatalf("competing run = %#v, want untouched pending reservation", stored)
+	}
+	task := &corev1alpha1.Task{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: scan.Namespace, Name: stored.TaskName}, task); !apierrors.IsNotFound(err) {
+		t.Fatalf("Get(competing task) error = %v, want no task created by losing reconciler", err)
+	}
+	current := &corev1alpha1.RepositoryScan{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(scan), current); err != nil {
+		t.Fatalf("Get(scan) error = %v", err)
+	}
+	if current.Status.LastScanID != "" || current.Status.LastScanTaskName != "" {
+		t.Fatalf("scan status = %#v, want unchanged status after contention", current.Status)
 	}
 }
 
@@ -4115,6 +4169,63 @@ func TestEnqueueAutoValidationTasksHonorsRunCapAcrossExistingTasks(t *testing.T)
 	}
 	if len(tasks.Items) != 1 {
 		t.Fatalf("validation tasks = %d, want existing task only due run cap", len(tasks.Items))
+	}
+}
+
+func TestCreateValidationTaskUsesLabelSafeExactSecurityIDs(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "validation-labels", Namespace: defaultNS, UID: types.UID("validation-labels-uid"), Generation: 1,
+		},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL: "https://github.com/example/repo", AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan).Build()
+	run := &storepkg.ScanRun{
+		ID: "scan-validation-labels", RunUID: "run_7777777777777777777777777777777777777777777777777777777777777777",
+		Namespace: scan.Namespace, RepositoryScan: scan.Name, RepositoryScanUID: string(scan.UID),
+		RepositoryScanGeneration: scan.Generation, TaskName: "source-task", Mode: "manual", Phase: scanRunPhaseSucceeded,
+		HeadCommit: strings.Repeat("d", 40), StartedAt: time.Now().UTC(), Quality: storepkg.LegacyScanQuality(),
+	}
+	if err := securityStore.CreateScanRun(ctx, run); err != nil {
+		t.Fatalf("CreateScanRun() error = %v", err)
+	}
+	finding := &storepkg.Finding{
+		ID: "fnd_" + strings.Repeat("a", 64), Namespace: scan.Namespace, RepositoryScan: scan.Name,
+		ScanRunID: run.ID, CurrentOccurrenceID: "occ_" + strings.Repeat("b", 64),
+		Title: "Full width finding", Severity: "high", Confidence: "high",
+	}
+	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore}
+	if err := reconciler.createValidationTask(ctx, scan, finding); err != nil {
+		t.Fatalf("createValidationTask() error = %v", err)
+	}
+	taskName := security.ScanStageTaskNameForRun(
+		scan.Name, "validation", security.StageValidation, finding.CurrentOccurrenceID, run.RunUID,
+	)
+	task := &corev1alpha1.Task{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: scan.Namespace, Name: taskName}, task); err != nil {
+		t.Fatalf("Get(validation task) error = %v", err)
+	}
+	if task.Labels[labels.LabelSecurityFindingID] != labels.SelectorValue(finding.ID) ||
+		task.Labels[labels.LabelSecurityOccurrenceID] != labels.SelectorValue(finding.CurrentOccurrenceID) {
+		t.Fatalf("validation labels = %#v", task.Labels)
+	}
+	if len(task.Labels[labels.LabelSecurityFindingID]) > 63 || len(task.Labels[labels.LabelSecurityOccurrenceID]) > 63 {
+		t.Fatalf("validation labels exceed Kubernetes limit: %#v", task.Labels)
+	}
+	if got, err := taskSecurityFindingID(task); err != nil || got != finding.ID {
+		t.Fatalf("taskSecurityFindingID() = (%q, %v)", got, err)
+	}
+	if got, err := taskSecurityOccurrenceID(task); err != nil || got != finding.CurrentOccurrenceID {
+		t.Fatalf("taskSecurityOccurrenceID() = (%q, %v)", got, err)
 	}
 }
 

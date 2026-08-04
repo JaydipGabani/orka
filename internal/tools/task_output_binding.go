@@ -9,6 +9,7 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
+	"github.com/orka-agents/orka/internal/security"
 	"github.com/orka-agents/orka/internal/store"
 )
 
@@ -50,21 +51,38 @@ func toolTaskResult(ctx context.Context, toolCtx *ToolContext, task *corev1alpha
 	if toolCtx == nil || toolCtx.ResultStore == nil || task == nil {
 		return nil, store.ErrNotFound
 	}
-	requireBound := toolTaskRequiresBoundOutput(task)
-	if task.UID != "" {
-		if bound, ok := any(toolCtx.ResultStore).(store.BoundOutputStore); ok {
-			result, err := bound.GetBoundResult(ctx, task.Namespace, task.Name, string(task.UID), toolTaskOutputAttempt(task))
-			if err == nil {
-				return result.Data, nil
+	if toolTaskRequiresBoundOutput(task) {
+		switch toolCtx.WorkerOutputBindingMode {
+		case "", security.WorkerOutputBindingOff:
+			return toolCtx.ResultStore.GetResult(ctx, task.Namespace, task.Name)
+		case security.WorkerOutputBindingAudit:
+			if result, err := toolBoundTaskResult(ctx, toolCtx, task); err == nil {
+				return result, nil
 			}
-			if requireBound {
-				return nil, err
-			}
-		} else if requireBound {
+			return toolCtx.ResultStore.GetResult(ctx, task.Namespace, task.Name)
+		case security.WorkerOutputBindingEnforce:
+			return toolBoundTaskResult(ctx, toolCtx, task)
+		default:
 			return nil, store.ErrNotReady
 		}
-	} else if requireBound {
-		return nil, store.ErrNotReady
+	}
+	if result, err := toolBoundTaskResult(ctx, toolCtx, task); err == nil {
+		return result, nil
 	}
 	return toolCtx.ResultStore.GetResult(ctx, task.Namespace, task.Name)
+}
+
+func toolBoundTaskResult(ctx context.Context, toolCtx *ToolContext, task *corev1alpha1.Task) ([]byte, error) {
+	if task.UID == "" {
+		return nil, store.ErrNotReady
+	}
+	bound, ok := any(toolCtx.ResultStore).(store.BoundOutputStore)
+	if !ok {
+		return nil, store.ErrNotReady
+	}
+	result, err := bound.GetBoundResult(ctx, task.Namespace, task.Name, string(task.UID), toolTaskOutputAttempt(task))
+	if err != nil {
+		return nil, err
+	}
+	return result.Data, nil
 }
