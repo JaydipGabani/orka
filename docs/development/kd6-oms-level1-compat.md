@@ -25,10 +25,9 @@ and never forwards the caller's bearer token downstream. This keeps the public
 interoperability surface separate from the private governance surface while
 allowing both to share one deployment and trust boundary.
 
-This profile proves API and behavior compatibility. It does not claim OAuth 2.1
-resource-server certification: the adapter binds a dedicated rotating bearer
-Secret to one configured tenant and agent. OAuth or mTLS claim validation may be
-provided by a trusted ingress.
+The adapter implements the Level 1 OAuth bearer profile with OIDC JWT
+verification. It validates issuer, signature, audience, expiry, required scope,
+and configurable tenant and agent claims before forwarding a request.
 
 The private `/v1/stores/resolve` path remains reserved, so `resolve` is not an
 available Level 1 store name on the combined listener.
@@ -55,10 +54,10 @@ Level 2/3 route is included in the Level 1 allowlist.
 
 ## Identity and authentication
 
-- Every request to the facade first passes a dedicated Level 1 inbound
-  bearer-token authentication realm; the private Orka token is not accepted.
-- One facade credential is bound at startup to one canonical tenant and agent
-  identity. Caller-supplied identity headers must match that binding exactly.
+- Every request to the facade first passes a dedicated OAuth 2.1/OIDC JWT
+  validation realm; the private Orka token is not accepted.
+- Trusted tenant and agent identities come from verified JWT claims.
+  Caller-supplied identity headers must match those claims exactly.
 - Store, memory, and search routes require safe, non-empty `X-Tenant-ID` and
   `X-Agent-ID` values.
 - The adapter injects a separately configured downstream KD6 bearer token on
@@ -87,7 +86,8 @@ The black-box Level 1 API compatibility suite proves at least:
 
 A transparent facade passes only when the configured downstream KD6 service
 passes the same suite. Passing the private `orka.oms.v0alpha1` suite is not
-substituted for this proof. This proof does not certify OAuth 2.1 behavior.
+substituted for this proof. The adapter separately tests issuer, signature, audience, expiry, scope, and
+identity-claim rejection paths.
 
 ## Non-goals
 
