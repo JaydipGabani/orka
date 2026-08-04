@@ -25,9 +25,10 @@ and never forwards the caller's bearer token downstream. This keeps the public
 interoperability surface separate from the private governance surface while
 allowing both to share one deployment and trust boundary.
 
-The adapter implements the Level 1 OAuth bearer profile with OIDC JWT
-verification. It validates issuer, signature, audience, expiry, required scope,
-and configurable tenant and agent claims before forwarding a request.
+The adapter implements the Level 1 OAuth bearer profile with RFC 9068-style
+JWT access tokens (`typ=at+jwt`). It validates issuer, signature, audience,
+expiry/not-before, required scope, and configurable tenant and agent claims;
+ordinary OIDC ID tokens are rejected.
 
 The private `/v1/stores/resolve` path remains reserved, so `resolve` is not an
 available Level 1 store name on the combined listener.
