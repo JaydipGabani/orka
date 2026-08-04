@@ -37,6 +37,9 @@ func validateOpenCodeAgentSpec(agent *corev1alpha1.Agent) error {
 	if strings.TrimSpace(agent.Spec.Model.Provider) != "" {
 		return fmt.Errorf("agent %q opencode runtime does not accept model.provider", agent.Name)
 	}
+	if agent.Spec.Model.Temperature != nil && *agent.Spec.Model.Temperature != legacyDefaultACPTemperature {
+		return fmt.Errorf("agent %q opencode runtime does not support spec.model.temperature values other than the legacy default %.1f", agent.Name, legacyDefaultACPTemperature)
+	}
 	if len(agent.Spec.Model.Fallbacks) > 0 {
 		return fmt.Errorf("agent %q opencode runtime does not support spec.model.fallbacks", agent.Name)
 	}

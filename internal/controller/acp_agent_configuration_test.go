@@ -22,6 +22,10 @@ func TestBuildACPAgentSessionConfigurationRejectsUnsupportedModelControls(t *tes
 	temperature := 0.2
 	maxTokens := int32(128)
 	fallbacks := []corev1alpha1.ModelFallback{{ProviderRef: "fallback-provider", Model: "fallback-model"}}
+	opencodeTemperature := testOpenCodeModelConfig()
+	opencodeTemperature.Temperature = &temperature
+	opencodeFallbacks := testOpenCodeModelConfig()
+	opencodeFallbacks.Fallbacks = fallbacks
 	for _, tt := range []struct {
 		name      string
 		runtime   corev1alpha1.AgentRuntimeType
@@ -58,6 +62,18 @@ func TestBuildACPAgentSessionConfigurationRejectsUnsupportedModelControls(t *tes
 			model:     &corev1alpha1.ModelConfig{Name: "model", Fallbacks: fallbacks},
 			wantError: "spec.model.fallbacks",
 		},
+		{
+			name:      "opencode temperature",
+			runtime:   corev1alpha1.AgentRuntimeOpencode,
+			model:     opencodeTemperature,
+			wantError: "spec.model.temperature",
+		},
+		{
+			name:      "opencode fallbacks",
+			runtime:   corev1alpha1.AgentRuntimeOpencode,
+			model:     opencodeFallbacks,
+			wantError: "spec.model.fallbacks",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent}}
@@ -74,6 +90,20 @@ func TestBuildACPAgentSessionConfigurationRejectsUnsupportedModelControls(t *tes
 				t.Fatalf("buildACPAgentSessionConfiguration() error = %v, permanent=%t, want %q", err, isPermanentACPAgentConfigurationError(err), tt.wantError)
 			}
 		})
+	}
+}
+
+func TestBuildACPAgentSessionConfigurationAcceptsOpenCodeTokenLimits(t *testing.T) {
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent}}
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID("agent-uid"), Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	if _, err := buildACPAgentSessionConfiguration(task, agent, ""); err != nil {
+		t.Fatalf("buildACPAgentSessionConfiguration() error = %v", err)
 	}
 }
 
