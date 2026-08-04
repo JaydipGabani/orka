@@ -170,6 +170,17 @@ Migrate or delete the reported live objects in dependency order:
 2. Agents that reference v1 AgentRuntimes.
 3. `orka.harness.v1` AgentRuntimes.
 
+Every live Agent with `spec.runtime.type: opencode` is also a pre-cutover
+blocker. The pre-cutover Agent CRD cannot retain `spec.model.contextWindow` and
+does not admit the new built-in OpenCode shape, so do not try to patch such an
+Agent in place. Export it after taking the verified CR backup, quiesce any
+callers, and delete it before rerunning the gate. After the new CRD is applied,
+recreate it with a provider-qualified `spec.model.name`, reviewed positive
+`contextWindow` and `maxTokens`, and no `providerRef`, provider Secret, or
+Agent-level system prompt. Alternatively, migrate the live Agent to
+`claude`, `codex`, `copilot`, or an admin-registered `runtimeRef` before the
+cutover.
+
 Do not resume Gateway workloads during this process.
 
 Legacy harness-wrapper Deployments, Services, and Secrets are also blockers.

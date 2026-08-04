@@ -20,7 +20,8 @@ The script performs a fail-closed ACP v2 CRD hard cutover. It will not apply
 CRDs while any of the following remain:
   * an orka.harness.v1 AgentRuntime;
   * an Agent that references a live or backed-up v1 AgentRuntime;
-  * an Agent that still uses a legacy or invalid built-in OpenCode shape;
+  * any live Agent that uses built-in OpenCode and must be recreated after the
+    new Agent CRD is applied;
   * a GatewayBinding that references an affected Agent;
   * a Task that still uses spec.workspace.gitSecretRef or
     spec.agentRuntime.workspace.gitSecretRef;
@@ -293,30 +294,8 @@ collect_cluster_state() {
 
 build_legacy_builtin_agent_inventory() {
   jq -r '
-    def trimmed_string:
-      if type == "string" then gsub("^\\s+|\\s+$"; "") else "" end;
-    def supported_opencode:
-      . as $agent
-      | ($agent.spec.model.name // "" | trimmed_string) as $model
-      | ($model | index("/")) as $slash
-      | ($agent.spec.model.contextWindow // 0) as $context
-      | ($agent.spec.model.maxTokens // 0) as $output
-      | ($slash != null and $slash > 0 and $slash < (($model | length) - 1))
-        and (($model | contains("{")) | not)
-        and (($model | contains("}")) | not)
-        and (($context | type) == "number" and ($context | floor) == $context and $context > 0)
-        and (($output | type) == "number" and ($output | floor) == $output and $output > 0 and $context > $output)
-        and (($agent.spec.model.provider // "" | trimmed_string | length) == 0)
-        and (($agent.spec.model.temperature // null) == null or $agent.spec.model.temperature == 0.7)
-        and (($agent.spec.model.fallbacks // []) | length) == 0
-        and (($agent.spec.runtime.defaultReasoningEffort // "" | trimmed_string | length) == 0)
-        and (($agent.spec.secretRef.name // "" | trimmed_string | length) == 0)
-        and ($agent.spec.providerRef == null)
-        and (($agent.spec.systemPrompt.inline // "" | trimmed_string | length) == 0)
-        and (($agent.spec.systemPrompt.configMapRef // null) == null);
     .items[]
     | select((.spec.runtime.type // "") == "opencode")
-    | select((supported_opencode | not))
     | [(.metadata.namespace // ""), (.metadata.name // "")] | @tsv
   ' "${tmp_dir}/live-agents.json" >"${tmp_dir}/live-legacy-builtin-agents.tsv"
   sort_unique_file "${tmp_dir}/live-legacy-builtin-agents.tsv"
@@ -617,8 +596,8 @@ report_legacy_builtin_agent_blockers() {
   local namespace name
   [[ -s "${tmp_dir}/live-legacy-builtin-agents.tsv" ]] || return 0
   while IFS=$'\t' read -r namespace name; do
-    echo "blocked: Agent ${namespace}/${name} still uses a legacy or invalid built-in OpenCode configuration" >&2
-    echo "  migrate: update or recreate the Agent with a supported OpenCode provider/model plus reviewed contextWindow/maxTokens and no Agent systemPrompt or provider Secret, select claude/codex/copilot, or use spec.runtime.runtimeRef, then retry the cutover" >&2
+    echo "blocked: Agent ${namespace}/${name} must be removed before the OpenCode CRD cutover" >&2
+    echo "  migrate: export and delete the Agent before cutover, then recreate it after the new CRD is applied with a provider-qualified model.name, reviewed positive contextWindow/maxTokens, and no providerRef, provider Secret, or Agent systemPrompt; alternatively migrate it to claude/codex/copilot or runtimeRef before retrying" >&2
   done <"${tmp_dir}/live-legacy-builtin-agents.tsv"
   return 1
 }
