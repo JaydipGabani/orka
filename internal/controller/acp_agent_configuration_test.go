@@ -20,6 +20,7 @@ import (
 
 func TestBuildACPAgentSessionConfigurationRejectsUnsupportedModelControls(t *testing.T) {
 	temperature := 0.2
+	contextWindow := int32(32768)
 	maxTokens := int32(128)
 	fallbacks := []corev1alpha1.ModelFallback{{ProviderRef: "fallback-provider", Model: "fallback-model"}}
 	opencodeTemperature := testOpenCodeModelConfig()
@@ -37,6 +38,12 @@ func TestBuildACPAgentSessionConfigurationRejectsUnsupportedModelControls(t *tes
 			runtime:   corev1alpha1.AgentRuntimeCodex,
 			model:     &corev1alpha1.ModelConfig{Name: "model", Temperature: &temperature},
 			wantError: "spec.model.temperature",
+		},
+		{
+			name:      "copilot context window",
+			runtime:   corev1alpha1.AgentRuntimeCopilot,
+			model:     &corev1alpha1.ModelConfig{Name: "model", ContextWindow: &contextWindow},
+			wantError: "spec.model.contextWindow",
 		},
 		{
 			name:      "claude max tokens",

@@ -161,8 +161,13 @@ func validateACPAgentModelControls(runtimeCfg *corev1alpha1.AgentCLIRuntime, mod
 	if model.Temperature != nil && *model.Temperature != legacyDefaultACPTemperature {
 		return fmt.Errorf("built-in ACP runtime %q does not support spec.model.temperature values other than the legacy default %.1f", runtimeCfg.Type, legacyDefaultACPTemperature)
 	}
-	if runtimeCfg.Type != corev1alpha1.AgentRuntimeOpencode && model.MaxTokens != nil {
-		return fmt.Errorf("built-in ACP runtime %q does not support spec.model.maxTokens", runtimeCfg.Type)
+	if runtimeCfg.Type != corev1alpha1.AgentRuntimeOpencode {
+		if model.ContextWindow != nil {
+			return fmt.Errorf("built-in ACP runtime %q does not support spec.model.contextWindow", runtimeCfg.Type)
+		}
+		if model.MaxTokens != nil {
+			return fmt.Errorf("built-in ACP runtime %q does not support spec.model.maxTokens", runtimeCfg.Type)
+		}
 	}
 	if len(model.Fallbacks) > 0 {
 		return fmt.Errorf("built-in ACP runtime %q does not support spec.model.fallbacks", runtimeCfg.Type)
