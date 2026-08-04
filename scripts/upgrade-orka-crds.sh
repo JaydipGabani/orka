@@ -311,6 +311,7 @@ build_legacy_builtin_agent_inventory() {
         and (($agent.spec.model.fallbacks // []) | length) == 0
         and (($agent.spec.runtime.defaultReasoningEffort // "" | trimmed_string | length) == 0)
         and (($agent.spec.secretRef.name // "" | trimmed_string | length) == 0)
+        and ($agent.spec.providerRef == null)
         and (($agent.spec.systemPrompt.inline // "" | trimmed_string | length) == 0)
         and (($agent.spec.systemPrompt.configMapRef // null) == null);
     .items[]

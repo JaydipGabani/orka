@@ -591,6 +591,35 @@ test_supported_opencode_agent_does_not_block_cutover() {
   assert_one_dry_run_and_one_live_apply "${case_dir}"
 }
 
+test_opencode_agent_provider_ref_blocks_cutover() {
+  local case_dir
+  case_dir="$(new_case opencode-agent-provider-ref)"
+  write_list "${case_dir}/agents.json" '[
+    {
+      "kind":"Agent",
+      "metadata":{"namespace":"work","name":"provider-ref-opencode"},
+      "spec":{
+        "model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},
+        "providerRef":{"name":"legacy-provider"},
+        "runtime":{"type":"opencode"}
+      }
+    },
+    {
+      "kind":"Agent",
+      "metadata":{"namespace":"work","name":"null-provider-ref-opencode"},
+      "spec":{
+        "model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},
+        "providerRef":null,
+        "runtime":{"type":"opencode"}
+      }
+    }
+  ]'
+
+  expect_failure "${case_dir}" 'Agent work/provider-ref-opencode still uses a legacy or invalid built-in OpenCode configuration' run_upgrade "${case_dir}"
+  ! grep -F 'Agent work/null-provider-ref-opencode' "${case_dir}/output" >/dev/null
+  assert_no_live_apply "${case_dir}"
+}
+
 test_post_dry_run_legacy_builtin_opencode_agent_blocks_live_apply() {
   local case_dir
   case_dir="$(new_case post-dry-run-legacy-builtin-opencode-agent)"
@@ -664,6 +693,7 @@ run_test 'never deletes wrapper without opt-in' test_wrapper_requires_explicit_c
 run_test 'deletes only exact legacy wrapper targets with opt-in' test_explicit_wrapper_cleanup_targets_only_legacy_resources
 run_test 'blocks legacy built-in OpenCode Agents before cutover' test_legacy_builtin_opencode_agent_blocks_cutover
 run_test 'allows supported built-in OpenCode Agents during cutover' test_supported_opencode_agent_does_not_block_cutover
+run_test 'blocks built-in OpenCode Agents with providerRef before cutover' test_opencode_agent_provider_ref_blocks_cutover
 run_test 'rechecks legacy built-in OpenCode Agents after server dry-run' test_post_dry_run_legacy_builtin_opencode_agent_blocks_live_apply
 run_test 'blocks legacy Task workspace credentials before cutover' test_legacy_task_workspace_credentials_block_cutover
 run_test 'rechecks legacy Tasks after server dry-run' test_post_dry_run_legacy_task_blocks_live_apply
