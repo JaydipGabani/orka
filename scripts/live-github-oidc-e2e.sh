@@ -125,7 +125,8 @@ make deploy \
   WORKSPACE_PUBLISHER_IMG="${publisher_ref}" \
   ACP_CODEX_RUNTIME_IMG="example.invalid/orka/acp-codex@${placeholder_digest}" \
   ACP_CLAUDE_RUNTIME_IMG="example.invalid/orka/acp-claude@${placeholder_digest}" \
-  ACP_COPILOT_RUNTIME_IMG="example.invalid/orka/acp-copilot@${placeholder_digest}"
+  ACP_COPILOT_RUNTIME_IMG="example.invalid/orka/acp-copilot@${placeholder_digest}" \
+  ACP_OPENCODE_RUNTIME_IMG="example.invalid/orka/acp-opencode@${placeholder_digest}"
 kubectl wait --for=condition=Established crd/tasks.core.orka.ai --timeout=60s
 kubectl -n "${namespace}" patch deployment "${deployment}" --type=strategic \
   -p '{"spec":{"template":{"spec":{"containers":[{"name":"manager","imagePullPolicy":"IfNotPresent"}]}}}}'

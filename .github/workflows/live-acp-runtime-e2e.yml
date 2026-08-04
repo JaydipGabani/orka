@@ -45,6 +45,9 @@ jobs:
     timeout-minutes: 180
     environment: live-acp-runtime-smoke
     env:
+      ACP_E2E_OPENCODE_CONTEXT_WINDOW: "32768"
+      ACP_E2E_OPENCODE_MAX_TOKENS: "4096"
+      ACP_E2E_OPENCODE_MODEL: "openai/gpt-5.4"
       ACP_E2E_REQUIRE_PARALLEL: "1"
       ACP_E2E_KIND_TAG: live-acp-${{ github.run_id }}-${{ github.run_attempt }}
       KIND_VERSION: v0.31.0

@@ -1,7 +1,8 @@
 # Immutable ACP runtime images
 
-These definitions build separate Codex, Claude, and GitHub Copilot ACP runtime
-images. The build context must be the repository root so each image can compile
+These definitions build separate Codex, Claude, GitHub Copilot, and OpenCode
+ACP runtime images. The build context must be the repository root so each image can
+compile
 `cmd/orka-acp-runtime` and verify its duplicated supply-chain values against
 `internal/acp/pins.go`.
 
@@ -31,6 +32,7 @@ Base images are immutable multi-platform manifest-list references:
 | Dockerfile frontend | `docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e` |
 | Go builder | `golang:1.26.2-bookworm@sha256:47ce5636e9936b2c5cbf708925578ef386b4f8872aec74a67bd13a627d242b19` |
 | Node builder/runtime | `node:22.22.0-bookworm-slim@sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca6d3ea96f16cb30df6187d94` |
+| Debian OpenCode runtime | `debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818` |
 
 Codex inputs:
 
@@ -69,6 +71,19 @@ credentialless custom-provider session creation in ACP mode. Orka therefore
 keeps the real upstream credential behind its provider proxy and starts
 Copilot ACP sessions without GitHub login or an ACP authentication exchange.
 
+OpenCode inputs:
+
+| Input | Pin |
+| --- | --- |
+| OpenCode release | `1.18.9` |
+| OpenCode source | tag commit `4da7bb44c84e013fa53e9c5d02ac753d1435c81a`; codeload archive SHA-256 `bbc3363c6886c63865a60b75d456fff3fbe6b87d8a86f44b2439900695b35de3` |
+| OpenCode `linux/amd64` | baseline `opencode-linux-x64-baseline-1.18.9.tgz` (no AVX2 scheduling assumption); npm tar SHA-256 `59bf22db1f20c6c9836c926800a8e6416228330c2b518ade3d431d315cd76366`; extracted binary SHA-256 `7c4d91c84d2bfdeabb59257e3490c5e5acb08f2aacb3e42f3ddc296a1c3f1aca` |
+| OpenCode `linux/arm64` | `opencode-linux-arm64-1.18.9.tgz`; npm tar SHA-256 `4846a7e470797950f209126442a291cc06574fd44ddbb96c89d730017f60aae7`; extracted binary SHA-256 `ae8a9b7c591d3c763463f16bfb5f45230c4c741f039e8967218662836449ecdf` |
+| ripgrep `linux/amd64` | `15.2.0` `x86_64-unknown-linux-musl`; release tar SHA-256 `33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c`; extracted `rg` SHA-256 `e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849` |
+| ripgrep `linux/arm64` | `15.2.0` `aarch64-unknown-linux-musl`; release tar SHA-256 `800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915`; extracted `rg` SHA-256 `c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a` |
+| Orka root instruction | `workers/acp/images/opencode/AGENTS.md`; SHA-256 `b8e691e210a9502c9689ba20705806dfb1b5b10b5ca1062f73f9a85b1043a812` |
+| Image third-party notice | `workers/acp/images/opencode/NOTICE.md` (mirrors root `NOTICE.md`); SHA-256 `93167c1d7505d3e38efce8bf019c2af4e10ef56529465b87c34e4b3401508a98` |
+
 Codex and Claude adapters are compiled from exact GitHub source archives after
 frozen `package-lock.json` installs with `npm ci --ignore-scripts`. Their
 unmodified adapter outputs must first byte-match separately checksum-verified
@@ -82,6 +97,28 @@ The Copilot image instead installs the unmodified official per-architecture
 release executable. Its tar asset is checksum-verified, must contain exactly one
 `copilot` entry, and is never downloaded at runtime. All final images perform no
 package installation or network download.
+
+OpenCode is not wrapped by an adapter: the supervisor launches the
+checksum-verified native binary as `opencode --pure acp`. Its per-session config
+permits only the explicit Orka OpenAI-compatible proxy and disables project
+config, model fetching, external skills/plugins, LSP downloads, formatters,
+sharing, snapshots, and auto-update. It explicitly loads the immutable
+`/opt/opencode/AGENTS.md` guardrail followed by the session workspace root
+`AGENTS.md`, while ambient project discovery remains disabled. Native tool
+permissions are deterministic `allow`/`deny` rules derived from the session's
+Orka tool policy; read-intent sessions additionally force shell, mutation,
+and Grep tools off. Grep cannot carry the path-specific secret-file exclusions
+applied to Read, and the current dispatcher does not admit interactive ACP
+permission prompts. The image vendors the checksum-pinned static ripgrep
+15.2.0 binary at `/usr/local/bin/rg`, preventing OpenCode's Glob/Grep tools from
+attempting a runtime GitHub download. The private config directory is seeded
+only with empty `node_modules` plus root package/lock dependency metadata for
+`@opencode-ai/plugin` 1.18.9 so OpenCode's shallow dependency check does not
+launch a background network install; no plugin implementation is vendored. As
+with the other built-in runtime images, Git is intentionally absent: the ACP
+child sees a materialized workspace tree without repository credentials, and
+Orka's clean-room Publisher owns Git staging and publication after delta
+validation.
 
 ## Build with the remote builder
 
@@ -123,6 +160,18 @@ docker buildx build \
   .
 ```
 
+```bash
+docker buildx build \
+  --builder remote-vm \
+  --platform linux/amd64,linux/arm64 \
+  --file workers/acp/images/opencode/Dockerfile \
+  --tag docker.io/sozercan/orka-acp-opencode:1.18.9-rg-15.2.0 \
+  --provenance=mode=max \
+  --sbom=true \
+  --push \
+  .
+```
+
 For a non-publishing verification build, replace `--push` and `--tag` with:
 
 ```bash
@@ -151,7 +200,8 @@ tree.
 Orka's license and notice, adapter licenses, and provider license/notice files
 are retained under `/usr/share/licenses` in the final images.
 
-Codex ACP and the pinned Codex source are Apache-2.0. Claude Agent ACP is
+Codex ACP and the pinned Codex source are Apache-2.0. OpenCode is MIT, and
+ripgrep is dual-licensed under MIT or the Unlicense. Claude Agent ACP is
 Apache-2.0, but the Claude Agent SDK and bundled native Claude Code executable
 are proprietary Anthropic artifacts whose package license says use is subject
 to Anthropic's legal agreements. GitHub Copilot CLI is distributed unmodified

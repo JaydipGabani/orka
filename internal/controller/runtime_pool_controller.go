@@ -88,6 +88,7 @@ const (
 	runtimePoolProviderCodex              = "codex"
 	runtimePoolProviderClaude             = "claude"
 	runtimePoolProviderCopilot            = "copilot"
+	runtimePoolProviderOpencode           = "opencode"
 	runtimePoolResourceClassStandard      = "standard"
 	runtimePoolDefaultControllerNamespace = "orka-system"
 
@@ -510,6 +511,8 @@ func (r *RuntimePoolReconciler) validateRuntimePoolImage(pool *corev1alpha1.Runt
 		allowedImage = strings.TrimSpace(r.AllowedImages.Claude)
 	case runtimePoolProviderCopilot:
 		allowedImage = strings.TrimSpace(r.AllowedImages.Copilot)
+	case runtimePoolProviderOpencode:
+		allowedImage = strings.TrimSpace(r.AllowedImages.Opencode)
 	}
 	if allowedImage == "" || image != allowedImage {
 		return fmt.Errorf("spec.runtime.image is not the controller-approved image for provider %q", pool.Spec.Runtime.Profile.ProviderKind)
@@ -1683,6 +1686,12 @@ func (r *RuntimePoolReconciler) runtimePoolPodTemplate(
 	mode := int32(0o400)
 	terminationGrace := int64(120)
 	adapterDigestsJSON, _ := json.Marshal(cfg.profile.AdapterDigests)
+	modelContextLimit := ""
+	modelOutputLimit := ""
+	if cfg.profile.ModelLimits != nil {
+		modelContextLimit = strconv.FormatInt(cfg.profile.ModelLimits.Context, 10)
+		modelOutputLimit = strconv.FormatInt(cfg.profile.ModelLimits.Output, 10)
+	}
 	template := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations},
 		Spec: corev1.PodSpec{
@@ -1715,6 +1724,8 @@ func (r *RuntimePoolReconciler) runtimePoolPodTemplate(
 					{Name: "ORKA_ACP_PROVIDER", Value: cfg.profile.ProviderKind},
 					{Name: "ORKA_ACP_PROVIDER_PROXY_BASE_URL", Value: cfg.providerProxy.baseURL},
 					{Name: "ORKA_ACP_MODEL", Value: cfg.profile.Model},
+					{Name: "ORKA_ACP_MODEL_CONTEXT_LIMIT", Value: modelContextLimit},
+					{Name: "ORKA_ACP_MODEL_OUTPUT_LIMIT", Value: modelOutputLimit},
 					{Name: "ORKA_ACP_WORKSPACE_INTENT", Value: string(cfg.profile.WorkspaceIntent)},
 					{Name: "ORKA_ACP_AGENT_CONFIGURATION_DIGEST", Value: cfg.profile.AgentConfigurationDigest},
 					{Name: "ORKA_ACP_TOOL_POLICY_DIGEST", Value: cfg.profile.ToolPolicyDigest},
@@ -2106,11 +2117,16 @@ func runtimePoolDeploymentValidationTarget(
 	if err := json.Unmarshal([]byte(environment["ORKA_ACP_ADAPTER_DIGESTS_JSON"]), &adapterDigests); err != nil || len(adapterDigests) == 0 {
 		return nil, runtimePoolConfig{}, fmt.Errorf("deployed RuntimePool adapter digests are invalid")
 	}
+	modelLimits, err := runtimePoolModelLimitsFromEnvironment(environment)
+	if err != nil {
+		return nil, runtimePoolConfig{}, fmt.Errorf("deployed RuntimePool model limits are invalid: %w", err)
+	}
 	profile := harnessv2.RuntimeProfile{
 		ACPProfile:               environment["ORKA_ACP_ACP_PROFILE"],
 		AdapterDigests:           adapterDigests,
 		ProviderKind:             environment["ORKA_ACP_PROVIDER"],
 		Model:                    environment["ORKA_ACP_MODEL"],
+		ModelLimits:              modelLimits,
 		AgentConfigurationDigest: environment["ORKA_ACP_AGENT_CONFIGURATION_DIGEST"],
 		ToolPolicyDigest:         environment["ORKA_ACP_TOOL_POLICY_DIGEST"],
 		ApprovalPolicyDigest:     environment["ORKA_ACP_APPROVAL_POLICY_DIGEST"],
@@ -2135,6 +2151,30 @@ func runtimePoolDeploymentValidationTarget(
 			tokenGeneration: providerGeneration,
 		},
 	}, nil
+}
+
+func runtimePoolModelLimitsFromEnvironment(environment map[string]string) (*harnessv2.ModelTokenLimits, error) {
+	contextValue := strings.TrimSpace(environment["ORKA_ACP_MODEL_CONTEXT_LIMIT"])
+	outputValue := strings.TrimSpace(environment["ORKA_ACP_MODEL_OUTPUT_LIMIT"])
+	if contextValue == "" && outputValue == "" {
+		return nil, nil
+	}
+	if contextValue == "" || outputValue == "" {
+		return nil, fmt.Errorf("context and output limits must be set together")
+	}
+	contextLimit, err := strconv.ParseInt(contextValue, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("context limit must be an integer")
+	}
+	outputLimit, err := strconv.ParseInt(outputValue, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("output limit must be an integer")
+	}
+	limits := &harnessv2.ModelTokenLimits{Context: contextLimit, Output: outputLimit}
+	if err := limits.Validate(); err != nil {
+		return nil, err
+	}
+	return limits, nil
 }
 
 func runtimePoolLiteralEnvironment(values []corev1.EnvVar) map[string]string {
@@ -2673,11 +2713,19 @@ func runtimePoolDigestSchemaMatches(spec string, observed uint32) bool {
 }
 
 func runtimePoolHarnessProfile(spec corev1alpha1.RuntimePoolProfileSpec) (harnessv2.RuntimeProfile, error) {
+	var modelLimits *harnessv2.ModelTokenLimits
+	if spec.ModelLimits != nil {
+		modelLimits = &harnessv2.ModelTokenLimits{
+			Context: spec.ModelLimits.Context,
+			Output:  spec.ModelLimits.Output,
+		}
+	}
 	profile := harnessv2.RuntimeProfile{
 		ACPProfile:               strings.TrimSpace(spec.ACPProfile),
 		AdapterDigests:           cloneStringMap(spec.AdapterDigests),
 		ProviderKind:             strings.TrimSpace(spec.ProviderKind),
 		Model:                    strings.TrimSpace(spec.Model),
+		ModelLimits:              modelLimits,
 		AgentConfigurationDigest: strings.TrimSpace(spec.AgentConfigurationDigest),
 		ToolPolicyDigest:         strings.TrimSpace(spec.ToolPolicyDigest),
 		ApprovalPolicyDigest:     strings.TrimSpace(spec.ApprovalPolicyDigest),
@@ -2690,8 +2738,11 @@ func runtimePoolHarnessProfile(spec corev1alpha1.RuntimePoolProfileSpec) (harnes
 	if err := profile.Validate(); err != nil {
 		return harnessv2.RuntimeProfile{}, fmt.Errorf("spec.runtime.profile is invalid: %w", err)
 	}
+	if profile.ProviderKind == runtimePoolProviderOpencode && profile.ModelLimits == nil {
+		return harnessv2.RuntimeProfile{}, fmt.Errorf("spec.runtime.profile.modelLimits is required for built-in OpenCode")
+	}
 	switch profile.ProviderKind {
-	case runtimePoolProviderCodex, runtimePoolProviderClaude, runtimePoolProviderCopilot:
+	case runtimePoolProviderCodex, runtimePoolProviderClaude, runtimePoolProviderCopilot, runtimePoolProviderOpencode:
 	default:
 		return harnessv2.RuntimeProfile{}, fmt.Errorf("spec.runtime.profile.providerKind %q is not a supported built-in provider", profile.ProviderKind)
 	}

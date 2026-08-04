@@ -1,8 +1,8 @@
 # This Agent shows the future namespace-local external v2 selector shape from
 # core_v1alpha1_agentruntime.yaml. Registration and conformance are available,
 # but runtimeRef Task dispatch remains fail-closed until the external v2
-# dispatcher support boundary is enabled. Built-in Codex, Claude, and Copilot
-# Agents use runtime.type instead; OpenCode is not a supported built-in type.
+# dispatcher support boundary is enabled. Built-in Codex, Claude, Copilot, and
+# OpenCode Agents use runtime.type instead.
 apiVersion: core.orka.ai/v1alpha1
 kind: Agent
 metadata:

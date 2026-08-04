@@ -3243,9 +3243,8 @@ func validateBuiltInRuntimeTaskCompatibility(task *corev1alpha1.Task, agent *cor
 	if isBuiltInACPProviderRuntime(agent.Spec.Runtime.Type) && task.Spec.SecretRef != nil {
 		return fmt.Errorf("built-in ACP runtime %q does not support task secretRef; provider credentials are controller-managed", agent.Spec.Runtime.Type)
 	}
-	if agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode &&
-		(agent.Spec.Model == nil || strings.TrimSpace(agent.Spec.Model.Name) == "") {
-		return fmt.Errorf("agent %q opencode runtime requires spec.model.name", agent.Name)
+	if err := validateOpenCodeAgentSpec(agent); err != nil {
+		return err
 	}
 	return validateReadOnlyBuiltInAgentRuntime(task, agent.Spec.Runtime.Type)
 }

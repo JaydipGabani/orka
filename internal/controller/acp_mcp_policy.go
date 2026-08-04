@@ -57,6 +57,10 @@ var providerNativeTools = map[string]map[string]string{
 		providerNativeToolRead, providerNativeToolWrite, providerNativeToolEdit, providerNativeToolBash,
 		providerNativeToolGlob, providerNativeToolGrep, providerNativeToolWebSearch, providerNativeToolWebFetch,
 	),
+	"opencode": canonicalToolSet(
+		providerNativeToolRead, providerNativeToolWrite, providerNativeToolEdit, "apply_patch",
+		providerNativeToolBash, providerNativeToolGlob, providerNativeToolGrep,
+	),
 }
 
 func canonicalToolSet(names ...string) map[string]string {
@@ -76,7 +80,7 @@ func normalizeACPProviderNativeToolPolicy(
 	allowed, disallowed []string,
 	allowBash bool,
 ) ([]string, []string, bool) {
-	if len(allowed) > 0 || (len(disallowed) == 0 && allowBash) {
+	if allowed != nil || (len(disallowed) == 0 && allowBash) {
 		return allowed, disallowed, allowBash
 	}
 	native := providerNativeTools[strings.ToLower(strings.TrimSpace(provider))]
@@ -136,8 +140,8 @@ func buildRuntimeSessionMCPConfigurationWithRegistry(
 	if task.Spec.AgentRuntime != nil && task.Spec.AgentRuntime.AllowBash != nil {
 		allowBash = *task.Spec.AgentRuntime.AllowBash
 	}
-	allowed, disallowed, allowBash = normalizeACPProviderNativeToolPolicy(
-		profile.ProviderKind, allowed, disallowed, allowBash,
+	allowed, disallowed, allowBash = normalizeACPRuntimeToolPolicy(
+		profile.ProviderKind, corev1alpha1.WorkspaceIntent(profile.WorkspaceIntent), allowed, disallowed, allowBash,
 	)
 	toolDigest, err := harnessv2.CanonicalRuntimeToolPolicyDigest(allowed, disallowed, allowBash)
 	if err != nil || toolDigest != profile.ToolPolicyDigest {

@@ -62,7 +62,7 @@ export const providers = [
     name: 'ACP RuntimePools',
     href: '/docs/agent-runtimes',
     description:
-      'Run Codex, Claude, and Copilot in digest-pinned, scale-to-zero RuntimePools with brokered tools and clean-room delivery.',
+      'Run Codex, OpenCode, Claude, and Copilot in digest-pinned, scale-to-zero RuntimePools with brokered tools and clean-room delivery.',
   },
 ];
 

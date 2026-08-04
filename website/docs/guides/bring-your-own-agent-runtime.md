@@ -18,7 +18,7 @@ or agent Job fallback.
 
 ## When to use an external registration
 
-Use an external registration to validate an operator-owned service with a stable, immutable runtime instance identity and a reviewed v2 implementation. Built-in Codex, Claude, and Copilot Tasks use controller-owned RuntimePools.
+Use an external registration to validate an operator-owned service with a stable, immutable runtime instance identity and a reviewed v2 implementation. Built-in Codex, Claude, Copilot, and OpenCode Tasks use controller-owned RuntimePools.
 
 External services are not managed by Orka Kubernetes pool scaling. They must implement their own lifecycle, instance replacement, process cleanup, and capacity controls while preserving the portable v2 semantics.
 

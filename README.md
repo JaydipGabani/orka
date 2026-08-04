@@ -51,7 +51,7 @@ One `helm install`, one LLM secret, and you're chatting with an orchestrator tha
 ## Features
 
 - 🤖 **AI Agents** — Anthropic, OpenAI, or Azure OpenAI with tools, skills, and session persistence
-- 🛠️ **ACP Agent Runtimes** — Run Codex, Claude, and Copilot through digest-pinned RuntimePools; external `orka.harness.v2` registration and conformance are available while `runtimeRef` Task dispatch remains fail-closed
+- 🛠️ **ACP Agent Runtimes** — Run Codex, Claude, Copilot, and OpenCode through digest-pinned RuntimePools; external `orka.harness.v2` registration and conformance are available while `runtimeRef` Task dispatch remains fail-closed
 - 🔁 **Autonomous Task Loops** — Coordinators can iterate on long-running goals until complete, canceled, or at an iteration limit
 - 🔀 **Multi-Agent Coordination** — Coordinators delegate to specialists with depth and concurrency controls
 - 💬 **Interactive Chat** — Agentic orchestrator with SSE streaming that creates and manages agents and tasks for you
@@ -91,7 +91,9 @@ helm install orka charts/orka \
   --set publisher.image.repository=docker.io/sozercan/orka-workspace-publisher \
   --set publisher.image.digest=sha256:<publisher-digest> \
   --set controller.acpRuntime.codexImage=docker.io/sozercan/orka-acp-codex@sha256:<codex-digest> \
-  --set controller.acpRuntime.claudeImage=docker.io/sozercan/orka-acp-claude@sha256:<claude-digest>
+  --set controller.acpRuntime.claudeImage=docker.io/sozercan/orka-acp-claude@sha256:<claude-digest> \
+  --set controller.acpRuntime.copilotImage=docker.io/sozercan/orka-acp-copilot@sha256:<copilot-digest> \
+  --set controller.acpRuntime.opencodeImage=docker.io/sozercan/orka-acp-opencode@sha256:<opencode-digest>
 ```
 
 For direct Kustomize deployments, use `config/acp-production`, not
@@ -130,8 +132,8 @@ EOF
 ```
 
 That `Provider` Secret is used by native `type: ai` Tasks and the compatible
-chat APIs. Built-in ACP Agents do **not** reference provider Secrets. Codex and
-Claude RuntimeSessions reach Vekil only through the central authenticated
+chat APIs. Built-in ACP Agents do **not** reference provider Secrets. Codex,
+Claude, Copilot, and OpenCode RuntimeSessions reach Vekil only through the central authenticated
 provider proxy. Source-read, target-read, target-write, and forge credentials
 are brokered separately to the clean-room Workspace/Publisher.
 

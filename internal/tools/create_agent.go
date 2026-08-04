@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/orka-agents/orka/internal/acp"
 	"github.com/orka-agents/orka/internal/workerenv"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,14 +45,31 @@ type CreateAgentArgs struct {
 
 // ModelArgs specifies LLM model configuration
 type ModelArgs struct {
-	Provider string `json:"provider,omitempty"`
-	Name     string `json:"name,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	Name          string `json:"name,omitempty"`
+	ContextWindow *int32 `json:"contextWindow,omitempty"`
+	MaxTokens     *int32 `json:"maxTokens,omitempty"`
 }
 
 // RuntimeArgs specifies agent CLI runtime configuration
 type RuntimeArgs struct {
-	Type      string `json:"type"`
-	SecretRef string `json:"secretRef,omitempty"`
+	Type                string   `json:"type"`
+	SecretRef           string   `json:"secretRef,omitempty"`
+	DefaultAllowedTools []string `json:"defaultAllowedTools,omitempty"`
+	DefaultAllowBash    *bool    `json:"defaultAllowBash,omitempty"`
+}
+
+func applyOpencodeRuntimeDefaults(runtime *corev1alpha1.AgentCLIRuntime, allowedToolsSupplied, allowBashSupplied bool) {
+	if runtime == nil || runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+		return
+	}
+	if !allowedToolsSupplied {
+		runtime.DefaultAllowedTools = acp.OpenCodeDefaultAllowedTools()
+	}
+	if !allowBashSupplied {
+		allowBash := true
+		runtime.DefaultAllowBash = &allowBash
+	}
 }
 
 // CoordinationArgs specifies coordination configuration
@@ -107,7 +125,7 @@ func (t *CreateAgentTool) Parameters() json.RawMessage {
 			},
 			"model": {
 				"type": "object",
-				"description": "LLM model config; model.name is inherited from the coordinator when omitted",
+				"description": "LLM model config; model.name is inherited from the coordinator when omitted except for OpenCode, which requires provider/model form",
 				"properties": {
 					"provider": {
 						"type": "string",
@@ -116,6 +134,16 @@ func (t *CreateAgentTool) Parameters() json.RawMessage {
 					"name": {
 						"type": "string",
 						"description": "Model identifier"
+					},
+					"contextWindow": {
+						"type": "integer",
+						"minimum": 1,
+						"description": "Reviewed model context capacity; required for OpenCode"
+					},
+					"maxTokens": {
+						"type": "integer",
+						"minimum": 1,
+						"description": "Reviewed maximum output tokens; required for OpenCode"
 					}
 				}
 			},
@@ -165,15 +193,24 @@ func (t *CreateAgentTool) Parameters() json.RawMessage {
 			},
 			"runtime": {
 				"type": "object",
-					"description": "Set to make this a built-in ACP runtime agent (copilot, claude, or codex). Runtime agents run code, edit files, and use git. Do NOT set runtime on coordinator agents.",
+					"description": "Set to make this a built-in ACP runtime agent (copilot, claude, codex, or opencode). Runtime agents run code against a materialized workspace. Do NOT set runtime on coordinator agents.",
 				"properties": {
 					"type": {
 						"type": "string",
-							"description": "Runtime type: copilot, claude, or codex"
+							"description": "Runtime type: copilot, claude, codex, or opencode"
 					},
 					"secretRef": {
 						"type": "string",
-						"description": "Deprecated legacy field. Built-in copilot, claude, and codex ACP runtimes are credential-free at the Agent boundary and ignore it."
+						"description": "Deprecated legacy field. Built-in ACP runtimes are credential-free at the Agent boundary; OpenCode rejects it."
+					},
+					"defaultAllowedTools": {
+						"type": "array",
+						"items": {"type": "string"},
+						"description": "Default CLI tools allowed for tasks using this runtime agent. OpenCode defaults to Read, Write, Edit, Bash, Glob, and Grep when omitted."
+					},
+					"defaultAllowBash": {
+						"type": "boolean",
+						"description": "Whether bash is allowed by default. OpenCode defaults to true when omitted."
 					}
 				}
 			}
@@ -184,11 +221,77 @@ func (t *CreateAgentTool) Parameters() json.RawMessage {
 
 func isBuiltInACPRuntime(runtimeType corev1alpha1.AgentRuntimeType) bool {
 	switch runtimeType {
-	case corev1alpha1.AgentRuntimeCopilot, corev1alpha1.AgentRuntimeClaude, corev1alpha1.AgentRuntimeCodex:
+	case corev1alpha1.AgentRuntimeCopilot, corev1alpha1.AgentRuntimeClaude, corev1alpha1.AgentRuntimeCodex, corev1alpha1.AgentRuntimeOpencode:
 		return true
 	default:
 		return false
 	}
+}
+
+func normalizedCreateAgentModel(runtime *RuntimeArgs, model *ModelArgs) (string, error) {
+	requested := ""
+	if model != nil {
+		requested = strings.TrimSpace(model.Name)
+	}
+	if runtime == nil || strings.TrimSpace(runtime.Type) != string(corev1alpha1.AgentRuntimeOpencode) {
+		return requested, nil
+	}
+	if requested == "" {
+		return "", fmt.Errorf("model.name is required for opencode runtime")
+	}
+	provider := strings.TrimSpace(model.Provider)
+	composed := requested
+	if provider != "" {
+		prefix := strings.TrimSuffix(provider, "/") + "/"
+		if !strings.HasPrefix(composed, prefix) {
+			composed = prefix + strings.TrimPrefix(composed, "/")
+		}
+	}
+	if strings.ContainsAny(composed, "{}") {
+		return "", fmt.Errorf("model.name for opencode runtime must not contain substitution braces")
+	}
+	providerID, modelID, ok := strings.Cut(composed, "/")
+	if !ok || strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "" {
+		return "", fmt.Errorf("model.name for opencode runtime must use provider/model form")
+	}
+	if model.ContextWindow == nil || *model.ContextWindow <= 0 {
+		return "", fmt.Errorf("model.contextWindow is required for opencode runtime and must be positive")
+	}
+	if model.MaxTokens == nil || *model.MaxTokens <= 0 {
+		return "", fmt.Errorf("model.maxTokens is required for opencode runtime and must be positive")
+	}
+	if *model.ContextWindow <= *model.MaxTokens {
+		return "", fmt.Errorf("model.contextWindow must exceed model.maxTokens for opencode runtime")
+	}
+	return composed, nil
+}
+
+func configureCreatedAgentRuntime(agent *corev1alpha1.Agent, runtimeArgs *RuntimeArgs) error {
+	if runtimeArgs == nil {
+		return nil
+	}
+	runtimeType := corev1alpha1.AgentRuntimeType(strings.TrimSpace(runtimeArgs.Type))
+	runtime := &corev1alpha1.AgentCLIRuntime{Type: runtimeType}
+	if runtimeArgs.DefaultAllowedTools != nil {
+		runtime.DefaultAllowedTools = append([]string{}, runtimeArgs.DefaultAllowedTools...)
+	}
+	if runtimeArgs.DefaultAllowBash != nil {
+		allowBash := *runtimeArgs.DefaultAllowBash
+		runtime.DefaultAllowBash = &allowBash
+	}
+	if runtimeType == corev1alpha1.AgentRuntimeOpencode {
+		if strings.TrimSpace(runtimeArgs.SecretRef) != "" {
+			return fmt.Errorf("opencode runtime does not accept runtime.secretRef; provider access is controller-proxied")
+		}
+		applyOpencodeRuntimeDefaults(runtime, runtimeArgs.DefaultAllowedTools != nil, runtimeArgs.DefaultAllowBash != nil)
+		if agent.Spec.Model != nil {
+			agent.Spec.Model.Provider = ""
+		}
+	}
+	agent.Spec.Runtime = runtime
+	agent.Spec.ProviderRef = nil
+	agent.Spec.SecretRef = nil
+	return nil
 }
 
 // Execute creates an Agent CRD dynamically
@@ -211,12 +314,12 @@ func (t *CreateAgentTool) Execute(ctx context.Context, args json.RawMessage) (st
 			return "", fmt.Errorf("runtime.type is required when runtime is provided")
 		}
 		if !isBuiltInACPRuntime(corev1alpha1.AgentRuntimeType(runtimeType)) {
-			return "", fmt.Errorf("unsupported runtime type %q; supported built-in runtimes are copilot, claude, and codex", runtimeType)
+			return "", fmt.Errorf("unsupported runtime type %q; supported built-in runtimes are copilot, claude, codex, and opencode", runtimeType)
 		}
 	}
-	requestedModel := ""
-	if a.Model != nil {
-		requestedModel = strings.TrimSpace(a.Model.Name)
+	requestedModel, err := normalizedCreateAgentModel(a.Runtime, a.Model)
+	if err != nil {
+		return "", err
 	}
 
 	parentName := os.Getenv(envOrkaTaskName)
@@ -242,6 +345,8 @@ func (t *CreateAgentTool) Execute(ctx context.Context, args json.RawMessage) (st
 	model := &corev1alpha1.ModelConfig{}
 	if a.Model != nil {
 		model.Name = requestedModel
+		model.ContextWindow = a.Model.ContextWindow
+		model.MaxTokens = a.Model.MaxTokens
 	}
 	if model.Name == "" {
 		model.Name = os.Getenv(workerenv.AIModel)
@@ -327,15 +432,8 @@ func (t *CreateAgentTool) Execute(ctx context.Context, args json.RawMessage) (st
 	}
 
 	// Set the normalized built-in runtime when provided.
-	if a.Runtime != nil {
-		agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
-			Type: corev1alpha1.AgentRuntimeType(runtimeType),
-		}
-		// Runtime agents don't use providerRef. Built-in ACP v2 runtimes are
-		// authenticated at the provider proxy and must not retain legacy
-		// per-Agent credentials.
-		agent.Spec.ProviderRef = nil
-		agent.Spec.SecretRef = nil
+	if err := configureCreatedAgentRuntime(agent, a.Runtime); err != nil {
+		return "", err
 	}
 
 	// Set owner reference to parent task for auto-cleanup

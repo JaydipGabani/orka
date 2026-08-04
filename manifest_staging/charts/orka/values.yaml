@@ -66,6 +66,7 @@ controller:
     codexImage: ""
     claudeImage: ""
     copilotImage: ""
+    opencodeImage: ""
     # Planned controller upgrades use a same-binary preStop child to call a
     # loopback-only coordinator. Keep terminationGracePeriodSeconds greater
     # than timeout and triggerTimeout so SIGTERM shutdown still has headroom.

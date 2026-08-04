@@ -19,6 +19,9 @@ Environment:
   ACP_E2E_KIND_CONFIG     optional Kind config path
   ACP_E2E_KEEP_CLUSTER=1  keep the cluster and local registry after the run
   ACP_E2E_VEKIL_IMAGE     digest-pinned Vekil image override
+  ACP_E2E_OPENCODE_MODEL  reviewed OpenCode provider/model identifier
+  ACP_E2E_OPENCODE_CONTEXT_WINDOW reviewed OpenCode context capacity (required)
+  ACP_E2E_OPENCODE_MAX_TOKENS reviewed OpenCode output limit (required)
   ACP_E2E_ROLLOUT_TIMEOUT rollout timeout (default: 10m)
   RELEASE_GATE=1          forwarded to the canonical validator
 USAGE
@@ -75,13 +78,15 @@ LIVE_ACP_CONTROLLER_IMAGE="orka-controller:live-acp-${image_tag}"
 LIVE_ACP_CODEX_IMAGE="orka-acp-codex:live-acp-${image_tag}"
 LIVE_ACP_CLAUDE_IMAGE="orka-acp-claude:live-acp-${image_tag}"
 LIVE_ACP_COPILOT_IMAGE="orka-acp-copilot:live-acp-${image_tag}"
+LIVE_ACP_OPENCODE_IMAGE="orka-acp-opencode:live-acp-${image_tag}"
 LIVE_ACP_PUBLISHER_IMAGE="orka-workspace-publisher:live-acp-${image_tag}"
 LIVE_ACP_KIND_CREATED=0
 LIVE_ACP_REGISTRY_STARTED=0
 LIVE_ACP_SECRET_DIR=""
 export LIVE_ACP_REPO_ROOT LIVE_ACP_KINDCTL_BIN LIVE_ACP_VEKIL_DEPLOY_SCRIPT LIVE_ACP_VALIDATOR_SCRIPT
 export LIVE_ACP_KIND_TAG LIVE_ACP_KIND_CONFIG LIVE_ACP_KEEP_CLUSTER LIVE_ACP_VEKIL_IMAGE LIVE_ACP_ROLLOUT_TIMEOUT
-export LIVE_ACP_CONTROLLER_IMAGE LIVE_ACP_CODEX_IMAGE LIVE_ACP_CLAUDE_IMAGE LIVE_ACP_COPILOT_IMAGE LIVE_ACP_PUBLISHER_IMAGE
+export LIVE_ACP_CONTROLLER_IMAGE LIVE_ACP_CODEX_IMAGE LIVE_ACP_CLAUDE_IMAGE LIVE_ACP_COPILOT_IMAGE
+export LIVE_ACP_OPENCODE_IMAGE LIVE_ACP_PUBLISHER_IMAGE
 export LIVE_ACP_SECRET_DIR
 
 if live_acp_kind_enabled "${RELEASE_GATE:-0}"; then

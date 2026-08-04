@@ -108,10 +108,24 @@ type RuntimePoolTrustDomain struct {
 	Identity string `json:"identity"`
 }
 
+// ModelTokenLimits pins the reviewed token capacities used by a
+// runtime's local context-management policy.
+// +kubebuilder:validation:XValidation:rule="self.context > self.output",message="model context limit must exceed output limit"
+type ModelTokenLimits struct {
+	// Context is the maximum model context capacity in tokens.
+	// +kubebuilder:validation:Minimum=1
+	Context int64 `json:"context"`
+
+	// Output is the maximum generated output in tokens.
+	// +kubebuilder:validation:Minimum=1
+	Output int64 `json:"output"`
+}
+
 // RuntimePoolProfileSpec pins the immutable runtime behavior selected for a
 // pool. The digest covers the adapter and CLI builds, ACP profile, provider and
-// agent configuration, tool and approval policy, MCP configuration, workspace
-// intent, proxy credential scope, and resource class.
+// model limits, agent configuration, tool and approval policy, MCP
+// configuration, workspace intent, proxy credential scope, and resource class.
+// +kubebuilder:validation:XValidation:rule="self.providerKind != 'opencode' || has(self.modelLimits)",message="OpenCode runtime profiles require modelLimits"
 type RuntimePoolProfileSpec struct {
 	// ProtocolVersion is the controller-to-supervisor protocol profile.
 	// +kubebuilder:default=orka.harness.v2
@@ -142,7 +156,7 @@ type RuntimePoolProfileSpec struct {
 
 	// ProviderKind selects the one provider adapter present in the immutable image.
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=codex;claude;copilot
+	// +kubebuilder:validation:Enum=codex;claude;copilot;opencode
 	ProviderKind string `json:"providerKind"`
 
 	// Model is the exact reviewed model identifier.
@@ -150,6 +164,11 @@ type RuntimePoolProfileSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=256
 	Model string `json:"model"`
+
+	// ModelLimits pins the reviewed context and output capacities used by the
+	// runtime's local compaction policy.
+	// +optional
+	ModelLimits *ModelTokenLimits `json:"modelLimits,omitempty"`
 
 	// AgentConfigurationDigest freezes non-secret Agent/runtime configuration.
 	// +kubebuilder:validation:Required

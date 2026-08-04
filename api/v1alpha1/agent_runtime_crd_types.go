@@ -200,6 +200,10 @@ type AgentRuntimeProfileSpec struct {
 	// +kubebuilder:validation:MaxLength=256
 	Model string `json:"model"`
 
+	// ModelLimits pins optional reviewed model token capacities.
+	// +optional
+	ModelLimits *ModelTokenLimits `json:"modelLimits,omitempty"`
+
 	// +kubebuilder:validation:Pattern=`^sha256:[a-f0-9]{64}$`
 	AgentConfigurationDigest string `json:"agentConfigurationDigest"`
 	// +kubebuilder:validation:Pattern=`^sha256:[a-f0-9]{64}$`

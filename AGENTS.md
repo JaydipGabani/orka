@@ -32,7 +32,7 @@ make build              # Build (includes UI)
 make test               # Run tests
 make lint-fix           # Lint and fix
 make docker-build-all   # Controller, AI/general workers, ACP runtimes, publisher
-make deploy IMG=<repo>@sha256:<digest> ACP_CODEX_RUNTIME_IMG=<repo>@sha256:<digest> ACP_CLAUDE_RUNTIME_IMG=<repo>@sha256:<digest> ACP_COPILOT_RUNTIME_IMG=<repo>@sha256:<digest> WORKSPACE_PUBLISHER_IMG=<repo>@sha256:<digest>
+make deploy IMG=<repo>@sha256:<digest> ACP_CODEX_RUNTIME_IMG=<repo>@sha256:<digest> ACP_CLAUDE_RUNTIME_IMG=<repo>@sha256:<digest> ACP_COPILOT_RUNTIME_IMG=<repo>@sha256:<digest> ACP_OPENCODE_RUNTIME_IMG=<repo>@sha256:<digest> WORKSPACE_PUBLISHER_IMG=<repo>@sha256:<digest>
 ```
 
 UI: `cd ui && bun install && bun run dev` (dev server on :5173). See @website/docs/development/development.md for full commands.
@@ -83,7 +83,7 @@ Do NOT delete `// +kubebuilder:scaffold:*` comments.
 - AI worker truncates messages on context overflow — keeps system prompt + newest, drops middle atomically with structured metadata
 - `code_exec` timeout max is 60s — values above are ignored (30s default used)
 - Built-in AI worker tools: `web_search`, `code_exec`, `file_read`, `web_fetch`, `file_write`
-- Built-in agent runtimes (`codex`, `claude`, `copilot`) use only the `orka.harness.v2` ACP RuntimePool path; there is no per-Task Job or legacy fallback.
+- Built-in agent runtimes (`codex`, `claude`, `copilot`, `opencode`) use only the `orka.harness.v2` ACP RuntimePool path; there is no per-Task Job or legacy fallback.
 - `Task.spec.workspace` is the only agent repository surface. Keep clone/read credentials in `readCredentialRef` and publication/forge credentials in `publicationCredentialRef`; neither enters the ACP process tree.
 - RuntimePools are controller-owned, digest-pinned, scale-to-zero resources. Only `Serving` + `Accepting` admits new RuntimeSessions; drain/finalization must complete before replacement or scale-down.
 - Safe v2 probes are `GET /v2/health` and `GET /v2/capabilities`; status and all mutations require controller authentication plus operation-scoped authorization and exact fences.
@@ -95,4 +95,4 @@ Do NOT delete `// +kubebuilder:scaffold:*` comments.
 - Kontxt TxTokens are accepted via `Txn-Token` by default; `Authorization: Bearer` context-token support is opt-in so ServiceAccount/OIDC auth can coexist
 - Live GitHub OIDC/kontxt E2E requires GitHub Actions `id-token: write` or `ORKA_GITHUB_OIDC_TOKEN`; redact JWTs, TxTokens, and request tokens in logs
 - OpenTelemetry GenAI constants are hand-rolled in `internal/tracing/genai`; telemetry is enabled with `--enable-telemetry`/`--enable-tracing`, workers honor `ORKA_ENABLE_TELEMETRY`, and prompt/completion content capture remains default-off/fail-closed
-- ACP real-world validation should include Codex and Claude through Vekil, Copilot image/profile admission (plus live execution when provider auth is available), workspace clone/read, Session continuation, cancellation/timeout, unsafe workspace rejection, controller restart, pool replacement, clean-room branch publication, PR reconciliation, and cleanup.
+- ACP real-world validation should include Codex, Claude, and OpenCode through Vekil, Copilot image/profile admission (plus live execution when provider auth is available), workspace clone/read, Session continuation, cancellation/timeout, unsafe workspace rejection, controller restart, pool replacement, clean-room branch publication, PR reconciliation, and cleanup.

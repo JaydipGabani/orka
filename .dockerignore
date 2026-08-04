@@ -60,3 +60,7 @@ ui/tsconfig.tsbuildinfo
 
 # Re-include the checksum-pinned Codex ACP source patch used by its image build
 !workers/acp/images/codex/patch-agent-mode.mjs
+
+# Re-include pinned OpenCode runtime policy and notice inputs.
+!workers/acp/images/opencode/AGENTS.md
+!workers/acp/images/opencode/NOTICE.md

@@ -13,7 +13,7 @@ Three custom resources cover most use cases:
 - **Agent** — a reusable configuration: Provider/model, system prompt, tools, skills,
   ACP runtime profile, or coordination settings.
 - **Task** — one unit of work. `type: ai` runs through Orka's built-in AI worker, `type: agent`
-  runs a Codex, Claude, or Copilot ACP session in a RuntimePool, and `type: container` runs an
+  runs a Codex, Claude, Copilot, or OpenCode ACP session in a RuntimePool, and `type: container` runs an
   arbitrary container command.
 
 A Task references an Agent, an Agent references a Provider. Results are retrieved over the
@@ -45,7 +45,8 @@ helm install orka charts/orka \
   --set publisher.image.digest=sha256:<publisher-digest> \
   --set controller.acpRuntime.codexImage=docker.io/sozercan/orka-acp-codex@sha256:<codex-digest> \
   --set controller.acpRuntime.claudeImage=docker.io/sozercan/orka-acp-claude@sha256:<claude-digest> \
-  --set controller.acpRuntime.copilotImage=docker.io/sozercan/orka-acp-copilot@sha256:<copilot-digest>
+  --set controller.acpRuntime.copilotImage=docker.io/sozercan/orka-acp-copilot@sha256:<copilot-digest> \
+  --set controller.acpRuntime.opencodeImage=docker.io/sozercan/orka-acp-opencode@sha256:<opencode-digest>
 ```
 
 A normal fresh install creates Orka's 26 cluster-scoped CRDs before the
@@ -77,7 +78,8 @@ make deploy \
   WORKSPACE_PUBLISHER_IMG=docker.io/sozercan/orka-workspace-publisher@sha256:<publisher-digest> \
   ACP_CODEX_RUNTIME_IMG=docker.io/sozercan/orka-acp-codex@sha256:<codex-digest> \
   ACP_CLAUDE_RUNTIME_IMG=docker.io/sozercan/orka-acp-claude@sha256:<claude-digest> \
-  ACP_COPILOT_RUNTIME_IMG=docker.io/sozercan/orka-acp-copilot@sha256:<copilot-digest>
+  ACP_COPILOT_RUNTIME_IMG=docker.io/sozercan/orka-acp-copilot@sha256:<copilot-digest> \
+  ACP_OPENCODE_RUNTIME_IMG=docker.io/sozercan/orka-acp-opencode@sha256:<opencode-digest>
 ```
 
 `make deploy` applies the same resources as the canonical
@@ -172,7 +174,7 @@ orka task download <task-name> [filename] -o <path>
 
 ## Agent Runtimes Quick Start
 
-ACP agent runtimes run the supported Codex, Claude, and Copilot profiles as
+ACP agent runtimes run the supported Codex, Claude, Copilot, and OpenCode profiles as
 fenced RuntimeSessions in controller-owned RuntimePools. External
 `orka.harness.v2` registrations can be probed and conformance-tested, but
 `runtimeRef` Task dispatch remains fail-closed until the external v2 dispatcher
@@ -213,7 +215,14 @@ spec:
 EOF
 ```
 
-For Codex Agents, keep `defaultAllowBash: true` for now. The current Codex runtime implementation fails fast when bash is disabled because the upstream Codex CLI does not yet expose a reliable shell-disable mode.
+For Codex Agents, keep `defaultAllowBash: true` for now. The current Codex
+runtime implementation fails fast when bash is disabled because the upstream
+Codex CLI does not yet expose a reliable shell-disable mode. For OpenCode
+Agents, set `runtime.type: opencode`, use the provider/model form expected by
+OpenCode (such as `openai/gpt-5.4`), and set reviewed `model.contextWindow`
+and `model.maxTokens` ceilings. Orka requires both values and pins them into the
+immutable RuntimePool profile so OpenCode compaction and proxy output limits do
+not depend on mutable catalog discovery.
 
 ### 3. Run an Agent Task
 

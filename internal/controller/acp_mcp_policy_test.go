@@ -271,12 +271,270 @@ func TestBuildRuntimeSessionMCPConfigurationRejectsControllerLocalTools(t *testi
 		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default", UID: "agent-uid", Generation: 1},
 		Spec: corev1alpha1.AgentSpec{
 			Model:   &corev1alpha1.ModelConfig{Name: "model"},
-			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeCodex},
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeClaude},
 		},
 	}
-	_, err := PlanACPRuntime(task, agent, ACPRuntimeImages{Codex: "docker.io/example/codex@sha256:" + strings.Repeat("a", 64)})
+	_, err := PlanACPRuntime(task, agent, ACPRuntimeImages{Claude: "docker.io/example/claude@sha256:" + strings.Repeat("a", 64)})
 	if err == nil || !strings.Contains(err.Error(), "local-process-only") {
 		t.Fatalf("controller-local tool error = %v", err)
+	}
+}
+
+func TestBuildRuntimeSessionMCPConfigurationClassifiesOpenCodeNativeTools(t *testing.T) {
+	requestedNativeTools := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep"}
+	nativeTools := []string{"apply_patch", "bash", "edit", "glob", "grep", "read", "write"}
+	brokeredTools := []string{"web_search", "web_fetch"}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: "default", UID: "task-uid"},
+		Spec: corev1alpha1.TaskSpec{
+			Type:         corev1alpha1.TaskTypeAgent,
+			Workspace:    &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: append(append([]string(nil), requestedNativeTools...), brokeredTools...)},
+		},
+	}
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default", UID: "agent-uid", Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	plan, err := PlanACPRuntime(task, agent, ACPRuntimeImages{
+		Opencode: "docker.io/example/opencode@sha256:" + strings.Repeat("a", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	configuration, err := buildRuntimeSessionMCPConfiguration(context.Background(), nil, task, agent, plan.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := len(nativeTools) + len(brokeredTools); len(configuration.ToolPolicy.Tools) != want {
+		t.Fatalf("descriptor count = %d, want %d", len(configuration.ToolPolicy.Tools), want)
+	}
+	byName := make(map[string]harnessv2.MCPToolDescriptor, len(configuration.ToolPolicy.Tools))
+	for _, descriptor := range configuration.ToolPolicy.Tools {
+		byName[descriptor.Name] = descriptor
+	}
+	for _, name := range nativeTools {
+		if got := byName[name].Source; got != harnessv2.MCPToolSourceProviderNative {
+			t.Fatalf("OpenCode tool %q source = %q, want provider-native", name, got)
+		}
+	}
+	for _, name := range brokeredTools {
+		if got := byName[name].Source; got != harnessv2.MCPToolSourceBrokeredBuiltin {
+			t.Fatalf("OpenCode tool %q source = %q, want brokered built-in", name, got)
+		}
+	}
+	for _, name := range []string{"read", "glob", "grep"} {
+		if got := byName[name].Effect; got != harnessv2.MCPToolEffectReadOnly {
+			t.Fatalf("OpenCode tool %q effect = %q, want read-only", name, got)
+		}
+	}
+	for _, name := range []string{"bash", "apply_patch", "edit", "write"} {
+		if got := byName[name].Effect; got != harnessv2.MCPToolEffectConsequential {
+			t.Fatalf("OpenCode tool %q effect = %q, want consequential", name, got)
+		}
+	}
+}
+
+func TestBuildRuntimeSessionMCPConfigurationNormalizesOpenCodeMutationAliases(t *testing.T) {
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default", UID: "agent-uid", Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: "default", UID: "task-uid"},
+		Spec: corev1alpha1.TaskSpec{
+			Type:         corev1alpha1.TaskTypeAgent,
+			Workspace:    &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"Edit"}},
+		},
+	}
+	images := ACPRuntimeImages{Opencode: "docker.io/example/opencode@sha256:" + strings.Repeat("a", 64)}
+	plan, err := PlanACPRuntime(task, agent, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := buildRuntimeSessionMCPConfiguration(context.Background(), nil, task, agent, plan.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"apply_patch", "edit", "write"}
+	if !slices.Equal(configuration.ToolPolicy.AllowedToolNames, want) {
+		t.Fatalf("allowed mutation aliases = %#v, want %#v", configuration.ToolPolicy.AllowedToolNames, want)
+	}
+	for _, name := range want {
+		descriptor, ok := configuration.ToolPolicy.Descriptor(name)
+		if !ok || descriptor.Source != harnessv2.MCPToolSourceProviderNative {
+			t.Fatalf("mutation alias %q descriptor = %#v, found=%v", name, descriptor, ok)
+		}
+	}
+}
+
+func TestBuildRuntimeSessionMCPConfigurationDefaultsOpenCodeToolsOnlyWhenOmitted(t *testing.T) {
+	tests := []struct {
+		name         string
+		allowedTools []string
+		want         []string
+	}{
+		{
+			name: "omitted",
+			want: []string{"apply_patch", "bash", "edit", "glob", "grep", "read", "write"},
+		},
+		{
+			name:         "explicit empty",
+			allowedTools: []string{},
+			want:         []string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := &corev1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default", UID: "agent-uid", Generation: 1},
+				Spec: corev1alpha1.AgentSpec{
+					Model: testOpenCodeModelConfig(),
+					Runtime: &corev1alpha1.AgentCLIRuntime{
+						Type:                corev1alpha1.AgentRuntimeOpencode,
+						DefaultAllowedTools: tt.allowedTools,
+					},
+				},
+			}
+			task := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: "default", UID: "task-uid"},
+				Spec: corev1alpha1.TaskSpec{
+					Type:      corev1alpha1.TaskTypeAgent,
+					Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+				},
+			}
+			images := ACPRuntimeImages{Opencode: "docker.io/example/opencode@sha256:" + strings.Repeat("a", 64)}
+			plan, err := PlanACPRuntime(task, agent, images)
+			if err != nil {
+				t.Fatal(err)
+			}
+			configuration, err := buildRuntimeSessionMCPConfiguration(context.Background(), nil, task, agent, plan.Profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(configuration.ToolPolicy.AllowedToolNames, tt.want) {
+				t.Fatalf("allowed tools = %#v, want %#v", configuration.ToolPolicy.AllowedToolNames, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildRuntimeSessionMCPConfigurationOpenCodeReadIntentClosesConsequentialTools(t *testing.T) {
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default", UID: "agent-uid", Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model: testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{
+				Type:                corev1alpha1.AgentRuntimeOpencode,
+				DefaultAllowedTools: []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep"},
+				DefaultAllowBash:    new(true),
+			},
+		},
+	}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: "default", UID: "task-uid"},
+		Spec: corev1alpha1.TaskSpec{
+			Type:      corev1alpha1.TaskTypeAgent,
+			Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead},
+		},
+	}
+	images := ACPRuntimeImages{Opencode: "docker.io/example/opencode@sha256:" + strings.Repeat("a", 64)}
+	plan, err := PlanACPRuntime(task, agent, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := buildRuntimeSessionMCPConfiguration(context.Background(), nil, task, agent, plan.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.ToolPolicy.AllowBash {
+		t.Fatal("read-intent OpenCode policy retained bash authority")
+	}
+	for _, name := range []string{"apply_patch", "bash", "edit", "grep", "write"} {
+		if configuration.ToolPolicy.Allows(name) {
+			t.Fatalf("read-intent OpenCode policy allows %q: %#v", name, configuration.ToolPolicy)
+		}
+	}
+	for _, name := range []string{"glob", "read"} {
+		if !configuration.ToolPolicy.Allows(name) {
+			t.Fatalf("read-intent OpenCode policy removed %q: %#v", name, configuration.ToolPolicy)
+		}
+	}
+}
+
+func TestBuildRuntimeSessionMCPConfigurationOpenCodeDenyIsCaseInsensitive(t *testing.T) {
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default", UID: "agent-uid", Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model: testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{
+				Type: corev1alpha1.AgentRuntimeOpencode, DefaultAllowedTools: []string{"Read", "Bash"},
+			},
+		},
+	}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: "default", UID: "task-uid"},
+		Spec: corev1alpha1.TaskSpec{
+			Type:      corev1alpha1.TaskTypeAgent,
+			Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
+				DisallowedTools: []string{"bAsH"},
+			},
+		},
+	}
+	images := ACPRuntimeImages{Opencode: "docker.io/example/opencode@sha256:" + strings.Repeat("a", 64)}
+	plan, err := PlanACPRuntime(task, agent, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := buildRuntimeSessionMCPConfiguration(context.Background(), nil, task, agent, plan.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.ToolPolicy.Allows("bash") {
+		t.Fatalf("case-variant bash deny did not close policy: %#v", configuration.ToolPolicy)
+	}
+	if !configuration.ToolPolicy.Allows("read") {
+		t.Fatalf("read permission was unexpectedly removed: %#v", configuration.ToolPolicy)
+	}
+}
+
+func TestBuildRuntimeSessionMCPConfigurationRejectsUngovernedOpenCodeNativeTools(t *testing.T) {
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default", UID: "agent-uid", Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	for _, toolName := range []string{"task", "skill", "question", "todowrite", "WebSearch", "WebFetch"} {
+		t.Run(toolName, func(t *testing.T) {
+			task := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: "default", UID: "task-uid"},
+				Spec: corev1alpha1.TaskSpec{
+					Type:         corev1alpha1.TaskTypeAgent,
+					AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{toolName}},
+				},
+			}
+			plan, err := PlanACPRuntime(task, agent, ACPRuntimeImages{
+				Opencode: "docker.io/example/opencode@sha256:" + strings.Repeat("a", 64),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := buildRuntimeSessionMCPConfiguration(context.Background(), nil, task, agent, plan.Profile); err == nil ||
+				!strings.Contains(err.Error(), "not a known provider-native") {
+				t.Fatalf("ungoverned OpenCode native tool error = %v, want rejection", err)
+			}
+		})
 	}
 }
 
@@ -314,5 +572,35 @@ func TestBuildRuntimeSessionMCPConfigurationRejectsUnknownOrUngovernedTools(t *t
 	if _, err := buildRuntimeSessionMCPConfiguration(context.Background(), reader, task, agent, plan.Profile); err == nil ||
 		!strings.Contains(err.Error(), "brokeredToolClass") {
 		t.Fatalf("unclassified tool error = %v", err)
+	}
+}
+
+func TestBuildRuntimeSessionMCPConfigurationHonorsExplicitEmptyTaskOpenCodeTools(t *testing.T) {
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default", UID: "agent-uid", Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: "default", UID: "task-uid"},
+		Spec: corev1alpha1.TaskSpec{
+			Type:         corev1alpha1.TaskTypeAgent,
+			Workspace:    &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{}},
+		},
+	}
+	images := ACPRuntimeImages{Opencode: "docker.io/example/opencode@sha256:" + strings.Repeat("a", 64)}
+	plan, err := PlanACPRuntime(task, agent, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := buildRuntimeSessionMCPConfiguration(context.Background(), nil, task, agent, plan.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.ToolPolicy.AllowedToolNames == nil || len(configuration.ToolPolicy.AllowedToolNames) != 0 {
+		t.Fatalf("allowed tools = %#v, want explicit deny-all", configuration.ToolPolicy.AllowedToolNames)
 	}
 }

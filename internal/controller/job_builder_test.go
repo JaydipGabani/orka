@@ -3344,7 +3344,33 @@ func TestJobBuilder_buildEnvVars_Telemetry(t *testing.T) {
 
 }
 
-func TestReadOnlyAgentRuntimeGuardsRejectOpencode(t *testing.T) {
+func TestJobBuilderAddAgentToolsEnvVarsDefaultsOpenCodeToolsOnlyWhenOmitted(t *testing.T) {
+	builder := setupJobBuilder()
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent}}
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeOpencode,
+	}}}
+
+	envVars := builder.addAgentToolsEnvVars(nil, task, agent)
+	if got, ok := findEnvVar(envVars, workerenv.AllowedTools); !ok || got.Value != "Read,Write,Edit,Bash,Glob,Grep" {
+		t.Fatalf("%s = %#v, found=%v", workerenv.AllowedTools, got, ok)
+	}
+
+	agent.Spec.Runtime.DefaultAllowedTools = []string{}
+	envVars = builder.addAgentToolsEnvVars(nil, task, agent)
+	if got, ok := findEnvVar(envVars, workerenv.AllowedTools); ok {
+		t.Fatalf("explicit empty %s unexpectedly emitted: %#v", workerenv.AllowedTools, got)
+	}
+
+	agent.Spec.Runtime.DefaultAllowedTools = nil
+	task.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{}}
+	envVars = builder.addAgentToolsEnvVars(nil, task, agent)
+	if got, ok := findEnvVar(envVars, workerenv.AllowedTools); ok {
+		t.Fatalf("explicit empty task override %s unexpectedly emitted: %#v", workerenv.AllowedTools, got)
+	}
+}
+
+func TestReadOnlyAgentRuntimeGuardsAllowOpencode(t *testing.T) {
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{labels.AnnotationAgentReadOnly: scheduledRunLabelValue},
@@ -3356,14 +3382,15 @@ func TestReadOnlyAgentRuntimeGuardsRejectOpencode(t *testing.T) {
 		},
 	}
 
-	if err := validateReadOnlyAgentRuntime(task, agent); err == nil || !strings.Contains(err.Error(), "opencode") {
-		t.Fatalf("validateReadOnlyAgentRuntime() error = %v, want opencode rejection", err)
+	if err := validateReadOnlyAgentRuntime(task, agent); err != nil {
+		t.Fatalf("validateReadOnlyAgentRuntime() error = %v, want OpenCode accepted", err)
 	}
 	if got := readOnlyAgentRuntimeType(agent); got != corev1alpha1.AgentRuntimeOpencode {
 		t.Fatalf("readOnlyAgentRuntimeType() = %q, want opencode", got)
 	}
-	if _, err := readOnlyAgentRuntimeSecretKeys(agent); err == nil || !strings.Contains(err.Error(), "opencode") {
-		t.Fatalf("readOnlyAgentRuntimeSecretKeys() error = %v, want opencode rejection", err)
+	keys, err := readOnlyAgentRuntimeSecretKeys(agent)
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("readOnlyAgentRuntimeSecretKeys() = %#v, %v, want no runtime secret keys", keys, err)
 	}
 }
 

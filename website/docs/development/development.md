@@ -80,9 +80,9 @@ See [Testing](testing.md) for full test structure and patterns.
 
 The repository has additional GitHub Actions workflows in addition to the normal test matrix:
 
-- `Live ACP Runtime E2E` — runs on trusted default-branch changes, nightly, or by manual dispatch. It builds the current controller and all three built-in runtime images, bootstraps Kind plus Vekil and the production ACP topology, and executes live Codex, Claude, and Copilot RuntimePools through the canonical smoke validator.
+- `Live ACP Runtime E2E` — runs on trusted default-branch changes, nightly, or by manual dispatch. It builds the current controller and all four built-in runtime images, bootstraps Kind plus Vekil and the production ACP topology, and executes live Codex, OpenCode, Claude, and Copilot RuntimePools through the canonical smoke validator.
 - `Live ACP Release Gate` — is a manual, protected-environment destructive gate that adds result/fork checks, clean-room publication to a distinct fork, PR verification and cleanup, scale-to-zero recovery, and immutable-image assertions.
-- `Live Copilot Proxy E2E` — exercises native `type: ai` and compatibility API paths through an external proxy used as test infrastructure. The canonical live ACP workflow separately executes the built-in Codex, Claude, and Copilot RuntimePools end to end.
+- `Live Copilot Proxy E2E` — exercises native `type: ai` and compatibility API paths through an external proxy used as test infrastructure. The canonical live ACP workflow separately executes the built-in Codex, OpenCode, Claude, and Copilot RuntimePools end to end.
 - `Live Agent Sandbox E2E` — installs the pinned upstream `agent-sandbox` release in Kind, builds the PR controller plus fake Claude/sandbox-runtime and upstream router images, then validates workspace claim, sandbox execution, delete cleanup, retained-session reuse, and token scrubbing without model access.
 - `Live GitHub Label Trigger E2E` — builds the PR controller image, deploys it to Kind, configures a generated webhook secret and synthetic runtime Agent, then verifies signed label webhooks create scoped agent Tasks while invalid signatures and duplicate deliveries are handled correctly. This workflow is manual, model-free, and secret-free.
 - `Live GitHub OIDC E2E` — builds the PR controller image, deploys it to Kind, authenticates to Orka with a real GitHub Actions OIDC token, and verifies `spec.requestedBy` stamping plus client provenance-tampering rejection.
@@ -178,6 +178,7 @@ make docker-build-general-worker        # General worker
 make docker-build-acp-codex-runtime      # Immutable Codex ACP runtime
 make docker-build-acp-claude-runtime     # Immutable Claude ACP runtime
 make docker-build-acp-copilot-runtime    # Immutable GitHub Copilot ACP runtime
+make docker-build-acp-opencode-runtime    # Immutable OpenCode ACP runtime
 make docker-build-workspace-publisher    # Clean-room Workspace/Publisher
 make docker-build-all
 
@@ -188,6 +189,7 @@ make docker-push-general-worker
 make docker-push-acp-codex-runtime
 make docker-push-acp-claude-runtime
 make docker-push-acp-copilot-runtime
+make docker-push-acp-opencode-runtime
 make docker-push-workspace-publisher
 make docker-push-all
 ```
@@ -203,6 +205,7 @@ make deploy \
   ACP_CODEX_RUNTIME_IMG=<registry>/acp-codex@sha256:<digest> \
   ACP_CLAUDE_RUNTIME_IMG=<registry>/acp-claude@sha256:<digest> \
   ACP_COPILOT_RUNTIME_IMG=<registry>/acp-copilot@sha256:<digest> \
+  ACP_OPENCODE_RUNTIME_IMG=<registry>/acp-opencode@sha256:<digest> \
   WORKSPACE_PUBLISHER_IMG=<repo>@sha256:<publisher-digest>
 ```
 

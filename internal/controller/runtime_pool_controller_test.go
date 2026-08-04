@@ -197,9 +197,17 @@ func assertRuntimePoolEnvironment(t *testing.T, r *RuntimePoolReconciler, pool *
 		}
 		environment[env.Name] = env.Value
 	}
+	modelContextLimit := ""
+	modelOutputLimit := ""
+	if pool.Spec.Runtime.Profile.ModelLimits != nil {
+		modelContextLimit = strconv.FormatInt(pool.Spec.Runtime.Profile.ModelLimits.Context, 10)
+		modelOutputLimit = strconv.FormatInt(pool.Spec.Runtime.Profile.ModelLimits.Output, 10)
+	}
 	for name, want := range map[string]string{
 		"ORKA_ACP_PROVIDER":                     pool.Spec.Runtime.Profile.ProviderKind,
 		"ORKA_ACP_MODEL":                        pool.Spec.Runtime.Profile.Model,
+		"ORKA_ACP_MODEL_CONTEXT_LIMIT":          modelContextLimit,
+		"ORKA_ACP_MODEL_OUTPUT_LIMIT":           modelOutputLimit,
 		"ORKA_ACP_WORKSPACE_INTENT":             string(pool.Spec.Runtime.Profile.WorkspaceIntent),
 		"ORKA_ACP_AGENT_CONFIGURATION_DIGEST":   pool.Spec.Runtime.Profile.AgentConfigurationDigest,
 		"ORKA_ACP_TOOL_POLICY_DIGEST":           pool.Spec.Runtime.Profile.ToolPolicyDigest,

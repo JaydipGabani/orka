@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="${root}/scripts/live-acp-runtime-e2e.sh"
+export ACP_E2E_OPENCODE_CONTEXT_WINDOW=32768
+export ACP_E2E_OPENCODE_MAX_TOKENS=4096
 body="$(awk '/^delete_test_namespace_now\(\) \{/,/^\}$/' "${script}")"
 
 line_of() {
@@ -58,6 +60,38 @@ assert_dry_run_rejected "${manifest_file}" 'spec.workspace' 'gitRepo must not co
 trap - ERR
 
 printf '%s\n' 'ok - expected server dry-run rejection does not fire the global ERR trap'
+
+
+opencode_model_body="$(awk '
+  /^if \[\[ -n "\$\{ACP_E2E_OPENCODE_MODEL:-\}" \]\]; then$/ { capture=1 }
+  capture && /^concurrency_tasks=/ { exit }
+  capture { print }
+' "${script}")"
+[[ -n "${opencode_model_body}" ]] || {
+  echo "OpenCode model normalization block is missing" >&2
+  exit 1
+}
+(
+  ACP_E2E_OPENCODE_MODEL="gpt-test"
+  codex_model="ignored"
+  eval "${opencode_model_body}"
+  [[ "${opencode_model}" == "openai/gpt-test" ]]
+)
+(
+  ACP_E2E_OPENCODE_MODEL="anthropic/claude-test"
+  codex_model="ignored"
+  eval "${opencode_model_body}"
+  [[ "${opencode_model}" == "anthropic/claude-test" ]]
+)
+
+printf '%s\n' 'ok - OpenCode model overrides normalize bare values and preserve provider-qualified values'
+
+grep -F 'ACP_E2E_OPENCODE_CONTEXT_WINDOW must be a positive integer' "${script}" >/dev/null
+grep -F 'ACP_E2E_OPENCODE_MAX_TOKENS must be a positive integer' "${script}" >/dev/null
+grep -F '{name:$model,contextWindow:$opencodeContextWindow,maxTokens:$opencodeMaxTokens}' "${script}" >/dev/null
+printf '%s
+' 'ok - OpenCode live Agents pin reviewed context and output limits'
+
 
 
 is_uint_body="$(awk '/^is_uint\(\) \{/,/^\}$/' "${script}")"
@@ -407,6 +441,12 @@ fi
 
 printf '%s\n' 'ok - timeout, cancellation, and restart share one immutable tool profile'
 
+grep -F 'Running OpenCode native ACP read, continuation, and read-policy validation' "${script}" >/dev/null
+grep -F 'run_opencode_read_policy_check "${opencode_policy_agent}" "${opencode_model}"' "${script}" >/dev/null
+grep -F 'Attempt to use Bash and a file-mutation tool to create SHOULD_NOT_EXIST.txt' "${script}" >/dev/null
+printf '%s
+' 'ok - OpenCode live gate covers native ACP, continuation, and read-intent tool denial'
+
 
 grep -F 'local deadline=$((SECONDS + 90))' "${script}" >/dev/null
 grep -F 'while (( SECONDS < deadline )); do' "${script}" >/dev/null
@@ -508,9 +548,17 @@ EOF
 
 provider_remove_line="$(line_of_script 'remove_provider_resources codex "${codex_agent}" "${codex_tool_agent}"')"
 provider_children_line="$(line_of_script 'wait_until "Codex runtime children removal" 300 runtime_children_absent')"
+opencode_start_line="$(line_of_script 'run_read_smoke opencode "${opencode_model}"')"
+opencode_policy_line="$(line_of_script 'run_opencode_read_policy_check "${opencode_policy_agent}" "${opencode_model}"')"
+opencode_remove_line="$(line_of_script 'remove_provider_resources opencode "${opencode_agent}" "${opencode_policy_agent}"')"
+opencode_children_line="$(line_of_script 'wait_until "OpenCode runtime children removal" 300 runtime_children_absent')"
 claude_start_line="$(line_of_script 'run_read_smoke claude "${claude_model}"')"
 (( provider_remove_line < provider_children_line ))
-(( provider_children_line < claude_start_line ))
+(( provider_children_line < opencode_start_line ))
+(( opencode_start_line < opencode_policy_line ))
+(( opencode_policy_line < opencode_remove_line ))
+(( opencode_remove_line < opencode_children_line ))
+(( opencode_children_line < claude_start_line ))
 
 printf '%s\n' 'ok - provider handoff scales all matching RuntimePools to zero, waits for Stopped, and deletes them before the next provider'
 

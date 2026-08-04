@@ -371,6 +371,39 @@ func TestAgentRuntimeEndpointPolicy(t *testing.T) {
 	}
 }
 
+func TestAgentRuntimeProfilePreservesModelLimits(t *testing.T) {
+	base, _, _ := testAgentRuntimeProfileClaimsAndLimits()
+	base.ProviderKind = runtimePoolProviderOpencode
+	base.Model = "openai/gpt-test"
+	base.AdapterDigests = map[string]string{"opencode": testControllerDigest("opencode-adapter")}
+	base.ProxyCredentialScope = "model:openai/gpt-test"
+	base.ModelLimits = &harnessv2.ModelTokenLimits{Context: 32768, Output: 4096}
+	spec := corev1alpha1.AgentRuntimeProfileSpec{
+		DigestSchemaVersion:      int32(harnessv2.ProfileDigestSchemaVersion),
+		ACPProfile:               base.ACPProfile,
+		AdapterName:              "opencode",
+		AdapterDigest:            base.AdapterDigests["opencode"],
+		ProviderKind:             base.ProviderKind,
+		Model:                    base.Model,
+		ModelLimits:              &corev1alpha1.ModelTokenLimits{Context: 32768, Output: 4096},
+		AgentConfigurationDigest: base.AgentConfigurationDigest,
+		ToolPolicyDigest:         base.ToolPolicyDigest,
+		ApprovalPolicyDigest:     base.ApprovalPolicyDigest,
+		MCPConfigurationDigest:   base.MCPConfigurationDigest,
+		WorkspaceIntent:          corev1alpha1.WorkspaceIntent(base.WorkspaceIntent),
+		ProxyCredentialRole:      base.ProxyCredentialRole,
+		ProxyCredentialScope:     base.ProxyCredentialScope,
+		ResourceClass:            base.ResourceClass,
+	}
+	profile, err := agentRuntimeProfile(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.ModelLimits == nil || profile.ModelLimits.Context != 32768 || profile.ModelLimits.Output != 4096 {
+		t.Fatalf("model limits = %#v", profile.ModelLimits)
+	}
+}
+
 func testAgentRuntimeAndSecret(t *testing.T, endpoint string, config conformancetest.Config) (*corev1alpha1.AgentRuntime, *corev1.Secret) {
 	t.Helper()
 	profileDigest, err := harnessv2.CanonicalProfileDigest(config.Profile)
@@ -380,6 +413,13 @@ func testAgentRuntimeAndSecret(t *testing.T, endpoint string, config conformance
 	adapterName, adapterDigest := "", ""
 	for adapterName, adapterDigest = range config.Profile.AdapterDigests {
 		break
+	}
+	var apiModelLimits *corev1alpha1.ModelTokenLimits
+	if config.Profile.ModelLimits != nil {
+		apiModelLimits = &corev1alpha1.ModelTokenLimits{
+			Context: config.Profile.ModelLimits.Context,
+			Output:  config.Profile.ModelLimits.Output,
+		}
 	}
 	runtimeObject := &corev1alpha1.AgentRuntime{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "runtime", Generation: 1},
@@ -395,7 +435,7 @@ func testAgentRuntimeAndSecret(t *testing.T, endpoint string, config conformance
 				Profile: corev1alpha1.AgentRuntimeProfileSpec{
 					Digest: string(profileDigest), DigestSchemaVersion: int32(harnessv2.ProfileDigestSchemaVersion),
 					ACPProfile: config.Profile.ACPProfile, AdapterName: adapterName, AdapterDigest: adapterDigest,
-					ProviderKind: config.Profile.ProviderKind, Model: config.Profile.Model,
+					ProviderKind: config.Profile.ProviderKind, Model: config.Profile.Model, ModelLimits: apiModelLimits,
 					AgentConfigurationDigest: config.Profile.AgentConfigurationDigest,
 					ToolPolicyDigest:         config.Profile.ToolPolicyDigest, ApprovalPolicyDigest: config.Profile.ApprovalPolicyDigest,
 					MCPConfigurationDigest: config.Profile.MCPConfigurationDigest,

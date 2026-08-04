@@ -34,7 +34,7 @@ but Orka owns authorization, durable effects, and delivery.
   operation-capability scheme for external adapters.
 - Rotate runtime bearer Secrets and ensure the `AgentRuntime` observes the new Secret resourceVersion before use.
 - Keep built-in provider credentials behind the central provider proxy; do not
-  add `Agent.spec.secretRef` to Codex, Claude, or Copilot Agents.
+  add `Agent.spec.secretRef` to Codex, Claude, Copilot, or OpenCode Agents.
 - Use `config/acp-production` for direct Kustomize deployments so Vekil accepts
   ingress only from the authenticated provider proxy.
 - Keep source-read, target-read, target-write, and forge credentials in

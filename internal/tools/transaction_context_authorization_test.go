@@ -8,6 +8,7 @@ package tools
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -268,5 +269,93 @@ func childTaskForResearcherAgent() *corev1alpha1.Task {
 				Name: testResearcherAgentName,
 			},
 		},
+	}
+}
+
+func TestChildTransactionEffectiveRuntimePolicyNormalizesOpenCode(t *testing.T) {
+	allowBash := false
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeOpencode,
+	}}}
+	child := &corev1alpha1.Task{}
+	tools, bash := childTransactionEffectiveRuntimePolicy(child, agent)
+	if want := []string{"glob", "read"}; !slices.Equal(tools, want) {
+		t.Fatalf("read-intent tools = %#v, want %#v", tools, want)
+	}
+	if bash {
+		t.Fatal("read-intent policy retained bash")
+	}
+
+	agent.Spec.Runtime.DefaultAllowedTools = []string{"Edit"}
+	agent.Spec.Runtime.DefaultAllowBash = &allowBash
+	child.Spec.Workspace = &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite}
+	tools, bash = childTransactionEffectiveRuntimePolicy(child, agent)
+	if want := []string{"apply_patch", "edit", "write"}; !slices.Equal(tools, want) {
+		t.Fatalf("write-intent tools = %#v, want %#v", tools, want)
+	}
+	if bash {
+		t.Fatal("write-intent policy changed explicit bash denial")
+	}
+
+	child.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{DisallowedTools: []string{"write"}, AllowBash: &allowBash}
+	tools, _ = childTransactionEffectiveRuntimePolicy(child, agent)
+	if tools == nil || len(tools) != 0 {
+		t.Fatalf("disallowed mutation alias tools = %#v, want non-nil empty", tools)
+	}
+
+	agent.Spec.Runtime.DefaultAllowedTools = []string{}
+	child.Spec.AgentRuntime = nil
+	tools, _ = childTransactionEffectiveRuntimePolicy(child, agent)
+	if tools == nil || len(tools) != 0 {
+		t.Fatalf("explicit empty tools = %#v, want non-nil empty", tools)
+	}
+
+	agent.Spec.Runtime.DefaultAllowedTools = nil
+	child.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{}}
+	tools, _ = childTransactionEffectiveRuntimePolicy(child, agent)
+	if tools == nil || len(tools) != 0 {
+		t.Fatalf("explicit empty task override = %#v, want non-nil empty", tools)
+	}
+}
+
+func TestValidateChildToolConstraintsAcceptsOpenCodeDenyAll(t *testing.T) {
+	allowBash := false
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeOpencode, DefaultAllowedTools: []string{}, DefaultAllowBash: &allowBash,
+	}}}
+	err := validateChildToolConstraints(map[string]string{"allowedTools": "[]"}, childTransactionContext{
+		childType: corev1alpha1.TaskTypeAgent, agent: agent, runtimeTools: []string{}, runtimeBash: false,
+	})
+	if err != nil {
+		t.Fatalf("deny-all OpenCode policy rejected: %v", err)
+	}
+}
+
+func TestValidateChildToolConstraintsNormalizesOpenCodePublicAllowlist(t *testing.T) {
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeOpencode,
+	}}}
+	err := validateChildToolConstraints(map[string]string{
+		"allowedTools": `["Read","Edit","Bash"]`,
+	}, childTransactionContext{
+		childType:    corev1alpha1.TaskTypeAgent,
+		agent:        agent,
+		runtimeTools: []string{"apply_patch", "bash", "edit", "read", "write"},
+		runtimeBash:  true,
+	})
+	if err != nil {
+		t.Fatalf("public OpenCode allowlist rejected: %v", err)
+	}
+}
+
+func TestValidateChildToolConstraintsAcceptsGenericDenyAll(t *testing.T) {
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeCodex, DefaultAllowedTools: []string{},
+	}}}
+	err := validateChildToolConstraints(map[string]string{"allowedTools": "[]"}, childTransactionContext{
+		childType: corev1alpha1.TaskTypeAgent, agent: agent, runtimeTools: []string{}, runtimeBash: false,
+	})
+	if err != nil {
+		t.Fatalf("deny-all generic runtime policy rejected: %v", err)
 	}
 }

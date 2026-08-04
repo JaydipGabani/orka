@@ -1899,11 +1899,12 @@ data:
   ORKA_ACP_CLAUDE_RUNTIME_IMAGE: docker.io/sozercan/orka-acp-claude@sha256:0000000000000000000000000000000000000000000000000000000000000000
   ORKA_ACP_CODEX_RUNTIME_IMAGE: docker.io/sozercan/orka-acp-codex@sha256:0000000000000000000000000000000000000000000000000000000000000000
   ORKA_ACP_COPILOT_RUNTIME_IMAGE: docker.io/sozercan/orka-acp-copilot@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  ORKA_ACP_OPENCODE_RUNTIME_IMAGE: docker.io/sozercan/orka-acp-opencode@sha256:0000000000000000000000000000000000000000000000000000000000000000
 kind: ConfigMap
 metadata:
   labels:
     orka.ai/acp-runtime-images: "true"
-  name: acp-runtime-images-4d57d78k2k
+  name: acp-runtime-images-2cc58tc8m7
   namespace: orka-system
 ---
 apiVersion: v1
@@ -2101,17 +2102,22 @@ spec:
           valueFrom:
             configMapKeyRef:
               key: ORKA_ACP_CODEX_RUNTIME_IMAGE
-              name: acp-runtime-images-4d57d78k2k
+              name: acp-runtime-images-2cc58tc8m7
         - name: ORKA_ACP_CLAUDE_RUNTIME_IMAGE
           valueFrom:
             configMapKeyRef:
               key: ORKA_ACP_CLAUDE_RUNTIME_IMAGE
-              name: acp-runtime-images-4d57d78k2k
+              name: acp-runtime-images-2cc58tc8m7
         - name: ORKA_ACP_COPILOT_RUNTIME_IMAGE
           valueFrom:
             configMapKeyRef:
               key: ORKA_ACP_COPILOT_RUNTIME_IMAGE
-              name: acp-runtime-images-4d57d78k2k
+              name: acp-runtime-images-2cc58tc8m7
+        - name: ORKA_ACP_OPENCODE_RUNTIME_IMAGE
+          valueFrom:
+            configMapKeyRef:
+              key: ORKA_ACP_OPENCODE_RUNTIME_IMAGE
+              name: acp-runtime-images-2cc58tc8m7
         - name: ORKA_WORKSPACE_PUBLISHER_URL
           value: http://orka-workspace-publisher.orka-system.svc:8080
         - name: ORKA_WORKSPACE_PUBLISHER_CONTROLLER_TOKEN_FILE

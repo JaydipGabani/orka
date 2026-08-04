@@ -16,6 +16,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/acp"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/llm"
 	"github.com/orka-agents/orka/internal/metrics"
@@ -1075,8 +1076,7 @@ func resolveContextTokenAgentSpecAuthorizationContext(ctx context.Context, c cli
 	authzCtx.EffectiveProvider, authzCtx.EffectiveModel = contextTokenTaskCreateEffectiveProviderModel(CreateTaskRequest{}, agent, provider)
 	authzCtx.Fallbacks = contextTokenTaskCreateFallbackProviderModels(ctx, c, agent.Namespace, agent)
 	authzCtx.EffectiveAITools = contextTokenTaskCreateEffectiveAITools(CreateTaskRequest{}, agent)
-	authzCtx.RuntimeAllowedTools = contextTokenTaskCreateEffectiveRuntimeAllowedTools(CreateTaskRequest{}, agent)
-	authzCtx.RuntimeAllowBash = contextTokenTaskCreateEffectiveRuntimeAllowBash(CreateTaskRequest{}, agent)
+	authzCtx.RuntimeAllowedTools, authzCtx.RuntimeAllowBash = contextTokenAgentRuntimeAuthorizationPolicy(agent)
 	return authzCtx, nil
 }
 
@@ -1085,12 +1085,16 @@ func contextTokenAgentSpecToolFailures(token *ContextToken, authzCtx contextToke
 	if !ok {
 		return nil
 	}
+	if authzCtx.Agent != nil && authzCtx.Agent.Spec.Runtime != nil && authzCtx.Agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
+		allowed = acp.NormalizeOpenCodeAuthorizationTools(allowed)
+	}
 	failures := []string{}
-	if authzCtx.Agent != nil && authzCtx.Agent.Spec.Runtime != nil && !hasNonEmptyToolNames(authzCtx.RuntimeAllowedTools) {
+	if authzCtx.Agent != nil && authzCtx.Agent.Spec.Runtime != nil && contextTokenRuntimeToolsUnrestricted(authzCtx.RuntimeAllowedTools) {
 		failures = append(failures, "agent runtime default tools are unrestricted while token context restricts allowedTools")
 	}
 	runtimeTools := append([]string{}, authzCtx.RuntimeAllowedTools...)
-	if authzCtx.Agent != nil && authzCtx.Agent.Spec.Runtime != nil && authzCtx.RuntimeAllowBash {
+	if authzCtx.Agent != nil && authzCtx.Agent.Spec.Runtime != nil &&
+		authzCtx.Agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode && authzCtx.RuntimeAllowBash {
 		runtimeTools = append(runtimeTools, "Bash")
 	}
 	for _, tool := range append(append([]string{}, authzCtx.EffectiveAITools...), runtimeTools...) {
@@ -1158,8 +1162,7 @@ func resolveContextTokenTaskCreateAuthorizationContext(ctx context.Context, c cl
 	authzCtx.EffectiveProvider, authzCtx.EffectiveModel = contextTokenTaskCreateEffectiveProviderModel(req, authzCtx.Agent, authzCtx.Provider)
 	authzCtx.Fallbacks = contextTokenTaskCreateFallbackProviderModels(ctx, c, namespace, authzCtx.Agent)
 	authzCtx.EffectiveAITools = contextTokenTaskCreateEffectiveAITools(req, authzCtx.Agent)
-	authzCtx.RuntimeAllowedTools = contextTokenTaskCreateEffectiveRuntimeAllowedTools(req, authzCtx.Agent)
-	authzCtx.RuntimeAllowBash = contextTokenTaskCreateEffectiveRuntimeAllowBash(req, authzCtx.Agent)
+	authzCtx.RuntimeAllowedTools, authzCtx.RuntimeAllowBash = contextTokenTaskCreateEffectiveRuntimePolicy(req, authzCtx.Agent)
 
 	return authzCtx, nil
 }
@@ -1291,25 +1294,60 @@ func coordinationToolNames() []string {
 	}
 }
 
-func contextTokenTaskCreateEffectiveRuntimeAllowedTools(req CreateTaskRequest, agent *corev1alpha1.Agent) []string {
-	if req.AgentRuntime != nil && len(req.AgentRuntime.AllowedTools) > 0 {
-		return append([]string{}, req.AgentRuntime.AllowedTools...)
+func contextTokenAgentRuntimeAllowedTools(agent *corev1alpha1.Agent) []string {
+	if agent == nil || agent.Spec.Runtime == nil {
+		return nil
 	}
-	if agent != nil && agent.Spec.Runtime != nil && len(agent.Spec.Runtime.DefaultAllowedTools) > 0 {
-		return append([]string{}, agent.Spec.Runtime.DefaultAllowedTools...)
+	runtime := agent.Spec.Runtime
+	if runtime.Type == corev1alpha1.AgentRuntimeOpencode && runtime.DefaultAllowedTools == nil {
+		return acp.OpenCodeDefaultAllowedTools()
+	}
+	if runtime.DefaultAllowedTools != nil {
+		return append([]string{}, runtime.DefaultAllowedTools...)
 	}
 	return nil
 }
 
-func contextTokenTaskCreateEffectiveRuntimeAllowBash(req CreateTaskRequest, agent *corev1alpha1.Agent) bool {
+func contextTokenAgentRuntimeAllowBash(agent *corev1alpha1.Agent) bool {
 	allowBash := true
 	if agent != nil && agent.Spec.Runtime != nil && agent.Spec.Runtime.DefaultAllowBash != nil {
 		allowBash = *agent.Spec.Runtime.DefaultAllowBash
 	}
+	return allowBash
+}
+
+func contextTokenAgentRuntimeAuthorizationPolicy(agent *corev1alpha1.Agent) ([]string, bool) {
+	allowedTools := contextTokenAgentRuntimeAllowedTools(agent)
+	allowBash := contextTokenAgentRuntimeAllowBash(agent)
+	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+		return allowedTools, allowBash
+	}
+	allowedTools, disallowedTools, allowBash := acp.NormalizeOpenCodeToolPolicy(false, allowedTools, nil, allowBash)
+	allowedTools = acp.OpenCodeEffectiveAllowedTools(allowedTools, disallowedTools, allowBash)
+	return allowedTools, allowBash && slices.Contains(allowedTools, "bash")
+}
+
+func contextTokenTaskCreateEffectiveRuntimePolicy(req CreateTaskRequest, agent *corev1alpha1.Agent) ([]string, bool) {
+	allowedTools := contextTokenAgentRuntimeAllowedTools(agent)
+	if req.AgentRuntime != nil && req.AgentRuntime.AllowedTools != nil {
+		allowedTools = append([]string{}, req.AgentRuntime.AllowedTools...)
+	}
+	allowBash := contextTokenAgentRuntimeAllowBash(agent)
+	disallowedTools := []string(nil)
 	if req.AgentRuntime != nil && req.AgentRuntime.AllowBash != nil {
 		allowBash = *req.AgentRuntime.AllowBash
 	}
-	return allowBash
+	if req.AgentRuntime != nil {
+		disallowedTools = append(disallowedTools, req.AgentRuntime.DisallowedTools...)
+	}
+	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+		return allowedTools, allowBash
+	}
+	workspace := taskRequestWorkspace(req)
+	readIntent := workspace == nil || workspace.Intent == "" || workspace.Intent == corev1alpha1.WorkspaceIntentRead
+	allowedTools, disallowedTools, allowBash = acp.NormalizeOpenCodeToolPolicy(readIntent, allowedTools, disallowedTools, allowBash)
+	allowedTools = acp.OpenCodeEffectiveAllowedTools(allowedTools, disallowedTools, allowBash)
+	return allowedTools, allowBash && slices.Contains(allowedTools, "bash")
 }
 
 func contextTokenTaskToolCredentialFailures(
@@ -1615,8 +1653,11 @@ func contextTokenTaskToolFailures(token *ContextToken, authzCtx contextTokenTask
 	if !ok {
 		return nil
 	}
+	if authzCtx.Agent != nil && authzCtx.Agent.Spec.Runtime != nil && authzCtx.Agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
+		allowed = acp.NormalizeOpenCodeAuthorizationTools(allowed)
+	}
 	failures := []string{}
-	if authzCtx.Request.Type == corev1alpha1.TaskTypeAgent && !hasNonEmptyToolNames(authzCtx.RuntimeAllowedTools) {
+	if authzCtx.Request.Type == corev1alpha1.TaskTypeAgent && contextTokenRuntimeToolsUnrestricted(authzCtx.RuntimeAllowedTools) {
 		failures = append(failures, "agent runtime tools are unrestricted by task or agent while token context restricts allowedTools")
 	}
 	runtimeTools := contextTokenRuntimeToolConstraints(authzCtx)
@@ -1685,6 +1726,9 @@ func contextTokenNativeRuntimeToolName(authzCtx contextTokenTaskCreateAuthorizat
 
 func contextTokenRuntimeToolConstraints(authzCtx contextTokenTaskCreateAuthorizationContext) []string {
 	runtimeTools := append([]string{}, authzCtx.RuntimeAllowedTools...)
+	if authzCtx.Agent != nil && authzCtx.Agent.Spec.Runtime != nil && authzCtx.Agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
+		return runtimeTools
+	}
 	if authzCtx.Request.Type == corev1alpha1.TaskTypeAgent && authzCtx.RuntimeAllowBash {
 		runtimeTools = append(runtimeTools, "Bash")
 	}
@@ -1695,6 +1739,10 @@ func hasNonEmptyToolNames(tools []string) bool {
 	return slices.ContainsFunc(tools, func(tool string) bool {
 		return strings.TrimSpace(tool) != ""
 	})
+}
+
+func contextTokenRuntimeToolsUnrestricted(tools []string) bool {
+	return tools == nil || (len(tools) > 0 && !hasNonEmptyToolNames(tools))
 }
 
 func contextTokenTaskCreateNamespaceFailures(authzCtx contextTokenTaskCreateAuthorizationContext, tokenNamespace string) []string {

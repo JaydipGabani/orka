@@ -9,6 +9,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -486,9 +487,96 @@ func TestCreateAgentTool_Execute_BuiltInRuntimesAreCredentialFree(t *testing.T) 
 		})
 	}
 }
+
+func TestCreateAgentTool_Execute_UsesBuiltInOpenCode(t *testing.T) {
+	t.Setenv(envOrkaTaskName, parentTaskName)
+	t.Setenv(envOrkaTaskNamespace, defaultNamespace)
+	k8sClient := newFakeClient(parentTask())
+	tool := NewCreateAgentTool(k8sClient)
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{
+		"role":"coder",
+		"systemPrompt":"You write code",
+		"model":{"provider":"moonshotai","name":"Kimi-K2-Instruct-0905","contextWindow":32768,"maxTokens":4096},
+		"runtime":{"type":"opencode"}
+	}`))
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var agentResult CreateAgentResult
+	if err := json.Unmarshal([]byte(result), &agentResult); err != nil {
+		t.Fatal(err)
+	}
+	var agent corev1alpha1.Agent
+	if err := k8sClient.Get(context.Background(), apitypes.NamespacedName{Name: agentResult.AgentName, Namespace: agentResult.Namespace}, &agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+		t.Fatalf("runtime = %#v, want opencode", agent.Spec.Runtime)
+	}
+	if agent.Spec.Model == nil || agent.Spec.Model.Name != "moonshotai/Kimi-K2-Instruct-0905" || agent.Spec.Model.Provider != "" {
+		t.Fatalf("model = %#v, want provider-qualified OpenCode model", agent.Spec.Model)
+	}
+	wantTools := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep"}
+	if !slices.Equal(agent.Spec.Runtime.DefaultAllowedTools, wantTools) {
+		t.Fatalf("defaultAllowedTools = %#v, want %#v", agent.Spec.Runtime.DefaultAllowedTools, wantTools)
+	}
+	if agent.Spec.Runtime.DefaultAllowBash == nil || !*agent.Spec.Runtime.DefaultAllowBash {
+		t.Fatalf("defaultAllowBash = %v, want true", agent.Spec.Runtime.DefaultAllowBash)
+	}
+	if agent.Spec.ProviderRef != nil || agent.Spec.SecretRef != nil {
+		t.Fatalf("providerRef=%#v secretRef=%#v, want credential-free runtime", agent.Spec.ProviderRef, agent.Spec.SecretRef)
+	}
+}
+
+func TestCreateAgentTool_Execute_PreservesExplicitEmptyOpenCodeTools(t *testing.T) {
+	t.Setenv(envOrkaTaskName, parentTaskName)
+	t.Setenv(envOrkaTaskNamespace, defaultNamespace)
+	k8sClient := newFakeClient(parentTask())
+	result, err := NewCreateAgentTool(k8sClient).Execute(context.Background(), json.RawMessage(`{
+		"role":"coder","systemPrompt":"You write code","model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},
+		"runtime":{"type":"opencode","defaultAllowedTools":[],"defaultAllowBash":false}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var agentResult CreateAgentResult
+	if err := json.Unmarshal([]byte(result), &agentResult); err != nil {
+		t.Fatal(err)
+	}
+	var agent corev1alpha1.Agent
+	if err := k8sClient.Get(context.Background(), apitypes.NamespacedName{Name: agentResult.AgentName, Namespace: agentResult.Namespace}, &agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Spec.Runtime == nil || agent.Spec.Runtime.DefaultAllowedTools == nil || len(agent.Spec.Runtime.DefaultAllowedTools) != 0 {
+		t.Fatalf("defaultAllowedTools = %#v, want explicit empty", agent.Spec.Runtime)
+	}
+}
+
+func TestCreateAgentTool_Execute_RejectsInvalidOpenCodeConfiguration(t *testing.T) {
+	for name, args := range map[string]string{
+		"missing model":   `{"role":"coder","systemPrompt":"x","runtime":{"type":"opencode"}}`,
+		"bare model":      `{"role":"coder","systemPrompt":"x","model":{"name":"gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"substitution":    `{"role":"coder","systemPrompt":"x","model":{"name":"{env:PROVIDER}/gpt","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"missing context": `{"role":"coder","systemPrompt":"x","model":{"name":"openai/gpt-5.4","maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"missing output":  `{"role":"coder","systemPrompt":"x","model":{"name":"openai/gpt-5.4","contextWindow":32768},"runtime":{"type":"opencode"}}`,
+		"inverted limits": `{"role":"coder","systemPrompt":"x","model":{"name":"openai/gpt-5.4","contextWindow":4096,"maxTokens":4096},"runtime":{"type":"opencode"}}`,
+		"legacy secret":   `{"role":"coder","systemPrompt":"x","model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096},"runtime":{"type":"opencode","secretRef":"legacy"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(envOrkaTaskName, parentTaskName)
+			t.Setenv(envOrkaTaskNamespace, defaultNamespace)
+			_, err := NewCreateAgentTool(newFakeClient(parentTask())).Execute(context.Background(), json.RawMessage(args))
+			if err == nil {
+				t.Fatal("Execute() accepted invalid OpenCode configuration")
+			}
+		})
+	}
+}
+
 func TestCreateAgentTool_Execute_RejectsUnsupportedRuntime(t *testing.T) {
 	for _, runtimeArgs := range []string{
-		`{"type":"opencode","secretRef":"legacy-runtime"}`,
+		`{"type":"unknown"}`,
 		`{}`,
 		`{"type":"   "}`,
 	} {

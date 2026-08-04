@@ -109,6 +109,10 @@ func (r *AgentReconciler) validateAgent(ctx context.Context, agent *corev1alpha1
 		}
 	}
 
+	if err := validateOpenCodeAgentSpec(agent); err != nil {
+		return err
+	}
+
 	if err := r.validateProviderRef(ctx, agent); err != nil {
 		return err
 	}
@@ -129,7 +133,8 @@ func (r *AgentReconciler) validateAgent(ctx context.Context, agent *corev1alpha1
 
 func isBuiltInACPProviderRuntime(runtimeType corev1alpha1.AgentRuntimeType) bool {
 	switch runtimeType {
-	case corev1alpha1.AgentRuntimeCodex, corev1alpha1.AgentRuntimeClaude, corev1alpha1.AgentRuntimeCopilot:
+	case corev1alpha1.AgentRuntimeCodex, corev1alpha1.AgentRuntimeClaude,
+		corev1alpha1.AgentRuntimeCopilot, corev1alpha1.AgentRuntimeOpencode:
 		return true
 	default:
 		return false

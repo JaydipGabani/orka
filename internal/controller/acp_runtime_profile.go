@@ -15,9 +15,10 @@ import (
 )
 
 type ACPRuntimeImages struct {
-	Codex   string
-	Claude  string
-	Copilot string
+	Codex    string
+	Claude   string
+	Copilot  string
+	Opencode string
 }
 
 type ACPRuntimePlan struct {
@@ -28,6 +29,9 @@ type ACPRuntimePlan struct {
 }
 
 func PlanACPRuntime(task *corev1alpha1.Task, agent *corev1alpha1.Agent, images ACPRuntimeImages) (ACPRuntimePlan, error) {
+	if err := validateOpenCodeAgentSpec(agent); err != nil {
+		return ACPRuntimePlan{}, err
+	}
 	if agent != nil && agent.Spec.SystemPrompt != nil && agent.Spec.SystemPrompt.ConfigMapRef != nil {
 		return ACPRuntimePlan{}, fmt.Errorf("PlanACPRuntime requires a resolved ConfigMap-backed Agent systemPrompt")
 	}
@@ -51,6 +55,9 @@ func PlanACPRuntimeWithConfiguration(
 	if task == nil || agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type == "" {
 		return ACPRuntimePlan{}, fmt.Errorf("built-in agent runtime is required")
 	}
+	if err := validateOpenCodeAgentSpec(agent); err != nil {
+		return ACPRuntimePlan{}, err
+	}
 	provider := string(agent.Spec.Runtime.Type)
 	model := ""
 	if agent.Spec.Model != nil {
@@ -73,26 +80,33 @@ func PlanACPRuntimeWithConfiguration(
 	if err != nil {
 		return ACPRuntimePlan{}, err
 	}
-	if !strings.Contains(image, "@sha256:") {
-		return ACPRuntimePlan{}, fmt.Errorf("ACP runtime image for %s must be digest-pinned", provider)
+	if !ACPRuntimeImageAvailable(image) {
+		return ACPRuntimePlan{}, fmt.Errorf("ACP runtime image for %s must be a configured digest-pinned image", provider)
 	}
 	allowed := effectiveACPAllowedTools(task, agent)
-	for _, name := range allowed {
-		if _, localOnly := controllerLocalOnlyTools[name]; localOnly {
-			return ACPRuntimePlan{}, fmt.Errorf("built-in tool %q is local-process-only and cannot be exposed through the controller MCP broker", name)
-		}
-	}
 	disallowed := []string(nil)
 	if task.Spec.AgentRuntime != nil {
 		disallowed = sortedUnique(task.Spec.AgentRuntime.DisallowedTools)
 	}
 	allowBash := effectiveACPAllowBash(task, agent)
-	allowed, disallowed, allowBash = normalizeACPProviderNativeToolPolicy(provider, allowed, disallowed, allowBash)
+	allowed, disallowed, allowBash = normalizeACPRuntimeToolPolicy(provider, intent, allowed, disallowed, allowBash)
 	if err := validateACPProviderNativePolicy(provider, allowed, disallowed, allowBash); err != nil {
 		return ACPRuntimePlan{}, err
 	}
 	if err := validateACPProviderSystemPrompt(provider, configuration); err != nil {
 		return ACPRuntimePlan{}, err
+	}
+	for _, name := range allowed {
+		if _, localOnly := controllerLocalOnlyTools[name]; localOnly {
+			return ACPRuntimePlan{}, fmt.Errorf("built-in tool %q is local-process-only and cannot be exposed through the controller MCP broker", name)
+		}
+	}
+	var modelLimits *harnessv2.ModelTokenLimits
+	if agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
+		modelLimits = &harnessv2.ModelTokenLimits{
+			Context: int64(*agent.Spec.Model.ContextWindow),
+			Output:  int64(*agent.Spec.Model.MaxTokens),
+		}
 	}
 	agentDigest, err := harnessv2.CanonicalAgentConfigurationDigest(configuration)
 	if err != nil {
@@ -116,7 +130,7 @@ func PlanACPRuntimeWithConfiguration(
 	}
 	profile := harnessv2.RuntimeProfile{
 		ACPProfile: harnessv2.ACPProfileV1, AdapterDigests: adapterDigests, ProviderKind: provider, Model: model,
-		AgentConfigurationDigest: agentDigest, ToolPolicyDigest: toolDigest, ApprovalPolicyDigest: approvalDigest,
+		ModelLimits: modelLimits, AgentConfigurationDigest: agentDigest, ToolPolicyDigest: toolDigest, ApprovalPolicyDigest: approvalDigest,
 		MCPConfigurationDigest: mcpDigest, WorkspaceIntent: harnessv2.WorkspaceIntent(intent),
 		ProxyCredentialRole: "provider-inference", ProxyCredentialScope: "model:" + model, ResourceClass: "standard",
 	}
@@ -137,11 +151,18 @@ func PlanACPRuntimeWithConfiguration(
 }
 
 func RuntimePoolProfileFromPlan(plan ACPRuntimePlan) corev1alpha1.RuntimePoolProfileSpec {
+	var modelLimits *corev1alpha1.ModelTokenLimits
+	if plan.Profile.ModelLimits != nil {
+		modelLimits = &corev1alpha1.ModelTokenLimits{
+			Context: plan.Profile.ModelLimits.Context,
+			Output:  plan.Profile.ModelLimits.Output,
+		}
+	}
 	return corev1alpha1.RuntimePoolProfileSpec{
 		ProtocolVersion: corev1alpha1.RuntimePoolProtocolHarnessV2,
 		Digest:          string(plan.Digest), DigestSchemaVersion: fmt.Sprintf("%d", harnessv2.ProfileDigestSchemaVersion),
 		ACPProfile: plan.Profile.ACPProfile, AdapterDigests: cloneMap(plan.Profile.AdapterDigests),
-		ProviderKind: plan.Profile.ProviderKind, Model: plan.Profile.Model,
+		ProviderKind: plan.Profile.ProviderKind, Model: plan.Profile.Model, ModelLimits: modelLimits,
 		AgentConfigurationDigest: plan.Profile.AgentConfigurationDigest, ToolPolicyDigest: plan.Profile.ToolPolicyDigest,
 		ApprovalPolicyDigest: plan.Profile.ApprovalPolicyDigest, MCPConfigurationDigest: plan.Profile.MCPConfigurationDigest,
 		WorkspaceIntent:     corev1alpha1.WorkspaceIntent(plan.Profile.WorkspaceIntent),
@@ -185,12 +206,17 @@ func effectiveACPWorkspaceIntent(task *corev1alpha1.Task) corev1alpha1.Workspace
 }
 
 func effectiveACPAllowedTools(task *corev1alpha1.Task, agent *corev1alpha1.Agent) []string {
-	values := []string(nil)
+	var values []string
 	if agent != nil && agent.Spec.Runtime != nil {
-		values = append(values, agent.Spec.Runtime.DefaultAllowedTools...)
+		runtime := agent.Spec.Runtime
+		if runtime.Type == corev1alpha1.AgentRuntimeOpencode && runtime.DefaultAllowedTools == nil {
+			values = acp.OpenCodeDefaultAllowedTools()
+		} else if runtime.DefaultAllowedTools != nil {
+			values = append([]string{}, runtime.DefaultAllowedTools...)
+		}
 	}
-	if task != nil && task.Spec.AgentRuntime != nil && len(task.Spec.AgentRuntime.AllowedTools) > 0 {
-		values = append([]string(nil), task.Spec.AgentRuntime.AllowedTools...)
+	if task != nil && task.Spec.AgentRuntime != nil && task.Spec.AgentRuntime.AllowedTools != nil {
+		values = append([]string{}, task.Spec.AgentRuntime.AllowedTools...)
 	}
 	if task != nil {
 		_, delegatedChild := task.Labels[labels.LabelParentTask]
@@ -199,8 +225,20 @@ func effectiveACPAllowedTools(task *corev1alpha1.Task, agent *corev1alpha1.Agent
 			values = append(values, "send_message", "check_messages")
 		}
 	}
-	values = sortedUnique(values)
-	return values
+	return sortedUnique(values)
+}
+
+func normalizeACPRuntimeToolPolicy(
+	provider string,
+	intent corev1alpha1.WorkspaceIntent,
+	allowed, disallowed []string,
+	allowBash bool,
+) ([]string, []string, bool) {
+	allowed, disallowed, allowBash = normalizeACPProviderNativeToolPolicy(provider, allowed, disallowed, allowBash)
+	if !strings.EqualFold(provider, string(corev1alpha1.AgentRuntimeOpencode)) {
+		return allowed, disallowed, allowBash
+	}
+	return acp.NormalizeOpenCodeToolPolicy(intent == corev1alpha1.WorkspaceIntentRead, allowed, disallowed, allowBash)
 }
 
 func effectiveACPMaxTurns(task *corev1alpha1.Task, agent *corev1alpha1.Agent) int32 {
@@ -237,9 +275,27 @@ func acpRuntimeArtifacts(runtime corev1alpha1.AgentRuntimeType, images ACPRuntim
 			"copilot-cli-linux-arm64": "sha256:" + acp.CopilotCLILinuxARM64SHA256,
 			"acp-schema":              "sha256:" + acp.ACPSchemaSHA256,
 		}, strings.TrimSpace(images.Copilot), nil
+	case corev1alpha1.AgentRuntimeOpencode:
+		return map[string]string{
+			"opencode-cli-linux-amd64":     "sha256:" + acp.OpenCodeLinuxX64BinarySHA256,
+			"opencode-cli-linux-arm64":     "sha256:" + acp.OpenCodeLinuxARM64BinarySHA256,
+			"opencode-ripgrep-linux-amd64": "sha256:" + acp.OpenCodeRipgrepLinuxX64BinarySHA256,
+			"opencode-ripgrep-linux-arm64": "sha256:" + acp.OpenCodeRipgrepLinuxARM64BinarySHA256,
+			"acp-schema":                   "sha256:" + acp.ACPSchemaSHA256,
+		}, strings.TrimSpace(images.Opencode), nil
 	default:
 		return nil, "", fmt.Errorf("runtime %q is not supported by the ACP core pool", runtime)
 	}
+}
+
+// ACPRuntimeImageAvailable reports whether a built-in runtime image is an
+// immutable, non-placeholder reference suitable for task admission and chat.
+func ACPRuntimeImageAvailable(image string) bool {
+	image = strings.TrimSpace(image)
+	if !digestPinnedImagePattern.MatchString(image) {
+		return false
+	}
+	return !strings.HasSuffix(image, "@sha256:"+strings.Repeat("0", 64))
 }
 
 func acpDomainDigest(domain string, value any) (string, error) {
@@ -259,6 +315,9 @@ func acpRuntimePoolName(provider string, digest harnessv2.ProfileDigest) string 
 }
 
 func sortedUnique(values []string) []string {
+	if values == nil {
+		return nil
+	}
 	seen := make(map[string]struct{}, len(values))
 	result := make([]string, 0, len(values))
 	for _, value := range values {

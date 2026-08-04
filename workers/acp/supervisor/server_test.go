@@ -1174,6 +1174,21 @@ func TestSupervisorFinalizesPreparedPublicationBeforeDeletion(t *testing.T) {
 	if deleteResponse.Classification.Class != harnessv2.RequestClassificationDuplicate || deleteResponse.Classification.Phase != harnessv2.OperationPhaseDeleted {
 		t.Fatalf("replayed delete classification=%#v", deleteResponse.Classification)
 	}
+	freshDelete := deleteRequest
+	freshDelete.Metadata.OperationID = "delete-finalized-session-new-operation"
+	freshDelete.Metadata.ExpiresAt = now.Add(2 * time.Minute)
+	sealRequest(t, &freshDelete.Metadata.RequestDigest, freshDelete)
+	freshResponse := performMutation(t, server.Handler(), http.MethodDelete, "/v2/runtime-sessions/session-1", freshDelete, cfg)
+	if freshResponse.Code != http.StatusNotFound {
+		t.Fatalf("fresh delete after tombstone status=%d body=%s", freshResponse.Code, freshResponse.Body.String())
+	}
+	var freshError harnessv2.ErrorResponse
+	if err := json.Unmarshal(freshResponse.Body.Bytes(), &freshError); err != nil {
+		t.Fatal(err)
+	}
+	if freshError.Classification != nil {
+		t.Fatalf("fresh delete after tombstone carried classification=%#v", freshError.Classification)
+	}
 }
 
 func TestCleanupDrainedSessionClearsDeferredSchedule(t *testing.T) {

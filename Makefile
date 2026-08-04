@@ -10,6 +10,7 @@ GENERAL_WORKER_IMG ?= ghcr.io/orka-agents/orka/general-worker:latest
 ACP_CODEX_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-codex-runtime:latest
 ACP_CLAUDE_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-claude-runtime:latest
 ACP_COPILOT_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-copilot-runtime:latest
+ACP_OPENCODE_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-opencode-runtime:latest
 WORKSPACE_PUBLISHER_IMG ?= ghcr.io/orka-agents/orka/workspace-publisher:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
@@ -207,6 +208,7 @@ test-e2e-setup-only: setup-test-e2e docker-build-all ## Set up Kind cluster and 
 	$(KIND) load docker-image $(ACP_CODEX_RUNTIME_IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(ACP_CLAUDE_RUNTIME_IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(ACP_COPILOT_RUNTIME_IMG) --name $(KIND_CLUSTER)
+	$(KIND) load docker-image $(ACP_OPENCODE_RUNTIME_IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(WORKSPACE_PUBLISHER_IMG) --name $(KIND_CLUSTER)
 
 .PHONY: test-e2e-run-only
@@ -349,6 +351,10 @@ docker-build-acp-claude-runtime: ## Build the immutable Claude ACP runtime image
 docker-build-acp-copilot-runtime: ## Build the immutable GitHub Copilot ACP runtime image.
 	$(CONTAINER_TOOL) build -t ${ACP_COPILOT_RUNTIME_IMG} -f workers/acp/images/copilot/Dockerfile .
 
+.PHONY: docker-build-acp-opencode-runtime
+docker-build-acp-opencode-runtime: ## Build the immutable OpenCode ACP runtime image.
+	$(CONTAINER_TOOL) build -t ${ACP_OPENCODE_RUNTIME_IMG} -f workers/acp/images/opencode/Dockerfile .
+
 .PHONY: docker-build-workspace-publisher
 docker-build-workspace-publisher: ## Build the clean-room workspace publisher image.
 	$(CONTAINER_TOOL) build -t ${WORKSPACE_PUBLISHER_IMG} -f workers/publisher/Dockerfile .
@@ -373,15 +379,19 @@ docker-push-acp-claude-runtime: ## Push the immutable Claude ACP runtime image.
 docker-push-acp-copilot-runtime: ## Push the immutable GitHub Copilot ACP runtime image.
 	$(CONTAINER_TOOL) push ${ACP_COPILOT_RUNTIME_IMG}
 
+.PHONY: docker-push-acp-opencode-runtime
+docker-push-acp-opencode-runtime: ## Push the immutable OpenCode ACP runtime image.
+	$(CONTAINER_TOOL) push ${ACP_OPENCODE_RUNTIME_IMG}
+
 .PHONY: docker-push-workspace-publisher
 docker-push-workspace-publisher: ## Push the clean-room workspace publisher image.
 	$(CONTAINER_TOOL) push ${WORKSPACE_PUBLISHER_IMG}
 
 .PHONY: docker-build-all
-docker-build-all: docker-build docker-build-ai-worker docker-build-general-worker docker-build-acp-codex-runtime docker-build-acp-claude-runtime docker-build-acp-copilot-runtime docker-build-workspace-publisher ## Build all docker images.
+docker-build-all: docker-build docker-build-ai-worker docker-build-general-worker docker-build-acp-codex-runtime docker-build-acp-claude-runtime docker-build-acp-copilot-runtime docker-build-acp-opencode-runtime docker-build-workspace-publisher ## Build all docker images.
 
 .PHONY: docker-push-all
-docker-push-all: docker-push docker-push-ai-worker docker-push-general-worker docker-push-acp-codex-runtime docker-push-acp-claude-runtime docker-push-acp-copilot-runtime docker-push-workspace-publisher ## Push all docker images.
+docker-push-all: docker-push docker-push-ai-worker docker-push-general-worker docker-push-acp-codex-runtime docker-push-acp-claude-runtime docker-push-acp-copilot-runtime docker-push-acp-opencode-runtime docker-push-workspace-publisher ## Push all docker images.
 
 ##@ Deployment
 
@@ -406,7 +416,8 @@ verify-acp-runtime-images: ## Require digest-pinned ACP runtime images for suppo
 		"WORKSPACE_PUBLISHER_IMG=$(WORKSPACE_PUBLISHER_IMG)" \
 		"ACP_CODEX_RUNTIME_IMG=$(ACP_CODEX_RUNTIME_IMG)" \
 		"ACP_CLAUDE_RUNTIME_IMG=$(ACP_CLAUDE_RUNTIME_IMG)" \
-		"ACP_COPILOT_RUNTIME_IMG=$(ACP_COPILOT_RUNTIME_IMG)"; do \
+		"ACP_COPILOT_RUNTIME_IMG=$(ACP_COPILOT_RUNTIME_IMG)" \
+		"ACP_OPENCODE_RUNTIME_IMG=$(ACP_OPENCODE_RUNTIME_IMG)"; do \
 		name="$${entry%%=*}"; ref="$${entry#*=}"; \
 		if [[ ! "$${ref}" =~ ^.+@sha256:[0-9a-f]{64}$$ ]]; then \
 			echo "$$name must be an immutable image reference ending in @sha256:<64 lowercase hex characters>; got '$$ref'" >&2; \
@@ -452,7 +463,7 @@ deploy: verify-acp-runtime-images verify-acp-crd-cutover manifests kustomize ## 
 		"$(CURDIR)/scripts/render-worker-images.sh" "$$tmp/config/manager/manager.yaml" \
 			"$(AI_WORKER_IMG)" "$(GENERAL_WORKER_IMG)"; \
 		"$(CURDIR)/scripts/render-acp-runtime-images.sh" "$$tmp/config/acp-production" \
-			"${ACP_CODEX_RUNTIME_IMG}" "${ACP_CLAUDE_RUNTIME_IMG}" "${ACP_COPILOT_RUNTIME_IMG}"; \
+			"${ACP_CODEX_RUNTIME_IMG}" "${ACP_CLAUDE_RUNTIME_IMG}" "${ACP_COPILOT_RUNTIME_IMG}" "${ACP_OPENCODE_RUNTIME_IMG}"; \
 		cd "$$tmp/config/acp-production"; \
 		"$(KUSTOMIZE)" edit set image \
 			ghcr.io/orka-agents/orka=${IMG} \

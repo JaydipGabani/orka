@@ -37,12 +37,14 @@ func (t *ChatCreateAgentTool) Parameters() json.RawMessage {
 		"requests": map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, "additionalProperties": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}},
 		"limits":   map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, "additionalProperties": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}},
 	},
-	}, modelField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaDescriptionField: "Model configuration; model.name is optional for built-in ACP runtimes", jsonSchemaPropertiesField: map[string]any{
-		"provider": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model provider (e.g. anthropic, openai)"}, nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model name"}, "temperature": map[string]any{jsonSchemaTypeField: "number", jsonSchemaDescriptionField: "Sampling temperature"},
+	}, modelField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaDescriptionField: "Model configuration; OpenCode requires a literal provider/model name plus reviewed contextWindow and maxTokens", jsonSchemaPropertiesField: map[string]any{
+		"provider": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model provider (e.g. anthropic, openai)"}, nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model name; OpenCode requires a literal provider/model ID"}, "temperature": map[string]any{jsonSchemaTypeField: "number", jsonSchemaDescriptionField: "Sampling temperature"},
+		"contextWindow": map[string]any{jsonSchemaTypeField: jsonSchemaTypeInteger, "minimum": 1, jsonSchemaDescriptionField: "Reviewed model context capacity; required for OpenCode"},
+		"maxTokens":     map[string]any{jsonSchemaTypeField: jsonSchemaTypeInteger, "minimum": 1, jsonSchemaDescriptionField: "Reviewed maximum output tokens; required for OpenCode"},
 	},
-	}, runtimeField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaPropertiesField: map[string]any{jsonSchemaTypeField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Runtime type: copilot, claude, or codex"}, "defaultMaxTurns": map[string]any{jsonSchemaTypeField: jsonSchemaTypeInteger, jsonSchemaDescriptionField: "Default max agent loop iterations"},
-		"defaultAllowedTools": map[string]any{jsonSchemaTypeField: jsonSchemaTypeArray, itemsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}, jsonSchemaDescriptionField: "Default CLI tools allowed for tasks using this runtime agent"},
-		"defaultAllowBash":    map[string]any{jsonSchemaTypeField: jsonSchemaTypeBoolean, jsonSchemaDescriptionField: "Whether bash is allowed by default for tasks using this runtime agent"}, secretRefField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Deprecated legacy field. Built-in ACP runtimes are credential-free at the Agent boundary and ignore it."},
+	}, runtimeField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaDescriptionField: "CLI runtime configuration. OpenCode uses the built-in ACP RuntimePool profile and controller provider proxy.", jsonSchemaPropertiesField: map[string]any{jsonSchemaTypeField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Runtime type: copilot, claude, codex, or opencode"}, "defaultMaxTurns": map[string]any{jsonSchemaTypeField: jsonSchemaTypeInteger, jsonSchemaDescriptionField: "Default max agent loop iterations"},
+		"defaultAllowedTools": map[string]any{jsonSchemaTypeField: jsonSchemaTypeArray, itemsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}, jsonSchemaDescriptionField: "Default CLI tools allowed for tasks using this runtime agent. OpenCode defaults to Read, Write, Edit, Bash, Glob, and Grep when omitted."},
+		"defaultAllowBash":    map[string]any{jsonSchemaTypeField: jsonSchemaTypeBoolean, jsonSchemaDescriptionField: "Whether bash is allowed by default for tasks using this runtime agent. OpenCode defaults to true when omitted."}, secretRefField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Deprecated legacy field. Built-in ACP runtimes are credential-free at the Agent boundary; OpenCode rejects it."},
 	},
 	}, "initialPrompt": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "When provided, automatically create and start a Task using this agent with this prompt. One tool call = agent + task. Leave empty to only create the agent config without running it."},
 		"coordination": map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaDescriptionField: "Enable multi-agent coordination so this agent can delegate tasks to other agents via delegate_task/wait_for_tasks tools", jsonSchemaPropertiesField: map[string]any{
@@ -101,6 +103,14 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 				if tempF, ok := temp.(float64); ok {
 					agent.Spec.Model.Temperature = &tempF
 				}
+			}
+			if contextWindow := chatGetIntArg(m, "contextWindow", 0); contextWindow > 0 && int64(contextWindow) <= int64(^uint32(0)>>1) {
+				value := int32(contextWindow)
+				agent.Spec.Model.ContextWindow = &value
+			}
+			if maxTokens := chatGetIntArg(m, "maxTokens", 0); maxTokens > 0 && int64(maxTokens) <= int64(^uint32(0)>>1) {
+				value := int32(maxTokens)
+				agent.Spec.Model.MaxTokens = &value
 			}
 		case string:
 			provider, modelName := splitModelString(m)
@@ -293,7 +303,7 @@ func parseRuntimeConfig(a map[string]any, agent *corev1alpha1.Agent) (string, bo
 		result, _ := ChatToolErrorResult(
 			"invalid_arguments",
 			"runtime.type is required when runtime is provided",
-			"Use one of the built-in ACP runtimes: copilot, claude, or codex.",
+			"Use one of the built-in ACP runtimes: copilot, claude, codex, or opencode.",
 		)
 		return result, false
 	}
@@ -302,9 +312,22 @@ func parseRuntimeConfig(a map[string]any, agent *corev1alpha1.Agent) (string, bo
 		result, _ := ChatToolErrorResult(
 			"invalid_arguments",
 			fmt.Sprintf("unsupported runtime type %q", runtimeType),
-			"Use one of the built-in ACP runtimes: copilot, claude, or codex.",
+			"Use one of the built-in ACP runtimes: copilot, claude, codex, or opencode.",
 		)
 		return result, false
+	}
+	if resolvedRuntimeType == corev1alpha1.AgentRuntimeOpencode {
+		if secretRef := strings.TrimSpace(chatGetStringArg(rtMap, secretRefField)); secretRef != "" {
+			result, _ := ChatToolErrorResult(
+				"invalid_arguments",
+				"opencode runtime does not accept runtime.secretRef; provider access is controller-proxied",
+				"Remove runtime.secretRef for OpenCode Agents.",
+			)
+			return result, false
+		}
+		if result, ok := normalizeChatOpenCodeModel(agent); !ok {
+			return result, false
+		}
 	}
 	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{Type: resolvedRuntimeType}
 	if agent.Spec.Model != nil {
@@ -314,14 +337,80 @@ func parseRuntimeConfig(a map[string]any, agent *corev1alpha1.Agent) (string, bo
 		maxTurnsInt := int32(maxTurns)
 		agent.Spec.Runtime.DefaultMaxTurns = &maxTurnsInt
 	}
-	if allowedTools := chatGetStringSliceArg(rtMap, "defaultAllowedTools"); len(allowedTools) > 0 {
-		agent.Spec.Runtime.DefaultAllowedTools = allowedTools
+	_, allowedToolsSupplied := rtMap["defaultAllowedTools"]
+	if allowedToolsSupplied {
+		agent.Spec.Runtime.DefaultAllowedTools = chatGetStringSliceArg(rtMap, "defaultAllowedTools")
 	}
+	_, allowBashSupplied := rtMap["defaultAllowBash"]
 	if allowBash, ok := rtMap["defaultAllowBash"].(bool); ok {
 		agent.Spec.Runtime.DefaultAllowBash = &allowBash
 	}
+	applyOpencodeRuntimeDefaults(agent.Spec.Runtime, allowedToolsSupplied, allowBashSupplied)
 	agent.Spec.SecretRef = nil
 	agent.Spec.ProviderRef = nil
+	return "", true
+}
+
+func normalizeChatOpenCodeModel(agent *corev1alpha1.Agent) (string, bool) {
+	if agent.Spec.Model == nil || strings.TrimSpace(agent.Spec.Model.Name) == "" {
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			"model.name is required for opencode runtime",
+			"Set model.name to a literal provider/model ID such as openai/gpt-5.4.",
+		)
+		return result, false
+	}
+	requested := strings.TrimSpace(agent.Spec.Model.Name)
+	provider := strings.TrimSpace(agent.Spec.Model.Provider)
+	if provider != "" {
+		prefix := strings.TrimSuffix(provider, "/") + "/"
+		if !strings.HasPrefix(requested, prefix) {
+			requested = prefix + strings.TrimPrefix(requested, "/")
+		}
+	}
+	if strings.ContainsAny(requested, "{}") {
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			"model.name for opencode runtime must not contain substitution braces",
+			"Use the literal provider/model ID without OpenCode config substitutions.",
+		)
+		return result, false
+	}
+	providerID, modelID, valid := strings.Cut(requested, "/")
+	if !valid || strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "" {
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			"model.name for opencode runtime must use provider/model form",
+			"Set model.name to a literal provider/model ID such as openai/gpt-5.4.",
+		)
+		return result, false
+	}
+	if agent.Spec.Model.ContextWindow == nil || *agent.Spec.Model.ContextWindow <= 0 {
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			"model.contextWindow is required for opencode runtime and must be positive",
+			"Set model.contextWindow to the reviewed context capacity for the selected model.",
+		)
+		return result, false
+	}
+	if agent.Spec.Model.MaxTokens == nil || *agent.Spec.Model.MaxTokens <= 0 {
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			"model.maxTokens is required for opencode runtime and must be positive",
+			"Set model.maxTokens to the reviewed output limit for the selected model.",
+		)
+		return result, false
+	}
+	if *agent.Spec.Model.ContextWindow <= *agent.Spec.Model.MaxTokens {
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			"model.contextWindow must exceed model.maxTokens for opencode runtime",
+			"Use the reviewed context and output capacities for the selected model.",
+		)
+		return result, false
+	}
+	agent.Spec.Model.Name = requested
+	agent.Spec.Model.Provider = ""
 	return "", true
 }
 

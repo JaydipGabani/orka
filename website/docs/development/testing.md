@@ -96,7 +96,7 @@ End-to-end tests run against a dedicated Kind cluster:
 | `test/e2e/tools_test.go` | Built-in tools (including `web_fetch`, `file_write`) and custom Tool CRD |
 | `test/e2e/scheduled_task_test.go` | Cron scheduling, suspend, `concurrencyPolicy: Forbid`, history-limit cleanup |
 | `test/e2e/task_lifecycle_test.go` | Timeout/retry/cancel plus session serialization and lock release |
-| `scripts/live-acp-runtime-e2e.sh` | Canonical deployed-cluster ACP smoke/release gate for Codex, Claude, and Copilot RuntimePools, exact Pod/runtime identity, workspace read/write, continuation/fork, cancellation/timeout, restart/replacement, publication/PR verification, drain/scale-to-zero, immutable images, and cleanup |
+| `scripts/live-acp-runtime-e2e.sh` | Canonical deployed-cluster ACP smoke/release gate for Codex, OpenCode, Claude, and Copilot RuntimePools, exact Pod/runtime identity, workspace read/write, continuation/fork, cancellation/timeout, restart/replacement, publication/PR verification, drain/scale-to-zero, immutable images, and cleanup |
 | `.github/workflows/live-acp-runtime-e2e.yml` / `scripts/live-acp-runtime-kind-e2e.sh` | Trusted-branch/nightly/manual live ACP smoke that bootstraps an ephemeral Kind cluster, Vekil, and the production ACP topology before invoking the canonical validator |
 | `.github/workflows/live-acp-release-gate.yml` / `scripts/live-acp-runtime-kind-e2e.sh` | Manual, protected-environment release acceptance with destructive publication, independent GitHub verification, PR reconciliation, and cleanup |
 
@@ -122,7 +122,7 @@ missing or mismatched artifacts staying not ready.
 - `.github/workflows/live-acp-runtime-e2e.yml` runs on relevant pushes to the
   default branch, nightly, and manual dispatch. It uses the
   `live-acp-runtime-smoke` environment and requires its
-  `COPILOT_GITHUB_TOKEN` secret so Vekil can exercise Codex, Claude, and Copilot
+  `COPILOT_GITHUB_TOKEN` secret so Vekil can exercise Codex, OpenCode, Claude, and Copilot
   without mounting provider credentials into RuntimePools. Restrict that
   environment to the default branch; do not require reviewers if scheduled runs
   must proceed unattended.
@@ -145,16 +145,19 @@ missing or mismatched artifacts staying not ready.
   `id-token: write`; GitHub OIDC validation remains isolated in
   `live-github-oidc-e2e.yml`.
 - The release gate additionally requires digest-pinned controller, Publisher,
-  Codex, Claude, and Copilot images; a Ready central provider proxy; the
+  Codex, OpenCode, Claude, and Copilot images; a Ready central provider proxy; the
   `config/acp-production` Vekil ingress boundary; durable controller/Publisher
   PVCs; a distinct publication fork; and authenticated `gh` access for
   independent remote and PR verification/cleanup.
 - Canonical ACP acceptance runs all Codex scenarios, including publication,
-  before deleting the Codex pool and starting Claude, then runs live Copilot
-  execution after Claude cleanup. It verifies exact Pod UID, image ID, runtime
-  instance/profile, RuntimeSession identity, cancellation and timeout
-  settlement, controller restart, pool replacement, drain and scale-to-zero,
-  continuation/fork behavior, and remote delivery receipts.
+  before deleting the Codex pool and starting OpenCode. It validates OpenCode
+  native ACP read, continuation, and read-intent tool policy, deletes the
+  OpenCode pool, starts Claude, and then runs live Copilot read/continuation
+  after Claude cleanup. Every provider phase verifies exact Pod UID, image ID,
+  runtime instance/profile, and RuntimeSession identity. Codex additionally
+  covers cancellation and timeout settlement, controller restart, pool
+  replacement, drain/scale-to-zero, and publication/remote delivery; release
+  mode also exercises Task forks.
 - `E2E_OPENAI_API_KEY` and `E2E_ANTHROPIC_API_KEY` remain inputs for older native
   `type: ai` test cases. They are not mounted into built-in ACP RuntimePools.
 - `COPILOT_GITHUB_TOKEN` also remains the credential for
@@ -181,6 +184,9 @@ rather than placed on a command line:
 ```bash
 read -rsp 'Copilot provider token: ' COPILOT_GITHUB_TOKEN && echo
 export COPILOT_GITHUB_TOKEN
+export ACP_E2E_OPENCODE_MODEL=openai/gpt-5.4
+export ACP_E2E_OPENCODE_CONTEXT_WINDOW=32768
+export ACP_E2E_OPENCODE_MAX_TOKENS=4096
 ACP_E2E_KIND_TAG=local bash scripts/live-acp-runtime-kind-e2e.sh
 ```
 

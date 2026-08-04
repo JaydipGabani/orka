@@ -38,6 +38,7 @@ var (
 	acpCodexRuntimeImage         = "ghcr.io/orka-agents/orka/acp-codex-runtime:e2e"
 	acpClaudeRuntimeImage        = "ghcr.io/orka-agents/orka/acp-claude-runtime:e2e"
 	acpCopilotRuntimeImage       = "ghcr.io/orka-agents/orka/acp-copilot-runtime:e2e"
+	acpOpencodeRuntimeImage      = "ghcr.io/orka-agents/orka/acp-opencode-runtime:e2e"
 	workspacePublisherImage      = "ghcr.io/orka-agents/orka/workspace-publisher:e2e"
 	gatewayReferenceAdapterImage = "ghcr.io/orka-agents/orka/gateway-reference-adapter:e2e"
 	gatewayE2EEnvVar             = "E2E_GATEWAY"
@@ -46,6 +47,7 @@ var (
 	acpCodexRuntimeRef           string
 	acpClaudeRuntimeRef          string
 	acpCopilotRuntimeRef         string
+	acpOpencodeRuntimeRef        string
 	workspacePublisherRef        string
 	e2eRegistryContainerName     string
 
@@ -81,6 +83,7 @@ var _ = BeforeSuite(func() {
 		fmt.Sprintf("ACP_CODEX_RUNTIME_IMG=%s", acpCodexRuntimeImage),
 		fmt.Sprintf("ACP_CLAUDE_RUNTIME_IMG=%s", acpClaudeRuntimeImage),
 		fmt.Sprintf("ACP_COPILOT_RUNTIME_IMG=%s", acpCopilotRuntimeImage),
+		fmt.Sprintf("ACP_OPENCODE_RUNTIME_IMG=%s", acpOpencodeRuntimeImage),
 		fmt.Sprintf("WORKSPACE_PUBLISHER_IMG=%s", workspacePublisherImage),
 	)
 	_, err := utils.Run(cmd)
@@ -121,6 +124,8 @@ var _ = BeforeSuite(func() {
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to publish Claude ACP runtime image")
 	acpCopilotRuntimeRef, err = pushImageToLocalRegistry(registry, acpCopilotRuntimeImage, "orka/acp-copilot-runtime:e2e")
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to publish Copilot ACP runtime image")
+	acpOpencodeRuntimeRef, err = pushImageToLocalRegistry(registry, acpOpencodeRuntimeImage, "orka/acp-opencode-runtime:e2e")
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to publish OpenCode ACP runtime image")
 	workspacePublisherRef, err = pushImageToLocalRegistry(registry, workspacePublisherImage, "orka/workspace-publisher:e2e")
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to publish workspace publisher image")
 
@@ -221,6 +226,7 @@ var _ = BeforeSuite(func() {
 		fmt.Sprintf("ACP_CODEX_RUNTIME_IMG=%s", acpCodexRuntimeRef),
 		fmt.Sprintf("ACP_CLAUDE_RUNTIME_IMG=%s", acpClaudeRuntimeRef),
 		fmt.Sprintf("ACP_COPILOT_RUNTIME_IMG=%s", acpCopilotRuntimeRef),
+		fmt.Sprintf("ACP_OPENCODE_RUNTIME_IMG=%s", acpOpencodeRuntimeRef),
 		fmt.Sprintf("WORKSPACE_PUBLISHER_IMG=%s", workspacePublisherRef),
 	)
 	_, err = utils.Run(cmd)

@@ -24,9 +24,11 @@ overlay="${test_root}/config/acp-production"
 codex_a="docker.io/example/acp-codex@sha256:$(printf 'a%.0s' {1..64})"
 claude_a="docker.io/example/acp-claude@sha256:$(printf 'b%.0s' {1..64})"
 copilot_a="docker.io/example/acp-copilot@sha256:$(printf 'c%.0s' {1..64})"
+opencode_a="docker.io/example/acp-opencode@sha256:$(printf '0%.0s' {1..64})"
 codex_b="registry--prod.example.com:5000/team/acp-codex@sha256:$(printf 'd%.0s' {1..64})"
 claude_b="registry--prod.example.com:5000/team/acp-claude@sha256:$(printf 'e%.0s' {1..64})"
 copilot_b="registry--prod.example.com:5000/team/acp-copilot@sha256:$(printf 'f%.0s' {1..64})"
+opencode_b="registry--prod.example.com:5000/team/acp-opencode@sha256:$(printf '9%.0s' {1..64})"
 ipv6_image="[2001:db8::1]:5000/team/acp-codex@sha256:$(printf 'a%.0s' {1..64})"
 multiline_image="docker.io/example/acp-codex
 #@sha256:$(printf 'b%.0s' {1..64})"
@@ -35,9 +37,10 @@ render_snapshot() {
   local codex_image="$1"
   local claude_image="$2"
   local copilot_image="$3"
-  local output="$4"
+  local opencode_image="$4"
+  local output="$5"
 
-  "${renderer}" "${overlay}" "${codex_image}" "${claude_image}" "${copilot_image}"
+  "${renderer}" "${overlay}" "${codex_image}" "${claude_image}" "${copilot_image}" "${opencode_image}"
   "${kustomize}" build "${overlay}" \
     | "${kubectl}" create --dry-run=client --validate=false -f - -o json \
     | jq -sc '
@@ -49,7 +52,7 @@ render_snapshot() {
           config: $config.data,
           references: [
             $deployment.spec.template.spec.containers[]?.env[]? |
-            select(.name == "ORKA_ACP_CODEX_RUNTIME_IMAGE" or .name == "ORKA_ACP_CLAUDE_RUNTIME_IMAGE" or .name == "ORKA_ACP_COPILOT_RUNTIME_IMAGE") |
+            select(.name == "ORKA_ACP_CODEX_RUNTIME_IMAGE" or .name == "ORKA_ACP_CLAUDE_RUNTIME_IMAGE" or .name == "ORKA_ACP_COPILOT_RUNTIME_IMAGE" or .name == "ORKA_ACP_OPENCODE_RUNTIME_IMAGE") |
             {name, configMapName: .valueFrom.configMapKeyRef.name, key: .valueFrom.configMapKeyRef.key}
           ] | sort_by(.name)
         }
@@ -61,38 +64,48 @@ assert_snapshot() {
   local codex_image="$2"
   local claude_image="$3"
   local copilot_image="$4"
+  local opencode_image="$5"
 
-  jq -e --arg codex "${codex_image}" --arg claude "${claude_image}" --arg copilot "${copilot_image}" '
+  jq -e --arg codex "${codex_image}" --arg claude "${claude_image}" --arg copilot "${copilot_image}" --arg opencode "${opencode_image}" '
     .configName as $configName |
     ($configName | test("^acp-runtime-images-[a-z0-9]+$")) and
     .config.ORKA_ACP_CODEX_RUNTIME_IMAGE == $codex and
     .config.ORKA_ACP_CLAUDE_RUNTIME_IMAGE == $claude and
     .config.ORKA_ACP_COPILOT_RUNTIME_IMAGE == $copilot and
-    (.references | length) == 3 and
+    .config.ORKA_ACP_OPENCODE_RUNTIME_IMAGE == $opencode and
+    (.references | length) == 4 and
     ([.references[].configMapName] | all(. == $configName)) and
-    ([.references[].key] | sort) == ["ORKA_ACP_CLAUDE_RUNTIME_IMAGE", "ORKA_ACP_CODEX_RUNTIME_IMAGE", "ORKA_ACP_COPILOT_RUNTIME_IMAGE"]
+    ([.references[].key] | sort) == ["ORKA_ACP_CLAUDE_RUNTIME_IMAGE", "ORKA_ACP_CODEX_RUNTIME_IMAGE", "ORKA_ACP_COPILOT_RUNTIME_IMAGE", "ORKA_ACP_OPENCODE_RUNTIME_IMAGE"]
   ' "${snapshot}" >/dev/null
 }
 
 first="${test_root}/first.json"
 repeat="${test_root}/repeat.json"
 copilot_changed="${test_root}/copilot-changed.json"
+opencode_changed="${test_root}/opencode-changed.json"
 changed="${test_root}/changed.json"
 
-render_snapshot "${codex_a}" "${claude_a}" "${copilot_a}" "${first}"
-assert_snapshot "${first}" "${codex_a}" "${claude_a}" "${copilot_a}"
-render_snapshot "${codex_a}" "${claude_a}" "${copilot_a}" "${repeat}"
+render_snapshot "${codex_a}" "${claude_a}" "${copilot_a}" "${opencode_a}" "${first}"
+assert_snapshot "${first}" "${codex_a}" "${claude_a}" "${copilot_a}" "${opencode_a}"
+render_snapshot "${codex_a}" "${claude_a}" "${copilot_a}" "${opencode_a}" "${repeat}"
 cmp -s "${first}" "${repeat}"
 
-render_snapshot "${codex_a}" "${claude_a}" "${copilot_b}" "${copilot_changed}"
-assert_snapshot "${copilot_changed}" "${codex_a}" "${claude_a}" "${copilot_b}"
+render_snapshot "${codex_a}" "${claude_a}" "${copilot_b}" "${opencode_a}" "${copilot_changed}"
+assert_snapshot "${copilot_changed}" "${codex_a}" "${claude_a}" "${copilot_b}" "${opencode_a}"
 if [[ "$(jq -r .configName "${first}")" == "$(jq -r .configName "${copilot_changed}")" ]]; then
   echo 'Copilot runtime image change did not create a new immutable ConfigMap generation' >&2
   exit 1
 fi
 
-render_snapshot "${codex_b}" "${claude_b}" "${copilot_b}" "${changed}"
-assert_snapshot "${changed}" "${codex_b}" "${claude_b}" "${copilot_b}"
+render_snapshot "${codex_a}" "${claude_a}" "${copilot_a}" "${opencode_b}" "${opencode_changed}"
+assert_snapshot "${opencode_changed}" "${codex_a}" "${claude_a}" "${copilot_a}" "${opencode_b}"
+if [[ "$(jq -r .configName "${first}")" == "$(jq -r .configName "${opencode_changed}")" ]]; then
+  echo 'OpenCode runtime image change did not create a new immutable ConfigMap generation' >&2
+  exit 1
+fi
+
+render_snapshot "${codex_b}" "${claude_b}" "${copilot_b}" "${opencode_b}" "${changed}"
+assert_snapshot "${changed}" "${codex_b}" "${claude_b}" "${copilot_b}" "${opencode_b}"
 if [[ "$(jq -r .configName "${first}")" == "$(jq -r .configName "${changed}")" ]]; then
   echo 'runtime image change did not create a new immutable ConfigMap generation' >&2
   exit 1
@@ -104,13 +117,15 @@ fi
 grep -F 'scripts/render-acp-runtime-images.sh' "${root}/Makefile" >/dev/null
 grep -F 'docker-build-acp-copilot-runtime' "${root}/Makefile" >/dev/null
 grep -F 'ACP_COPILOT_RUNTIME_IMG' "${root}/Makefile" >/dev/null
+grep -F 'docker-build-acp-opencode-runtime' "${root}/Makefile" >/dev/null
+grep -F 'ACP_OPENCODE_RUNTIME_IMG' "${root}/Makefile" >/dev/null
 if grep -F 'rollout restart deployment/orka-controller-manager' "${root}/Makefile" >/dev/null; then
   echo 'deploy still relies on an imperative, non-retryable controller restart' >&2
   exit 1
 fi
 
-"${renderer}" "${overlay}" "${ipv6_image}" "${claude_b}" "${copilot_b}"
-"${renderer}" "${overlay}" "${codex_b}" "${claude_b}" "${copilot_b}"
+"${renderer}" "${overlay}" "${ipv6_image}" "${claude_b}" "${copilot_b}" "${opencode_b}"
+"${renderer}" "${overlay}" "${codex_b}" "${claude_b}" "${copilot_b}" "${opencode_b}"
 
 for invalid_image in \
   'not-digest-pinned' \
@@ -118,14 +133,19 @@ for invalid_image in \
   "registry.example.com:notaport/team/acp@sha256:$(printf '2%.0s' {1..64})" \
   "[127.0.0.1]/team/acp@sha256:$(printf '3%.0s' {1..64})" \
   "${multiline_image}"; do
-  if "${renderer}" "${overlay}" "${invalid_image}" "${claude_b}" "${copilot_b}" >/dev/null 2>&1; then
+  if "${renderer}" "${overlay}" "${invalid_image}" "${claude_b}" "${copilot_b}" "${opencode_b}" >/dev/null 2>&1; then
     echo "renderer accepted invalid runtime image: ${invalid_image}" >&2
     exit 1
   fi
 done
 
-if "${renderer}" "${overlay}" "${codex_b}" "${claude_b}" "not-digest-pinned" >/dev/null 2>&1; then
+if "${renderer}" "${overlay}" "${codex_b}" "${claude_b}" "not-digest-pinned" "${opencode_b}" >/dev/null 2>&1; then
   echo 'renderer accepted an invalid Copilot runtime image' >&2
+  exit 1
+fi
+
+if "${renderer}" "${overlay}" "${codex_b}" "${claude_b}" "${copilot_b}" "not-digest-pinned" >/dev/null 2>&1; then
+  echo 'renderer accepted an invalid OpenCode runtime image' >&2
   exit 1
 fi
 

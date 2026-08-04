@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   modelConfigSchema,
   toolRefSchema,
+  builtInAgentRuntimeTypeSchema,
   builtInAgentRuntimeSchema,
   externalAgentRuntimeSchema,
   agentRuntimeSchema,
@@ -13,13 +14,14 @@ import type { Agent, AgentSpec, AgentStatus } from './agent'
 
 describe('modelConfigSchema', () => {
   it('parses valid data with all fields', () => {
-    const data = { provider: 'openai', name: 'gpt-4', temperature: 0.7, maxTokens: 1000 }
+    const data = { provider: 'openai', name: 'gpt-4', temperature: 0.7, contextWindow: 32768, maxTokens: 1000 }
     expect(modelConfigSchema.parse(data)).toEqual(data)
   })
 
   it('parses empty object and rejects invalid numeric fields', () => {
     expect(modelConfigSchema.parse({})).toEqual({})
     expect(() => modelConfigSchema.parse({ temperature: 'warm' })).toThrow()
+    expect(() => modelConfigSchema.parse({ contextWindow: '32768' })).toThrow()
     expect(() => modelConfigSchema.parse({ maxTokens: '1000' })).toThrow()
   })
 })
@@ -33,7 +35,8 @@ describe('toolRefSchema', () => {
 
 describe('agentRuntimeSchema', () => {
   it('accepts reviewed built-in ACP profiles', () => {
-    for (const type of ['claude', 'codex', 'copilot']) {
+    for (const type of ['claude', 'codex', 'copilot', 'opencode']) {
+      expect(builtInAgentRuntimeTypeSchema.parse(type)).toBe(type)
       expect(builtInAgentRuntimeSchema.parse({ type })).toEqual({ type })
     }
   })
@@ -45,19 +48,24 @@ describe('agentRuntimeSchema', () => {
   })
 
   it('accepts supported runtime defaults', () => {
-    const runtime = { type: 'claude', defaultReasoningEffort: 'max', defaultAllowBash: false }
+    const runtime = {
+      type: 'opencode',
+      defaultMaxTurns: 50,
+      defaultAllowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
+      defaultAllowBash: true,
+      defaultReasoningEffort: 'max',
+    }
     expect(builtInAgentRuntimeSchema.parse(runtime)).toEqual(runtime)
     expect(agentRuntimeSchema.parse(runtime)).toEqual(runtime)
   })
 
   it('rejects removed, ambiguous, or malformed runtime selectors', () => {
-    expect(() => agentRuntimeSchema.parse({ type: 'opencode' })).toThrow()
+    expect(() => agentRuntimeSchema.parse({ type: 'unknown' })).toThrow()
     expect(() => agentRuntimeSchema.parse({})).toThrow()
     expect(() => agentRuntimeSchema.parse({ type: 'codex', runtimeRef: { name: 'external' } })).toThrow()
     expect(() => agentRuntimeSchema.parse({ type: 'codex', defaultMaxTurns: 'many' })).toThrow()
     expect(() => agentRuntimeSchema.parse({ type: 'claude', defaultAllowBash: 'yes' })).toThrow()
     expect(() => agentRuntimeSchema.parse({ type: 'claude', defaultReasoningEffort: 'maximum' })).toThrow()
-
   })
 })
 
@@ -85,6 +93,13 @@ describe('agentSpecSchema', () => {
 
   it('parses built-in and external runtime agents', () => {
     expect(agentSpecSchema.parse({ runtime: { type: 'codex' } })).toEqual({ runtime: { type: 'codex' } })
+    expect(agentSpecSchema.parse({
+      model: { name: 'openai/gpt-5.4', contextWindow: 32768, maxTokens: 4096 },
+      runtime: { type: 'opencode' },
+    })).toEqual({
+      model: { name: 'openai/gpt-5.4', contextWindow: 32768, maxTokens: 4096 },
+      runtime: { type: 'opencode' },
+    })
     expect(agentSpecSchema.parse({ runtime: { runtimeRef: { name: 'external' } } })).toEqual({ runtime: { runtimeRef: { name: 'external' } } })
   })
 
@@ -92,6 +107,11 @@ describe('agentSpecSchema', () => {
     expect(agentSpecSchema.parse({})).toEqual({})
     expect(() => agentSpecSchema.parse({ coordination: {} })).toThrow()
     expect(() => agentSpecSchema.parse({ systemPrompt: { configMapRef: { name: 'x' } } })).toThrow()
+    expect(() => agentSpecSchema.parse({ runtime: { type: 'opencode' } })).toThrow()
+    expect(() => agentSpecSchema.parse({ model: { name: '   ', contextWindow: 32768, maxTokens: 4096 }, runtime: { type: 'opencode' } })).toThrow()
+    expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', maxTokens: 4096 }, runtime: { type: 'opencode' } })).toThrow()
+    expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', contextWindow: 32768 }, runtime: { type: 'opencode' } })).toThrow()
+    expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', contextWindow: 4096, maxTokens: 4096 }, runtime: { type: 'opencode' } })).toThrow()
   })
 })
 

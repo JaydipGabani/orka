@@ -65,7 +65,8 @@ placeholder_digest="sha256:$(printf '0%.0s' {1..64})"
   WORKSPACE_PUBLISHER_IMG="${publisher_ref}" \
   ACP_CODEX_RUNTIME_IMG="example.invalid/orka/acp-codex@${placeholder_digest}" \
   ACP_CLAUDE_RUNTIME_IMG="example.invalid/orka/acp-claude@${placeholder_digest}" \
-  ACP_COPILOT_RUNTIME_IMG="example.invalid/orka/acp-copilot@${placeholder_digest}")
+  ACP_COPILOT_RUNTIME_IMG="example.invalid/orka/acp-copilot@${placeholder_digest}" \
+  ACP_OPENCODE_RUNTIME_IMG="example.invalid/orka/acp-opencode@${placeholder_digest}")
 
 log "Waiting for orka-controller-manager rollout"
 kubectl -n "${namespace}" rollout status deployment/orka-controller-manager --timeout=300s

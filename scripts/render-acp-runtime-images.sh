@@ -2,10 +2,10 @@
 set -Eeuo pipefail
 
 usage() {
-  echo "Usage: $0 OUTPUT_DIR CODEX_IMAGE CLAUDE_IMAGE COPILOT_IMAGE" >&2
+  echo "Usage: $0 OUTPUT_DIR CODEX_IMAGE CLAUDE_IMAGE COPILOT_IMAGE OPENCODE_IMAGE" >&2
 }
 
-[[ $# -eq 4 ]] || {
+[[ $# -eq 5 ]] || {
   usage
   exit 2
 }
@@ -14,6 +14,7 @@ output_dir="$1"
 codex_image="$2"
 claude_image="$3"
 copilot_image="$4"
+opencode_image="$5"
 
 [[ -d "${output_dir}" && ! -L "${output_dir}" ]] || {
   echo "ACP production output directory must be a real directory: ${output_dir}" >&2
@@ -25,7 +26,7 @@ command -v go >/dev/null 2>&1 || {
   echo "Go is required to validate ACP runtime image references" >&2
   exit 1
 }
-if ! (cd "${root}" && go run ./cmd/orka-image-ref-validator "${codex_image}" "${claude_image}" "${copilot_image}"); then
+if ! (cd "${root}" && go run ./cmd/orka-image-ref-validator "${codex_image}" "${claude_image}" "${copilot_image}" "${opencode_image}"); then
   echo "ACP runtime image reference validation failed" >&2
   exit 1
 fi
@@ -42,6 +43,7 @@ cat >"${env_tmp}" <<EOF_ENV
 ORKA_ACP_CODEX_RUNTIME_IMAGE=${codex_image}
 ORKA_ACP_CLAUDE_RUNTIME_IMAGE=${claude_image}
 ORKA_ACP_COPILOT_RUNTIME_IMAGE=${copilot_image}
+ORKA_ACP_OPENCODE_RUNTIME_IMAGE=${opencode_image}
 EOF_ENV
 
 mv -f -- "${env_tmp}" "${output_dir}/runtime-images.env"

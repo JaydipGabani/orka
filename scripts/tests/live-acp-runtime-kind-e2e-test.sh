@@ -5,6 +5,9 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 wrapper="${root}/scripts/live-acp-runtime-kind-e2e.sh"
 bootstrap="${root}/scripts/lib/live-acp-runtime-kind-bootstrap.sh"
 
+export ACP_E2E_OPENCODE_CONTEXT_WINDOW=32768
+export ACP_E2E_OPENCODE_MAX_TOKENS=4096
+
 help="$(${wrapper} --help)"
 grep -F 'intentionally noninteractive' <<<"${help}" >/dev/null
 grep -F 'COPILOT_GITHUB_TOKEN is required' <<<"${help}" >/dev/null
@@ -12,6 +15,15 @@ grep -F 'COPILOT_GITHUB_TOKEN is required' <<<"${help}" >/dev/null
 grep -F -- '--create-copilot-token-secret live-acp-runtime-copilot:token' "${bootstrap}" >/dev/null
 grep -F '/api/v1/namespaces/vekil-system/services/http:vekil:1337/proxy/v1/models' "${bootstrap}" >/dev/null
 grep -F 'ACP_E2E_COPILOT_MODEL:-gpt-5.3-codex' "${bootstrap}" >/dev/null
+grep -F 'LIVE_ACP_OPENCODE_IMAGE="orka-acp-opencode:live-acp-${image_tag}"' "${wrapper}" >/dev/null
+grep -F 'ACP_OPENCODE_RUNTIME_IMG="${LIVE_ACP_OPENCODE_IMAGE}"' "${bootstrap}" >/dev/null
+grep -F 'docker-build-acp-opencode-runtime' "${bootstrap}" >/dev/null
+grep -F 'orka/acp-opencode-runtime' "${bootstrap}" >/dev/null
+grep -F 'ACP_OPENCODE_RUNTIME_IMG="${LIVE_ACP_OPENCODE_REF}"' "${bootstrap}" >/dev/null
+grep -F 'opencode_model="${ACP_E2E_OPENCODE_MODEL:-${ACP_E2E_CODEX_MODEL:-gpt-5.4}}"' "${bootstrap}" >/dev/null
+grep -F 'opencode_model="${opencode_model#*/}"' "${bootstrap}" >/dev/null
+grep -F 'ACP_E2E_OPENCODE_CONTEXT_WINDOW must be a positive integer' "${bootstrap}" >/dev/null
+grep -F 'ACP_E2E_OPENCODE_MAX_TOKENS must be a positive integer' "${bootstrap}" >/dev/null
 # shellcheck disable=SC2016 # Match the literal catalog-validation expression.
 grep -F 'live_acp_kind_validate_vekil_catalog "${models_file}"' "${bootstrap}" >/dev/null
 grep -F 'live_acp_kind_probe_configured_models' "${bootstrap}" >/dev/null
@@ -58,6 +70,7 @@ cat >"${catalog_file}" <<'JSON'
 {
   "data": [
     {"id":"gpt-codex-test","supported_endpoints":["/responses"]},
+    {"id":"gpt-opencode-test","supported_endpoints":["/responses"]},
     {"id":"claude-test","supported_endpoints":["/v1/messages"]}
   ],
   "models": [
@@ -66,6 +79,7 @@ cat >"${catalog_file}" <<'JSON'
 }
 JSON
 export ACP_E2E_CODEX_MODEL='gpt-codex-test'
+export ACP_E2E_OPENCODE_MODEL='openai/gpt-opencode-test'
 export ACP_E2E_CLAUDE_MODEL='claude-test'
 export ACP_E2E_COPILOT_MODEL='gpt-copilot-test'
 live_acp_kind_validate_vekil_catalog "${catalog_file}"
@@ -77,6 +91,15 @@ if catalog_error="$(live_acp_kind_validate_vekil_catalog "${catalog_root}/wrong-
   exit 1
 fi
 grep -F 'does not advertise required endpoint /responses' <<<"${catalog_error}" >/dev/null
+
+jq '(.data[] | select(.id == "gpt-opencode-test") | .supported_endpoints) = ["/v1/messages"]' \
+  "${catalog_file}" >"${catalog_root}/wrong-opencode-endpoint.json"
+if catalog_error="$(live_acp_kind_validate_vekil_catalog "${catalog_root}/wrong-opencode-endpoint.json" 2>&1)"; then
+  echo 'catalog validation accepted an OpenCode model without Chat or Responses compatibility' >&2
+  exit 1
+fi
+grep -F 'does not advertise required endpoint /chat/completions or compatible /responses' \
+  <<<"${catalog_error}" >/dev/null
 
 LIVE_ACP_CONTEXT='kind-live-acp-test'
 LIVE_ACP_SECRET_DIR="${catalog_root}"
@@ -133,6 +156,8 @@ if [[ -n "${output_file}" && "${output_file}" != "/dev/null" ]]; then
     printf '%s\n' 'event: response.completed' 'data: {"type":"response.completed"}' >"${output_file}"
   elif [[ "$*" == *'/v1/messages'* ]]; then
     printf '%s\n' 'event: message_stop' 'data: {"type":"message_stop"}' >"${output_file}"
+  elif [[ "$*" == *'/v1/chat/completions'* ]]; then
+    printf '%s\n' 'data: {"choices":[{"delta":{"content":"OK"}}]}' 'data: [DONE]' >"${output_file}"
   fi
 fi
 printf '200'
@@ -158,7 +183,9 @@ fi
 [[ -z "${LIVE_ACP_VEKIL_BASE_URL:-}" ]]
 grep -F '/v1/responses' "${wire_log}" >/dev/null
 grep -F '/v1/messages' "${wire_log}" >/dev/null
+grep -F '/v1/chat/completions' "${wire_log}" >/dev/null
 grep -F '"model":"gpt-codex-test"' "${wire_log}" >/dev/null
+grep -F '"model":"gpt-opencode-test"' "${wire_log}" >/dev/null
 grep -F '"model":"claude-test"' "${wire_log}" >/dev/null
 grep -F '"model":"gpt-copilot-test"' "${wire_log}" >/dev/null
 grep -F '"stream":true' "${wire_log}" >/dev/null

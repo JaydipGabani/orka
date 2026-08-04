@@ -9,8 +9,11 @@ import { useCreateAgent } from '@/hooks/use-agents'
 import { useSecretNames } from '@/hooks/use-secrets'
 import { useUIStore } from '@/stores/ui'
 import { toast } from 'sonner'
-
-type BuiltInRuntime = 'claude' | 'codex' | 'copilot'
+import {
+  OPENCODE_REVIEWED_RUNTIME_DEFAULTS,
+  isOpenCodeModelID,
+  type BuiltInAgentRuntimeType,
+} from '@/lib/agent-runtime'
 
 export function AgentCreateForm() {
   const navigate = useNavigate()
@@ -25,21 +28,48 @@ export function AgentCreateForm() {
   const [provider, setProvider] = useState('')
   const [model, setModel] = useState('')
   const [temperature, setTemperature] = useState('0.7')
+  const [contextWindow, setContextWindow] = useState('')
   const [maxTokens, setMaxTokens] = useState('')
   const [secretRef, setSecretRef] = useState('')
   const [systemPrompt, setSystemPrompt] = useState('')
 
   // ACP runtime mode selects either an Orka-managed profile or a registered v2 runtime.
   const [runtimeSource, setRuntimeSource] = useState<'built-in' | 'external'>('built-in')
-  const [runtimeType, setRuntimeType] = useState<BuiltInRuntime>('claude')
+  const [runtimeType, setRuntimeType] = useState<BuiltInAgentRuntimeType>('claude')
   const [runtimeRef, setRuntimeRef] = useState('')
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
 
-    if (mode === 'runtime' && runtimeSource === 'built-in' && !model.trim()) {
+    const trimmedModel = model.trim()
+    if (
+      mode === 'runtime'
+      && runtimeSource === 'built-in'
+      && runtimeType === 'opencode'
+      && !isOpenCodeModelID(trimmedModel)
+    ) {
+      toast.error('OpenCode requires a literal provider/model ID')
+      return
+    }
+    if (mode === 'runtime' && runtimeSource === 'built-in' && !trimmedModel) {
       toast.error('Model is required for built-in ACP runtimes')
       return
+    }
+    const parsedContextWindow = Number(contextWindow)
+    const parsedMaxTokens = Number(maxTokens)
+    if (mode === 'runtime' && runtimeSource === 'built-in' && runtimeType === 'opencode') {
+      if (!Number.isInteger(parsedContextWindow) || parsedContextWindow <= 0) {
+        toast.error('OpenCode requires a positive context window')
+        return
+      }
+      if (!Number.isInteger(parsedMaxTokens) || parsedMaxTokens <= 0) {
+        toast.error('OpenCode requires a positive max output token limit')
+        return
+      }
+      if (parsedContextWindow <= parsedMaxTokens) {
+        toast.error('OpenCode context window must exceed max output tokens')
+        return
+      }
     }
     if (mode === 'runtime' && runtimeSource === 'external' && !runtimeRef.trim()) {
       toast.error('AgentRuntime name is required')
@@ -63,10 +93,18 @@ export function AgentCreateForm() {
       }
     } else {
       spec.runtime = runtimeSource === 'built-in'
-        ? { type: runtimeType }
+        ? runtimeType === 'opencode'
+          ? {
+              type: runtimeType,
+              defaultAllowedTools: [...OPENCODE_REVIEWED_RUNTIME_DEFAULTS.defaultAllowedTools],
+              defaultAllowBash: OPENCODE_REVIEWED_RUNTIME_DEFAULTS.defaultAllowBash,
+            }
+          : { type: runtimeType }
         : { runtimeRef: { name: runtimeRef.trim() } }
-      if (model.trim()) {
-        spec.model = { name: model.trim() }
+      if (trimmedModel) {
+        spec.model = runtimeSource === 'built-in' && runtimeType === 'opencode'
+          ? { name: trimmedModel, contextWindow: parsedContextWindow, maxTokens: parsedMaxTokens }
+          : { name: trimmedModel }
       }
     }
 
@@ -178,14 +216,20 @@ export function AgentCreateForm() {
                 {runtimeSource === 'built-in' ? (
                   <div className="space-y-2">
                     <label className="text-sm font-medium">Runtime profile</label>
-                    <Select value={runtimeType} onValueChange={(value) => setRuntimeType(value as BuiltInRuntime)}>
+                    <Select value={runtimeType} onValueChange={(value) => setRuntimeType(value as BuiltInAgentRuntimeType)}>
                       <SelectTrigger><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="claude">Claude ACP</SelectItem>
                         <SelectItem value="codex">OpenAI Codex ACP</SelectItem>
                         <SelectItem value="copilot">GitHub Copilot ACP</SelectItem>
+                        <SelectItem value="opencode">OpenCode ACP</SelectItem>
                       </SelectContent>
                     </Select>
+                    {runtimeType === 'opencode' && (
+                      <p className="text-xs text-muted-foreground">
+                        Reviewed native-tool defaults: Read, Write, Edit, Bash, Glob, and Grep; bash enabled.
+                      </p>
+                    )}
                   </div>
                 ) : (
                   <div className="space-y-2">
@@ -209,10 +253,50 @@ export function AgentCreateForm() {
                     id="runtime-model"
                     value={model}
                     onChange={(e) => setModel(e.target.value)}
-                    placeholder={runtimeSource === 'built-in' ? 'Enter model identifier' : 'Optional model override'}
+                    placeholder={
+                      runtimeSource === 'built-in' && runtimeType === 'opencode'
+                        ? 'openai/gpt-5.4'
+                        : runtimeSource === 'built-in'
+                          ? 'Enter model identifier'
+                          : 'Optional model override'
+                    }
                     required={runtimeSource === 'built-in'}
                   />
+                  {runtimeSource === 'built-in' && runtimeType === 'opencode' && (
+                    <p className="text-xs text-muted-foreground">OpenCode model IDs use provider/model form.</p>
+                  )}
                 </div>
+                {runtimeSource === 'built-in' && runtimeType === 'opencode' && (
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div className="space-y-2">
+                      <label htmlFor="runtime-context-window" className="text-sm font-medium">Context Window</label>
+                      <Input
+                        id="runtime-context-window"
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={contextWindow}
+                        onChange={(e) => setContextWindow(e.target.value)}
+                        placeholder="32768"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label htmlFor="runtime-max-tokens" className="text-sm font-medium">Max Output Tokens</label>
+                      <Input
+                        id="runtime-max-tokens"
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={maxTokens}
+                        onChange={(e) => setMaxTokens(e.target.value)}
+                        placeholder="4096"
+                      />
+                    </div>
+                    <p className="text-xs text-muted-foreground md:col-span-2">
+                      Use reviewed ceilings for the selected model. Orka pins them into the immutable runtime profile.
+                    </p>
+                  </div>
+                )}
               </div>
             )}
 

@@ -7,6 +7,8 @@ MIT License - see LICENSE file for details.
 package v1alpha1
 
 import (
+	"encoding/json"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -106,6 +108,33 @@ type AgentCLIRuntime struct {
 	DefaultReasoningEffort string `json:"defaultReasoningEffort,omitempty"`
 }
 
+// MarshalJSON preserves the distinction between an omitted tool allowlist and
+// an explicitly empty deny-all allowlist. The standard omitempty handling for
+// slices would otherwise serialize both states as omission.
+func (in AgentCLIRuntime) MarshalJSON() ([]byte, error) {
+	type agentCLIRuntimeJSON struct {
+		Type                   AgentRuntimeType       `json:"type,omitempty"`
+		RuntimeRef             *AgentRuntimeReference `json:"runtimeRef,omitempty"`
+		DefaultMaxTurns        *int32                 `json:"defaultMaxTurns,omitempty"`
+		DefaultAllowedTools    *[]string              `json:"defaultAllowedTools,omitempty"`
+		DefaultAllowBash       *bool                  `json:"defaultAllowBash,omitempty"`
+		DefaultReasoningEffort string                 `json:"defaultReasoningEffort,omitempty"`
+	}
+	var defaultAllowedTools *[]string
+	if in.DefaultAllowedTools != nil {
+		tools := append([]string{}, in.DefaultAllowedTools...)
+		defaultAllowedTools = &tools
+	}
+	return json.Marshal(agentCLIRuntimeJSON{
+		Type:                   in.Type,
+		RuntimeRef:             in.RuntimeRef,
+		DefaultMaxTurns:        in.DefaultMaxTurns,
+		DefaultAllowedTools:    defaultAllowedTools,
+		DefaultAllowBash:       in.DefaultAllowBash,
+		DefaultReasoningEffort: in.DefaultReasoningEffort,
+	})
+}
+
 // ModelFallback defines a fallback provider configuration
 type ModelFallback struct {
 	// ProviderRef is the name of a Provider CRD to fall back to
@@ -136,7 +165,14 @@ type ModelConfig struct {
 	// +optional
 	Temperature *float64 `json:"temperature,omitempty"`
 
-	// MaxTokens limits the response length
+	// ContextWindow is the reviewed model context capacity in tokens. Built-in
+	// runtimes that manage their own compaction require this value explicitly.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	ContextWindow *int32 `json:"contextWindow,omitempty"`
+
+	// MaxTokens limits the response length.
+	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxTokens *int32 `json:"maxTokens,omitempty"`
 

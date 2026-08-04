@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,8 @@ const (
 	providerForwardedForHeader            = "X-Forwarded-For"
 	providerContentEncodingHeader         = "Content-Encoding"
 	providerOpenAIResponsesV1Path         = "/v1/responses"
+	providerOpenAIChatCompletionsPath     = "/chat/completions"
+	providerOpenAIChatCompletionsV1Path   = "/v1/chat/completions"
 	providerModelsV1Path                  = "/v1/models"
 	defaultProviderProxyMaxRequestBytes   = 32 << 20
 	defaultProviderProxyMaxResponseBytes  = 64 << 20
@@ -50,6 +53,7 @@ type ProviderProxyConfig struct {
 	MaxRequestBytes       int64
 	MaxResponseBytes      int64
 	ResponseHeaderTimeout time.Duration
+	ModelOutputLimit      int64
 }
 
 type ProviderProxyBinding struct {
@@ -76,6 +80,7 @@ type providerProxy struct {
 	model            string
 	maxRequestBytes  int64
 	maxResponseBytes int64
+	modelOutputLimit int64
 	client           *http.Client
 	listener         net.Listener
 	server           *http.Server
@@ -163,6 +168,12 @@ func (c ProviderProxyConfig) normalized() (ProviderProxyConfig, *url.URL, error)
 	if c.ResponseHeaderTimeout <= 0 {
 		c.ResponseHeaderTimeout = defaultProviderProxyHeaderTimeout
 	}
+	if c.ModelOutputLimit < 0 {
+		return ProviderProxyConfig{}, nil, fmt.Errorf("provider proxy model output limit must be positive")
+	}
+	if c.ProviderKind == providerKindOpencode && c.ModelOutputLimit == 0 {
+		return ProviderProxyConfig{}, nil, fmt.Errorf("OpenCode provider proxy model output limit is required")
+	}
 	return c, parsed, nil
 }
 
@@ -207,6 +218,7 @@ func newProviderProxy(cfg ProviderProxyConfig) (*providerProxy, error) {
 		model:            normalized.Model,
 		maxRequestBytes:  normalized.MaxRequestBytes,
 		maxResponseBytes: normalized.MaxResponseBytes,
+		modelOutputLimit: normalized.ModelOutputLimit,
 		client: &http.Client{
 			Transport:     transport,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -595,6 +607,11 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProviderProxyError(w, http.StatusForbidden, "provider request is outside the immutable profile")
 		return
 	}
+	body, err = normalizeProviderRequestBody(p.providerKind, p.model, suffix, p.modelOutputLimit, body)
+	if err != nil {
+		writeProviderProxyError(w, http.StatusForbidden, "provider request is outside the immutable profile")
+		return
+	}
 	select {
 	case <-authorization.gateContext.Done():
 		writeProviderProxyError(w, http.StatusForbidden, "provider request is no longer active")
@@ -653,6 +670,81 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func normalizeProviderRequestBody(providerKind, model, requestPath string, modelOutputLimit int64, body []byte) ([]byte, error) {
+	if providerKind != providerKindOpencode ||
+		(requestPath != providerOpenAIChatCompletionsPath && requestPath != providerOpenAIChatCompletionsV1Path) {
+		return body, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var payload map[string]any
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode OpenCode provider request: %w", err)
+	}
+	if err := ensureProviderJSONEOF(decoder); err != nil {
+		return nil, err
+	}
+	if modelOutputLimit <= 0 {
+		return nil, fmt.Errorf("OpenCode model output limit is required")
+	}
+	maxTokens, hasMaxTokens, err := positiveProviderOutputLimit(payload, "max_tokens")
+	if err != nil {
+		return nil, err
+	}
+	maxCompletionTokens, hasMaxCompletionTokens, err := positiveProviderOutputLimit(payload, "max_completion_tokens")
+	if err != nil {
+		return nil, err
+	}
+	outputLimit := modelOutputLimit
+	outputField := "max_tokens"
+	if hasMaxTokens && maxTokens < outputLimit {
+		outputLimit = maxTokens
+	}
+	if hasMaxCompletionTokens {
+		outputField = "max_completion_tokens"
+		if maxCompletionTokens < outputLimit {
+			outputLimit = maxCompletionTokens
+		}
+	}
+	delete(payload, "max_tokens")
+	delete(payload, "max_completion_tokens")
+	payload[outputField] = outputLimit
+	_, upstreamModel, ok := strings.Cut(model, "/")
+	if !ok || strings.TrimSpace(upstreamModel) == "" {
+		return nil, fmt.Errorf("OpenCode model must use provider/model form")
+	}
+	payload["model"] = strings.TrimSpace(upstreamModel)
+	return json.Marshal(payload)
+}
+
+func positiveProviderOutputLimit(payload map[string]any, name string) (int64, bool, error) {
+	value, ok := payload[name]
+	if !ok {
+		return 0, false, nil
+	}
+	number, ok := value.(json.Number)
+	if !ok {
+		return 0, false, fmt.Errorf("OpenCode %s must be a positive integer", name)
+	}
+	parsed, err := strconv.ParseInt(string(number), 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0, false, fmt.Errorf("OpenCode %s must be a positive integer", name)
+	}
+	return parsed, true, nil
+}
+
+func ensureProviderJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	err := decoder.Decode(&extra)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	if err == nil {
+		return fmt.Errorf("provider request contains trailing JSON data")
+	}
+	return fmt.Errorf("decode provider request trailer: %w", err)
+}
+
 func validateProviderRequest(providerKind, model, requestPath, method string, body []byte) (providerRequestClass, error) {
 	allowed := false
 	requiresModel := false
@@ -660,10 +752,15 @@ func validateProviderRequest(providerKind, model, requestPath, method string, bo
 	switch providerKind {
 	case providerKindCodex, providerKindCopilot:
 		switch requestPath {
-		case "/responses", providerOpenAIResponsesV1Path, "/responses/compact", "/v1/responses/compact", "/chat/completions", "/v1/chat/completions":
+		case "/responses", providerOpenAIResponsesV1Path, "/responses/compact", "/v1/responses/compact", providerOpenAIChatCompletionsPath, providerOpenAIChatCompletionsV1Path:
 			allowed, requiresModel, class = method == http.MethodPost, true, providerRequestInference
 		case "/models", providerModelsV1Path:
 			allowed = method == http.MethodGet
+		}
+	case providerKindOpencode:
+		switch requestPath {
+		case providerOpenAIChatCompletionsPath, providerOpenAIChatCompletionsV1Path:
+			allowed, requiresModel, class = method == http.MethodPost, true, providerRequestInference
 		}
 	case "claude":
 		switch requestPath {

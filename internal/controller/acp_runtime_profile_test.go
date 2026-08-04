@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -62,6 +63,25 @@ func TestEffectiveACPAllowedToolsPreservesDelegatedChildMessagingInjection(t *te
 				t.Fatalf("effectiveACPAllowedTools() = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestEffectiveACPAllowedToolsPreservesOpenCodeExplicitEmptyChildPolicy(t *testing.T) {
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeOpencode,
+	}}}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labels.LabelParentTask: "parent"}},
+		Spec:       corev1alpha1.TaskSpec{AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{}}},
+	}
+	if got, want := effectiveACPAllowedTools(task, agent), []string{"check_messages", "send_message"}; !slices.Equal(got, want) {
+		t.Fatalf("delegated OpenCode child tools = %#v, want %#v", got, want)
+	}
+
+	task.Annotations = map[string]string{labels.AnnotationDisableCoordinationToolInject: scheduledRunLabelValue}
+	got := effectiveACPAllowedTools(task, agent)
+	if got == nil || len(got) != 0 {
+		t.Fatalf("disabled delegated OpenCode child tools = %#v, want explicit empty", got)
 	}
 }
 
@@ -270,8 +290,142 @@ func TestPlanACPRuntimeSelectsCopilotProfileAndPinnedImage(t *testing.T) {
 		t.Fatalf("unexpected Copilot adapter digests: %#v", plan.Profile.AdapterDigests)
 	}
 
-	if _, err := PlanACPRuntime(task, agent, ACPRuntimeImages{}); err == nil || !strings.Contains(err.Error(), "must be digest-pinned") {
+	if _, err := PlanACPRuntime(task, agent, ACPRuntimeImages{}); err == nil || !strings.Contains(err.Error(), "digest-pinned image") {
 		t.Fatalf("missing Copilot image error = %v, want digest-pinning rejection", err)
+	}
+}
+
+func TestPlanACPRuntimePreservesExplicitEmptyAllowedTools(t *testing.T) {
+	image := "docker.io/example/claude@sha256:" + strings.Repeat("a", 64)
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID("agent-uid"), Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   &corev1alpha1.ModelConfig{Name: "claude-test"},
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeClaude},
+		},
+	}
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent}}
+	omitted, err := PlanACPRuntime(task, agent, ACPRuntimeImages{Claude: image})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := effectiveACPAllowedTools(task, agent); got != nil {
+		t.Fatalf("omitted allowed tools = %#v, want nil", got)
+	}
+
+	task.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{}, AllowBash: new(false)}
+	explicitEmpty, err := PlanACPRuntime(task, agent, ACPRuntimeImages{Claude: image})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := effectiveACPAllowedTools(task, agent); got == nil || len(got) != 0 {
+		t.Fatalf("explicit empty allowed tools = %#v, want non-nil empty", got)
+	}
+	if omitted.Profile.ToolPolicyDigest == explicitEmpty.Profile.ToolPolicyDigest || omitted.Digest == explicitEmpty.Digest {
+		t.Fatal("explicit deny-all tools collapsed into omitted/unrestricted ACP policy")
+	}
+}
+
+func TestPlanACPRuntimeOpenCodeUsesNativeACPImage(t *testing.T) {
+	imageDigest := "sha256:" + strings.Repeat("d", 64)
+	image := "docker.io/example/opencode@" + imageDigest
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID("opencode-agent-uid"), Generation: 2},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent}}
+
+	plan, err := PlanACPRuntime(task, agent, ACPRuntimeImages{Opencode: image})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Image != image {
+		t.Fatalf("image = %q, want %q", plan.Image, image)
+	}
+	if plan.Profile.ProviderKind != string(corev1alpha1.AgentRuntimeOpencode) || plan.Profile.Model != "openai/gpt-test" {
+		t.Fatalf("unexpected OpenCode profile: %#v", plan.Profile)
+	}
+	if plan.Profile.ModelLimits == nil || plan.Profile.ModelLimits.Context != int64(testOpenCodeContextWindow) ||
+		plan.Profile.ModelLimits.Output != int64(testOpenCodeMaxTokens) {
+		t.Fatalf("OpenCode model limits = %#v", plan.Profile.ModelLimits)
+	}
+	profileSpec := RuntimePoolProfileFromPlan(plan)
+	if profileSpec.ModelLimits == nil || profileSpec.ModelLimits.Context != int64(testOpenCodeContextWindow) ||
+		profileSpec.ModelLimits.Output != int64(testOpenCodeMaxTokens) {
+		t.Fatalf("RuntimePool model limits = %#v", profileSpec.ModelLimits)
+	}
+	dispatchProfile := runtimeProfileFromPool(profileSpec)
+	if dispatchProfile.ModelLimits == nil || dispatchProfile.ModelLimits.Context != int64(testOpenCodeContextWindow) ||
+		dispatchProfile.ModelLimits.Output != int64(testOpenCodeMaxTokens) {
+		t.Fatalf("dispatcher model limits = %#v", dispatchProfile.ModelLimits)
+	}
+	dispatchDigest, err := harnessv2.CanonicalProfileDigest(dispatchProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dispatchDigest != plan.Digest {
+		t.Fatalf("dispatcher profile digest = %q, want %q", dispatchDigest, plan.Digest)
+	}
+	wantAdapterDigests := map[string]string{
+		"opencode-cli-linux-amd64":     "sha256:" + acp.OpenCodeLinuxX64BinarySHA256,
+		"opencode-cli-linux-arm64":     "sha256:" + acp.OpenCodeLinuxARM64BinarySHA256,
+		"opencode-ripgrep-linux-amd64": "sha256:" + acp.OpenCodeRipgrepLinuxX64BinarySHA256,
+		"opencode-ripgrep-linux-arm64": "sha256:" + acp.OpenCodeRipgrepLinuxARM64BinarySHA256,
+		"acp-schema":                   "sha256:" + acp.ACPSchemaSHA256,
+	}
+	if !reflect.DeepEqual(plan.Profile.AdapterDigests, wantAdapterDigests) {
+		t.Fatalf("adapter digests = %#v, want %#v", plan.Profile.AdapterDigests, wantAdapterDigests)
+	}
+	if !strings.HasPrefix(plan.PoolName, "acp-opencode-") {
+		t.Fatalf("pool name = %q, want OpenCode prefix", plan.PoolName)
+	}
+
+	fallbackAgent := agent.DeepCopy()
+	fallbackAgent.Spec.Model.Fallbacks = []corev1alpha1.ModelFallback{{ProviderRef: "fallback-provider", Model: "fallback-model"}}
+	if _, err := PlanACPRuntime(task, fallbackAgent, ACPRuntimeImages{Opencode: image}); err == nil || !strings.Contains(err.Error(), "spec.model.fallbacks") {
+		t.Fatalf("OpenCode fallbacks error = %v, want unsupported fallbacks rejection", err)
+	}
+
+	changedAgent := agent.DeepCopy()
+	changedContext := *changedAgent.Spec.Model.ContextWindow + 1
+	changedAgent.Spec.Model.ContextWindow = &changedContext
+	changedPlan, err := PlanACPRuntime(task, changedAgent, ACPRuntimeImages{Opencode: image})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedPlan.Digest == plan.Digest || changedPlan.PoolName == plan.PoolName {
+		t.Fatal("changing OpenCode model limits did not rotate the immutable RuntimePool profile")
+	}
+
+	if _, err := PlanACPRuntime(task, agent, ACPRuntimeImages{Opencode: "docker.io/example/opencode:latest"}); err == nil ||
+		!strings.Contains(err.Error(), "digest-pinned image") {
+		t.Fatalf("mutable OpenCode image error = %v, want digest-pinned rejection", err)
+	}
+
+	reasoningAgent := agent.DeepCopy()
+	reasoningAgent.Spec.Runtime.DefaultReasoningEffort = agentReasoningEffortHigh
+	if _, err := PlanACPRuntime(task, reasoningAgent, ACPRuntimeImages{Opencode: image}); err == nil ||
+		!strings.Contains(err.Error(), "does not support spec.runtime.defaultReasoningEffort") {
+		t.Fatalf("OpenCode reasoning-effort error = %v, want unsupported-setting rejection", err)
+	}
+}
+
+func TestACPRuntimeImageAvailableRejectsPlaceholderAndMutableReferences(t *testing.T) {
+	valid := "docker.io/example/opencode@sha256:" + strings.Repeat("a", 64)
+	if !ACPRuntimeImageAvailable(valid) {
+		t.Fatalf("ACPRuntimeImageAvailable(%q) = false", valid)
+	}
+	for _, image := range []string{
+		"",
+		"docker.io/example/opencode:latest",
+		"docker.io/example/opencode@sha256:" + strings.Repeat("0", 64),
+	} {
+		if ACPRuntimeImageAvailable(image) {
+			t.Fatalf("ACPRuntimeImageAvailable(%q) = true, want false", image)
+		}
 	}
 }
 

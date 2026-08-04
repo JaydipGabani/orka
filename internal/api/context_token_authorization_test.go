@@ -663,6 +663,112 @@ func TestRedactedContextTokenAuthorizationFailuresRedactsRepositoryCredentials(t
 	}
 }
 
+func TestContextTokenTaskCreateEffectiveRuntimePolicyNormalizesOpenCode(t *testing.T) {
+	allowBash := false
+	allowBashTrue := true
+	tests := []struct {
+		name         string
+		runtime      *corev1alpha1.AgentCLIRuntime
+		workspace    *corev1alpha1.WorkspaceConfig
+		agentRuntime *corev1alpha1.AgentRuntimeSpec
+		wantTools    []string
+		wantBash     bool
+		wantNonNil   bool
+	}{
+		{
+			name:       "default read intent",
+			runtime:    &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+			wantTools:  []string{"glob", "read"},
+			wantNonNil: true,
+		},
+		{
+			name: "write intent expands mutation aliases",
+			runtime: &corev1alpha1.AgentCLIRuntime{
+				Type: corev1alpha1.AgentRuntimeOpencode, DefaultAllowedTools: []string{"Edit"}, DefaultAllowBash: &allowBash,
+			},
+			workspace:  &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+			wantTools:  []string{"apply_patch", "edit", "write"},
+			wantNonNil: true,
+		},
+		{
+			name: "explicit empty remains deny all",
+			runtime: &corev1alpha1.AgentCLIRuntime{
+				Type: corev1alpha1.AgentRuntimeOpencode, DefaultAllowedTools: []string{}, DefaultAllowBash: &allowBash,
+			},
+			workspace:  &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+			wantTools:  []string{},
+			wantNonNil: true,
+		},
+		{
+			name:         "explicit empty task override remains deny all",
+			runtime:      &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+			workspace:    &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+			agentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{}},
+			wantTools:    []string{},
+			wantNonNil:   true,
+		},
+		{
+			name: "disallowed mutation alias closes the group",
+			runtime: &corev1alpha1.AgentCLIRuntime{
+				Type: corev1alpha1.AgentRuntimeOpencode, DefaultAllowedTools: []string{"Edit"}, DefaultAllowBash: &allowBash,
+			},
+			workspace:  &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+			wantTools:  []string{},
+			wantNonNil: true,
+		},
+		{
+			name: "bash remains canonical without duplicate authority",
+			runtime: &corev1alpha1.AgentCLIRuntime{
+				Type: corev1alpha1.AgentRuntimeOpencode, DefaultAllowedTools: []string{"Bash"}, DefaultAllowBash: &allowBashTrue,
+			},
+			workspace:  &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+			wantTools:  []string{"bash"},
+			wantBash:   true,
+			wantNonNil: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: tt.runtime}}
+			req := CreateTaskRequest{Workspace: tt.workspace, AgentRuntime: tt.agentRuntime}
+			if tt.name == "disallowed mutation alias closes the group" {
+				req.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{DisallowedTools: []string{"write"}}
+			}
+			gotTools, gotBash := contextTokenTaskCreateEffectiveRuntimePolicy(req, agent)
+			require.Equal(t, tt.wantTools, gotTools)
+			require.Equal(t, tt.wantBash, gotBash)
+			if tt.wantNonNil {
+				require.NotNil(t, gotTools)
+			}
+		})
+	}
+}
+
+func TestContextTokenRuntimeToolConstraintsDoesNotDuplicateOpenCodeBash(t *testing.T) {
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeOpencode,
+	}}}
+	got := contextTokenRuntimeToolConstraints(contextTokenTaskCreateAuthorizationContext{
+		Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent}, Agent: agent,
+		RuntimeAllowedTools: []string{"bash"}, RuntimeAllowBash: true,
+	})
+	require.Equal(t, []string{"bash"}, got)
+}
+
+func TestContextTokenTaskToolFailuresAcceptsOpenCodeDenyAll(t *testing.T) {
+	allowBash := false
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeOpencode, DefaultAllowedTools: []string{}, DefaultAllowBash: &allowBash,
+	}}}
+	failures := contextTokenTaskToolFailures(&ContextToken{TransactionContext: map[string]any{
+		"allowedTools": []any{},
+	}}, contextTokenTaskCreateAuthorizationContext{
+		Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent}, Agent: agent,
+		RuntimeAllowedTools: []string{}, RuntimeAllowBash: false,
+	})
+	require.Empty(t, failures)
+}
+
 func TestContextTokenTaskToolCredentialFailuresForOutboundAccessPolicy(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1alpha1.AddToScheme(scheme))
@@ -1051,5 +1157,61 @@ func TestContextTokenTaskToolCredentialFailuresAllowsLowercaseBrokeredBashWithSy
 	}
 	failures, err := contextTokenTaskToolCredentialFailures(context.Background(), client, &ContextToken{}, enforceContextTokenAuthorizationConfig(), authzCtx)
 	require.NoError(t, err)
+	require.Empty(t, failures)
+}
+
+func TestContextTokenAgentSpecToolFailuresAcceptsNormalizedOpenCodeBash(t *testing.T) {
+	allowBash := true
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeOpencode, DefaultAllowedTools: []string{"Bash"}, DefaultAllowBash: &allowBash,
+	}}}
+	authzCtx, err := resolveContextTokenAgentSpecAuthorizationContext(context.Background(), nil, agent)
+	require.NoError(t, err)
+	require.Equal(t, []string{"bash"}, authzCtx.RuntimeAllowedTools)
+	require.True(t, authzCtx.RuntimeAllowBash)
+
+	failures := contextTokenAgentSpecToolFailures(&ContextToken{TransactionContext: map[string]any{
+		"allowedTools": []any{"bash"},
+	}}, authzCtx)
+	require.Empty(t, failures)
+}
+
+func TestContextTokenTaskToolFailuresNormalizesOpenCodePublicAllowlist(t *testing.T) {
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeOpencode,
+	}}}
+	failures := contextTokenTaskToolFailures(&ContextToken{TransactionContext: map[string]any{
+		"allowedTools": []any{"Read", "Edit", "Bash"},
+	}}, contextTokenTaskCreateAuthorizationContext{
+		Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent}, Agent: agent,
+		RuntimeAllowedTools: []string{"apply_patch", "bash", "edit", "read", "write"}, RuntimeAllowBash: true,
+	})
+	require.Empty(t, failures)
+}
+
+func TestContextTokenAgentSpecToolFailuresNormalizesOpenCodePublicAllowlist(t *testing.T) {
+	authzCtx := contextTokenAgentSpecAuthorizationContext{
+		Agent: &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			Type: corev1alpha1.AgentRuntimeOpencode,
+		}}},
+		RuntimeAllowedTools: []string{"apply_patch", "bash", "edit", "read", "write"},
+		RuntimeAllowBash:    true,
+	}
+	failures := contextTokenAgentSpecToolFailures(&ContextToken{TransactionContext: map[string]any{
+		"allowedTools": []any{"Read", "Edit", "Bash"},
+	}}, authzCtx)
+	require.Empty(t, failures)
+}
+
+func TestContextTokenTaskToolFailuresAcceptsGenericDenyAll(t *testing.T) {
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeCodex, DefaultAllowedTools: []string{},
+	}}}
+	failures := contextTokenTaskToolFailures(&ContextToken{TransactionContext: map[string]any{
+		"allowedTools": []any{},
+	}}, contextTokenTaskCreateAuthorizationContext{
+		Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent}, Agent: agent,
+		RuntimeAllowedTools: []string{}, RuntimeAllowBash: false,
+	})
 	require.Empty(t, failures)
 }

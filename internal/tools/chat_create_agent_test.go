@@ -9,6 +9,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -20,6 +21,15 @@ import (
 )
 
 const testProviderOpenAI = "openai"
+
+func TestChatCreateAgentTool_ParametersDescribeOpenCodeACP(t *testing.T) {
+	params := string((&ChatCreateAgentTool{}).Parameters())
+	for _, want := range []string{"copilot, claude, codex, or opencode", "OpenCode defaults to Read, Write, Edit, Bash, Glob, and Grep", "OpenCode defaults to true"} {
+		if !strings.Contains(params, want) {
+			t.Errorf("Parameters() missing %q", want)
+		}
+	}
+}
 
 func TestChatCreateAgentTool_Execute_OmittedProviderRefLeavesNil(t *testing.T) {
 	fc := newFakeClient()
@@ -60,11 +70,12 @@ func TestChatCreateAgentTool_Execute_OmittedProviderRefLeavesNil(t *testing.T) {
 		t.Fatalf("model.provider = %q, want openai when no providerRef is set", created.Spec.Model.Provider)
 	}
 }
-func TestChatCreateAgentTool_Execute_RejectsUnsupportedRuntime(t *testing.T) {
+func TestChatCreateAgentTool_Execute_RejectsOpenCodeLegacySecret(t *testing.T) {
 	fc := newFakeClient()
 	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
 	result, err := (&ChatCreateAgentTool{}).Execute(ctx, json.RawMessage(`{
 		"name": "legacy-runtime-agent",
+		"model": "openai/gpt-5.4",
 		"runtime": {"type": "opencode", "secretRef": "legacy-runtime"}
 	}`))
 	if err != nil {
@@ -74,12 +85,43 @@ func TestChatCreateAgentTool_Execute_RejectsUnsupportedRuntime(t *testing.T) {
 	if err := json.Unmarshal([]byte(result), &response); err != nil {
 		t.Fatalf("failed to parse result: %v", err)
 	}
-	if response.Success || response.ErrorType != errTypeInvalidArgs || !strings.Contains(response.Error, "unsupported runtime type") {
-		t.Fatalf("response = %#v, want unsupported runtime rejection", response)
+	if response.Success || response.ErrorType != errTypeInvalidArgs || !strings.Contains(response.Error, "does not accept runtime.secretRef") {
+		t.Fatalf("response = %#v, want legacy secret rejection", response)
 	}
 	var created corev1alpha1.Agent
 	if err := fc.Get(context.Background(), client.ObjectKey{Name: "legacy-runtime-agent", Namespace: defaultNamespace}, &created); !apierrors.IsNotFound(err) {
-		t.Fatalf("unsupported runtime Agent should not be created, get err=%v", err)
+		t.Fatalf("invalid OpenCode Agent should not be created, get err=%v", err)
+	}
+}
+
+func TestChatCreateAgentTool_Execute_UsesBuiltInOpenCode(t *testing.T) {
+	fc := newFakeClient()
+	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
+	result, err := (&ChatCreateAgentTool{}).Execute(ctx, json.RawMessage(`{
+		"name":"opencode-agent",
+		"model":{"name":"moonshotai/Kimi-K2-Instruct-0905","contextWindow":32768,"maxTokens":4096},
+		"runtime":{"type":"opencode"}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Success {
+		t.Fatalf("response = %#v, want success", response)
+	}
+	var agent corev1alpha1.Agent
+	if err := fc.Get(context.Background(), client.ObjectKey{Name: "opencode-agent", Namespace: defaultNamespace}, &agent); err != nil {
+		t.Fatal(err)
+	}
+	wantTools := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep"}
+	if agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode || !slices.Equal(agent.Spec.Runtime.DefaultAllowedTools, wantTools) {
+		t.Fatalf("runtime = %#v, want OpenCode defaults %#v", agent.Spec.Runtime, wantTools)
+	}
+	if agent.Spec.Model == nil || agent.Spec.Model.Name != "moonshotai/Kimi-K2-Instruct-0905" || agent.Spec.Model.Provider != "" {
+		t.Fatalf("model = %#v, want provider-qualified OpenCode model", agent.Spec.Model)
 	}
 }
 
@@ -178,6 +220,24 @@ func TestParseRuntimeConfig_BuiltInRuntimesAreCredentialFree(t *testing.T) {
 			}
 		})
 	}
+	t.Run("opencode", func(t *testing.T) {
+		agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
+			Model:       testOpenCodeModelConfig("openai/gpt-5.4"),
+			ProviderRef: &corev1alpha1.ProviderReference{Name: testProviderOpenAI},
+			SecretRef:   &corev1.LocalObjectReference{Name: "legacy-runtime"},
+		}}
+		args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: "opencode"}}
+		if errResult, ok := parseRuntimeConfig(args, agent); !ok {
+			t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
+		}
+		wantTools := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep"}
+		if agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode || !slices.Equal(agent.Spec.Runtime.DefaultAllowedTools, wantTools) {
+			t.Fatalf("runtime = %#v, want OpenCode defaults %#v", agent.Spec.Runtime, wantTools)
+		}
+		if agent.Spec.ProviderRef != nil || agent.Spec.SecretRef != nil || agent.Spec.Model.Provider != "" {
+			t.Fatalf("providerRef=%#v secretRef=%#v model=%#v, want credential-free OpenCode runtime", agent.Spec.ProviderRef, agent.Spec.SecretRef, agent.Spec.Model)
+		}
+	})
 	t.Run("normalizes runtime type", func(t *testing.T) {
 		agent := &corev1alpha1.Agent{}
 		args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: "  claude  "}}
@@ -191,7 +251,7 @@ func TestParseRuntimeConfig_BuiltInRuntimesAreCredentialFree(t *testing.T) {
 }
 
 func TestParseRuntimeConfig_RejectsUnsupportedRuntime(t *testing.T) {
-	for _, runtimeType := range []string{"opencode", "", "   "} {
+	for _, runtimeType := range []string{"unknown", "", "   "} {
 		t.Run(runtimeType, func(t *testing.T) {
 			agent := &corev1alpha1.Agent{}
 			args := map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: runtimeType}}
@@ -267,5 +327,53 @@ func TestParseCoordinationConfig_EnabledClearsRuntimeAndSecretRef(t *testing.T) 
 	}
 	if agent.Spec.SecretRef != nil {
 		t.Errorf("secretRef = %v, want nil", agent.Spec.SecretRef)
+	}
+}
+
+func TestParseRuntimeConfig_PreservesExplicitEmptyOpenCodeTools(t *testing.T) {
+	allowBash := false
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Model: testOpenCodeModelConfig("openai/gpt-5.4")}}
+	args := map[string]any{runtimeField: map[string]any{
+		jsonSchemaTypeField:   "opencode",
+		"defaultAllowedTools": []any{},
+		"defaultAllowBash":    allowBash,
+	}}
+	if errResult, ok := parseRuntimeConfig(args, agent); !ok {
+		t.Fatalf("parseRuntimeConfig returned error: %s", errResult)
+	}
+	if agent.Spec.Runtime == nil || agent.Spec.Runtime.DefaultAllowedTools == nil || len(agent.Spec.Runtime.DefaultAllowedTools) != 0 {
+		t.Fatalf("defaultAllowedTools = %#v, want explicit empty", agent.Spec.Runtime)
+	}
+	if agent.Spec.Runtime.DefaultAllowBash == nil || *agent.Spec.Runtime.DefaultAllowBash {
+		t.Fatalf("defaultAllowBash = %v, want false", agent.Spec.Runtime.DefaultAllowBash)
+	}
+}
+
+func TestParseRuntimeConfig_RejectsInvalidOpenCodeModel(t *testing.T) {
+	contextWindow := int32(32768)
+	maxTokens := int32(4096)
+	inverted := int32(4096)
+	for name, model := range map[string]*corev1alpha1.ModelConfig{
+		"missing":         nil,
+		"bare":            {Name: "gpt-5.4", ContextWindow: &contextWindow, MaxTokens: &maxTokens},
+		"substitution":    {Name: "{env:PROVIDER}/gpt", ContextWindow: &contextWindow, MaxTokens: &maxTokens},
+		"missing context": {Name: "openai/gpt-5.4", MaxTokens: &maxTokens},
+		"missing output":  {Name: "openai/gpt-5.4", ContextWindow: &contextWindow},
+		"inverted":        {Name: "openai/gpt-5.4", ContextWindow: &inverted, MaxTokens: &maxTokens},
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Model: model}}
+			errResult, ok := parseRuntimeConfig(map[string]any{runtimeField: map[string]any{jsonSchemaTypeField: "opencode"}}, agent)
+			if ok {
+				t.Fatal("parseRuntimeConfig accepted invalid OpenCode model")
+			}
+			var response ChatToolResult
+			if err := json.Unmarshal([]byte(errResult), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.ErrorType != errTypeInvalidArgs {
+				t.Fatalf("response = %#v, want invalid arguments", response)
+			}
+		})
 	}
 }

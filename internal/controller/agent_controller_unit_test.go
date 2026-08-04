@@ -105,11 +105,56 @@ func TestValidateAgent_RuntimeOnly(t *testing.T) {
 	}
 }
 
+func TestValidateAgent_OpenCodeRequirements(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		model         string
+		contextWindow *int32
+		maxTokens     *int32
+		secret        string
+		systemPrompt  string
+		wantErr       string
+	}{
+		{name: "valid", model: "openai/gpt-5.4", contextWindow: new(int32(32768)), maxTokens: new(int32(4096))},
+		{name: "system prompt", model: "openai/gpt-5.4", contextWindow: new(int32(32768)), maxTokens: new(int32(4096)), systemPrompt: "ignored", wantErr: "does not support spec.systemPrompt"},
+		{name: "missing model", wantErr: "requires spec.model.name"},
+		{name: "missing context window", model: "openai/gpt-5.4", maxTokens: new(int32(4096)), wantErr: "requires a positive spec.model.contextWindow"},
+		{name: "missing max tokens", model: "openai/gpt-5.4", contextWindow: new(int32(32768)), wantErr: "requires a positive spec.model.maxTokens"},
+		{name: "inverted limits", model: "openai/gpt-5.4", contextWindow: new(int32(4096)), maxTokens: new(int32(4096)), wantErr: "contextWindow must exceed"},
+		{name: "substitution model", model: "{env:ORKA_OPENCODE_PROVIDER_TOKEN}", contextWindow: new(int32(32768)), maxTokens: new(int32(4096)), wantErr: "substitution braces"},
+		{name: "legacy secret", model: "openai/gpt-5.4", contextWindow: new(int32(32768)), maxTokens: new(int32(4096)), secret: "placeholder", wantErr: "does not support agent secretRef"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			agent := baseAgent("opencode")
+			agent.Spec.ProviderRef = nil
+			agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode}
+			agent.Spec.Model = &corev1alpha1.ModelConfig{Name: test.model, ContextWindow: test.contextWindow, MaxTokens: test.maxTokens}
+			if test.secret != "" {
+				agent.Spec.SecretRef = &corev1.LocalObjectReference{Name: test.secret}
+			}
+			if test.systemPrompt != "" {
+				agent.Spec.SystemPrompt = &corev1alpha1.PromptSource{Inline: test.systemPrompt}
+			}
+			err := setupAgentReconciler().validateAgent(context.Background(), agent)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateAgent() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("validateAgent() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateAgent_BuiltInRuntimeRejectsCredentialSecretRef(t *testing.T) {
 	for _, runtimeType := range []corev1alpha1.AgentRuntimeType{
 		corev1alpha1.AgentRuntimeCodex,
 		corev1alpha1.AgentRuntimeClaude,
 		corev1alpha1.AgentRuntimeCopilot,
+		corev1alpha1.AgentRuntimeOpencode,
 	} {
 		t.Run(string(runtimeType), func(t *testing.T) {
 			r := setupAgentReconciler()

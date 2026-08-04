@@ -894,6 +894,11 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		record := tombstoneOperation(tombstone, request.Metadata.OperationID)
+		if record == nil {
+			s.mu.Unlock()
+			writeError(w, http.StatusNotFound, harnessv2.ErrorCodeInvalidRequest, "runtime session not found", nil, false)
+			return
+		}
 		classification, classifyErr := harnessv2.ClassifyOperation(
 			s.expectedFence(tombstone.RuntimeSessionUID, tombstone.RuntimeSessionGeneration), request.Metadata, record, true, now,
 		)

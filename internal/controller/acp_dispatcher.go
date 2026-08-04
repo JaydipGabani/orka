@@ -2951,9 +2951,17 @@ func (d *ACPDispatcher) runtimeAuthSecret(ctx context.Context, pool *corev1alpha
 }
 
 func runtimeProfileFromPool(profile corev1alpha1.RuntimePoolProfileSpec) harnessv2.RuntimeProfile {
+	var modelLimits *harnessv2.ModelTokenLimits
+	if profile.ModelLimits != nil {
+		modelLimits = &harnessv2.ModelTokenLimits{
+			Context: profile.ModelLimits.Context,
+			Output:  profile.ModelLimits.Output,
+		}
+	}
 	return harnessv2.RuntimeProfile{
 		ACPProfile: profile.ACPProfile, AdapterDigests: cloneMap(profile.AdapterDigests), ProviderKind: profile.ProviderKind,
 		Model:                    profile.Model,
+		ModelLimits:              modelLimits,
 		AgentConfigurationDigest: profile.AgentConfigurationDigest, ToolPolicyDigest: profile.ToolPolicyDigest,
 		ApprovalPolicyDigest: profile.ApprovalPolicyDigest, MCPConfigurationDigest: profile.MCPConfigurationDigest,
 		WorkspaceIntent: harnessv2.WorkspaceIntent(profile.WorkspaceIntent), ProxyCredentialRole: profile.ProxyCredentialRole,

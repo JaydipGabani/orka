@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/acp"
 	"github.com/orka-agents/orka/internal/contexttoken"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/metrics"
@@ -1496,8 +1497,6 @@ func validateReadOnlyAgentRuntime(task *corev1alpha1.Task, agent *corev1alpha1.A
 	switch agent.Spec.Runtime.Type {
 	case corev1alpha1.AgentRuntimeCopilot:
 		return fmt.Errorf("read-only agent tasks do not support copilot runtime credentials because GITHUB_TOKEN can mutate GitHub")
-	case corev1alpha1.AgentRuntimeOpencode:
-		return fmt.Errorf("read-only agent tasks do not support opencode runtime because the OpenCode adapter pre-approves file edits")
 	default:
 		return validateReadOnlyBuiltInAgentRuntime(task, agent.Spec.Runtime.Type)
 	}
@@ -1741,7 +1740,7 @@ func readOnlyAgentRuntimeSecretKeys(agent *corev1alpha1.Agent) ([]string, error)
 	case corev1alpha1.AgentRuntimeCopilot:
 		return nil, fmt.Errorf("read-only agent tasks do not support copilot runtime credentials because GITHUB_TOKEN can mutate GitHub")
 	case corev1alpha1.AgentRuntimeOpencode:
-		return nil, fmt.Errorf("read-only agent tasks do not support opencode runtime because the OpenCode adapter pre-approves file edits")
+		return nil, nil
 	default:
 		return nil, nil
 	}
@@ -2123,9 +2122,14 @@ func (b *JobBuilder) addAgentToolsEnvVars(
 	// AllowedTools: read-only task override > task override > agent default
 	var allowedTools []string
 	if agent != nil && agent.Spec.Runtime != nil {
-		allowedTools = agent.Spec.Runtime.DefaultAllowedTools
+		runtime := agent.Spec.Runtime
+		if runtime.Type == corev1alpha1.AgentRuntimeOpencode && runtime.DefaultAllowedTools == nil {
+			allowedTools = acp.OpenCodeDefaultAllowedTools()
+		} else {
+			allowedTools = runtime.DefaultAllowedTools
+		}
 	}
-	if task.Spec.AgentRuntime != nil && len(task.Spec.AgentRuntime.AllowedTools) > 0 {
+	if task.Spec.AgentRuntime != nil && task.Spec.AgentRuntime.AllowedTools != nil {
 		allowedTools = task.Spec.AgentRuntime.AllowedTools
 	}
 	if taskRequestsReadOnlyAgent(task) {

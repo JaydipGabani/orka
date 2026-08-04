@@ -27,6 +27,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/llm"
 	openaiprovider "github.com/orka-agents/orka/internal/llm/openai"
 	"github.com/orka-agents/orka/internal/store"
@@ -229,15 +230,23 @@ type acpWorkspaceExpectation struct {
 	CreatePR                  *bool
 }
 
+type acpToolPolicyExpectation struct {
+	AllowedTools    []string
+	DisallowedTools []string
+	AllowBash       bool
+}
+
 type acpTaskExpectation struct {
 	ProviderKind    string
 	Model           string
+	ModelLimits     *corev1alpha1.ModelTokenLimits
 	WorkspaceIntent corev1alpha1.WorkspaceIntent
 	RuntimeImage    string
 	MaxTurns        *int32
 	AllowBash       *bool
 	AllowedTools    []string
 	DisallowedTools []string
+	ToolPolicy      *acpToolPolicyExpectation
 	SkillNames      []string
 	SessionName     string
 	Workspace       *acpWorkspaceExpectation
@@ -307,8 +316,21 @@ func verifyACPTaskRuntimeForTask(taskName string, expected acpTaskExpectation, t
 		if expected.Model != "" {
 			g.Expect(pool.Spec.Runtime.Profile.Model).To(Equal(expected.Model))
 		}
+		if expected.ModelLimits != nil {
+			g.Expect(pool.Spec.Runtime.Profile.ModelLimits).NotTo(BeNil())
+			g.Expect(*pool.Spec.Runtime.Profile.ModelLimits).To(Equal(*expected.ModelLimits))
+		}
 		if expected.WorkspaceIntent != "" {
 			g.Expect(pool.Spec.Runtime.Profile.WorkspaceIntent).To(Equal(expected.WorkspaceIntent))
+		}
+		if expected.ToolPolicy != nil {
+			toolPolicyDigest, err := harnessv2.CanonicalRuntimeToolPolicyDigest(
+				expected.ToolPolicy.AllowedTools,
+				expected.ToolPolicy.DisallowedTools,
+				expected.ToolPolicy.AllowBash,
+			)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(pool.Spec.Runtime.Profile.ToolPolicyDigest).To(Equal(toolPolicyDigest))
 		}
 	}, timeout, time.Second).Should(Succeed())
 }

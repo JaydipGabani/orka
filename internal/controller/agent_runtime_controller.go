@@ -232,11 +232,16 @@ func hasStrictWorkspaceGovernanceClaim(governance v2conformance.WorkspaceGoverna
 }
 
 func agentRuntimeProfile(spec corev1alpha1.AgentRuntimeProfileSpec) (harnessv2.RuntimeProfile, error) {
+	var modelLimits *harnessv2.ModelTokenLimits
+	if spec.ModelLimits != nil {
+		modelLimits = &harnessv2.ModelTokenLimits{Context: spec.ModelLimits.Context, Output: spec.ModelLimits.Output}
+	}
 	profile := harnessv2.RuntimeProfile{
 		ACPProfile:               spec.ACPProfile,
 		AdapterDigests:           map[string]string{spec.AdapterName: spec.AdapterDigest},
 		ProviderKind:             spec.ProviderKind,
 		Model:                    spec.Model,
+		ModelLimits:              modelLimits,
 		AgentConfigurationDigest: spec.AgentConfigurationDigest,
 		ToolPolicyDigest:         spec.ToolPolicyDigest,
 		ApprovalPolicyDigest:     spec.ApprovalPolicyDigest,

@@ -131,6 +131,11 @@ spec:
               configMapKeyRef:
                 name: acp-runtime-images
                 key: ORKA_ACP_COPILOT_RUNTIME_IMAGE
+          - name: ORKA_ACP_OPENCODE_RUNTIME_IMAGE
+            valueFrom:
+              configMapKeyRef:
+                name: acp-runtime-images
+                key: ORKA_ACP_OPENCODE_RUNTIME_IMAGE
           - name: ORKA_WORKSPACE_PUBLISHER_URL
             value: http://orka-workspace-publisher.orka-system.svc:8080
           - name: ORKA_WORKSPACE_PUBLISHER_CONTROLLER_TOKEN_FILE

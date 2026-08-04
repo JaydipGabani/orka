@@ -478,21 +478,71 @@ func TestValidateTaskAgentCompatibility_AgentTaskCopilotRuntime(t *testing.T) {
 func TestValidateTaskAgentCompatibility_AgentTaskOpencodeRuntime(t *testing.T) {
 	r := &TaskReconciler{}
 	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "do stuff"}}
-	agent := &corev1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "a1"}, Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode}}}
-	err := r.validateTaskAgentCompatibility(task, agent)
-	if err == nil || !strings.Contains(err.Error(), "does not have an ACP runtime profile") {
-		t.Fatalf("validateTaskAgentCompatibility() error = %v, want unsupported runtime rejection", err)
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "a1"},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	if err := r.validateTaskAgentCompatibility(task, agent); err != nil {
+		t.Fatalf("validateTaskAgentCompatibility() error = %v, want OpenCode accepted", err)
 	}
 }
+
+func TestValidateTaskAgentCompatibility_AgentTaskOpencodeRejectsSecretRef(t *testing.T) {
+	r := &TaskReconciler{}
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "do stuff"}}
+	agent := &corev1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "a1"}, Spec: corev1alpha1.AgentSpec{
+		Model:     testOpenCodeModelConfig(),
+		Runtime:   &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		SecretRef: &corev1.LocalObjectReference{Name: "legacy-opencode-secret"},
+	}}
+	err := r.validateTaskAgentCompatibility(task, agent)
+	if err == nil || !strings.Contains(err.Error(), "does not support agent secretRef") {
+		t.Fatalf("validateTaskAgentCompatibility() error = %v, want OpenCode secretRef rejection", err)
+	}
+}
+
+func TestValidateTaskAgentCompatibility_AgentTaskOpencodeRejectsReasoningEffort(t *testing.T) {
+	r := &TaskReconciler{}
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "do stuff"}}
+	agent := &corev1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "a1"}, Spec: corev1alpha1.AgentSpec{
+		Model: testOpenCodeModelConfig(),
+		Runtime: &corev1alpha1.AgentCLIRuntime{
+			Type:                   corev1alpha1.AgentRuntimeOpencode,
+			DefaultReasoningEffort: agentReasoningEffortHigh,
+		},
+	}}
+	err := r.validateTaskAgentCompatibility(task, agent)
+	if err == nil || !strings.Contains(err.Error(), "does not support spec.runtime.defaultReasoningEffort") {
+		t.Fatalf("validateTaskAgentCompatibility() error = %v, want OpenCode reasoning-effort rejection", err)
+	}
+}
+
+func TestValidateTaskAgentCompatibility_AgentTaskOpencodeRejectsSubstitutionModel(t *testing.T) {
+	r := &TaskReconciler{}
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "do stuff"}}
+	agent := &corev1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "a1"}, Spec: corev1alpha1.AgentSpec{
+		Model:   &corev1alpha1.ModelConfig{Name: "{file:/proc/self/environ}"},
+		Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+	}}
+	err := r.validateTaskAgentCompatibility(task, agent)
+	if err == nil || !strings.Contains(err.Error(), "substitution braces") {
+		t.Fatalf("validateTaskAgentCompatibility() error = %v, want substitution rejection", err)
+	}
+}
+
 func TestValidateTaskAgentCompatibility_AgentTaskOpencodeRuntimeRequiresModel(t *testing.T) {
 	r := &TaskReconciler{}
 	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "do stuff"}}
 	agent := &corev1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "a1"}, Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode}}}
 	err := r.validateTaskAgentCompatibility(task, agent)
-	if err == nil || !strings.Contains(err.Error(), "does not have an ACP runtime profile") {
-		t.Fatalf("validateTaskAgentCompatibility() error = %v, want unsupported runtime rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "opencode runtime requires spec.model.name") {
+		t.Fatalf("validateTaskAgentCompatibility() error = %v, want missing model rejection", err)
 	}
 }
+
 func TestValidateTaskAgentCompatibility_ReadOnlyCopilotRejected(t *testing.T) {
 	r := &TaskReconciler{}
 	task := &corev1alpha1.Task{
@@ -505,15 +555,24 @@ func TestValidateTaskAgentCompatibility_ReadOnlyCopilotRejected(t *testing.T) {
 		t.Fatalf("validateTaskAgentCompatibility() error = %v, want read-only credential rejection", err)
 	}
 }
-func TestValidateTaskAgentCompatibility_ReadOnlyOpencodeRejected(t *testing.T) {
+func TestValidateTaskAgentCompatibility_ReadOnlyOpencodeAccepted(t *testing.T) {
 	r := &TaskReconciler{}
-	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "do stuff"}}
-	agent := &corev1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "a1"}, Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode}}}
-	err := r.validateTaskAgentCompatibility(task, agent)
-	if err == nil || !strings.Contains(err.Error(), "does not have an ACP runtime profile") {
-		t.Fatalf("validateTaskAgentCompatibility() error = %v, want unsupported runtime rejection", err)
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{labels.AnnotationAgentReadOnly: scheduledRunLabelValue}},
+		Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "review"},
+	}
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "a1"},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	if err := r.validateTaskAgentCompatibility(task, agent); err != nil {
+		t.Fatalf("validateTaskAgentCompatibility() error = %v, want read-only OpenCode accepted", err)
 	}
 }
+
 func TestValidateTaskAgentCompatibility_AgentTaskRejectsApprovalRequiredTools(t *testing.T) {
 	r := &TaskReconciler{}
 	task := &corev1alpha1.Task{

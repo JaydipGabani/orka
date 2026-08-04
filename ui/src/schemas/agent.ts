@@ -5,7 +5,8 @@ export const modelConfigSchema = z.object({
   provider: z.string().optional(),
   name: z.string().optional(),
   temperature: z.number().optional(),
-  maxTokens: z.number().optional(),
+  contextWindow: z.number().int().positive().optional(),
+  maxTokens: z.number().int().positive().optional(),
 })
 
 export const toolRefSchema = z.object({
@@ -20,8 +21,12 @@ const agentRuntimeDefaultsSchema = {
   defaultReasoningEffort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
 }
 
+export const builtInAgentRuntimeTypes = ['claude', 'codex', 'copilot', 'opencode'] as const
+
+export const builtInAgentRuntimeTypeSchema = z.enum(builtInAgentRuntimeTypes)
+
 export const builtInAgentRuntimeSchema = z.object({
-  type: z.enum(['claude', 'codex', 'copilot']),
+  type: builtInAgentRuntimeTypeSchema,
   ...agentRuntimeDefaultsSchema,
 }).strict()
 
@@ -34,7 +39,6 @@ export const externalAgentRuntimeSchema = z.object({
 
 export const agentRuntimeSchema = z.union([builtInAgentRuntimeSchema, externalAgentRuntimeSchema])
 export const agentCLIRuntimeSchema = agentRuntimeSchema
-
 
 export const agentSpecSchema = z.object({
   providerRef: z.object({ name: z.string(), namespace: z.string().optional() }).optional(),
@@ -63,6 +67,41 @@ export const agentSpecSchema = z.object({
     maxDepth: z.number().optional(),
   }).optional(),
   runtime: agentRuntimeSchema.optional(),
+}).superRefine((spec, ctx) => {
+  if (spec.runtime && 'type' in spec.runtime && spec.runtime.type === 'opencode') {
+    if (!spec.model?.name?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'OpenCode requires model.name',
+        path: ['model', 'name'],
+      })
+    }
+    if (spec.model?.contextWindow === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'OpenCode requires model.contextWindow',
+        path: ['model', 'contextWindow'],
+      })
+    }
+    if (spec.model?.maxTokens === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'OpenCode requires model.maxTokens',
+        path: ['model', 'maxTokens'],
+      })
+    }
+    if (
+      spec.model?.contextWindow !== undefined
+      && spec.model?.maxTokens !== undefined
+      && spec.model.contextWindow <= spec.model.maxTokens
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'OpenCode model.contextWindow must exceed model.maxTokens',
+        path: ['model', 'contextWindow'],
+      })
+    }
+  }
 })
 
 export const agentStatusSchema = z.object({
@@ -86,6 +125,7 @@ export const agentSchema = z.object({
   status: agentStatusSchema.optional(),
 })
 
+export type BuiltInAgentRuntimeType = z.infer<typeof builtInAgentRuntimeTypeSchema>
 export type Agent = z.infer<typeof agentSchema>
 export type AgentSpec = z.infer<typeof agentSpecSchema>
 export type AgentStatus = z.infer<typeof agentStatusSchema>

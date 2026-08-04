@@ -64,6 +64,12 @@ live_acp_kind_preflight() {
     live_acp_kind_die "LIVE_ACP_VEKIL_IMAGE must be digest-pinned" || return 1
   [[ -n "${COPILOT_GITHUB_TOKEN:-}" ]] || \
     live_acp_kind_die "COPILOT_GITHUB_TOKEN is required; this bootstrap is noninteractive and never starts device-code login" || return 1
+  [[ "${ACP_E2E_OPENCODE_CONTEXT_WINDOW:-}" =~ ^[1-9][0-9]*$ ]] || \
+    live_acp_kind_die "ACP_E2E_OPENCODE_CONTEXT_WINDOW must be a positive integer" || return 1
+  [[ "${ACP_E2E_OPENCODE_MAX_TOKENS:-}" =~ ^[1-9][0-9]*$ ]] || \
+    live_acp_kind_die "ACP_E2E_OPENCODE_MAX_TOKENS must be a positive integer" || return 1
+  (( ACP_E2E_OPENCODE_CONTEXT_WINDOW > ACP_E2E_OPENCODE_MAX_TOKENS )) || \
+    live_acp_kind_die "ACP_E2E_OPENCODE_CONTEXT_WINDOW must exceed ACP_E2E_OPENCODE_MAX_TOKENS" || return 1
   docker info >/dev/null 2>&1 || live_acp_kind_die "Docker daemon is not reachable" || return 1
 }
 
@@ -96,16 +102,20 @@ live_acp_kind_build_and_publish_images() {
     ACP_CODEX_RUNTIME_IMG="${LIVE_ACP_CODEX_IMAGE}" \
     ACP_CLAUDE_RUNTIME_IMG="${LIVE_ACP_CLAUDE_IMAGE}" \
     ACP_COPILOT_RUNTIME_IMG="${LIVE_ACP_COPILOT_IMAGE}" \
+    ACP_OPENCODE_RUNTIME_IMG="${LIVE_ACP_OPENCODE_IMAGE}" \
     WORKSPACE_PUBLISHER_IMG="${LIVE_ACP_PUBLISHER_IMAGE}" \
     docker-build docker-build-acp-codex-runtime docker-build-acp-claude-runtime \
-    docker-build-acp-copilot-runtime docker-build-workspace-publisher
+    docker-build-acp-copilot-runtime docker-build-acp-opencode-runtime \
+    docker-build-workspace-publisher
 
   LIVE_ACP_CONTROLLER_REF="$(orka_kind_registry_push "${LIVE_ACP_CONTROLLER_IMAGE}" orka/controller)"
   LIVE_ACP_CODEX_REF="$(orka_kind_registry_push "${LIVE_ACP_CODEX_IMAGE}" orka/acp-codex-runtime)"
   LIVE_ACP_CLAUDE_REF="$(orka_kind_registry_push "${LIVE_ACP_CLAUDE_IMAGE}" orka/acp-claude-runtime)"
   LIVE_ACP_COPILOT_REF="$(orka_kind_registry_push "${LIVE_ACP_COPILOT_IMAGE}" orka/acp-copilot-runtime)"
+  LIVE_ACP_OPENCODE_REF="$(orka_kind_registry_push "${LIVE_ACP_OPENCODE_IMAGE}" orka/acp-opencode-runtime)"
   LIVE_ACP_PUBLISHER_REF="$(orka_kind_registry_push "${LIVE_ACP_PUBLISHER_IMAGE}" orka/workspace-publisher)"
-  export LIVE_ACP_CONTROLLER_REF LIVE_ACP_CODEX_REF LIVE_ACP_CLAUDE_REF LIVE_ACP_COPILOT_REF LIVE_ACP_PUBLISHER_REF
+  export LIVE_ACP_CONTROLLER_REF LIVE_ACP_CODEX_REF LIVE_ACP_CLAUDE_REF LIVE_ACP_COPILOT_REF
+  export LIVE_ACP_OPENCODE_REF LIVE_ACP_PUBLISHER_REF
 }
 
 live_acp_kind_catalog_model_supports_endpoint() {
@@ -147,8 +157,16 @@ live_acp_kind_validate_vekil_catalog() {
   local codex_model="${ACP_E2E_CODEX_MODEL:-gpt-5.4}"
   local claude_model="${ACP_E2E_CLAUDE_MODEL:-claude-sonnet-4.6}"
   local copilot_model="${ACP_E2E_COPILOT_MODEL:-gpt-5.3-codex}"
+  local opencode_model="${ACP_E2E_OPENCODE_MODEL:-${ACP_E2E_CODEX_MODEL:-gpt-5.4}}"
+  opencode_model="${opencode_model#*/}"
 
   live_acp_kind_require_model_endpoint "${models_file}" Codex "${codex_model}" /responses || return 1
+  if ! live_acp_kind_catalog_model_supports_endpoint "${models_file}" "${opencode_model}" /chat/completions && \
+      ! live_acp_kind_catalog_model_supports_endpoint "${models_file}" "${opencode_model}" /responses; then
+    live_acp_kind_die \
+      "Vekil model ${opencode_model} for OpenCode does not advertise required endpoint /chat/completions or compatible /responses"
+    return 1
+  fi
   live_acp_kind_require_model_endpoint "${models_file}" Claude "${claude_model}" /v1/messages || return 1
   live_acp_kind_require_model_endpoint "${models_file}" Copilot "${copilot_model}" /responses || return 1
 }
@@ -270,6 +288,18 @@ live_acp_kind_probe_vekil_wire_path() {
         --header 'anthropic-version: 2023-06-01'
       )
       ;;
+    /chat/completions)
+      payload="$(jq -cn --arg model "${model}" '{
+        model:$model,
+        max_tokens:16,
+        stream:true,
+        messages:[{role:"user",content:"Reply with exactly OK."}]
+      }')"
+      headers=(
+        --header 'Content-Type: application/json'
+        --header "${authorization_header}: Bearer ${probe_value}"
+      )
+      ;;
     *)
       live_acp_kind_die "unsupported Vekil preflight endpoint: ${endpoint}"
       return 1
@@ -314,6 +344,14 @@ live_acp_kind_probe_vekil_wire_path() {
         return 1
       fi
       ;;
+    /chat/completions)
+      if grep -Eq '^data: .*"error"' "${response_file}" || \
+          ! grep -Fx 'data: [DONE]' "${response_file}" >/dev/null; then
+        rm -f "${payload_file}" "${response_file}" "${error_file}"
+        live_acp_kind_die "Vekil ${endpoint} live probe did not complete configured ${provider} model ${model} successfully"
+        return 1
+      fi
+      ;;
   esac
   rm -f "${payload_file}" "${response_file}" "${error_file}"
 }
@@ -322,11 +360,15 @@ live_acp_kind_probe_configured_models() {
   local codex_model="${ACP_E2E_CODEX_MODEL:-gpt-5.4}"
   local claude_model="${ACP_E2E_CLAUDE_MODEL:-claude-sonnet-4.6}"
   local copilot_model="${ACP_E2E_COPILOT_MODEL:-gpt-5.3-codex}"
+  local opencode_model="${ACP_E2E_OPENCODE_MODEL:-${ACP_E2E_CODEX_MODEL:-gpt-5.4}}"
+  opencode_model="${opencode_model#*/}"
   local status=0
 
   live_acp_kind_log "Probing configured provider models through their live Vekil streaming wire paths"
   live_acp_kind_start_vekil_port_forward || return 1
   if ! live_acp_kind_probe_vekil_wire_path Codex "${codex_model}" /responses; then
+    status=1
+  elif ! live_acp_kind_probe_vekil_wire_path OpenCode "${opencode_model}" /chat/completions; then
     status=1
   elif ! live_acp_kind_probe_vekil_wire_path Claude "${claude_model}" /messages; then
     status=1
@@ -373,6 +415,7 @@ live_acp_kind_deploy_orka() {
     ACP_CODEX_RUNTIME_IMG="${LIVE_ACP_CODEX_REF}" \
     ACP_CLAUDE_RUNTIME_IMG="${LIVE_ACP_CLAUDE_REF}" \
     ACP_COPILOT_RUNTIME_IMG="${LIVE_ACP_COPILOT_REF}" \
+    ACP_OPENCODE_RUNTIME_IMG="${LIVE_ACP_OPENCODE_REF}" \
     WORKSPACE_PUBLISHER_IMG="${LIVE_ACP_PUBLISHER_REF}"
 
   local deployment

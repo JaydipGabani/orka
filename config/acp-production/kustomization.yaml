@@ -15,7 +15,7 @@ generatorOptions:
   labels:
     orka.ai/acp-runtime-images: "true"
 # Fail-closed placeholders: direct rendering is immutable but not runnable
-# until an operator replaces all three runtime digests (make deploy does this atomically).
+# until an operator replaces all four runtime digests (make deploy does this atomically).
 images:
   - name: ghcr.io/orka-agents/orka
     newName: docker.io/sozercan/orka

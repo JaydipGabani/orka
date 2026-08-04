@@ -22,11 +22,30 @@ func (i WorkspaceIntent) Validate() error {
 	}
 }
 
+type ModelTokenLimits struct {
+	Context int64 `json:"context"`
+	Output  int64 `json:"output"`
+}
+
+func (l ModelTokenLimits) Validate() error {
+	if l.Context <= 0 {
+		return fmt.Errorf("model context limit must be positive")
+	}
+	if l.Output <= 0 {
+		return fmt.Errorf("model output limit must be positive")
+	}
+	if l.Context <= l.Output {
+		return fmt.Errorf("model context limit must exceed output limit")
+	}
+	return nil
+}
+
 type RuntimeProfile struct {
 	ACPProfile               string            `json:"acpProfile"`
 	AdapterDigests           map[string]string `json:"adapterDigests"`
 	ProviderKind             string            `json:"providerKind"`
 	Model                    string            `json:"model"`
+	ModelLimits              *ModelTokenLimits `json:"modelLimits,omitempty"`
 	AgentConfigurationDigest string            `json:"agentConfigurationDigest"`
 	ToolPolicyDigest         string            `json:"toolPolicyDigest"`
 	ApprovalPolicyDigest     string            `json:"approvalPolicyDigest"`
@@ -57,6 +76,11 @@ func (p RuntimeProfile) Validate() error {
 	}
 	if err := validateBoundedString("model", p.Model, true, 256); err != nil {
 		return err
+	}
+	if p.ModelLimits != nil {
+		if err := p.ModelLimits.Validate(); err != nil {
+			return err
+		}
 	}
 	for name, digest := range map[string]string{
 		"agent configuration digest": p.AgentConfigurationDigest,

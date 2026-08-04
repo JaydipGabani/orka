@@ -231,6 +231,10 @@ jobs:
             image_suffix: "/acp-copilot-runtime"
             dockerfile: workers/acp/images/copilot/Dockerfile
             context: .
+          - image: acp-opencode-runtime
+            image_suffix: "/acp-opencode-runtime"
+            dockerfile: workers/acp/images/opencode/Dockerfile
+            context: .
           - image: workspace-publisher
             image_suffix: "/workspace-publisher"
             dockerfile: workers/publisher/Dockerfile
@@ -373,6 +377,14 @@ jobs:
             image_suffix: "/acp-copilot-runtime"
             platform: linux/arm64
             platform_slug: linux-arm64
+          - image: acp-opencode-runtime
+            image_suffix: "/acp-opencode-runtime"
+            platform: linux/amd64
+            platform_slug: linux-amd64
+          - image: acp-opencode-runtime
+            image_suffix: "/acp-opencode-runtime"
+            platform: linux/arm64
+            platform_slug: linux-arm64
           - image: workspace-publisher
             image_suffix: "/workspace-publisher"
             platform: linux/amd64
@@ -443,6 +455,8 @@ jobs:
             image_suffix: "/acp-claude-runtime"
           - image: acp-copilot-runtime
             image_suffix: "/acp-copilot-runtime"
+          - image: acp-opencode-runtime
+            image_suffix: "/acp-opencode-runtime"
           - image: workspace-publisher
             image_suffix: "/workspace-publisher"
     steps:
@@ -565,6 +579,7 @@ jobs:
           promote_image acp-codex-runtime "/acp-codex-runtime"
           promote_image acp-claude-runtime "/acp-claude-runtime"
           promote_image acp-copilot-runtime "/acp-copilot-runtime"
+          promote_image acp-opencode-runtime "/acp-opencode-runtime"
           promote_image workspace-publisher "/workspace-publisher"
 
 

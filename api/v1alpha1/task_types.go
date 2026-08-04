@@ -7,6 +7,8 @@ MIT License - see LICENSE file for details.
 package v1alpha1
 
 import (
+	"encoding/json"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -696,7 +698,7 @@ type TaskList struct {
 }
 
 // AgentRuntimeType defines the agent runtime to use
-// +kubebuilder:validation:Enum=claude;codex;copilot
+// +kubebuilder:validation:Enum=claude;codex;copilot;opencode
 type AgentRuntimeType string
 
 const (
@@ -706,7 +708,7 @@ const (
 	AgentRuntimeClaude AgentRuntimeType = "claude"
 	// AgentRuntimeCodex uses OpenAI Codex CLI as the agent runtime
 	AgentRuntimeCodex AgentRuntimeType = "codex"
-	// AgentRuntimeOpencode is retained only for rejecting legacy API values in Go tests.
+	// AgentRuntimeOpencode uses OpenCode CLI's native ACP server as the agent runtime.
 	AgentRuntimeOpencode AgentRuntimeType = "opencode"
 )
 
@@ -730,6 +732,28 @@ type AgentRuntimeSpec struct {
 	// AllowBash enables the agent to run bash commands (overrides Agent default)
 	// +optional
 	AllowBash *bool `json:"allowBash,omitempty"`
+}
+
+// MarshalJSON preserves the distinction between an omitted task tool override
+// and an explicitly empty deny-all override.
+func (in AgentRuntimeSpec) MarshalJSON() ([]byte, error) {
+	type agentRuntimeSpecJSON struct {
+		MaxTurns        *int32    `json:"maxTurns,omitempty"`
+		AllowedTools    *[]string `json:"allowedTools,omitempty"`
+		DisallowedTools []string  `json:"disallowedTools,omitempty"`
+		AllowBash       *bool     `json:"allowBash,omitempty"`
+	}
+	var allowedTools *[]string
+	if in.AllowedTools != nil {
+		tools := append([]string{}, in.AllowedTools...)
+		allowedTools = &tools
+	}
+	return json.Marshal(agentRuntimeSpecJSON{
+		MaxTurns:        in.MaxTurns,
+		AllowedTools:    allowedTools,
+		DisallowedTools: in.DisallowedTools,
+		AllowBash:       in.AllowBash,
+	})
 }
 
 // WorkspaceConfig defines repository workspace, validation, and publication intent.

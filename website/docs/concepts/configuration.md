@@ -402,6 +402,12 @@ spec:
 | `targetWorkers` | integer | `0` | Intended physical worker budget. `targetActors` may exceed this value to express oversubscription. |
 | `precreateActors` | boolean | `false` | Pre-create deterministic warm actors up to `targetActors`. |
 
+For built-in OpenCode Agents, `spec.model.name` must use literal
+`provider/model` form and both `spec.model.contextWindow` and
+`spec.model.maxTokens` are required positive reviewed ceilings, with
+`contextWindow > maxTokens`. They are included in the immutable runtime profile;
+Orka does not discover or guess them from a mutable model catalog.
+
 ### Provider Fallback Chain
 
 You can configure fallback providers that are automatically tried when the primary provider fails (e.g., due to auth errors, provider outages, or rate limiting). Fallbacks are configured on the Agent CRD's `spec.model.fallbacks` field.
@@ -447,7 +453,7 @@ spec:
 ### Agent (with Runtime)
 
 Agent configuration for the supported built-in ACP runtime profiles: Claude,
-Codex, and Copilot. Built-in ACP Agents do not reference provider Secrets; RuntimePools reach
+Codex, Copilot, and OpenCode. Built-in ACP Agents do not reference provider Secrets; RuntimePools reach
 Vekil through the central authenticated provider proxy.
 
 ```yaml
@@ -461,7 +467,7 @@ spec:
   systemPrompt:
     inline: "You are a senior software engineer."
   runtime:
-    type: claude         # or "codex" / "copilot"
+    type: claude         # or "codex" / "copilot" / "opencode"
     defaultMaxTurns: 50
     defaultAllowBash: true
     defaultAllowedTools:
@@ -471,10 +477,12 @@ spec:
       - Bash
 ```
 
-OpenCode is not a supported built-in runtime type. Operator-owned
-`orka.harness.v2` `AgentRuntime` registration and conformance are available, but
-Task planning through `runtime.runtimeRef` remains fail-closed until the external
-v2 dispatcher support boundary is enabled.
+OpenCode model IDs use provider/model form, for example `openai/gpt-5.4`.
+
+Operator-owned runtimes outside the built-in set can use `orka.harness.v2`
+`AgentRuntime` registration and conformance, but Task planning through
+`runtime.runtimeRef` remains fail-closed until the external v2 dispatcher
+support boundary is enabled.
 
 Agent runtime tasks reference an Agent with `runtime` configured:
 
@@ -691,6 +699,7 @@ Key configuration values for the Helm chart:
 | `controller.acpRuntime.codexImage` | `""` | Digest-pinned Codex ACP image; Tasks fail closed when empty. |
 | `controller.acpRuntime.claudeImage` | `""` | Digest-pinned Claude ACP image; Tasks fail closed when empty. |
 | `controller.acpRuntime.copilotImage` | `""` | Digest-pinned GitHub Copilot ACP image; Tasks fail closed when empty. |
+| `controller.acpRuntime.opencodeImage` | `""` | Digest-pinned OpenCode ACP image; Tasks fail closed when empty. |
 | `controller.acpRuntime.upgradeDrain.*` | enabled | Two-phase planned-upgrade admission closure and RuntimePool drain settings. |
 | `providerProxy.enabled` | `false` | Deploy the authenticated provider boundary in front of Vekil. Required for built-in ACP profiles. |
 | `providerProxy.upstreamBaseURL` | `http://vekil.vekil-system.svc:1337` | Exact supported Vekil upstream. An optional trailing slash is normalized; alternate hosts, namespaces, and ports are rejected to preserve the fixed NetworkPolicies. |
@@ -743,7 +752,7 @@ kubectl apply -k config/acp-production
 ingress NetworkPolicy. Applying `config/default` alone omits the boundary that
 prevents runtime Pods from bypassing the authenticated provider proxy. Configure
 the required system Secrets and digest-pinned controller, Publisher, Codex,
-Claude, and Copilot images before applying the overlay. `make deploy` validates those image
+Claude, Copilot, and OpenCode images before applying the overlay. `make deploy` validates those image
 references and applies the equivalent resource set.
 
 ### ACP storage split
@@ -913,6 +922,7 @@ See [charts/orka/values.yaml](https://github.com/orka-agents/orka/blob/main/char
 | `--acp-codex-runtime-image` / `ORKA_ACP_CODEX_RUNTIME_IMAGE` | unset | Required digest-pinned Codex runtime image when Codex Tasks are used. |
 | `--acp-claude-runtime-image` / `ORKA_ACP_CLAUDE_RUNTIME_IMAGE` | unset | Required digest-pinned Claude runtime image when Claude Tasks are used. |
 | `--acp-copilot-runtime-image` / `ORKA_ACP_COPILOT_RUNTIME_IMAGE` | unset | Required digest-pinned GitHub Copilot runtime image when Copilot Tasks are used. |
+| `--acp-opencode-runtime-image` / `ORKA_ACP_OPENCODE_RUNTIME_IMAGE` | unset | Required digest-pinned OpenCode runtime image when OpenCode Tasks are used. |
 | `--general-worker-image` | `ghcr.io/orka-agents/orka/general-worker:latest` | General worker container image |
 | `--store-backend` | `sqlite` | Payload/read-model backend. ACP control authority remains Kubernetes CRDs and Leases. |
 | `--store-path` | `/data/orka.db` | Path to the SQLite transcript/outbox/artifact database file. |

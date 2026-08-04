@@ -238,6 +238,38 @@ func TestAgentCLIRuntimeFields(t *testing.T) {
 	}
 }
 
+func TestAgentCLIRuntimeJSONPreservesExplicitEmptyAllowedTools(t *testing.T) {
+	omitted, err := json.Marshal(AgentCLIRuntime{Type: AgentRuntimeOpencode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(omitted), `"defaultAllowedTools"`) {
+		t.Fatalf("omitted runtime JSON = %s, want no defaultAllowedTools field", omitted)
+	}
+
+	explicit, err := json.Marshal(AgentCLIRuntime{
+		Type:                   AgentRuntimeOpencode,
+		DefaultAllowedTools:    []string{},
+		DefaultReasoningEffort: "high",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(explicit), `"defaultAllowedTools":[]`) {
+		t.Fatalf("explicit empty runtime JSON = %s, want defaultAllowedTools:[]", explicit)
+	}
+	var roundTrip AgentCLIRuntime
+	if err := json.Unmarshal(explicit, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.DefaultAllowedTools == nil || len(roundTrip.DefaultAllowedTools) != 0 {
+		t.Fatalf("round-trip defaultAllowedTools = %#v, want explicit empty slice", roundTrip.DefaultAllowedTools)
+	}
+	if roundTrip.DefaultReasoningEffort != "high" {
+		t.Fatalf("round-trip defaultReasoningEffort = %q, want high", roundTrip.DefaultReasoningEffort)
+	}
+}
+
 func TestAgentCLIRuntimeOnAgentSpec(t *testing.T) {
 	maxTurns := int32(25)
 	allowBash := false
@@ -561,5 +593,57 @@ func TestAgentRuntimeV1CapabilityFieldsAreAbsentFromSerializedCRDSurface(t *test
 		if !strings.Contains(serialized, required) {
 			t.Fatalf("serialized AgentRuntime is missing v2 field %q: %s", required, serialized)
 		}
+	}
+}
+
+func TestAgentRuntimeSpecJSONPreservesExplicitEmptyAllowedTools(t *testing.T) {
+	omitted, err := json.Marshal(AgentRuntimeSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(omitted), `"allowedTools"`) {
+		t.Fatalf("omitted runtime JSON = %s, want no allowedTools field", omitted)
+	}
+
+	explicit, err := json.Marshal(AgentRuntimeSpec{AllowedTools: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(explicit), `"allowedTools":[]`) {
+		t.Fatalf("explicit empty runtime JSON = %s, want allowedTools:[]", explicit)
+	}
+	var roundTrip AgentRuntimeSpec
+	if err := json.Unmarshal(explicit, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.AllowedTools == nil || len(roundTrip.AllowedTools) != 0 {
+		t.Fatalf("round-trip allowedTools = %#v, want explicit empty slice", roundTrip.AllowedTools)
+	}
+}
+
+func TestModelConfigTokenLimitsJSONRoundTrip(t *testing.T) {
+	contextWindow := int32(32768)
+	maxTokens := int32(4096)
+	original := ModelConfig{
+		Name:          "openai/gpt-test",
+		ContextWindow: &contextWindow,
+		MaxTokens:     &maxTokens,
+	}
+	encoded, err := json.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ModelConfig
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ContextWindow == nil || *decoded.ContextWindow != contextWindow ||
+		decoded.MaxTokens == nil || *decoded.MaxTokens != maxTokens {
+		t.Fatalf("round-trip model limits = %#v", decoded)
+	}
+	copy := original.DeepCopy()
+	*copy.ContextWindow++
+	if *original.ContextWindow != contextWindow {
+		t.Fatal("ModelConfig.DeepCopy shared contextWindow storage")
 	}
 }

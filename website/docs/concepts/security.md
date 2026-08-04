@@ -70,7 +70,7 @@ operations reserve a durable `ExternalEffect` identity before execution.
 
 - External `AgentRuntime` v2 registration and conformance are supported, but `runtimeRef` Task dispatch remains fail-closed until the external v2 dispatcher support boundary is enabled.
 - Non-empty write delivery uses the clean-room publisher and is successful only with a terminal independently verified `status.delivery` receipt.
-- Copilot is a supported built-in RuntimePool profile. OpenCode is not supported.
+- Codex, Claude, Copilot, and OpenCode are supported built-in RuntimePool profiles.
 
 ## Controller
 

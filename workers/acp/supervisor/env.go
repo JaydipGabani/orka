@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,6 +20,7 @@ const (
 	providerKindCodex            = "codex"
 	providerKindClaude           = "claude"
 	providerKindCopilot          = "copilot"
+	providerKindOpencode         = "opencode"
 	providerToolBash             = "Bash"
 	providerToolEdit             = "Edit"
 	providerToolGlob             = "Glob"
@@ -27,6 +29,7 @@ const (
 	providerToolWebFetch         = "WebFetch"
 	providerToolWebSearch        = "WebSearch"
 	providerToolWrite            = "Write"
+	architectureARM64            = "arm64"
 	EnvListenAddress             = "ORKA_ACP_LISTEN_ADDRESS"
 	EnvRuntimeInstanceID         = "ORKA_ACP_RUNTIME_INSTANCE_ID"
 	EnvSupervisorBootID          = "ORKA_ACP_SUPERVISOR_BOOT_ID"
@@ -36,6 +39,8 @@ const (
 	EnvRuntimePoolGeneration     = "ORKA_ACP_RUNTIME_POOL_GENERATION"
 	EnvProvider                  = "ORKA_ACP_PROVIDER"
 	EnvModel                     = "ORKA_ACP_MODEL"
+	EnvModelContextLimit         = "ORKA_ACP_MODEL_CONTEXT_LIMIT"
+	EnvModelOutputLimit          = "ORKA_ACP_MODEL_OUTPUT_LIMIT"
 	EnvWorkspaceIntent           = "ORKA_ACP_WORKSPACE_INTENT"
 	EnvAgentConfigurationDigest  = "ORKA_ACP_AGENT_CONFIGURATION_DIGEST"
 	EnvToolPolicyDigest          = "ORKA_ACP_TOOL_POLICY_DIGEST"
@@ -57,6 +62,12 @@ const (
 	EnvLastSessionUID            = "ORKA_ACP_LAST_SESSION_UID"
 	EnvSessionGID                = "ORKA_ACP_SESSION_GID"
 
+	openCodeProviderID          = "orka"
+	openCodeProviderEnvName     = "ORKA_OPENCODE_PROVIDER_TOKEN"
+	openCodePermissionAllow     = "allow"
+	openCodePermissionDeny      = "deny"
+	openCodeRootInstructionPath = "/opt/opencode/AGENTS.md"
+
 	// Codex ACP can flush buffered token/tool updates in short bursts above the
 	// generic protocol default. Keep a bounded runtime-specific ceiling that the
 	// supervisor advertises and the controller then enforces symmetrically.
@@ -74,10 +85,15 @@ func LoadConfigFromEnv() (Config, error) {
 	providerKind := requiredEnv(EnvProvider)
 	model := requiredEnv(EnvModel)
 	intent := harnessv2.WorkspaceIntent(requiredEnv(EnvWorkspaceIntent))
+	modelLimits, err := modelTokenLimitsFromEnv()
+	if err != nil {
+		return Config{}, err
+	}
 	profile := harnessv2.RuntimeProfile{
 		ACPProfile:               harnessv2.ACPProfileV1,
 		ProviderKind:             providerKind,
 		Model:                    model,
+		ModelLimits:              modelLimits,
 		AgentConfigurationDigest: requiredEnv(EnvAgentConfigurationDigest),
 		ToolPolicyDigest:         requiredEnv(EnvToolPolicyDigest),
 		ApprovalPolicyDigest:     requiredEnv(EnvApprovalPolicyDigest),
@@ -88,7 +104,11 @@ func LoadConfigFromEnv() (Config, error) {
 		ResourceClass:            envDefault(EnvResourceClass, "standard"),
 	}
 	providerBaseURL := envDefault(EnvProviderProxyBaseURL, defaultProxyBaseURL())
-	provider, err := providerProfile(providerKind, model, intent)
+	modelOutputLimit := int64(0)
+	if modelLimits != nil {
+		modelOutputLimit = modelLimits.Output
+	}
+	provider, err := providerProfile(providerKind, model, intent, modelLimits)
 	if err != nil {
 		return Config{}, err
 	}
@@ -218,6 +238,7 @@ func LoadConfigFromEnv() (Config, error) {
 		WorkspaceMaterializer: workspaceMaterializer,
 		ArtifactUploader:      artifactUploader,
 	}
+	cfg.ProviderProxy.ModelOutputLimit = modelOutputLimit
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -248,6 +269,14 @@ func providerAdapterDigests(provider string) map[string]string {
 			"copilot-cli-linux-amd64": "sha256:" + acp.CopilotCLILinuxX64SHA256,
 			"copilot-cli-linux-arm64": "sha256:" + acp.CopilotCLILinuxARM64SHA256,
 			"acp-schema":              schema,
+		}
+	case providerKindOpencode:
+		return map[string]string{
+			"opencode-cli-linux-amd64":     "sha256:" + acp.OpenCodeLinuxX64BinarySHA256,
+			"opencode-cli-linux-arm64":     "sha256:" + acp.OpenCodeLinuxARM64BinarySHA256,
+			"opencode-ripgrep-linux-amd64": "sha256:" + acp.OpenCodeRipgrepLinuxX64BinarySHA256,
+			"opencode-ripgrep-linux-arm64": "sha256:" + acp.OpenCodeRipgrepLinuxARM64BinarySHA256,
+			"acp-schema":                   schema,
 		}
 	default:
 		return nil
@@ -437,7 +466,59 @@ func copilotSessionProjection(
 	return projection, nil
 }
 
-func providerProfile(kind, model string, _ harnessv2.WorkspaceIntent) (ProviderProfile, error) {
+func openCodeSessionProjection(
+	request harnessv2.CreateRuntimeSessionRequest,
+	_ acp.SessionPaths,
+	_ ProviderProxyBinding,
+	model string,
+) (ProviderSessionProjection, error) {
+	if request.AgentConfiguration == nil {
+		return ProviderSessionProjection{}, fmt.Errorf("agent session configuration is required")
+	}
+	if err := request.MCPConfiguration.ValidateProfile(request.Profile); err != nil {
+		return ProviderSessionProjection{}, fmt.Errorf("MCP policy configuration: %w", err)
+	}
+	if err := request.AgentConfiguration.ValidateProfileOrLegacy(
+		request.Profile,
+		request.MCPConfiguration.ToolPolicy.AllowBash,
+	); err != nil {
+		return ProviderSessionProjection{}, fmt.Errorf("agent session configuration: %w", err)
+	}
+	if request.Profile.ProviderKind != providerKindOpencode ||
+		request.AgentConfiguration.ProviderKind != providerKindOpencode ||
+		request.Profile.Model != model || request.AgentConfiguration.Model != model {
+		return ProviderSessionProjection{}, fmt.Errorf("provider session configuration does not match runtime profile")
+	}
+	if request.AgentConfiguration.SystemPrompt != "" {
+		return ProviderSessionProjection{}, fmt.Errorf("opencode ACP runtime cannot exactly enforce Agent systemPrompt")
+	}
+	if request.AgentConfiguration.ReasoningEffort != "" {
+		return ProviderSessionProjection{}, fmt.Errorf("opencode ACP runtime cannot enforce reasoning effort")
+	}
+	for _, descriptor := range request.MCPConfiguration.ToolPolicy.Tools {
+		if descriptor.Source != harnessv2.MCPToolSourceProviderNative {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(descriptor.Name)) {
+		case "apply_patch", "bash", "edit", "glob", "grep", "read", "write":
+		default:
+			return ProviderSessionProjection{}, fmt.Errorf(
+				"provider-native tool %q is not supported by the opencode projection",
+				descriptor.Name,
+			)
+		}
+	}
+	return ProviderSessionProjection{}, nil
+}
+
+func providerProfile(
+	kind, model string, intent harnessv2.WorkspaceIntent,
+	modelLimitOptions ...*harnessv2.ModelTokenLimits,
+) (ProviderProfile, error) {
+	var modelLimits *harnessv2.ModelTokenLimits
+	if len(modelLimitOptions) > 0 {
+		modelLimits = modelLimitOptions[0]
+	}
 	switch kind {
 	case providerKindCodex:
 		return ProviderProfile{
@@ -500,9 +581,268 @@ func providerProfile(kind, model string, _ harnessv2.WorkspaceIntent) (ProviderP
 				}, nil
 			},
 		}, nil
+	case providerKindOpencode:
+		if modelLimits == nil {
+			return ProviderProfile{}, fmt.Errorf("OpenCode model token limits are required")
+		}
+		if err := modelLimits.Validate(); err != nil {
+			return ProviderProfile{}, fmt.Errorf("OpenCode model token limits: %w", err)
+		}
+		if strings.ContainsAny(model, "{}") {
+			return ProviderProfile{}, fmt.Errorf("OpenCode model must not contain substitution braces")
+		}
+		providerID, modelID, valid := strings.Cut(strings.TrimSpace(model), "/")
+		if !valid || strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "" {
+			return ProviderProfile{}, fmt.Errorf("OpenCode model must use provider/model form")
+		}
+		return ProviderProfile{
+			Kind: kind, Model: model, Command: "/opt/opencode/bin/opencode",
+			Args:        []string{"--pure", "acp", "--hostname", "127.0.0.1", "--port", "0", "--no-mdns"},
+			AdapterName: openCodeAdapterName(), AdapterDigest: openCodeAdapterDigest(),
+			ProjectSession: func(request harnessv2.CreateRuntimeSessionRequest, paths acp.SessionPaths, proxy ProviderProxyBinding) (ProviderSessionProjection, error) {
+				return openCodeSessionProjection(request, paths, proxy, model)
+			},
+			EnvironmentForSession: func(request harnessv2.CreateRuntimeSessionRequest, paths acp.SessionPaths, proxy ProviderProxyBinding) (map[string]string, error) {
+				// The credential below is not an upstream provider secret. It is a random,
+				// per-session loopback capability accepted only while the prompt lease is active
+				// and only for the immutable profile model. OpenCode needs it during provider
+				// construction; write-intent shells share the child environment by design, as
+				// with the other built-in runtimes, while read-intent sessions disable bash.
+				config, err := openCodeSessionConfig(model, modelLimits, intent, request, paths, proxy)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]string{
+					"CI":                                        "true",
+					"NO_BROWSER":                                "1",
+					"OPENCODE_AUTH_CONTENT":                     "{}",
+					"OPENCODE_CONFIG_CONTENT":                   string(config),
+					"OPENCODE_CONFIG_DIR":                       filepath.Join(paths.Config, "opencode"),
+					"OPENCODE_DISABLE_AUTOUPDATE":               "1",
+					"OPENCODE_DISABLE_CLAUDE_CODE":              "1",
+					"OPENCODE_DISABLE_DEFAULT_PLUGINS":          "1",
+					"OPENCODE_DISABLE_EMBEDDED_WEB_UI":          "1",
+					"OPENCODE_DISABLE_EXTERNAL_SKILLS":          "1",
+					"OPENCODE_DISABLE_LSP_DOWNLOAD":             "1",
+					"OPENCODE_DISABLE_MODELS_FETCH":             "1",
+					"OPENCODE_DISABLE_PROJECT_CONFIG":           "1",
+					"OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER": "1",
+					"OPENCODE_PURE":                             "1",
+					"OPENCODE_SERVER_PASSWORD":                  openCodeServerPassword(proxy.Credential),
+					"OPENCODE_SERVER_USERNAME":                  "orka",
+					openCodeProviderEnvName:                     proxy.Credential,
+				}, nil
+			},
+			PrepareSession: prepareOpenCodeConfig,
+		}, nil
 	default:
 		return ProviderProfile{}, fmt.Errorf("unsupported ACP provider %q", kind)
 	}
+}
+
+func prepareOpenCodeConfig(paths acp.SessionPaths) error {
+	configDir := filepath.Join(paths.Config, "opencode")
+	if err := os.MkdirAll(filepath.Join(configDir, "node_modules"), 0o700); err != nil {
+		return err
+	}
+	files := map[string][]byte{
+		"package.json": fmt.Appendf(nil,
+			"{\n  \"private\": true,\n  \"dependencies\": {\n    \"@opencode-ai/plugin\": %q\n  }\n}\n",
+			acp.OpenCodeVersion,
+		),
+		"package-lock.json": fmt.Appendf(nil,
+			"{\n  \"name\": \"orka-opencode-runtime\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"dependencies\": {\n        \"@opencode-ai/plugin\": %q\n      }\n    }\n  }\n}\n",
+			acp.OpenCodeVersion,
+		),
+	}
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(configDir, name), data, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func openCodeSessionConfig(
+	model string,
+	modelLimits *harnessv2.ModelTokenLimits,
+	intent harnessv2.WorkspaceIntent,
+	request harnessv2.CreateRuntimeSessionRequest,
+	paths acp.SessionPaths,
+	proxy ProviderProxyBinding,
+) ([]byte, error) {
+	if modelLimits == nil {
+		return nil, fmt.Errorf("OpenCode model token limits are required")
+	}
+	if err := modelLimits.Validate(); err != nil {
+		return nil, fmt.Errorf("OpenCode model token limits: %w", err)
+	}
+	providerID, modelID, ok := strings.Cut(strings.TrimSpace(model), "/")
+	if !ok || providerID == "" || modelID == "" {
+		return nil, fmt.Errorf("OpenCode model must use provider/model form")
+	}
+	model = providerID + "/" + modelID
+	toolPolicy := request.MCPConfiguration.ToolPolicy
+	permissions := map[string]any{
+		"*":                  openCodePermissionDeny,
+		"doom_loop":          openCodePermissionDeny,
+		"external_directory": openCodePermissionDeny,
+		"list":               openCodePermissionDeny,
+		"lsp":                openCodePermissionDeny,
+		"question":           openCodePermissionDeny,
+		"skill":              openCodePermissionDeny,
+		"task":               openCodePermissionDeny,
+		"todowrite":          openCodePermissionDeny,
+		"webfetch":           openCodePermissionDeny,
+		"websearch":          openCodePermissionDeny,
+	}
+	for _, permission := range []string{"bash", "glob", "grep", "read"} {
+		if openCodeToolPolicyAllows(toolPolicy, permission) {
+			permissions[permission] = openCodePermissionAllow
+		} else {
+			permissions[permission] = openCodePermissionDeny
+		}
+	}
+	mutationAction := openCodePermissionDeny
+	if openCodeMutationPolicyAllows(toolPolicy) {
+		mutationAction = openCodePermissionAllow
+	}
+	for _, permission := range []string{"apply_patch", "edit", "write"} {
+		permissions[permission] = mutationAction
+	}
+	for permission, allowed := range openCodeBrokeredPermissions(toolPolicy) {
+		if allowed {
+			permissions[permission] = openCodePermissionAllow
+		} else {
+			permissions[permission] = openCodePermissionDeny
+		}
+	}
+	if permissions["read"] == openCodePermissionAllow {
+		permissions["read"] = map[string]string{
+			"*":             openCodePermissionAllow,
+			"*.env":         openCodePermissionDeny,
+			"*.env.*":       openCodePermissionDeny,
+			"*.env.example": openCodePermissionAllow,
+		}
+	}
+	if intent == harnessv2.WorkspaceIntentRead {
+		permissions["apply_patch"] = openCodePermissionDeny
+		permissions["bash"] = openCodePermissionDeny
+		permissions["edit"] = openCodePermissionDeny
+		permissions["grep"] = openCodePermissionDeny
+		permissions["write"] = openCodePermissionDeny
+	}
+	return json.Marshal(map[string]any{
+		"$schema":           "https://opencode.ai/config.json",
+		"autoupdate":        false,
+		"enabled_providers": []string{openCodeProviderID},
+		"formatter":         false,
+		"instructions":      []string{openCodeRootInstructionPath, filepath.Join(paths.Workspace, "AGENTS.md")},
+		"lsp":               false,
+		"mcp":               map[string]any{},
+		"model":             openCodeProviderID + "/" + model,
+		"permission":        permissions,
+		"plugin":            []string{},
+		"share":             "disabled",
+		"small_model":       openCodeProviderID + "/" + model,
+		"snapshot":          false,
+		"subagent_depth":    0,
+		"provider": map[string]any{
+			openCodeProviderID: map[string]any{
+				"env":       []string{},
+				"name":      "Orka session proxy",
+				"npm":       "@ai-sdk/openai-compatible",
+				"whitelist": []string{model},
+				"models": map[string]any{
+					model: map[string]any{
+						"limit": map[string]int64{
+							"context": modelLimits.Context,
+							"output":  modelLimits.Output,
+						},
+					},
+				},
+				"options": map[string]any{
+					"apiKey":  "{env:" + openCodeProviderEnvName + "}",
+					"baseURL": proxy.BaseURL,
+				},
+			},
+		},
+	})
+}
+
+func openCodeBrokeredPermissions(policy harnessv2.MCPToolPolicy) map[string]bool {
+	permissions := make(map[string]bool)
+	for _, descriptor := range policy.Tools {
+		if !descriptor.Source.Brokered() {
+			continue
+		}
+		name := "orka_" + strings.Map(func(value rune) rune {
+			if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' ||
+				value >= '0' && value <= '9' || value == '_' || value == '-' {
+				return value
+			}
+			return '_'
+		}, descriptor.Name)
+		allowed := openCodeToolPolicyAllows(policy, descriptor.Name)
+		if existing, ok := permissions[name]; ok {
+			permissions[name] = existing && allowed
+			continue
+		}
+		permissions[name] = allowed
+	}
+	return permissions
+}
+
+// openCodeMutationPolicyAllows consumes the controller-normalized mutation
+// group. Any denied alias closes the entire shared OpenCode edit permission.
+func openCodeMutationPolicyAllows(policy harnessv2.MCPToolPolicy) bool {
+	mutationPermissions := []string{"apply_patch", "edit", "write"}
+	for _, denied := range policy.DisallowedToolNames {
+		for _, permission := range mutationPermissions {
+			if strings.EqualFold(denied, permission) {
+				return false
+			}
+		}
+	}
+	for _, permission := range mutationPermissions {
+		if openCodeToolPolicyAllows(policy, permission) {
+			return true
+		}
+	}
+	return false
+}
+
+func openCodeToolPolicyAllows(policy harnessv2.MCPToolPolicy, permission string) bool {
+	for _, denied := range policy.DisallowedToolNames {
+		if strings.EqualFold(denied, permission) {
+			return false
+		}
+	}
+	for _, allowed := range policy.AllowedToolNames {
+		if strings.EqualFold(allowed, permission) && policy.Allows(allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func openCodeServerPassword(credential string) string {
+	digest := sha256.Sum256([]byte("orka-opencode-server\x00" + credential))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func openCodeAdapterName() string {
+	if runtime.GOARCH == architectureARM64 {
+		return "opencode-cli-linux-arm64"
+	}
+	return "opencode-cli-linux-amd64"
+}
+
+func openCodeAdapterDigest() string {
+	if runtime.GOARCH == architectureARM64 {
+		return "sha256:" + acp.OpenCodeLinuxARM64BinarySHA256
+	}
+	return "sha256:" + acp.OpenCodeLinuxX64BinarySHA256
 }
 
 func prepareCodexHome(paths acp.SessionPaths) error {
@@ -527,7 +867,7 @@ func defaultProxyBaseURL() string {
 
 func providerUpstreamBaseURL(provider, base string) string {
 	base = strings.TrimSuffix(strings.TrimSpace(base), "/")
-	if provider == providerKindCodex || provider == providerKindCopilot {
+	if provider == providerKindCodex || provider == providerKindCopilot || provider == providerKindOpencode {
 		return openAIProxyURL(base)
 	}
 	return base
@@ -575,6 +915,30 @@ func envDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func modelTokenLimitsFromEnv() (*harnessv2.ModelTokenLimits, error) {
+	contextValue := strings.TrimSpace(os.Getenv(EnvModelContextLimit))
+	outputValue := strings.TrimSpace(os.Getenv(EnvModelOutputLimit))
+	if contextValue == "" && outputValue == "" {
+		return nil, nil
+	}
+	if contextValue == "" || outputValue == "" {
+		return nil, fmt.Errorf("%s and %s must be set together", EnvModelContextLimit, EnvModelOutputLimit)
+	}
+	contextLimit, err := strconv.ParseInt(contextValue, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be an integer", EnvModelContextLimit)
+	}
+	outputLimit, err := strconv.ParseInt(outputValue, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be an integer", EnvModelOutputLimit)
+	}
+	limits := &harnessv2.ModelTokenLimits{Context: contextLimit, Output: outputLimit}
+	if err := limits.Validate(); err != nil {
+		return nil, fmt.Errorf("model token limits: %w", err)
+	}
+	return limits, nil
 }
 
 func parsePositiveUint(name, value string) (uint64, error) {

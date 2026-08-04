@@ -162,7 +162,7 @@ Common list query parameters: `namespace`, `taskName`, `agentName`, `type`, `sta
 | `/api/v1/agent-runtimes/:name` | PUT | Replace an external registration. |
 | `/api/v1/agent-runtimes/:name` | DELETE | Delete an external registration. |
 
-RuntimePools are controller-owned for built-in Codex, Claude, and Copilot Tasks; the public API is read-only. External registrations can be probed and conformance-tested, but `Agent.spec.runtime.runtimeRef` Task dispatch remains fail-closed until the external v2 dispatcher support boundary is enabled.
+RuntimePools are controller-owned for built-in Codex, OpenCode, Claude, and Copilot Tasks; the public API is read-only. External registrations can be probed and conformance-tested, but `Agent.spec.runtime.runtimeRef` Task dispatch remains fail-closed until the external v2 dispatcher support boundary is enabled.
 
 ## Agents
 

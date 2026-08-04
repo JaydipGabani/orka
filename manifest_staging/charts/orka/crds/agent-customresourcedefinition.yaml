@@ -1247,6 +1247,13 @@ spec:
                   Model defines the LLM model configuration
                   Provider field is optional if providerRef is set
                 properties:
+                  contextWindow:
+                    description: |-
+                      ContextWindow is the reviewed model context capacity in tokens. Built-in
+                      runtimes that manage their own compaction require this value explicitly.
+                    format: int32
+                    minimum: 1
+                    type: integer
                   fallbacks:
                     description: |-
                       Fallbacks defines alternative providers to try when the primary fails.
@@ -1267,8 +1274,9 @@ spec:
                       type: object
                     type: array
                   maxTokens:
-                    description: MaxTokens limits the response length
+                    description: MaxTokens limits the response length.
                     format: int32
+                    minimum: 1
                     type: integer
                   name:
                     description: |-
@@ -1430,6 +1438,7 @@ spec:
                     - claude
                     - codex
                     - copilot
+                    - opencode
                     type: string
                 type: object
                 x-kubernetes-validations:

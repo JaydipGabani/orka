@@ -109,7 +109,7 @@ Orka uses workload, gateway, workspace, and controller-owned ACP control CRDs:
 | --- | --- |
 | **General Worker** (`workers/general/`) | Runs arbitrary container commands in a per-Task Job. |
 | **AI Worker** (`workers/ai/`) | Runs native LLM/coordination Tasks in a per-Task Job. |
-| **ACP Runtime** (`cmd/orka-acp-runtime`, `workers/acp/`) | Hosts multiple private Codex, Claude, or Copilot RuntimeSessions through `orka.harness.v2`. |
+| **ACP Runtime** (`cmd/orka-acp-runtime`, `workers/acp/`) | Hosts multiple private Codex, Claude, Copilot, or OpenCode RuntimeSessions through `orka.harness.v2`. |
 | **Provider Auth Proxy** (`cmd/orka-provider-auth-proxy`) | Authenticates RuntimePool traffic, enforces provider/model routing, and fronts Vekil. |
 | **Workspace Publisher** (`cmd/orka-workspace-publisher`, `workers/publisher/`) | Uses a separate identity for clean-room clone, commit preparation, exact-ref publication, independent verification, and PR reconciliation. |
 

@@ -71,8 +71,9 @@ describe('AgentCreateForm', () => {
     expect(screen.getByText('Secret Reference')).toBeInTheDocument()
   })
 
-  it('shows ACP runtime selection without legacy loop controls', () => {
+  it('shows all built-in ACP runtime options without legacy loop controls', async () => {
     useStateModeOverride = 'runtime'
+    const user = userEvent.setup()
     render(<AgentCreateForm />)
     expect(screen.getByText('Runtime source')).toBeInTheDocument()
     expect(screen.getByText('Runtime profile')).toBeInTheDocument()
@@ -82,7 +83,13 @@ describe('AgentCreateForm', () => {
     expect(screen.queryByText('Max Turns')).not.toBeInTheDocument()
     expect(screen.queryByText('Allowed Tools')).not.toBeInTheDocument()
     expect(screen.queryByText('Allow Bash')).not.toBeInTheDocument()
-    expect(screen.queryByText('OpenCode')).not.toBeInTheDocument()
+
+    const profileTrigger = screen.getByText('Runtime profile').closest('.space-y-2')!.querySelector('[role="combobox"]')!
+    await user.click(profileTrigger)
+    expect(await screen.findByRole('option', { name: 'Claude ACP' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'OpenAI Codex ACP' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'GitHub Copilot ACP' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'OpenCode ACP' })).toBeInTheDocument()
   })
 
   it('submits a built-in ACP runtime profile', async () => {
@@ -132,6 +139,96 @@ describe('AgentCreateForm', () => {
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Agent created'))
     expect(submitted.spec.runtime).toEqual({ type: 'copilot' })
     expect(submitted.spec.model).toEqual({ name: 'gpt-5.3-codex' })
+  })
+
+  it('submits OpenCode with its reviewed defaults and required provider/model ID', async () => {
+    useStateModeOverride = 'runtime'
+    let submitted: any
+    server.use(http.post('/api/v1/agents', async ({ request }) => {
+      submitted = await request.json()
+      return HttpResponse.json({ metadata: { name: submitted.name }, spec: submitted.spec })
+    }))
+
+    const user = userEvent.setup()
+    render(<AgentCreateForm />)
+    await user.type(screen.getByPlaceholderText('my-agent'), 'opencode-agent')
+    const profileTrigger = screen.getByText('Runtime profile').closest('.space-y-2')!.querySelector('[role="combobox"]')!
+    await act(async () => {
+      fireEvent.pointerDown(profileTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    })
+    const opencodeOption = await screen.findByRole('option', { name: 'OpenCode ACP' })
+    await act(async () => {
+      fireEvent.click(opencodeOption)
+    })
+    await waitFor(() => expect(profileTrigger).toHaveTextContent('OpenCode ACP'))
+
+    const modelInput = screen.getByLabelText('Model')
+    expect(modelInput).toBeRequired()
+    expect(modelInput).toHaveAttribute('placeholder', 'openai/gpt-5.4')
+    expect(screen.getByText('OpenCode model IDs use provider/model form.')).toBeInTheDocument()
+    expect(screen.getByText(/Reviewed native-tool defaults: Read, Write, Edit, Bash, Glob, and Grep/)).toBeInTheDocument()
+    await user.type(modelInput, 'openai/gpt-5.4')
+    await user.type(screen.getByLabelText('Context Window'), '32768')
+    await user.type(screen.getByLabelText('Max Output Tokens'), '4096')
+    await user.click(screen.getByRole('button', { name: 'Create Agent' }))
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Agent created'))
+    expect(submitted.spec.runtime).toEqual({
+      type: 'opencode',
+      defaultAllowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
+      defaultAllowBash: true,
+    })
+    expect(submitted.spec.model).toEqual({ name: 'openai/gpt-5.4', contextWindow: 32768, maxTokens: 4096 })
+  })
+
+  it('rejects OpenCode when reviewed model limits are missing', async () => {
+    useStateModeOverride = 'runtime'
+    let postCount = 0
+    server.use(http.post('/api/v1/agents', () => {
+      postCount += 1
+      return HttpResponse.json({})
+    }))
+
+    const user = userEvent.setup()
+    render(<AgentCreateForm />)
+    await user.type(screen.getByPlaceholderText('my-agent'), 'opencode-agent')
+    const profileTrigger = screen.getByText('Runtime profile').closest('.space-y-2')!.querySelector('[role="combobox"]')!
+    await act(async () => {
+      fireEvent.pointerDown(profileTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    })
+    fireEvent.click(await screen.findByRole('option', { name: 'OpenCode ACP' }))
+    await user.type(screen.getByLabelText('Model'), 'openai/gpt-5.4')
+    await user.click(screen.getByRole('button', { name: 'Create Agent' }))
+
+    expect(toast.error).toHaveBeenCalledWith('OpenCode requires a positive context window')
+    expect(postCount).toBe(0)
+  })
+
+  it('rejects a bare OpenCode model name before posting', async () => {
+    useStateModeOverride = 'runtime'
+    let postCount = 0
+    server.use(http.post('/api/v1/agents', () => {
+      postCount += 1
+      return HttpResponse.json({})
+    }))
+
+    const user = userEvent.setup()
+    render(<AgentCreateForm />)
+    await user.type(screen.getByPlaceholderText('my-agent'), 'opencode-agent')
+    const profileTrigger = screen.getByText('Runtime profile').closest('.space-y-2')!.querySelector('[role="combobox"]')!
+    await act(async () => {
+      fireEvent.pointerDown(profileTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    })
+    const opencodeOption = await screen.findByRole('option', { name: 'OpenCode ACP' })
+    await act(async () => {
+      fireEvent.click(opencodeOption)
+    })
+    await user.type(screen.getByLabelText('Model'), 'gpt-5.4')
+    await user.click(screen.getByRole('button', { name: 'Create Agent' }))
+
+    expect(toast.error).toHaveBeenCalledWith('OpenCode requires a literal provider/model ID')
+    expect(postCount).toBe(0)
+    expect(toast.success).not.toHaveBeenCalled()
   })
 
   it('rejects a blank model for built-in ACP runtimes before posting', async () => {

@@ -4,15 +4,15 @@ slug: /agent-runtimes
 
 # Agent Runtimes
 
-`type: agent` Tasks use the ACP core runtime and the `orka.harness.v2` session protocol. Built-in Codex, Claude, and Copilot profiles run in controller-owned `RuntimePool` resources; there is no per-Task agent Job and no fallback runtime path.
+`type: agent` Tasks use the ACP core runtime and the `orka.harness.v2` session protocol. Built-in Codex, Claude, Copilot, and OpenCode profiles run in controller-owned `RuntimePool` resources; there is no per-Task agent Job and no fallback runtime path.
 
 Orka owns the durable Task attempt, RuntimeSession identity, queueing, workspace validation, delivery receipt, transcript, and result projection. The runtime Pod owns only the short-lived provider process and ACP session for a fenced RuntimeSession.
 
-The supported built-in set is intentionally closed: `codex`, `claude`, and
-`copilot`. OpenCode is not a built-in ACP profile. Operators can register and
-conformance-test an external `orka.harness.v2` `AgentRuntime`, but Task
-dispatch through `runtimeRef` remains fail-closed until the external v2
-dispatcher support boundary is enabled.
+The supported built-in set is intentionally closed: `codex`, `claude`,
+`copilot`, and `opencode`. Operators can register and conformance-test an
+external `orka.harness.v2` `AgentRuntime`, but Task dispatch through
+`runtimeRef` remains fail-closed until the external v2 dispatcher support
+boundary is enabled.
 
 ## Supported runtime profiles
 
@@ -21,6 +21,7 @@ dispatcher support boundary is enabled.
 | Codex | `codex` | Immutable Codex ACP image definition is included. Configure a digest-pinned image. |
 | Claude | `claude` | Immutable Claude ACP image definition is included. Configure a digest-pinned image. |
 | Copilot | `copilot` | Immutable Copilot ACP image definition is included. Configure a digest-pinned image. |
+| OpenCode | `opencode` | Immutable OpenCode ACP image definition is included. Configure a digest-pinned image. |
 
 External runtimes use an `AgentRuntime` registration with `contractVersion: orka.harness.v2`. Current-generation conformance proves the exact instance, profile, cancellation, duplicate, and workspace-governance claims, but readiness does not yet enable `runtimeRef` Task dispatch. See [Bring your own AgentRuntime](../guides/bring-your-own-agent-runtime.md) and the [adapter contract](../development/agent-runtime-adapter-contract.md).
 
@@ -149,6 +150,14 @@ spec:
   model:
     name: gpt-5.4
 ```
+
+OpenCode model IDs use provider/model form, for example `openai/gpt-5.4`.
+OpenCode selects `apply_patch` for GPT-family models and `edit`/`write` for
+others; Orka normalizes those aliases into one governed mutation capability, so
+allowing one exposes the group and disallowing one closes the group. For
+read-intent workspaces, Orka also disables Bash and OpenCode Grep because Grep
+cannot carry the secret-file exclusions applied to OpenCode Read; Read and Glob
+remain available when allowed by policy.
 
 Task-level `spec.agentRuntime` contains only runtime overrides such as `maxTurns`, `allowedTools`, `disallowedTools`, and `allowBash`. Repository configuration belongs at top-level `spec.workspace`.
 
@@ -333,6 +342,7 @@ At minimum, enable ACP and configure immutable images:
 --acp-codex-runtime-image=<repository>@sha256:<digest>
 --acp-claude-runtime-image=<repository>@sha256:<digest>
 --acp-copilot-runtime-image=<repository>@sha256:<digest>
+--acp-opencode-runtime-image=<repository>@sha256:<digest>
 ```
 
 Mutable image tags are rejected for built-in pools. For Kustomize deployment,
@@ -341,7 +351,7 @@ cross-namespace Vekil ingress boundary.
 
 ## Troubleshooting
 
-- **Task fails before queueing**: verify the Agent has `runtime.type: codex`, `claude`, or `copilot`, ACP is enabled, and the matching digest-pinned built-in image is configured. `runtimeRef` Task dispatch is intentionally rejected at the current support boundary.
+- **Task fails before queueing**: verify the Agent has `runtime.type: codex`, `claude`, `copilot`, or `opencode`, ACP is enabled, and the matching digest-pinned built-in image is configured. `runtimeRef` Task dispatch is intentionally rejected at the current support boundary.
 - **Task remains queued**: inspect the selected RuntimePool lifecycle/admission/capacity and the runtime Pod scheduling conditions.
 - **Task reports `OutcomeUnknown`**: do not retry the same attempt automatically. Inspect the recorded attempt, controller epoch, runtime instance, and event timeline.
 - **Read Task fails validation**: inspect `status.delivery` for `ReadOnlyWorkspaceModified` and treat the session as poisoned.

@@ -25,6 +25,9 @@ Common environment:
   ACP_E2E_REF                        Immutable read repository commit SHA
   ACP_E2E_CODEX_MODEL                Codex model (default: gpt-5.4)
   ACP_E2E_CLAUDE_MODEL               Claude model (default: claude-sonnet-4.6)
+  ACP_E2E_OPENCODE_MODEL             OpenCode model (default: ACP_E2E_CODEX_MODEL)
+  ACP_E2E_OPENCODE_CONTEXT_WINDOW    Reviewed OpenCode model context capacity (required)
+  ACP_E2E_OPENCODE_MAX_TOKENS        Reviewed OpenCode model output limit (required)
   ACP_E2E_COPILOT_MODEL              Copilot model (default: gpt-5.3-codex)
   ACP_E2E_CONCURRENCY_TASKS          Concurrent Codex task count (default: 6)
   ACP_E2E_REQUIRE_PARALLEL=1         Require >=2 running prompts in smoke; release always requires it
@@ -224,6 +227,16 @@ repo_url="${ACP_E2E_REPO:-https://github.com/orka-agents/orka.git}"
 repo_ref="${ACP_E2E_REF:-d03acb995b6014a6e855181c50b922b65ea8e7ff}"
 codex_model="${ACP_E2E_CODEX_MODEL:-gpt-5.4}"
 claude_model="${ACP_E2E_CLAUDE_MODEL:-claude-sonnet-4.6}"
+if [[ -n "${ACP_E2E_OPENCODE_MODEL:-}" ]]; then
+  opencode_model="${ACP_E2E_OPENCODE_MODEL}"
+else
+  opencode_model="${codex_model}"
+fi
+if [[ "${opencode_model}" != */* ]]; then
+  opencode_model="openai/${opencode_model}"
+fi
+opencode_context_window="${ACP_E2E_OPENCODE_CONTEXT_WINDOW:-}"
+opencode_max_tokens="${ACP_E2E_OPENCODE_MAX_TOKENS:-}"
 copilot_model="${ACP_E2E_COPILOT_MODEL:-gpt-5.3-codex}"
 concurrency_tasks="${ACP_E2E_CONCURRENCY_TASKS:-6}"
 wait_seconds="${ACP_E2E_WAIT_SECONDS:-900}"
@@ -236,6 +249,10 @@ blocking_prompt="${ACP_E2E_BLOCKING_PROMPT:-Immediately use the Bash tool to run
 long_prompt="${ACP_E2E_LONG_PROMPT:-Read LICENSE, NOTICE.md, go.mod, Makefile, and the first ten Go source files you find. Compare their purpose and provide a detailed evidence-backed summary. Do not modify files.}"
 api_local_port="${ACP_E2E_API_LOCAL_PORT:-$((20000 + ($$ % 20000)))}"
 
+is_uint "${opencode_context_window}" || die "ACP_E2E_OPENCODE_CONTEXT_WINDOW must be a positive integer"
+is_uint "${opencode_max_tokens}" || die "ACP_E2E_OPENCODE_MAX_TOKENS must be a positive integer"
+(( opencode_context_window > opencode_max_tokens )) || \
+  die "ACP_E2E_OPENCODE_CONTEXT_WINDOW must exceed ACP_E2E_OPENCODE_MAX_TOKENS"
 is_uint "${concurrency_tasks}" || die "ACP_E2E_CONCURRENCY_TASKS must be an integer without leading zeros"
 (( concurrency_tasks >= 2 )) || die "ACP_E2E_CONCURRENCY_TASKS must be at least 2"
 is_uint "${wait_seconds}" || die "ACP_E2E_WAIT_SECONDS must be an integer without leading zeros"
@@ -1395,6 +1412,8 @@ apply_agent() {
     --arg name "${name}" \
     --argjson maxTurns "${max_turns}" \
     --argjson allowBash "${allow_bash}" \
+    --argjson opencodeContextWindow "${opencode_context_window}" \
+    --argjson opencodeMaxTokens "${opencode_max_tokens}" \
     '{
       apiVersion:"core.orka.ai/v1alpha1",
       kind:"Agent",
@@ -1405,9 +1424,17 @@ apply_agent() {
           defaultMaxTurns:$maxTurns
         } + (if $provider == "codex" then {} else {
           defaultAllowBash:$allowBash,
-          defaultAllowedTools:(if $allowBash then ["Read","Glob","Grep","Bash"] else ["Read","Glob","Grep"] end)
+          defaultAllowedTools:(
+            if $provider == "opencode" and $allowBash then ["Read","Write","Edit","Bash","Glob","Grep"]
+            elif $allowBash then ["Read","Glob","Grep","Bash"]
+            else ["Read","Glob","Grep"] end
+          )
         } end)),
-        model:{name:$model}
+        model:(
+          if $provider == "opencode" then
+            {name:$model,contextWindow:$opencodeContextWindow,maxTokens:$opencodeMaxTokens}
+          else {name:$model} end
+        )
       }
     }' | k -n "${namespace}" apply -f - >/dev/null
 }
@@ -2217,6 +2244,22 @@ run_read_smoke() {
   read_smoke_pool="${pool}"
   read_smoke_session_uid="${continued_uid}"
   read_smoke_session_generation="${continued_generation}"
+}
+
+run_opencode_read_policy_check() {
+  local agent="$1"
+  local model="$2"
+  local task session pool snapshot
+  task="$(sanitize_name "acp-opencode-policy-${run_id}")"
+  session="$(sanitize_name "acp-opencode-policy-session-${run_id}")"
+  apply_read_task "${task}" "${agent}" "${session}" true \
+    "Attempt to use Bash and a file-mutation tool to create SHOULD_NOT_EXIST.txt. Those tools must be unavailable in this read-intent session. Then read LICENSE and report its first non-empty line without modifying any file." \
+    "12m" true
+  wait_until "Task/${task} RuntimePool assignment" "${state_wait_seconds}" wait_task_pool_name_value "${task}"
+  pool="$(wait_task_pool_name_value "${task}")"
+  snapshot="${temp_root}/${task}-pool.json"
+  capture_pool_snapshot "${pool}" opencode "${model}" read "${snapshot}"
+  assert_task_succeeded_read "${task}" "${snapshot}" "${read_repo_commit}" "" "${expected_license_line}"
 }
 
 server_dry_run_manifest() {
@@ -3281,6 +3324,20 @@ fi
 
 remove_provider_resources codex "${codex_agent}" "${codex_tool_agent}"
 wait_until "Codex runtime children removal" 300 runtime_children_absent
+
+opencode_agent="$(sanitize_name "acp-opencode-${run_id}")"
+opencode_task="$(sanitize_name "acp-opencode-read-${run_id}")"
+opencode_session="$(sanitize_name "acp-opencode-session-${run_id}")"
+opencode_nonce="opencode-${run_id}-${RANDOM}-${RANDOM}"
+log "Running OpenCode native ACP read, continuation, and read-policy validation"
+run_read_smoke opencode "${opencode_model}" "${opencode_agent}" "${opencode_task}" "${opencode_session}" \
+  "${opencode_nonce}" "${expected_license_line}"
+opencode_policy_agent="$(sanitize_name "acp-opencode-policy-agent-${run_id}")"
+apply_agent opencode "${opencode_model}" "${opencode_policy_agent}" 12 true
+run_opencode_read_policy_check "${opencode_policy_agent}" "${opencode_model}"
+assert_all_tasks_validated
+remove_provider_resources opencode "${opencode_agent}" "${opencode_policy_agent}"
+wait_until "OpenCode runtime children removal" 300 runtime_children_absent
 
 claude_agent="$(sanitize_name "acp-claude-${run_id}")"
 claude_task="$(sanitize_name "acp-claude-read-${run_id}")"

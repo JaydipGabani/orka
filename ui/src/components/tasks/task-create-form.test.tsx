@@ -371,7 +371,7 @@ describe('TaskCreateForm', () => {
     expect(submitted.agentRuntime?.workspace).toBeUndefined()
     expect(submitted.workspace.gitSecretRef).toBeUndefined()
     expect(submitted.workspace.forkRepo).toBeUndefined()
-  })
+  }, 10_000)
 
   it('requires a source repository URL for write workspaces', async () => {
     useStateTypeOverride = 'agent'

@@ -7,6 +7,7 @@ import { PageHeader } from '@/components/layout/page-header'
 import { Bot, Plus } from 'lucide-react'
 import { useAgentList } from '@/hooks/use-agents'
 import type { Agent } from '@/schemas/agent'
+import { builtInAgentRuntimeLabel } from '@/lib/agent-runtime'
 
 export function AgentList() {
   const { data, isLoading } = useAgentList()
@@ -54,7 +55,7 @@ export function AgentList() {
                     {agent.spec.model?.name && <Badge variant="outline">{agent.spec.model.name}</Badge>}
                     {agent.spec.runtime && (
                       <Badge variant="secondary">
-                        {'type' in agent.spec.runtime ? `${agent.spec.runtime.type} ACP` : `AgentRuntime ${agent.spec.runtime.runtimeRef.name}`}
+                        {'type' in agent.spec.runtime ? builtInAgentRuntimeLabel(agent.spec.runtime.type) : `AgentRuntime ${agent.spec.runtime.runtimeRef.name}`}
                       </Badge>
                     )}
                   </div>

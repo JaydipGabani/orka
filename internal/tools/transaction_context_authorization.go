@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/acp"
 	"github.com/orka-agents/orka/internal/labels"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -177,8 +178,7 @@ func resolveChildTransactionContext(ctx context.Context, k8sClient client.Client
 	childCtx.providerInfo, childCtx.model = childTransactionEffectiveProviderModel(child, childCtx.agent, childCtx.provider, childCtx.providerInfo)
 	childCtx.fallbacks = childTransactionFallbackProviderModels(ctx, k8sClient, child.Namespace, childCtx.agent)
 	childCtx.aiTools = childTransactionEffectiveAITools(child, childCtx.agent)
-	childCtx.runtimeTools = childTransactionEffectiveRuntimeAllowedTools(child, childCtx.agent)
-	childCtx.runtimeBash = childTransactionEffectiveRuntimeAllowBash(child, childCtx.agent)
+	childCtx.runtimeTools, childCtx.runtimeBash = childTransactionEffectiveRuntimePolicy(child, childCtx.agent)
 	return childCtx, nil
 }
 
@@ -303,7 +303,10 @@ func validateChildToolConstraints(txCtx map[string]string, childCtx childTransac
 	if !ok {
 		return nil
 	}
-	if childCtx.childType == corev1alpha1.TaskTypeAgent && !hasNonEmptyTransactionTools(childCtx.runtimeTools) {
+	if childCtx.agent != nil && childCtx.agent.Spec.Runtime != nil && childCtx.agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
+		allowed = acp.NormalizeOpenCodeAuthorizationTools(allowed)
+	}
+	if childCtx.childType == corev1alpha1.TaskTypeAgent && childTransactionRuntimeToolsUnrestricted(childCtx.runtimeTools) {
 		return fmt.Errorf("child task agent runtime tools are unrestricted by task or agent while transaction context restricts allowedTools")
 	}
 	runtimeTools := childTransactionRuntimeToolConstraints(childCtx)
@@ -321,6 +324,9 @@ func validateChildToolConstraints(txCtx map[string]string, childCtx childTransac
 
 func childTransactionRuntimeToolConstraints(childCtx childTransactionContext) []string {
 	runtimeTools := append([]string{}, childCtx.runtimeTools...)
+	if childCtx.agent != nil && childCtx.agent.Spec.Runtime != nil && childCtx.agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
+		return runtimeTools
+	}
 	if childCtx.childType == corev1alpha1.TaskTypeAgent && childCtx.runtimeBash {
 		runtimeTools = append(runtimeTools, "Bash")
 	}
@@ -331,6 +337,10 @@ func hasNonEmptyTransactionTools(tools []string) bool {
 	return slices.ContainsFunc(tools, func(tool string) bool {
 		return strings.TrimSpace(tool) != ""
 	})
+}
+
+func childTransactionRuntimeToolsUnrestricted(tools []string) bool {
+	return tools == nil || (len(tools) > 0 && !hasNonEmptyTransactionTools(tools))
 }
 
 func childTransactionEffectiveAITools(child *corev1alpha1.Task, agent *corev1alpha1.Agent) []string {
@@ -378,25 +388,49 @@ func transactionMemoryToolNames() []string {
 	}
 }
 
-func childTransactionEffectiveRuntimeAllowedTools(child *corev1alpha1.Task, agent *corev1alpha1.Agent) []string {
-	if child.Spec.AgentRuntime != nil && len(child.Spec.AgentRuntime.AllowedTools) > 0 {
-		return append([]string{}, child.Spec.AgentRuntime.AllowedTools...)
+func childTransactionAgentRuntimeAllowedTools(agent *corev1alpha1.Agent) []string {
+	if agent == nil || agent.Spec.Runtime == nil {
+		return nil
 	}
-	if agent != nil && agent.Spec.Runtime != nil && len(agent.Spec.Runtime.DefaultAllowedTools) > 0 {
-		return append([]string{}, agent.Spec.Runtime.DefaultAllowedTools...)
+	runtime := agent.Spec.Runtime
+	if runtime.Type == corev1alpha1.AgentRuntimeOpencode && runtime.DefaultAllowedTools == nil {
+		return acp.OpenCodeDefaultAllowedTools()
+	}
+	if runtime.DefaultAllowedTools != nil {
+		return append([]string{}, runtime.DefaultAllowedTools...)
 	}
 	return nil
 }
 
-func childTransactionEffectiveRuntimeAllowBash(child *corev1alpha1.Task, agent *corev1alpha1.Agent) bool {
+func childTransactionAgentRuntimeAllowBash(agent *corev1alpha1.Agent) bool {
 	allowBash := true
 	if agent != nil && agent.Spec.Runtime != nil && agent.Spec.Runtime.DefaultAllowBash != nil {
 		allowBash = *agent.Spec.Runtime.DefaultAllowBash
 	}
+	return allowBash
+}
+
+func childTransactionEffectiveRuntimePolicy(child *corev1alpha1.Task, agent *corev1alpha1.Agent) ([]string, bool) {
+	allowedTools := childTransactionAgentRuntimeAllowedTools(agent)
+	if child.Spec.AgentRuntime != nil && child.Spec.AgentRuntime.AllowedTools != nil {
+		allowedTools = append([]string{}, child.Spec.AgentRuntime.AllowedTools...)
+	}
+	allowBash := childTransactionAgentRuntimeAllowBash(agent)
+	disallowedTools := []string(nil)
 	if child.Spec.AgentRuntime != nil && child.Spec.AgentRuntime.AllowBash != nil {
 		allowBash = *child.Spec.AgentRuntime.AllowBash
 	}
-	return allowBash
+	if child.Spec.AgentRuntime != nil {
+		disallowedTools = append(disallowedTools, child.Spec.AgentRuntime.DisallowedTools...)
+	}
+	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
+		return allowedTools, allowBash
+	}
+	workspace := child.Spec.Workspace
+	readIntent := workspace == nil || workspace.Intent == "" || workspace.Intent == corev1alpha1.WorkspaceIntentRead
+	allowedTools, disallowedTools, allowBash = acp.NormalizeOpenCodeToolPolicy(readIntent, allowedTools, disallowedTools, allowBash)
+	allowedTools = acp.OpenCodeEffectiveAllowedTools(allowedTools, disallowedTools, allowBash)
+	return allowedTools, allowBash && slices.Contains(allowedTools, "bash")
 }
 
 func transactionCoordinationToolNames() []string {

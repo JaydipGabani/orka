@@ -205,6 +205,8 @@ func validateACPProviderNativePolicy(provider string, allowed, disallowed []stri
 			}
 		}
 		return nil
+	case string(corev1alpha1.AgentRuntimeOpencode):
+		return nil
 	default:
 		return fmt.Errorf("unsupported ACP provider %q", provider)
 	}
@@ -230,6 +232,8 @@ func validateACPProviderSystemPrompt(provider string, configuration harnessv2.Ag
 		}
 	case string(corev1alpha1.AgentRuntimeCopilot):
 		return fmt.Errorf("copilot ACP runtime cannot enforce Agent systemPrompt")
+	case string(corev1alpha1.AgentRuntimeOpencode):
+		return fmt.Errorf("opencode ACP runtime cannot enforce Agent systemPrompt")
 	}
 	return nil
 }

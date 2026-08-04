@@ -57,6 +57,16 @@ type ChatConfig struct {
 	MaxTasksPerTurn        int
 	MaxSessionSize         int // bytes
 	MaxPrematureEndRetries int // re-prompts when the model emits text without the GOAL_STATE sentinel
+	RuntimeAvailability    ACPRuntimeAvailability
+}
+
+// ACPRuntimeAvailability identifies built-in profiles backed by configured,
+// digest-pinned RuntimePool images.
+type ACPRuntimeAvailability struct {
+	Codex    bool
+	Claude   bool
+	Copilot  bool
+	OpenCode bool
 }
 
 // ChatRequest is the request body for POST /api/v1/chat.
@@ -295,7 +305,7 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 	}()
 
 	// Build system prompt
-	promptBuilder := NewSystemPromptBuilder(ch.client, namespace)
+	promptBuilder := NewSystemPromptBuilder(ch.client, namespace, ch.config.RuntimeAvailability)
 	systemPrompt, err := promptBuilder.BuildSystemPrompt(ctx, req.SystemPrompt, PromptModeFull)
 	if err != nil {
 		chatLog.Error(err, "failed to build system prompt")

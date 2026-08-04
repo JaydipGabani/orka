@@ -46,7 +46,7 @@ func rejectAgentExecutionPlanWithWorkspaceStatus(reason string, err error) agent
 }
 
 // planAgentExecution owns the controller routing decision for type: agent
-// Tasks. Built-in Codex, Claude, and Copilot runtimes use only the ACP v2
+// Tasks. Built-in Codex, Claude, Copilot, and OpenCode runtimes use only the ACP v2
 // RuntimePool path. External runtimeRef registrations and conformance remain
 // available, but Task dispatch fails closed until the v2 dispatcher support
 // boundary is enabled. There is no legacy turn or Job fallback.
@@ -86,7 +86,7 @@ func (r *TaskReconciler) planAgentExecution(
 	}
 
 	switch agent.Spec.Runtime.Type {
-	case corev1alpha1.AgentRuntimeCodex, corev1alpha1.AgentRuntimeClaude, corev1alpha1.AgentRuntimeCopilot:
+	case corev1alpha1.AgentRuntimeCodex, corev1alpha1.AgentRuntimeClaude, corev1alpha1.AgentRuntimeCopilot, corev1alpha1.AgentRuntimeOpencode:
 		return agentACPPlan()
 	default:
 		return rejectAgentExecutionPlan(fmt.Sprintf("agent runtime %q is not supported by the ACP core runtime", agent.Spec.Runtime.Type))

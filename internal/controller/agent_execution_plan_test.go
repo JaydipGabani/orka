@@ -68,13 +68,12 @@ func TestPlanAgentExecutionMatrix(t *testing.T) {
 			wantReason:        "Task dispatch is not supported until the v2 dispatcher is wired",
 		},
 		{
-			name: "OpenCode has no ACP core profile",
+			name: "OpenCode uses ACP RuntimePool",
 			mutateAgent: func(agent *corev1alpha1.Agent) {
 				agent.Spec.Runtime.Type = corev1alpha1.AgentRuntimeOpencode
 			},
 			acpRuntimeEnabled: true,
-			wantPath:          agentExecutionPathRejected,
-			wantReason:        "is not supported by the ACP core runtime",
+			wantPath:          agentExecutionPathACP,
 		},
 		{
 			name: "priorTaskRef continuation is rejected",

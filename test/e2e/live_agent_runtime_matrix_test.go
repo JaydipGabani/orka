@@ -16,6 +16,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/test/utils"
 )
 
@@ -30,20 +31,24 @@ var _ = Describe("Live Agent Runtime Matrix", Ordered, func() {
 	const (
 		codexAgentName         = "e2e-live-runtime-codex-agent"
 		codexTaskReadName      = "e2e-live-runtime-codex-read"
+		opencodeAgentName      = "e2e-live-runtime-opencode-agent"
+		opencodeTaskReadName   = "e2e-live-runtime-opencode-read"
 		claudeAgentName        = "e2e-live-runtime-claude-agent"
 		claudeTaskName         = "e2e-live-runtime-claude-task"
 		claudeExpectedResponse = "ORKA_LIVE_CLAUDE_OK"
 	)
 
 	var (
-		apiBaseURL         string
-		cancelControllerPF context.CancelFunc
-		controllerPFCmd    *exec.Cmd
-		token              string
-		gptModel           string
-		gptModelSkipReason string
-		claudeModel        string
-		claudeSessionName  string
+		apiBaseURL              string
+		cancelControllerPF      context.CancelFunc
+		controllerPFCmd         *exec.Cmd
+		token                   string
+		gptModel                string
+		gptModelSkipReason      string
+		opencodeModel           string
+		opencodeModelSkipReason string
+		claudeModel             string
+		claudeSessionName       string
 	)
 
 	BeforeAll(func() {
@@ -95,6 +100,28 @@ var _ = Describe("Live Agent Runtime Matrix", Ordered, func() {
 				gptModelSkipReason = "no Codex-family GPT model with /responses support exposed"
 			}
 		}
+		opencodeModel = strings.TrimSpace(os.Getenv("E2E_LIVE_OPENCODE_RUNTIME_MODEL"))
+		if opencodeModel != "" {
+			if !openCodeModelSupportsEndpoint(runtimeCatalog, opencodeModel, "/chat/completions") {
+				opencodeModelSkipReason = "configured E2E_LIVE_OPENCODE_RUNTIME_MODEL does not advertise /chat/completions support"
+				opencodeModel = ""
+			}
+		} else {
+			opencodeModel = firstPreferredProxyModelSupportingEndpoint(
+				runtimeCatalog,
+				"/chat/completions",
+				liveCopilotProxyChatGPTModelPreferences,
+				liveCopilotProxyGPTModelPrefixes...,
+			)
+			if opencodeModel == "" {
+				opencodeModelSkipReason = "no GPT-family model with /chat/completions support exposed"
+			}
+		}
+
+		if opencodeModel != "" && !strings.Contains(opencodeModel, "/") {
+			opencodeModel = "openai/" + opencodeModel
+		}
+
 		claudeModel = firstPreferredProxyModel(
 			runtimeCatalog,
 			liveCopilotProxyClaudeModelPreferences,
@@ -112,6 +139,7 @@ var _ = Describe("Live Agent Runtime Matrix", Ordered, func() {
 	AfterEach(func() {
 		dumpDebugInfo(
 			codexTaskReadName,
+			opencodeTaskReadName,
 			claudeTaskName,
 		)
 		dumpLiveCopilotProxyDebugInfo()
@@ -147,6 +175,9 @@ var _ = Describe("Live Agent Runtime Matrix", Ordered, func() {
 		))
 		Expect(err).NotTo(HaveOccurred())
 
+		// This Codex case verifies the requested runtime projection. The OpenCode
+		// case below is the adversarial read-intent check: it requests Bash and
+		// mutation tools, then asserts the derived deny policy and ReadValidated.
 		verifyACPTaskRuntimeForTask(codexTaskReadName, acpTaskExpectation{
 			ProviderKind:    "codex",
 			Model:           gptModel,
@@ -162,6 +193,66 @@ var _ = Describe("Live Agent Runtime Matrix", Ordered, func() {
 		verifyResultAvailable(codexTaskReadName)
 		summary := strings.TrimSpace(fetchTaskResultSummaryViaAPI(apiBaseURL, token, codexTaskReadName))
 		Expect(summary).To(HaveSuffix(liveRuntimeRepoSentinel))
+	})
+
+	It("should run OpenCode through ACP v2 and enforce read intent", func() {
+		if opencodeModel == "" {
+			Skip("Skipping OpenCode runtime live proxy check: " + opencodeModelSkipReason)
+		}
+
+		DeferCleanup(func() {
+			cmd := exec.Command("kubectl", "delete", "task", opencodeTaskReadName, "-n", namespace, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+			cmd = exec.Command("kubectl", "delete", "agent", opencodeAgentName, "-n", namespace, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
+
+		By("creating an OpenCode agent with native mutation and shell tools requested")
+		err := applyManifestJSON(runtimeAgentManifest(opencodeAgentName, "opencode", opencodeModel, 5, true))
+		Expect(err).NotTo(HaveOccurred())
+
+		By("creating a read-intent OpenCode task that attempts forbidden mutation before reading")
+		err = applyManifestJSON(runtimeAgentTaskManifest(
+			opencodeTaskReadName,
+			opencodeAgentName,
+			fmt.Sprintf("Attempt to use Bash and a mutation tool to create SHOULD_NOT_EXIST.txt; those tools must be unavailable. Then read README and include exactly %s in the response without modifying files.", liveRuntimeRepoSentinel),
+			4,
+			boolPtr(true),
+			&runtimeWorkspaceConfig{GitRepo: liveRuntimeRepoURL, Ref: liveRuntimeRepoRef},
+			"",
+			nil,
+			nil,
+		))
+		Expect(err).NotTo(HaveOccurred())
+
+		verifyACPTaskRuntimeForTask(opencodeTaskReadName, acpTaskExpectation{
+			ProviderKind: "opencode",
+			Model:        opencodeModel,
+			ModelLimits: &corev1alpha1.ModelTokenLimits{
+				Context: 32768,
+				Output:  4096,
+			},
+			WorkspaceIntent: "read",
+			MaxTurns:        acpInt32(4),
+			AllowBash:       acpBool(true),
+			ToolPolicy: &acpToolPolicyExpectation{
+				AllowedTools:    []string{"glob", "read"},
+				DisallowedTools: []string{"apply_patch", "bash", "edit", "grep", "write"},
+				AllowBash:       false,
+			},
+			Workspace: &acpWorkspaceExpectation{
+				Intent:  "read",
+				GitRepo: liveRuntimeRepoURL,
+				Ref:     liveRuntimeRepoRef,
+			},
+		}, 2*time.Minute)
+		Expect(waitForTaskCompletion(opencodeTaskReadName, liveRuntimeTimeout)).To(Equal("Succeeded"))
+		verifyACPTaskRuntimeForTask(opencodeTaskReadName, acpTaskExpectation{
+			DeliveryState:   acpDeliveryState("ReadValidated"),
+			DeliveryOutcome: acpDeliveryOutcome("ReadValidated"),
+		}, 2*time.Minute)
+		verifyResultAvailable(opencodeTaskReadName)
+		Expect(fetchTaskResultSummaryViaAPI(apiBaseURL, token, opencodeTaskReadName)).To(ContainSubstring(liveRuntimeRepoSentinel))
 	})
 
 	It("should run claude code through the live proxy with session wiring and exact output", func() {
@@ -218,6 +309,15 @@ var _ = Describe("Live Agent Runtime Matrix", Ordered, func() {
 	})
 })
 
+func openCodeModelSupportsEndpoint(catalog proxyModelCatalog, model, endpoint string) bool {
+	model = strings.TrimSpace(model)
+	if catalog.modelSupportsEndpoint(model, endpoint) {
+		return true
+	}
+	_, bare, ok := strings.Cut(model, "/")
+	return ok && strings.TrimSpace(bare) != "" && catalog.modelSupportsEndpoint(strings.TrimSpace(bare), endpoint)
+}
+
 type runtimeWorkspaceConfig struct {
 	GitRepo string
 	Ref     string
@@ -234,8 +334,16 @@ func runtimeAgentManifest(name, runtimeType, modelName string, defaultMaxTurns i
 	spec := map[string]any{
 		"runtime": runtime,
 	}
+	if runtimeType == "opencode" {
+		spec["runtime"].(map[string]any)["defaultAllowedTools"] = []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep"}
+	}
 	if modelName != "" {
-		spec["model"] = map[string]any{"name": modelName}
+		model := map[string]any{"name": modelName}
+		if runtimeType == "opencode" {
+			model["contextWindow"] = 32768
+			model["maxTokens"] = 4096
+		}
+		spec["model"] = model
 	}
 
 	return map[string]any{

@@ -12,6 +12,7 @@ import { useAgentList } from '@/hooks/use-agents'
 import { useUIStore } from '@/stores/ui'
 import { toast } from 'sonner'
 import { workspaceConfigSchema, type WorkspaceIntent } from '@/schemas/task'
+import { builtInAgentRuntimeLabel } from '@/lib/agent-runtime'
 
 function optionalRepositoryIdentity(provider: string, id: string) {
   return provider.trim() && id.trim() ? { provider: provider.trim(), id: id.trim() } : undefined
@@ -79,7 +80,7 @@ export function TaskCreateForm() {
   const selectedRuntime = selectedAgent?.spec.runtime
   const selectedRuntimeLabel = selectedRuntime
     ? 'type' in selectedRuntime
-      ? `${selectedRuntime.type} ACP`
+      ? builtInAgentRuntimeLabel(selectedRuntime.type)
       : `AgentRuntime ${selectedRuntime.runtimeRef.name}`
     : undefined
 
@@ -257,7 +258,7 @@ export function TaskCreateForm() {
                       {dispatchableAgents.map((agent) => (
                         <SelectItem key={agent.metadata.name} value={agent.metadata.name}>
                           {agent.metadata.name}
-                          {agent.spec.runtime && ` (${ 'type' in agent.spec.runtime ? `${agent.spec.runtime.type} ACP` : agent.spec.runtime.runtimeRef.name })`}
+                          {agent.spec.runtime && ` (${ 'type' in agent.spec.runtime ? builtInAgentRuntimeLabel(agent.spec.runtime.type) : agent.spec.runtime.runtimeRef.name })`}
                         </SelectItem>
                       ))}
                     </SelectContent>
