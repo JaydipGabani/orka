@@ -75,7 +75,7 @@ The black-box Level 1 suite proves at least:
 7. semantic/vector search returns scored results;
 8. tag and owner filters are applied as part of search selection;
 9. capability discovery advertises the features used by the proof; and
-10. all conformance fixtures are cleaned up.
+10. a successful conformance run verifies that all fixtures are cleaned up.
 
 A transparent facade passes only when the configured downstream KD6 service
 passes the same suite. Passing the private `orka.oms.v0alpha1` suite is not
