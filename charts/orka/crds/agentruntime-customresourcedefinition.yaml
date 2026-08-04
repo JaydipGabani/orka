@@ -165,29 +165,6 @@ spec:
                         maxLength: 256
                         minLength: 1
                         type: string
-                      modelLimits:
-                        description: ModelLimits pins optional reviewed model token
-                          capacities.
-                        properties:
-                          context:
-                            description: Context is the maximum model context capacity
-                              in tokens.
-                            format: int64
-                            minimum: 1
-                            type: integer
-                          output:
-                            description: Output is the maximum generated output in
-                              tokens.
-                            format: int64
-                            minimum: 1
-                            type: integer
-                        required:
-                        - context
-                        - output
-                        type: object
-                        x-kubernetes-validations:
-                        - message: model context limit must exceed output limit
-                          rule: self.context > self.output
                       providerKind:
                         maxLength: 128
                         minLength: 1

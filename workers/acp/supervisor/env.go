@@ -317,7 +317,7 @@ func providerSessionPolicy(
 		return providerNativePolicy{}, fmt.Errorf("provider session configuration does not match runtime profile")
 	}
 	toolPolicy := request.MCPConfiguration.ToolPolicy
-	unrestricted := len(toolPolicy.AllowedToolNames) == 0 && len(toolPolicy.DisallowedToolNames) == 0 && toolPolicy.AllowBash
+	unrestricted := toolPolicy.AllowedToolNames == nil && toolPolicy.DisallowedToolNames == nil && toolPolicy.AllowBash
 	policy := providerNativePolicy{unrestricted: unrestricted, allowed: make(map[string]struct{}, len(providerNativeToolNames))}
 	for _, descriptor := range toolPolicy.Tools {
 		if descriptor.Source != harnessv2.MCPToolSourceProviderNative {

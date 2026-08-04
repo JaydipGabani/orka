@@ -12,7 +12,6 @@
 {{- include "orka.validateACPRuntimeImage" (dict "name" "controller.acpRuntime.codexImage" "ref" .Values.controller.acpRuntime.codexImage) }}
 {{- include "orka.validateACPRuntimeImage" (dict "name" "controller.acpRuntime.claudeImage" "ref" .Values.controller.acpRuntime.claudeImage) }}
 {{- include "orka.validateACPRuntimeImage" (dict "name" "controller.acpRuntime.copilotImage" "ref" .Values.controller.acpRuntime.copilotImage) }}
-{{- include "orka.validateACPRuntimeImage" (dict "name" "controller.acpRuntime.opencodeImage" "ref" .Values.controller.acpRuntime.opencodeImage) }}
 {{- if and .Values.controller.acpRuntime.enabled (not .Values.providerProxy.enabled) }}
 {{- fail "providerProxy.enabled must be true when controller.acpRuntime.enabled is true" }}
 {{- end }}
@@ -111,9 +110,6 @@ spec:
             {{- end }}
             {{- if .Values.controller.acpRuntime.copilotImage }}
             - {{ printf "--acp-copilot-runtime-image=%s" .Values.controller.acpRuntime.copilotImage | quote }}
-            {{- end }}
-            {{- if .Values.controller.acpRuntime.opencodeImage }}
-            - {{ printf "--acp-opencode-runtime-image=%s" .Values.controller.acpRuntime.opencodeImage | quote }}
             {{- end }}
             - --zap-log-level={{ .Values.controller.logLevel }}
             - --gateway-enabled={{ $gatewayRuntimeEnabled }}

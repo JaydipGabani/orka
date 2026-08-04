@@ -239,6 +239,38 @@ func TestProviderSessionProjectionFailsClosed(t *testing.T) {
 	}
 }
 
+func TestProviderSessionPolicyDistinguishesOmittedAndExplicitEmptyToolPolicies(t *testing.T) {
+	tests := []struct {
+		provider string
+		model    string
+	}{
+		{provider: providerKindCodex, model: "gpt-test"},
+		{provider: providerKindClaude, model: "claude-test"},
+		{provider: providerKindCopilot, model: "copilot-test"},
+	}
+	for _, test := range tests {
+		t.Run(test.provider, func(t *testing.T) {
+			omitted := testProviderProjectionRequest(t, test.provider, test.model, "", "", nil, nil, true)
+			policy, err := providerSessionPolicy(omitted, test.provider, test.model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !policy.unrestricted {
+				t.Fatal("omitted provider-native tool policy was not unrestricted")
+			}
+
+			explicitEmpty := testProviderProjectionRequest(t, test.provider, test.model, "", "", []string{}, nil, true)
+			policy, err = providerSessionPolicy(explicitEmpty, test.provider, test.model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if policy.unrestricted {
+				t.Fatal("explicit-empty provider-native tool policy was unrestricted")
+			}
+		})
+	}
+}
+
 func TestCopilotAdapterIdentity(t *testing.T) {
 	tests := []struct {
 		goarch     string
@@ -396,8 +428,8 @@ func testProviderProjectionRequest(
 	allowBash bool,
 ) harnessv2.CreateRuntimeSessionRequest {
 	t.Helper()
-	allowed = append([]string(nil), allowed...)
-	disallowed = append([]string(nil), disallowed...)
+	allowed = slices.Clone(allowed)
+	disallowed = slices.Clone(disallowed)
 	slices.Sort(allowed)
 	slices.Sort(disallowed)
 	toolPolicy := harnessv2.MCPToolPolicy{

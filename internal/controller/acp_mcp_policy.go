@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/acp"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/tools"
 )
@@ -45,22 +46,10 @@ const (
 )
 
 var providerNativeTools = map[string]map[string]string{
-	"codex": canonicalToolSet(
-		providerNativeToolRead, providerNativeToolWrite, providerNativeToolEdit, providerNativeToolBash,
-		providerNativeToolGlob, providerNativeToolGrep, providerNativeToolWebSearch, providerNativeToolWebFetch,
-	),
-	"claude": canonicalToolSet(
-		providerNativeToolRead, providerNativeToolWrite, providerNativeToolEdit, providerNativeToolBash,
-		providerNativeToolGlob, providerNativeToolGrep, providerNativeToolWebSearch, providerNativeToolWebFetch,
-	),
-	"copilot": canonicalToolSet(
-		providerNativeToolRead, providerNativeToolWrite, providerNativeToolEdit, providerNativeToolBash,
-		providerNativeToolGlob, providerNativeToolGrep, providerNativeToolWebSearch, providerNativeToolWebFetch,
-	),
-	"opencode": canonicalToolSet(
-		providerNativeToolRead, providerNativeToolWrite, providerNativeToolEdit, "apply_patch",
-		providerNativeToolBash, providerNativeToolGlob, providerNativeToolGrep,
-	),
+	"codex":    canonicalToolSet(acp.BuiltInRuntimeNativeToolNames("codex")...),
+	"claude":   canonicalToolSet(acp.BuiltInRuntimeNativeToolNames("claude")...),
+	"copilot":  canonicalToolSet(acp.BuiltInRuntimeNativeToolNames("copilot")...),
+	"opencode": canonicalToolSet(acp.BuiltInRuntimeNativeToolNames("opencode")...),
 }
 
 func canonicalToolSet(names ...string) map[string]string {

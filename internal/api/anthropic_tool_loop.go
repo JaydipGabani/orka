@@ -285,18 +285,26 @@ your bug — read this section before calling create_agent):
 - runtime.type and model.provider are MUTUALLY EXCLUSIVE on the same Agent.
   - For coders/reviewers that need a workspace (git, shell): set
     runtime.type=codex|claude|copilot|opencode and OMIT model.provider.
-    OpenCode is a built-in ACP RuntimePool profile: set model.name to the endpoint-specific
-    provider/model ID and OMIT runtime.secretRef because credentials come from the controller proxy.
+    OpenCode is a built-in ACP RuntimePool profile. It requires model.name in literal
+    provider/model form (for example openai/gpt-5.4) plus positive, reviewed
+    model.contextWindow and model.maxTokens limits, with contextWindow greater than
+    maxTokens. OMIT systemPrompt and runtime.secretRef/secretRef because OpenCode
+    instructions belong in initialPrompt or Task prompts and credentials come from
+    the controller proxy.
     For credential-backed compatibility runtimes, set runtime.secretRef when required.
     For codex, claude, and copilot, model.name is optional because the runtime can select a default.
   - For pure LLM analysis personas (no git, no shell): set model.provider
     + model.name, OMIT runtime.
-- Coder/reviewer Agents you create in chat MUST set resources so the worker pod
-  is large enough for real test suites:
+- Built-in ACP RuntimePool Agents (runtime.type=codex|claude|copilot|opencode)
+  MUST OMIT custom Agent resources. Their resource classes are controller-owned;
+  Agent-level requests/limits are rejected until a reviewed RuntimePool resource
+  class is selected.
+- For non-ACP execution paths that support custom Agent resources, size the worker
+  for the workload. A useful starting point for memory-heavy work is:
     resources.requests.memory: "512Mi"
     resources.limits.memory:   "2Gi"   (4Gi for medium repos, 8Gi for large)
-  Without this, "go test ./..." / "npm test" / "pytest" routinely OOMKill the
-  worker and the Task fails with "container OOMKilled".
+  Increase those non-ACP limits when "go test ./..." / "npm test" / "pytest"
+  OOMKills the worker.
 - runtime.secretRef naming convention for credential-backed compatibility runtimes
   (OpenCode must omit it; use list_agents first to see what the cluster actually has):
     codex   → codex-runtime-{copilot|openai}
@@ -513,7 +521,7 @@ CRITICAL RULES:
 - Delegate deliberately — do enough research to scope the task, then let agents do the deep dive
 - ALWAYS validate and review after implementation — never skip either step
 - When a child Task fails, ALWAYS fetch_task_output AND check Status.Message for these signals:
-  - "OOMKilled" or "memory limit ... exceeded" → recreate the Agent: call create_agent again (a fresh name) with resources.limits.memory doubled, then use the returned name on a NEW task. Do NOT retry the same Agent; the new Task will OOM the same way.
+  - "OOMKilled" or "memory limit ... exceeded" → first identify the execution path. For a built-in ACP RuntimePool Agent, DO NOT add custom Agent resources; resource classes are controller-owned. Reuse an Agent backed by a suitable reviewed RuntimePool resource class, or report the blocker if none is available. For a non-ACP path that supports custom Agent resources, recreate the Agent with a fresh name and doubled resources.limits.memory, then use the returned name on a NEW task. Do NOT retry the same undersized Agent.
   - "failed to get agent" / "Agent.core.orka.ai ... not found" → the agentRef you passed is not an existing Agent. See AGENT_REF SOURCING. Call create_agent (name + correct shape) and use the returned name on a NEW create_agent_task / create_ai_task. Do NOT retry the failed Task — the missing-Agent error is permanent for that Task object.
   - "container exited with code" → fetch_task_output for the actual error. If fetch_task_output returns a real error string, fix it in the next coder Task (build/test failure) or recreate the Agent (runtime config wrong). If fetch_task_output returns EMPTY / "task has no result yet" while Status.Message says "container exited with code 1", the worker pod crashed BEFORE writing its result configmap — most commonly because git push was rejected (the pushBranch already exists on the remote and the coder's fresh main-based checkout cannot fast-forward). Recovery: create a NEW create_agent_task with a DIFFERENT, suffixed pushBranch (e.g. append "-retry-<short-suffix>" or generate a fresh "orka/<topic>-<8-hex>"). Do NOT declare VALIDATION_BLOCKED on the first occurrence — empty output from a runtime container is much more often a workspace/git problem than a credentials problem; runtime credentials, when broken, produce auth-specific error strings via fetch_task_output, not silent crashes.
   - "failed to push some refs" / "[rejected] (fetch first)" / "non-fast-forward" → the pushBranch you chose already exists on the remote with commits the coder didn't see. Generate a FRESH unique pushBranch (NEW 8-char hex suffix per the WORKSPACE BRANCH RULES — placeholder shape "orka/<topic>-<NEWLY-GENERATED-hex>", do NOT reuse the suffix from the rejected branch or any suffix you've seen in this prompt) and retry the task. Do NOT retry the same branch name — it will reject the same way.

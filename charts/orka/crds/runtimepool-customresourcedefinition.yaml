@@ -168,30 +168,6 @@ spec:
                         maxLength: 256
                         minLength: 1
                         type: string
-                      modelLimits:
-                        description: |-
-                          ModelLimits pins the reviewed context and output capacities used by the
-                          runtime's local compaction policy.
-                        properties:
-                          context:
-                            description: Context is the maximum model context capacity
-                              in tokens.
-                            format: int64
-                            minimum: 1
-                            type: integer
-                          output:
-                            description: Output is the maximum generated output in
-                              tokens.
-                            format: int64
-                            minimum: 1
-                            type: integer
-                        required:
-                        - context
-                        - output
-                        type: object
-                        x-kubernetes-validations:
-                        - message: model context limit must exceed output limit
-                          rule: self.context > self.output
                       protocolVersion:
                         default: orka.harness.v2
                         description: ProtocolVersion is the controller-to-supervisor
@@ -206,7 +182,6 @@ spec:
                         - codex
                         - claude
                         - copilot
-                        - opencode
                         type: string
                       proxyCredentialRole:
                         description: ProxyCredentialRole identifies the provider-proxy
@@ -255,9 +230,6 @@ spec:
                     - toolPolicyDigest
                     - workspaceIntent
                     type: object
-                    x-kubernetes-validations:
-                    - message: OpenCode runtime profiles require modelLimits
-                      rule: self.providerKind != 'opencode' || has(self.modelLimits)
                 required:
                 - image
                 - profile

@@ -93,6 +93,10 @@ describe('agentSpecSchema', () => {
 
   it('parses built-in and external runtime agents', () => {
     expect(agentSpecSchema.parse({ runtime: { type: 'codex' } })).toEqual({ runtime: { type: 'codex' } })
+    expect(agentSpecSchema.parse({ model: { maxTokens: 0 }, runtime: { type: 'codex' } })).toEqual({
+      model: { maxTokens: 0 },
+      runtime: { type: 'codex' },
+    })
     expect(agentSpecSchema.parse({
       model: { name: 'openai/gpt-5.4', contextWindow: 32768, maxTokens: 4096 },
       runtime: { type: 'opencode' },
@@ -111,6 +115,8 @@ describe('agentSpecSchema', () => {
     expect(() => agentSpecSchema.parse({ model: { name: '   ', contextWindow: 32768, maxTokens: 4096 }, runtime: { type: 'opencode' } })).toThrow()
     expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', maxTokens: 4096 }, runtime: { type: 'opencode' } })).toThrow()
     expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', contextWindow: 32768 }, runtime: { type: 'opencode' } })).toThrow()
+    expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', contextWindow: 32768, maxTokens: 0 }, runtime: { type: 'opencode' } })).toThrow('OpenCode requires a positive integer model.maxTokens')
+    expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', contextWindow: 32768, maxTokens: 1.5 }, runtime: { type: 'opencode' } })).toThrow('OpenCode requires a positive integer model.maxTokens')
     expect(() => agentSpecSchema.parse({ model: { name: 'openai/gpt-5.4', contextWindow: 4096, maxTokens: 4096 }, runtime: { type: 'opencode' } })).toThrow()
     expect(() => agentSpecSchema.parse({
       model: { name: 'openai/gpt-5.4', contextWindow: 32768, maxTokens: 4096 },

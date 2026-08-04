@@ -96,6 +96,57 @@ func TestChatCreateAgentTool_Execute_RejectsOpenCodeSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestChatCreateAgentTool_Execute_RejectsUnsupportedOpenCodeTemperature(t *testing.T) {
+	fc := newFakeClient()
+	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
+	result, err := (&ChatCreateAgentTool{}).Execute(ctx, json.RawMessage(`{
+		"name":"opencode-temperature-agent",
+		"model":{"name":"openai/gpt-5.4","temperature":1,"contextWindow":32768,"maxTokens":4096},
+		"runtime":{"type":"opencode"}
+	}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if response.Success || response.ErrorType != errTypeInvalidArgs || !strings.Contains(response.Error, "temperature") {
+		t.Fatalf("response = %#v, want unsupported OpenCode temperature rejection", response)
+	}
+	var created corev1alpha1.Agent
+	if err := fc.Get(context.Background(), client.ObjectKey{Name: "opencode-temperature-agent", Namespace: defaultNamespace}, &created); !apierrors.IsNotFound(err) {
+		t.Fatalf("invalid OpenCode Agent should not be created, get err=%v", err)
+	}
+}
+
+func TestChatCreateAgentTool_Execute_AcceptsLegacyOpenCodeTemperature(t *testing.T) {
+	fc := newFakeClient()
+	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
+	result, err := (&ChatCreateAgentTool{}).Execute(ctx, json.RawMessage(`{
+		"name":"opencode-legacy-temperature-agent",
+		"model":{"name":"openai/gpt-5.4","temperature":0.7,"contextWindow":32768,"maxTokens":4096},
+		"runtime":{"type":"opencode"}
+	}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if !response.Success {
+		t.Fatalf("expected success, got error: %s", response.Error)
+	}
+	var created corev1alpha1.Agent
+	if err := fc.Get(context.Background(), client.ObjectKey{Name: "opencode-legacy-temperature-agent", Namespace: defaultNamespace}, &created); err != nil {
+		t.Fatalf("failed to get created Agent: %v", err)
+	}
+	if created.Spec.Model == nil || created.Spec.Model.Temperature == nil || *created.Spec.Model.Temperature != 0.7 {
+		t.Fatalf("model.temperature = %#v, want legacy value 0.7", created.Spec.Model)
+	}
+}
+
 func TestChatCreateAgentTool_Execute_RejectsOpenCodeLegacySecret(t *testing.T) {
 	fc := newFakeClient()
 	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})

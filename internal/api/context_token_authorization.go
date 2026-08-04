@@ -1711,7 +1711,7 @@ func contextTokenNativeRuntimeToolName(authzCtx contextTokenTaskCreateAuthorizat
 		return true
 	}
 	if runtime != nil && runtime.Type != "" {
-		return true
+		return contextTokenBuiltInRuntimeNativeToolName(runtime.Type, base)
 	}
 	if slices.Contains(toolspkg.CoordinationToolNames(), base) {
 		return true
@@ -1722,6 +1722,11 @@ func contextTokenNativeRuntimeToolName(authzCtx contextTokenTaskCreateAuthorizat
 	default:
 		return false
 	}
+}
+
+// Use the shared built-in runtime policy so credential authorization and MCP projection cannot drift.
+func contextTokenBuiltInRuntimeNativeToolName(runtimeType corev1alpha1.AgentRuntimeType, name string) bool {
+	return acp.IsBuiltInRuntimeNativeTool(string(runtimeType), name)
 }
 
 func contextTokenRuntimeToolConstraints(authzCtx contextTokenTaskCreateAuthorizationContext) []string {

@@ -38,7 +38,7 @@ func (t *ChatCreateAgentTool) Parameters() json.RawMessage {
 		"limits":   map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, "additionalProperties": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString}},
 	},
 	}, modelField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaDescriptionField: "Model configuration; OpenCode requires a literal provider/model name plus reviewed contextWindow and maxTokens", jsonSchemaPropertiesField: map[string]any{
-		"provider": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model provider (e.g. anthropic, openai)"}, nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model name; OpenCode requires a literal provider/model ID"}, "temperature": map[string]any{jsonSchemaTypeField: "number", jsonSchemaDescriptionField: "Sampling temperature"},
+		"provider": map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model provider (e.g. anthropic, openai)"}, nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Model name; OpenCode requires a literal provider/model ID"}, "temperature": map[string]any{jsonSchemaTypeField: "number", "minimum": 0, "maximum": 2, jsonSchemaDescriptionField: "Sampling temperature. OpenCode only accepts the legacy default 0.7."},
 		"contextWindow": map[string]any{jsonSchemaTypeField: jsonSchemaTypeInteger, "minimum": 1, jsonSchemaDescriptionField: "Reviewed model context capacity; required for OpenCode"},
 		"maxTokens":     map[string]any{jsonSchemaTypeField: jsonSchemaTypeInteger, "minimum": 1, jsonSchemaDescriptionField: "Reviewed maximum output tokens; required for OpenCode"},
 	},
@@ -359,6 +359,8 @@ func parseRuntimeConfig(a map[string]any, agent *corev1alpha1.Agent) (string, bo
 	return "", true
 }
 
+const legacyDefaultOpenCodeTemperature = 0.7
+
 func normalizeChatOpenCodeModel(agent *corev1alpha1.Agent) (string, bool) {
 	if agent.Spec.Model == nil || strings.TrimSpace(agent.Spec.Model.Name) == "" {
 		result, _ := ChatToolErrorResult(
@@ -369,14 +371,8 @@ func normalizeChatOpenCodeModel(agent *corev1alpha1.Agent) (string, bool) {
 		return result, false
 	}
 	requested := strings.TrimSpace(agent.Spec.Model.Name)
-	provider := strings.TrimSpace(agent.Spec.Model.Provider)
-	if provider != "" {
-		prefix := strings.TrimSuffix(provider, "/") + "/"
-		if !strings.HasPrefix(requested, prefix) {
-			requested = prefix + strings.TrimPrefix(requested, "/")
-		}
-	}
-	if strings.ContainsAny(requested, "{}") {
+	providerHint := strings.Trim(strings.TrimSpace(agent.Spec.Model.Provider), "/")
+	if strings.ContainsAny(requested, "{}") || strings.ContainsAny(providerHint, "{}") {
 		result, _ := ChatToolErrorResult(
 			"invalid_arguments",
 			"model.name for opencode runtime must not contain substitution braces",
@@ -384,12 +380,43 @@ func normalizeChatOpenCodeModel(agent *corev1alpha1.Agent) (string, bool) {
 		)
 		return result, false
 	}
-	providerID, modelID, valid := strings.Cut(requested, "/")
-	if !valid || strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "" {
+	providerID, modelID, qualified := strings.Cut(requested, "/")
+	if qualified {
+		providerID = strings.TrimSpace(providerID)
+		modelID = strings.TrimSpace(modelID)
+		if providerHint != "" && providerHint != providerID {
+			result, _ := ChatToolErrorResult(
+				"invalid_arguments",
+				fmt.Sprintf("model.provider %q does not match provider %q in model.name for opencode runtime", providerHint, providerID),
+				"Use one provider consistently, or omit model.provider when model.name already uses provider/model form.",
+			)
+			return result, false
+		}
+	} else {
+		providerID = providerHint
+		modelID = requested
+	}
+	if providerID == "" || modelID == "" {
 		result, _ := ChatToolErrorResult(
 			"invalid_arguments",
 			"model.name for opencode runtime must use provider/model form",
 			"Set model.name to a literal provider/model ID such as openai/gpt-5.4.",
+		)
+		return result, false
+	}
+	if agent.Spec.Model.Temperature != nil && *agent.Spec.Model.Temperature != legacyDefaultOpenCodeTemperature {
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			fmt.Sprintf("opencode runtime does not support model.temperature values other than the legacy default %.1f", legacyDefaultOpenCodeTemperature),
+			"Omit model.temperature for OpenCode or use the legacy default 0.7.",
+		)
+		return result, false
+	}
+	if len(agent.Spec.Model.Fallbacks) > 0 {
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			"opencode runtime does not support model.fallbacks",
+			"Remove model.fallbacks from the OpenCode Agent.",
 		)
 		return result, false
 	}
@@ -417,7 +444,7 @@ func normalizeChatOpenCodeModel(agent *corev1alpha1.Agent) (string, bool) {
 		)
 		return result, false
 	}
-	agent.Spec.Model.Name = requested
+	agent.Spec.Model.Name = providerID + "/" + modelID
 	agent.Spec.Model.Provider = ""
 	return "", true
 }

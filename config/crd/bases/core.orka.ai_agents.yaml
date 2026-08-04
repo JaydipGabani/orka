@@ -1274,9 +1274,11 @@ spec:
                       type: object
                     type: array
                   maxTokens:
-                    description: MaxTokens limits the response length.
+                    description: |-
+                      MaxTokens limits the response length. OpenCode validates positive reviewed
+                      limits at its runtime-specific admission boundary; existing Agent objects
+                      may retain the legacy zero value.
                     format: int32
-                    minimum: 1
                     type: integer
                   name:
                     description: |-

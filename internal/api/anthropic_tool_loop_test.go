@@ -41,13 +41,32 @@ func TestCoordinatorSystemPrompt_CreateAgentInvariants(t *testing.T) {
 		"MUTUALLY EXCLUSIVE",
 		"runtime.type=codex|claude|copilot|opencode",
 		"OpenCode is a built-in ACP RuntimePool profile",
-		"OMIT runtime.secretRef",
+		"model.name in literal",
+		"provider/model form",
+		"positive, reviewed",
+		"model.contextWindow and model.maxTokens limits",
+		"contextWindow greater than",
+		"OMIT systemPrompt and runtime.secretRef/secretRef",
+		"instructions belong in initialPrompt or Task prompts",
+		"Built-in ACP RuntimePool Agents",
+		"MUST OMIT custom Agent resources",
+		"resource classes are controller-owned",
+		"Agent-level requests/limits are rejected",
+		"For non-ACP execution paths that support custom Agent resources",
 		"runtime-backed Agent (codex/claude/copilot/opencode",
 		"resources.limits.memory:   \"2Gi\"",
 		"auto-discovery",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("coordinator prompt missing create-agent invariant %q", want)
+		}
+	}
+
+	for _, banned := range []string{
+		"Coder/reviewer Agents you create in chat MUST set resources",
+	} {
+		if strings.Contains(prompt, banned) {
+			t.Fatalf("coordinator prompt still contains contradictory ACP resource instruction %q", banned)
 		}
 	}
 }
@@ -76,6 +95,9 @@ func TestCoordinatorSystemPrompt_FailureSignalHandling(t *testing.T) {
 
 	for _, want := range []string{
 		"\"OOMKilled\" or \"memory limit ... exceeded\"",
+		"For a built-in ACP RuntimePool Agent, DO NOT add custom Agent resources",
+		"resource classes are controller-owned",
+		"For a non-ACP path that supports custom Agent resources",
 		"\"container exited with code\"",
 		"\"agent ... has both runtime and model.provider set\"",
 		"\"git secret ... not found\"",

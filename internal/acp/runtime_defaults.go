@@ -9,6 +9,35 @@ const openCodeToolRead = "read"
 
 var openCodeDefaultAllowedTools = [...]string{"Read", "Write", "Edit", "Bash", "Glob", "Grep"}
 
+var builtInRuntimeNativeTools = map[string][]string{
+	"codex":    {"Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"},
+	"claude":   {"Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"},
+	"copilot":  {"Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"},
+	"opencode": {"Read", "Write", "Edit", "apply_patch", "Bash", "Glob", "Grep"},
+}
+
+// BuiltInRuntimeNativeToolNames returns the provider-native tool names owned by
+// one built-in ACP runtime. Callers receive a copy so policy tables remain
+// immutable.
+func BuiltInRuntimeNativeToolNames(provider string) []string {
+	return append([]string(nil), builtInRuntimeNativeTools[strings.ToLower(strings.TrimSpace(provider))]...)
+}
+
+// IsBuiltInRuntimeNativeTool reports whether name is provider-native for the
+// selected built-in runtime. Brokered and custom tool names return false.
+func IsBuiltInRuntimeNativeTool(provider, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	for _, native := range builtInRuntimeNativeTools[strings.ToLower(strings.TrimSpace(provider))] {
+		if strings.EqualFold(native, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // OpenCodeDefaultAllowedTools returns the governed provider-native tool defaults
 // used when an OpenCode Agent omits runtime.defaultAllowedTools.
 func OpenCodeDefaultAllowedTools() []string {

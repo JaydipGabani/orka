@@ -5,15 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/acp"
 	"github.com/orka-agents/orka/internal/labels"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+const transactionSecretCredentialReadScope = "orka:secrets:credentials:read"
 
 type transactionProviderInfo struct {
 	Name      string
@@ -72,7 +77,6 @@ func validateChildTaskAgainstParentTransaction(ctx context.Context, k8sClient cl
 
 	workspace := taskWorkspace(child)
 	if workspace != nil {
-		const secretCredentialReadScope = "orka:secrets:credentials:read"
 		for _, credential := range []struct {
 			role string
 			ref  *corev1alpha1.WorkspaceCredentialReference
@@ -85,8 +89,8 @@ func validateChildTaskAgainstParentTransaction(ctx context.Context, k8sClient cl
 			if credential.ref == nil || strings.TrimSpace(credential.ref.Name) == "" {
 				continue
 			}
-			if !TransactionHasScope(parent.Spec.Transaction, secretCredentialReadScope) {
-				return fmt.Errorf("child task %s credential %q requires transaction scope %q", credential.role, credential.ref.Name, secretCredentialReadScope)
+			if !TransactionHasScope(parent.Spec.Transaction, transactionSecretCredentialReadScope) {
+				return fmt.Errorf("child task %s credential %q requires transaction scope %q", credential.role, credential.ref.Name, transactionSecretCredentialReadScope)
 			}
 			if want := strings.TrimSpace(txCtx["secret"]); want != "" && credential.ref.Name != want {
 				return fmt.Errorf("child task %s credential %q does not match transaction context %q", credential.role, credential.ref.Name, want)
@@ -94,7 +98,7 @@ func validateChildTaskAgainstParentTransaction(ctx context.Context, k8sClient cl
 		}
 	}
 	if len(txCtx) == 0 {
-		return nil
+		return validateChildToolCredentialConstraints(ctx, k8sClient, parent, child, childCtx)
 	}
 	for _, constraint := range []struct {
 		key string
@@ -114,7 +118,7 @@ func validateChildTaskAgainstParentTransaction(ctx context.Context, k8sClient cl
 	if err := validateChildToolConstraints(txCtx, childCtx); err != nil {
 		return err
 	}
-	return nil
+	return validateChildToolCredentialConstraints(ctx, k8sClient, parent, child, childCtx)
 }
 
 func TransactionHasScope(tx *corev1alpha1.TaskTransaction, want string) bool {
@@ -322,6 +326,217 @@ func validateChildToolConstraints(txCtx map[string]string, childCtx childTransac
 	return nil
 }
 
+type childTransactionCredentialRequirements struct {
+	requiresScope bool
+	secretNames   map[string]struct{}
+}
+
+func validateChildToolCredentialConstraints(
+	ctx context.Context,
+	k8sClient client.Client,
+	parent, child *corev1alpha1.Task,
+	childCtx childTransactionContext,
+) error {
+	for _, toolName := range childTransactionCustomToolNames(childCtx) {
+		if k8sClient == nil {
+			return fmt.Errorf("child task tool %q is unresolved because a Kubernetes client is unavailable", toolName)
+		}
+		tool := &corev1alpha1.Tool{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: toolName, Namespace: child.Namespace}, tool); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("child task tool %q is unresolved", toolName)
+			}
+			return fmt.Errorf("resolve child task Tool %q in namespace %q: %w", toolName, child.Namespace, err)
+		}
+		if tool.Spec.HTTP == nil {
+			continue
+		}
+
+		requirements := childTransactionCredentialRequirements{secretNames: map[string]struct{}{}}
+		if authSecretRef := tool.Spec.HTTP.AuthSecretRef; authSecretRef != nil {
+			secretName := strings.TrimSpace(authSecretRef.Name)
+			if secretName == "" {
+				return fmt.Errorf("child task tool %q has an unresolved HTTP auth Secret reference", toolName)
+			}
+			requirements.addSecret(secretName)
+		}
+		if policyRef := tool.Spec.HTTP.OutboundAccessPolicyRef; policyRef != nil {
+			policyName := strings.TrimSpace(policyRef.Name)
+			if policyName == "" {
+				return fmt.Errorf("child task tool %q has an unresolved OutboundAccessPolicy reference", toolName)
+			}
+			policy := &corev1alpha1.OutboundAccessPolicy{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: policyName, Namespace: child.Namespace}, policy); err != nil {
+				if apierrors.IsNotFound(err) {
+					return fmt.Errorf("child task tool %q references unresolved OutboundAccessPolicy %q", toolName, policyName)
+				}
+				return fmt.Errorf("resolve child task Tool %q OutboundAccessPolicy %q: %w", toolName, policyName, err)
+			}
+			if !childTransactionOutboundAccessPolicyReady(policy) {
+				return fmt.Errorf("child task tool %q references not-ready OutboundAccessPolicy %q", toolName, policyName)
+			}
+			if err := requirements.addOutboundAccessPolicy(policy); err != nil {
+				return fmt.Errorf("child task tool %q OutboundAccessPolicy %q credentials: %w", toolName, policyName, err)
+			}
+		}
+		if err := validateChildTransactionCredentialRequirements(parent, fmt.Sprintf("tool %q credential", toolName), requirements); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func childTransactionCustomToolNames(childCtx childTransactionContext) []string {
+	builtInTools := make(map[string]struct{})
+	for _, name := range KnownBuiltInToolNames() {
+		builtInTools[name] = struct{}{}
+	}
+	seen := map[string]struct{}{}
+	custom := []string{}
+	toolNames := append(append([]string{}, childCtx.aiTools...), childTransactionRuntimeToolConstraints(childCtx)...)
+	for _, name := range toolNames {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, builtIn := builtInTools[name]; builtIn || childTransactionProviderNativeToolName(childCtx.agent, name) {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		custom = append(custom, name)
+	}
+	sort.Strings(custom)
+	return custom
+}
+
+func childTransactionProviderNativeToolName(agent *corev1alpha1.Agent, name string) bool {
+	return agent != nil && agent.Spec.Runtime != nil &&
+		acp.IsBuiltInRuntimeNativeTool(string(agent.Spec.Runtime.Type), name)
+}
+
+func (requirements *childTransactionCredentialRequirements) addSecret(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	if requirements.secretNames == nil {
+		requirements.secretNames = map[string]struct{}{}
+	}
+	requirements.secretNames[name] = struct{}{}
+	requirements.requiresScope = true
+}
+
+func (requirements *childTransactionCredentialRequirements) addOutboundAccessPolicy(policy *corev1alpha1.OutboundAccessPolicy) error {
+	if policy == nil {
+		return fmt.Errorf("policy is unresolved")
+	}
+	addSecretRef := func(role string, ref *corev1alpha1.NamespacedSecretKeySelector) error {
+		if ref == nil {
+			return nil
+		}
+		name := strings.TrimSpace(ref.Name)
+		if name == "" {
+			return fmt.Errorf("%s Secret reference is unresolved", role)
+		}
+		if namespace := strings.TrimSpace(ref.Namespace); namespace != "" && namespace != policy.Namespace {
+			return fmt.Errorf("%s Secret namespace %q does not match policy namespace %q", role, namespace, policy.Namespace)
+		}
+		requirements.addSecret(name)
+		return nil
+	}
+	addTokenSource := func(role string, source *corev1alpha1.OutboundTokenSource) error {
+		if source == nil {
+			return nil
+		}
+		if source.Source == corev1alpha1.OutboundTokenSourceServiceAccount {
+			requirements.requiresScope = true
+		}
+		if source.Source == corev1alpha1.OutboundTokenSourceSecretRef && source.SecretRef == nil {
+			return fmt.Errorf("%s Secret reference is unresolved", role)
+		}
+		return addSecretRef(role, source.SecretRef)
+	}
+	addTLS := func(role string, tlsConfig *corev1alpha1.OutboundTLSConfig) error {
+		if tlsConfig == nil {
+			return nil
+		}
+		return addSecretRef(role, tlsConfig.CASecretRef)
+	}
+
+	if direct := policy.Spec.Direct; direct != nil {
+		if err := addTokenSource("subject", &direct.Subject); err != nil {
+			return err
+		}
+		if err := addTokenSource("actor", direct.Actor); err != nil {
+			return err
+		}
+		if auth := direct.ClientAuthentication; auth != nil {
+			if err := addSecretRef("client authentication", auth.ClientSecretRef); err != nil {
+				return err
+			}
+			if err := addSecretRef("private-key authentication", auth.PrivateKeyRef); err != nil {
+				return err
+			}
+		}
+		if err := addTLS("token endpoint CA", direct.TokenEndpoint.TLS); err != nil {
+			return err
+		}
+	}
+	if gateway := policy.Spec.Gateway; gateway != nil {
+		if err := addTLS("gateway CA", gateway.TLS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateChildTransactionCredentialRequirements(
+	parent *corev1alpha1.Task,
+	description string,
+	requirements childTransactionCredentialRequirements,
+) error {
+	if !requirements.requiresScope {
+		return nil
+	}
+	if !TransactionHasScope(parent.Spec.Transaction, transactionSecretCredentialReadScope) {
+		return fmt.Errorf("child task %s requires transaction scope %q", description, transactionSecretCredentialReadScope)
+	}
+	want := strings.TrimSpace(parent.Spec.Transaction.Context["secret"])
+	if want == "" {
+		return nil
+	}
+	secretNames := make([]string, 0, len(requirements.secretNames))
+	for name := range requirements.secretNames {
+		secretNames = append(secretNames, name)
+	}
+	sort.Strings(secretNames)
+	for _, name := range secretNames {
+		if name != want {
+			return fmt.Errorf("child task %s %q does not match transaction context %q", description, name, want)
+		}
+	}
+	return nil
+}
+
+func childTransactionOutboundAccessPolicyReady(policy *corev1alpha1.OutboundAccessPolicy) bool {
+	if policy == nil || !policy.DeletionTimestamp.IsZero() || policy.Status.ObservedGeneration != policy.Generation {
+		return false
+	}
+	for _, conditionType := range []string{
+		corev1alpha1.OutboundAccessPolicyConditionAccepted,
+		corev1alpha1.OutboundAccessPolicyConditionResolvedRefs,
+	} {
+		condition := meta.FindStatusCondition(policy.Status.Conditions, conditionType)
+		if condition == nil || condition.Status != metav1.ConditionTrue || condition.ObservedGeneration != policy.Generation {
+			return false
+		}
+	}
+	return true
+}
+
 func childTransactionRuntimeToolConstraints(childCtx childTransactionContext) []string {
 	runtimeTools := append([]string{}, childCtx.runtimeTools...)
 	if childCtx.agent != nil && childCtx.agent.Spec.Runtime != nil && childCtx.agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
@@ -371,6 +586,14 @@ func childTransactionEffectiveAITools(child *corev1alpha1.Task, agent *corev1alp
 	}
 	if child.Spec.Type == corev1alpha1.TaskTypeAI {
 		for _, tool := range transactionMemoryToolNames() {
+			if !slices.Contains(tools, tool) {
+				tools = append(tools, tool)
+			}
+		}
+	}
+	messagingCapable := child.Spec.Type == corev1alpha1.TaskTypeAI || child.Spec.Type == corev1alpha1.TaskTypeAgent
+	if _, delegatedChild := child.Labels[labels.LabelParentTask]; messagingCapable && delegatedChild && child.Annotations[labels.AnnotationDisableCoordinationToolInject] != trueStr {
+		for _, tool := range []string{sendMessageToolName, checkMessagesToolName} {
 			if !slices.Contains(tools, tool) {
 				tools = append(tools, tool)
 			}

@@ -172,8 +172,9 @@ type ModelConfig struct {
 	// +optional
 	ContextWindow *int32 `json:"contextWindow,omitempty"`
 
-	// MaxTokens limits the response length.
-	// +kubebuilder:validation:Minimum=1
+	// MaxTokens limits the response length. OpenCode validates positive reviewed
+	// limits at its runtime-specific admission boundary; existing Agent objects
+	// may retain the legacy zero value.
 	// +optional
 	MaxTokens *int32 `json:"maxTokens,omitempty"`
 

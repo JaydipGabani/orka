@@ -54,3 +54,26 @@ func TestNormalizeOpenCodeToolPolicy(t *testing.T) {
 		t.Fatalf("explicit empty policy = %#v, want non-nil empty", allowed)
 	}
 }
+
+func TestBuiltInRuntimeNativeToolPolicy(t *testing.T) {
+	for _, provider := range []string{"codex", "claude", "copilot"} {
+		if !IsBuiltInRuntimeNativeTool(provider, "WebSearch") || !IsBuiltInRuntimeNativeTool(provider, "bash") {
+			t.Fatalf("%s native tool policy omitted a reviewed tool", provider)
+		}
+		if IsBuiltInRuntimeNativeTool(provider, "custom_tool") {
+			t.Fatalf("%s native tool policy accepted a custom tool", provider)
+		}
+	}
+	if !IsBuiltInRuntimeNativeTool("opencode", "apply_patch") || IsBuiltInRuntimeNativeTool("opencode", "WebSearch") {
+		t.Fatal("OpenCode native tool policy does not match the reviewed runtime surface")
+	}
+
+	tools := BuiltInRuntimeNativeToolNames("opencode")
+	if len(tools) == 0 {
+		t.Fatal("OpenCode native tool policy is empty")
+	}
+	tools[0] = "changed"
+	if IsBuiltInRuntimeNativeTool("opencode", "changed") {
+		t.Fatal("BuiltInRuntimeNativeToolNames returned mutable policy storage")
+	}
+}

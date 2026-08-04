@@ -810,6 +810,105 @@ func TestContextTokenTaskToolCredentialFailuresForOutboundAccessPolicy(t *testin
 	require.Contains(t, failures[0], "resource-assertion")
 }
 
+func TestContextTokenTaskToolCredentialFailuresResolvesBuiltInRuntimeCustomTools(t *testing.T) {
+	cfg := enforceContextTokenAuthorizationConfig()
+	cfg.SecretCredentialReadScopeList = []string{ContextTokenScopeSecretsCredentialsRead}
+
+	tests := []struct {
+		name             string
+		runtimeType      corev1alpha1.AgentRuntimeType
+		tool             *corev1alpha1.Tool
+		policy           *corev1alpha1.OutboundAccessPolicy
+		credentialSecret string
+	}{
+		{
+			name:        "OpenCode AuthSecretRef",
+			runtimeType: corev1alpha1.AgentRuntimeOpencode,
+			tool: &corev1alpha1.Tool{
+				ObjectMeta: metav1.ObjectMeta{Name: "incident-search", Namespace: "team-a"},
+				Spec: corev1alpha1.ToolSpec{
+					BrokeredToolClass: corev1alpha1.AgentRuntimeBrokeredToolClassRead,
+					HTTP: &corev1alpha1.HTTPExecution{
+						URL: "https://tools.example.test/incidents",
+						AuthSecretRef: &corev1alpha1.SecretKeySelector{
+							Name: "opencode-tool-auth", Key: "token",
+						},
+					},
+				},
+			},
+			credentialSecret: "opencode-tool-auth",
+		},
+		{
+			name:        "Codex OutboundAccessPolicy",
+			runtimeType: corev1alpha1.AgentRuntimeCodex,
+			tool: &corev1alpha1.Tool{
+				ObjectMeta: metav1.ObjectMeta{Name: "deploy-status", Namespace: "team-a"},
+				Spec: corev1alpha1.ToolSpec{
+					BrokeredToolClass: corev1alpha1.AgentRuntimeBrokeredToolClassRead,
+					HTTP: &corev1alpha1.HTTPExecution{
+						URL: "https://tools.example.test/deployments",
+						OutboundAccessPolicyRef: &corev1alpha1.LocalObjectReference{
+							Name: "resource-api",
+						},
+					},
+				},
+			},
+			policy: readyContextTokenOutboundPolicy(corev1alpha1.OutboundAccessPolicySpec{
+				Direct: &corev1alpha1.DirectOutboundAccess{
+					Subject: corev1alpha1.OutboundTokenSource{
+						Source: corev1alpha1.OutboundTokenSourceSecretRef,
+						SecretRef: &corev1alpha1.NamespacedSecretKeySelector{
+							Name: "codex-resource-assertion", Key: "token",
+						},
+					},
+				},
+			}),
+			credentialSecret: "codex-resource-assertion",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, corev1alpha1.AddToScheme(scheme))
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.tool)
+			if tt.policy != nil {
+				builder = builder.WithObjects(tt.policy)
+			}
+			client := builder.Build()
+			agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+				Type: tt.runtimeType,
+			}}}
+			authzCtx := contextTokenTaskCreateAuthorizationContext{
+				Namespace: "team-a",
+				Request:   CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent},
+				Agent:     agent,
+				RuntimeAllowedTools: []string{
+					tt.tool.Name,
+				},
+			}
+			token := &ContextToken{Scopes: []string{ContextTokenScopeTaskCreate}}
+
+			failures, err := contextTokenTaskToolCredentialFailures(context.Background(), client, token, cfg, authzCtx)
+			require.NoError(t, err)
+			require.Len(t, failures, 1)
+			require.Contains(t, failures[0], ContextTokenScopeSecretsCredentialsRead)
+
+			token.Scopes = append(token.Scopes, ContextTokenScopeSecretsCredentialsRead)
+			token.TransactionContext = map[string]any{"secret": "different-secret"}
+			failures, err = contextTokenTaskToolCredentialFailures(context.Background(), client, token, cfg, authzCtx)
+			require.NoError(t, err)
+			require.Len(t, failures, 1)
+			require.Contains(t, failures[0], tt.credentialSecret)
+
+			token.TransactionContext = map[string]any{"secret": tt.credentialSecret}
+			failures, err = contextTokenTaskToolCredentialFailures(context.Background(), client, token, cfg, authzCtx)
+			require.NoError(t, err)
+			require.Empty(t, failures)
+		})
+	}
+}
+
 func TestContextTokenTaskToolCredentialFailuresForTLSCASecrets(t *testing.T) {
 	tests := []struct {
 		name string

@@ -6,7 +6,7 @@ export const modelConfigSchema = z.object({
   name: z.string().optional(),
   temperature: z.number().optional(),
   contextWindow: z.number().int().positive().optional(),
-  maxTokens: z.number().int().positive().optional(),
+  maxTokens: z.number().optional(),
 })
 
 export const toolRefSchema = z.object({
@@ -90,10 +90,10 @@ export const agentSpecSchema = z.object({
         path: ['model', 'contextWindow'],
       })
     }
-    if (spec.model?.maxTokens === undefined) {
+    if (spec.model?.maxTokens === undefined || !Number.isInteger(spec.model.maxTokens) || spec.model.maxTokens <= 0) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'OpenCode requires model.maxTokens',
+        message: 'OpenCode requires a positive integer model.maxTokens',
         path: ['model', 'maxTokens'],
       })
     }
