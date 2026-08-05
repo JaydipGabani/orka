@@ -109,7 +109,7 @@ func (r *AgentReconciler) validateAgent(ctx context.Context, agent *corev1alpha1
 		}
 	}
 
-	if err := validateOpenCodeAgentSpec(agent); err != nil {
+	if err := ValidateOpenCodeAgentSpec(agent); err != nil {
 		return err
 	}
 

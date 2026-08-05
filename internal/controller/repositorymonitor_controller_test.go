@@ -3900,14 +3900,8 @@ func assertRepositoryMonitorReviewTask(t *testing.T, ctx context.Context, cl crc
 	if task.Spec.Workspace.ReadCredentialRef == nil || task.Spec.Workspace.ReadCredentialRef.Name != "github-token" {
 		t.Fatalf("workspace ReadCredentialRef = %#v, want github-token", task.Spec.Workspace.ReadCredentialRef)
 	}
-	if got := repositoryMonitorTaskEnvValue(task.Spec.Env, workerenv.PRBaseRepo); got != repositoryMonitorTestRepoURL {
-		t.Fatalf("%s = %q, want %s", workerenv.PRBaseRepo, got, repositoryMonitorTestRepoURL)
-	}
-	if got := repositoryMonitorTaskEnvValue(task.Spec.Env, workerenv.PRBaseSHA); got != "base1" {
-		t.Fatalf("%s = %q, want base1", workerenv.PRBaseSHA, got)
-	}
-	if got := repositoryMonitorTaskEnvValue(task.Spec.Env, workerenv.ResultStdout); got != scheduledRunLabelValue {
-		t.Fatalf("%s = %q, want "+scheduledRunLabelValue+" so review JSON is preserved", workerenv.ResultStdout, got)
+	if len(task.Spec.Env) != 0 {
+		t.Fatalf("task env = %#v, want no arbitrary env for ACP runtime compatibility", task.Spec.Env)
 	}
 	if task.Labels[labels.LabelRepositoryMonitor] != labels.SelectorValue("inventory") || task.Labels[labels.LabelMonitorRun] != labels.SelectorValue("run-1") {
 		t.Fatalf("task labels = %#v, want monitor and run labels", task.Labels)
@@ -3921,15 +3915,6 @@ func assertRepositoryMonitorReviewTask(t *testing.T, ctx context.Context, cl crc
 	if !strings.Contains(task.Spec.Prompt, "/workspace/.git/orka/pr-review.diff") {
 		t.Fatalf("task prompt does not include generated PR diff context path:\n%s", task.Spec.Prompt)
 	}
-}
-
-func repositoryMonitorTaskEnvValue(envVars []corev1.EnvVar, name string) string {
-	for _, envVar := range envVars {
-		if envVar.Name == name {
-			return envVar.Value
-		}
-	}
-	return ""
 }
 
 func TestRepositoryMonitorReconcileRejectsInvalidRepoURLWithoutPersistingMetadata(t *testing.T) {

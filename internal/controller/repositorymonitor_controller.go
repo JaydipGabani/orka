@@ -312,7 +312,7 @@ func (r *RepositoryMonitorReconciler) validateRepositoryMonitorReviewerAgent(ctx
 	switch agent.Spec.Runtime.Type {
 	case corev1alpha1.AgentRuntimeClaude, corev1alpha1.AgentRuntimeCodex:
 	case corev1alpha1.AgentRuntimeOpencode:
-		if err := validateOpenCodeAgentSpec(&agent); err != nil {
+		if err := ValidateOpenCodeAgentSpec(&agent); err != nil {
 			return repositoryMonitorReasonUnsupportedReviewerAgent, fmt.Sprintf("spec.agents.reviewer %q has an invalid OpenCode configuration: %v", reviewer.Name, err), nil
 		}
 		return "", "", nil
@@ -446,7 +446,7 @@ func (r *RepositoryMonitorReconciler) validateRepositoryMonitorIssueReadOnlyAgen
 	}
 	switch agent.Spec.Runtime.Type {
 	case corev1alpha1.AgentRuntimeOpencode:
-		if err := validateOpenCodeAgentSpec(&agent); err != nil {
+		if err := ValidateOpenCodeAgentSpec(&agent); err != nil {
 			return "Unsupported" + reasonPrefix + "Agent", fmt.Sprintf("%s %q has an invalid OpenCode configuration: %v", field, ref.Name, err), nil
 		}
 		return "", "", nil

@@ -30,7 +30,7 @@ type ACPRuntimePlan struct {
 }
 
 func PlanACPRuntime(task *corev1alpha1.Task, agent *corev1alpha1.Agent, images ACPRuntimeImages) (ACPRuntimePlan, error) {
-	if err := validateOpenCodeAgentSpec(agent); err != nil {
+	if err := ValidateOpenCodeAgentSpec(agent); err != nil {
 		return ACPRuntimePlan{}, err
 	}
 	if agent != nil && agent.Spec.SystemPrompt != nil && agent.Spec.SystemPrompt.ConfigMapRef != nil {
@@ -56,7 +56,7 @@ func PlanACPRuntimeWithConfiguration(
 	if task == nil || agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type == "" {
 		return ACPRuntimePlan{}, fmt.Errorf("built-in agent runtime is required")
 	}
-	if err := validateOpenCodeAgentSpec(agent); err != nil {
+	if err := ValidateOpenCodeAgentSpec(agent); err != nil {
 		return ACPRuntimePlan{}, err
 	}
 	provider := string(agent.Spec.Runtime.Type)

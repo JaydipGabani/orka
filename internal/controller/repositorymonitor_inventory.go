@@ -385,11 +385,6 @@ func (r *RepositoryMonitorReconciler) createRepositoryMonitorReviewTask(ctx cont
 				ReadCredentialRef: workspaceCredentialReference(gitSecretRef),
 				PRBaseBranch:      pr.BaseBranch,
 			},
-			Env: []corev1.EnvVar{
-				{Name: workerenv.PRBaseRepo, Value: repositoryMonitorHTTPSCloneURL(owner, repository)},
-				{Name: workerenv.PRBaseSHA, Value: pr.BaseSHA},
-				{Name: workerenv.ResultStdout, Value: scheduledRunLabelValue},
-			},
 		},
 	}
 	if err := controllerutil.SetControllerReference(monitor, task, r.Scheme); err != nil {

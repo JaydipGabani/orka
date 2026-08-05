@@ -13,7 +13,8 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 )
 
-func validateOpenCodeAgentSpec(agent *corev1alpha1.Agent) error {
+// ValidateOpenCodeAgentSpec validates the reviewed OpenCode runtime configuration.
+func ValidateOpenCodeAgentSpec(agent *corev1alpha1.Agent) error {
 	if agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.Type != corev1alpha1.AgentRuntimeOpencode {
 		return nil
 	}
