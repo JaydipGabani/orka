@@ -198,12 +198,15 @@ func applyOpenCodeModelUpdate(model *corev1alpha1.ModelConfig, update agentModel
 
 	model.Name = modelName
 	model.Provider = provider
-	if update.legacyString {
-		// Preserve the complete legacy string before final validation so nested
-		// model IDs are not reinterpreted as a conflicting provider hint.
+	if nameWasQualified {
+		// Preserve every qualified OpenCode ID through final validation so nested
+		// model paths are not reinterpreted as a conflicting provider hint.
 		model.Provider = ""
 		if provider != "" {
 			model.Name = provider + "/" + modelName
+		}
+		if update.providerSet {
+			model.Provider = strings.TrimSpace(update.provider)
 		}
 	}
 	applyAgentModelControlUpdate(model, update)

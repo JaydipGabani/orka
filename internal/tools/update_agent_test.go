@@ -393,7 +393,7 @@ func TestUpdateAgentTool_Execute_NormalizesOpenCodeModelAndPreservesOmittedField
 }
 
 func TestUpdateAgentTool_Execute_PreservesNestedOpenCodeLegacyModelString(t *testing.T) {
-	agent := testOpenCodeAgent(testMyAgentName)
+	agent := testOpenCodeAgent()
 	fc := newFakeClient(agent)
 	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
 	result, err := (&UpdateAgentTool{}).Execute(ctx, json.RawMessage(`{
@@ -417,6 +417,34 @@ func TestUpdateAgentTool_Execute_PreservesNestedOpenCodeLegacyModelString(t *tes
 	}
 	if updated.Spec.Model == nil || updated.Spec.Model.Name != "openrouter/anthropic/claude-sonnet-4" || updated.Spec.Model.Provider != "" {
 		t.Fatalf("model identity = %#v, want full nested OpenCode model ID", updated.Spec.Model)
+	}
+}
+
+func TestUpdateAgentTool_Execute_PreservesNestedOpenCodeObjectModelName(t *testing.T) {
+	agent := testOpenCodeAgent()
+	fc := newFakeClient(agent)
+	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
+	result, err := (&UpdateAgentTool{}).Execute(ctx, json.RawMessage(`{
+		"name":"my-agent",
+		"model":{"name":"openrouter/google/gemini-3.1-pro"}
+	}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if !response.Success {
+		t.Fatalf("expected success, got error: %s", response.Error)
+	}
+
+	var updated corev1alpha1.Agent
+	if err := fc.Get(context.Background(), apitypes.NamespacedName{Name: testMyAgentName, Namespace: defaultNamespace}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Spec.Model == nil || updated.Spec.Model.Name != "openrouter/google/gemini-3.1-pro" || updated.Spec.Model.Provider != "" {
+		t.Fatalf("model identity = %#v, want full nested OpenCode object model ID", updated.Spec.Model)
 	}
 }
 
@@ -479,7 +507,7 @@ func TestUpdateAgentTool_Execute_RejectsInvalidOpenCodeModelUpdates(t *testing.T
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			original := testOpenCodeAgent(testMyAgentName)
+			original := testOpenCodeAgent()
 			fc := newFakeClient(original.DeepCopy())
 			ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
 			result, err := (&UpdateAgentTool{}).Execute(ctx, json.RawMessage(`{"name":"my-agent","model":`+tt.modelJSON+`}`))
@@ -506,7 +534,7 @@ func TestUpdateAgentTool_Execute_RejectsInvalidOpenCodeModelUpdates(t *testing.T
 }
 
 func TestUpdateAgentTool_Execute_RejectsUnusableResultingOpenCodeAgent(t *testing.T) {
-	agent := testOpenCodeAgent(testMyAgentName)
+	agent := testOpenCodeAgent()
 	unsupportedTemperature := 1.0
 	agent.Spec.Model.Temperature = &unsupportedTemperature
 	fc := newFakeClient(agent.DeepCopy())
@@ -560,9 +588,9 @@ func TestUpdateAgentTool_Execute_RejectsOpenCodeSystemPrompt(t *testing.T) {
 	}
 }
 
-func testOpenCodeAgent(name string) *corev1alpha1.Agent {
+func testOpenCodeAgent() *corev1alpha1.Agent {
 	return &corev1alpha1.Agent{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: defaultNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: testMyAgentName, Namespace: defaultNamespace},
 		Spec: corev1alpha1.AgentSpec{
 			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
 			Model:   testOpenCodeModelConfig("openai/gpt-5.4"),
