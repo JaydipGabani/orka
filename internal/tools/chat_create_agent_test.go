@@ -147,6 +147,107 @@ func TestChatCreateAgentTool_Execute_AcceptsLegacyOpenCodeTemperature(t *testing
 	}
 }
 
+func TestChatCreateAgentTool_Execute_RejectsFractionalOpenCodeModelLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		agentName string
+		args      json.RawMessage
+		wantField string
+	}{
+		{
+			name:      "context window",
+			agentName: "fractional-context-window",
+			args: json.RawMessage(`{
+				"name":"fractional-context-window",
+				"model":{"name":"openai/gpt-5.4","contextWindow":32768.5,"maxTokens":4096},
+				"runtime":{"type":"opencode"}
+			}`),
+			wantField: "model.contextWindow",
+		},
+		{
+			name:      "max tokens",
+			agentName: "fractional-max-tokens",
+			args: json.RawMessage(`{
+				"name":"fractional-max-tokens",
+				"model":{"name":"openai/gpt-5.4","contextWindow":32768,"maxTokens":4096.5},
+				"runtime":{"type":"opencode"}
+			}`),
+			wantField: "model.maxTokens",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := newFakeClient()
+			ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
+			result, err := (&ChatCreateAgentTool{}).Execute(ctx, tc.args)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var response ChatToolResult
+			if err := json.Unmarshal([]byte(result), &response); err != nil {
+				t.Fatalf("failed to parse result: %v", err)
+			}
+			if response.Success || response.ErrorType != errTypeInvalidArgs || !strings.Contains(response.Error, tc.wantField) {
+				t.Fatalf("response = %#v, want %s integer rejection", response, tc.wantField)
+			}
+			var created corev1alpha1.Agent
+			if err := fc.Get(context.Background(), client.ObjectKey{Name: tc.agentName, Namespace: defaultNamespace}, &created); !apierrors.IsNotFound(err) {
+				t.Fatalf("invalid OpenCode Agent should not be created, get err=%v", err)
+			}
+		})
+	}
+}
+
+func TestParseChatPositiveAgentModelInt32(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  any
+		want int32
+	}{
+		{name: "decoded JSON integer", raw: float64(4096), want: 4096},
+		{name: "int", raw: int(4096), want: 4096},
+		{name: "int8", raw: int8(127), want: 127},
+		{name: "int16", raw: int16(4096), want: 4096},
+		{name: "int32", raw: int32(4096), want: 4096},
+		{name: "int64", raw: int64(4096), want: 4096},
+		{name: "uint", raw: uint(4096), want: 4096},
+		{name: "uint8", raw: uint8(127), want: 127},
+		{name: "uint16", raw: uint16(4096), want: 4096},
+		{name: "uint32", raw: uint32(4096), want: 4096},
+		{name: "uint64", raw: uint64(4096), want: 4096},
+		{name: "max int32", raw: int64(1<<31 - 1), want: 1<<31 - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseChatPositiveAgentModelInt32("model.contextWindow", tc.raw)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name      string
+		raw       any
+		wantError string
+	}{
+		{name: "fractional decoded JSON number", raw: float64(4096.5), wantError: "must be an integer"},
+		{name: "zero", raw: int(0), wantError: "positive 32-bit integer"},
+		{name: "negative", raw: int64(-1), wantError: "positive 32-bit integer"},
+		{name: "signed overflow", raw: int64(1 << 31), wantError: "positive 32-bit integer"},
+		{name: "unsigned overflow", raw: uint64(1 << 31), wantError: "positive 32-bit integer"},
+		{name: "wrong type", raw: "4096", wantError: "must be an integer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseChatPositiveAgentModelInt32("model.contextWindow", tc.raw)
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error = %v, want %q", err, tc.wantError)
+			}
+		})
+	}
+}
+
 func TestChatCreateAgentTool_Execute_RejectsOpenCodeLegacySecret(t *testing.T) {
 	fc := newFakeClient()
 	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})

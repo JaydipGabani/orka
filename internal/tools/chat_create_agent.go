@@ -104,13 +104,27 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 					agent.Spec.Model.Temperature = &tempF
 				}
 			}
-			if contextWindow := chatGetIntArg(m, "contextWindow", 0); contextWindow > 0 && int64(contextWindow) <= int64(^uint32(0)>>1) {
-				value := int32(contextWindow)
-				agent.Spec.Model.ContextWindow = &value
+			if raw, supplied := m["contextWindow"]; supplied {
+				contextWindow, err := parseChatPositiveAgentModelInt32("model.contextWindow", raw)
+				if err != nil {
+					return ChatToolErrorResult(
+						"invalid_arguments",
+						err.Error(),
+						"Use a positive whole-number model.contextWindow within the 32-bit integer range.",
+					)
+				}
+				agent.Spec.Model.ContextWindow = &contextWindow
 			}
-			if maxTokens := chatGetIntArg(m, "maxTokens", 0); maxTokens > 0 && int64(maxTokens) <= int64(^uint32(0)>>1) {
-				value := int32(maxTokens)
-				agent.Spec.Model.MaxTokens = &value
+			if raw, supplied := m["maxTokens"]; supplied {
+				maxTokens, err := parseChatPositiveAgentModelInt32("model.maxTokens", raw)
+				if err != nil {
+					return ChatToolErrorResult(
+						"invalid_arguments",
+						err.Error(),
+						"Use a positive whole-number model.maxTokens within the 32-bit integer range.",
+					)
+				}
+				agent.Spec.Model.MaxTokens = &maxTokens
 			}
 		case string:
 			provider, modelName := splitModelString(m)
@@ -167,6 +181,51 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 	}
 
 	return ChatToolSuccess(map[string]any{nameField: agent.Name, namespaceField: agent.Namespace, messageField: "Agent created"})
+}
+
+func parseChatPositiveAgentModelInt32(field string, raw any) (int32, error) {
+	switch value := raw.(type) {
+	case float64:
+		return parsePositiveAgentModelInt32(field, value)
+	case int:
+		return parseChatPositiveAgentModelSignedInt32(field, int64(value))
+	case int8:
+		return parseChatPositiveAgentModelSignedInt32(field, int64(value))
+	case int16:
+		return parseChatPositiveAgentModelSignedInt32(field, int64(value))
+	case int32:
+		return parseChatPositiveAgentModelSignedInt32(field, int64(value))
+	case int64:
+		return parseChatPositiveAgentModelSignedInt32(field, value)
+	case uint:
+		return parseChatPositiveAgentModelUnsignedInt32(field, uint64(value))
+	case uint8:
+		return parseChatPositiveAgentModelUnsignedInt32(field, uint64(value))
+	case uint16:
+		return parseChatPositiveAgentModelUnsignedInt32(field, uint64(value))
+	case uint32:
+		return parseChatPositiveAgentModelUnsignedInt32(field, uint64(value))
+	case uint64:
+		return parseChatPositiveAgentModelUnsignedInt32(field, value)
+	default:
+		return 0, fmt.Errorf("%s must be an integer", field)
+	}
+}
+
+func parseChatPositiveAgentModelSignedInt32(field string, value int64) (int32, error) {
+	const maxInt32 = int64(1<<31 - 1)
+	if value < 1 || value > maxInt32 {
+		return 0, fmt.Errorf("%s must be a positive 32-bit integer", field)
+	}
+	return int32(value), nil
+}
+
+func parseChatPositiveAgentModelUnsignedInt32(field string, value uint64) (int32, error) {
+	const maxInt32 = uint64(1<<31 - 1)
+	if value < 1 || value > maxInt32 {
+		return 0, fmt.Errorf("%s must be a positive 32-bit integer", field)
+	}
+	return int32(value), nil
 }
 
 func (t *ChatCreateAgentTool) handleInitialPrompt(ctx context.Context, tc *ToolContext, agent *corev1alpha1.Agent, namespace, initialPrompt string) (string, error) {
