@@ -155,6 +155,31 @@ func validateScanRunBundleStatusTransition(current, requested store.BundleStatus
 	return nil
 }
 
+const (
+	storedScanRunPhasePending   = "pending"
+	storedScanRunPhaseRunning   = "running"
+	storedScanRunPhaseSucceeded = "succeeded"
+	storedScanRunPhaseFailed    = "failed"
+)
+
+func terminalSecurityScanRunPhase(phase string) bool {
+	switch strings.TrimSpace(phase) {
+	case storedScanRunPhaseSucceeded, storedScanRunPhaseFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func activeSecurityScanRunPhase(phase string) bool {
+	switch strings.TrimSpace(phase) {
+	case storedScanRunPhasePending, storedScanRunPhaseRunning:
+		return true
+	default:
+		return false
+	}
+}
+
 // UpdateScanRun updates mutable progress while allowing one-time population of immutable identity fields.
 func (s *Store) UpdateScanRun(ctx context.Context, run *store.ScanRun) error {
 	if err := normalizeScanRunIntegrityFields(run); err != nil {
@@ -166,19 +191,41 @@ func (s *Store) UpdateScanRun(ctx context.Context, run *store.ScanRun) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var currentRunUID, currentRepositoryScanUID, currentRequestKey, currentTargetKey, currentTargetReceiptID string
+	var currentRunUID, currentRepositoryScan, currentRepositoryScanUID, currentRequestKey, currentTargetKey, currentTargetReceiptID, currentPhase string
 	var currentBundleStatus store.BundleStatus
-	var currentRepositoryScanGeneration int64
-	err = tx.QueryRowContext(ctx, `SELECT run_uid, repository_scan_uid, repository_scan_generation,
-		request_idempotency_key, resolved_target_key, target_receipt_id, bundle_status
+	var currentRepositoryScanGeneration, currentRowID int64
+	err = tx.QueryRowContext(ctx, `SELECT rowid, run_uid, repository_scan, repository_scan_uid, repository_scan_generation,
+		request_idempotency_key, resolved_target_key, target_receipt_id, bundle_status, phase
 		FROM security_scan_runs WHERE namespace = ? AND id = ?`, run.Namespace, run.ID).
-		Scan(&currentRunUID, &currentRepositoryScanUID, &currentRepositoryScanGeneration,
-			&currentRequestKey, &currentTargetKey, &currentTargetReceiptID, &currentBundleStatus)
+		Scan(&currentRowID, &currentRunUID, &currentRepositoryScan, &currentRepositoryScanUID, &currentRepositoryScanGeneration,
+			&currentRequestKey, &currentTargetKey, &currentTargetReceiptID, &currentBundleStatus, &currentPhase)
 	if errors.Is(err, sql.ErrNoRows) {
 		return store.ErrNotFound
 	}
 	if err != nil {
 		return err
+	}
+	if terminalSecurityScanRunPhase(currentPhase) && activeSecurityScanRunPhase(run.Phase) {
+		var newerRunID string
+		newerErr := tx.QueryRowContext(ctx, `SELECT id
+			FROM security_scan_runs
+			WHERE namespace = ? AND repository_scan = ? AND rowid > ?
+			ORDER BY rowid DESC
+			LIMIT 1`, run.Namespace, currentRepositoryScan, currentRowID).Scan(&newerRunID)
+		switch {
+		case newerErr == nil:
+			// A delayed reconciliation may replay an old Task snapshot after a
+			// newer repository run has been reserved or completed. SQLite rowid is
+			// the immutable insertion sequence, so never let that historical
+			// projection reopen and become
+			// the active repository run again.
+			return nil
+		case errors.Is(newerErr, sql.ErrNoRows):
+			// The latest run may legitimately return to running if newly discovered
+			// work still belongs to that same run.
+		default:
+			return newerErr
+		}
 	}
 	if err := validateScanRunBundleStatusTransition(currentBundleStatus, run.Quality.BundleStatus); err != nil {
 		return err
@@ -233,6 +280,9 @@ func (s *Store) UpdateScanRun(ctx context.Context, run *store.ScanRun) error {
 		run.Quality.IsolationStatus, reasonCodesJSON, run.Summary, run.ErrorMessage, run.StartedAt,
 		run.CompletedAt, run.Namespace, run.ID,
 	)
+	if isSQLiteConstraintError(err) {
+		return fmt.Errorf("%w: active repository scan already exists", store.ErrConflict)
+	}
 	if err != nil {
 		return err
 	}
@@ -429,7 +479,7 @@ func (s *Store) UpsertReviewSlice(ctx context.Context, slice *store.ReviewSlice)
 		slice.Confidence = "medium"
 	}
 	if slice.Status == "" {
-		slice.Status = "pending"
+		slice.Status = "pending" //nolint:goconst // review-slice status is a separate domain from scan-run phase
 	}
 
 	entrypointsJSON, err := marshalSecurityJSON(slice.Entrypoints)

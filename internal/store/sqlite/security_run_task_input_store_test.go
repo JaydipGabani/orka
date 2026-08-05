@@ -235,7 +235,7 @@ func TestCreateScanRunWithTaskInputReservesRepositoryAcrossRequestKeys(t *testin
 		t.Fatalf("GetScanRun(first) error = %v", err)
 	}
 	now := time.Now().UTC()
-	completed.Phase = "succeeded"
+	completed.Phase = storedScanRunPhaseSucceeded
 	completed.CompletedAt = &now
 	if err := s.UpdateScanRun(ctx, completed); err != nil {
 		t.Fatalf("UpdateScanRun(first terminal) error = %v", err)

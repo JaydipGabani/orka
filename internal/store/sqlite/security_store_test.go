@@ -1408,3 +1408,89 @@ func TestUpsertFindingRejectsCredentialBearingProjectionCoordinates(t *testing.T
 		})
 	}
 }
+
+func TestUpdateScanRunIgnoresStaleTerminalReactivationAfterNewerRun(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		completeNewerRun bool
+	}{
+		{name: "newer run active"},
+		{name: "newer run completed", completeNewerRun: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := setupTestStore(t)
+			ctx := context.Background()
+			first := &store.ScanRun{
+				ID: "scan-z-first", RunUID: "run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				Namespace: "ns", RepositoryScan: "repo", RepositoryScanUID: "repo-uid", RepositoryScanGeneration: 1,
+				TaskName: "task-first", Mode: "initial", Phase: storedScanRunPhasePending,
+				RequestIdempotencyKey: "req-first", IdempotencyKey: "req-first",
+				StartedAt: time.Now().UTC(), Quality: store.LegacyScanQuality(),
+			}
+			if err := s.CreateScanRun(ctx, first); err != nil {
+				t.Fatalf("CreateScanRun(first) error = %v", err)
+			}
+			stale, err := s.GetScanRun(ctx, first.Namespace, first.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			completed, err := s.GetScanRun(ctx, first.Namespace, first.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			completed.Phase = storedScanRunPhaseSucceeded
+			completed.CompletedAt = &now
+			completed.Summary = "completed"
+			completed.Quality.BundleStatus = store.BundleStatusSealing
+			if err := s.UpdateScanRun(ctx, completed); err != nil {
+				t.Fatalf("UpdateScanRun(first sealing) error = %v", err)
+			}
+			completed.Quality.BundleStatus = store.BundleStatusSealed
+			if err := s.UpdateScanRun(ctx, completed); err != nil {
+				t.Fatalf("UpdateScanRun(first sealed) error = %v", err)
+			}
+			second := &store.ScanRun{
+				ID: "scan-a-second", RunUID: "run_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				Namespace: first.Namespace, RepositoryScan: first.RepositoryScan, RepositoryScanUID: first.RepositoryScanUID,
+				RepositoryScanGeneration: first.RepositoryScanGeneration, TaskName: "task-second", Mode: "manual",
+				Phase: storedScanRunPhasePending, RequestIdempotencyKey: "req-second", IdempotencyKey: "req-second",
+				StartedAt: now.Add(-time.Hour), Quality: store.LegacyScanQuality(),
+			}
+			if err := s.CreateScanRun(ctx, second); err != nil {
+				t.Fatalf("CreateScanRun(second) error = %v", err)
+			}
+			wantSecondPhase := storedScanRunPhasePending
+			if tt.completeNewerRun {
+				newerCompleted := now.Add(2 * time.Second)
+				second.Phase = storedScanRunPhaseSucceeded
+				second.CompletedAt = &newerCompleted
+				if err := s.UpdateScanRun(ctx, second); err != nil {
+					t.Fatalf("UpdateScanRun(second terminal) error = %v", err)
+				}
+				wantSecondPhase = storedScanRunPhaseSucceeded
+			}
+			stale.Phase = storedScanRunPhaseRunning
+			stale.CompletedAt = nil
+			stale.Summary = "stale replay"
+			if err := s.UpdateScanRun(ctx, stale); err != nil {
+				t.Fatalf("UpdateScanRun(stale terminal replay) error = %v", err)
+			}
+			gotFirst, err := s.GetScanRun(ctx, first.Namespace, first.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotFirst.Phase != storedScanRunPhaseSucceeded || gotFirst.Summary != "completed" || gotFirst.CompletedAt == nil ||
+				gotFirst.Quality.BundleStatus != store.BundleStatusSealed {
+				t.Fatalf("first run after stale replay = %#v", gotFirst)
+			}
+			gotSecond, err := s.GetScanRun(ctx, second.Namespace, second.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotSecond.Phase != wantSecondPhase {
+				t.Fatalf("second run phase = %q, want %q", gotSecond.Phase, wantSecondPhase)
+			}
+		})
+	}
+}
