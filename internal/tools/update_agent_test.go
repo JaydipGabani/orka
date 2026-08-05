@@ -280,7 +280,7 @@ func TestUpdateAgentTool_Execute_LegacyModelStringKeepsProviderBackedSplitting(t
 	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
 	result, err := (&UpdateAgentTool{}).Execute(ctx, json.RawMessage(`{
 		"name":"my-agent",
-		"model":"anthropic/claude-sonnet-4-20250514"
+		"model":"anthropic/claude-haiku-4-5"
 	}`))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -297,7 +297,7 @@ func TestUpdateAgentTool_Execute_LegacyModelStringKeepsProviderBackedSplitting(t
 	if err := fc.Get(context.Background(), apitypes.NamespacedName{Name: testMyAgentName, Namespace: defaultNamespace}, &updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Spec.Model == nil || updated.Spec.Model.Provider != "anthropic" || updated.Spec.Model.Name != "claude-sonnet-4-20250514" {
+	if updated.Spec.Model == nil || updated.Spec.Model.Provider != "anthropic" || updated.Spec.Model.Name != "claude-haiku-4-5" {
 		t.Fatalf("model identity = %#v, want legacy provider/name split", updated.Spec.Model)
 	}
 }

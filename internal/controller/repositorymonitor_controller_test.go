@@ -4241,6 +4241,32 @@ func TestRepositoryMonitorValidationAllowsCodexReviewer(t *testing.T) {
 	}
 }
 
+func TestRepositoryMonitorValidationAllowsOpenCodeReviewerWithoutSecret(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	monitor := &corev1alpha1.RepositoryMonitor{
+		ObjectMeta: metav1.ObjectMeta{Name: "opencode-review-monitor", Namespace: "default"},
+		Spec: corev1alpha1.RepositoryMonitorSpec{Agents: corev1alpha1.RepositoryMonitorAgents{
+			Reviewer: &corev1alpha1.AgentReference{Name: "opencode-reviewer"},
+		}},
+	}
+	reviewer := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "opencode-reviewer", Namespace: "default"},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	reconciler := &RepositoryMonitorReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(reviewer).Build()}
+	reason, message, err := reconciler.validateRepositoryMonitorReviewerAgent(ctx, monitor)
+	if err != nil || reason != "" || message != "" {
+		t.Fatalf("validation reason=%q message=%q err=%v", reason, message, err)
+	}
+}
+
 func TestRepositoryMonitorReconcileRejectsInvalidGitSecretWithoutPersistingMetadata(t *testing.T) {
 	ctx := context.Background()
 	monitorStore := setupControllerSQLiteStore(t)
@@ -7169,6 +7195,33 @@ func TestRepositoryMonitorValidationRejectsCodexPlanner(t *testing.T) {
 	reason, message, err = reconciler.validateRepositoryMonitorIssueReadOnlyAgents(ctx, monitor)
 	if err != nil || reason != "" || message != "" {
 		t.Fatalf("disabled planner validation reason=%q message=%q err=%v", reason, message, err)
+	}
+}
+
+func TestRepositoryMonitorValidationAllowsOpenCodeIssueReadOnlyRolesWithoutSecret(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	for _, role := range []string{"triager", "researcher", "planner"} {
+		t.Run(role, func(t *testing.T) {
+			agent := &corev1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{Name: role, Namespace: "default"},
+				Spec: corev1alpha1.AgentSpec{
+					Model:   testOpenCodeModelConfig(),
+					Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+				},
+			}
+			monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: role + "-monitor", Namespace: "default"}}
+			reconciler := &RepositoryMonitorReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build()}
+			reason, message, err := reconciler.validateRepositoryMonitorIssueReadOnlyAgent(
+				ctx, monitor, role, &corev1alpha1.AgentReference{Name: role},
+			)
+			if err != nil || reason != "" || message != "" {
+				t.Fatalf("validation reason=%q message=%q err=%v", reason, message, err)
+			}
+		})
 	}
 }
 
