@@ -36,6 +36,8 @@ const (
 	providerOpenAIChatCompletionsPath     = "/chat/completions"
 	providerOpenAIChatCompletionsV1Path   = "/v1/chat/completions"
 	providerModelsV1Path                  = "/v1/models"
+	providerMaxTokensField                = "max_tokens"
+	providerMaxCompletionTokensField      = "max_completion_tokens"
 	defaultProviderProxyMaxRequestBytes   = 32 << 20
 	defaultProviderProxyMaxResponseBytes  = 64 << 20
 	defaultProviderProxyHeaderTimeout     = 30 * time.Second
@@ -687,33 +689,38 @@ func normalizeProviderRequestBody(providerKind, model, requestPath string, model
 	if modelOutputLimit <= 0 {
 		return nil, fmt.Errorf("OpenCode model output limit is required")
 	}
-	maxTokens, hasMaxTokens, err := positiveProviderOutputLimit(payload, "max_tokens")
+	providerID, upstreamModel, ok := strings.Cut(model, "/")
+	providerID = strings.TrimSpace(providerID)
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	if !ok || providerID == "" || upstreamModel == "" {
+		return nil, fmt.Errorf("OpenCode model must use provider/model form")
+	}
+	maxTokens, hasMaxTokens, err := positiveProviderOutputLimit(payload, providerMaxTokensField)
 	if err != nil {
 		return nil, err
 	}
-	maxCompletionTokens, hasMaxCompletionTokens, err := positiveProviderOutputLimit(payload, "max_completion_tokens")
+	maxCompletionTokens, hasMaxCompletionTokens, err := positiveProviderOutputLimit(payload, providerMaxCompletionTokensField)
 	if err != nil {
 		return nil, err
 	}
 	outputLimit := modelOutputLimit
-	outputField := "max_tokens"
+	outputField := providerMaxTokensField
+	if strings.EqualFold(providerID, "openai") {
+		outputField = providerMaxCompletionTokensField
+	}
 	if hasMaxTokens && maxTokens < outputLimit {
 		outputLimit = maxTokens
 	}
 	if hasMaxCompletionTokens {
-		outputField = "max_completion_tokens"
+		outputField = providerMaxCompletionTokensField
 		if maxCompletionTokens < outputLimit {
 			outputLimit = maxCompletionTokens
 		}
 	}
-	delete(payload, "max_tokens")
-	delete(payload, "max_completion_tokens")
+	delete(payload, providerMaxTokensField)
+	delete(payload, providerMaxCompletionTokensField)
 	payload[outputField] = outputLimit
-	_, upstreamModel, ok := strings.Cut(model, "/")
-	if !ok || strings.TrimSpace(upstreamModel) == "" {
-		return nil, fmt.Errorf("OpenCode model must use provider/model form")
-	}
-	payload["model"] = strings.TrimSpace(upstreamModel)
+	payload["model"] = upstreamModel
 	return json.Marshal(payload)
 }
 

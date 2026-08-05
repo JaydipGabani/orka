@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -89,22 +90,24 @@ func TestProviderProxyClassifiesOpenCodeChatAsInference(t *testing.T) {
 func TestNormalizeOpenCodeProviderRequestEnforcesOutputLimit(t *testing.T) {
 	for _, test := range []struct {
 		name      string
+		model     string
 		body      string
 		wantField string
 		want      int64
 		wantErr   bool
 	}{
-		{name: "injects missing limit", body: `{"model":"openai/test-model"}`, wantField: "max_tokens", want: 4096},
-		{name: "clamps max tokens", body: `{"model":"openai/test-model","max_tokens":9000}`, wantField: "max_tokens", want: 4096},
-		{name: "preserves lower max tokens", body: `{"model":"openai/test-model","max_tokens":1024}`, wantField: "max_tokens", want: 1024},
-		{name: "prefers completion field", body: `{"model":"openai/test-model","max_tokens":3000,"max_completion_tokens":2000}`, wantField: "max_completion_tokens", want: 2000},
-		{name: "rejects zero", body: `{"model":"openai/test-model","max_tokens":0}`, wantErr: true},
-		{name: "rejects fractional", body: `{"model":"openai/test-model","max_tokens":1.5}`, wantErr: true},
+		{name: "OpenAI translates max tokens", model: "openai/gpt-5.4", body: `{"model":"openai/gpt-5.4","max_tokens":1024}`, wantField: "max_completion_tokens", want: 1024},
+		{name: "injects missing limit", model: "openrouter/anthropic/test-model", body: `{"model":"openrouter/anthropic/test-model"}`, wantField: "max_tokens", want: 4096},
+		{name: "clamps max tokens", model: "openrouter/anthropic/test-model", body: `{"model":"openrouter/anthropic/test-model","max_tokens":9000}`, wantField: "max_tokens", want: 4096},
+		{name: "preserves lower max tokens", model: "openrouter/anthropic/test-model", body: `{"model":"openrouter/anthropic/test-model","max_tokens":1024}`, wantField: "max_tokens", want: 1024},
+		{name: "prefers completion field", model: "openrouter/anthropic/test-model", body: `{"model":"openrouter/anthropic/test-model","max_tokens":3000,"max_completion_tokens":2000}`, wantField: "max_completion_tokens", want: 2000},
+		{name: "rejects zero", model: "openrouter/anthropic/test-model", body: `{"model":"openrouter/anthropic/test-model","max_tokens":0}`, wantErr: true},
+		{name: "rejects fractional", model: "openrouter/anthropic/test-model", body: `{"model":"openrouter/anthropic/test-model","max_tokens":1.5}`, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := normalizeProviderRequestBody(
 				providerKindOpencode,
-				"openai/"+testOpenCodeProxyModel,
+				test.model,
 				providerOpenAIChatCompletionsV1Path,
 				4096,
 				[]byte(test.body),
@@ -122,8 +125,9 @@ func TestNormalizeOpenCodeProviderRequestEnforcesOutputLimit(t *testing.T) {
 			if err := json.Unmarshal(got, &payload); err != nil {
 				t.Fatal(err)
 			}
-			if payload["model"] != testOpenCodeProxyModel {
-				t.Fatalf("model = %#v, want %s", payload["model"], testOpenCodeProxyModel)
+			_, wantModel, _ := strings.Cut(test.model, "/")
+			if payload["model"] != wantModel {
+				t.Fatalf("model = %#v, want %s", payload["model"], wantModel)
 			}
 			if payload[test.wantField] != float64(test.want) {
 				t.Fatalf("%s = %#v, want %d", test.wantField, payload[test.wantField], test.want)
