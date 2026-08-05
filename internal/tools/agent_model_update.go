@@ -19,6 +19,7 @@ type agentModelUpdate struct {
 	providerSet    bool
 	name           string
 	nameSet        bool
+	legacyString   bool
 	temperature    float64
 	temperatureSet bool
 	contextWindow  int32
@@ -70,13 +71,9 @@ func parseAgentModelUpdate(value any) (agentModelUpdate, error) {
 		if legacy == "" {
 			return update, nil
 		}
-		provider, modelName := splitModelString(legacy)
-		if provider != "" {
-			update.provider = strings.TrimSpace(provider)
-			update.providerSet = true
-		}
-		update.name = strings.TrimSpace(modelName)
+		update.name = legacy
 		update.nameSet = true
+		update.legacyString = true
 		return update, nil
 	default:
 		return agentModelUpdate{}, fmt.Errorf("model must be an object")
@@ -158,6 +155,15 @@ func (u agentModelUpdate) hasChanges() bool {
 }
 
 func applyCommonAgentModelUpdate(model *corev1alpha1.ModelConfig, update agentModelUpdate) {
+	if update.legacyString {
+		provider, modelName := splitModelString(update.name)
+		if provider != "" {
+			model.Provider = strings.TrimSpace(provider)
+		}
+		model.Name = strings.TrimSpace(modelName)
+		applyAgentModelControlUpdate(model, update)
+		return
+	}
 	if update.providerSet {
 		model.Provider = update.provider
 	}
@@ -190,9 +196,16 @@ func applyOpenCodeModelUpdate(model *corev1alpha1.ModelConfig, update agentModel
 		}
 	}
 
-	// normalizeChatOpenCodeModel composes and validates the final provider/model ID.
 	model.Name = modelName
 	model.Provider = provider
+	if update.legacyString {
+		// Preserve the complete legacy string before final validation so nested
+		// model IDs are not reinterpreted as a conflicting provider hint.
+		model.Provider = ""
+		if provider != "" {
+			model.Name = provider + "/" + modelName
+		}
+	}
 	applyAgentModelControlUpdate(model, update)
 	return nil
 }

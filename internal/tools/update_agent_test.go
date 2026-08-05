@@ -268,6 +268,40 @@ func TestUpdateAgentTool_Execute_UpdatesNestedModelFields(t *testing.T) {
 	}
 }
 
+func TestUpdateAgentTool_Execute_LegacyModelStringKeepsProviderBackedSplitting(t *testing.T) {
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: testMyAgentName, Namespace: defaultNamespace},
+		Spec: corev1alpha1.AgentSpec{Model: &corev1alpha1.ModelConfig{
+			Provider: providerOpenAI,
+			Name:     testGPT4OModel,
+		}},
+	}
+	fc := newFakeClient(agent)
+	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
+	result, err := (&UpdateAgentTool{}).Execute(ctx, json.RawMessage(`{
+		"name":"my-agent",
+		"model":"anthropic/claude-sonnet-4-20250514"
+	}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if !response.Success {
+		t.Fatalf("expected success, got error: %s", response.Error)
+	}
+
+	var updated corev1alpha1.Agent
+	if err := fc.Get(context.Background(), apitypes.NamespacedName{Name: testMyAgentName, Namespace: defaultNamespace}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Spec.Model == nil || updated.Spec.Model.Provider != "anthropic" || updated.Spec.Model.Name != "claude-sonnet-4-20250514" {
+		t.Fatalf("model identity = %#v, want legacy provider/name split", updated.Spec.Model)
+	}
+}
+
 func TestUpdateAgentTool_Execute_RejectsModelLimitsForNonOpenCodeBuiltIns(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
@@ -358,6 +392,34 @@ func TestUpdateAgentTool_Execute_NormalizesOpenCodeModelAndPreservesOmittedField
 	}
 }
 
+func TestUpdateAgentTool_Execute_PreservesNestedOpenCodeLegacyModelString(t *testing.T) {
+	agent := testOpenCodeAgent(testMyAgentName)
+	fc := newFakeClient(agent)
+	ctx := WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace})
+	result, err := (&UpdateAgentTool{}).Execute(ctx, json.RawMessage(`{
+		"name":"my-agent",
+		"model":"openrouter/anthropic/claude-sonnet-4"
+	}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if !response.Success {
+		t.Fatalf("expected success, got error: %s", response.Error)
+	}
+
+	var updated corev1alpha1.Agent
+	if err := fc.Get(context.Background(), apitypes.NamespacedName{Name: testMyAgentName, Namespace: defaultNamespace}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Spec.Model == nil || updated.Spec.Model.Name != "openrouter/anthropic/claude-sonnet-4" || updated.Spec.Model.Provider != "" {
+		t.Fatalf("model identity = %#v, want full nested OpenCode model ID", updated.Spec.Model)
+	}
+}
+
 func TestUpdateAgentTool_Execute_UpdatesAllOpenCodeModelFields(t *testing.T) {
 	contextWindow := int32(32768)
 	maxTokens := int32(4096)
@@ -413,6 +475,7 @@ func TestUpdateAgentTool_Execute_RejectsInvalidOpenCodeModelUpdates(t *testing.T
 		{name: "invalid token limits", modelJSON: `{"contextWindow":4096,"maxTokens":4096}`, wantError: "must exceed"},
 		{name: "substitution model", modelJSON: `{"name":"{env:PROVIDER}/gpt"}`, wantError: "substitution braces"},
 		{name: "conflicting provider", modelJSON: `{"provider":"anthropic","name":"openai/gpt-5.4"}`, wantError: "provider"},
+		{name: "nested model with conflicting provider", modelJSON: `{"provider":"openrouter","name":"anthropic/claude-sonnet-4"}`, wantError: "provider"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
