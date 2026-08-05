@@ -670,6 +670,68 @@ func TestCreateSecurityScanRunRecoveryUsesImmutableThreatModelInput(t *testing.T
 	require.NotContains(t, task.Spec.Prompt, "replacement threat model")
 }
 
+func TestCreateSecurityScanRunReplaysAfterMapperResolvesHeadCommit(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "resolved-head-replay", Namespace: "demo", UID: types.UID("resolved-head-replay-uid"), Generation: 2,
+		},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL: "https://github.com/example/repo", Branch: "main",
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.RepositoryScan{}).
+		WithObjects(scan).
+		Build()
+	db, err := sqlite.NewDB(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	securityStore := sqlite.NewStore(db, ":memory:")
+	handlers := NewHandlers(HandlersConfig{
+		Client: cl, SecurityStore: securityStore,
+		IntegrityConfig: security.IntegrityConfig{PinnedScanTargetsEnabled: true},
+	})
+	current := &corev1alpha1.RepositoryScan{}
+	require.NoError(t, cl.Get(ctx, client.ObjectKeyFromObject(scan), current))
+
+	created, err := handlers.createSecurityScanRun(ctx, nil, current, "")
+	require.NoError(t, err)
+	requestKey := created.RequestIdempotencyKey
+	resolvedHead := strings.Repeat("a", 40)
+	created.Phase = securityScanRunPhaseRunning
+	created.HeadCommit = resolvedHead
+	created.ResolvedTargetKey = security.ResolvedTargetKey(
+		security.RepositoryTargetID(current), created.BaseCommit, resolvedHead, current.Spec.SubPath, created.PolicyDigest,
+	)
+	created.TargetReceiptID = "target_receipt_resolved_head"
+	require.NoError(t, securityStore.UpdateScanRun(ctx, created))
+
+	app := fiber.New()
+	app.Post("/security/repositories/:name/scans", handlers.CreateManualSecurityScan)
+	req := httptest.NewRequest(http.MethodPost,
+		"/security/repositories/"+scan.Name+"/scans?namespace="+scan.Namespace, nil)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+	require.Equal(t, fiber.StatusCreated, resp.StatusCode)
+	var replayed store.ScanRun
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&replayed))
+	require.Equal(t, created.ID, replayed.ID)
+	require.Equal(t, requestKey, replayed.RequestIdempotencyKey)
+	require.Equal(t, resolvedHead, replayed.HeadCommit)
+
+	runs, _, err := securityStore.ListScanRuns(ctx, scan.Namespace, scan.Name, 10, "")
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	require.Equal(t, created.ID, runs[0].ID)
+}
+
 func TestCreateSecurityScanRunRechecksIdempotencyAfterActiveTaskObserved(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1alpha1.AddToScheme(scheme))
@@ -2384,6 +2446,105 @@ func TestListSecurityPatchProposals_RejectsRecreatedRepositoryScan(t *testing.T)
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestLegacyFindingStateEndpointsRejectPreIntegrityUnboundRun(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		initial string
+	}{
+		{name: "dismiss", path: "/security/findings/finding-legacy/dismiss?namespace=demo", initial: "open"},
+		{name: "reopen", path: "/security/findings/finding-legacy/reopen?namespace=demo", initial: "dismissed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			scheme := runtime.NewScheme()
+			require.NoError(t, corev1alpha1.AddToScheme(scheme))
+			scan := &corev1alpha1.RepositoryScan{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "legacy-scan", Namespace: "demo", UID: types.UID("legacy-scan-uid"), Generation: 1,
+				},
+				Spec: corev1alpha1.RepositoryScanSpec{
+					RepoURL: securityTestRepoURL, Branch: "main",
+					AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+				},
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan).Build()
+			db, err := sqlite.NewDB(":memory:")
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, db.Close()) })
+			securityStore := sqlite.NewStore(db, ":memory:")
+			handlers := NewHandlers(HandlersConfig{
+				Client: cl, SecurityStore: securityStore, SecurityIntegrityStore: securityStore,
+			})
+			require.NoError(t, securityStore.CreateScanRun(ctx, &store.ScanRun{
+				ID: "scan-legacy", Namespace: scan.Namespace, RepositoryScan: scan.Name,
+				TaskName: "legacy-task", Mode: "manual", Phase: "succeeded", StartedAt: time.Now().UTC(),
+				Quality: store.LegacyScanQuality(),
+			}))
+			require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
+				ID: "finding-legacy", Namespace: scan.Namespace, RepositoryScan: scan.Name, ScanRunID: "scan-legacy",
+				Fingerprint: "legacy-fingerprint", Title: "Legacy finding", Summary: "Pre-integrity finding",
+				Severity: "high", Confidence: "medium", State: tt.initial,
+			}))
+
+			app := fiber.New()
+			app.Post("/security/findings/:id/dismiss", handlers.DismissSecurityFinding)
+			app.Post("/security/findings/:id/reopen", handlers.ReopenSecurityFinding)
+			resp, err := app.Test(httptest.NewRequest(http.MethodPost, tt.path, nil))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+			require.Equal(t, fiber.StatusConflict, resp.StatusCode)
+			updated, err := securityStore.GetFinding(ctx, scan.Namespace, "finding-legacy")
+			require.NoError(t, err)
+			require.Equal(t, tt.initial, updated.State)
+		})
+	}
+}
+
+func TestIntegrityFindingDecisionRejectsPreIntegrityUnboundRun(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "legacy-scan", Namespace: "demo", UID: types.UID("legacy-scan-uid"), Generation: 3,
+		},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL: securityTestRepoURL, Branch: "main",
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan).Build()
+	db, err := sqlite.NewDB(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	securityStore := sqlite.NewStore(db, ":memory:")
+	handlers := NewHandlers(HandlersConfig{
+		Client: cl, SecurityStore: securityStore, SecurityIntegrityStore: securityStore,
+	})
+	require.NoError(t, securityStore.CreateScanRun(ctx, &store.ScanRun{
+		ID: "scan-legacy", Namespace: scan.Namespace, RepositoryScan: scan.Name,
+		TaskName: "legacy-task", Mode: "manual", Phase: "succeeded", StartedAt: time.Now().UTC(),
+		Quality: store.LegacyScanQuality(),
+	}))
+	require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
+		ID: "finding-legacy", Namespace: scan.Namespace, RepositoryScan: scan.Name, ScanRunID: "scan-legacy",
+		Fingerprint: "legacy-fingerprint", Title: "Legacy finding", Summary: "Pre-integrity finding",
+		Severity: "high", Confidence: "medium", State: "open",
+	}))
+
+	app := fiber.New()
+	app.Post("/security/findings/:id/decisions", handlers.AppendSecurityFindingDecision)
+	body := strings.NewReader(`{"decisionId":"decision-1","scope":"finding","action":"close_wont_fix","expectedDecisionVersion":0}`)
+	req := httptest.NewRequest(http.MethodPost, "/security/findings/finding-legacy/decisions?namespace=demo", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+	require.Equal(t, fiber.StatusConflict, resp.StatusCode)
 }
 
 func TestSecurityFindingMutations_ContextTokenTransactionContextAuthorizationDenials(t *testing.T) {

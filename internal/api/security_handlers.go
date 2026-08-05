@@ -539,6 +539,25 @@ func scanRunMatchesIdempotencyKey(run *store.ScanRun, requestKey string) bool {
 	return legacyKey == requestKey
 }
 
+func scanRunMatchesOriginalRequest(
+	run *store.ScanRun,
+	mode, baseCommit, headCommit, policyDigest, requestKey string,
+) bool {
+	if run == nil || run.Mode != mode || run.BaseCommit != baseCommit ||
+		run.ScannerPolicyVersion != security.ScannerPolicyVersion || run.PolicyDigest != policyDigest ||
+		!scanRunMatchesIdempotencyKey(run, requestKey) {
+		return false
+	}
+	if strings.TrimSpace(run.RequestIdempotencyKey) != "" {
+		// RequestIdempotencyKey is immutable and captures the originally requested
+		// head before the mapper resolves and writes ScanRun.HeadCommit.
+		return true
+	}
+	// Legacy rows do not carry the immutable request key, so retain the stricter
+	// projection comparison rather than treating a later head as a replay match.
+	return run.HeadCommit == headCommit
+}
+
 func (h *Handlers) findActiveSecurityScanRunByIdempotencyKey(
 	ctx context.Context,
 	scan *corev1alpha1.RepositoryScan,
@@ -596,9 +615,7 @@ func (h *Handlers) recoveredInitialSecurityScanTask(
 		run.RepositoryScanUID != string(scan.UID) || run.RepositoryScanGeneration != scan.Generation {
 		return nil, fmt.Errorf("active scan run %q does not match the current repository scan identity", run.ID)
 	}
-	if run.Mode != mode || run.BaseCommit != baseCommit || run.HeadCommit != headCommit ||
-		run.ScannerPolicyVersion != security.ScannerPolicyVersion || run.PolicyDigest != policyDigest ||
-		!scanRunMatchesIdempotencyKey(run, requestKey) {
+	if !scanRunMatchesOriginalRequest(run, mode, baseCommit, headCommit, policyDigest, requestKey) {
 		return nil, fmt.Errorf("active scan run %q does not match the requested scan inputs", run.ID)
 	}
 	if run.RunUID != strings.TrimSpace(run.RunUID) || !security.ValidRunUID(run.RunUID) {

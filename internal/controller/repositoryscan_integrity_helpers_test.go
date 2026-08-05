@@ -573,11 +573,122 @@ func TestHasActiveValidationTaskIgnoresUncontrolledMalformedBinding(t *testing.T
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, uncontrolled).Build(),
 		Scheme: scheme,
 	}
-	active, err := r.hasActiveValidationTask(context.Background(), scan, findingID)
+	active, err := r.hasActiveValidationTask(context.Background(), scan, &store.Finding{ID: findingID})
 	if err != nil {
 		t.Fatalf("hasActiveValidationTask() error = %v", err)
 	}
 	if active {
 		t.Fatal("hasActiveValidationTask() = true for uncontrolled task")
+	}
+}
+
+func TestHasActiveValidationTaskScopesToCurrentRunAndOccurrence(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta:   metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{Name: "repo", Namespace: "ns", UID: types.UID("scan-uid")},
+	}
+	finding := &store.Finding{
+		ID:                  "fnd_" + strings.Repeat("a", 64),
+		ScanRunID:           "scan-current",
+		CurrentOccurrenceID: "occ_" + strings.Repeat("b", 64),
+	}
+	validationTask := func(name, scanRunID, occurrenceID string) *corev1alpha1.Task {
+		t.Helper()
+		task := &corev1alpha1.Task{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: scan.Namespace,
+				Labels: map[string]string{
+					labels.LabelSecurityTarget:       labels.SelectorValue(scan.Name),
+					labels.LabelSecurityFindingID:    labels.SelectorValue(finding.ID),
+					labels.LabelSecurityScanID:       scanRunID,
+					labels.LabelSecurityOccurrenceID: labels.SelectorValue(occurrenceID),
+					labels.LabelSecurityStage:        security.StageValidation,
+				},
+			},
+			Spec: corev1alpha1.TaskSpec{Env: []corev1.EnvVar{
+				{Name: security.EnvScanID, Value: scanRunID},
+				{Name: security.EnvFindingID, Value: finding.ID},
+				{Name: security.EnvOccurrenceID, Value: occurrenceID},
+			}},
+			Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseRunning},
+		}
+		if err := controllerutil.SetControllerReference(scan, task, scheme); err != nil {
+			t.Fatalf("SetControllerReference() error = %v", err)
+		}
+		return task
+	}
+
+	previousRun := validationTask("previous-run-validation", "scan-previous", finding.CurrentOccurrenceID)
+	previousOccurrence := validationTask("previous-occurrence-validation", finding.ScanRunID, "occ_"+strings.Repeat("c", 64))
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, previousRun, previousOccurrence).Build()
+	r := &RepositoryScanReconciler{Client: cl, Scheme: scheme}
+
+	active, err := r.hasActiveValidationTask(context.Background(), scan, finding)
+	if err != nil {
+		t.Fatalf("hasActiveValidationTask() error = %v", err)
+	}
+	if active {
+		t.Fatal("hasActiveValidationTask() = true for a previous run or occurrence")
+	}
+
+	current := validationTask("current-occurrence-validation", finding.ScanRunID, finding.CurrentOccurrenceID)
+	if err := cl.Create(context.Background(), current); err != nil {
+		t.Fatalf("Create(current validation task) error = %v", err)
+	}
+	active, err = r.hasActiveValidationTask(context.Background(), scan, finding)
+	if err != nil {
+		t.Fatalf("hasActiveValidationTask() with current task error = %v", err)
+	}
+	if !active {
+		t.Fatal("hasActiveValidationTask() = false for the current run and occurrence")
+	}
+}
+
+func TestHasActiveValidationTaskRejectsMalformedCurrentOccurrenceBinding(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta:   metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{Name: "repo", Namespace: "ns", UID: types.UID("scan-uid")},
+	}
+	finding := &store.Finding{
+		ID:                  "fnd_" + strings.Repeat("a", 64),
+		ScanRunID:           "scan-current",
+		CurrentOccurrenceID: "occ_" + strings.Repeat("b", 64),
+	}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "malformed-current-validation", Namespace: scan.Namespace,
+			Labels: map[string]string{
+				labels.LabelSecurityTarget:       labels.SelectorValue(scan.Name),
+				labels.LabelSecurityFindingID:    labels.SelectorValue(finding.ID),
+				labels.LabelSecurityScanID:       finding.ScanRunID,
+				labels.LabelSecurityOccurrenceID: labels.SelectorValue(finding.CurrentOccurrenceID),
+				labels.LabelSecurityStage:        security.StageValidation,
+			},
+		},
+		Spec: corev1alpha1.TaskSpec{Env: []corev1.EnvVar{
+			{Name: security.EnvScanID, Value: finding.ScanRunID},
+			{Name: security.EnvFindingID, Value: finding.ID},
+			{Name: security.EnvOccurrenceID, Value: "occ_" + strings.Repeat("c", 64)},
+		}},
+		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseRunning},
+	}
+	if err := controllerutil.SetControllerReference(scan, task, scheme); err != nil {
+		t.Fatalf("SetControllerReference() error = %v", err)
+	}
+	r := &RepositoryScanReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, task).Build(),
+		Scheme: scheme,
+	}
+
+	if active, err := r.hasActiveValidationTask(context.Background(), scan, finding); err == nil {
+		t.Fatalf("hasActiveValidationTask() = %v, nil error for mismatched occurrence binding", active)
 	}
 }

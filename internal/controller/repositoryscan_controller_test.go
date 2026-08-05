@@ -4172,6 +4172,77 @@ func TestEnqueueAutoValidationTasksHonorsRunCapAcrossExistingTasks(t *testing.T)
 	}
 }
 
+func TestScheduleFinalizedValidationDoesNotReusePreviousOccurrenceTask(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "validation-occurrence-scope", Namespace: defaultNS,
+			UID: types.UID("validation-occurrence-scope-uid"), Generation: 1,
+		},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL: "https://github.com/example/repo", AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	}
+	run := &storepkg.ScanRun{
+		ID: "scan-current-validation", RunUID: "run_6666666666666666666666666666666666666666666666666666666666666666",
+		Namespace: scan.Namespace, RepositoryScan: scan.Name, RepositoryScanUID: string(scan.UID),
+		RepositoryScanGeneration: scan.Generation, TaskName: "source-task", Mode: "manual", Phase: scanRunPhaseSucceeded,
+		HeadCommit: strings.Repeat("d", 40), StartedAt: time.Now().UTC(), Quality: storepkg.LegacyScanQuality(),
+	}
+	if err := securityStore.CreateScanRun(ctx, run); err != nil {
+		t.Fatalf("CreateScanRun() error = %v", err)
+	}
+	finding := &storepkg.Finding{
+		ID: "fnd_" + strings.Repeat("a", 64), Namespace: scan.Namespace, RepositoryScan: scan.Name,
+		ScanRunID: run.ID, CurrentOccurrenceID: "occ_" + strings.Repeat("b", 64),
+		Title: "Current occurrence", Severity: "high", Confidence: "high",
+	}
+	previousOccurrenceID := "occ_" + strings.Repeat("c", 64)
+	previous := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "previous-occurrence-validation", Namespace: scan.Namespace,
+			Labels: map[string]string{
+				labels.LabelSecurityTarget:       labels.SelectorValue(scan.Name),
+				labels.LabelSecurityFindingID:    labels.SelectorValue(finding.ID),
+				labels.LabelSecurityScanID:       "scan-previous-validation",
+				labels.LabelSecurityOccurrenceID: labels.SelectorValue(previousOccurrenceID),
+				labels.LabelSecurityStage:        security.StageValidation,
+			},
+		},
+		Spec: corev1alpha1.TaskSpec{Env: []corev1.EnvVar{
+			{Name: security.EnvScanID, Value: "scan-previous-validation"},
+			{Name: security.EnvFindingID, Value: finding.ID},
+			{Name: security.EnvOccurrenceID, Value: previousOccurrenceID},
+		}},
+		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseRunning},
+	}
+	if err := controllerutil.SetControllerReference(scan, previous, scheme); err != nil {
+		t.Fatalf("SetControllerReference() error = %v", err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, previous).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore}
+
+	if err := reconciler.scheduleFinalizedValidation(ctx, scan, run, []*storepkg.Finding{finding}); err != nil {
+		t.Fatalf("scheduleFinalizedValidation() error = %v", err)
+	}
+	currentTaskName := security.ScanStageTaskNameForRun(
+		scan.Name, "validation", security.StageValidation, finding.CurrentOccurrenceID, run.RunUID,
+	)
+	current := &corev1alpha1.Task{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: scan.Namespace, Name: currentTaskName}, current); err != nil {
+		t.Fatalf("Get(current occurrence validation task) error = %v", err)
+	}
+	if got, err := taskSecurityOccurrenceID(current); err != nil || got != finding.CurrentOccurrenceID {
+		t.Fatalf("taskSecurityOccurrenceID() = (%q, %v), want current occurrence", got, err)
+	}
+}
+
 func TestCreateValidationTaskUsesLabelSafeExactSecurityIDs(t *testing.T) {
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)

@@ -2221,6 +2221,10 @@ func taskSecurityBoundID(task *corev1alpha1.Task, labelKey, envName, kind string
 	return fullID, nil
 }
 
+func taskSecurityScanRunID(task *corev1alpha1.Task) (string, error) {
+	return taskSecurityBoundID(task, labels.LabelSecurityScanID, security.EnvScanID, "scan run ID")
+}
+
 func taskSecurityFindingID(task *corev1alpha1.Task) (string, error) {
 	return taskSecurityBoundID(task, labels.LabelSecurityFindingID, security.EnvFindingID, "finding ID")
 }
@@ -3455,10 +3459,18 @@ func (r *RepositoryScanReconciler) shouldAutoValidateFinding(scan *corev1alpha1.
 	}
 }
 
-func (r *RepositoryScanReconciler) hasActiveValidationTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, findingID string) (bool, error) {
-	if r.Client == nil {
+func (r *RepositoryScanReconciler) hasActiveValidationTask(
+	ctx context.Context,
+	scan *corev1alpha1.RepositoryScan,
+	finding *store.Finding,
+) (bool, error) {
+	if r.Client == nil || finding == nil {
 		return false, nil
 	}
+	findingID := strings.TrimSpace(finding.ID)
+	scanRunID := strings.TrimSpace(finding.ScanRunID)
+	occurrenceID := strings.TrimSpace(finding.CurrentOccurrenceID)
+
 	var tasks corev1alpha1.TaskList
 	if err := r.List(ctx, &tasks,
 		client.InNamespace(scan.Namespace),
@@ -3479,7 +3491,15 @@ func (r *RepositoryScanReconciler) hasActiveValidationTask(ctx context.Context, 
 		if err != nil {
 			return false, err
 		}
-		if taskFindingID == findingID {
+		taskScanRunID, err := taskSecurityScanRunID(task)
+		if err != nil {
+			return false, err
+		}
+		taskOccurrenceID, err := taskSecurityOccurrenceID(task)
+		if err != nil {
+			return false, err
+		}
+		if taskFindingID == findingID && taskScanRunID == scanRunID && taskOccurrenceID == occurrenceID {
 			return true, nil
 		}
 	}
@@ -3753,7 +3773,7 @@ func (r *RepositoryScanReconciler) enqueueAutoValidationTasks(ctx context.Contex
 			finding.ValidationStatus == findingValidationStatusPending {
 			continue
 		}
-		active, err := r.hasActiveValidationTask(ctx, scan, finding.ID)
+		active, err := r.hasActiveValidationTask(ctx, scan, finding)
 		if err != nil {
 			return err
 		}
@@ -4447,7 +4467,7 @@ func (r *RepositoryScanReconciler) scheduleFinalizedValidation(
 			}
 		}
 		if r.shouldAutoValidateFinding(scan, finding, created) {
-			active, err := r.hasActiveValidationTask(ctx, scan, finding.ID)
+			active, err := r.hasActiveValidationTask(ctx, scan, finding)
 			if err != nil {
 				return err
 			}
