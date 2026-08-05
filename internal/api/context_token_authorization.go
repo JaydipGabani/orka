@@ -1359,7 +1359,7 @@ func contextTokenAgentRuntimeAuthorizationPolicy(agent *corev1alpha1.Agent) ([]s
 			string(agent.Spec.Runtime.Type), allowedTools, nil, allowBash,
 		)
 		allowedTools = acp.BuiltInRuntimeEffectiveAllowedTools(allowedTools, nil, allowBash)
-		allowBash = acp.BuiltInRuntimeEffectiveAllowBash(nil, allowBash)
+		allowBash = acp.BuiltInRuntimeEffectiveAllowBash(allowedTools, nil, allowBash)
 		return allowedTools, allowBash
 	}
 	allowedTools, disallowedTools, allowBash := acp.NormalizeOpenCodeToolPolicy(false, allowedTools, nil, allowBash)
@@ -1391,7 +1391,7 @@ func contextTokenTaskCreateEffectiveRuntimePolicy(req CreateTaskRequest, agent *
 			string(agent.Spec.Runtime.Type), allowedTools, disallowedTools, allowBash,
 		)
 		allowedTools = acp.BuiltInRuntimeEffectiveAllowedTools(allowedTools, disallowedTools, allowBash)
-		allowBash = acp.BuiltInRuntimeEffectiveAllowBash(disallowedTools, allowBash)
+		allowBash = acp.BuiltInRuntimeEffectiveAllowBash(allowedTools, disallowedTools, allowBash)
 		return allowedTools, allowBash
 	}
 	workspace := taskRequestWorkspace(req)

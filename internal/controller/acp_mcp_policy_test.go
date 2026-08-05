@@ -164,6 +164,66 @@ func TestBuildRuntimeSessionMCPConfigurationSynthesizesDenyOnlyProviderNativeToo
 	}
 }
 
+func TestBuildRuntimeSessionMCPConfigurationTranslatesReadOnlyOpenCodeTools(t *testing.T) {
+	image := "docker.io/example/opencode@sha256:" + strings.Repeat("d", 64)
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "review", Namespace: "default", UID: "task-uid",
+			Annotations: map[string]string{labels.AnnotationAgentReadOnly: scheduledRunLabelValue},
+		},
+		Spec: corev1alpha1.TaskSpec{
+			Type:         corev1alpha1.TaskTypeAgent,
+			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: readOnlyAgentAllowedTools()},
+			Workspace:    &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead},
+		},
+	}
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "reviewer", Namespace: "default", UID: "agent-uid", Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   testOpenCodeModelConfig(),
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
+		},
+	}
+	plan, err := PlanACPRuntime(task, agent, ACPRuntimeImages{Opencode: image})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := buildRuntimeSessionMCPConfiguration(context.Background(), nil, task, agent, plan.Profile)
+	if err != nil {
+		t.Fatalf("buildRuntimeSessionMCPConfiguration() error = %v", err)
+	}
+	if want := []string{"glob", "read"}; !slices.Equal(configuration.ToolPolicy.AllowedToolNames, want) {
+		t.Fatalf("read-only OpenCode tools = %#v, want %#v", configuration.ToolPolicy.AllowedToolNames, want)
+	}
+}
+
+func TestEffectiveACPAllowedToolsOnlyTranslatesReadOnlyOpenCodePreset(t *testing.T) {
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		Type: corev1alpha1.AgentRuntimeOpencode,
+	}}}
+	for _, tt := range []struct {
+		name    string
+		allowed []string
+		want    []string
+	}{
+		{name: "repository monitor preset", allowed: readOnlyAgentAllowedTools(), want: []string{providerNativeToolGlob, providerNativeToolRead}},
+		{name: "explicit deny all", allowed: []string{}, want: []string{}},
+		{name: "all blank remains deny all", allowed: []string{" "}, want: []string{}},
+		{name: "narrower glob only", allowed: []string{providerNativeToolGlob}, want: []string{providerNativeToolGlob}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			task := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{labels.AnnotationAgentReadOnly: scheduledRunLabelValue}},
+				Spec:       corev1alpha1.TaskSpec{AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: tt.allowed}},
+			}
+			got := effectiveACPAllowedTools(task, agent)
+			if !slices.Equal(got, tt.want) || (tt.want != nil && got == nil) {
+				t.Fatalf("effective tools = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNormalizeACPProviderNativeToolPolicyPreservesExplicitAndUnrestrictedPolicies(t *testing.T) {
 	explicitAllowed := []string{providerNativeToolRead, "web_search"}
 	explicitDisallowed := []string{providerNativeToolWrite}

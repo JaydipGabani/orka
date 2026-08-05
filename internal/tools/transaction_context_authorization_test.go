@@ -232,7 +232,7 @@ func TestValidateChildTaskAgainstParentTransactionRejectsBlankAgentRuntimeTools(
 	}
 }
 
-func TestValidateChildTaskAgainstParentTransactionRejectsEnabledBashOutsideAllowedTools(t *testing.T) {
+func TestValidateChildTaskAgainstParentTransactionAcceptsExplicitAllowlistWithoutBash(t *testing.T) {
 	parent := parentTask()
 	parent.Spec.Transaction.Context = map[string]string{
 		"namespace":     defaultNamespace,
@@ -247,9 +247,8 @@ func TestValidateChildTaskAgainstParentTransactionRejectsEnabledBashOutsideAllow
 	child := childTaskForResearcherAgent()
 	child.Spec.Type = corev1alpha1.TaskTypeAgent
 
-	err := validateChildTaskAgainstParentTransaction(context.Background(), newFakeClient(agent), parent, child, testResearcherAgentName)
-	if err == nil || !strings.Contains(err.Error(), `tool "Bash"`) {
-		t.Fatalf("validateChildTaskAgainstParentTransaction() error = %v, want bash tool denial", err)
+	if err := validateChildTaskAgainstParentTransaction(context.Background(), newFakeClient(agent), parent, child, testResearcherAgentName); err != nil {
+		t.Fatalf("validateChildTaskAgainstParentTransaction() error = %v, want explicit Read-only subset accepted", err)
 	}
 }
 
@@ -690,6 +689,15 @@ func TestChildTransactionEffectiveRuntimePolicyNormalizesBuiltInNarrowing(t *tes
 					childType: child.Spec.Type, agent: agent, runtimeTools: tools, runtimeBash: bash,
 				}); err != nil {
 					t.Fatalf("explicit deny-all subset rejected: %v", err)
+				}
+			})
+
+			t.Run("explicit allowlist without bash closes effective bash", func(t *testing.T) {
+				explicitAgent := agent.DeepCopy()
+				explicitAgent.Spec.Runtime.DefaultAllowedTools = []string{"Read"}
+				tools, bash := childTransactionEffectiveRuntimePolicy(&corev1alpha1.Task{}, explicitAgent)
+				if !slices.Equal(tools, []string{"Read"}) || bash {
+					t.Fatalf("explicit read-only policy = %#v allowBash=%v, want Read with allowBash=false", tools, bash)
 				}
 			})
 

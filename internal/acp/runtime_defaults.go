@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"slices"
 	"sort"
 	"strings"
 )
@@ -83,12 +84,13 @@ func BuiltInRuntimeEffectiveAllowedTools(allowed, disallowed []string, allowBash
 	result := make([]string, 0, len(allowed))
 	for _, name := range allowed {
 		name = strings.TrimSpace(name)
-		if name == "" || (!allowBash && strings.EqualFold(name, "bash")) {
+		if name == "" || (!allowBash && strings.EqualFold(builtInRuntimeToolBaseName(name), "bash")) {
 			continue
 		}
 		blocked := false
 		for _, denied := range disallowed {
-			if strings.TrimSpace(denied) == name {
+			denied = strings.TrimSpace(denied)
+			if denied == name || (strings.EqualFold(denied, "bash") && strings.EqualFold(builtInRuntimeToolBaseName(name), "bash")) {
 				blocked = true
 				break
 			}
@@ -100,9 +102,9 @@ func BuiltInRuntimeEffectiveAllowedTools(allowed, disallowed []string, allowBash
 	return sortedUniqueToolNames(result)
 }
 
-// BuiltInRuntimeEffectiveAllowBash applies explicit Bash denies to the
-// separate Bash gate used by authorization subset checks.
-func BuiltInRuntimeEffectiveAllowBash(disallowed []string, allowBash bool) bool {
+// BuiltInRuntimeEffectiveAllowBash projects the effective Bash capability into
+// the separate gate used by authorization subset checks.
+func BuiltInRuntimeEffectiveAllowBash(allowed, disallowed []string, allowBash bool) bool {
 	if !allowBash {
 		return false
 	}
@@ -111,7 +113,20 @@ func BuiltInRuntimeEffectiveAllowBash(disallowed []string, allowBash bool) bool 
 			return false
 		}
 	}
-	return true
+	if allowed == nil {
+		return true
+	}
+	return slices.ContainsFunc(allowed, func(name string) bool {
+		return strings.EqualFold(builtInRuntimeToolBaseName(name), "bash")
+	})
+}
+
+func builtInRuntimeToolBaseName(value string) string {
+	value = strings.TrimSpace(value)
+	if index := strings.IndexByte(value, '('); index >= 0 {
+		value = strings.TrimSpace(value[:index])
+	}
+	return value
 }
 
 // OpenCodeDefaultAllowedTools returns the governed provider-native tool defaults

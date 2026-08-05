@@ -222,7 +222,7 @@ func TestAuthorizeContextTokenToolAgentCreateRejectsSpecOutsideTokenConstraints(
 	require.Contains(t, joined, `agent provider "anthropic" is not allowed by token context`)
 	require.Contains(t, joined, `agent model "claude-3-5-sonnet" is not allowed by token context`)
 	require.Contains(t, joined, `agent tool "web_search" is not allowed by token context`)
-	require.Contains(t, joined, `agent tool "Bash" is not allowed by token context`)
+	require.NotContains(t, joined, `agent tool "Bash" is not allowed by token context`)
 }
 
 func TestContextTokenAgentSpecFailuresRejectsCrossNamespaceProviderRef(t *testing.T) {
@@ -860,7 +860,15 @@ func TestContextTokenRuntimeAuthorizationPolicyExpandsGenericNarrowing(t *testin
 		Type: corev1alpha1.AgentRuntimeClaude, DefaultAllowedTools: []string{"Read", "Write"},
 	}}})
 	require.Equal(t, []string{"Read"}, gotTools)
-	require.True(t, gotBash)
+	require.False(t, gotBash)
+
+	gotTools, gotBash = contextTokenAgentRuntimeAuthorizationPolicy(&corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
+		Runtime: &corev1alpha1.AgentCLIRuntime{
+			Type: corev1alpha1.AgentRuntimeClaude, DefaultAllowedTools: []string{"Read"},
+		},
+	}})
+	require.Equal(t, []string{"Read"}, gotTools)
+	require.False(t, gotBash)
 
 	gotTools, gotBash = contextTokenAgentRuntimeAuthorizationPolicy(&corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
 		Runtime: &corev1alpha1.AgentCLIRuntime{

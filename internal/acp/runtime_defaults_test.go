@@ -104,10 +104,25 @@ func TestNormalizeBuiltInRuntimeToolPolicy(t *testing.T) {
 	if got := BuiltInRuntimeEffectiveAllowedTools(nil, []string{"Write"}, true); got != nil {
 		t.Fatalf("unrestricted effective tools = %#v, want nil sentinel", got)
 	}
-	if BuiltInRuntimeEffectiveAllowBash([]string{"bAsH"}, true) {
+	if BuiltInRuntimeEffectiveAllowBash(nil, []string{"bAsH"}, true) {
 		t.Fatal("case-insensitive Bash deny did not close the effective Bash gate")
 	}
-	if !BuiltInRuntimeEffectiveAllowBash([]string{"Write"}, true) {
+	if !BuiltInRuntimeEffectiveAllowBash(nil, []string{"Write"}, true) {
 		t.Fatal("non-Bash deny unexpectedly closed the effective Bash gate")
+	}
+	if BuiltInRuntimeEffectiveAllowBash([]string{"Read"}, nil, true) {
+		t.Fatal("explicit allowlist without Bash unexpectedly kept the Bash gate open")
+	}
+	if !BuiltInRuntimeEffectiveAllowBash([]string{"Read", "bAsH"}, nil, true) {
+		t.Fatal("explicit allowlist containing Bash did not keep the Bash gate open")
+	}
+	if !BuiltInRuntimeEffectiveAllowBash([]string{"Bash(git status:*)"}, nil, true) {
+		t.Fatal("scoped Bash allowlist rule did not keep the Bash gate open")
+	}
+	if got := BuiltInRuntimeEffectiveAllowedTools([]string{"Read", "Bash(git status:*)"}, nil, false); !slices.Equal(got, []string{"Read"}) {
+		t.Fatalf("allowBash=false effective tools = %#v, want scoped Bash removed", got)
+	}
+	if got := BuiltInRuntimeEffectiveAllowedTools([]string{"Read", "Bash(git status:*)"}, []string{"Bash"}, true); !slices.Equal(got, []string{"Read"}) {
+		t.Fatalf("bare Bash deny effective tools = %#v, want scoped Bash removed", got)
 	}
 }

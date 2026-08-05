@@ -687,7 +687,7 @@ func childTransactionEffectiveRuntimePolicy(child *corev1alpha1.Task, agent *cor
 				string(agent.Spec.Runtime.Type), allowedTools, disallowedTools, allowBash,
 			)
 			allowedTools = acp.BuiltInRuntimeEffectiveAllowedTools(allowedTools, disallowedTools, allowBash)
-			allowBash = acp.BuiltInRuntimeEffectiveAllowBash(disallowedTools, allowBash)
+			allowBash = acp.BuiltInRuntimeEffectiveAllowBash(allowedTools, disallowedTools, allowBash)
 		}
 		return allowedTools, allowBash
 	}

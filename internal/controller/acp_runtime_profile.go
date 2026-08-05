@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -218,6 +219,13 @@ func effectiveACPAllowedTools(task *corev1alpha1.Task, agent *corev1alpha1.Agent
 	if task != nil && task.Spec.AgentRuntime != nil && task.Spec.AgentRuntime.AllowedTools != nil {
 		values = append([]string{}, task.Spec.AgentRuntime.AllowedTools...)
 	}
+	if taskRequestsReadOnlyAgent(task) && taskUsesReadOnlyAgentToolPreset(task) &&
+		agent != nil && agent.Spec.Runtime != nil && agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeOpencode {
+		// Repository-monitor presets use Claude-style path-scoped names. OpenCode
+		// cannot project those descriptors; its read-intent policy safely exposes
+		// only native Read and Glob (Grep is intentionally disabled).
+		values = []string{providerNativeToolRead, providerNativeToolGlob}
+	}
 	if task != nil {
 		_, delegatedChild := task.Labels[labels.LabelParentTask]
 		disableCoordinationToolInjection := task.Annotations[labels.AnnotationDisableCoordinationToolInject] == scheduledRunLabelValue
@@ -226,6 +234,11 @@ func effectiveACPAllowedTools(task *corev1alpha1.Task, agent *corev1alpha1.Agent
 		}
 	}
 	return sortedUnique(values)
+}
+
+func taskUsesReadOnlyAgentToolPreset(task *corev1alpha1.Task) bool {
+	return task != nil && task.Spec.AgentRuntime != nil && task.Spec.AgentRuntime.AllowedTools != nil &&
+		slices.Equal(sortedUnique(task.Spec.AgentRuntime.AllowedTools), sortedUnique(readOnlyAgentAllowedTools()))
 }
 
 func normalizeACPRuntimeToolPolicy(
