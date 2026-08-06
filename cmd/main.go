@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -182,6 +183,7 @@ func main() {
 	var storeBackend string
 	var storePath string
 	var agentExecutionSnapshotKeyFile string
+	var agentExecutionOwnershipMode string
 	var controllerURL string
 	var enforceNamespaceIsolation bool
 	var maxTasksPerNamespace int
@@ -357,6 +359,8 @@ func main() {
 		"Maximum gateway events and deliveries processed per iteration.")
 	flag.StringVar(&storeBackend, "store-backend", "sqlite", "Storage backend (sqlite)")
 	flag.StringVar(&storePath, "store-path", "/data/orka.db", "Path to SQLite database file")
+	flag.StringVar(&agentExecutionOwnershipMode, "agent-execution-ownership", "legacy",
+		"Controller ownership scope: 'legacy' keeps the historical per-install election Lease; 'coexistence' uses the fixed orka-system/orka-agent-execution Lease, requires leader election, and continuously fences every legacy 03b49a10.orka.ai Lease.")
 	flag.StringVar(&agentExecutionSnapshotKeyFile, "agent-execution-snapshot-key-file", "",
 		"Path to the 32-byte (raw or base64) AES-256 key encrypting immutable agent execution snapshots. "+
 			"When set, executable agent Tasks freeze a write-once binding and encrypted snapshot before dispatch.")
@@ -820,6 +824,25 @@ func main() {
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "03b49a10.orka.ai",
 	}
+	agentExecutionCoexistence := false
+	switch agentExecutionOwnershipMode {
+	case "legacy":
+	case "coexistence":
+		// One fixed global ownership scope for every dual-controller release
+		// that can watch the same Tasks; leader election is mandatory because a
+		// process without election cannot be fenced by any Lease.
+		if !enableLeaderElection {
+			setupLog.Error(fmt.Errorf("--agent-execution-ownership=coexistence requires --leader-elect"),
+				"coexistence ownership without leader election cannot be fenced")
+			os.Exit(1)
+		}
+		agentExecutionCoexistence = true
+		mgrOptions.LeaderElectionID = corev1alpha1.AgentExecutionOwnershipLeaseName
+		mgrOptions.LeaderElectionNamespace = corev1alpha1.AgentExecutionControlNamespace
+	default:
+		setupLog.Error(fmt.Errorf("unsupported --agent-execution-ownership %q", agentExecutionOwnershipMode), "unknown ownership mode")
+		os.Exit(1)
+	}
 
 	// Keep tenant resources namespace-scoped while allowing only RuntimePool
 	// child kinds to be cached from the separate ACP runtime namespace.
@@ -1198,6 +1221,72 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Task")
 		os.Exit(1)
+	}
+	if err := (&controller.AgentExecutionAdjudicationReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: mgr.GetEventRecorderFor("agent-execution-adjudication"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "AgentExecutionAdjudication")
+		os.Exit(1)
+	}
+	if err := mgr.Add(&controller.AgentExecutionClassifier{
+		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(),
+		Snapshots: taskAgentExecutionSnapshotStore(agentExecutionBindingEnabled, sqliteStore),
+		Recorder:  mgr.GetEventRecorderFor("agent-execution-classifier"),
+	}); err != nil {
+		setupLog.Error(err, "unable to add agent execution classifier")
+		os.Exit(1)
+	}
+	if agentExecutionCoexistence {
+		if err := (&controller.AgentExecutionControlReconciler{
+			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(),
+			Recorder: mgr.GetEventRecorderFor("agent-execution-control"),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "AgentExecutionControl")
+			os.Exit(1)
+		}
+		ownership := &controller.AgentExecutionOwnership{
+			Client: mgr.GetClient(), Reader: mgr.GetAPIReader(),
+			Identity:       currentControllerHolderID() + "-coexistence",
+			LeaseNamespace: corev1alpha1.AgentExecutionControlNamespace,
+			LeaseName:      corev1alpha1.AgentExecutionOwnershipLeaseName,
+		}
+		if err := mgr.Add(ownership); err != nil {
+			setupLog.Error(err, "unable to add agent execution ownership fence")
+			os.Exit(1)
+		}
+		if err := mgr.AddReadyzCheck("agent-execution-ownership", func(_ *http.Request) error {
+			return ownership.Healthy()
+		}); err != nil {
+			setupLog.Error(err, "unable to register ownership readiness check")
+			os.Exit(1)
+		}
+		wrapperEndpoint := strings.TrimSpace(os.Getenv("ORKA_HARNESS_WRAPPER_ENDPOINT"))
+		if wrapperEndpoint != "" {
+			wrapperToken := strings.TrimSpace(os.Getenv("ORKA_HARNESS_WRAPPER_BEARER_TOKEN"))
+			if wrapperToken == "" {
+				if tokenFile := strings.TrimSpace(os.Getenv("ORKA_HARNESS_WRAPPER_BEARER_TOKEN_FILE")); tokenFile != "" {
+					raw, readErr := os.ReadFile(tokenFile) // #nosec G304 -- operator-supplied token path.
+					if readErr != nil {
+						setupLog.Error(readErr, "unable to read harness wrapper bearer token; v1 dispatch fails closed")
+						os.Exit(1)
+					}
+					wrapperToken = strings.TrimSpace(string(raw))
+				}
+			}
+			if err := mgr.Add(&controller.HarnessV1Dispatcher{
+				Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(),
+				Attempts: sqliteStore, Snapshots: taskAgentExecutionSnapshotStore(agentExecutionBindingEnabled, sqliteStore),
+				ExecutionEvents: sqliteStore, Epochs: controllerEpochManager,
+				Recorder:        mgr.GetEventRecorderFor("harness-v1-dispatcher"),
+				WrapperEndpoint: wrapperEndpoint, WrapperBearerToken: wrapperToken,
+			}); err != nil {
+				setupLog.Error(err, "unable to add harness v1 dispatcher")
+				os.Exit(1)
+			}
+			setupLog.Info("harness v1 dispatcher enabled", "endpoint", wrapperEndpoint)
+		} else {
+			setupLog.Info("harness v1 dispatcher disabled: ORKA_HARNESS_WRAPPER_ENDPOINT is not configured")
+		}
 	}
 	if acpRuntimeEnabled {
 		if err := mgr.Add(&controller.ACPDispatcher{
