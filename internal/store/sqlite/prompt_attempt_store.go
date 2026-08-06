@@ -50,12 +50,13 @@ func (s *Store) CreatePromptAttempt(ctx context.Context, attempt *store.PromptAt
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO prompt_attempts(
 			id, namespace, task_uid, attempt, prompt_id, session_uid, session_lease_generation,
-			runtime_instance_id, request_digest, execution_state, delivery_state, terminal_reason,
+			runtime_instance_id, request_digest, binding_digest, execution_state, delivery_state, terminal_reason,
 			outcome_marker, controller_epoch_name, controller_epoch, last_operation_id,
 			last_operation_digest, version, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		normalized.ID, normalized.Key.Namespace, normalized.Key.TaskUID, normalized.Key.Attempt, normalized.Key.PromptID,
 		normalized.SessionUID, normalized.SessionLeaseGeneration, normalized.RuntimeInstanceID, normalized.RequestDigest,
+		normalized.BindingDigest,
 		string(normalized.ExecutionState), string(normalized.DeliveryState), normalized.TerminalReason, normalized.OutcomeMarker,
 		normalized.ControllerEpochName, normalized.ControllerEpoch, normalized.LastOperationID,
 		normalized.LastOperationDigest, normalized.Version, normalized.CreatedAt, normalized.UpdatedAt,
@@ -1170,14 +1171,14 @@ func normalizePromptAttemptForCreate(attempt *store.PromptAttempt, fence store.C
 }
 
 func samePromptAttemptCreation(a, b store.PromptAttempt) bool {
-	return a.ID == b.ID && a.Key == b.Key && a.RequestDigest == b.RequestDigest
+	return a.ID == b.ID && a.Key == b.Key && a.RequestDigest == b.RequestDigest && a.BindingDigest == b.BindingDigest
 }
 
 func getPromptAttempt(ctx context.Context, q controlQueryRower, id string) (store.PromptAttempt, error) {
 	var attempt store.PromptAttempt
 	err := q.QueryRowContext(ctx,
 		`SELECT id, namespace, task_uid, attempt, prompt_id, session_uid, session_lease_generation,
-		        runtime_instance_id, request_digest, execution_state, delivery_state, terminal_reason,
+		        runtime_instance_id, request_digest, binding_digest, execution_state, delivery_state, terminal_reason,
 		        outcome_marker, controller_epoch_name, controller_epoch, last_operation_id,
 		        last_operation_digest, version, created_at, updated_at
 		 FROM prompt_attempts WHERE id = ?`,
@@ -1185,6 +1186,7 @@ func getPromptAttempt(ctx context.Context, q controlQueryRower, id string) (stor
 	).Scan(
 		&attempt.ID, &attempt.Key.Namespace, &attempt.Key.TaskUID, &attempt.Key.Attempt, &attempt.Key.PromptID,
 		&attempt.SessionUID, &attempt.SessionLeaseGeneration, &attempt.RuntimeInstanceID, &attempt.RequestDigest,
+		&attempt.BindingDigest,
 		&attempt.ExecutionState, &attempt.DeliveryState, &attempt.TerminalReason, &attempt.OutcomeMarker,
 		&attempt.ControllerEpochName, &attempt.ControllerEpoch, &attempt.LastOperationID,
 		&attempt.LastOperationDigest, &attempt.Version, &attempt.CreatedAt, &attempt.UpdatedAt,

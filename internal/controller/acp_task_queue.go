@@ -113,9 +113,14 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 		}
 		return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), credentialErr.Error())
 	}
+	bindingDigest := ""
+	if binding := task.Status.AgentExecutionBinding; binding != nil {
+		bindingDigest = binding.BindingDigest
+	}
 	attempt, err := r.DurableControlStore.CreatePromptAttempt(ctx, &store.PromptAttempt{
-		ID: attemptID, Key: key, RequestDigest: requestDigest, CredentialBindings: credentialBindings,
-		ExecutionState: store.PromptExecutionQueued, DeliveryState: store.PromptDeliveryNotRequested, CreatedAt: queuedAt,
+		ID: attemptID, Key: key, RequestDigest: requestDigest, BindingDigest: bindingDigest,
+		CredentialBindings: credentialBindings,
+		ExecutionState:     store.PromptExecutionQueued, DeliveryState: store.PromptDeliveryNotRequested, CreatedAt: queuedAt,
 	}, fence)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("persist ACP prompt attempt: %w", err)

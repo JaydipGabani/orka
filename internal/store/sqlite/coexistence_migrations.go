@@ -91,6 +91,14 @@ func migrateAgentExecutionCoexistence(db *sql.DB) error {
 			WHERE state NOT IN ('Rejected','Succeeded','Failed','Cancelled','OutcomeUnknown')`,
 	}
 
+	// Pre-coexistence databases created prompt_attempts without the binding
+	// digest column; add it before the transactional table creation below.
+	if err := ensureSQLiteColumns(db, "prompt_attempts", []sqliteColumnMigration{
+		{Name: "binding_digest", Definition: "TEXT NOT NULL DEFAULT ''"},
+	}); err != nil {
+		return err
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin coexistence migration: %w", err)

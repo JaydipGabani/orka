@@ -58,6 +58,7 @@ func (s *Store) CreatePromptAttempt(ctx context.Context, attempt *store.PromptAt
 		Spec: corev1alpha1.PromptAttemptSpec{
 			ID: normalized.ID, TaskUID: normalized.Key.TaskUID, Attempt: normalized.Key.Attempt,
 			PromptID: normalized.Key.PromptID, RequestDigest: normalized.RequestDigest,
+			BindingDigest:      normalized.BindingDigest,
 			CredentialBindings: promptCredentialBindingsToAPI(normalized.CredentialBindings),
 		},
 	}
@@ -1383,6 +1384,7 @@ func validatePromptExecutionTransition(transition *store.PromptAttemptExecutionT
 func samePromptAttemptSpec(object *corev1alpha1.PromptAttempt, attempt store.PromptAttempt) bool {
 	return object.Namespace == attempt.Key.Namespace && object.Spec.ID == attempt.ID && object.Spec.TaskUID == attempt.Key.TaskUID &&
 		object.Spec.Attempt == attempt.Key.Attempt && object.Spec.PromptID == attempt.Key.PromptID && object.Spec.RequestDigest == attempt.RequestDigest &&
+		object.Spec.BindingDigest == attempt.BindingDigest &&
 		reflect.DeepEqual(promptCredentialBindingsFromAPI(object.Spec.CredentialBindings), attempt.CredentialBindings)
 }
 
@@ -1428,6 +1430,7 @@ func promptAttemptFromObject(object *corev1alpha1.PromptAttempt) store.PromptAtt
 		SessionLeaseGeneration: object.Status.SessionLeaseGeneration,
 		RuntimeInstanceID:      object.Status.RuntimeInstanceID,
 		RequestDigest:          object.Spec.RequestDigest,
+		BindingDigest:          object.Spec.BindingDigest,
 		CredentialBindings:     promptCredentialBindingsFromAPI(object.Spec.CredentialBindings),
 		ExecutionState:         store.PromptExecutionState(object.Status.ExecutionState),
 		DeliveryState:          store.PromptDeliveryState(object.Status.DeliveryState),

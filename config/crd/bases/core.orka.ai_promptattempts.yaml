@@ -66,6 +66,13 @@ spec:
                 format: int64
                 minimum: 1
                 type: integer
+              bindingDigest:
+                description: |-
+                  BindingDigest copies the Task's immutable execution binding digest so a
+                  stale dispatcher cannot process demand created for another binding.
+                  Empty only for attempts created before the binding stage was enabled.
+                pattern: ^sha256:[a-f0-9]{64}$
+                type: string
               credentialBindings:
                 description: CredentialBindings is the immutable, role-separated Secret
                   identity set.

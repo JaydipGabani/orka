@@ -346,6 +346,7 @@ func (c *ACPSessionContinuity) claimSessionLineage(
 		return nil
 	}
 	if strings.TrimSpace(request.RuntimeIdentity) == "" || strings.TrimSpace(request.NamespaceUID) == "" {
+		agentExecutionLineageConflicts.WithLabelValues("identity-missing").Inc()
 		return c.releaseLeaseAfterLineageFailure(ctx, request, lease,
 			fmt.Errorf("session lineage recording requires the runtime identity and namespace UID"))
 	}
@@ -373,6 +374,7 @@ func (c *ACPSessionContinuity) claimSessionLineage(
 		Provenance:        provenance,
 		EstablishIfAbsent: true,
 	}); err != nil {
+		agentExecutionLineageConflicts.WithLabelValues("claim-conflict").Inc()
 		return c.releaseLeaseAfterLineageFailure(ctx, request, lease,
 			fmt.Errorf("session lineage claim: %w", err))
 	}

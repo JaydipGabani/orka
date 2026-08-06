@@ -2519,6 +2519,9 @@ func (d *ACPDispatcher) reserveTask(ctx context.Context, queued *corev1alpha1.Ta
 	if err != nil {
 		return nil, acpDispatchTarget{}, err
 	}
+	if err := d.verifyAttemptBindingDigest(ctx, task, attemptID, fence); err != nil {
+		return nil, acpDispatchTarget{}, err
+	}
 	var target acpDispatchTarget
 	pool, reservation, claimErr := d.claimRuntimePoolReservation(
 		ctx, task, task.Status.Execution.RuntimePoolName, fence, 1,

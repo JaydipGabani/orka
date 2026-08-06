@@ -397,6 +397,7 @@ func (r *TaskReconciler) ensureAgentExecutionBinding(
 
 	candidate, err := r.resolveAgentExecutionCandidate(ctx, task, agent)
 	if err != nil {
+		agentExecutionBindingFailures.WithLabelValues("candidate-resolution").Inc()
 		if isPermanentACPAgentConfigurationError(err) {
 			result, failErr := r.failTask(ctx, task, err.Error())
 			return result, failErr, true
@@ -405,6 +406,7 @@ func (r *TaskReconciler) ensureAgentExecutionBinding(
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, true
 	}
 	if err := r.persistAgentExecutionSnapshot(ctx, task, candidate); err != nil {
+		agentExecutionBindingFailures.WithLabelValues("snapshot-persistence").Inc()
 		log.Error(err, "immutable execution snapshot persistence failed")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, true
 	}
@@ -412,10 +414,12 @@ func (r *TaskReconciler) ensureAgentExecutionBinding(
 	if err != nil {
 		conflict := &errAgentExecutionBindingConflict{}
 		if errors.As(err, &conflict) {
+			agentExecutionBindingConflicts.WithLabelValues("write-once-conflict").Inc()
 			r.Recorder.Eventf(task, corev1.EventTypeWarning, agentExecutionBindingConflictReason, "%s", err.Error())
 			result, failErr := r.failTask(ctx, task, err.Error())
 			return result, failErr, true
 		}
+		agentExecutionBindingFailures.WithLabelValues("binding-persistence").Inc()
 		log.Error(err, "write-once binding persistence failed")
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil, true
 	}

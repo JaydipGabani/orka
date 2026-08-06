@@ -305,6 +305,7 @@ type PromptAttempt struct {
 	SessionLeaseGeneration int64                     `json:"sessionLeaseGeneration,omitempty"`
 	RuntimeInstanceID      string                    `json:"runtimeInstanceId,omitempty"`
 	RequestDigest          string                    `json:"requestDigest"`
+	BindingDigest          string                    `json:"bindingDigest,omitempty"`
 	CredentialBindings     []PromptCredentialBinding `json:"credentialBindings,omitempty"`
 	ExecutionState         PromptExecutionState      `json:"executionState"`
 	DeliveryState          PromptDeliveryState       `json:"deliveryState"`

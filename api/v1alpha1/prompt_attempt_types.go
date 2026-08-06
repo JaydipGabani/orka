@@ -70,6 +70,13 @@ type PromptAttemptSpec struct {
 	// +kubebuilder:validation:Pattern=`^sha256:[a-f0-9]{64}$`
 	RequestDigest string `json:"requestDigest"`
 
+	// BindingDigest copies the Task's immutable execution binding digest so a
+	// stale dispatcher cannot process demand created for another binding.
+	// Empty only for attempts created before the binding stage was enabled.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^sha256:[a-f0-9]{64}$`
+	BindingDigest string `json:"bindingDigest,omitempty"`
+
 	// CredentialBindings is the immutable, role-separated Secret identity set.
 	// +optional
 	// +listType=map
