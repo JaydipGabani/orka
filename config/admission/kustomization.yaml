@@ -2,3 +2,14 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
 - gateway_task_protection.yaml
+# Stateless orka-admission Deployment serving the fail-closed harness v1/v2
+# coexistence webhooks (not wired into config/default; the rollout sequences
+# certificates and ready endpoints before webhook installation).
+- serviceaccount.yaml
+- service.yaml
+- deployment.yaml
+- pdb.yaml
+- networkpolicy.yaml
+- validating-webhooks.yaml
+# binding-vap.yaml is applied as its own explicit wave after the
+# AgentExecutionControl singleton exists; see plan section 5.4 install order.

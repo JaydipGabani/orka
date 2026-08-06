@@ -1,0 +1,34 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orka-admission
+  namespace: orka-system
+  labels:
+    app.kubernetes.io/name: orka
+    app.kubernetes.io/component: coexistence-admission
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: orka
+      app.kubernetes.io/component: coexistence-admission
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # The intended callers are the kube-apiservers delivering AdmissionReview
+  # requests. API-server source addresses are cluster-specific (host network,
+  # node IPs, or a dedicated CIDR) and cannot be pinned with a portable pod or
+  # namespace selector, so the webhook port accepts all sources; TLS plus
+  # AdmissionReview semantics protect the endpoint itself. Tighten "from" with
+  # a cluster-specific ipBlock where the apiserver egress CIDR is known.
+  - ports:
+    - protocol: TCP
+      port: 9443
+  # Kubelet readiness/liveness probes; kubelet traffic bypasses NetworkPolicy
+  # on many CNIs but is allowed explicitly for CNIs that enforce it.
+  - ports:
+    - protocol: TCP
+      port: 8081
+  # The admission service is a pure validator: it makes no outbound calls
+  # (no Kubernetes API access, no DNS), so all egress is denied.
+  egress: []

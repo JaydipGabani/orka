@@ -1,0 +1,16 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orka-admission
+  namespace: orka-system
+  labels:
+    app.kubernetes.io/name: orka
+    app.kubernetes.io/component: coexistence-admission
+spec:
+  # Keep at least one replica serving the failurePolicy: Fail coexistence
+  # webhooks through voluntary disruptions (node drains, upgrades).
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orka
+      app.kubernetes.io/component: coexistence-admission

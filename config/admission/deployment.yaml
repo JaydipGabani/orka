@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orka-admission
+  namespace: orka-system
+  labels:
+    app.kubernetes.io/name: orka
+    app.kubernetes.io/component: coexistence-admission
+spec:
+  # Stateless, replicated fail-closed admission plane: never a singleton and
+  # never colocated with the SQLite controller (coexistence plan section 5.4).
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orka
+      app.kubernetes.io/component: coexistence-admission
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: admission
+      labels:
+        app.kubernetes.io/name: orka
+        app.kubernetes.io/component: coexistence-admission
+        orka.ai/network-role: coexistence-admission
+    spec:
+      serviceAccountName: orka-admission
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: orka
+                  app.kubernetes.io/component: coexistence-admission
+      containers:
+      - name: admission
+        image: ghcr.io/orka-agents/orka/orka-admission:latest
+        command:
+        - /orka-admission
+        args:
+        - --webhook-cert-dir=/tmp/k8s-webhook-server/serving-certs
+        - --webhook-port=9443
+        - --health-probe-bind-address=:8081
+        - --controller-service-accounts=system:serviceaccount:orka-system:orka-controller-manager
+        - --admin-groups=system:masters
+        ports:
+        - name: webhook-server
+          containerPort: 9443
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        # Readiness proves the serving certificate files exist, the handlers
+        # are registered, and the TLS endpoint answers before the Pod enters
+        # Service endpoints.
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: webhook-certs
+          mountPath: /tmp/k8s-webhook-server/serving-certs
+          readOnly: true
+      volumes:
+      # Plain TLS Secret mount; the Secret is provisioned by the operator or a
+      # certificate manager before the webhook configurations are installed.
+      - name: webhook-certs
+        secret:
+          secretName: orka-admission-cert
+          defaultMode: 420

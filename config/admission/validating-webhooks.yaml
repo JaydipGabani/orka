@@ -1,0 +1,154 @@
+# Fail-closed harness v1/v2 coexistence admission boundary served by the
+# stateless orka-admission Deployment (coexistence plan sections 5.4 and 10).
+#
+# Install ordering (section 9.7): apply this configuration only after the
+# orka-admission Service has at least two ready endpoints and an
+# AdmissionReview smoke test succeeds. Every webhook below uses
+# failurePolicy: Fail, so applying it before the endpoints are ready blocks
+# the protected writes.
+#
+# CA bundle: each clientConfig requires the CA that signed the
+# orka-admission-cert serving certificate. Inject it with cert-manager
+# (cert-manager.io/inject-ca-from) or patch caBundle manually when the
+# serving Secret is provisioned by hand.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: orka-coexistence-admission
+  labels:
+    app.kubernetes.io/name: orka
+    app.kubernetes.io/component: coexistence-admission
+webhooks:
+# Built-in runtime Agents must carry an explicit, immutable
+# spec.runtime.contractVersion; new v1 OpenCode classifications are rejected.
+- name: coexistence-agent.orka.ai
+  admissionReviewVersions: [v1]
+  sideEffects: None
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  timeoutSeconds: 10
+  clientConfig:
+    service:
+      name: orka-admission
+      namespace: orka-system
+      path: /validate-coexistence-agent
+      port: 443
+  rules:
+  - apiGroups: [core.orka.ai]
+    apiVersions: [v1alpha1]
+    operations: [CREATE, UPDATE]
+    resources: [agents]
+    scope: Namespaced
+# AgentRuntime registrations must carry an explicit, immutable
+# spec.contractVersion.
+- name: coexistence-agentruntime.orka.ai
+  admissionReviewVersions: [v1]
+  sideEffects: None
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  timeoutSeconds: 10
+  clientConfig:
+    service:
+      name: orka-admission
+      namespace: orka-system
+      path: /validate-coexistence-agentruntime
+      port: 443
+  rules:
+  - apiGroups: [core.orka.ai]
+    apiVersions: [v1alpha1]
+    operations: [CREATE, UPDATE]
+    resources: [agentruntimes]
+    scope: Namespaced
+# Only configured controller identities may add, change, or remove the four
+# Task execution provenance fields; tasks/status is included because binding,
+# no-execution, quarantine, and resolution-reference records live in status.
+- name: coexistence-task-provenance.orka.ai
+  admissionReviewVersions: [v1]
+  sideEffects: None
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  timeoutSeconds: 10
+  clientConfig:
+    service:
+      name: orka-admission
+      namespace: orka-system
+      path: /validate-coexistence-task-provenance
+      port: 443
+  rules:
+  - apiGroups: [core.orka.ai]
+    apiVersions: [v1alpha1]
+    operations: [CREATE, UPDATE]
+    resources: [tasks, tasks/status]
+    scope: Namespaced
+  # Cleanup-safe carve-out (coexistence plan section 5.4): exempt ONLY the
+  # exact controller ServiceAccount, and only for UPDATE requests in which
+  # none of the four execution provenance fields exists on either the old or
+  # the new object. Such writes (finalizer maintenance, terminal projection
+  # recovery on Tasks without coexistence provenance) provably cannot create
+  # or alter provenance and must keep working while the admission endpoints
+  # are unavailable, so controller recovery never depends on webhook uptime.
+  # The exemption never covers binding creation: a request that introduces or
+  # touches any provenance field has that field present on the new or old
+  # object, which falsifies the skip-guard below and routes the request to
+  # the webhook (and, for controller binding writes, to the parameterized
+  # backend-control ValidatingAdmissionPolicy) like any other write.
+  matchConditions:
+  - name: route-unless-controller-cleanup-safe
+    expression: >-
+      !(request.userInfo.username == 'system:serviceaccount:orka-system:orka-controller-manager' &&
+      request.operation == 'UPDATE' &&
+      (!has(object.status) ||
+      (!has(object.status.agentExecutionBinding) &&
+      !has(object.status.agentExecutionNoExecution) &&
+      !has(object.status.agentExecutionQuarantine) &&
+      !has(object.status.agentExecutionResolutionRef))) &&
+      (!has(oldObject.status) ||
+      (!has(oldObject.status.agentExecutionBinding) &&
+      !has(oldObject.status.agentExecutionNoExecution) &&
+      !has(oldObject.status.agentExecutionQuarantine) &&
+      !has(oldObject.status.agentExecutionResolutionRef))))
+# Adjudications are admin-authored (verified requester identity), immutable in
+# spec, and deletable only by admins or Kubernetes cleanup controllers. The
+# status subresource is intentionally NOT matched: adjudication status is
+# controller-owned, and routing it through a Fail webhook would make
+# controller recovery depend on admission availability (section 5.4).
+- name: coexistence-adjudication.orka.ai
+  admissionReviewVersions: [v1]
+  sideEffects: None
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  timeoutSeconds: 10
+  clientConfig:
+    service:
+      name: orka-admission
+      namespace: orka-system
+      path: /validate-coexistence-adjudication
+      port: 443
+  rules:
+  - apiGroups: [core.orka.ai]
+    apiVersions: [v1alpha1]
+    operations: [CREATE, UPDATE, DELETE]
+    resources: [agentexecutionadjudications]
+    scope: Namespaced
+# Backend control and compatibility policy specs are admin-authored. The
+# status subresources are intentionally NOT matched for the same
+# controller-recovery reason; the handler additionally allows any status
+# write it does receive.
+- name: coexistence-control-policy.orka.ai
+  admissionReviewVersions: [v1]
+  sideEffects: None
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  timeoutSeconds: 10
+  clientConfig:
+    service:
+      name: orka-admission
+      namespace: orka-system
+      path: /validate-coexistence-control-policy
+      port: 443
+  rules:
+  - apiGroups: [core.orka.ai]
+    apiVersions: [v1alpha1]
+    operations: [CREATE, UPDATE]
+    resources: [agentexecutioncontrols, agentexecutionpolicies]
+    scope: Namespaced

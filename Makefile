@@ -7,11 +7,13 @@ VERSION := v0.1.1
 IMG ?= controller:latest
 AI_WORKER_IMG ?= ghcr.io/orka-agents/orka/ai-worker:latest
 GENERAL_WORKER_IMG ?= ghcr.io/orka-agents/orka/general-worker:latest
+HARNESS_WRAPPER_IMG ?= ghcr.io/orka-agents/orka/agent-harness-wrapper:latest
 ACP_CODEX_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-codex-runtime:latest
 ACP_CLAUDE_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-claude-runtime:latest
 ACP_COPILOT_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-copilot-runtime:latest
 ACP_OPENCODE_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-opencode-runtime:latest
 WORKSPACE_PUBLISHER_IMG ?= ghcr.io/orka-agents/orka/workspace-publisher:latest
+ORKA_ADMISSION_IMG ?= ghcr.io/orka-agents/orka/orka-admission:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -205,6 +207,7 @@ test-e2e-setup-only: setup-test-e2e docker-build-all ## Set up Kind cluster and 
 	$(KIND) load docker-image $(IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(AI_WORKER_IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(GENERAL_WORKER_IMG) --name $(KIND_CLUSTER)
+	$(KIND) load docker-image $(HARNESS_WRAPPER_IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(ACP_CODEX_RUNTIME_IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(ACP_CLAUDE_RUNTIME_IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(ACP_COPILOT_RUNTIME_IMG) --name $(KIND_CLUSTER)
@@ -339,6 +342,10 @@ docker-build-ai-worker: ## Build docker image for the AI worker.
 docker-build-general-worker: ## Build docker image for the general worker.
 	$(CONTAINER_TOOL) build -t ${GENERAL_WORKER_IMG} -f workers/general/Dockerfile .
 
+.PHONY: docker-build-harness-wrapper
+docker-build-harness-wrapper: ## Build docker image for the agent harness wrapper.
+	$(CONTAINER_TOOL) build -t ${HARNESS_WRAPPER_IMG} -f workers/harness/Dockerfile .
+
 .PHONY: docker-build-acp-codex-runtime
 docker-build-acp-codex-runtime: ## Build the immutable Codex ACP runtime image.
 	$(CONTAINER_TOOL) build -t ${ACP_CODEX_RUNTIME_IMG} -f workers/acp/images/codex/Dockerfile .
@@ -359,6 +366,14 @@ docker-build-acp-opencode-runtime: ## Build the immutable OpenCode ACP runtime i
 docker-build-workspace-publisher: ## Build the clean-room workspace publisher image.
 	$(CONTAINER_TOOL) build -t ${WORKSPACE_PUBLISHER_IMG} -f workers/publisher/Dockerfile .
 
+.PHONY: docker-build-orka-admission
+docker-build-orka-admission: ## Build the stateless coexistence admission service image.
+	$(CONTAINER_TOOL) build -t ${ORKA_ADMISSION_IMG} -f cmd/orka-admission/Dockerfile .
+
+.PHONY: docker-push-orka-admission
+docker-push-orka-admission: ## Push the coexistence admission service image.
+	$(CONTAINER_TOOL) push ${ORKA_ADMISSION_IMG}
+
 .PHONY: docker-push-ai-worker
 docker-push-ai-worker: ## Push docker image for the AI worker.
 	$(CONTAINER_TOOL) push ${AI_WORKER_IMG}
@@ -366,6 +381,10 @@ docker-push-ai-worker: ## Push docker image for the AI worker.
 .PHONY: docker-push-general-worker
 docker-push-general-worker: ## Push docker image for the general worker.
 	$(CONTAINER_TOOL) push ${GENERAL_WORKER_IMG}
+
+.PHONY: docker-push-harness-wrapper
+docker-push-harness-wrapper: ## Push docker image for the agent harness wrapper.
+	$(CONTAINER_TOOL) push ${HARNESS_WRAPPER_IMG}
 
 .PHONY: docker-push-acp-codex-runtime
 docker-push-acp-codex-runtime: ## Push the immutable Codex ACP runtime image.
@@ -388,10 +407,10 @@ docker-push-workspace-publisher: ## Push the clean-room workspace publisher imag
 	$(CONTAINER_TOOL) push ${WORKSPACE_PUBLISHER_IMG}
 
 .PHONY: docker-build-all
-docker-build-all: docker-build docker-build-ai-worker docker-build-general-worker docker-build-acp-codex-runtime docker-build-acp-claude-runtime docker-build-acp-copilot-runtime docker-build-acp-opencode-runtime docker-build-workspace-publisher ## Build all docker images.
+docker-build-all: docker-build docker-build-ai-worker docker-build-general-worker docker-build-harness-wrapper docker-build-acp-codex-runtime docker-build-acp-claude-runtime docker-build-acp-copilot-runtime docker-build-acp-opencode-runtime docker-build-workspace-publisher ## Build all docker images.
 
 .PHONY: docker-push-all
-docker-push-all: docker-push docker-push-ai-worker docker-push-general-worker docker-push-acp-codex-runtime docker-push-acp-claude-runtime docker-push-acp-copilot-runtime docker-push-acp-opencode-runtime docker-push-workspace-publisher ## Push all docker images.
+docker-push-all: docker-push docker-push-ai-worker docker-push-general-worker docker-push-harness-wrapper docker-push-acp-codex-runtime docker-push-acp-claude-runtime docker-push-acp-copilot-runtime docker-push-acp-opencode-runtime docker-push-workspace-publisher ## Push all docker images.
 
 ##@ Deployment
 
@@ -437,6 +456,15 @@ verify-acp-crd-cutover: ## Refuse workload deployment until the ACP v2 hard cuto
 		echo "legacy orka.harness.v1 AgentRuntime objects remain" >&2; exit 1; \
 	fi
 	@KUBECTL="$(KUBECTL)" scripts/check-legacy-wrapper-resources.sh
+
+.PHONY: verify-coexistence-crds
+verify-coexistence-crds: ## Verify the served harness v1/v2 coexistence bridge CRDs are installed.
+	@"$(KUBECTL)" get crd agentruntimes.core.orka.ai -o json | jq -e \
+		'[.spec.versions[] | select(.served == true) | .schema.openAPIV3Schema.properties.spec.properties.contractVersion.enum] | all(. == ["orka.harness.v1","orka.harness.v2"])' >/dev/null || \
+		{ echo "AgentRuntime CRD is not the dual orka.harness.v1/orka.harness.v2 bridge schema" >&2; exit 1; }
+	@for crd in agentexecutionpolicies agentexecutioncontrols agentexecutionadjudications; do \
+		"$(KUBECTL)" get crd "$$crd.core.orka.ai" >/dev/null || { echo "missing coexistence CRD: $$crd.core.orka.ai" >&2; exit 1; }; \
+	done
 
 .PHONY: deploy
 deploy: verify-acp-runtime-images verify-acp-crd-cutover manifests kustomize ## Deploy ACP workloads after verified CRD hard cutover.

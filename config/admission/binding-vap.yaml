@@ -1,0 +1,75 @@
+# Parameterized fail-closed admission for every absent-to-present execution
+# binding write, including controller writes (plan section 5.4). The policy is
+# defense in depth behind the controller's serialized closing barrier: it
+# denies observed stale mode revisions and missing parameters; it does not
+# replace the controller-owned reservation cutoff.
+#
+# Install order: only after the stateless orka-admission Deployment is ready
+# and the AgentExecutionControl singleton exists. parameterNotFoundAction:
+# Deny keeps binding admission fail-closed if the control object disappears.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: orka-agent-execution-binding
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: core.orka.ai/v1alpha1
+    kind: AgentExecutionControl
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["core.orka.ai"]
+        apiVersions: ["v1alpha1"]
+        operations: ["UPDATE"]
+        resources: ["tasks", "tasks/status"]
+  matchConditions:
+    - name: binding-introduced
+      expression: >-
+        object.?status.?agentExecutionBinding.hasValue() &&
+        !oldObject.?status.?agentExecutionBinding.hasValue()
+  validations:
+    - expression: >-
+        params != null && params.?status.?backends.hasValue() &&
+        (
+          object.status.agentExecutionBinding.provenance in ['legacy-adopted', 'legacy-cleanup-only']
+          ||
+          (
+            object.status.agentExecutionBinding.contractVersion == 'orka.harness.v2' &&
+            params.status.backends.v2.effectiveMode == 'enabled' &&
+            (
+              !object.status.agentExecutionBinding.?backendControl.hasValue() ||
+              (
+                string(object.status.agentExecutionBinding.backendControl.uid) == string(params.metadata.uid) &&
+                object.status.agentExecutionBinding.backendControl.modeRevision == params.status.backends.v2.modeRevision
+              )
+            )
+          )
+          ||
+          (
+            object.status.agentExecutionBinding.contractVersion == 'orka.harness.v1' &&
+            params.status.backends.v1.effectiveMode == 'enabled' &&
+            (
+              !object.status.agentExecutionBinding.?backendControl.hasValue() ||
+              (
+                string(object.status.agentExecutionBinding.backendControl.uid) == string(params.metadata.uid) &&
+                object.status.agentExecutionBinding.backendControl.modeRevision == params.status.backends.v1.modeRevision
+              )
+            )
+          )
+        )
+      message: >-
+        new execution bindings require the exact AgentExecutionControl identity
+        with an effectively enabled backend at the observed mode revision;
+        missing or stale parameters deny the write and there is no fallback
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: orka-agent-execution-binding
+spec:
+  policyName: orka-agent-execution-binding
+  validationActions: ["Deny"]
+  paramRef:
+    name: cluster
+    namespace: orka-system
+    parameterNotFoundAction: Deny
