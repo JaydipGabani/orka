@@ -341,6 +341,32 @@ workers:
       repository: ghcr.io/orka-agents/orka/general-worker
       tag: "0.1.1"
 
+  # Legacy v1 agent harness wrapper (harness v1/v2 coexistence data plane).
+  harnessWrapper:
+    image:
+      repository: ghcr.io/orka-agents/orka/agent-harness-wrapper
+      tag: "0.1.1"
+      pullPolicy: IfNotPresent
+    auth:
+      # Existing Secret containing the shared wrapper bearer token.
+      # When existingSecret and token are both empty, Helm generates a release-local token.
+      existingSecret: ""
+      tokenKey: token
+      token: ""
+    # Optional Codex CLI sandbox mode for the Codex adapter.
+    codexSandboxMode: ""
+    # Durable admission/turn ledger. Upgrades must not mutate the wrapper Pod
+    # template while active v1 turns exist without a completed durable drain.
+    ledger:
+      # SQLite ledger file path inside the wrapper container.
+      path: /var/lib/orka/ledger/ledger.db
+      # Mount point of the ledger PersistentVolumeClaim.
+      mountPath: /var/lib/orka/ledger
+      persistence:
+        size: 1Gi
+        storageClass: ""     # use cluster default
+    resources: {}
+
 # GitHub webhook and label-trigger configuration.
 # Configure a repository webhook to POST to /webhooks/github with the secret below.
 github:

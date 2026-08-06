@@ -36,6 +36,16 @@ automountServiceAccountToken: false
 kind: ServiceAccount
 metadata:
   labels:
+    app.kubernetes.io/component: coexistence-admission
+    app.kubernetes.io/name: orka
+  name: orka-orka-admission
+  namespace: orka-system
+---
+apiVersion: v1
+automountServiceAccountToken: false
+kind: ServiceAccount
+metadata:
+  labels:
     app.kubernetes.io/component: provider-auth-proxy
     app.kubernetes.io/name: orka
   name: orka-provider-auth-proxy
@@ -897,6 +907,43 @@ rules:
 - apiGroups:
   - core.orka.ai
   resources:
+  - agentexecutionadjudications
+  - agentexecutioncontrols
+  - agentexecutionpolicies
+  - outboundaccesspolicies
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - agentexecutionadjudications/status
+  - agentexecutioncontrols/status
+  - agentruntimes/status
+  - agents/status
+  - branchclaims/status
+  - controllerepochs/status
+  - externaleffects/status
+  - outboundaccesspolicies/status
+  - promptattempts/status
+  - providers/status
+  - publications/status
+  - repositorymonitors/status
+  - repositoryscans/status
+  - runtimepools/status
+  - runtimesessioncontrols/status
+  - skills/status
+  - substrateactorpools/status
+  - tasks/status
+  - tools/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - core.orka.ai
+  resources:
   - agentruntimes
   - agents
   - branchclaims
@@ -943,38 +990,6 @@ rules:
   - tools/finalizers
   verbs:
   - update
-- apiGroups:
-  - core.orka.ai
-  resources:
-  - agentruntimes/status
-  - agents/status
-  - branchclaims/status
-  - controllerepochs/status
-  - externaleffects/status
-  - outboundaccesspolicies/status
-  - promptattempts/status
-  - providers/status
-  - publications/status
-  - repositorymonitors/status
-  - repositoryscans/status
-  - runtimepools/status
-  - runtimesessioncontrols/status
-  - skills/status
-  - substrateactorpools/status
-  - tasks/status
-  - tools/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - core.orka.ai
-  resources:
-  - outboundaccesspolicies
-  verbs:
-  - get
-  - list
-  - watch
 - apiGroups:
   - discovery.k8s.io
   resources:
@@ -1949,6 +1964,24 @@ apiVersion: v1
 kind: Service
 metadata:
   labels:
+    app.kubernetes.io/component: coexistence-admission
+    app.kubernetes.io/name: orka
+  name: orka-orka-admission
+  namespace: orka-system
+spec:
+  ports:
+  - name: https
+    port: 443
+    protocol: TCP
+    targetPort: 9443
+  selector:
+    app.kubernetes.io/component: coexistence-admission
+    app.kubernetes.io/name: orka
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
     app.kubernetes.io/component: provider-auth-proxy
     app.kubernetes.io/name: orka
   name: orka-provider-auth-proxy
@@ -2205,6 +2238,103 @@ spec:
           - key: token
             path: token
           secretName: provider-auth-proxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: coexistence-admission
+    app.kubernetes.io/name: orka
+  name: orka-orka-admission
+  namespace: orka-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: coexistence-admission
+      app.kubernetes.io/name: orka
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: admission
+      labels:
+        app.kubernetes.io/component: coexistence-admission
+        app.kubernetes.io/name: orka
+        orka.ai/network-role: coexistence-admission
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/component: coexistence-admission
+                  app.kubernetes.io/name: orka
+              topologyKey: kubernetes.io/hostname
+            weight: 100
+      containers:
+      - args:
+        - --webhook-cert-dir=/tmp/k8s-webhook-server/serving-certs
+        - --webhook-port=9443
+        - --health-probe-bind-address=:8081
+        - --controller-service-accounts=system:serviceaccount:orka-system:orka-controller-manager
+        - --admin-groups=system:masters
+        command:
+        - /orka-admission
+        image: ghcr.io/orka-agents/orka/orka-admission:latest
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        name: admission
+        ports:
+        - containerPort: 9443
+          name: webhook-server
+          protocol: TCP
+        - containerPort: 8081
+          name: health
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /tmp/k8s-webhook-server/serving-certs
+          name: webhook-certs
+          readOnly: true
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: orka-orka-admission
+      terminationGracePeriodSeconds: 10
+      volumes:
+      - name: webhook-certs
+        secret:
+          defaultMode: 420
+          secretName: orka-admission-cert
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -2528,6 +2658,21 @@ spec:
             path: operation-capability-secret
           secretName: workspace-publisher-auth
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/component: coexistence-admission
+    app.kubernetes.io/name: orka
+  name: orka-orka-admission
+  namespace: orka-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: coexistence-admission
+      app.kubernetes.io/name: orka
+---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -2718,6 +2863,31 @@ spec:
   policyName: orka-gateway-task-protection
   validationActions:
   - Deny
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/component: coexistence-admission
+    app.kubernetes.io/name: orka
+  name: orka-orka-admission
+  namespace: orka-system
+spec:
+  egress: []
+  ingress:
+  - ports:
+    - port: 9443
+      protocol: TCP
+  - ports:
+    - port: 8081
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: coexistence-admission
+      app.kubernetes.io/name: orka
+  policyTypes:
+  - Ingress
+  - Egress
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -2924,3 +3094,143 @@ spec:
       app.kubernetes.io/name: vekil
   policyTypes:
   - Ingress
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  labels:
+    app.kubernetes.io/component: coexistence-admission
+    app.kubernetes.io/name: orka
+  name: orka-orka-coexistence-admission
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: orka-orka-admission
+      namespace: orka-system
+      path: /validate-coexistence-agent
+      port: 443
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: coexistence-agent.orka.ai
+  rules:
+  - apiGroups:
+    - core.orka.ai
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - agents
+    scope: Namespaced
+  sideEffects: None
+  timeoutSeconds: 10
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: orka-orka-admission
+      namespace: orka-system
+      path: /validate-coexistence-agentruntime
+      port: 443
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: coexistence-agentruntime.orka.ai
+  rules:
+  - apiGroups:
+    - core.orka.ai
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - agentruntimes
+    scope: Namespaced
+  sideEffects: None
+  timeoutSeconds: 10
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: orka-orka-admission
+      namespace: orka-system
+      path: /validate-coexistence-task-provenance
+      port: 443
+  failurePolicy: Fail
+  matchConditions:
+  - expression: '!(request.userInfo.username == ''system:serviceaccount:orka-system:orka-controller-manager''
+      && request.operation == ''UPDATE'' && (!has(object.status) || (!has(object.status.agentExecutionBinding)
+      && !has(object.status.agentExecutionNoExecution) && !has(object.status.agentExecutionQuarantine)
+      && !has(object.status.agentExecutionResolutionRef))) && (!has(oldObject.status)
+      || (!has(oldObject.status.agentExecutionBinding) && !has(oldObject.status.agentExecutionNoExecution)
+      && !has(oldObject.status.agentExecutionQuarantine) && !has(oldObject.status.agentExecutionResolutionRef))))'
+    name: route-unless-controller-cleanup-safe
+  matchPolicy: Equivalent
+  name: coexistence-task-provenance.orka.ai
+  rules:
+  - apiGroups:
+    - core.orka.ai
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - tasks
+    - tasks/status
+    scope: Namespaced
+  sideEffects: None
+  timeoutSeconds: 10
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: orka-orka-admission
+      namespace: orka-system
+      path: /validate-coexistence-adjudication
+      port: 443
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: coexistence-adjudication.orka.ai
+  rules:
+  - apiGroups:
+    - core.orka.ai
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    - DELETE
+    resources:
+    - agentexecutionadjudications
+    scope: Namespaced
+  sideEffects: None
+  timeoutSeconds: 10
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: orka-orka-admission
+      namespace: orka-system
+      path: /validate-coexistence-control-policy
+      port: 443
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: coexistence-control-policy.orka.ai
+  rules:
+  - apiGroups:
+    - core.orka.ai
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - agentexecutioncontrols
+    - agentexecutionpolicies
+    scope: Namespaced
+  sideEffects: None
+  timeoutSeconds: 10

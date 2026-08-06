@@ -115,6 +115,22 @@ suffix so long release names cannot collapse all trust tiers to one name.
 {{- end }}
 
 {{/*
+Create release-scoped harness-wrapper names while reserving room for suffixes
+that must remain valid DNS labels (notably the Service name).
+*/}}
+{{- define "orka.harnessWrapperName" -}}
+{{- printf "%s-agent-harness-wrapper" (include "orka.fullname" . | trunc 41 | trimSuffix "-") | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "orka.harnessWrapperAuthSecretName" -}}
+{{- printf "%s-harness-wrapper-auth" (include "orka.fullname" . | trunc 42 | trimSuffix "-") | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "orka.harnessWrapperLedgerName" -}}
+{{- printf "%s-harness-wrapper-ledger" (include "orka.fullname" . | trunc 40 | trimSuffix "-") | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Create the name of the workspace publisher ServiceAccount to use.
 */}}
 {{- define "orka.publisherServiceAccountName" -}}

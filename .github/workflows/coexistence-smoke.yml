@@ -1,0 +1,70 @@
+name: Coexistence Smoke
+
+on:
+  push:
+    paths:
+      - ".github/workflows/coexistence-smoke.yml"
+      - "api/**"
+      - "config/harness-wrapper/**"
+      - "go.mod"
+      - "go.sum"
+      - "internal/controller/agent_execution*"
+      - "internal/harness/**"
+      - "internal/store/**"
+      - "scripts/check-legacy-wrapper-resources.sh"
+      - "scripts/coexistence-*"
+      - "workers/harness/**"
+  pull_request:
+    paths:
+      - ".github/workflows/coexistence-smoke.yml"
+      - "api/**"
+      - "config/harness-wrapper/**"
+      - "go.mod"
+      - "go.sum"
+      - "internal/controller/agent_execution*"
+      - "internal/harness/**"
+      - "internal/store/**"
+      - "scripts/check-legacy-wrapper-resources.sh"
+      - "scripts/coexistence-*"
+      - "workers/harness/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coexistence-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coexistence-go-tests:
+    name: Coexistence Focused Go Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Create UI embed stub
+        run: make ensure-ui-embed
+
+      - name: Run coexistence focused Go tests
+        run: |
+          go test ./api/v1alpha1/ ./internal/store/... ./internal/harness/... ./internal/controller/ -run 'Coexistence|Bridge|AgentExecution|HarnessV1|Lineage|Ledger' -count=1
+
+  coexistence-shell-lint:
+    name: Coexistence Shell Script Syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: bash -n coexistence scripts
+        run: |
+          bash -n scripts/coexistence-bridge-crd-validate.sh
+          bash -n scripts/check-legacy-wrapper-resources.sh

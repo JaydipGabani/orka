@@ -1,0 +1,48 @@
+# Default-deny ingress for the v1 harness wrapper: selecting the wrapper Pod
+# with policyTypes [Ingress, Egress] denies all traffic except the rules below.
+# Only the Orka controller (same namespace) may reach the wrapper API, and the
+# wrapper may only resolve DNS and reach documented provider/SCM endpoints on
+# TCP 443. Per-trust-domain deployments are expected to tighten this policy
+# further (for example, restricting egress to an explicit provider/SCM
+# allowlist or an egress proxy) — see
+# docs/harness-v1-v2-coexistence-plan.md section 9.2.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-harness-wrapper
+  labels:
+    app.kubernetes.io/name: orka
+    app.kubernetes.io/component: agent-harness-wrapper
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: orka
+      app.kubernetes.io/component: agent-harness-wrapper
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Narrowly scoped controller ingress: only manager Pods in the same
+    # namespace (labels from config/manager/manager.yaml) on the wrapper port.
+    - from:
+        - podSelector:
+            matchLabels:
+              control-plane: controller-manager
+              app.kubernetes.io/name: orka
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # Cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # Documented provider/SCM egress (HTTPS). Tighten per trust domain.
+    - ports:
+        - {protocol: TCP, port: 443}

@@ -155,10 +155,13 @@ jobs:
             echo "AI workers must not receive an unrestricted TokenRequest ClusterRole." >&2
             exit 1
           fi
-          if grep -Rq 'harness-wrapper' manifest_staging/charts/orka/templates; then
-            echo "The generated chart reintroduced removed v1 harness-wrapper templates." >&2
-            exit 1
-          fi
+          # Harness v1/v2 coexistence: the chart ships the v1 wrapper again and
+          # must keep the Recreate + durable-ledger upgrade contract.
+          for template in harness-wrapper-deployment.yaml harness-wrapper-secret.yaml harness-wrapper-service.yaml harness-wrapper-pvc.yaml; do
+            test -f "manifest_staging/charts/orka/templates/${template}"
+          done
+          grep -Fq 'type: Recreate' manifest_staging/charts/orka/templates/harness-wrapper-deployment.yaml
+          grep -Fq 'ORKA_HARNESS_WRAPPER_LEDGER_PATH' manifest_staging/charts/orka/templates/harness-wrapper-deployment.yaml
 
           mkdir -p cr-release-packages
           helm package manifest_staging/charts/orka --destination cr-release-packages
@@ -168,7 +171,7 @@ jobs:
             echo "Expected exactly one packaged Orka chart, found ${#chart_packages[@]}." >&2
             exit 1
           fi
-          test "$(helm show crds "${chart_packages[0]}" | grep -c '^kind: CustomResourceDefinition$')" -eq 26
+          test "$(helm show crds "${chart_packages[0]}" | grep -c '^kind: CustomResourceDefinition$')" -eq 29
 
       - name: Install kind
         run: |
@@ -200,6 +203,9 @@ jobs:
           chart_package=${chart_packages[0]}
 
           expected_crds=$(cat <<'CRDS'
+          agentexecutionadjudications.core.orka.ai
+          agentexecutioncontrols.core.orka.ai
+          agentexecutionpolicies.core.orka.ai
           agentruntimes.core.orka.ai
           agents.core.orka.ai
           branchclaims.core.orka.ai
