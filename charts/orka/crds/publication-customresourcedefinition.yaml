@@ -301,6 +301,12 @@ spec:
                   preparedAt:
                     format: date-time
                     type: string
+                  relativeRoot:
+                    description: |-
+                      RelativeRoot is the canonical repository-relative workspace root applied
+                      to every path in the immutable delta artifact.
+                    maxLength: 1024
+                    type: string
                   requestDigest:
                     pattern: ^sha256:[a-f0-9]{64}$
                     type: string

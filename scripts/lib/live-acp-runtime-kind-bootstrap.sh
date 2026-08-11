@@ -85,8 +85,10 @@ live_acp_kind_create_cluster() {
     args+=(--config "${LIVE_ACP_KIND_CONFIG}")
   fi
 
-  live_acp_kind_run "${LIVE_ACP_KINDCTL_BIN}" "${args[@]}"
+  # Arm exact-tag deletion before create: Kind can leave a partial cluster even
+  # when its create command returns non-zero.
   LIVE_ACP_KIND_CREATED=1
+  live_acp_kind_run "${LIVE_ACP_KINDCTL_BIN}" "${args[@]}" || return $?
   LIVE_ACP_KUBECONFIG="$("${LIVE_ACP_KINDCTL_BIN}" path --tag "${LIVE_ACP_KIND_TAG}")"
   export KUBECONFIG="${LIVE_ACP_KUBECONFIG}"
   LIVE_ACP_CONTEXT="$(kubectl config current-context)"
@@ -109,9 +111,10 @@ live_acp_kind_build_and_publish_images() {
     ACP_COPILOT_RUNTIME_IMG="${LIVE_ACP_COPILOT_IMAGE}" \
     ACP_OPENCODE_RUNTIME_IMG="${LIVE_ACP_OPENCODE_IMAGE}" \
     WORKSPACE_PUBLISHER_IMG="${LIVE_ACP_PUBLISHER_IMAGE}" \
+    GENERAL_WORKER_IMG="${LIVE_ACP_GENERAL_WORKER_IMAGE}" \
     docker-build docker-build-acp-codex-runtime docker-build-acp-claude-runtime \
     docker-build-acp-copilot-runtime docker-build-acp-opencode-runtime \
-    docker-build-workspace-publisher
+    docker-build-workspace-publisher docker-build-general-worker
 
   LIVE_ACP_CONTROLLER_REF="$(orka_kind_registry_push "${LIVE_ACP_CONTROLLER_IMAGE}" orka/controller)"
   LIVE_ACP_CODEX_REF="$(orka_kind_registry_push "${LIVE_ACP_CODEX_IMAGE}" orka/acp-codex-runtime)"
@@ -119,8 +122,9 @@ live_acp_kind_build_and_publish_images() {
   LIVE_ACP_COPILOT_REF="$(orka_kind_registry_push "${LIVE_ACP_COPILOT_IMAGE}" orka/acp-copilot-runtime)"
   LIVE_ACP_OPENCODE_REF="$(orka_kind_registry_push "${LIVE_ACP_OPENCODE_IMAGE}" orka/acp-opencode-runtime)"
   LIVE_ACP_PUBLISHER_REF="$(orka_kind_registry_push "${LIVE_ACP_PUBLISHER_IMAGE}" orka/workspace-publisher)"
+  LIVE_ACP_GENERAL_WORKER_REF="$(orka_kind_registry_push "${LIVE_ACP_GENERAL_WORKER_IMAGE}" orka/general-worker)"
   export LIVE_ACP_CONTROLLER_REF LIVE_ACP_CODEX_REF LIVE_ACP_CLAUDE_REF LIVE_ACP_COPILOT_REF
-  export LIVE_ACP_OPENCODE_REF LIVE_ACP_PUBLISHER_REF
+  export LIVE_ACP_OPENCODE_REF LIVE_ACP_PUBLISHER_REF LIVE_ACP_GENERAL_WORKER_REF
 }
 
 live_acp_kind_catalog_model_supports_endpoint() {
@@ -424,7 +428,8 @@ live_acp_kind_deploy_orka() {
     ACP_CLAUDE_RUNTIME_IMG="${LIVE_ACP_CLAUDE_REF}" \
     ACP_COPILOT_RUNTIME_IMG="${LIVE_ACP_COPILOT_REF}" \
     ACP_OPENCODE_RUNTIME_IMG="${LIVE_ACP_OPENCODE_REF}" \
-    WORKSPACE_PUBLISHER_IMG="${LIVE_ACP_PUBLISHER_REF}"
+    WORKSPACE_PUBLISHER_IMG="${LIVE_ACP_PUBLISHER_REF}" \
+    GENERAL_WORKER_IMG="${LIVE_ACP_GENERAL_WORKER_REF}"
 
   local deployment
   for deployment in orka-controller-manager orka-workspace-publisher orka-provider-auth-proxy orka-scm-egress-proxy; do
@@ -485,9 +490,12 @@ live_acp_kind_bootstrap() {
 
 live_acp_kind_cleanup() {
   local status="${1:-0}"
+  local cleanup_status=0
   set +e
-  live_acp_kind_stop_vekil_port_forward >/dev/null 2>&1 || true
-  rm -rf "${LIVE_ACP_SECRET_DIR:-}" >/dev/null 2>&1 || true
+  live_acp_kind_stop_vekil_port_forward >/dev/null 2>&1 || cleanup_status=1
+  if [[ -n "${LIVE_ACP_SECRET_DIR:-}" ]]; then
+    rm -rf -- "${LIVE_ACP_SECRET_DIR}" >/dev/null 2>&1 || cleanup_status=1
+  fi
   if [[ "${LIVE_ACP_KEEP_CLUSTER:-0}" == "1" ]]; then
     live_acp_kind_log "Keeping Kind cluster ${LIVE_ACP_KIND_CLUSTER:-<not-created>} (ACP_E2E_KEEP_CLUSTER=1)"
     return "${status}"
@@ -495,10 +503,13 @@ live_acp_kind_cleanup() {
   if [[ "${LIVE_ACP_REGISTRY_STARTED:-0}" == "1" ]]; then
     # shellcheck source=scripts/lib/kind-local-registry.sh
     . "${LIVE_ACP_REPO_ROOT}/scripts/lib/kind-local-registry.sh"
-    orka_kind_registry_stop "${LIVE_ACP_KIND_CLUSTER:-}" || true
+    orka_kind_registry_stop "${LIVE_ACP_KIND_CLUSTER:-}" || cleanup_status=1
   fi
   if [[ "${LIVE_ACP_KIND_CREATED:-0}" == "1" ]]; then
-    "${LIVE_ACP_KINDCTL_BIN}" delete --tag "${LIVE_ACP_KIND_TAG}" || true
+    "${LIVE_ACP_KINDCTL_BIN}" delete --tag "${LIVE_ACP_KIND_TAG}" || cleanup_status=1
   fi
-  return "${status}"
+  if (( status != 0 )); then
+    return "${status}"
+  fi
+  return "${cleanup_status}"
 }

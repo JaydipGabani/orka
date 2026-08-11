@@ -132,9 +132,16 @@ func externalEffectLeaseOwner(fence store.ControllerEpochFence, identity store.E
 	return "effect-" + hex.EncodeToString(sum[:16])
 }
 
+const (
+	defaultACPExternalEffectRetryDelay = 5 * time.Second
+	maxACPExternalEffectRetryBudget    = acpExternalEffectLease - time.Minute
+)
+
 // runACPExternalEffectWithRetry retries the same immutable external-effect
-// identity until it commits, a non-retryable response is proven, or the caller's
-// bounded reconciliation context expires. Prompt input is never replayed.
+// operation while retaining its controller-side lease until it commits, a
+// non-retryable response is proven, or the caller's bounded reconciliation
+// context expires. Publisher operations are idempotent by operation ID, and
+// prompt input is never replayed.
 func runACPExternalEffectWithRetry[T any](
 	ctx context.Context,
 	d *ACPDispatcher,
@@ -143,23 +150,66 @@ func runACPExternalEffectWithRetry[T any](
 	request any,
 	call func(context.Context) (T, error),
 ) (T, error) {
+	return runACPExternalEffectWithRetryPolicy(
+		ctx, d, fence, identity, request,
+		defaultACPExternalEffectRetryDelay, maxACPExternalEffectRetryBudget, call,
+	)
+}
+
+func runACPExternalEffectWithRetryDelay[T any](
+	ctx context.Context,
+	d *ACPDispatcher,
+	fence store.ControllerEpochFence,
+	identity store.ExternalEffectIdentity,
+	request any,
+	retryDelay time.Duration,
+	call func(context.Context) (T, error),
+) (T, error) {
+	return runACPExternalEffectWithRetryPolicy(
+		ctx, d, fence, identity, request, retryDelay, maxACPExternalEffectRetryBudget, call,
+	)
+}
+
+func runACPExternalEffectWithRetryPolicy[T any](
+	ctx context.Context,
+	d *ACPDispatcher,
+	fence store.ControllerEpochFence,
+	identity store.ExternalEffectIdentity,
+	request any,
+	retryDelay time.Duration,
+	retryBudget time.Duration,
+	call func(context.Context) (T, error),
+) (T, error) {
 	var zero T
-	for {
-		value, err := runACPExternalEffect(ctx, d, fence, identity, request, call)
-		if err == nil {
-			return value, nil
-		}
-		if !retryableACPExternalEffectError(err) {
-			return zero, err
-		}
-		timer := time.NewTimer(5 * time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return zero, fmt.Errorf("bounded external-effect reconciliation expired: %w", ctx.Err())
-		case <-timer.C:
-		}
+	if retryDelay <= 0 {
+		return zero, fmt.Errorf("external-effect retry delay must be positive")
 	}
+	if retryBudget <= 0 || retryBudget > maxACPExternalEffectRetryBudget {
+		return zero, fmt.Errorf("external-effect retry budget must be positive and leave the required lease settlement margin")
+	}
+	return runACPExternalEffect(ctx, d, fence, identity, request, func(callCtx context.Context) (T, error) {
+		retryCtx, cancel := context.WithTimeout(callCtx, retryBudget)
+		defer cancel()
+		for {
+			value, err := call(retryCtx)
+			if retryErr := retryCtx.Err(); retryErr != nil {
+				return zero, fmt.Errorf("bounded external-effect reconciliation expired: %w", retryErr)
+			}
+			if err == nil {
+				return value, nil
+			}
+			if !retryableACPExternalEffectError(err) {
+				return zero, err
+			}
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-retryCtx.Done():
+				timer.Stop()
+				return zero, fmt.Errorf("bounded external-effect reconciliation expired: %w", retryCtx.Err())
+			case <-timer.C:
+			}
+		}
+	})
 }
 
 func retryableACPExternalEffectError(err error) bool {

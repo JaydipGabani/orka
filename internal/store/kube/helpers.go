@@ -58,6 +58,7 @@ type epochSnapshot struct {
 	LeaseResourceVersion string
 	MutationToken        string
 	MutationLease        *coordinationv1.Lease
+	LocalMutationSlot    bool
 }
 
 func validateKubernetesNamespace(namespace string) error {

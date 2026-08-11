@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -18,13 +19,68 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/taskterminal"
 )
 
 const (
 	taskResourceKind                     = "Task"
+	taskTerminalProjectionKind           = "TaskTerminalStatus"
 	acpControllerRestartRecoveredReason  = "ControllerRestartRecovered"
 	acpControllerRestartRecoveredMessage = "pre-submission attempt recovered under the new controller epoch"
+	acpRestoreIdentityChangedReason      = "RestoreIdentityChanged"
+	acpRestoreIdentityChangedOperation   = "restore-identity-changed"
+	acpRestorePreSubmissionMessage       = "Task incarnation changed during restore before prompt submission; source execution was not replayed"
+	acpRestorePostWriteMessage           = "Task incarnation changed during restore after the prompt request-write boundary; outcome is unknown and was not replayed"
+	acpRestoreTerminalPreservedMessage   = "Task incarnation changed during restore after source execution reached a durable terminal state; execution was preserved and was not replayed"
 )
+
+func acpTaskControlUID(task *corev1alpha1.Task) types.UID {
+	if task == nil {
+		return ""
+	}
+	if acpTaskUsesRestoredSourceIdentity(task) {
+		binding := task.Status.AgentExecutionBinding
+		return binding.Task.UID
+	}
+	return task.UID
+}
+
+func acpTaskUsesRestoredSourceIdentity(task *corev1alpha1.Task) bool {
+	if task == nil || task.Status.Execution == nil {
+		return false
+	}
+	switch task.Status.Phase {
+	case corev1alpha1.TaskPhaseSucceeded, corev1alpha1.TaskPhaseFailed, corev1alpha1.TaskPhaseCancelled:
+	default:
+		return false
+	}
+	binding := executionBinding(task, corev1alpha1.AgentRuntimeContractHarnessV2)
+	if binding == nil || binding.Task.UID == "" || binding.Task.UID == task.UID ||
+		task.Status.Execution.Reason != corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason) {
+		return false
+	}
+	switch task.Status.Execution.State {
+	case corev1alpha1.TaskExecutionStateSucceeded:
+		return task.Status.Execution.Outcome == corev1alpha1.TaskExecutionOutcomeSucceeded
+	case corev1alpha1.TaskExecutionStateFailed:
+		return task.Status.Execution.Outcome == corev1alpha1.TaskExecutionOutcomeFailed
+	case corev1alpha1.TaskExecutionStateCancelled:
+		return task.Status.Execution.Outcome == corev1alpha1.TaskExecutionOutcomeCancelled
+	case corev1alpha1.TaskExecutionStateOutcomeUnknown:
+		return task.Status.Execution.Outcome == corev1alpha1.TaskExecutionOutcomeOutcomeUnknown
+	default:
+		return false
+	}
+}
+
+func acpTaskHasUnvalidatedSourceIdentity(task *corev1alpha1.Task) bool {
+	return acpTaskHasRestoredSourceIdentityBinding(task) && !acpTaskUsesRestoredSourceIdentity(task)
+}
+
+func acpTaskHasRestoredSourceIdentityBinding(task *corev1alpha1.Task) bool {
+	binding := executionBinding(task, corev1alpha1.AgentRuntimeContractHarnessV2)
+	return binding != nil && binding.Task.UID != "" && binding.Task.UID != task.UID
+}
 
 // recoverStaleAttempts classifies every old-epoch ACP attempt before the new
 // leader admits work. It resumes only states that provably crossed no prompt
@@ -45,8 +101,22 @@ func (d *ACPDispatcher) recoverStaleAttempts(ctx context.Context) error {
 		if readErr != nil {
 			return fmt.Errorf("refresh stale ACP task %s/%s: %w", candidate.Namespace, candidate.Name, readErr)
 		}
-		if !recoverable || !taskManagedByACP(task) || !taskDispatchableByACP(task) ||
-			task.Status.Execution == nil || task.Status.Execution.ControllerEpoch >= fence.Epoch {
+		if !recoverable {
+			continue
+		}
+		if acpTaskHasRestoredSourceIdentityBinding(task) {
+			if restored, restoreErr := d.recoverRestoredTaskIncarnation(ctx, task, fence); restoreErr != nil {
+				return fmt.Errorf("recover restored ACP task %s/%s: %w", task.Namespace, task.Name, restoreErr)
+			} else if !restored {
+				return fmt.Errorf("recover restored ACP task %s/%s: %w: restored Task source identity was not classified",
+					task.Namespace, task.Name, store.ErrConflict)
+			}
+			continue
+		}
+		if !taskManagedByACP(task) || !taskDispatchableByACP(task) || task.Status.Execution == nil {
+			continue
+		}
+		if task.Status.Execution.ControllerEpoch >= fence.Epoch {
 			continue
 		}
 		if err := d.recoverStaleTask(ctx, task, fence); err != nil {
@@ -63,6 +133,453 @@ func (d *ACPDispatcher) recoverStaleAttempts(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// recoverRestoredTaskIncarnation settles a Task whose Kubernetes UID changed
+// during a clean-cluster restore. Kubernetes UIDs are incarnation fences, not
+// portable logical identifiers: all durable source records remain keyed by the
+// UID frozen in AgentExecutionBinding and are never rewritten or replayed under
+// the restored Task UID.
+func (d *ACPDispatcher) recoverRestoredTaskIncarnation(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	fence store.ControllerEpochFence,
+) (bool, error) {
+	if task == nil {
+		return false, nil
+	}
+	binding := executionBinding(task, corev1alpha1.AgentRuntimeContractHarnessV2)
+	if binding == nil {
+		return false, nil
+	}
+	sourceUID := strings.TrimSpace(string(binding.Task.UID))
+	if sourceUID == "" {
+		return false, nil
+	}
+	if sourceUID == string(task.UID) {
+		return false, nil
+	}
+	if task.Status.Execution == nil {
+		return true, fmt.Errorf("%w: restored Task execution status is missing", store.ErrConflict)
+	}
+	if task.Status.Execution.Attempt < 1 || strings.TrimSpace(task.Status.Execution.PromptID) == "" {
+		return true, fmt.Errorf("%w: restored Task execution identity is incomplete", store.ErrConflict)
+	}
+	attemptID, err := (store.PromptAttemptKey{
+		Namespace: task.Namespace,
+		TaskUID:   sourceUID,
+		Attempt:   int64(task.Status.Execution.Attempt),
+		PromptID:  task.Status.Execution.PromptID,
+	}).CanonicalID()
+	if err != nil {
+		return true, err
+	}
+	attempt, err := d.Store.GetPromptAttempt(ctx, attemptID)
+	if err != nil {
+		return true, err
+	}
+	if err := validateRestoredTaskSourceAttempt(task, attempt, attemptID); err != nil {
+		return true, err
+	}
+
+	alreadySettled := acpTaskUsesRestoredSourceIdentity(task)
+
+	settlement, err := d.settleRestoredTaskExecution(ctx, attempt, fence)
+	if err != nil {
+		return true, err
+	}
+	attempt, err = d.Store.GetPromptAttempt(ctx, attemptID)
+	if err != nil {
+		return true, err
+	}
+	if err := validateRestoredTaskSourceAttempt(task, attempt, attemptID); err != nil {
+		return true, err
+	}
+	attempt, err = d.settleRestoredTerminalDelivery(ctx, task, types.UID(sourceUID), attempt, fence)
+	if err != nil {
+		return true, err
+	}
+	delivery, err := restoredTerminalDeliveryStatus(task, attempt.DeliveryState)
+	if err != nil {
+		return true, err
+	}
+	cleanupComplete, err := d.cleanupRecoveredTaskScopedRuntimeSessionForUID(ctx, task, types.UID(sourceUID))
+	if err != nil {
+		return true, err
+	}
+	if !cleanupComplete {
+		return true, fmt.Errorf("%w: restored Task RuntimeSession cleanup is not complete", store.ErrNotReady)
+	}
+	if settlement.requiresProjection || alreadySettled {
+		if err := d.ensureRestoredTaskTerminalProjection(
+			ctx, task, types.UID(sourceUID), attempt, fence,
+			settlement.state, settlement.outcome, settlement.message, delivery,
+		); err != nil {
+			return true, err
+		}
+	}
+	return true, d.patchRestoredTaskTerminal(
+		ctx, task, fence.Epoch, settlement.state, settlement.outcome, settlement.message, delivery,
+	)
+}
+
+type restoredTaskExecutionSettlement struct {
+	state              corev1alpha1.TaskExecutionState
+	outcome            corev1alpha1.TaskExecutionOutcome
+	message            string
+	requiresProjection bool
+}
+
+func (d *ACPDispatcher) settleRestoredTaskExecution(
+	ctx context.Context,
+	attempt *store.PromptAttempt,
+	fence store.ControllerEpochFence,
+) (restoredTaskExecutionSettlement, error) {
+	settlement := restoredTaskExecutionSettlement{
+		state:   corev1alpha1.TaskExecutionStateFailed,
+		outcome: corev1alpha1.TaskExecutionOutcomeFailed,
+		message: acpRestorePreSubmissionMessage,
+	}
+	if attempt == nil {
+		return settlement, fmt.Errorf("%w: restored Task source PromptAttempt is missing", store.ErrConflict)
+	}
+	switch attempt.ExecutionState {
+	case store.PromptExecutionQueued, store.PromptExecutionReserved,
+		store.PromptExecutionSessionStarting, store.PromptExecutionPlanned:
+		if err := d.persistRestoredPreSubmissionFailure(ctx, attempt, fence); err != nil {
+			return settlement, err
+		}
+		settlement.requiresProjection = true
+	case store.PromptExecutionSubmitting, store.PromptExecutionSubmittedUnknown,
+		store.PromptExecutionAccepted, store.PromptExecutionRunning, store.PromptExecutionSettling:
+		settlement.state = corev1alpha1.TaskExecutionStateOutcomeUnknown
+		settlement.outcome = corev1alpha1.TaskExecutionOutcomeOutcomeUnknown
+		settlement.message = acpRestorePostWriteMessage
+		if err := d.persistOutcomeUnknown(ctx, attempt.ID, fence, acpRestoreIdentityChangedReason, settlement.message); err != nil {
+			return settlement, err
+		}
+		settlement.requiresProjection = true
+	case store.PromptExecutionSucceeded, store.PromptExecutionFailed,
+		store.PromptExecutionCancelled, store.PromptExecutionOutcomeUnknown:
+		settlement.requiresProjection = true
+		if attempt.ExecutionState == store.PromptExecutionFailed &&
+			attempt.TerminalReason == acpRestoreIdentityChangedReason &&
+			attempt.OutcomeMarker == acpRestorePreSubmissionMessage {
+			settlement.message = acpRestorePreSubmissionMessage
+		} else if attempt.ExecutionState == store.PromptExecutionOutcomeUnknown &&
+			attempt.TerminalReason == acpRestoreIdentityChangedReason &&
+			attempt.OutcomeMarker == acpRestorePostWriteMessage {
+			settlement.state = corev1alpha1.TaskExecutionStateOutcomeUnknown
+			settlement.outcome = corev1alpha1.TaskExecutionOutcomeOutcomeUnknown
+			settlement.message = acpRestorePostWriteMessage
+		} else {
+			settlement.state, settlement.outcome = restoredTerminalExecutionState(attempt.ExecutionState)
+			settlement.message = acpRestoreTerminalPreservedMessage
+		}
+	default:
+		return settlement, fmt.Errorf("%w: restored Task source PromptAttempt has unsupported state %q", store.ErrConflict, attempt.ExecutionState)
+	}
+	return settlement, nil
+}
+
+func restoredTerminalExecutionState(state store.PromptExecutionState) (corev1alpha1.TaskExecutionState, corev1alpha1.TaskExecutionOutcome) {
+	switch state {
+	case store.PromptExecutionSucceeded:
+		return corev1alpha1.TaskExecutionStateSucceeded, corev1alpha1.TaskExecutionOutcomeSucceeded
+	case store.PromptExecutionCancelled:
+		return corev1alpha1.TaskExecutionStateCancelled, corev1alpha1.TaskExecutionOutcomeCancelled
+	case store.PromptExecutionOutcomeUnknown:
+		return corev1alpha1.TaskExecutionStateOutcomeUnknown, corev1alpha1.TaskExecutionOutcomeOutcomeUnknown
+	default:
+		return corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed
+	}
+}
+
+func restoredTaskPhase(state corev1alpha1.TaskExecutionState, delivery store.PromptDeliveryState) corev1alpha1.TaskPhase {
+	switch state {
+	case corev1alpha1.TaskExecutionStateCancelled:
+		return corev1alpha1.TaskPhaseCancelled
+	case corev1alpha1.TaskExecutionStateSucceeded:
+		switch delivery {
+		case store.PromptDeliveryNotRequested, store.PromptDeliveryReadValidated, store.PromptDeliveryNoChange,
+			store.PromptDeliveryVerifiedExact, store.PromptDeliveryDeliveredSuperseded:
+			return corev1alpha1.TaskPhaseSucceeded
+		case store.PromptDeliveryCancelledBeforePublish:
+			return corev1alpha1.TaskPhaseCancelled
+		}
+	}
+	return corev1alpha1.TaskPhaseFailed
+}
+
+func restoredTerminalDeliveryStatus(task *corev1alpha1.Task, state store.PromptDeliveryState) (*corev1alpha1.TaskDeliveryStatus, error) {
+	if !store.IsTerminalPromptDeliveryState(state) {
+		return nil, fmt.Errorf("%w: restored Task delivery state %q is not terminal", store.ErrConflict, state)
+	}
+	var delivery *corev1alpha1.TaskDeliveryStatus
+	if task != nil && task.Status.Delivery != nil {
+		delivery = task.Status.Delivery.DeepCopy()
+	} else {
+		delivery = &corev1alpha1.TaskDeliveryStatus{}
+	}
+	if store.PromptDeliveryState(delivery.State) == state && string(delivery.Outcome) == string(state) {
+		return delivery, nil
+	}
+	delivery.State = corev1alpha1.TaskDeliveryState(state)
+	delivery.Outcome = corev1alpha1.TaskDeliveryOutcome(state)
+	delivery.LastTransitionTime = nowMeta()
+	return delivery, nil
+}
+
+func (d *ACPDispatcher) persistRestoredPreSubmissionFailure(
+	ctx context.Context,
+	attempt *store.PromptAttempt,
+	fence store.ControllerEpochFence,
+) error {
+	if attempt == nil {
+		return fmt.Errorf("%w: restored Task source PromptAttempt is missing", store.ErrConflict)
+	}
+	if attempt.ExecutionState == store.PromptExecutionFailed {
+		if attempt.TerminalReason == acpRestoreIdentityChangedReason && attempt.OutcomeMarker == acpRestorePreSubmissionMessage {
+			return nil
+		}
+		return fmt.Errorf("%w: restored Task source PromptAttempt has a conflicting terminal failure", store.ErrConflict)
+	}
+	if err := store.ValidatePromptExecutionTransition(attempt.ExecutionState, store.PromptExecutionFailed); err != nil {
+		return err
+	}
+	digest, err := acpDomainDigest("attempt-transition", map[string]any{
+		"id": attempt.ID, "from": attempt.ExecutionState, "to": store.PromptExecutionFailed,
+		"operation": acpRestoreIdentityChangedOperation, "version": attempt.Version,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.Store.TransitionPromptAttemptExecution(ctx, store.PromptAttemptExecutionTransition{
+		ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
+		NewState:        store.PromptExecutionFailed,
+		OperationID:     acpRestoreIdentityChangedOperation + "-" + strconv.FormatInt(attempt.Version, 10),
+		OperationDigest: digest, TerminalReason: acpRestoreIdentityChangedReason,
+		OutcomeMarker: acpRestorePreSubmissionMessage, UpdatedAt: time.Now().UTC(),
+	})
+	return err
+}
+
+func (d *ACPDispatcher) ensureRestoredTaskTerminalProjection(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	sourceUID types.UID,
+	attempt *store.PromptAttempt,
+	fence store.ControllerEpochFence,
+	state corev1alpha1.TaskExecutionState,
+	outcome corev1alpha1.TaskExecutionOutcome,
+	message string,
+	delivery *corev1alpha1.TaskDeliveryStatus,
+) error {
+	if task == nil || task.Status.Execution == nil || attempt == nil || delivery == nil || sourceUID == "" || sourceUID == task.UID ||
+		store.PromptDeliveryState(delivery.State) != attempt.DeliveryState || string(delivery.Outcome) != string(attempt.DeliveryState) {
+		return fmt.Errorf("%w: restored Task projection identity is incomplete", store.ErrConflict)
+	}
+	projectionID := standaloneTaskTerminalProjectionIDForUID(task.Namespace, sourceUID, task.Status.Execution.Attempt)
+	existing, err := d.Store.GetOutboxProjection(ctx, projectionID)
+	if err == nil {
+		return validateRestoredSourceTerminalProjection(task, sourceUID, attempt, existing)
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	execution := *task.Status.Execution
+	execution.State = state
+	execution.Outcome = outcome
+	phase := restoredTaskPhase(state, attempt.DeliveryState)
+	projectionMessage := message
+	if attempt.TerminalReason == acpRestoreIdentityChangedReason {
+		execution.Reason = corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason)
+		execution.Message = message
+	}
+	execution.ControllerEpoch = fence.Epoch
+	payload := taskTerminalProjection{
+		Namespace: task.Namespace,
+		Task:      task.Name,
+		TaskUID:   string(sourceUID),
+		Attempt:   execution.Attempt,
+		Phase:     phase,
+		Message:   projectionMessage,
+		Execution: execution,
+		Delivery:  delivery,
+	}
+	return enqueueDurableTaskTerminalProjectionForUID(ctx, d.Store, fence, task, sourceUID, payload)
+}
+
+func validateRestoredSourceTerminalProjection(task *corev1alpha1.Task, sourceUID types.UID, attempt *store.PromptAttempt, projection *store.OutboxProjection) error {
+	if projection == nil || projection.ID != standaloneTaskTerminalProjectionIDForUID(task.Namespace, sourceUID, task.Status.Execution.Attempt) ||
+		projection.AggregateKind != taskResourceKind || projection.AggregateID != string(sourceUID) || projection.ProjectionKind != taskTerminalProjectionKind {
+		return fmt.Errorf("%w: restored source terminal projection identity mismatch", store.ErrConflict)
+	}
+	_, err := taskterminal.ValidateRestoredProjection(projection.Payload, task, string(sourceUID), attempt)
+	return err
+}
+
+func validateRestoredTaskSourceAttempt(task *corev1alpha1.Task, attempt *store.PromptAttempt, attemptID string) error {
+	if task == nil || task.Status.Execution == nil || task.Status.AgentExecutionBinding == nil || attempt == nil {
+		return fmt.Errorf("%w: restored Task source execution evidence is incomplete", store.ErrConflict)
+	}
+	binding := task.Status.AgentExecutionBinding
+	if binding.ContractVersion != corev1alpha1.AgentRuntimeContractHarnessV2 ||
+		attempt.ID != attemptID || attempt.Key.Namespace != task.Namespace ||
+		attempt.Key.TaskUID != string(binding.Task.UID) || attempt.Key.Attempt != int64(task.Status.Execution.Attempt) ||
+		attempt.Key.PromptID != task.Status.Execution.PromptID || attempt.BindingDigest != binding.BindingDigest ||
+		attempt.SnapshotDigest != binding.Snapshot.Digest ||
+		(strings.TrimSpace(task.Status.Execution.RequestDigest) != "" && attempt.RequestDigest != task.Status.Execution.RequestDigest) {
+		return fmt.Errorf("%w: restored Task source PromptAttempt does not match its frozen execution binding", store.ErrConflict)
+	}
+	return nil
+}
+
+//nolint:gocyclo // Restore settlement must mirror every durable delivery/publication state without losing fail-closed cases.
+func (d *ACPDispatcher) settleRestoredTerminalDelivery(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	sourceUID types.UID,
+	attempt *store.PromptAttempt,
+	fence store.ControllerEpochFence,
+) (*store.PromptAttempt, error) {
+	if task == nil || task.Status.Execution == nil || attempt == nil || !store.IsTerminalPromptExecutionState(attempt.ExecutionState) {
+		return nil, fmt.Errorf("%w: restored delivery settlement requires terminal source execution", store.ErrConflict)
+	}
+	publicationState := store.PublicationState("")
+	if task.Spec.Workspace != nil && task.Spec.Workspace.Intent == corev1alpha1.WorkspaceIntentWrite {
+		publicationID := publicationIDForTaskUID(task, sourceUID)
+		publication, err := d.Store.GetPublication(ctx, publicationID)
+		if err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				return nil, err
+			}
+			switch {
+			case store.IsTerminalPromptDeliveryState(attempt.DeliveryState):
+				return attempt, nil
+			case attempt.DeliveryState == store.PromptDeliveryValidating:
+				// Publication creation precedes the Validating -> Preparing
+				// transition. A restored Validating attempt may therefore have no
+				// Publication, and can settle fail-closed without inventing one.
+			default:
+				return nil, err
+			}
+		}
+		if publication != nil {
+			if publication.Namespace != task.Namespace || publication.TaskUID != string(sourceUID) ||
+				publication.Attempt != int64(task.Status.Execution.Attempt) || publication.PromptID != task.Status.Execution.PromptID {
+				return nil, fmt.Errorf("%w: restored Publication does not match frozen source identity", store.ErrConflict)
+			}
+			publicationState = publication.State
+			if !store.IsTerminalPublicationState(publication.State) {
+				const reason = "clean-cluster restore cannot prove the in-flight publication outcome"
+				switch publication.State {
+				case store.PublicationPreparing, store.PublicationPublishing:
+					if err := d.transitionPublicationTerminal(ctx, publication, fence, store.PublicationOutcomeUnknown, reason); err != nil {
+						return nil, err
+					}
+					publicationState = store.PublicationOutcomeUnknown
+				case store.PublicationPrepared:
+					if err := d.transitionPublicationTerminal(ctx, publication, fence, store.PublicationCancelledBeforePublish, reason); err != nil {
+						return nil, err
+					}
+					publicationState = store.PublicationCancelledBeforePublish
+				case store.PublicationVerifying:
+					if publication.PreparedReceipt == nil || publication.PublishReceipt == nil {
+						return nil, fmt.Errorf("%w: restored verifying Publication lacks durable prepare/publish receipts", store.ErrConflict)
+					}
+					op := publicationOperationID("restore-unknown", nil)
+					digest, digestErr := acpDomainDigest("publication-restore-unknown", map[string]any{
+						"id": publication.ID, "generation": publication.Generation, "version": publication.Version,
+					})
+					if digestErr != nil {
+						return nil, digestErr
+					}
+					receipt := &store.PublicationVerificationReceipt{
+						OperationID: op, RequestDigest: digest, Outcome: store.PublicationOutcomeUnknown,
+						ExpectedCommitSHA: publication.PreparedReceipt.CommitSHA, VerifiedAt: time.Now().UTC(),
+					}
+					if _, err := d.transitionPublication(ctx, publication, fence, store.PublicationOutcomeUnknown, op, digest, nil, nil, receipt, reason); err != nil {
+						return nil, err
+					}
+					publicationState = store.PublicationOutcomeUnknown
+				default:
+					return nil, fmt.Errorf("%w: unsupported restored Publication state %q", store.ErrConflict, publication.State)
+				}
+			}
+		}
+	}
+	if store.IsTerminalPromptDeliveryState(attempt.DeliveryState) {
+		return attempt, nil
+	}
+	to := store.PromptDeliveryPublicationOutcomeUnknown
+	if publicationState != "" {
+		to = promptDeliveryForPublication(publicationState)
+	}
+	switch attempt.DeliveryState {
+	case store.PromptDeliveryValidating:
+		if publicationState == "" {
+			to = store.PromptDeliveryConflict
+		}
+	case store.PromptDeliveryPrepared:
+	case store.PromptDeliveryPreparing, store.PromptDeliveryPublishing, store.PromptDeliveryVerifying:
+	default:
+		return nil, fmt.Errorf("%w: unsupported restored delivery state %q", store.ErrConflict, attempt.DeliveryState)
+	}
+	const reason = "clean-cluster restore terminalized an in-flight delivery without replay"
+	if err := d.transitionDelivery(ctx, attempt.ID, fence, attempt.DeliveryState, to, "restore-delivery-settlement", reason); err != nil {
+		return nil, err
+	}
+	return d.Store.GetPromptAttempt(ctx, attempt.ID)
+}
+
+func (d *ACPDispatcher) patchRestoredTaskTerminal(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	epoch int64,
+	state corev1alpha1.TaskExecutionState,
+	outcome corev1alpha1.TaskExecutionOutcome,
+	message string,
+	delivery *corev1alpha1.TaskDeliveryStatus,
+) error {
+	if delivery == nil || !store.IsTerminalPromptDeliveryState(store.PromptDeliveryState(delivery.State)) ||
+		string(delivery.Outcome) != string(delivery.State) {
+		return fmt.Errorf("%w: restored Task terminal delivery evidence is incomplete", store.ErrConflict)
+	}
+	deliveryState := store.PromptDeliveryState(delivery.State)
+	key := types.NamespacedName{Namespace: task.Namespace, Name: task.Name}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &corev1alpha1.Task{}
+		if err := d.Client.Get(ctx, key, latest); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if latest.UID != task.UID || latest.Status.Execution == nil || latest.Status.AgentExecutionBinding == nil ||
+			latest.Status.AgentExecutionBinding.Task.UID == latest.UID || task.Status.AgentExecutionBinding == nil ||
+			latest.Status.AgentExecutionBinding.Task.UID != task.Status.AgentExecutionBinding.Task.UID ||
+			latest.Status.AgentExecutionBinding.BindingDigest != task.Status.AgentExecutionBinding.BindingDigest ||
+			latest.Status.Execution.Attempt != task.Status.Execution.Attempt ||
+			latest.Status.Execution.PromptID != task.Status.Execution.PromptID {
+			return fmt.Errorf("%w: restored Task incarnation changed during settlement", store.ErrConflict)
+		}
+		if acpTaskUsesRestoredSourceIdentity(latest) && latest.Status.Execution.State == state &&
+			latest.Status.Execution.Outcome == outcome && latest.Status.Execution.ControllerEpoch == epoch &&
+			reflect.DeepEqual(latest.Status.Delivery, delivery) {
+			return nil
+		}
+		base := latest.DeepCopy()
+		now := metav1.Now()
+		latest.Status.Phase = restoredTaskPhase(state, deliveryState)
+		latest.Status.Message = message
+		latest.Status.Execution.State = state
+		latest.Status.Execution.Outcome = outcome
+		latest.Status.Execution.Reason = corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason)
+		latest.Status.Execution.Message = message
+		latest.Status.Execution.ControllerEpoch = epoch
+		latest.Status.Execution.LastTransitionTime = &now
+		latest.Status.Delivery = delivery.DeepCopy()
+		latest.Status.CompletionTime = &now
+		return d.Client.Status().Patch(ctx, latest, client.MergeFrom(base))
+	})
 }
 
 func (d *ACPDispatcher) readRecoverableTask(
@@ -87,7 +604,8 @@ func (d *ACPDispatcher) readRecoverableTask(
 	if err != nil {
 		return nil, false, err
 	}
-	if latest.UID != candidate.UID || !latest.DeletionTimestamp.IsZero() {
+	if latest.UID != candidate.UID ||
+		(!latest.DeletionTimestamp.IsZero() && !acpTaskHasUnvalidatedSourceIdentity(latest)) {
 		return nil, false, nil
 	}
 	return latest, true, nil
@@ -192,6 +710,10 @@ func taskScopedRuntimeSessionCleanupDigest(
 }
 
 func taskScopedRuntimeSessionCleanupComplete(task *corev1alpha1.Task) bool {
+	return taskScopedRuntimeSessionCleanupCompleteForUID(task, acpTaskControlUID(task))
+}
+
+func taskScopedRuntimeSessionCleanupCompleteForUID(task *corev1alpha1.Task, taskUID types.UID) bool {
 	if task == nil || task.Status.Execution == nil || strings.TrimSpace(task.Status.Execution.RuntimeSessionUID) == "" {
 		return true
 	}
@@ -199,7 +721,7 @@ func taskScopedRuntimeSessionCleanupComplete(task *corev1alpha1.Task) bool {
 		return true
 	}
 	digest, err := taskScopedRuntimeSessionCleanupDigest(
-		task.UID, task.Status.Execution.Attempt, task.Status.Execution.RuntimeInstanceID,
+		taskUID, task.Status.Execution.Attempt, task.Status.Execution.RuntimeInstanceID,
 		task.Status.Execution.RuntimeSessionUID, task.Status.Execution.RuntimeSessionGeneration,
 	)
 	return err == nil && task.Status.Execution.RuntimeSessionCleanupDigest == digest
@@ -208,6 +730,7 @@ func taskScopedRuntimeSessionCleanupComplete(task *corev1alpha1.Task) bool {
 func (d *ACPDispatcher) markTaskScopedRuntimeSessionCleanupComplete(
 	ctx context.Context,
 	task *corev1alpha1.Task,
+	taskUID types.UID,
 	runtimeInstanceID string,
 	runtimeSessionUID string,
 	runtimeSessionGeneration int64,
@@ -219,7 +742,7 @@ func (d *ACPDispatcher) markTaskScopedRuntimeSessionCleanupComplete(
 		return nil
 	}
 	digest, err := taskScopedRuntimeSessionCleanupDigest(
-		task.UID, task.Status.Execution.Attempt, runtimeInstanceID, runtimeSessionUID, runtimeSessionGeneration,
+		taskUID, task.Status.Execution.Attempt, runtimeInstanceID, runtimeSessionUID, runtimeSessionGeneration,
 	)
 	if err != nil {
 		return err
@@ -233,6 +756,18 @@ func (d *ACPDispatcher) markTaskScopedRuntimeSessionCleanupComplete(
 		if latest.Status.Execution == nil {
 			return fmt.Errorf("%w: Task execution status is missing during RuntimeSession cleanup receipt", store.ErrConflict)
 		}
+		if latest.Status.Execution.Attempt != task.Status.Execution.Attempt ||
+			latest.Status.Execution.RuntimeInstanceID != runtimeInstanceID ||
+			latest.Status.Execution.RuntimeSessionUID != runtimeSessionUID ||
+			latest.Status.Execution.RuntimeSessionGeneration != runtimeSessionGeneration {
+			return fmt.Errorf("%w: Task execution identity changed during RuntimeSession cleanup receipt", store.ErrConflict)
+		}
+		if taskUID != latest.UID {
+			binding := executionBinding(latest, corev1alpha1.AgentRuntimeContractHarnessV2)
+			if binding == nil || binding.Task.UID != taskUID {
+				return fmt.Errorf("%w: restored Task source identity changed during RuntimeSession cleanup receipt", store.ErrConflict)
+			}
+		}
 		if latest.Status.Execution.RuntimeSessionCleanupDigest == digest {
 			return nil
 		}
@@ -242,27 +777,34 @@ func (d *ACPDispatcher) markTaskScopedRuntimeSessionCleanupComplete(
 }
 
 func (d *ACPDispatcher) prepareRecoveredTaskScopedRuntimeSessionForSettlement(ctx context.Context, task *corev1alpha1.Task) (bool, error) {
-	return d.reconcileRecoveredTaskScopedRuntimeSession(ctx, task, false)
+	return d.reconcileRecoveredTaskScopedRuntimeSession(ctx, task, acpTaskControlUID(task), false)
 }
 
 func (d *ACPDispatcher) cleanupRecoveredTaskScopedRuntimeSession(ctx context.Context, task *corev1alpha1.Task) (bool, error) {
-	return d.reconcileRecoveredTaskScopedRuntimeSession(ctx, task, true)
+	return d.cleanupRecoveredTaskScopedRuntimeSessionForUID(ctx, task, acpTaskControlUID(task))
+}
+
+func (d *ACPDispatcher) cleanupRecoveredTaskScopedRuntimeSessionForUID(ctx context.Context, task *corev1alpha1.Task, taskUID types.UID) (bool, error) {
+	return d.reconcileRecoveredTaskScopedRuntimeSession(ctx, task, taskUID, true)
 }
 
 //nolint:gocyclo // Recovery keeps exact runtime-state and fence cleanup decisions in one fail-closed boundary.
 func (d *ACPDispatcher) reconcileRecoveredTaskScopedRuntimeSession(
 	ctx context.Context,
 	task *corev1alpha1.Task,
+	taskUID types.UID,
 	deleteAfterSettlement bool,
 ) (bool, error) {
-	if task == nil || task.Status.Execution == nil || strings.TrimSpace(task.Status.Execution.RuntimeSessionUID) == "" ||
-		task.Status.Execution.RuntimeSessionGeneration < 1 {
+	if task == nil || task.Status.Execution == nil || strings.TrimSpace(task.Status.Execution.RuntimeSessionUID) == "" {
 		return true, nil
+	}
+	if task.Status.Execution.RuntimeSessionGeneration < 1 {
+		return false, fmt.Errorf("%w: RuntimeSession cleanup generation is missing", store.ErrConflict)
 	}
 	if task.Spec.SessionRef != nil && (task.Spec.Workspace == nil || task.Spec.Workspace.Intent != corev1alpha1.WorkspaceIntentWrite) {
 		return true, nil
 	}
-	if taskScopedRuntimeSessionCleanupComplete(task) {
+	if taskScopedRuntimeSessionCleanupCompleteForUID(task, taskUID) {
 		return true, nil
 	}
 	execution := task.Status.Execution
@@ -274,7 +816,7 @@ func (d *ACPDispatcher) reconcileRecoveredTaskScopedRuntimeSession(
 				if !deleteAfterSettlement {
 					return true, nil
 				}
-				if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration); markErr != nil {
+				if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration); markErr != nil {
 					return false, markErr
 				}
 				return true, nil
@@ -290,7 +832,7 @@ func (d *ACPDispatcher) reconcileRecoveredTaskScopedRuntimeSession(
 			if !deleteAfterSettlement {
 				return true, nil
 			}
-			if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration); markErr != nil {
+			if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration); markErr != nil {
 				return false, markErr
 			}
 			return true, nil
@@ -303,7 +845,13 @@ func (d *ACPDispatcher) reconcileRecoveredTaskScopedRuntimeSession(
 		runtime := &corev1alpha1.AgentRuntime{}
 		if err := d.APIReader.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: runtimeName}, runtime); err != nil {
 			if apierrors.IsNotFound(err) {
-				return false, nil
+				if !deleteAfterSettlement {
+					return true, nil
+				}
+				if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration); markErr != nil {
+					return false, markErr
+				}
+				return true, nil
 			}
 			return false, err
 		}
@@ -311,7 +859,7 @@ func (d *ACPDispatcher) reconcileRecoveredTaskScopedRuntimeSession(
 			if !deleteAfterSettlement {
 				return true, nil
 			}
-			if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration); markErr != nil {
+			if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration); markErr != nil {
 				return false, markErr
 			}
 			return true, nil
@@ -325,6 +873,12 @@ func (d *ACPDispatcher) reconcileRecoveredTaskScopedRuntimeSession(
 		}
 		target.external = runtime
 	} else {
+		if !deleteAfterSettlement {
+			return true, nil
+		}
+		if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration); markErr != nil {
+			return false, markErr
+		}
 		return true, nil
 	}
 	runtimeClient, runtimeFence, _, _, err := d.runtimeClient(ctx, target)
@@ -343,7 +897,7 @@ func (d *ACPDispatcher) reconcileRecoveredTaskScopedRuntimeSession(
 			return true, nil
 		}
 		if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(
-			ctx, task, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration,
+			ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration,
 		); markErr != nil {
 			return false, markErr
 		}
@@ -355,16 +909,16 @@ func (d *ACPDispatcher) reconcileRecoveredTaskScopedRuntimeSession(
 			return false, fmt.Errorf("recover RuntimeSession publication finalization: prepared session is not bound to a write workspace")
 		}
 		deltaID := harnessv2.WorkspaceDeltaID("delta-" + execution.PromptID)
-		finalization, finalizationErr := d.runtimeSessionPublicationFinalization(ctx, publicationIDForTask(task), deltaID)
+		finalization, finalizationErr := d.runtimeSessionPublicationFinalization(ctx, publicationIDForTaskUID(task, taskUID), deltaID)
 		if errors.Is(finalizationErr, store.ErrNotFound) && task.Status.Delivery != nil &&
 			task.Status.Delivery.Outcome != corev1alpha1.TaskDeliveryOutcomeNoChange {
-			finalization, finalizationErr = runtimeSessionDeltaAbandonmentFinalization(task, deltaID, *task.Status.Delivery)
+			finalization, finalizationErr = runtimeSessionDeltaAbandonmentFinalizationForTaskUID(task, taskUID, deltaID, *task.Status.Delivery)
 		}
 		if finalizationErr != nil {
 			return false, fmt.Errorf("recover task-scoped RuntimeSession publication finalization: %w", finalizationErr)
 		}
-		if err := d.finalizeRuntimeSessionPublication(
-			context.WithoutCancel(ctx), runtimeClient, harnessv2.RuntimeSessionID(runtimeSessionID(runtimeFence)), task, runtimeFence, finalization,
+		if err := d.finalizeRuntimeSessionPublicationForTaskUID(
+			context.WithoutCancel(ctx), runtimeClient, harnessv2.RuntimeSessionID(runtimeSessionID(runtimeFence)), task, taskUID, runtimeFence, finalization,
 		); err != nil {
 			return false, fmt.Errorf("recover task-scoped RuntimeSession publication finalization: %w", err)
 		}
@@ -378,13 +932,13 @@ func (d *ACPDispatcher) reconcileRecoveredTaskScopedRuntimeSession(
 	if !deleteAfterSettlement {
 		return true, nil
 	}
-	if err := d.deleteRuntimeSession(
-		context.WithoutCancel(ctx), runtimeClient, harnessv2.RuntimeSessionID(runtimeSessionID(runtimeFence)), task, runtimeFence, "terminal_recovery",
+	if err := d.deleteRuntimeSessionForTaskUID(
+		context.WithoutCancel(ctx), runtimeClient, harnessv2.RuntimeSessionID(runtimeSessionID(runtimeFence)), task, taskUID, runtimeFence, "terminal_recovery",
 	); err != nil {
 		return false, fmt.Errorf("recover task-scoped RuntimeSession cleanup: %w", err)
 	}
 	if err := d.markTaskScopedRuntimeSessionCleanupComplete(
-		ctx, task, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration,
+		ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration,
 	); err != nil {
 		return false, err
 	}
@@ -474,7 +1028,7 @@ func (d *ACPDispatcher) validateExistingStandaloneTaskProjection(
 		}
 		return false, err
 	}
-	if projection.AggregateKind != taskResourceKind || projection.AggregateID != string(task.UID) || projection.ProjectionKind != "TaskTerminalStatus" {
+	if projection.AggregateKind != taskResourceKind || projection.AggregateID != string(task.UID) || projection.ProjectionKind != taskTerminalProjectionKind {
 		return false, fmt.Errorf("%w: standalone terminal projection %q has mismatched identity", store.ErrConflict, projectionID)
 	}
 	var payload taskTerminalProjection

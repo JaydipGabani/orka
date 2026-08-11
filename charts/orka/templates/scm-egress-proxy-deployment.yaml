@@ -1,4 +1,4 @@
-{{- if and .Values.publisher.enabled .Values.scmEgressProxy.enabled }}
+{{- if and (eq .Values.controller.mode "harness-v2") .Values.publisher.enabled .Values.scmEgressProxy.enabled }}
 {{- $secretName := .Values.scmEgressProxy.auth.existingSecret | default (include "orka.scmEgressProxyAuthSecretName" .) }}
 {{- $tokenKey := .Values.scmEgressProxy.auth.tokenKey | default "token" }}
 apiVersion: apps/v1
@@ -28,6 +28,7 @@ spec:
     spec:
       serviceAccountName: {{ include "orka.scmEgressProxyName" . }}
       automountServiceAccountToken: false
+      enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -48,11 +49,11 @@ spec:
             - --forge-api-base-url=
             {{- end }}
             - --token-file=/var/run/secrets/orka/scm-egress/token
-            - {{ printf "--max-request-header-bytes=%v" .Values.scmEgressProxy.maxRequestHeaderBytes | quote }}
-            - {{ printf "--max-response-header-bytes=%v" .Values.scmEgressProxy.maxResponseHeaderBytes | quote }}
-            - {{ printf "--max-request-bytes=%v" .Values.scmEgressProxy.maxRequestBytes | quote }}
-            - {{ printf "--max-response-bytes=%v" .Values.scmEgressProxy.maxResponseBytes | quote }}
-            - {{ printf "--max-tunnel-bytes=%v" .Values.scmEgressProxy.maxTunnelBytes | quote }}
+            - {{ printf "--max-request-header-bytes=%d" (int64 .Values.scmEgressProxy.maxRequestHeaderBytes) | quote }}
+            - {{ printf "--max-response-header-bytes=%d" (int64 .Values.scmEgressProxy.maxResponseHeaderBytes) | quote }}
+            - {{ printf "--max-request-bytes=%d" (int64 .Values.scmEgressProxy.maxRequestBytes) | quote }}
+            - {{ printf "--max-response-bytes=%d" (int64 .Values.scmEgressProxy.maxResponseBytes) | quote }}
+            - {{ printf "--max-tunnel-bytes=%d" (int64 .Values.scmEgressProxy.maxTunnelBytes) | quote }}
             - {{ printf "--max-concurrent=%v" .Values.scmEgressProxy.maxConcurrent | quote }}
             - {{ printf "--resolution-timeout=%s" .Values.scmEgressProxy.resolutionTimeout | quote }}
             - {{ printf "--connect-timeout=%s" .Values.scmEgressProxy.connectTimeout | quote }}

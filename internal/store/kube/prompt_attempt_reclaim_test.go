@@ -2,19 +2,23 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	controlstore "github.com/orka-agents/orka/internal/store"
 	sqlitestore "github.com/orka-agents/orka/internal/store/sqlite"
+	"github.com/orka-agents/orka/internal/taskterminal"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
@@ -154,6 +158,155 @@ func TestReclaimPromptAttemptsDeletesTerminalTaskRecords(t *testing.T) {
 		t.Fatalf("idempotent ReclaimPromptAttempts() = deleted:%d err:%v, want 0,nil", deleted, err)
 	}
 	assertPromptAttemptReclamationMarker(t, ctx, kubeClient, finalAttempt.Key.TaskUID, false)
+}
+
+func TestReclaimPromptAttemptsDeletesRestoredSourceRecordsIdempotently(t *testing.T) {
+	tests := []struct {
+		name      string
+		execution controlstore.PromptExecutionState
+		delivery  controlstore.PromptDeliveryState
+		phase     corev1alpha1.TaskPhase
+		outcome   corev1alpha1.TaskExecutionOutcome
+	}{
+		{name: "failed", execution: controlstore.PromptExecutionFailed, delivery: controlstore.PromptDeliveryNotRequested, phase: corev1alpha1.TaskPhaseFailed, outcome: corev1alpha1.TaskExecutionOutcomeFailed},
+		{name: "outcome unknown", execution: controlstore.PromptExecutionOutcomeUnknown, delivery: controlstore.PromptDeliveryNotRequested, phase: corev1alpha1.TaskPhaseFailed, outcome: corev1alpha1.TaskExecutionOutcomeOutcomeUnknown},
+		{name: "succeeded verified exact", execution: controlstore.PromptExecutionSucceeded, delivery: controlstore.PromptDeliveryVerifiedExact, phase: corev1alpha1.TaskPhaseSucceeded, outcome: corev1alpha1.TaskExecutionOutcomeSucceeded},
+		{name: "succeeded cancelled before publish", execution: controlstore.PromptExecutionSucceeded, delivery: controlstore.PromptDeliveryCancelledBeforePublish, phase: corev1alpha1.TaskPhaseCancelled, outcome: corev1alpha1.TaskExecutionOutcomeSucceeded},
+		{name: "succeeded delivery conflict", execution: controlstore.PromptExecutionSucceeded, delivery: controlstore.PromptDeliveryConflict, phase: corev1alpha1.TaskPhaseFailed, outcome: corev1alpha1.TaskExecutionOutcomeSucceeded},
+		{name: "cancelled", execution: controlstore.PromptExecutionCancelled, delivery: controlstore.PromptDeliveryNotRequested, phase: corev1alpha1.TaskPhaseCancelled, outcome: corev1alpha1.TaskExecutionOutcomeCancelled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			kubeStore, kubeClient, fence := newPromptAttemptReclaimStore(t)
+			taskUID := "task-restored-" + strings.ReplaceAll(tt.name, " ", "-")
+			attempt := createTerminalPromptAttempt(t, ctx, kubeStore, fence, taskUID, 1, "prompt-final", tt.execution, tt.delivery)
+			taskName := attempt.Key.TaskUID
+			projectionID := enqueueTaskTerminalProjection(t, ctx, kubeStore, fence, attempt, true)
+			setRestoredPromptAttemptOwner(t, ctx, kubeClient, taskName, attempt, restoredPromptAttemptTerminalStatus{
+				phase: tt.phase, execution: corev1alpha1.TaskExecutionState(tt.execution), outcome: tt.outcome, delivery: tt.delivery,
+			})
+			request := controlstore.ReclaimPromptAttemptsRequest{
+				Namespace: attempt.Key.Namespace, TaskName: taskName, TaskUID: attempt.Key.TaskUID,
+				Mode:                 controlstore.PromptAttemptReclamationProjected,
+				FinalPromptAttemptID: attempt.ID, TerminalProjectionID: projectionID, Fence: fence,
+			}
+
+			if err := kubeStore.PreparePromptAttemptReclamation(ctx, request); err != nil {
+				t.Fatalf("PreparePromptAttemptReclamation(restored source): %v", err)
+			}
+			if deleted, err := kubeStore.ReclaimPromptAttempts(ctx, request); err != nil || deleted != 1 {
+				t.Fatalf("ReclaimPromptAttempts(restored source) = deleted:%d err:%v, want 1,nil", deleted, err)
+			}
+			if _, err := kubeStore.GetPromptAttempt(ctx, attempt.ID); !errors.Is(err, controlstore.ErrNotFound) {
+				t.Fatalf("GetPromptAttempt(restored source) error = %v, want ErrNotFound", err)
+			}
+			assertPromptAttemptReclamationCompleted(t, ctx, kubeClient, request, true)
+			if err := kubeStore.PreparePromptAttemptReclamation(ctx, request); err != nil {
+				t.Fatalf("PreparePromptAttemptReclamation(restored retry): %v", err)
+			}
+			if deleted, err := kubeStore.ReclaimPromptAttempts(ctx, request); err != nil || deleted != 0 {
+				t.Fatalf("ReclaimPromptAttempts(restored retry) = deleted:%d err:%v, want 0,nil", deleted, err)
+			}
+		})
+	}
+}
+
+func TestPreparePromptAttemptReclamationRejectsUnvalidatedRestoredSourceIdentity(t *testing.T) {
+	tests := []struct {
+		name          string
+		mutateTask    func(task *corev1alpha1.Task)
+		mutateRequest func(request *controlstore.ReclaimPromptAttemptsRequest)
+	}{
+		{name: "phase mismatch", mutateTask: func(task *corev1alpha1.Task) {
+			task.Status.Phase = corev1alpha1.TaskPhaseFailed
+		}},
+		{name: "execution outcome mismatch", mutateTask: func(task *corev1alpha1.Task) {
+			task.Status.Execution.Outcome = corev1alpha1.TaskExecutionOutcomeFailed
+		}},
+		{name: "delivery outcome mismatch", mutateTask: func(task *corev1alpha1.Task) {
+			task.Status.Delivery.Outcome = corev1alpha1.TaskDeliveryOutcomeDeliveryConflict
+		}},
+		{name: "settlement reason missing", mutateTask: func(task *corev1alpha1.Task) {
+			task.Status.Execution.Reason = ""
+		}},
+		{name: "binding digest mismatch", mutateTask: func(task *corev1alpha1.Task) {
+			task.Status.AgentExecutionBinding.BindingDigest = testDigest("foreign-binding")
+		}},
+		{name: "snapshot digest mismatch", mutateTask: func(task *corev1alpha1.Task) {
+			task.Status.AgentExecutionBinding.Snapshot.Digest = testDigest("foreign-snapshot")
+		}},
+		{name: "request digest mismatch", mutateTask: func(task *corev1alpha1.Task) {
+			task.Status.Execution.RequestDigest = testDigest("foreign-request")
+		}},
+		{name: "source UID mismatch", mutateTask: func(task *corev1alpha1.Task) {
+			task.Status.AgentExecutionBinding.Task.UID = types.UID("foreign-source")
+		}},
+		{name: "final attempt mismatch", mutateRequest: func(request *controlstore.ReclaimPromptAttemptsRequest) {
+			request.FinalPromptAttemptID = "foreign-attempt"
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			kubeStore, kubeClient, fence := newPromptAttemptReclaimStore(t)
+			attempt := createTerminalPromptAttempt(t, ctx, kubeStore, fence, "task-restored-reject", 1, "prompt-final",
+				controlstore.PromptExecutionSucceeded, controlstore.PromptDeliveryVerifiedExact)
+			taskName := attempt.Key.TaskUID
+			projectionID := enqueueTaskTerminalProjection(t, ctx, kubeStore, fence, attempt, true)
+			task := setRestoredPromptAttemptOwner(t, ctx, kubeClient, taskName, attempt, restoredPromptAttemptTerminalStatus{
+				phase: corev1alpha1.TaskPhaseSucceeded, execution: corev1alpha1.TaskExecutionStateSucceeded,
+				outcome: corev1alpha1.TaskExecutionOutcomeSucceeded, delivery: controlstore.PromptDeliveryVerifiedExact,
+			})
+			if tt.mutateTask != nil {
+				tt.mutateTask(task)
+			}
+			if err := kubeClient.Status().Update(ctx, task); err != nil {
+				t.Fatalf("mutate restored Task status: %v", err)
+			}
+			request := controlstore.ReclaimPromptAttemptsRequest{
+				Namespace: attempt.Key.Namespace, TaskName: taskName, TaskUID: attempt.Key.TaskUID,
+				Mode:                 controlstore.PromptAttemptReclamationProjected,
+				FinalPromptAttemptID: attempt.ID, TerminalProjectionID: projectionID, Fence: fence,
+			}
+			if tt.mutateRequest != nil {
+				tt.mutateRequest(&request)
+			}
+			if err := kubeStore.PreparePromptAttemptReclamation(ctx, request); !errors.Is(err, controlstore.ErrConflict) {
+				t.Fatalf("PreparePromptAttemptReclamation() error = %v, want ErrConflict", err)
+			}
+			if _, err := kubeStore.GetPromptAttempt(ctx, attempt.ID); err != nil {
+				t.Fatalf("unvalidated restored source attempt was mutated: %v", err)
+			}
+			assertPromptAttemptReclamationMarker(t, ctx, kubeClient, attempt.Key.TaskUID, false)
+		})
+	}
+}
+
+func TestPreparePromptAttemptReclamationRejectsIncompleteTerminalProjectionPayload(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient, fence := newPromptAttemptReclaimStore(t)
+	attempt := createTerminalPromptAttempt(t, ctx, kubeStore, fence, "task-restored-incomplete-projection", 1, "prompt-final",
+		controlstore.PromptExecutionSucceeded, controlstore.PromptDeliveryVerifiedExact)
+	taskName := attempt.Key.TaskUID
+	setRestoredPromptAttemptOwner(t, ctx, kubeClient, taskName, attempt, restoredPromptAttemptTerminalStatus{
+		phase: corev1alpha1.TaskPhaseSucceeded, execution: corev1alpha1.TaskExecutionStateSucceeded,
+		outcome: corev1alpha1.TaskExecutionOutcomeSucceeded, delivery: controlstore.PromptDeliveryVerifiedExact,
+	})
+	projectionID := enqueueRawTaskTerminalProjection(t, ctx, kubeStore, fence, attempt, []byte(`{"phase":"Succeeded"}`), true)
+	request := controlstore.ReclaimPromptAttemptsRequest{
+		Namespace: attempt.Key.Namespace, TaskName: taskName, TaskUID: attempt.Key.TaskUID,
+		Mode:                 controlstore.PromptAttemptReclamationProjected,
+		FinalPromptAttemptID: attempt.ID, TerminalProjectionID: projectionID, Fence: fence,
+	}
+
+	if err := kubeStore.PreparePromptAttemptReclamation(ctx, request); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("PreparePromptAttemptReclamation() error = %v, want ErrConflict", err)
+	}
+	if _, err := kubeStore.GetPromptAttempt(ctx, attempt.ID); err != nil {
+		t.Fatalf("incomplete terminal projection mutated its source PromptAttempt: %v", err)
+	}
+	assertPromptAttemptReclamationMarker(t, ctx, kubeClient, attempt.Key.TaskUID, false)
 }
 
 func TestReclaimPromptAttemptsRecoversMarkerCleanupCrash(t *testing.T) {
@@ -389,6 +542,72 @@ func createDeletingAgentTask(
 	}
 }
 
+type restoredPromptAttemptTerminalStatus struct {
+	phase     corev1alpha1.TaskPhase
+	execution corev1alpha1.TaskExecutionState
+	outcome   corev1alpha1.TaskExecutionOutcome
+	delivery  controlstore.PromptDeliveryState
+}
+
+func setRestoredPromptAttemptOwner(
+	t *testing.T,
+	ctx context.Context,
+	kubeClient client.Client,
+	taskName string,
+	attempt *controlstore.PromptAttempt,
+	terminal restoredPromptAttemptTerminalStatus,
+) *corev1alpha1.Task {
+	t.Helper()
+	task := &corev1alpha1.Task{}
+	key := client.ObjectKey{Namespace: attempt.Key.Namespace, Name: taskName}
+	if err := kubeClient.Get(ctx, key, task); err != nil {
+		t.Fatalf("get source Task for restore: %v", err)
+	}
+	if err := kubeClient.Delete(ctx, task); err != nil {
+		t.Fatalf("remove source Task fixture: %v", err)
+	}
+	restored := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: task.Namespace, Name: task.Name, UID: types.UID("task-restored-target"),
+			Finalizers: []string{"reclamation-test"},
+		},
+		Spec: task.Spec,
+	}
+	if err := kubeClient.Create(ctx, restored); err != nil {
+		t.Fatalf("create restored Task fixture: %v", err)
+	}
+	restored.Status.Phase = terminal.phase
+	restored.Status.Execution = &corev1alpha1.TaskExecutionStatus{
+		State: terminal.execution, Outcome: terminal.outcome,
+		Reason: restoredTaskIdentityChangedReason, Attempt: int32(attempt.Key.Attempt), PromptID: attempt.Key.PromptID,
+		RequestDigest: attempt.RequestDigest,
+	}
+	restored.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{
+		State:   corev1alpha1.TaskDeliveryState(terminal.delivery),
+		Outcome: corev1alpha1.TaskDeliveryOutcome(terminal.delivery),
+	}
+	restored.Status.AgentExecutionBinding = &corev1alpha1.AgentExecutionBinding{
+		SchemaVersion: 1, ContractVersion: corev1alpha1.AgentRuntimeContractHarnessV2,
+		BindingDigest: attempt.BindingDigest,
+		Task:          corev1alpha1.AgentExecutionBindingTaskRef{UID: types.UID(attempt.Key.TaskUID)},
+		Snapshot: corev1alpha1.AgentExecutionSnapshotRef{
+			ID:            (controlstore.AgentExecutionSnapshotKey{TaskUID: attempt.Key.TaskUID, Digest: attempt.SnapshotDigest}).ID(),
+			Digest:        attempt.SnapshotDigest,
+			SchemaVersion: controlstore.AgentExecutionSnapshotSchemaVersion,
+		},
+	}
+	if err := kubeClient.Status().Update(ctx, restored); err != nil {
+		t.Fatalf("record restored Task status: %v", err)
+	}
+	if err := kubeClient.Delete(ctx, restored); err != nil {
+		t.Fatalf("mark restored Task deleting: %v", err)
+	}
+	if err := kubeClient.Get(ctx, key, restored); err != nil {
+		t.Fatalf("refresh restored deleting Task: %v", err)
+	}
+	return restored
+}
+
 func assertPromptAttemptReclamationMarker(
 	t *testing.T,
 	ctx context.Context,
@@ -462,6 +681,21 @@ func createFailedPromptAttempt(
 	attemptNumber int64,
 	promptID string,
 ) *controlstore.PromptAttempt {
+	return createTerminalPromptAttempt(t, ctx, kubeStore, fence, taskUID, attemptNumber, promptID,
+		controlstore.PromptExecutionFailed, controlstore.PromptDeliveryNotRequested)
+}
+
+func createTerminalPromptAttempt(
+	t *testing.T,
+	ctx context.Context,
+	kubeStore *Store,
+	fence controlstore.ControllerEpochFence,
+	taskUID string,
+	attemptNumber int64,
+	promptID string,
+	executionState controlstore.PromptExecutionState,
+	deliveryState controlstore.PromptDeliveryState,
+) *controlstore.PromptAttempt {
 	t.Helper()
 	ensureActiveAgentTask(t, ctx, kubeStore.client, "tenant-a", taskUID, taskUID)
 	attempt, err := kubeStore.CreatePromptAttempt(ctx, boundPromptAttemptForKubeTest(&controlstore.PromptAttempt{
@@ -473,14 +707,74 @@ func createFailedPromptAttempt(
 	if err != nil {
 		t.Fatalf("CreatePromptAttempt: %v", err)
 	}
-	attempt, err = kubeStore.TransitionPromptAttemptExecution(ctx, controlstore.PromptAttemptExecutionTransition{
-		ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
-		NewState: controlstore.PromptExecutionFailed, OperationID: "fail-" + promptID,
-		OperationDigest: testDigest("fail-" + taskUID + ":" + promptID), TerminalReason: "test terminal failure",
-		UpdatedAt: testNow.Add(time.Duration(attemptNumber) * time.Minute),
-	})
-	if err != nil {
-		t.Fatalf("TransitionPromptAttemptExecution(Failed): %v", err)
+	executionPath := []controlstore.PromptExecutionState{executionState}
+	switch executionState {
+	case controlstore.PromptExecutionSucceeded:
+		executionPath = []controlstore.PromptExecutionState{
+			controlstore.PromptExecutionReserved, controlstore.PromptExecutionSessionStarting,
+			controlstore.PromptExecutionPlanned, controlstore.PromptExecutionSubmitting,
+			controlstore.PromptExecutionAccepted, controlstore.PromptExecutionRunning,
+			controlstore.PromptExecutionSettling, controlstore.PromptExecutionSucceeded,
+		}
+	case controlstore.PromptExecutionOutcomeUnknown:
+		executionPath = []controlstore.PromptExecutionState{
+			controlstore.PromptExecutionReserved, controlstore.PromptExecutionSessionStarting,
+			controlstore.PromptExecutionPlanned, controlstore.PromptExecutionSubmitting,
+			controlstore.PromptExecutionAccepted, controlstore.PromptExecutionOutcomeUnknown,
+		}
+	case controlstore.PromptExecutionFailed, controlstore.PromptExecutionCancelled:
+	default:
+		t.Fatalf("unsupported terminal execution fixture state %q", executionState)
+	}
+	for i, next := range executionPath {
+		terminalReason := ""
+		outcomeMarker := ""
+		if controlstore.IsTerminalPromptExecutionState(next) {
+			terminalReason = "test terminal " + string(executionState)
+		}
+		if next == controlstore.PromptExecutionOutcomeUnknown {
+			outcomeMarker = "test outcome unknown"
+		}
+		attempt, err = kubeStore.TransitionPromptAttemptExecution(ctx, controlstore.PromptAttemptExecutionTransition{
+			ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
+			NewState: next, OperationID: fmt.Sprintf("terminal-%s-%d", promptID, i),
+			OperationDigest: testDigest(fmt.Sprintf("terminal-%s-%s-%d", taskUID, promptID, i)),
+			TerminalReason:  terminalReason, OutcomeMarker: outcomeMarker,
+			UpdatedAt: testNow.Add(time.Duration(i+1) * time.Minute),
+		})
+		if err != nil {
+			t.Fatalf("TransitionPromptAttemptExecution(%s): %v", next, err)
+		}
+	}
+	deliveryPath := []controlstore.PromptDeliveryState{}
+	switch deliveryState {
+	case controlstore.PromptDeliveryNotRequested:
+	case controlstore.PromptDeliveryVerifiedExact:
+		deliveryPath = []controlstore.PromptDeliveryState{
+			controlstore.PromptDeliveryValidating, controlstore.PromptDeliveryPreparing,
+			controlstore.PromptDeliveryPrepared, controlstore.PromptDeliveryPublishing,
+			controlstore.PromptDeliveryVerifying, controlstore.PromptDeliveryVerifiedExact,
+		}
+	case controlstore.PromptDeliveryCancelledBeforePublish:
+		deliveryPath = []controlstore.PromptDeliveryState{
+			controlstore.PromptDeliveryValidating, controlstore.PromptDeliveryPreparing,
+			controlstore.PromptDeliveryPrepared, controlstore.PromptDeliveryCancelledBeforePublish,
+		}
+	case controlstore.PromptDeliveryConflict:
+		deliveryPath = []controlstore.PromptDeliveryState{controlstore.PromptDeliveryValidating, controlstore.PromptDeliveryConflict}
+	default:
+		t.Fatalf("unsupported terminal delivery fixture state %q", deliveryState)
+	}
+	for i, next := range deliveryPath {
+		attempt, err = kubeStore.TransitionPromptAttemptDelivery(ctx, controlstore.PromptAttemptDeliveryTransition{
+			ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.DeliveryState,
+			NewState: next, OperationID: fmt.Sprintf("delivery-%s-%d", promptID, i),
+			OperationDigest: testDigest(fmt.Sprintf("delivery-%s-%s-%d", taskUID, promptID, i)),
+			UpdatedAt:       testNow.Add(time.Duration(len(executionPath)+i+1) * time.Minute),
+		})
+		if err != nil {
+			t.Fatalf("TransitionPromptAttemptDelivery(%s): %v", next, err)
+		}
 	}
 	return attempt
 }
@@ -494,10 +788,51 @@ func enqueueTaskTerminalProjection(
 	delivered bool,
 ) string {
 	t.Helper()
+	task := &corev1alpha1.Task{}
+	taskKey := client.ObjectKey{Namespace: attempt.Key.Namespace, Name: attempt.Key.TaskUID}
+	if err := kubeStore.client.Get(ctx, taskKey, task); err != nil {
+		t.Fatalf("get terminal projection Task: %v", err)
+	}
+	executionState, executionOutcome, ok := terminalPromptAttemptExecutionForTest(attempt.ExecutionState)
+	if !ok {
+		t.Fatalf("unsupported terminal execution fixture state %q", attempt.ExecutionState)
+	}
+	phase := terminalPromptAttemptPhaseForTest(executionState, attempt.DeliveryState)
+	task.Status.Phase = phase
+	task.Status.Execution = &corev1alpha1.TaskExecutionStatus{
+		State: executionState, Outcome: executionOutcome, Attempt: int32(attempt.Key.Attempt),
+		PromptID: attempt.Key.PromptID, RequestDigest: attempt.RequestDigest, ControllerEpoch: attempt.ControllerEpoch,
+	}
+	task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{
+		State: corev1alpha1.TaskDeliveryState(attempt.DeliveryState), Outcome: corev1alpha1.TaskDeliveryOutcome(attempt.DeliveryState),
+	}
+	if err := kubeStore.client.Status().Update(ctx, task); err != nil {
+		t.Fatalf("record terminal projection Task status: %v", err)
+	}
+	payload, err := json.Marshal(taskterminal.Projection{
+		Namespace: attempt.Key.Namespace, Task: task.Name, TaskUID: attempt.Key.TaskUID,
+		Attempt: int32(attempt.Key.Attempt), Phase: phase, Execution: *task.Status.Execution.DeepCopy(),
+		Delivery: task.Status.Delivery.DeepCopy(),
+	})
+	if err != nil {
+		t.Fatalf("encode terminal projection payload: %v", err)
+	}
+	return enqueueRawTaskTerminalProjection(t, ctx, kubeStore, fence, attempt, payload, delivered)
+}
+
+func enqueueRawTaskTerminalProjection(
+	t *testing.T,
+	ctx context.Context,
+	kubeStore *Store,
+	fence controlstore.ControllerEpochFence,
+	attempt *controlstore.PromptAttempt,
+	payload []byte,
+	delivered bool,
+) string {
+	t.Helper()
 	projectionID := controlstore.CanonicalControlID(
 		"task-terminal-projection", attempt.Key.Namespace, attempt.Key.TaskUID, fmt.Sprint(attempt.Key.Attempt),
 	)
-	payload := []byte(`{"phase":"Failed"}`)
 	projection, err := kubeStore.EnqueueOutboxProjection(ctx, &controlstore.OutboxProjection{
 		ID: projectionID, AggregateKind: "Task", AggregateID: attempt.Key.TaskUID,
 		ProjectionKind: "TaskTerminalStatus", PayloadDigest: testBytesDigest(payload), Payload: payload,
@@ -528,4 +863,43 @@ func enqueueTaskTerminalProjection(
 		t.Fatalf("CompleteOutboxProjection(Delivered): %v", err)
 	}
 	return projectionID
+}
+
+func terminalPromptAttemptExecutionForTest(state controlstore.PromptExecutionState) (
+	corev1alpha1.TaskExecutionState,
+	corev1alpha1.TaskExecutionOutcome,
+	bool,
+) {
+	switch state {
+	case controlstore.PromptExecutionSucceeded:
+		return corev1alpha1.TaskExecutionStateSucceeded, corev1alpha1.TaskExecutionOutcomeSucceeded, true
+	case controlstore.PromptExecutionFailed:
+		return corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed, true
+	case controlstore.PromptExecutionCancelled:
+		return corev1alpha1.TaskExecutionStateCancelled, corev1alpha1.TaskExecutionOutcomeCancelled, true
+	case controlstore.PromptExecutionOutcomeUnknown:
+		return corev1alpha1.TaskExecutionStateOutcomeUnknown, corev1alpha1.TaskExecutionOutcomeOutcomeUnknown, true
+	default:
+		return "", "", false
+	}
+}
+
+func terminalPromptAttemptPhaseForTest(
+	state corev1alpha1.TaskExecutionState,
+	delivery controlstore.PromptDeliveryState,
+) corev1alpha1.TaskPhase {
+	if state == corev1alpha1.TaskExecutionStateCancelled {
+		return corev1alpha1.TaskPhaseCancelled
+	}
+	if state == corev1alpha1.TaskExecutionStateSucceeded {
+		switch delivery {
+		case controlstore.PromptDeliveryNotRequested, controlstore.PromptDeliveryReadValidated,
+			controlstore.PromptDeliveryNoChange, controlstore.PromptDeliveryVerifiedExact,
+			controlstore.PromptDeliveryDeliveredSuperseded:
+			return corev1alpha1.TaskPhaseSucceeded
+		case controlstore.PromptDeliveryCancelledBeforePublish:
+			return corev1alpha1.TaskPhaseCancelled
+		}
+	}
+	return corev1alpha1.TaskPhaseFailed
 }

@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,7 +27,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-const testControlNamespace = "orka-system"
+const (
+	testControlNamespace   = "orka-system"
+	testControllerFresh    = "controller-fresh"
+	testControllerRestored = "controller-restored"
+	testControllerFirst    = "controller-first"
+	testControllerSecond   = "controller-second"
+	testStatusSubresource  = "status"
+)
 
 var testNow = time.Date(2026, time.July, 25, 6, 0, 0, 0, time.UTC)
 
@@ -77,6 +86,12 @@ func TestControllerEpochLeaseCAS(t *testing.T) {
 	if record.Status.LeaseResourceVersion != lease.ResourceVersion || record.Status.Epoch != 1 {
 		t.Fatalf("epoch status = %#v, lease rv = %q", record.Status, lease.ResourceVersion)
 	}
+	if record.Annotations[annotationControllerEpochLeaseUID] != string(lease.UID) {
+		t.Fatalf("epoch mirror Lease UID binding = %q, want %q", record.Annotations[annotationControllerEpochLeaseUID], lease.UID)
+	}
+	if predecessorDigest := lease.Annotations[annotationControllerEpochPredecessorDigest]; predecessorDigest != "" {
+		t.Fatalf("initial epoch Lease predecessor digest = %q, want empty", predecessorDigest)
+	}
 
 	secondChange := controlstore.ControllerEpochCAS{
 		ExpectedVersion: 1,
@@ -92,6 +107,22 @@ func TestControllerEpochLeaseCAS(t *testing.T) {
 	}
 	if second.Version != 2 || second.Epoch != 2 || second.HolderID != "controller-b" {
 		t.Fatalf("second epoch = %#v", second)
+	}
+	if err := kubeClient.Get(ctx, leaseKey, &lease); err != nil {
+		t.Fatalf("get advanced epoch Lease: %v", err)
+	}
+	if err := kubeClient.Get(ctx, recordKey, &record); err != nil {
+		t.Fatalf("get advanced epoch record: %v", err)
+	}
+	predecessorDigest, err := controllerEpochPredecessorDigest(&lease)
+	if err != nil {
+		t.Fatalf("parse advanced epoch predecessor digest: %v", err)
+	}
+	if predecessorDigest == "" {
+		t.Fatal("advanced epoch Lease omitted authenticated predecessor digest")
+	}
+	if record.Annotations[annotationControllerEpochLeaseUID] != string(lease.UID) || record.Status.Epoch != 2 || record.Status.Version != 2 {
+		t.Fatalf("advanced epoch mirror = annotations %#v status %#v Lease UID %q", record.Annotations, record.Status, lease.UID)
 	}
 
 	if _, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
@@ -111,6 +142,1314 @@ func TestControllerEpochLeaseCAS(t *testing.T) {
 	}
 	if retry.Version != 2 || retry.Epoch != 2 {
 		t.Fatalf("retry epoch = %#v", retry)
+	}
+}
+
+func TestControllerEpochAuthorityRejectsRecreatedLeaseIncarnation(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient, fence := newTestStoreWithEpoch(t)
+	name := controlstore.DefaultControllerEpochName
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	lease := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get original controller epoch Lease: %v", err)
+	}
+	originalUID := lease.UID
+	originalResourceVersion := lease.ResourceVersion
+	replacement := lease.DeepCopy()
+	replacement.ResourceVersion = ""
+	replacement.UID = types.UID("replacement-controller-epoch-lease-uid")
+	replacement.CreationTimestamp = metav1.Time{}
+	replacement.ManagedFields = nil
+	if err := kubeClient.Delete(ctx, lease); err != nil {
+		t.Fatalf("delete original controller epoch Lease: %v", err)
+	}
+	if err := kubeClient.Create(ctx, replacement); err != nil {
+		t.Fatalf("recreate controller epoch Lease under a new UID: %v", err)
+	}
+	if replacement.UID == originalUID {
+		t.Fatalf("replacement Lease reused original UID %q", originalUID)
+	}
+	if replacement.ResourceVersion != originalResourceVersion {
+		t.Fatalf("fake replacement Lease resourceVersion = %q, want original %q to prove UID is decisive", replacement.ResourceVersion, originalResourceVersion)
+	}
+
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	before := &corev1alpha1.ControllerEpoch{}
+	if err := kubeClient.Get(ctx, objectKey, before); err != nil {
+		t.Fatalf("get bound controller epoch mirror: %v", err)
+	}
+	if before.Annotations[annotationControllerEpochLeaseUID] != string(originalUID) {
+		t.Fatalf("mirror binding = %q, want original UID %q", before.Annotations[annotationControllerEpochLeaseUID], originalUID)
+	}
+	if _, err := kubeStore.GetControllerEpoch(ctx, name); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "bound to Lease UID") {
+		t.Fatalf("recreated Lease read error = %v, want UID conflict", err)
+	}
+	if _, _, err := kubeStore.requireControllerEpoch(ctx, fence); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "bound to Lease UID") {
+		t.Fatalf("recreated Lease mutation-fence error = %v, want UID conflict", err)
+	}
+	key := controlstore.PromptAttemptKey{
+		Namespace: "tenant-a", TaskUID: "task-recreated-epoch-lease", Attempt: 1, PromptID: "prompt-recreated-epoch-lease",
+	}
+	ensureActiveAgentTask(t, ctx, kubeClient, key.Namespace, key.TaskUID, key.TaskUID)
+	if _, err := kubeStore.CreatePromptAttempt(ctx, boundPromptAttemptForKubeTest(&controlstore.PromptAttempt{
+		Key: key, RequestDigest: testDigest("recreated-epoch-lease"),
+	}), fence); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "bound to Lease UID") {
+		t.Fatalf("recreated Lease PromptAttempt mutation error = %v, want UID conflict", err)
+	}
+	var attempts corev1alpha1.PromptAttemptList
+	if err := kubeClient.List(ctx, &attempts, client.InNamespace(key.Namespace)); err != nil {
+		t.Fatalf("list PromptAttempts after rejected recreated Lease: %v", err)
+	}
+	if len(attempts.Items) != 0 {
+		t.Fatalf("recreated Lease authorized PromptAttempt writes: %#v", attempts.Items)
+	}
+	currentLease := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, leaseKey, currentLease); err != nil {
+		t.Fatalf("get rejected replacement controller epoch Lease: %v", err)
+	}
+	if currentLease.ResourceVersion != replacement.ResourceVersion {
+		t.Fatalf("rejected replacement Lease resourceVersion changed from %q to %q", replacement.ResourceVersion, currentLease.ResourceVersion)
+	}
+	if token := currentLease.Annotations[annotationMutationToken]; token != "" {
+		t.Fatalf("recreated Lease gained a mutation token: %q", token)
+	}
+	if expiresAt := currentLease.Annotations[annotationMutationExpiresAt]; expiresAt != "" {
+		t.Fatalf("recreated Lease gained a mutation expiry: %q", expiresAt)
+	}
+	after := &corev1alpha1.ControllerEpoch{}
+	if err := kubeClient.Get(ctx, objectKey, after); err != nil {
+		t.Fatalf("get mirror after rejected Lease recreation: %v", err)
+	}
+	if after.ResourceVersion != before.ResourceVersion || after.Annotations[annotationControllerEpochLeaseUID] != string(originalUID) {
+		t.Fatalf("rejected Lease recreation changed mirror: before=%#v after=%#v", before.ObjectMeta, after.ObjectMeta)
+	}
+}
+
+func TestControllerEpochAuthorityRejectsRecreatedLeaseWhenMirrorBindingIsMissing(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient, _ := newTestStoreWithEpoch(t)
+	name := controlstore.DefaultControllerEpochName
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	lease := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get original controller epoch Lease: %v", err)
+	}
+	originalResourceVersion := lease.ResourceVersion
+	replacement := lease.DeepCopy()
+	replacement.ResourceVersion = ""
+	replacement.UID = types.UID("replacement-unbound-controller-epoch-lease-uid")
+	replacement.CreationTimestamp = metav1.Time{}
+	replacement.ManagedFields = nil
+
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	object := &corev1alpha1.ControllerEpoch{}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get bound controller epoch mirror: %v", err)
+	}
+	delete(object.Annotations, annotationControllerEpochLeaseUID)
+	if err := kubeClient.Update(ctx, object); err != nil {
+		t.Fatalf("remove controller epoch Lease UID binding: %v", err)
+	}
+	beforeResourceVersion := object.ResourceVersion
+
+	if err := kubeClient.Delete(ctx, lease); err != nil {
+		t.Fatalf("delete original controller epoch Lease: %v", err)
+	}
+	if err := kubeClient.Create(ctx, replacement); err != nil {
+		t.Fatalf("recreate unbound controller epoch Lease under a new UID: %v", err)
+	}
+	if replacement.ResourceVersion != originalResourceVersion {
+		t.Fatalf("fake replacement Lease resourceVersion = %q, want original %q to prove UID is decisive", replacement.ResourceVersion, originalResourceVersion)
+	}
+
+	if _, err := kubeStore.GetControllerEpoch(ctx, name); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "has no immutable authoritative Lease UID binding") {
+		t.Fatalf("unbound recreated Lease read error = %v, want fail-closed conflict", err)
+	}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get mirror after rejected unbound Lease recreation: %v", err)
+	}
+	if object.ResourceVersion != beforeResourceVersion {
+		t.Fatalf("rejected unbound Lease recreation changed mirror resourceVersion from %q to %q", beforeResourceVersion, object.ResourceVersion)
+	}
+	if _, present := object.Annotations[annotationControllerEpochLeaseUID]; present {
+		t.Fatalf("rejected unbound Lease recreation gained a UID binding: %#v", object.Annotations)
+	}
+}
+
+func TestControllerEpochAuthorityRejectsMissingLeaseUIDBinding(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient, fence := newTestStoreWithEpoch(t)
+	name := controlstore.DefaultControllerEpochName
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	leaseBefore := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, leaseKey, leaseBefore); err != nil {
+		t.Fatalf("get controller epoch Lease before missing-binding rejection: %v", err)
+	}
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get controller epoch mirror: %v", err)
+	}
+	delete(object.Annotations, annotationControllerEpochLeaseUID)
+	if err := kubeClient.Update(ctx, object); err != nil {
+		t.Fatalf("simulate pre-UID-binding controller epoch mirror: %v", err)
+	}
+	beforeResourceVersion := object.ResourceVersion
+
+	if _, err := kubeStore.GetControllerEpoch(ctx, name); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "has no immutable authoritative Lease UID binding") {
+		t.Fatalf("missing Lease UID binding error = %v, want fail-closed conflict", err)
+	}
+	if _, _, err := kubeStore.requireControllerEpoch(ctx, fence); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "has no immutable authoritative Lease UID binding") {
+		t.Fatalf("missing Lease UID mutation-fence error = %v, want fail-closed conflict", err)
+	}
+	leaseAfter := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, leaseKey, leaseAfter); err != nil {
+		t.Fatalf("get controller epoch Lease after missing-binding rejection: %v", err)
+	}
+	if leaseAfter.ResourceVersion != leaseBefore.ResourceVersion || leaseAfter.Annotations[annotationMutationToken] != "" || leaseAfter.Annotations[annotationMutationExpiresAt] != "" {
+		t.Fatalf("missing binding changed controller epoch Lease: before=%#v after=%#v", leaseBefore.ObjectMeta, leaseAfter.ObjectMeta)
+	}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get rejected unbound controller epoch mirror: %v", err)
+	}
+	if object.ResourceVersion != beforeResourceVersion {
+		t.Fatalf("rejected unbound mirror changed resourceVersion from %q to %q", beforeResourceVersion, object.ResourceVersion)
+	}
+	if _, present := object.Annotations[annotationControllerEpochLeaseUID]; present {
+		t.Fatalf("rejected unbound mirror gained a Lease UID binding: %#v", object.Annotations)
+	}
+}
+
+func TestControllerEpochAuthorityRejectsLegacyUIDBackfillDuringActiveMutation(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient, _ := newTestStoreWithEpoch(t)
+	name := controlstore.DefaultControllerEpochName
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get controller epoch mirror: %v", err)
+	}
+	delete(object.Annotations, annotationControllerEpochLeaseUID)
+	if err := kubeClient.Update(ctx, object); err != nil {
+		t.Fatalf("remove legacy Lease UID binding: %v", err)
+	}
+	lease := &coordinationv1.Lease{}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	if err := kubeClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get controller epoch Lease: %v", err)
+	}
+	lease.Annotations[annotationMutationToken] = "active-upgrade-mutation"
+	lease.Annotations[annotationMutationExpiresAt] = formatTime(time.Now().UTC().Add(time.Minute))
+	if err := kubeClient.Update(ctx, lease); err != nil {
+		t.Fatalf("mark active controller epoch mutation: %v", err)
+	}
+
+	if _, err := kubeStore.GetControllerEpoch(ctx, name); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "has no immutable authoritative Lease UID binding") {
+		t.Fatalf("active-mutation missing-binding error = %v, want conflict", err)
+	}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get mirror after rejected UID backfill: %v", err)
+	}
+	if _, present := object.Annotations[annotationControllerEpochLeaseUID]; present {
+		t.Fatalf("active mutation gained a Lease UID binding: %#v", object.Annotations)
+	}
+}
+
+func TestControllerEpochAuthorityRejectsWrongLeaseUIDBinding(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient, fence := newTestStoreWithEpoch(t)
+	name := controlstore.DefaultControllerEpochName
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	leaseBefore := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, leaseKey, leaseBefore); err != nil {
+		t.Fatalf("get controller epoch Lease before wrong-binding rejection: %v", err)
+	}
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get controller epoch mirror: %v", err)
+	}
+	object.Annotations[annotationControllerEpochLeaseUID] = "wrong-controller-epoch-lease-uid"
+	if err := kubeClient.Update(ctx, object); err != nil {
+		t.Fatalf("forge controller epoch Lease UID binding: %v", err)
+	}
+	if _, err := kubeStore.GetControllerEpoch(ctx, name); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "bound to Lease UID") {
+		t.Fatalf("wrong Lease UID binding error = %v, want conflict", err)
+	}
+	if _, _, err := kubeStore.requireControllerEpoch(ctx, fence); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "bound to Lease UID") {
+		t.Fatalf("wrong Lease UID mutation-fence error = %v, want conflict", err)
+	}
+	leaseAfter := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, leaseKey, leaseAfter); err != nil {
+		t.Fatalf("get controller epoch Lease after wrong-binding rejection: %v", err)
+	}
+	if leaseAfter.ResourceVersion != leaseBefore.ResourceVersion || leaseAfter.Annotations[annotationMutationToken] != "" || leaseAfter.Annotations[annotationMutationExpiresAt] != "" {
+		t.Fatalf("wrong binding changed controller epoch Lease: before=%#v after=%#v", leaseBefore.ObjectMeta, leaseAfter.ObjectMeta)
+	}
+}
+
+func TestControllerEpochStatusSyncExactMirrorIsWriteFree(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, rawClient, _ := newTestStoreWithEpoch(t)
+	name := controlstore.DefaultControllerEpochName
+	lease := &coordinationv1.Lease{}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	if err := rawClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get authoritative controller epoch Lease: %v", err)
+	}
+	epoch, err := controllerEpochFromLease(name, lease)
+	if err != nil {
+		t.Fatalf("parse authoritative controller epoch Lease: %v", err)
+	}
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := rawClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get exact controller epoch mirror: %v", err)
+	}
+	beforeResourceVersion := object.ResourceVersion
+
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	var statusWrites atomic.Int32
+	var objectWrites atomic.Int32
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, delegate client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			if _, isEpochObject := object.(*corev1alpha1.ControllerEpoch); isEpochObject {
+				statusWrites.Add(1)
+			}
+			return delegate.SubResource(subresource).Update(ctx, object, options...)
+		},
+		Update: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			if _, isEpochObject := object.(*corev1alpha1.ControllerEpoch); isEpochObject {
+				objectWrites.Add(1)
+			}
+			return delegate.Update(ctx, object, options...)
+		},
+	})
+
+	if err := kubeStore.syncControllerEpochStatus(ctx, epoch, lease, ""); err != nil {
+		t.Fatalf("sync exact controller epoch mirror: %v", err)
+	}
+	if got := statusWrites.Load(); got != 0 {
+		t.Fatalf("exact controller epoch mirror triggered %d status write(s)", got)
+	}
+	if got := objectWrites.Load(); got != 0 {
+		t.Fatalf("exact controller epoch mirror triggered %d object write(s)", got)
+	}
+	if err := rawClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get controller epoch mirror after exact sync: %v", err)
+	}
+	if object.ResourceVersion != beforeResourceVersion {
+		t.Fatalf("exact controller epoch mirror resourceVersion changed from %q to %q", beforeResourceVersion, object.ResourceVersion)
+	}
+}
+
+func TestControllerEpochStatusSyncRejectsChangedLeaseSnapshotWithoutWriting(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, rawClient, _ := newTestStoreWithEpoch(t)
+	name := controlstore.DefaultControllerEpochName
+	lease := &coordinationv1.Lease{}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	if err := rawClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get authoritative controller epoch Lease: %v", err)
+	}
+	epoch, err := controllerEpochFromLease(name, lease)
+	if err != nil {
+		t.Fatalf("parse authoritative controller epoch Lease: %v", err)
+	}
+	staleLeaseSnapshot := lease.DeepCopy()
+	staleLeaseResourceVersion := lease.ResourceVersion
+	lease.Annotations["core.orka.ai/test-lease-revision"] = "changed"
+	if err := rawClient.Update(ctx, lease); err != nil {
+		t.Fatalf("change controller epoch Lease revision: %v", err)
+	}
+	if lease.ResourceVersion == staleLeaseResourceVersion {
+		t.Fatal("controller epoch Lease revision did not change")
+	}
+
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := rawClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get controller epoch mirror before stale sync: %v", err)
+	}
+	beforeResourceVersion := object.ResourceVersion
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	var writes atomic.Int32
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, delegate client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			if _, isEpochObject := object.(*corev1alpha1.ControllerEpoch); isEpochObject {
+				writes.Add(1)
+			}
+			return delegate.SubResource(subresource).Update(ctx, object, options...)
+		},
+		Update: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			if _, isEpochObject := object.(*corev1alpha1.ControllerEpoch); isEpochObject {
+				writes.Add(1)
+			}
+			return delegate.Update(ctx, object, options...)
+		},
+	})
+
+	err = kubeStore.syncControllerEpochStatus(ctx, epoch, staleLeaseSnapshot, "")
+	if !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "changed from UID/resourceVersion") {
+		t.Fatalf("changed Lease snapshot sync error = %v, want resourceVersion conflict", err)
+	}
+	if got := writes.Load(); got != 0 {
+		t.Fatalf("changed Lease snapshot triggered %d controller epoch write(s)", got)
+	}
+	if err := rawClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get controller epoch mirror after stale sync: %v", err)
+	}
+	if object.ResourceVersion != beforeResourceVersion || object.Status.Epoch != epoch.Epoch || object.Status.Version != epoch.Version {
+		t.Fatalf("changed Lease snapshot changed controller epoch mirror: %#v", object.Status)
+	}
+}
+
+func TestControllerEpochStatusSyncRejectsNonPredecessorMirrorWithoutWriting(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, rawClient, _ := newTestStoreWithEpoch(t)
+	name := controlstore.DefaultControllerEpochName
+	lease := &coordinationv1.Lease{}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	if err := rawClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get epoch-1 authoritative Lease: %v", err)
+	}
+	predecessorDigest := testDigest("restored-epoch-3-predecessor")
+	setControllerEpochLease(lease, controlstore.ControllerEpochCAS{
+		Name: name, NewEpoch: 3, HolderID: "controller-three",
+		RequestDigest: testDigest("epoch-3-restore"), UpdatedAt: testNow.Add(2 * time.Minute),
+	}, 3, predecessorDigest)
+	if err := rawClient.Update(ctx, lease); err != nil {
+		t.Fatalf("restore epoch-3 authoritative Lease over epoch-1 mirror: %v", err)
+	}
+	target, err := controllerEpochFromLease(name, lease)
+	if err != nil {
+		t.Fatalf("parse restored epoch-3 authoritative Lease: %v", err)
+	}
+
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := rawClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get epoch-1 controller epoch mirror: %v", err)
+	}
+	beforeResourceVersion := object.ResourceVersion
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	var writes atomic.Int32
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, delegate client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			if _, isEpochObject := object.(*corev1alpha1.ControllerEpoch); isEpochObject {
+				writes.Add(1)
+			}
+			return delegate.SubResource(subresource).Update(ctx, object, options...)
+		},
+		Update: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			if _, isEpochObject := object.(*corev1alpha1.ControllerEpoch); isEpochObject {
+				writes.Add(1)
+			}
+			return delegate.Update(ctx, object, options...)
+		},
+	})
+
+	err = kubeStore.syncControllerEpochStatus(ctx, target, lease, predecessorDigest)
+	if !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "not the exact predecessor") {
+		t.Fatalf("non-predecessor mirror sync error = %v, want exact-predecessor conflict", err)
+	}
+	if got := writes.Load(); got != 0 {
+		t.Fatalf("non-predecessor mirror triggered %d controller epoch write(s)", got)
+	}
+	if err := rawClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get controller epoch mirror after rejected jump: %v", err)
+	}
+	if object.ResourceVersion != beforeResourceVersion || object.Status.Epoch != 1 || object.Status.Version != 1 {
+		t.Fatalf("rejected epoch jump changed controller epoch mirror: %#v", object.Status)
+	}
+}
+
+func TestControllerEpochDelayedEpochOneStatusRetryCannotRollbackEpochTwo(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, rawClient := newTestStore(t)
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	name := controlstore.DefaultControllerEpochName
+	firstStatusBlocked := make(chan struct{})
+	releaseFirstStatus := make(chan struct{})
+	var statusCalls atomic.Int32
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, delegate client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			if _, isEpochObject := object.(*corev1alpha1.ControllerEpoch); subresource == testStatusSubresource && isEpochObject && statusCalls.Add(1) == 1 {
+				close(firstStatusBlocked)
+				select {
+				case <-releaseFirstStatus:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				return apierrors.NewConflict(
+					schema.GroupResource{Group: corev1alpha1.GroupVersion.Group, Resource: "controllerepochs"},
+					object.GetName(), errors.New("simulated delayed epoch-1 status conflict"),
+				)
+			}
+			return delegate.SubResource(subresource).Update(ctx, object, options...)
+		},
+	})
+
+	type casResult struct {
+		epoch *controlstore.ControllerEpoch
+		err   error
+	}
+	firstResult := make(chan casResult, 1)
+	go func() {
+		epoch, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+			Name: name, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+			HolderID: testControllerFirst, RequestDigest: testDigest("delayed-epoch-1"), UpdatedAt: testNow,
+		})
+		firstResult <- casResult{epoch: epoch, err: err}
+	}()
+
+	select {
+	case <-firstStatusBlocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("epoch-1 status sync did not reach deterministic delay")
+	}
+	advanced, advanceErr := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 1, ExpectedEpoch: 1, NewEpoch: 2,
+		HolderID: testControllerSecond, RequestDigest: testDigest("delayed-epoch-2"), UpdatedAt: testNow.Add(time.Minute),
+	})
+	close(releaseFirstStatus)
+
+	var delayed casResult
+	select {
+	case delayed = <-firstResult:
+	case <-time.After(2 * time.Second):
+		t.Fatal("delayed epoch-1 status sync did not finish")
+	}
+	if advanceErr != nil {
+		t.Fatalf("advance to epoch 2 while epoch-1 status write is delayed: %v", advanceErr)
+	}
+	if advanced.Epoch != 2 || advanced.Version != 2 || advanced.HolderID != testControllerSecond {
+		t.Fatalf("advanced controller epoch = %#v", advanced)
+	}
+	if !errors.Is(delayed.err, controlstore.ErrConflict) {
+		t.Fatalf("delayed epoch-1 retry error = %v, want conflict after epoch 2 committed", delayed.err)
+	}
+	if delayed.epoch != nil {
+		t.Fatalf("delayed epoch-1 retry returned an epoch after conflict: %#v", delayed.epoch)
+	}
+
+	lease := &coordinationv1.Lease{}
+	if err := rawClient.Get(ctx, client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}, lease); err != nil {
+		t.Fatalf("get final authoritative controller epoch Lease: %v", err)
+	}
+	finalEpoch, err := controllerEpochFromLease(name, lease)
+	if err != nil {
+		t.Fatalf("parse final authoritative controller epoch Lease: %v", err)
+	}
+	object := &corev1alpha1.ControllerEpoch{}
+	if err := rawClient.Get(ctx, client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}, object); err != nil {
+		t.Fatalf("get final controller epoch mirror: %v", err)
+	}
+	if finalEpoch.Epoch != 2 || finalEpoch.Version != 2 || object.Status.Epoch != 2 || object.Status.Version != 2 ||
+		object.Status.HolderID != testControllerSecond || object.Status.RequestDigest != finalEpoch.RequestDigest {
+		t.Fatalf("delayed epoch-1 retry rolled back epoch 2: Lease=%#v mirror=%#v", finalEpoch, object.Status)
+	}
+	if controllerEpochInitializationMarkerPresent(object) {
+		t.Fatalf("final epoch-2 mirror retained initialization marker: %#v", object.Annotations)
+	}
+}
+
+func TestControllerEpochLeaseCASRepairsAuthenticatedPostCASTailOnRestart(t *testing.T) {
+	ctx := context.Background()
+	rawClient, change := leaveAuthenticatedControllerEpochPostCASTail(t)
+	restartedStore, err := New(rawClient, testControlNamespace)
+	if err != nil {
+		t.Fatalf("create restarted Kubernetes store: %v", err)
+	}
+	current, err := restartedStore.GetControllerEpoch(ctx, change.Name)
+	if err != nil {
+		t.Fatalf("repair authenticated post-CAS mirror tail: %v", err)
+	}
+	if current.Epoch != change.NewEpoch || current.Version != change.NewEpoch || current.HolderID != change.HolderID || current.RequestDigest != change.RequestDigest {
+		t.Fatalf("repaired controller epoch = %#v, want target %#v", current, change)
+	}
+	lease := &coordinationv1.Lease{}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(change.Name)}
+	if err := rawClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get repaired authoritative Lease: %v", err)
+	}
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(change.Name)}
+	if err := rawClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get repaired controller epoch mirror: %v", err)
+	}
+	if object.Status.Epoch != change.NewEpoch || object.Status.Version != change.NewEpoch ||
+		object.Status.LeaseResourceVersion != lease.ResourceVersion ||
+		object.Annotations[annotationControllerEpochLeaseUID] != string(lease.UID) {
+		t.Fatalf("repaired mirror = annotations %#v status %#v Lease=%#v", object.Annotations, object.Status, lease.ObjectMeta)
+	}
+	retry, err := restartedStore.CompareAndSwapControllerEpoch(ctx, change)
+	if err != nil {
+		t.Fatalf("retry committed post-CAS target: %v", err)
+	}
+	if retry.Epoch != change.NewEpoch || retry.Version != change.NewEpoch {
+		t.Fatalf("post-CAS target retry = %#v", retry)
+	}
+}
+
+func TestControllerEpochLeaseCASRejectsConcurrentPredecessorMutation(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, rawClient, _ := newTestStoreWithEpoch(t)
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	name := controlstore.DefaultControllerEpochName
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	mutated := false
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		Update: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			lease, isLease := object.(*coordinationv1.Lease)
+			if !isLease || lease.Annotations[annotationControllerEpoch] != "2" || mutated {
+				return delegate.Update(ctx, object, options...)
+			}
+			if err := delegate.Update(ctx, object, options...); err != nil {
+				return err
+			}
+			mirror := &corev1alpha1.ControllerEpoch{}
+			if err := delegate.Get(ctx, objectKey, mirror); err != nil {
+				return err
+			}
+			mirror.Status.RequestDigest = testDigest("forged-concurrent-predecessor")
+			if err := delegate.Status().Update(ctx, mirror); err != nil {
+				return err
+			}
+			mutated = true
+			return nil
+		},
+	})
+	change := controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 1, ExpectedEpoch: 1, NewEpoch: 2,
+		HolderID: testControllerSecond, RequestDigest: testDigest("concurrent-predecessor-epoch-2"), UpdatedAt: testNow.Add(time.Minute),
+	}
+	if _, err := kubeStore.CompareAndSwapControllerEpoch(ctx, change); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "predecessor mirror digest does not match") {
+		t.Fatalf("concurrent predecessor mutation CAS error = %v, want digest conflict", err)
+	}
+	if !mutated {
+		t.Fatal("concurrent predecessor mutation hook did not run")
+	}
+	lease := &coordinationv1.Lease{}
+	if err := rawClient.Get(ctx, client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}, lease); err != nil {
+		t.Fatalf("get committed epoch-2 Lease after rejected mirror sync: %v", err)
+	}
+	committed, err := controllerEpochFromLease(name, lease)
+	if err != nil {
+		t.Fatalf("parse committed epoch-2 Lease: %v", err)
+	}
+	if committed.Epoch != 2 || committed.Version != 2 {
+		t.Fatalf("authoritative Lease did not commit epoch 2: %#v", committed)
+	}
+	restartedStore, err := New(rawClient, testControlNamespace)
+	if err != nil {
+		t.Fatalf("create restarted Kubernetes store: %v", err)
+	}
+	if _, err := restartedStore.GetControllerEpoch(ctx, name); !errors.Is(err, controlstore.ErrConflict) || !strings.Contains(err.Error(), "predecessor mirror digest does not match") {
+		t.Fatalf("restart accepted forged predecessor mirror: %v", err)
+	}
+}
+
+func TestControllerEpochAuthorityRejectsCorruptPredecessorTimestampsWithoutPanic(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*corev1alpha1.ControllerEpochStatus)
+	}{
+		{name: "missing acquiredAt", mutate: func(status *corev1alpha1.ControllerEpochStatus) { status.AcquiredAt = nil }},
+		{name: "missing updatedAt", mutate: func(status *corev1alpha1.ControllerEpochStatus) { status.UpdatedAt = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			rawClient, change := leaveAuthenticatedControllerEpochPostCASTail(t)
+			object := &corev1alpha1.ControllerEpoch{}
+			objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(change.Name)}
+			if err := rawClient.Get(ctx, objectKey, object); err != nil {
+				t.Fatalf("get authenticated predecessor mirror: %v", err)
+			}
+			test.mutate(&object.Status)
+			if err := rawClient.Status().Update(ctx, object); err != nil {
+				t.Fatalf("corrupt predecessor timestamp: %v", err)
+			}
+			restartedStore, err := New(rawClient, testControlNamespace)
+			if err != nil {
+				t.Fatalf("create restarted Kubernetes store: %v", err)
+			}
+			if _, err := restartedStore.GetControllerEpoch(ctx, change.Name); err == nil || !strings.Contains(err.Error(), "predecessor mirror has incomplete timestamps") {
+				t.Fatalf("corrupt predecessor timestamp error = %v, want fail-closed validation", err)
+			}
+		})
+	}
+}
+
+func leaveAuthenticatedControllerEpochPostCASTail(t *testing.T) (client.Client, controlstore.ControllerEpochCAS) {
+	t.Helper()
+	ctx := context.Background()
+	kubeStore, rawClient, _ := newTestStoreWithEpoch(t)
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	injectedErr := errors.New("injected post-CAS status sync failure")
+	failTargetStatus := true
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, delegate client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			mirror, isEpochObject := object.(*corev1alpha1.ControllerEpoch)
+			if subresource == testStatusSubresource && isEpochObject && mirror.Status.Epoch == 2 && failTargetStatus {
+				failTargetStatus = false
+				return injectedErr
+			}
+			return delegate.SubResource(subresource).Update(ctx, object, options...)
+		},
+	})
+	change := controlstore.ControllerEpochCAS{
+		Name: controlstore.DefaultControllerEpochName, ExpectedVersion: 1, ExpectedEpoch: 1, NewEpoch: 2,
+		HolderID: testControllerSecond, RequestDigest: testDigest("post-CAS-tail-epoch-2"), UpdatedAt: testNow.Add(time.Minute),
+	}
+	if _, err := kubeStore.CompareAndSwapControllerEpoch(ctx, change); !errors.Is(err, injectedErr) {
+		t.Fatalf("post-CAS status sync error = %v, want injected failure", err)
+	}
+	lease := &coordinationv1.Lease{}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(change.Name)}
+	if err := rawClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get committed post-CAS Lease: %v", err)
+	}
+	predecessorDigest, err := controllerEpochPredecessorDigest(lease)
+	if err != nil {
+		t.Fatalf("parse committed predecessor digest: %v", err)
+	}
+	if predecessorDigest == "" {
+		t.Fatal("committed post-CAS Lease omitted predecessor digest")
+	}
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(change.Name)}
+	if err := rawClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get post-CAS predecessor mirror: %v", err)
+	}
+	if object.Status.Epoch != 1 || object.Status.Version != 1 || object.Annotations[annotationControllerEpochLeaseUID] != string(lease.UID) {
+		t.Fatalf("post-CAS tail = annotations %#v status %#v Lease UID %q", object.Annotations, object.Status, lease.UID)
+	}
+	return rawClient, change
+}
+
+func TestControllerEpochLeaseCASRejectsMissingLeaseWithBlankObject(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient := newTestStore(t)
+	name := controlstore.DefaultControllerEpochName
+	object := &corev1alpha1.ControllerEpoch{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testControlNamespace,
+			Name:      controllerEpochObjectName(name),
+		},
+		Spec: corev1alpha1.ControllerEpochSpec{Name: name},
+	}
+	if err := kubeClient.Create(ctx, object); err != nil {
+		t.Fatalf("create blank controller epoch object: %v", err)
+	}
+
+	_, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+		HolderID: testControllerFresh, RequestDigest: testDigest("fresh-epoch-1"), UpdatedAt: testNow,
+	})
+	if err == nil || !strings.Contains(err.Error(), "authoritative Lease is missing") {
+		t.Fatalf("blank pre-existing object CAS error = %v, want fail-closed authority error", err)
+	}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	if err := kubeClient.Get(ctx, leaseKey, &coordinationv1.Lease{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("missing Lease was created from a blank pre-existing object: %v", err)
+	}
+}
+
+func TestControllerEpochLeaseCASRejectsRestoreWinningFreshObjectCreation(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, rawClient := newTestStore(t)
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	name := controlstore.DefaultControllerEpochName
+	restoreApplied := false
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		Create: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.CreateOption) error {
+			epochObject, isEpochObject := object.(*corev1alpha1.ControllerEpoch)
+			if !isEpochObject || restoreApplied {
+				return delegate.Create(ctx, object, options...)
+			}
+			restored := epochObject.DeepCopy()
+			if err := delegate.Create(ctx, restored, options...); err != nil {
+				return err
+			}
+			restoredAt := metav1.NewTime(testNow.Add(7 * time.Hour))
+			restored.Status = corev1alpha1.ControllerEpochStatus{
+				Epoch: 7, Version: 7, HolderID: testControllerRestored, RequestDigest: testDigest("restored-epoch-7"),
+				AcquiredAt: &restoredAt, UpdatedAt: &restoredAt,
+				LeaseName: controllerEpochLeaseName(name), LeaseResourceVersion: "restored-lease-rv",
+			}
+			if err := delegate.Status().Update(ctx, restored); err != nil {
+				return err
+			}
+			restoreApplied = true
+			return apierrors.NewAlreadyExists(
+				schema.GroupResource{Group: corev1alpha1.GroupVersion.Group, Resource: "controllerepochs"},
+				restored.Name,
+			)
+		},
+	})
+
+	_, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+		HolderID: testControllerFresh, RequestDigest: testDigest("fresh-epoch-1"), UpdatedAt: testNow,
+	})
+	if err == nil || !strings.Contains(err.Error(), "authoritative Lease is missing") {
+		t.Fatalf("restore-winning CAS error = %v, want fail-closed authority error", err)
+	}
+	if !restoreApplied {
+		t.Fatal("restore race was not exercised")
+	}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	if err := rawClient.Get(ctx, leaseKey, &coordinationv1.Lease{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("epoch-1 Lease was created after restore won object creation: %v", err)
+	}
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := rawClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get restore-winning ControllerEpoch object: %v", err)
+	}
+	if object.Status.Epoch != 7 || object.Status.Version != 7 || object.Status.HolderID != testControllerRestored {
+		t.Fatalf("restore-winning status changed: %#v", object.Status)
+	}
+}
+
+func TestControllerEpochLeaseCASCrashTailAfterFreshObjectCreationFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, rawClient := newTestStore(t)
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	name := controlstore.DefaultControllerEpochName
+	injectedErr := errors.New("injected Lease create failure")
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		Create: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.CreateOption) error {
+			if lease, isLease := object.(*coordinationv1.Lease); isLease && lease.Name == controllerEpochLeaseName(name) {
+				return injectedErr
+			}
+			return delegate.Create(ctx, object, options...)
+		},
+	})
+	_, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+		HolderID: testControllerFresh, RequestDigest: testDigest("fresh-epoch-1"), UpdatedAt: testNow,
+	})
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("initial CAS error = %v, want injected Lease create failure", err)
+	}
+
+	restartedStore, err := New(rawClient, testControlNamespace)
+	if err != nil {
+		t.Fatalf("create restarted Kubernetes store: %v", err)
+	}
+	_, err = restartedStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+		HolderID: "controller-restarted", RequestDigest: testDigest("restart-epoch-1"), UpdatedAt: testNow.Add(time.Minute),
+	})
+	if err == nil || !strings.Contains(err.Error(), "authoritative Lease is missing") {
+		t.Fatalf("crash-tail retry error = %v, want fail-closed authority error", err)
+	}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	if err := rawClient.Get(ctx, leaseKey, &coordinationv1.Lease{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("crash-tail retry created epoch-1 Lease: %v", err)
+	}
+}
+
+func TestControllerEpochLeaseCASRepairsMarkedEpochOneCrashTailBeforeAdvance(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, rawClient := newTestStore(t)
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	name := controlstore.DefaultControllerEpochName
+	injectedErr := errors.New("injected status mirror failure")
+	failStatus := true
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, delegate client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			if _, isEpochObject := object.(*corev1alpha1.ControllerEpoch); subresource == testStatusSubresource && isEpochObject && failStatus {
+				failStatus = false
+				return injectedErr
+			}
+			return delegate.SubResource(subresource).Update(ctx, object, options...)
+		},
+	})
+	_, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+		HolderID: testControllerFirst, RequestDigest: testDigest("marked-epoch-1"), UpdatedAt: testNow,
+	})
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("initial CAS error = %v, want injected mirror failure", err)
+	}
+
+	restartedStore, err := New(rawClient, testControlNamespace)
+	if err != nil {
+		t.Fatalf("create restarted Kubernetes store: %v", err)
+	}
+	current, err := restartedStore.GetControllerEpoch(ctx, name)
+	if err != nil {
+		t.Fatalf("read marked epoch-1 crash tail: %v", err)
+	}
+	if current.Epoch != 1 || current.Version != 1 || current.HolderID != testControllerFirst {
+		t.Fatalf("marked crash-tail epoch = %#v", current)
+	}
+	advanced, err := restartedStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 1, ExpectedEpoch: 1, NewEpoch: 2,
+		HolderID: testControllerSecond, RequestDigest: testDigest("marked-epoch-2"), UpdatedAt: testNow.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("advance marked crash tail: %v", err)
+	}
+	if advanced.Epoch != 2 || advanced.Version != 2 || advanced.HolderID != testControllerSecond {
+		t.Fatalf("advanced marked crash-tail epoch = %#v", advanced)
+	}
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := rawClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get repaired ControllerEpoch object: %v", err)
+	}
+	if object.Status.Epoch != 2 || object.Status.Version != 2 || object.Status.HolderID != testControllerSecond {
+		t.Fatalf("repaired ControllerEpoch status = %#v", object.Status)
+	}
+	if controllerEpochInitializationMarkerPresent(object) {
+		t.Fatalf("repaired ControllerEpoch retained reusable initialization marker: %#v", object.Annotations)
+	}
+}
+
+func TestControllerEpochLeaseCASConsumesInitializationMarkerAfterSuccessfulMirror(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient := newTestStore(t)
+	name := controlstore.DefaultControllerEpochName
+	initial, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+		HolderID: testControllerFirst, RequestDigest: testDigest("consumed-epoch-1"), UpdatedAt: testNow,
+	})
+	if err != nil {
+		t.Fatalf("create initial epoch: %v", err)
+	}
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get committed ControllerEpoch object: %v", err)
+	}
+	if controllerEpochInitializationMarkerPresent(object) {
+		t.Fatalf("committed ControllerEpoch retained reusable initialization marker: %#v", object.Annotations)
+	}
+	object.Status = corev1alpha1.ControllerEpochStatus{}
+	if err := kubeClient.Status().Update(ctx, object); err != nil {
+		t.Fatalf("blank committed ControllerEpoch status: %v", err)
+	}
+	if _, err := kubeStore.GetControllerEpoch(ctx, name); err == nil || !strings.Contains(err.Error(), "blank status without an exact epoch-1 initialization marker") {
+		t.Fatalf("lost committed epoch-1 mirror error = %v, want fail-closed marker error", err)
+	}
+	lease := &coordinationv1.Lease{}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	if err := kubeClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get preserved authoritative Lease: %v", err)
+	}
+	parsed, err := controllerEpochFromLease(name, lease)
+	if err != nil {
+		t.Fatalf("parse preserved authoritative Lease: %v", err)
+	}
+	if parsed.Epoch != initial.Epoch || parsed.Version != initial.Version || parsed.HolderID != initial.HolderID {
+		t.Fatalf("lost mirror changed authoritative Lease: got %#v, want %#v", parsed, initial)
+	}
+}
+
+func TestControllerEpochLeaseCASRepairsInitializationMarkerCleanupCrashTail(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, rawClient := newTestStore(t)
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	name := controlstore.DefaultControllerEpochName
+	injectedErr := errors.New("injected initialization marker cleanup failure")
+	failCleanup := true
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		Update: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			if _, isEpochObject := object.(*corev1alpha1.ControllerEpoch); isEpochObject && failCleanup {
+				failCleanup = false
+				return injectedErr
+			}
+			return delegate.Update(ctx, object, options...)
+		},
+	})
+	_, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+		HolderID: testControllerFirst, RequestDigest: testDigest("marker-cleanup-epoch-1"), UpdatedAt: testNow,
+	})
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("initial CAS error = %v, want injected marker cleanup failure", err)
+	}
+	partial := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := rawClient.Get(ctx, objectKey, partial); err != nil {
+		t.Fatalf("get marker cleanup crash tail: %v", err)
+	}
+	if partial.Status.Epoch != 1 || partial.Status.Version != 1 || !controllerEpochInitializationMarkerPresent(partial) {
+		t.Fatalf("marker cleanup crash tail = status %#v annotations %#v", partial.Status, partial.Annotations)
+	}
+	if _, bound := partial.Annotations[annotationControllerEpochLeaseUID]; bound {
+		t.Fatalf("marker cleanup crash tail already bound a Lease UID: %#v", partial.Annotations)
+	}
+
+	restartedStore, err := New(rawClient, testControlNamespace)
+	if err != nil {
+		t.Fatalf("create restarted Kubernetes store: %v", err)
+	}
+	current, err := restartedStore.GetControllerEpoch(ctx, name)
+	if err != nil {
+		t.Fatalf("repair marker cleanup crash tail: %v", err)
+	}
+	if current.Epoch != 1 || current.Version != 1 || current.HolderID != testControllerFirst {
+		t.Fatalf("repaired marker cleanup epoch = %#v", current)
+	}
+	repaired := &corev1alpha1.ControllerEpoch{}
+	if err := rawClient.Get(ctx, objectKey, repaired); err != nil {
+		t.Fatalf("get repaired marker cleanup object: %v", err)
+	}
+	if controllerEpochInitializationMarkerPresent(repaired) {
+		t.Fatalf("repaired object retained initialization marker: %#v", repaired.Annotations)
+	}
+	lease := &coordinationv1.Lease{}
+	if err := rawClient.Get(ctx, client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}, lease); err != nil {
+		t.Fatalf("get authoritative Lease after marker cleanup repair: %v", err)
+	}
+	if repaired.Annotations[annotationControllerEpochLeaseUID] != string(lease.UID) {
+		t.Fatalf("repaired object Lease UID binding = %q, want %q", repaired.Annotations[annotationControllerEpochLeaseUID], lease.UID)
+	}
+}
+
+func TestControllerEpochAuthorityRejectsBlankMirrorAfterAdvance(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient, _ := newTestStoreWithEpoch(t)
+	name := controlstore.DefaultControllerEpochName
+	advanced, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 1, ExpectedEpoch: 1, NewEpoch: 2,
+		HolderID: testControllerSecond, RequestDigest: testDigest("epoch-2"), UpdatedAt: testNow.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("advance controller epoch: %v", err)
+	}
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get advanced ControllerEpoch object: %v", err)
+	}
+	object.Status = corev1alpha1.ControllerEpochStatus{}
+	if err := kubeClient.Status().Update(ctx, object); err != nil {
+		t.Fatalf("blank advanced ControllerEpoch status: %v", err)
+	}
+	if _, err := kubeStore.GetControllerEpoch(ctx, name); err == nil || !strings.Contains(err.Error(), "blank mirror cannot consume") {
+		t.Fatalf("blank advanced mirror read error = %v, want fail-closed marker error", err)
+	}
+	lease := &coordinationv1.Lease{}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	if err := kubeClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get preserved authoritative Lease: %v", err)
+	}
+	parsed, err := controllerEpochFromLease(name, lease)
+	if err != nil {
+		t.Fatalf("parse preserved authoritative Lease: %v", err)
+	}
+	if parsed.Epoch != advanced.Epoch || parsed.Version != advanced.Version || parsed.HolderID != advanced.HolderID {
+		t.Fatalf("blank mirror changed authoritative Lease: got %#v, want %#v", parsed, advanced)
+	}
+}
+
+func TestControllerEpochAuthorityRejectsForgedPredecessorAfterAdvance(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient, _ := newTestStoreWithEpoch(t)
+	name := controlstore.DefaultControllerEpochName
+	object := &corev1alpha1.ControllerEpoch{}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get epoch-1 ControllerEpoch object: %v", err)
+	}
+	staleStatus := object.Status.DeepCopy()
+	advanced, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 1, ExpectedEpoch: 1, NewEpoch: 2,
+		HolderID: testControllerSecond, RequestDigest: testDigest("epoch-2"), UpdatedAt: testNow.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("advance controller epoch: %v", err)
+	}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get epoch-2 ControllerEpoch object: %v", err)
+	}
+	object.Status = *staleStatus
+	object.Status.HolderID = "controller-forged-predecessor"
+	if err := kubeClient.Status().Update(ctx, object); err != nil {
+		t.Fatalf("restore forged predecessor ControllerEpoch status: %v", err)
+	}
+	if _, err := kubeStore.GetControllerEpoch(ctx, name); err == nil || !strings.Contains(err.Error(), "predecessor mirror digest does not match") {
+		t.Fatalf("forged predecessor mirror read error = %v, want digest mismatch", err)
+	}
+	lease := &coordinationv1.Lease{}
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	if err := kubeClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get preserved authoritative Lease: %v", err)
+	}
+	parsed, err := controllerEpochFromLease(name, lease)
+	if err != nil {
+		t.Fatalf("parse preserved authoritative Lease: %v", err)
+	}
+	if parsed.Epoch != advanced.Epoch || parsed.Version != advanced.Version || parsed.HolderID != advanced.HolderID {
+		t.Fatalf("stale mirror changed authoritative Lease: got %#v, want %#v", parsed, advanced)
+	}
+}
+
+func TestControllerEpochAuthorityRejectsCorruptBlankMirrorInitializationMarker(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+	}{
+		{name: "missing holder", mutate: func(annotations map[string]string) {
+			delete(annotations, annotationControllerEpochInitializationHolder)
+		}},
+		{name: "digest mismatch", mutate: func(annotations map[string]string) {
+			annotations[annotationRequestDigest] = testDigest("other-initialization")
+		}},
+		{name: "Lease name mismatch", mutate: func(annotations map[string]string) {
+			annotations[annotationControllerEpochInitializationLeaseName] = "other-lease"
+		}},
+		{name: "epoch mismatch", mutate: func(annotations map[string]string) { annotations[annotationControllerEpoch] = "2" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			kubeStore, rawClient := newTestStore(t)
+			withWatch, ok := rawClient.(client.WithWatch)
+			if !ok {
+				t.Fatal("fake client does not implement client.WithWatch")
+			}
+			injectedErr := errors.New("injected status mirror failure")
+			kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+				SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+					return injectedErr
+				},
+			})
+			_, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+				Name: controlstore.DefaultControllerEpochName, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+				HolderID: testControllerFirst, RequestDigest: testDigest("marked-epoch-1"), UpdatedAt: testNow,
+			})
+			if !errors.Is(err, injectedErr) {
+				t.Fatalf("initial CAS error = %v, want injected mirror failure", err)
+			}
+			object := &corev1alpha1.ControllerEpoch{}
+			objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(controlstore.DefaultControllerEpochName)}
+			if err := rawClient.Get(ctx, objectKey, object); err != nil {
+				t.Fatalf("get marked ControllerEpoch object: %v", err)
+			}
+			test.mutate(object.Annotations)
+			if err := rawClient.Update(ctx, object); err != nil {
+				t.Fatalf("corrupt initialization marker: %v", err)
+			}
+			restartedStore, err := New(rawClient, testControlNamespace)
+			if err != nil {
+				t.Fatalf("create restarted Kubernetes store: %v", err)
+			}
+			if _, err := restartedStore.GetControllerEpoch(ctx, controlstore.DefaultControllerEpochName); err == nil {
+				t.Fatal("corrupt blank-mirror initialization marker was accepted")
+			}
+		})
+	}
+}
+
+func TestControllerEpochLeaseCASRejectsMissingLeaseWithRestoredStatus(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient := newTestStore(t)
+	name := controlstore.DefaultControllerEpochName
+	initial, err := kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+		HolderID: "controller-initial", RequestDigest: testDigest("initial-epoch-1"), UpdatedAt: testNow,
+	})
+	if err != nil {
+		t.Fatalf("create initial epoch: %v", err)
+	}
+	if initial.Epoch != 1 {
+		t.Fatalf("initial epoch = %#v", initial)
+	}
+
+	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+	lease := &coordinationv1.Lease{}
+	if err := kubeClient.Get(ctx, leaseKey, lease); err != nil {
+		t.Fatalf("get initial controller epoch Lease: %v", err)
+	}
+	objectKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}
+	object := &corev1alpha1.ControllerEpoch{}
+	if err := kubeClient.Get(ctx, objectKey, object); err != nil {
+		t.Fatalf("get initial controller epoch object: %v", err)
+	}
+	restoredAt := metav1.NewTime(testNow.Add(7 * time.Hour))
+	object.Status = corev1alpha1.ControllerEpochStatus{
+		Epoch: 7, Version: 7, HolderID: testControllerRestored, RequestDigest: testDigest("restored-epoch-7"),
+		AcquiredAt: &restoredAt, UpdatedAt: &restoredAt,
+		LeaseName: lease.Name, LeaseResourceVersion: lease.ResourceVersion,
+	}
+	if err := kubeClient.Status().Update(ctx, object); err != nil {
+		t.Fatalf("restore controller epoch status: %v", err)
+	}
+	if err := kubeClient.Delete(ctx, lease); err != nil {
+		t.Fatalf("remove authoritative Lease to simulate incomplete restore: %v", err)
+	}
+
+	_, err = kubeStore.CompareAndSwapControllerEpoch(ctx, controlstore.ControllerEpochCAS{
+		Name: name, ExpectedVersion: 0, ExpectedEpoch: 0, NewEpoch: 1,
+		HolderID: "controller-after-restore", RequestDigest: testDigest("invalid-reset-to-1"), UpdatedAt: testNow.Add(8 * time.Hour),
+	})
+	if err == nil || !strings.Contains(err.Error(), "authoritative Lease is missing") {
+		t.Fatalf("missing restored Lease CAS error = %v, want fail-closed authority error", err)
+	}
+	if err := kubeClient.Get(ctx, leaseKey, &coordinationv1.Lease{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("missing restored Lease was recreated: %v", err)
+	}
+	preserved := &corev1alpha1.ControllerEpoch{}
+	if err := kubeClient.Get(ctx, objectKey, preserved); err != nil {
+		t.Fatalf("get preserved controller epoch object: %v", err)
+	}
+	if preserved.Status.Epoch != 7 || preserved.Status.Version != 7 || preserved.Status.HolderID != testControllerRestored {
+		t.Fatalf("restored status was changed after rejected reset: %#v", preserved.Status)
+	}
+}
+
+func TestControllerEpochAuthorityRejectsCorruptRestore(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, context.Context, client.Client, *coordinationv1.Lease, *corev1alpha1.ControllerEpoch)
+	}{
+		{
+			name: "missing Lease holder",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, lease *coordinationv1.Lease, _ *corev1alpha1.ControllerEpoch) {
+				t.Helper()
+				lease.Spec.HolderIdentity = nil
+				if err := kubeClient.Update(ctx, lease); err != nil {
+					t.Fatalf("clear Lease holder: %v", err)
+				}
+			},
+		},
+		{
+			name: "invalid Lease digest",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, lease *coordinationv1.Lease, _ *corev1alpha1.ControllerEpoch) {
+				t.Helper()
+				lease.Annotations[annotationRequestDigest] = "sha256:invalid"
+				if err := kubeClient.Update(ctx, lease); err != nil {
+					t.Fatalf("corrupt Lease digest: %v", err)
+				}
+			},
+		},
+		{
+			name: "missing Lease epoch annotation",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, lease *coordinationv1.Lease, _ *corev1alpha1.ControllerEpoch) {
+				t.Helper()
+				delete(lease.Annotations, annotationControllerEpoch)
+				if err := kubeClient.Update(ctx, lease); err != nil {
+					t.Fatalf("remove Lease epoch annotation: %v", err)
+				}
+			},
+		},
+		{
+			name: "Lease version epoch mismatch",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, lease *coordinationv1.Lease, _ *corev1alpha1.ControllerEpoch) {
+				t.Helper()
+				lease.Annotations[annotationDomainVersion] = "2"
+				if err := kubeClient.Update(ctx, lease); err != nil {
+					t.Fatalf("corrupt Lease version: %v", err)
+				}
+			},
+		},
+		{
+			name: "status holder mismatch",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, _ *coordinationv1.Lease, object *corev1alpha1.ControllerEpoch) {
+				t.Helper()
+				object.Status.HolderID = "controller-other"
+				if err := kubeClient.Status().Update(ctx, object); err != nil {
+					t.Fatalf("mismatch status holder: %v", err)
+				}
+			},
+		},
+		{
+			name: "status digest mismatch",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, _ *coordinationv1.Lease, object *corev1alpha1.ControllerEpoch) {
+				t.Helper()
+				object.Status.RequestDigest = testDigest("mismatched-status-digest")
+				if err := kubeClient.Status().Update(ctx, object); err != nil {
+					t.Fatalf("mismatch status digest: %v", err)
+				}
+			},
+		},
+		{
+			name: "status ahead of Lease",
+			mutate: func(t *testing.T, ctx context.Context, kubeClient client.Client, _ *coordinationv1.Lease, object *corev1alpha1.ControllerEpoch) {
+				t.Helper()
+				object.Status.Epoch = 2
+				object.Status.Version = 2
+				if err := kubeClient.Status().Update(ctx, object); err != nil {
+					t.Fatalf("advance status beyond Lease: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			kubeStore, kubeClient, fence := newTestStoreWithEpoch(t)
+			name := controlstore.DefaultControllerEpochName
+			leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(name)}
+			lease := &coordinationv1.Lease{}
+			if err := kubeClient.Get(ctx, leaseKey, lease); err != nil {
+				t.Fatalf("get controller epoch Lease: %v", err)
+			}
+			object := &corev1alpha1.ControllerEpoch{}
+			if err := kubeClient.Get(ctx, client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochObjectName(name)}, object); err != nil {
+				t.Fatalf("get controller epoch object: %v", err)
+			}
+			test.mutate(t, ctx, kubeClient, lease, object)
+			leaseBefore := &coordinationv1.Lease{}
+			if err := kubeClient.Get(ctx, leaseKey, leaseBefore); err != nil {
+				t.Fatalf("get corrupted controller epoch Lease: %v", err)
+			}
+			if _, err := kubeStore.GetControllerEpoch(ctx, name); err == nil {
+				t.Fatal("corrupt restored epoch authority was accepted")
+			}
+			if _, _, err := kubeStore.requireControllerEpoch(ctx, fence); err == nil {
+				t.Fatal("corrupt restored epoch authority granted a mutation fence")
+			}
+			leaseAfter := &coordinationv1.Lease{}
+			if err := kubeClient.Get(ctx, leaseKey, leaseAfter); err != nil {
+				t.Fatalf("get controller epoch Lease after rejected mutation fence: %v", err)
+			}
+			if leaseAfter.ResourceVersion != leaseBefore.ResourceVersion ||
+				leaseAfter.Annotations[annotationMutationToken] != leaseBefore.Annotations[annotationMutationToken] ||
+				leaseAfter.Annotations[annotationMutationExpiresAt] != leaseBefore.Annotations[annotationMutationExpiresAt] {
+				t.Fatalf("corrupt authority mutation check changed Lease: before=%#v after=%#v", leaseBefore.ObjectMeta, leaseAfter.ObjectMeta)
+			}
+		})
 	}
 }
 
@@ -186,32 +1525,14 @@ func TestControllerEpochMutationWaitsForShortContention(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire blocking mutation: %v", err)
 	}
-	withWatch, ok := rawClient.(client.WithWatch)
-	if !ok {
-		t.Fatal("fake client does not implement client.WithWatch")
-	}
-	leaseKey := client.ObjectKey{Namespace: testControlNamespace, Name: controllerEpochLeaseName(controlstore.DefaultControllerEpochName)}
-	contentionObserved := make(chan struct{})
-	kubeStore.reader = interceptor.NewClient(withWatch, interceptor.Funcs{
-		Get: func(ctx context.Context, delegate client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
-			if err := delegate.Get(ctx, key, object, options...); err != nil {
-				return err
-			}
-			if key == leaseKey {
-				if lease, ok := object.(*coordinationv1.Lease); ok && lease.Annotations[annotationMutationToken] == snapshot.MutationToken {
-					select {
-					case <-contentionObserved:
-					default:
-						close(contentionObserved)
-					}
-				}
-			}
-			return nil
-		},
-	})
 	released := make(chan struct{})
 	go func() {
-		<-contentionObserved
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+		}
 		kubeStore.releaseControllerEpochMutation(snapshot)
 		close(released)
 	}()
@@ -224,6 +1545,100 @@ func TestControllerEpochMutationWaitsForShortContention(t *testing.T) {
 	<-released
 	if attempt.ExecutionState != controlstore.PromptExecutionQueued || attempt.Version != 1 {
 		t.Fatalf("attempt after contention = %#v", attempt)
+	}
+}
+
+func TestExternalEffectLifecyclesQueueThirtyConcurrentControllerEpochMutations(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	kubeStore, rawClient, fence := newTestStoreWithEpoch(t)
+	withWatch, ok := rawClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	kubeStore.client = interceptor.NewClient(withWatch, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, delegate client.Client, subResourceName string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			if subResourceName == "status" {
+				if _, ok := object.(*corev1alpha1.ExternalEffect); ok {
+					timer := time.NewTimer(30 * time.Millisecond)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return ctx.Err()
+					case <-timer.C:
+					}
+				}
+			}
+			return delegate.SubResource(subResourceName).Update(ctx, object, options...)
+		},
+	})
+
+	const lifecycleCount = 30
+	start := make(chan struct{})
+	results := make(chan error, lifecycleCount)
+	for index := range lifecycleCount {
+		go func() {
+			<-start
+			label := fmt.Sprintf("security-review-%02d", index)
+			identity := controlstore.ExternalEffectIdentity{
+				Kind: "security.review", Namespace: "tenant-a", AggregateID: label, OperationID: "review",
+			}
+			now := testNow.Add(time.Duration(index) * time.Second)
+			effect, err := kubeStore.ReserveExternalEffect(ctx, controlstore.ReserveExternalEffectRequest{
+				Identity: identity, RequestDigest: testDigest(label), Fence: fence, CreatedAt: now,
+			})
+			if err != nil {
+				results <- fmt.Errorf("reserve %s: %w", label, err)
+				return
+			}
+			leaseExpiry := now.Add(5 * time.Minute)
+			inFlight, err := kubeStore.TransitionExternalEffect(ctx, controlstore.ExternalEffectTransition{
+				ID: effect.ID, Fence: fence, ExpectedVersion: effect.Version, ExpectedState: controlstore.ExternalEffectPending,
+				NewState: controlstore.ExternalEffectInFlight, RequestDigest: effect.RequestDigest,
+				LeaseOwner: "owner-" + label, LeaseExpiresAt: &leaseExpiry, UpdatedAt: now.Add(time.Millisecond),
+			})
+			if err != nil {
+				results <- fmt.Errorf("claim %s: %w", label, err)
+				return
+			}
+			response := []byte(`{"reviewed":true}`)
+			completed, err := kubeStore.TransitionExternalEffect(ctx, controlstore.ExternalEffectTransition{
+				ID: effect.ID, Fence: fence, ExpectedVersion: inFlight.Version, ExpectedState: controlstore.ExternalEffectInFlight,
+				NewState: controlstore.ExternalEffectSucceeded, RequestDigest: effect.RequestDigest,
+				ResponseDigest: testBytesDigest(response), Response: response,
+				ExpectedLeaseOwner: inFlight.LeaseOwner, UpdatedAt: now.Add(2 * time.Millisecond),
+			})
+			if err != nil {
+				results <- fmt.Errorf("settle %s: %w", label, err)
+				return
+			}
+			if completed.State != controlstore.ExternalEffectSucceeded {
+				results <- fmt.Errorf("settle %s state = %s", label, completed.State)
+				return
+			}
+			results <- nil
+		}()
+	}
+	close(start)
+	for range lifecycleCount {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestControllerEpochMutationQueueRespectsCallerDeadline(t *testing.T) {
+	kubeStore, _, fence := newTestStoreWithEpoch(t)
+	_, snapshot, err := kubeStore.requireControllerEpoch(context.Background(), fence)
+	if err != nil {
+		t.Fatalf("acquire blocking mutation: %v", err)
+	}
+	defer kubeStore.releaseControllerEpochMutation(snapshot)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, _, err := kubeStore.requireControllerEpoch(ctx, fence); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("queued mutation error = %v, want context deadline exceeded", err)
 	}
 }
 
@@ -1501,7 +2916,7 @@ func newTestStore(t *testing.T) (*Store, client.Client) {
 	if err := coordinationv1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add coordination scheme: %v", err)
 	}
-	kubeClient := fake.NewClientBuilder().
+	baseClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(
 			&corev1alpha1.Task{},
@@ -1513,6 +2928,15 @@ func newTestStore(t *testing.T) (*Store, client.Client) {
 			&corev1alpha1.ExternalEffect{},
 		).
 		Build()
+	var leaseUIDSequence atomic.Int64
+	kubeClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Create: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.CreateOption) error {
+			if lease, ok := object.(*coordinationv1.Lease); ok && lease.UID == "" {
+				lease.UID = types.UID(fmt.Sprintf("test-lease-uid-%d", leaseUIDSequence.Add(1)))
+			}
+			return delegate.Create(ctx, object, options...)
+		},
+	})
 	kubeStore, err := New(kubeClient, testControlNamespace)
 	if err != nil {
 		t.Fatalf("New: %v", err)

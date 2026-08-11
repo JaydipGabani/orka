@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # This test intentionally matches literal shell expressions.
 set -Eeuo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -16,10 +17,15 @@ grep -F -- '--create-copilot-token-secret live-acp-runtime-copilot:token' "${boo
 grep -F '/api/v1/namespaces/vekil-system/services/http:vekil:1337/proxy/v1/models' "${bootstrap}" >/dev/null
 grep -F 'ACP_E2E_COPILOT_MODEL:-gpt-5.3-codex' "${bootstrap}" >/dev/null
 grep -F 'LIVE_ACP_OPENCODE_IMAGE="orka-acp-opencode:live-acp-${image_tag}"' "${wrapper}" >/dev/null
+grep -F 'LIVE_ACP_GENERAL_WORKER_IMAGE="orka-general-worker:live-acp-${image_tag}"' "${wrapper}" >/dev/null
 grep -F 'ACP_OPENCODE_RUNTIME_IMG="${LIVE_ACP_OPENCODE_IMAGE}"' "${bootstrap}" >/dev/null
+grep -F 'GENERAL_WORKER_IMG="${LIVE_ACP_GENERAL_WORKER_IMAGE}"' "${bootstrap}" >/dev/null
 grep -F 'docker-build-acp-opencode-runtime' "${bootstrap}" >/dev/null
+grep -F 'docker-build-general-worker' "${bootstrap}" >/dev/null
 grep -F 'orka/acp-opencode-runtime' "${bootstrap}" >/dev/null
+grep -F 'orka/general-worker' "${bootstrap}" >/dev/null
 grep -F 'ACP_OPENCODE_RUNTIME_IMG="${LIVE_ACP_OPENCODE_REF}"' "${bootstrap}" >/dev/null
+grep -F 'GENERAL_WORKER_IMG="${LIVE_ACP_GENERAL_WORKER_REF}"' "${bootstrap}" >/dev/null
 grep -F 'opencode_model="${ACP_E2E_OPENCODE_MODEL:-${ACP_E2E_CODEX_MODEL:-gpt-5.4}}"' "${bootstrap}" >/dev/null
 grep -F 'opencode_model="${opencode_model#*/}"' "${bootstrap}" >/dev/null
 grep -F 'ACP_E2E_OPENCODE_CONTEXT_WINDOW must be a positive integer' "${bootstrap}" >/dev/null
@@ -49,6 +55,7 @@ inherited_state="$(
   echo 'bootstrap retained inherited port-forward cleanup state' >&2
   exit 1
 }
+
 unowned_root="$(mktemp -d "${TMPDIR:-/tmp}/live-acp-unowned-forward.XXXXXX")"
 mkdir -p "${unowned_root}/owned"
 unowned_log="${unowned_root}/vekil-port-forward.unowned"
@@ -169,7 +176,8 @@ PATH="${probe_bin}:${PATH}" live_acp_kind_probe_configured_models
 grep -F 'port-forward' "${port_forward_command_log}" >/dev/null
 grep -F -- '--address=127.0.0.1' "${port_forward_command_log}" >/dev/null
 grep -F 'service/vekil' "${port_forward_command_log}" >/dev/null
-if grep -F 'exec' "${port_forward_command_log}" >/dev/null || grep -F 'wget' "${bootstrap}" >/dev/null; then
+wire_probe_source="$(sed -n '/^live_acp_kind_probe_vekil_wire_path()/,/^}/p' "${bootstrap}")"
+if grep -F 'exec' "${port_forward_command_log}" >/dev/null || grep -F 'wget' <<<"${wire_probe_source}" >/dev/null; then
   echo 'Vekil wire probe still depends on an in-container executable' >&2
   exit 1
 fi
@@ -253,6 +261,84 @@ cat >"${fake_bin}/docker" <<'STUB'
 [[ "${1:-}" == info ]]
 STUB
 chmod +x "${fake_bin}/docker"
+
+cat >"${fake_bin}/failing-kindctl" <<'STUB'
+#!/usr/bin/env bash
+[[ "${1:-}" == delete ]] || exit 2
+exit 1
+STUB
+chmod +x "${fake_bin}/failing-kindctl"
+
+partial_create_log="${fake_bin}/partial-create.log"
+export PARTIAL_CREATE_LOG="${partial_create_log}"
+cat >"${fake_bin}/partial-kindctl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${PARTIAL_CREATE_LOG}"
+case "${1:-}" in
+  create) exit 23 ;;
+  delete) exit 0 ;;
+  *) exit 97 ;;
+esac
+STUB
+chmod +x "${fake_bin}/partial-kindctl"
+partial_secret_dir="$(mktemp -d "${TMPDIR:-/tmp}/live-acp-partial-create.XXXXXX")"
+LIVE_ACP_SECRET_DIR="${partial_secret_dir}"
+LIVE_ACP_KEEP_CLUSTER=0
+LIVE_ACP_REGISTRY_STARTED=0
+LIVE_ACP_KIND_CREATED=0
+LIVE_ACP_KINDCTL_BIN="${fake_bin}/partial-kindctl"
+LIVE_ACP_KIND_TAG="partial-create-test"
+LIVE_ACP_KIND_CONFIG=""
+set +e
+live_acp_kind_create_cluster >/dev/null 2>&1
+partial_create_status=$?
+set -e
+[[ "${partial_create_status}" -eq 23 && "${LIVE_ACP_KIND_CREATED}" -eq 1 ]] || {
+  echo 'Kind create failure did not preserve status and arm exact cleanup' >&2
+  exit 1
+}
+set +e
+live_acp_kind_cleanup "${partial_create_status}" >/dev/null 2>&1
+partial_cleanup_status=$?
+set -e
+[[ "${partial_cleanup_status}" -eq 23 ]] || {
+  echo 'partial Kind cleanup masked the create failure' >&2
+  exit 1
+}
+grep -Fx 'create --tag partial-create-test' "${partial_create_log}" >/dev/null
+grep -Fx 'delete --tag partial-create-test' "${partial_create_log}" >/dev/null
+[[ ! -e "${partial_secret_dir}" ]] || {
+  echo 'partial Kind cleanup retained its secret directory' >&2
+  exit 1
+}
+printf '%s\n' 'ok - partial Kind create failures exact-clean by tag'
+
+cleanup_secret_dir="$(mktemp -d "${TMPDIR:-/tmp}/live-acp-cleanup-test.XXXXXX")"
+LIVE_ACP_SECRET_DIR="${cleanup_secret_dir}"
+LIVE_ACP_KEEP_CLUSTER=0
+LIVE_ACP_REGISTRY_STARTED=0
+LIVE_ACP_KIND_CREATED=1
+LIVE_ACP_KINDCTL_BIN="${fake_bin}/failing-kindctl"
+LIVE_ACP_KIND_TAG="cleanup-test"
+if live_acp_kind_cleanup 0; then
+  echo 'successful validation unexpectedly masked Kind cluster deletion failure' >&2
+  exit 1
+fi
+if [[ -d "${cleanup_secret_dir}" ]]; then
+  echo 'Kind cleanup did not remove its secret directory after deletion failure' >&2
+  exit 1
+fi
+cleanup_secret_dir="$(mktemp -d "${TMPDIR:-/tmp}/live-acp-cleanup-test.XXXXXX")"
+LIVE_ACP_SECRET_DIR="${cleanup_secret_dir}"
+set +e
+live_acp_kind_cleanup 23
+cleanup_failure_status=$?
+set -e
+if [[ "${cleanup_failure_status}" -ne 23 ]]; then
+  echo "Kind cleanup replaced validator failure 23 with ${cleanup_failure_status}" >&2
+  exit 1
+fi
+printf '%s\n' 'ok - Kind cleanup failure fails successful validation without masking validator failures'
 
 provider_sentinel='must-not-appear-in-output'
 output="$(PATH="${fake_bin}:${PATH}" COPILOT_GITHUB_TOKEN="${provider_sentinel}" "${wrapper}" --preflight-only 2>&1)"

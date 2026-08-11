@@ -11,6 +11,7 @@ import (
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -214,11 +215,17 @@ func TestSharedAdmissionAuthorizesCanonicalProductionController(t *testing.T) {
 	}
 
 	var args []string
+	var lifecycle *corev1.Lifecycle
 	for _, container := range deployment.Spec.Template.Spec.Containers {
 		if container.Name == "admission" {
 			args = container.Args
+			lifecycle = container.Lifecycle
 			break
 		}
+	}
+	if lifecycle == nil || lifecycle.PreStop == nil || lifecycle.PreStop.Exec == nil ||
+		!slices.Equal(lifecycle.PreStop.Exec.Command, []string{"/orka-admission", "--pre-stop-delay=5s"}) {
+		t.Fatalf("admission preStop lifecycle = %#v, want bounded endpoint-removal delay", lifecycle)
 	}
 	for _, prefix := range []string{"--controller-usernames=", "--task-provenance-trusted-users="} {
 		if !commaListArgumentContains(args, prefix, canonicalProductionControllerUsername) {
@@ -230,6 +237,88 @@ func TestSharedAdmissionAuthorizesCanonicalProductionController(t *testing.T) {
 		if !commaListArgumentContains(args, "--task-provenance-trusted-service-accounts=", serviceAccount) {
 			t.Errorf("admission args do not authorize canonical worker %q: %#v", serviceAccount, args)
 		}
+	}
+}
+
+//nolint:gocyclo // This contract intentionally validates the complete multi-resource HA rollout shape.
+func TestSharedAdmissionRolloutPreservesReadyEndpoints(t *testing.T) {
+	deploymentPath := filepath.Join("..", "..", "..", "config", "orka-admission", "deployment.yaml")
+	manifest, err := os.ReadFile(deploymentPath)
+	if err != nil {
+		t.Fatalf("read standalone admission Deployment: %v", err)
+	}
+	deployment := appsv1.Deployment{}
+	if err := yaml.Unmarshal(manifest, &deployment); err != nil {
+		t.Fatalf("decode standalone admission Deployment: %v", err)
+	}
+	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas < 2 {
+		t.Fatalf("admission replicas = %v, want at least two", deployment.Spec.Replicas)
+	}
+	rollingUpdate := deployment.Spec.Strategy.RollingUpdate
+	if deployment.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType || rollingUpdate == nil ||
+		rollingUpdate.MaxUnavailable == nil || rollingUpdate.MaxUnavailable.IntValue() != 0 ||
+		rollingUpdate.MaxSurge == nil || rollingUpdate.MaxSurge.IntValue() < 1 {
+		t.Fatalf(
+			"admission rollout strategy = %#v, want zero-unavailable rolling update with surge",
+			deployment.Spec.Strategy,
+		)
+	}
+	if deployment.Spec.Template.Spec.TerminationGracePeriodSeconds == nil ||
+		*deployment.Spec.Template.Spec.TerminationGracePeriodSeconds <= 5 {
+		t.Fatalf("admission termination grace = %v, want longer than endpoint-removal delay",
+			deployment.Spec.Template.Spec.TerminationGracePeriodSeconds)
+	}
+
+	var admissionContainer *corev1.Container
+	for i := range deployment.Spec.Template.Spec.Containers {
+		container := &deployment.Spec.Template.Spec.Containers[i]
+		if container.Name == "admission" {
+			admissionContainer = container
+			break
+		}
+	}
+	if admissionContainer == nil {
+		t.Fatal("standalone admission container is missing")
+	}
+	if admissionContainer.ReadinessProbe == nil || admissionContainer.ReadinessProbe.HTTPGet == nil ||
+		admissionContainer.ReadinessProbe.HTTPGet.Path != "/readyz" {
+		t.Fatalf("admission readiness probe = %#v, want /readyz", admissionContainer.ReadinessProbe)
+	}
+	if admissionContainer.Lifecycle == nil || admissionContainer.Lifecycle.PreStop == nil ||
+		admissionContainer.Lifecycle.PreStop.Exec == nil ||
+		!slices.Equal(admissionContainer.Lifecycle.PreStop.Exec.Command, []string{"/orka-admission", "--pre-stop-delay=5s"}) {
+		t.Fatalf("admission preStop lifecycle = %#v, want bounded endpoint-removal delay", admissionContainer.Lifecycle)
+	}
+
+	servicePath := filepath.Join("..", "..", "..", "config", "orka-admission", "service.yaml")
+	manifest, err = os.ReadFile(servicePath)
+	if err != nil {
+		t.Fatalf("read standalone admission Service: %v", err)
+	}
+	service := corev1.Service{}
+	if err := yaml.Unmarshal(manifest, &service); err != nil {
+		t.Fatalf("decode standalone admission Service: %v", err)
+	}
+	if service.Spec.PublishNotReadyAddresses {
+		t.Fatal("admission Service publishes unready addresses; terminating Pods could remain routable")
+	}
+	if !reflect.DeepEqual(service.Spec.Selector, deployment.Spec.Selector.MatchLabels) {
+		t.Fatalf("admission Service selector = %#v, want Deployment selector %#v",
+			service.Spec.Selector, deployment.Spec.Selector.MatchLabels)
+	}
+
+	pdbPath := filepath.Join("..", "..", "..", "config", "orka-admission", "poddisruptionbudget.yaml")
+	manifest, err = os.ReadFile(pdbPath)
+	if err != nil {
+		t.Fatalf("read standalone admission PodDisruptionBudget: %v", err)
+	}
+	pdb := policyv1.PodDisruptionBudget{}
+	if err := yaml.Unmarshal(manifest, &pdb); err != nil {
+		t.Fatalf("decode standalone admission PodDisruptionBudget: %v", err)
+	}
+	if pdb.Spec.MinAvailable == nil || pdb.Spec.MinAvailable.IntValue() < 1 || pdb.Spec.Selector == nil ||
+		!reflect.DeepEqual(pdb.Spec.Selector.MatchLabels, deployment.Spec.Selector.MatchLabels) {
+		t.Fatalf("admission disruption budget = %#v, want at least one matching Pod available", pdb.Spec)
 	}
 }
 

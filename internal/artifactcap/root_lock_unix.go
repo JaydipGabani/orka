@@ -57,18 +57,10 @@ func acquireArtifactRootLock(ctx context.Context, root string, exclusive bool) (
 		cleanupIntentAndGate()
 		return nil, fmt.Errorf("open artifact retention lock: %w", err)
 	}
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() {
+	if _, err := secureManagedArtifactFile(file, "artifact retention lock"); err != nil {
 		_ = file.Close()
 		cleanupIntentAndGate()
-		return nil, ErrUnsafePath
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		if err := file.Chmod(0o600); err != nil {
-			_ = file.Close()
-			cleanupIntentAndGate()
-			return nil, fmt.Errorf("secure artifact retention lock: %w", err)
-		}
+		return nil, err
 	}
 	operation := unix.LOCK_SH | unix.LOCK_NB
 	if exclusive {
@@ -255,8 +247,8 @@ func publishArtifactWriterIntent(ctx context.Context, root, pendingPath, nonce s
 		return "", err
 	}
 	defer lockFile.Close() //nolint:errcheck
-	if info, err := lockFile.Stat(); err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return "", ErrUnsafePath
+	if _, err := secureManagedArtifactFile(lockFile, "artifact writer sequence lock"); err != nil {
+		return "", err
 	}
 	for {
 		err = unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB)
@@ -293,9 +285,12 @@ func nextArtifactWriterTicket(root string) (uint64, error) {
 	current := uint64(0)
 	sequence, err := openFileNoFollow(sequencePath, os.O_RDONLY, 0)
 	if err == nil {
-		info, statErr := sequence.Stat()
-		if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > 32 {
+		info, statErr := secureManagedArtifactFile(sequence, "artifact writer sequence")
+		if statErr != nil || info.Size() > 32 {
 			_ = sequence.Close()
+			if statErr != nil {
+				return 0, statErr
+			}
 			return 0, ErrUnsafePath
 		}
 		data, readErr := io.ReadAll(io.LimitReader(sequence, 33))
@@ -364,9 +359,8 @@ func inspectArtifactWriterMarker(path string) (active, stale bool, err error) {
 		return false, false, err
 	}
 	defer file.Close() //nolint:errcheck
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return false, false, ErrUnsafePath
+	if _, err := secureManagedArtifactFile(file, "artifact writer intent"); err != nil {
+		return false, false, err
 	}
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
@@ -389,4 +383,37 @@ func waitArtifactLockRetry(ctx context.Context) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// secureManagedArtifactFile repairs group permission bits that a Kubernetes
+// fsGroup volume mount can add to an existing controller-owned regular file.
+// Other-accessible files remain fail-closed. The file is already opened with
+// O_NOFOLLOW, and chmod operates on that descriptor, so symlinks and
+// non-regular replacements remain fail-closed.
+func secureManagedArtifactFile(file *os.File, description string) (os.FileInfo, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s: %w", description, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, ErrUnsafePath
+	}
+	permissions := info.Mode().Perm()
+	if permissions&0o007 != 0 {
+		return nil, ErrUnsafePath
+	}
+	if permissions&0o070 == 0 {
+		return info, nil
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return nil, fmt.Errorf("secure %s: %w", description, err)
+	}
+	info, err = file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("verify %s permissions: %w", description, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return nil, ErrUnsafePath
+	}
+	return info, nil
 }

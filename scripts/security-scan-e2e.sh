@@ -23,6 +23,15 @@ sanitize_image_tag() {
   printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '-'
 }
 
+parse_github_repository_identity() {
+  local repo_url="${1%/}"
+  repo_url="${repo_url%.git}"
+  if [[ ! "${repo_url}" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
+    return 1
+  fi
+  printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 # shellcheck source=scripts/lib/kind-local-registry.sh
@@ -30,7 +39,9 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 # shellcheck source=scripts/lib/e2e-admission-tls.sh
 . "${script_dir}/lib/e2e-admission-tls.sh"
 
-kind_cluster="${KIND_CLUSTER:-orka-security-scan-e2e}"
+e2e_run_id="$(sanitize_image_tag "${ORKA_SECURITY_SCAN_RUN_ID:-${GITHUB_RUN_ID:-manual}-$(date -u +%Y%m%d%H%M%S)}")"
+default_kind_suffix="${e2e_run_id:0:32}"
+kind_cluster="${KIND_CLUSTER:-orka-security-scan-${default_kind_suffix}}"
 orka_namespace="${ORKA_NAMESPACE:-orka-system}"
 test_namespace="${ORKA_SECURITY_SCAN_E2E_NAMESPACE:-${orka_namespace}}"
 orka_controller_deployment="${ORKA_CONTROLLER_DEPLOYMENT:-orka-controller-manager}"
@@ -38,21 +49,34 @@ wait_timeout="${ORKA_SECURITY_SCAN_WAIT_TIMEOUT:-25m}"
 target_repo="${ORKA_SECURITY_SCAN_TARGET_REPO:-https://github.com/sozercan/nodejs-goof}"
 target_branch="${ORKA_SECURITY_SCAN_TARGET_BRANCH:-main}"
 target_ref="${ORKA_SECURITY_SCAN_TARGET_REF:-add14ba59e98240d9e00a235dd7d42cd61ae9912}"
+read -r target_owner target_repository < <(parse_github_repository_identity "${target_repo}") ||
+  die "ORKA_SECURITY_SCAN_TARGET_REPO must be a credential-free HTTPS github.com repository URL"
 agent_name="${ORKA_SECURITY_SCAN_AGENT:-security-scan-e2e-agent}"
 scan_name="${ORKA_SECURITY_SCAN_NAME:-security-goof}"
-bad_scan_name="${ORKA_SECURITY_BAD_SCAN_NAME:-security-goof-tool-transcript}"
+bad_scan_name="${ORKA_SECURITY_BAD_SCAN_NAME:-security-goof-malformed-result}"
+api_identity_name="${ORKA_SECURITY_SCAN_API_IDENTITY:-security-scan-e2e}"
+api_local_port="${ORKA_SECURITY_SCAN_API_LOCAL_PORT:-18086}"
 keep_cluster="${KEEP_CLUSTER:-0}"
-created_kind_cluster="0"
+kind_cleanup_armed="0"
+registry_cleanup_armed="0"
+kind_lock_held="0"
+api_forward_pid=""
 
-e2e_run_id="$(sanitize_image_tag "${ORKA_SECURITY_SCAN_RUN_ID:-${GITHUB_RUN_ID:-manual}-$(date -u +%Y%m%d%H%M%S)}")"
 manager_image="${ORKA_MANAGER_IMAGE:-orka-controller:security-scan-e2e-${e2e_run_id}}"
 publisher_image="${ORKA_WORKSPACE_PUBLISHER_IMAGE:-orka-workspace-publisher:security-scan-e2e-${e2e_run_id}}"
 general_worker_image="${ORKA_GENERAL_WORKER_IMAGE:-orka-general-worker:security-scan-e2e-${e2e_run_id}}"
+fake_runtime_image="${ORKA_SECURITY_SCAN_FAKE_RUNTIME_IMAGE:-orka-acp-security-fixture:security-scan-e2e-${e2e_run_id}}"
 
 work_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/security-scan-e2e.XXXXXX")"
 kind_config="${ORKA_SECURITY_SCAN_KIND_CONFIG:-${work_dir}/kind-config.yaml}"
 manager_kustomization="${repo_root}/config/manager/kustomization.yaml"
 manager_kustomization_backup="${work_dir}/manager-kustomization.yaml.bak"
+api_forward_log="${work_dir}/api-port-forward.log"
+api_token_file="${work_dir}/api-token"
+api_auth_header_file="${work_dir}/api-auth-header"
+kubeconfig_file="${work_dir}/kubeconfig"
+kind_lock_dir=""
+registry_owner="security-scan-e2e-${e2e_run_id}"
 
 redact() {
   sed -E \
@@ -79,61 +103,52 @@ run_redacted() {
 
 restore_manager_kustomization() {
   if [[ -f "${manager_kustomization_backup}" ]]; then
-    cp "${manager_kustomization_backup}" "${manager_kustomization}" || true
+    cp "${manager_kustomization_backup}" "${manager_kustomization}"
   fi
-}
-
-dump_diagnostics() {
-  log "Collecting diagnostics"
-  {
-    echo "=== Current Kubernetes Context ==="
-    kubectl config current-context 2>/dev/null || true
-    echo
-    echo "=== Orka Namespace Resources ==="
-    kubectl -n "${orka_namespace}" get pods,svc,deploy,jobs -o wide 2>/dev/null || true
-    echo
-    echo "=== Test Namespace Security Resources ==="
-    kubectl -n "${test_namespace}" get agents,repositoryscans,tasks,jobs,pods -o wide 2>/dev/null || true
-    echo
-    echo "=== RepositoryScan YAML ==="
-    kubectl -n "${test_namespace}" get repositoryscan "${scan_name}" "${bad_scan_name}" -o yaml 2>/dev/null || true
-    echo
-    echo "=== Security Tasks YAML ==="
-    kubectl -n "${test_namespace}" get tasks \
-      -l "orka.ai/security-target" \
-      -o yaml 2>/dev/null || true
-    echo
-    echo "=== Controller Logs ==="
-    kubectl -n "${orka_namespace}" logs deployment/"${orka_controller_deployment}" -c manager --tail=500 2>/dev/null || true
-    echo
-    echo "=== Worker Logs ==="
-    for job in $(kubectl -n "${test_namespace}" get jobs -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true); do
-      echo "--- job/${job} ---"
-      kubectl -n "${test_namespace}" logs "job/${job}" --all-containers --tail=300 --prefix 2>/dev/null || true
-    done
-  } 2>&1 | redact >&2
 }
 
 on_exit() {
   local status="$1"
+  local cleanup_status=0
   set +e
-  if [[ "${status}" -ne 0 ]]; then
-    if [[ "$(kubectl config current-context 2>/dev/null || true)" == "kind-${kind_cluster}" ]]; then
-      dump_diagnostics
-    else
-      warn "skipping Kubernetes diagnostics because the current context is not kind-${kind_cluster}"
+  stop_api_forward
+  if [[ "$(kubectl config current-context 2>/dev/null || true)" == "kind-${kind_cluster}" ]]; then
+    kubectl -n "${test_namespace}" delete serviceaccount "${api_identity_name}" \
+      --ignore-not-found=true --wait=false >/dev/null 2>&1 || cleanup_status=1
+    kubectl -n "${test_namespace}" delete role "${api_identity_name}" \
+      --ignore-not-found=true --wait=false >/dev/null 2>&1 || cleanup_status=1
+    kubectl -n "${test_namespace}" delete rolebinding "${api_identity_name}" \
+      --ignore-not-found=true --wait=false >/dev/null 2>&1 || cleanup_status=1
+  fi
+  restore_manager_kustomization || cleanup_status=1
+  if [[ "${registry_cleanup_armed}" == "1" ]]; then
+    orka_kind_registry_stop "${kind_cluster}" "${registry_owner}" || cleanup_status=1
+  fi
+  if [[ "${kind_cleanup_armed}" == "1" ]]; then
+    kind delete cluster --name "${kind_cluster}" >/dev/null 2>&1 || cleanup_status=1
+    if kind_cluster_exists; then
+      cleanup_status=1
     fi
   fi
-  restore_manager_kustomization
-  orka_kind_registry_stop
-  if [[ "${created_kind_cluster}" == "1" && "${keep_cluster}" != "1" ]]; then
-    kind delete cluster --name "${kind_cluster}" >/dev/null 2>&1 || true
-  elif [[ "${keep_cluster}" == "1" ]]; then
-    log "KEEP_CLUSTER=1, leaving kind cluster ${kind_cluster}"
+  rm -rf "${work_dir}" >/dev/null 2>&1 || cleanup_status=1
+  if [[ "${kind_lock_held}" == "1" ]]; then
+    rmdir "${kind_lock_dir}" >/dev/null 2>&1 || cleanup_status=1
+    [[ ! -e "${kind_lock_dir}" ]] || cleanup_status=1
   fi
-  rm -rf "${work_dir}" >/dev/null 2>&1 || true
   if [[ "${status}" -ne 0 ]]; then
     log "Security scan e2e failed"
+  fi
+  status="$(security_scan_exit_status "${status}" "${cleanup_status}")"
+  return "${status}"
+}
+
+security_scan_exit_status() {
+  local original_status="$1"
+  local cleanup_status="$2"
+  if [[ "${original_status}" -ne 0 ]]; then
+    printf '%s\n' "${original_status}"
+  else
+    printf '%s\n' "${cleanup_status}"
   fi
 }
 
@@ -182,8 +197,7 @@ YAML
 
 setup_kind_cluster() {
   if kind_cluster_exists; then
-    log "Kind cluster ${kind_cluster} already exists; reusing it"
-    return
+    die "refusing to reuse existing Kind cluster ${kind_cluster}"
   fi
 
   if [[ -z "${ORKA_SECURITY_SCAN_KIND_CONFIG:-}" ]]; then
@@ -192,8 +206,160 @@ setup_kind_cluster() {
   [[ -f "${kind_config}" ]] || die "Kind config not found: ${kind_config}"
 
   log "Creating Kind cluster ${kind_cluster}"
-  run kind create cluster --name "${kind_cluster}" --config "${kind_config}"
-  created_kind_cluster="1"
+  if ! run kind create cluster --name "${kind_cluster}" --config "${kind_config}" --kubeconfig "${kubeconfig_file}"; then
+    return 1
+  fi
+  kind_cleanup_armed="1"
+}
+
+initialize_isolated_kubeconfig() {
+  : >"${kubeconfig_file}"
+  chmod 600 "${kubeconfig_file}"
+  export KUBECONFIG="${kubeconfig_file}"
+}
+
+acquire_kind_cluster_lock() {
+  kind_lock_dir="${TMPDIR:-/tmp}/orka-security-scan-kind-${kind_cluster}.lock"
+  mkdir "${kind_lock_dir}" 2>/dev/null || die "another SecurityScan gate owns Kind cluster ${kind_cluster}"
+  kind_lock_held="1"
+}
+
+stop_api_forward() {
+  if [[ -z "${api_forward_pid}" ]]; then
+    return 0
+  fi
+  if kill -0 "${api_forward_pid}" >/dev/null 2>&1; then
+    kill "${api_forward_pid}" >/dev/null 2>&1 || true
+    wait "${api_forward_pid}" >/dev/null 2>&1 || true
+  fi
+  api_forward_pid=""
+}
+
+api_health_ready() {
+  curl --fail --silent --show-error --max-time 2 \
+    "http://127.0.0.1:${api_local_port}/healthz" >/dev/null
+}
+
+start_api_forward() {
+  stop_api_forward
+  : >"${api_forward_log}"
+  kubectl -n "${orka_namespace}" port-forward service/orka-api \
+    "${api_local_port}:8080" >"${api_forward_log}" 2>&1 &
+  api_forward_pid="$!"
+
+  local deadline=$((SECONDS + 60))
+  while (( SECONDS < deadline )); do
+    if api_health_ready; then
+      return 0
+    fi
+    if ! kill -0 "${api_forward_pid}" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  cat "${api_forward_log}" | redact >&2
+  die "controller API port-forward did not become ready"
+}
+
+create_api_identity() {
+  log "Creating namespace-scoped API identity ${api_identity_name}"
+  jq -n \
+    --arg ns "${test_namespace}" \
+    --arg name "${api_identity_name}" \
+    '{apiVersion:"v1",kind:"ServiceAccount",metadata:{name:$name,namespace:$ns}}' |
+    kubectl apply -f - >/dev/null
+  jq -n \
+    --arg ns "${test_namespace}" \
+    --arg name "${api_identity_name}" '
+    {
+      apiVersion:"rbac.authorization.k8s.io/v1",
+      kind:"Role",
+      metadata:{name:$name,namespace:$ns},
+      rules:[{
+        apiGroups:["core.orka.ai"],
+        resources:["agents","repositoryscans","tasks"],
+        verbs:["get","list","watch"]
+      }]
+    }' | kubectl apply -f - >/dev/null
+  jq -n \
+    --arg ns "${test_namespace}" \
+    --arg name "${api_identity_name}" '
+    {
+      apiVersion:"rbac.authorization.k8s.io/v1",
+      kind:"RoleBinding",
+      metadata:{name:$name,namespace:$ns},
+      subjects:[{kind:"ServiceAccount",name:$name,namespace:$ns}],
+      roleRef:{apiGroup:"rbac.authorization.k8s.io",kind:"Role",name:$name}
+    }' | kubectl apply -f - >/dev/null
+  kubectl -n "${test_namespace}" create token "${api_identity_name}" --duration=2h >"${api_token_file}"
+  chmod 600 "${api_token_file}"
+  {
+    printf 'Authorization: Bearer '
+    tr -d '\r\n' <"${api_token_file}"
+    printf '\n'
+  } >"${api_auth_header_file}"
+  chmod 600 "${api_auth_header_file}"
+}
+
+api_get() {
+  local path="$1"
+  local output_file="$2"
+  local error_file="${output_file}.curl-error"
+  local status rc
+
+  set +e
+  status="$(curl --silent --show-error --max-time 60 \
+    --request GET \
+    --header @"${api_auth_header_file}" \
+    --output "${output_file}" \
+    --write-out '%{http_code}' \
+    "http://127.0.0.1:${api_local_port}${path}" 2>"${error_file}")"
+  rc=$?
+  set -e
+  if [[ "${rc}" -ne 0 || ! "${status}" =~ ^2[0-9][0-9]$ ]]; then
+    cat "${error_file}" | redact >&2
+    cat "${output_file}" | redact >&2
+    die "API GET ${path} failed with status ${status:-unavailable}"
+  fi
+}
+
+build_fake_runtime() {
+  local dockerfile="${work_dir}/security-scan-fake-runtime.Dockerfile"
+  cat >"${dockerfile}" <<'DOCKERFILE'
+# syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.2-bookworm@sha256:47ce5636e9936b2c5cbf708925578ef386b4f8872aec74a67bd13a627d242b19 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked go mod download
+COPY . .
+RUN set -eu; \
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -buildvcs=false -trimpath -ldflags='-s -w' -o /out/orka-acp-runtime ./cmd/orka-acp-runtime; \
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -buildvcs=false -trimpath -ldflags='-s -w' -o /out/orka-acp-exec-helper ./cmd/orka-acp-exec-helper; \
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -buildvcs=false -trimpath -ldflags='-s -w' -o /out/node ./scripts/fixtures/security-scan-fake-acp
+
+FROM --platform=$TARGETPLATFORM docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
+LABEL org.opencontainers.image.title="Orka SecurityScan deterministic ACP fixture" \
+      io.orka.test.fixture="security-scan-harness-v2"
+ENV HOME=/root \
+    ORKA_ACP_PROVIDER=codex \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN set -eu; \
+    mkdir -p /sessions /opt/codex-acp/dist; \
+    chmod 0711 /sessions
+COPY --from=builder /out/orka-acp-runtime /usr/local/bin/orka-acp-runtime
+COPY --from=builder /out/orka-acp-exec-helper /usr/local/bin/orka-acp-exec-helper
+COPY --from=builder /out/node /usr/bin/node
+WORKDIR /
+USER 0:0
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/orka-acp-runtime"]
+DOCKERFILE
+
+  log "Building deterministic ACP v2 runtime ${fake_runtime_image}"
+  run docker build -t "${fake_runtime_image}" -f "${dockerfile}" .
 }
 
 patch_controller_images() {
@@ -254,7 +420,7 @@ spec:
     contractVersion: orka.harness.v2
     type: codex
     defaultMaxTurns: 1
-    defaultAllowBash: false
+    defaultAllowBash: true
   model:
     name: gpt-5.4
 YAML
@@ -272,8 +438,8 @@ metadata:
 spec:
   provider: github
   repoURL: ${target_repo}
-  owner: sozercan
-  repository: nodejs-goof
+  owner: ${target_owner}
+  repository: ${target_repository}
   branch: ${target_branch}
   ref: ${target_ref}
   validationMode: "off"
@@ -302,6 +468,213 @@ wait_repo_phase() {
   die "RepositoryScan/${name} did not reach phase ${expected}; current phase ${phase:-<empty>}"
 }
 
+collect_scan_evidence() {
+  local name="$1"
+  local prefix="$2"
+  run kubectl -n "${test_namespace}" get repositoryscan "${name}" -o json >"${prefix}-scan.json"
+  run kubectl -n "${test_namespace}" get tasks -l "orka.ai/security-target=${name}" -o json >"${prefix}-tasks.json"
+  api_get "/api/v1/security/repositories/${name}/scans?namespace=${test_namespace}&limit=100" "${prefix}-runs.json"
+  api_get "/api/v1/security/repositories/${name}/slices?namespace=${test_namespace}&limit=1000" "${prefix}-slices.json"
+  api_get "/api/v1/security/repositories/${name}/findings?namespace=${test_namespace}&limit=1000" "${prefix}-findings.json"
+  api_get "/api/v1/security/repositories/${name}/dropped-findings?namespace=${test_namespace}&limit=1000" "${prefix}-dropped.json"
+}
+
+assert_positive_scan_snapshot() {
+  local prefix="$1"
+  if ! jq -e \
+    --arg agent "${agent_name}" \
+    --arg branch "${target_branch}" \
+    --arg ref "${target_ref}" \
+    --arg repo "${target_repo}" \
+    --arg scanName "${scan_name}" \
+    --slurpfile tasks "${prefix}-tasks.json" \
+    --slurpfile runs "${prefix}-runs.json" \
+    --slurpfile slices "${prefix}-slices.json" \
+    --slurpfile findings "${prefix}-findings.json" \
+    --slurpfile dropped "${prefix}-dropped.json" '
+    .status.lastScanID as $scanID |
+    ($tasks[0].items | map(select(.metadata.labels["orka.ai/security-scan-id"] == $scanID))) as $runTasks |
+    ($runTasks | map(select(.metadata.labels["orka.ai/security-stage"] == "threat-model"))) as $threatTasks |
+    ($runTasks | map(select(.metadata.labels["orka.ai/security-stage"] == "mapper"))) as $mapperTasks |
+    ($runTasks | map(select(.metadata.labels["orka.ai/security-stage"] == "review"))) as $reviewTasks |
+    ($runs[0].items | map(select(.id == $scanID))) as $runItems |
+    ($slices[0].items | map(select(.lastScanRunID == $scanID))) as $sliceItems |
+    ($findings[0].items | map(select(.scanRunID == $scanID))) as $findingItems |
+    ($dropped[0].items | map(select(.scanRunID == $scanID))) as $dropItems |
+    .status.phase == "Ready" and
+    (.status.lastScanTaskName | length > 0) and
+    (.status.lastScanAt | length > 0) and
+    (.status.lastSuccessfulScanAt | length > 0) and
+    .status.lastProcessedCommit == $ref and
+    .status.lastObservedHeadSHA == $ref and
+    (.status.threatModelVersion // 0) > 0 and
+    any(.status.conditions[]?; .type == "Ready" and .status == "True" and .reason == "ScanSucceeded") and
+    ($runItems | length) == 1 and
+    ($runItems[0] as $run |
+      $run.repositoryScan == $scanName and
+      $run.taskName == .status.lastScanTaskName and
+      $run.mode == "initial" and
+      $run.phase == "succeeded" and
+      ($run.completedAt | length > 0) and
+      ($run.policyDigest | test("^sha256:[0-9a-f]{64}$")) and
+      ($run.idempotencyKey | test("^scanidem:[0-9a-f]{64}$")) and
+      $run.sliceCount > 0 and
+      $run.reviewedSliceCount == $run.sliceCount and
+      $run.skippedSliceCount == 0 and
+      $run.acceptedFindings == ($findingItems | length) and
+      $run.droppedFindings == ($dropItems | length) and
+      $run.acceptedFindings > 0 and
+      $run.droppedFindings > 0 and
+      ($threatTasks | length) == 1 and
+      ($mapperTasks | length) == 1 and
+      ($reviewTasks | length) == $run.sliceCount
+    ) and
+    all($runTasks[];
+      .metadata.labels["orka.ai/security-target"] == $scanName and
+      .metadata.labels["orka.ai/security-scan-mode"] == "initial" and
+      any(.metadata.ownerReferences[]?; .kind == "RepositoryScan" and .name == $scanName and .controller == true) and
+      .status.phase == "Succeeded"
+    ) and
+    all(($threatTasks + $reviewTasks)[];
+      .spec.type == "agent" and
+      .spec.agentRef.name == $agent and
+      ((.spec.env // []) | length) == 0 and
+      .spec.workspace.intent == "read" and
+      .spec.workspace.gitRepo == $repo and
+      .spec.workspace.branch == $branch and
+      .spec.workspace.ref == $ref and
+      .status.resultRef.available == true and
+      .status.agentExecutionBinding.contractVersion == "orka.harness.v2" and
+      .status.agentExecutionBinding.backend == "runtime-pool" and
+      .status.execution.state == "Succeeded" and
+      .status.execution.outcome == "Succeeded" and
+      .status.delivery.state == "ReadValidated" and
+      .status.delivery.outcome == "ReadValidated"
+    ) and
+    ($mapperTasks[0].spec.type == "container") and
+    ($mapperTasks[0].spec.command == ["--security-mapper"]) and
+    (($mapperTasks[0].spec.env // []) | map(.name) | index("ORKA_SECURITY_REPOSITORY_SCAN") != null) and
+    ($sliceItems | length) == $runItems[0].sliceCount and
+    all($sliceItems[]; .status == "reviewed" and (.reviewContextHash | test("^sha256:[0-9a-f]{64}$"))) and
+    any($findingItems[]; .category == "authorization" and .severity == "high" and (.evidence | length) > 0) and
+    all($findingItems[]; .repositoryScan == $scanName and .scanRunID == $scanID and (.id | length) > 0) and
+    any($dropItems[]; .layer == "validation" and (.reason | contains("review context"))) and
+    all($dropItems[];
+      .repositoryScan == $scanName and .scanRunID == $scanID and
+      (.id | test("^drop_")) and (.taskName | length) > 0 and
+      (.sliceID | length) > 0 and (.reason | length) > 0
+    ) and
+    (.status.findingCounts.total // 0) == ($findingItems | length) and
+    (.status.findingCounts.high // 0) == ($findingItems | map(select(.severity == "high")) | length) and
+    (.status.findingCounts.critical // 0) == ($findingItems | map(select(.severity == "critical")) | length) and
+    (.status.findingCounts.medium // 0) == ($findingItems | map(select(.severity == "medium")) | length) and
+    (.status.findingCounts.low // 0) == ($findingItems | map(select(.severity == "low")) | length)
+  ' "${prefix}-scan.json" >/dev/null; then
+    die "positive SecurityScan snapshot did not satisfy the harness-v2 ingestion contract"
+  fi
+}
+
+positive_scan_idempotency_snapshot() {
+  local prefix="$1"
+  jq -S \
+    --slurpfile tasks "${prefix}-tasks.json" \
+    --slurpfile runs "${prefix}-runs.json" \
+    --slurpfile slices "${prefix}-slices.json" \
+    --slurpfile findings "${prefix}-findings.json" \
+    --slurpfile dropped "${prefix}-dropped.json" '
+    .status.lastScanID as $scanID |
+    {
+      scanID:$scanID,
+      lastScanTaskName:.status.lastScanTaskName,
+      threatModelVersion:.status.threatModelVersion,
+      tasks:($tasks[0].items | map(select(.metadata.labels["orka.ai/security-scan-id"] == $scanID) | {
+        name:.metadata.name, stage:.metadata.labels["orka.ai/security-stage"], slice:.metadata.labels["orka.ai/security-slice-id"]
+      }) | sort_by(.name)),
+      run:($runs[0].items | map(select(.id == $scanID) | {
+        id,phase,taskName,sliceCount,reviewedSliceCount,skippedSliceCount,acceptedFindings,droppedFindings,policyDigest,idempotencyKey
+      })),
+      slices:($slices[0].items | map(select(.lastScanRunID == $scanID) | {id,status,lastScanRunID,reviewContextHash}) | sort_by(.id)),
+      findings:($findings[0].items | map(select(.scanRunID == $scanID) | .id) | sort),
+      dropped:($dropped[0].items | map(select(.scanRunID == $scanID) | .id) | sort)
+    }
+  ' "${prefix}-scan.json"
+}
+
+assert_malformed_scan_snapshot() {
+  local prefix="$1"
+  local expected="threat model terminal result is missing or invalid: security result scanId does not match task run"
+  if ! jq -e \
+    --arg agent "${agent_name}" \
+    --arg expected "${expected}" \
+    --arg scanName "${bad_scan_name}" \
+    --slurpfile tasks "${prefix}-tasks.json" \
+    --slurpfile runs "${prefix}-runs.json" \
+    --slurpfile slices "${prefix}-slices.json" \
+    --slurpfile findings "${prefix}-findings.json" \
+    --slurpfile dropped "${prefix}-dropped.json" '
+    .status.lastScanID as $scanID |
+    ($tasks[0].items | map(select(.metadata.labels["orka.ai/security-scan-id"] == $scanID))) as $runTasks |
+    ($runs[0].items | map(select(.id == $scanID))) as $runItems |
+    .status.phase == "Error" and
+    (.status.lastScanTaskName | length > 0) and
+    (.status.lastScanAt | length > 0) and
+    (.status | has("lastSuccessfulScanAt") | not) and
+    (.status.threatModelVersion // 0) == 0 and
+    (.status.findingCounts.total // 0) == 0 and
+    any(.status.conditions[]?;
+      .type == "Ready" and .status == "False" and .reason == "ScanFailed" and (.message | startswith($expected))
+    ) and
+    ($runTasks | length) == 1 and
+    ($runTasks[0] as $task |
+      $task.metadata.labels["orka.ai/security-stage"] == "threat-model" and
+      $task.spec.type == "agent" and $task.spec.agentRef.name == $agent and
+      (($task.spec.env // []) | length) == 0 and
+      $task.status.phase == "Succeeded" and $task.status.resultRef.available == true and
+      $task.status.agentExecutionBinding.contractVersion == "orka.harness.v2" and
+      $task.status.agentExecutionBinding.backend == "runtime-pool" and
+      $task.status.execution.outcome == "Succeeded" and
+      $task.status.delivery.outcome == "ReadValidated"
+    ) and
+    ($runItems | length) == 1 and
+    $runItems[0].phase == "failed" and
+    ($runItems[0].errorMessage | startswith($expected)) and
+    $runItems[0].sliceCount == 0 and $runItems[0].acceptedFindings == 0 and $runItems[0].droppedFindings == 0 and
+    ($slices[0].items | length) == 0 and
+    ($findings[0].items | length) == 0 and
+    ($dropped[0].items | length) == 0
+  ' "${prefix}-scan.json" >/dev/null; then
+    die "malformed SecurityScan result did not fail closed after successful ACP execution"
+  fi
+}
+
+assert_positive_scan_gate() {
+  local before="${work_dir}/${scan_name}-before"
+  local after="${work_dir}/${scan_name}-after"
+  collect_scan_evidence "${scan_name}" "${before}"
+  api_get "/api/v1/security/repositories/${scan_name}/threat-model?namespace=${test_namespace}" "${before}-threat-model.json"
+  assert_positive_scan_snapshot "${before}"
+  jq -e --slurpfile scan "${before}-scan.json" '
+    .source == "generated" and .generatedByScan == $scan[0].status.lastScanID and
+    .version == $scan[0].status.threatModelVersion and (.content | startswith("#"))
+  ' "${before}-threat-model.json" >/dev/null || die "generated threat model was not durably ingested"
+  positive_scan_idempotency_snapshot "${before}" >"${work_dir}/positive-before.json"
+
+  run kubectl -n "${test_namespace}" annotate repositoryscan "${scan_name}" \
+    "orka.ai/security-scan-e2e-reconcile=${e2e_run_id}" --overwrite
+  wait_repo_phase "${scan_name}" "Ready"
+  collect_scan_evidence "${scan_name}" "${after}"
+  assert_positive_scan_snapshot "${after}"
+  positive_scan_idempotency_snapshot "${after}" >"${work_dir}/positive-after.json"
+  cmp -s "${work_dir}/positive-before.json" "${work_dir}/positive-after.json" ||
+    die "RepositoryScan reconciliation changed durable run, task, finding, slice, or drop identities"
+}
+
+assert_malformed_result_gate() {
+  local prefix="${work_dir}/${bad_scan_name}"
+  collect_scan_evidence "${bad_scan_name}" "${prefix}"
+  assert_malformed_scan_snapshot "${prefix}"
+}
+
 main() {
   require_cmd make
   require_cmd go
@@ -310,23 +683,28 @@ main() {
   require_cmd kubectl
   require_cmd jq
   require_cmd openssl
+  require_cmd curl
+  require_cmd cmp
 
   [[ "${orka_namespace}" == "orka-system" ]] || die "ORKA_NAMESPACE must be orka-system for the canonical make deploy path"
   [[ "${test_namespace}" == "${orka_namespace}" ]] || die "ORKA_SECURITY_SCAN_E2E_NAMESPACE must match ORKA_NAMESPACE for an isolated controller"
+  [[ "${keep_cluster}" == "0" ]] || die "KEEP_CLUSTER is forbidden for the isolated SecurityScan gate"
+  [[ "${kind_cluster}" =~ ^[a-z0-9][a-z0-9.-]{0,62}$ ]] || die "KIND_CLUSTER must be a valid lowercase Kind cluster name of at most 63 characters"
 
   cd "${repo_root}"
+  initialize_isolated_kubeconfig
   [[ -f "${manager_kustomization}" ]] || die "missing ${manager_kustomization}"
   cp "${manager_kustomization}" "${manager_kustomization_backup}"
 
-  trap 'status=$?; on_exit "${status}"; exit "${status}"' EXIT
-
+  acquire_kind_cluster_lock
   setup_kind_cluster
   run kubectl config use-context "kind-${kind_cluster}"
   log "Installing current Orka CRDs into the test cluster"
   run make install
   log "Creating the Vekil namespace required by the production ingress policy"
   kubectl create namespace vekil-system --dry-run=client -o yaml | kubectl apply -f -
-  orka_kind_registry_start "${kind_cluster}"
+  registry_cleanup_armed="1"
+  orka_kind_registry_start "${kind_cluster}" "${registry_owner}"
 
   log "Building manager image ${manager_image}"
   run make docker-build IMG="${manager_image}"
@@ -335,47 +713,52 @@ main() {
 
   log "Building general worker image ${general_worker_image}"
   run docker build -t "${general_worker_image}" -f workers/general/Dockerfile .
+  build_fake_runtime
 
   log "Loading images into Kind cluster ${kind_cluster}"
   run kind load docker-image "${manager_image}" --name "${kind_cluster}"
   run kind load docker-image "${general_worker_image}" --name "${kind_cluster}"
 
-  local manager_ref publisher_ref
+  local manager_ref publisher_ref fake_runtime_ref
   manager_ref="$(orka_kind_registry_push "${manager_image}" "orka/controller")"
   publisher_ref="$(orka_kind_registry_push "${publisher_image}" "orka/workspace-publisher")"
+  fake_runtime_ref="$(orka_kind_registry_push "${fake_runtime_image}" "orka/acp-security-fixture")"
 
   log "Bootstrapping test-only admission TLS"
   orka_e2e_bootstrap_admission_tls
 
-  log "Deploying Orka manager with inert digest-pinned ACP images for the deferred RepositoryScan agent path"
+  log "Deploying Orka manager with the deterministic digest-pinned ACP v2 fixture"
   local placeholder_digest
   placeholder_digest="sha256:$(printf '0%.0s' {1..64})"
   run make deploy \
     IMG="${manager_ref}" \
     WORKSPACE_PUBLISHER_IMG="${publisher_ref}" \
-    ACP_CODEX_RUNTIME_IMG="example.invalid/orka/acp-codex@${placeholder_digest}" \
+    ACP_CODEX_RUNTIME_IMG="${fake_runtime_ref}" \
     ACP_CLAUDE_RUNTIME_IMG="example.invalid/orka/acp-claude@${placeholder_digest}" \
     ACP_COPILOT_RUNTIME_IMG="example.invalid/orka/acp-copilot@${placeholder_digest}" \
     ACP_OPENCODE_RUNTIME_IMG="example.invalid/orka/acp-opencode@${placeholder_digest}"
   run kubectl wait --for=condition=Established crd/repositoryscans.core.orka.ai --timeout=60s
   run kubectl -n "${orka_namespace}" rollout status deployment/"${orka_controller_deployment}" --timeout=5m
   patch_controller_images
+  create_api_identity
+  start_api_forward
 
   reset_e2e_resources
   apply_agent
 
   apply_repository_scan "${scan_name}"
-  wait_repo_phase "${scan_name}" "Error"
-  log "Verifying the ACP v2 hard-cutover gate for RepositoryScan agent Tasks"
-  local deferred_messages
-  deferred_messages="$(kubectl -n "${test_namespace}" get tasks \
-    -l "orka.ai/security-target=${scan_name}" -o json | \
-    jq -r '[.items[].status.message // ""] | join("\n")')"
-  if ! grep -Fq "type: agent ACP runtime tasks do not support arbitrary task env" <<<"${deferred_messages}"; then
-    run_redacted kubectl -n "${test_namespace}" get tasks -l "orka.ai/security-target=${scan_name}" -o yaml || true
-    die "RepositoryScan did not fail at the expected ACP task-env compatibility gate"
-  fi
-  log "RepositoryScan workspace-backed agent execution is explicitly deferred under ACP v2; fail-closed gate validated"
+  wait_repo_phase "${scan_name}" "Ready"
+  log "Verifying positive harness-v2 execution and durable ResultStore ingestion"
+  assert_positive_scan_gate
+
+  apply_repository_scan "${bad_scan_name}"
+  wait_repo_phase "${bad_scan_name}" "Error"
+  log "Verifying malformed terminal results fail closed after successful ACP execution"
+  assert_malformed_result_gate
+  log "SecurityScan harness-v2 execution, ingestion, idempotency, and malformed-result gates passed"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  trap 'status=$?; set +e; on_exit "${status}"; exit $?' EXIT
+  main "$@"
+fi

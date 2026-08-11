@@ -3038,6 +3038,26 @@ func (in *RepositoryMonitorSpec) DeepCopyInto(out *RepositoryMonitorSpec) {
 		*out = new(corev1.LocalObjectReference)
 		**out = **in
 	}
+	if in.ReadCredentialRef != nil {
+		in, out := &in.ReadCredentialRef, &out.ReadCredentialRef
+		*out = new(corev1.LocalObjectReference)
+		**out = **in
+	}
+	if in.PublicationReadCredentialRef != nil {
+		in, out := &in.PublicationReadCredentialRef, &out.PublicationReadCredentialRef
+		*out = new(corev1.LocalObjectReference)
+		**out = **in
+	}
+	if in.PublicationCredentialRef != nil {
+		in, out := &in.PublicationCredentialRef, &out.PublicationCredentialRef
+		*out = new(corev1.LocalObjectReference)
+		**out = **in
+	}
+	if in.ForgeCredentialRef != nil {
+		in, out := &in.ForgeCredentialRef, &out.ForgeCredentialRef
+		*out = new(corev1.LocalObjectReference)
+		**out = **in
+	}
 	if in.TimeZone != nil {
 		in, out := &in.TimeZone, &out.TimeZone
 		*out = new(string)
@@ -3217,6 +3237,26 @@ func (in *RepositoryScanSpec) DeepCopyInto(out *RepositoryScanSpec) {
 	*out = *in
 	if in.GitSecretRef != nil {
 		in, out := &in.GitSecretRef, &out.GitSecretRef
+		*out = new(corev1.LocalObjectReference)
+		**out = **in
+	}
+	if in.ReadCredentialRef != nil {
+		in, out := &in.ReadCredentialRef, &out.ReadCredentialRef
+		*out = new(corev1.LocalObjectReference)
+		**out = **in
+	}
+	if in.PublicationReadCredentialRef != nil {
+		in, out := &in.PublicationReadCredentialRef, &out.PublicationReadCredentialRef
+		*out = new(corev1.LocalObjectReference)
+		**out = **in
+	}
+	if in.PublicationCredentialRef != nil {
+		in, out := &in.PublicationCredentialRef, &out.PublicationCredentialRef
+		*out = new(corev1.LocalObjectReference)
+		**out = **in
+	}
+	if in.ForgeCredentialRef != nil {
+		in, out := &in.ForgeCredentialRef, &out.ForgeCredentialRef
 		*out = new(corev1.LocalObjectReference)
 		**out = **in
 	}

@@ -23,6 +23,7 @@ const (
 	defaultAllowedHosts          = "github.com"
 	defaultForgeAPIBaseURL       = "https://api.github.com"
 	defaultTokenFile             = "/var/run/secrets/orka/scm-egress/token"
+	defaultKubernetesTokenFile   = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	defaultMaxRequestHeaderBytes = int64(32 << 10)
 	defaultMaxResponseHeader     = int64(64 << 10)
 	defaultMaxRequestBytes       = int64(4 << 20)

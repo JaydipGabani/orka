@@ -24,15 +24,15 @@ func childCredentialIDs() (int, int, bool) {
 	if os.Geteuid() != 0 {
 		return 0, 0, false
 	}
-	uid, err := strconv.Atoi(strings.TrimSpace(os.Getenv(EnvChildUID)))
-	if err != nil || uid <= 0 {
+	uid, err := strconv.ParseUint(strings.TrimSpace(os.Getenv(EnvChildUID)), 10, 32)
+	if err != nil || uid == 0 {
 		return 0, 0, false
 	}
-	gid, err := strconv.Atoi(strings.TrimSpace(os.Getenv(EnvChildGID)))
-	if err != nil || gid <= 0 {
+	gid, err := strconv.ParseUint(strings.TrimSpace(os.Getenv(EnvChildGID)), 10, 32)
+	if err != nil || gid == 0 {
 		return 0, 0, false
 	}
-	return uid, gid, true
+	return int(uid), int(gid), true
 }
 
 func chownTreeForChild(path string, excludePaths ...string) error {

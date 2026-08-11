@@ -2402,6 +2402,12 @@ spec:
         - /orka-admission
         image: docker.io/sozercan/orka@sha256:0000000000000000000000000000000000000000000000000000000000000000
         imagePullPolicy: IfNotPresent
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /orka-admission
+              - --pre-stop-delay=5s
         livenessProbe:
           failureThreshold: 3
           httpGet:
@@ -2833,6 +2839,7 @@ spec:
           name: auth
           readOnly: true
           subPath: token
+      enableServiceLinks: false
       securityContext:
         fsGroup: 65532
         runAsGroup: 65532

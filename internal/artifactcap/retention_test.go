@@ -374,6 +374,277 @@ func TestArtifactWriterIntentQueueIsFIFO(t *testing.T) {
 	}
 }
 
+func TestArtifactManagedFilesRepairFSGroupPermissions(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+
+	_, releaseIntent, err := acquireArtifactWriterIntent(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := releaseIntent(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(root, artifactWriterSequenceName),
+		filepath.Join(root, artifactWriterSequenceLockName),
+	} {
+		if err := os.Chmod(path, 0o660); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	intentPath, releaseIntent, err := acquireArtifactWriterIntent(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if releaseIntent != nil {
+			_ = releaseIntent()
+		}
+	})
+	for _, path := range []string{
+		filepath.Join(root, artifactWriterSequenceName),
+		filepath.Join(root, artifactWriterSequenceLockName),
+	} {
+		assertArtifactManagedFileMode(t, path)
+	}
+	if err := os.Chmod(intentPath, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	queue, err := artifactWriterQueue(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queue) != 1 || queue[0].path != intentPath {
+		t.Fatalf("writer queue = %#v, want active intent %q", queue, intentPath)
+	}
+	assertArtifactManagedFileMode(t, intentPath)
+	if err := releaseIntent(); err != nil {
+		t.Fatal(err)
+	}
+	releaseIntent = nil
+
+	lockPath := filepath.Join(root, artifactRootLockName)
+	if err := os.WriteFile(lockPath, nil, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	releaseLock, err := acquireArtifactRootLock(context.Background(), root, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := releaseLock(); err != nil {
+		t.Fatal(err)
+	}
+	assertArtifactManagedFileMode(t, lockPath)
+}
+
+func TestCollectorRepairsFSGroupManagedFilesAcrossLifecycle(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	now := time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)
+	collector, err := NewCollector(CollectorConfig{Root: root, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := Identity{Namespace: "orka-system", TaskID: "task-fsgroup-restart"}
+	reserve := func(operationID string) {
+		t.Helper()
+		request := operationRequestForIdentity(OperationUpload, identity, []byte(operationID), operationID)
+		if err := collector.Reserve(context.Background(), request, now.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	managedPaths := []string{
+		filepath.Join(root, artifactRootLockName),
+		filepath.Join(root, artifactWriterSequenceName),
+		filepath.Join(root, artifactWriterSequenceLockName),
+	}
+	chmodManaged := func() {
+		t.Helper()
+		for _, path := range managedPaths {
+			if err := os.Chmod(path, 0o660); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	assertRepaired := func() {
+		t.Helper()
+		for _, path := range managedPaths {
+			assertArtifactManagedFileMode(t, path)
+		}
+	}
+
+	reserve("reserve-before-restart")
+	chmodManaged()
+	reserve("reserve-after-restart")
+	assertRepaired()
+	chmodManaged()
+	if err := collector.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertRepaired()
+	chmodManaged()
+	if err := collector.Retire(context.Background(), identity); err != nil {
+		t.Fatal(err)
+	}
+	assertRepaired()
+}
+
+func TestArtifactManagedFilesRejectWorldPermissions(t *testing.T) {
+	t.Parallel()
+	createWithMode := func(t *testing.T, path string, data []byte, mode os.FileMode) {
+		t.Helper()
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("sequence lock", func(t *testing.T) {
+		root := t.TempDir()
+		createWithMode(t, filepath.Join(root, artifactWriterSequenceLockName), nil, 0o606)
+		if _, _, err := acquireArtifactWriterIntent(context.Background(), root); !errors.Is(err, ErrUnsafePath) {
+			t.Fatalf("writer intent error = %v, want ErrUnsafePath", err)
+		}
+	})
+	t.Run("sequence", func(t *testing.T) {
+		root := t.TempDir()
+		createWithMode(t, filepath.Join(root, artifactWriterSequenceLockName), nil, 0o600)
+		createWithMode(t, filepath.Join(root, artifactWriterSequenceName), []byte("1\n"), 0o606)
+		if _, _, err := acquireArtifactWriterIntent(context.Background(), root); !errors.Is(err, ErrUnsafePath) {
+			t.Fatalf("writer intent error = %v, want ErrUnsafePath", err)
+		}
+	})
+	t.Run("root lock", func(t *testing.T) {
+		root := t.TempDir()
+		createWithMode(t, filepath.Join(root, artifactRootLockName), nil, 0o606)
+		if _, err := acquireArtifactRootLock(context.Background(), root, false); !errors.Is(err, ErrUnsafePath) {
+			t.Fatalf("root lock error = %v, want ErrUnsafePath", err)
+		}
+	})
+	t.Run("intent", func(t *testing.T) {
+		root := t.TempDir()
+		name := artifactWriterIntentPrefix + "00000000000000000001-test" + artifactWriterIntentSuffix
+		createWithMode(t, filepath.Join(root, name), []byte("1\n"), 0o606)
+		if _, err := artifactWriterQueue(root); !errors.Is(err, ErrUnsafePath) {
+			t.Fatalf("writer queue error = %v, want ErrUnsafePath", err)
+		}
+	})
+}
+
+func TestArtifactManagedFilesRejectSymlinkAndNonRegularEntries(t *testing.T) {
+	t.Parallel()
+	t.Run("sequence lock symlink", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "target")
+		if err := os.WriteFile(target, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(root, artifactWriterSequenceLockName)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := acquireArtifactWriterIntent(context.Background(), root); err == nil {
+			t.Fatal("writer intent accepted a symlink sequence lock")
+		}
+	})
+	t.Run("sequence symlink", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "target")
+		if err := os.WriteFile(target, []byte("1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, artifactWriterSequenceLockName), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(root, artifactWriterSequenceName)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := acquireArtifactWriterIntent(context.Background(), root); err == nil {
+			t.Fatal("writer intent accepted a symlink sequence")
+		}
+	})
+	t.Run("root lock symlink", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "target")
+		if err := os.WriteFile(target, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(root, artifactRootLockName)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := acquireArtifactRootLock(context.Background(), root, false); err == nil {
+			t.Fatal("root lock accepted a symlink lock file")
+		}
+	})
+	t.Run("sequence lock directory", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Mkdir(filepath.Join(root, artifactWriterSequenceLockName), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := acquireArtifactWriterIntent(context.Background(), root); err == nil {
+			t.Fatal("writer intent accepted a non-regular sequence lock")
+		}
+	})
+	t.Run("sequence directory", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, artifactWriterSequenceLockName), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(root, artifactWriterSequenceName), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := acquireArtifactWriterIntent(context.Background(), root); err == nil {
+			t.Fatal("writer intent accepted a non-regular sequence")
+		}
+	})
+	t.Run("root lock directory", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Mkdir(filepath.Join(root, artifactRootLockName), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := acquireArtifactRootLock(context.Background(), root, false); err == nil {
+			t.Fatal("root lock accepted a non-regular lock file")
+		}
+	})
+	t.Run("intent symlink", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "target")
+		if err := os.WriteFile(target, []byte("1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		name := artifactWriterIntentPrefix + "00000000000000000001-test" + artifactWriterIntentSuffix
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := artifactWriterQueue(root); err == nil {
+			t.Fatal("writer queue accepted a symlink intent entry")
+		}
+	})
+	t.Run("intent directory", func(t *testing.T) {
+		root := t.TempDir()
+		name := artifactWriterIntentPrefix + "00000000000000000001-test" + artifactWriterIntentSuffix
+		if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := artifactWriterQueue(root); err == nil {
+			t.Fatal("writer queue accepted a non-regular intent entry")
+		}
+	})
+}
+
+func assertArtifactManagedFileMode(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("%s mode = %04o, want 0600", path, got)
+	}
+}
+
 func uploadArtifactForIdentity(t *testing.T, service *Service, secret []byte, now time.Time, identity Identity, data []byte, operationID string) {
 	t.Helper()
 	request := operationRequestForIdentity(OperationUpload, identity, data, operationID)

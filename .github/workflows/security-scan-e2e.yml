@@ -18,7 +18,10 @@ on:
       - "pkg/**"
       - "scripts/lib/e2e-admission-tls.sh"
       - "scripts/lib/ensure-static-mode-namespace.sh"
+      - "scripts/lib/kind-local-registry.sh"
+      - "scripts/fixtures/security-scan-fake-acp/**"
       - "scripts/security-scan-e2e.sh"
+      - "scripts/tests/security-scan-e2e-test.sh"
       - "workers/**"
   push:
     paths:
@@ -36,7 +39,10 @@ on:
       - "pkg/**"
       - "scripts/lib/e2e-admission-tls.sh"
       - "scripts/lib/ensure-static-mode-namespace.sh"
+      - "scripts/lib/kind-local-registry.sh"
+      - "scripts/fixtures/security-scan-fake-acp/**"
       - "scripts/security-scan-e2e.sh"
+      - "scripts/tests/security-scan-e2e-test.sh"
       - "workers/**"
 
 permissions:
@@ -52,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      KIND_CLUSTER: orka-security-scan-e2e
+      KIND_CLUSTER: orka-security-scan-${{ github.run_id }}-${{ github.run_attempt }}
       KIND_VERSION: v0.31.0
     steps:
       - name: Checkout
@@ -76,6 +82,11 @@ jobs:
           kind version
           kubectl version --client=true
           jq --version
+
+      - name: Verify security scan harness-v2 assertions
+        run: |
+          bash -n scripts/security-scan-e2e.sh scripts/tests/security-scan-e2e-test.sh
+          bash scripts/tests/security-scan-e2e-test.sh
 
       - name: Run security scan e2e
         run: bash scripts/security-scan-e2e.sh

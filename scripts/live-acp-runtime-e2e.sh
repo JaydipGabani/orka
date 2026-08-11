@@ -82,7 +82,7 @@ Release-gate local requirements:
     permission to close the created PR and delete the run branch.
   - git, curl, docker buildx, jq, kubectl, and shell tools.
   - Permission to create/delete the test namespace, copy the named credential
-    Secret key, patch Task status and RuntimePools, restart the controller,
+    Secret key, delete Tasks, patch Task metadata and RuntimePools, restart the controller,
     create a namespaced ServiceAccount/Role, inspect Pods/PVCs, and impersonate
     the Publisher ServiceAccount for `kubectl auth can-i` checks.
 
@@ -362,6 +362,8 @@ remote_cleanup_source_slug=""
 remote_cleanup_pr_base=""
 write_task_name=""
 write_task_started=0
+write_task_observer_uid=""
+task_observer_finalizer="acp-e2e.orka.ai/cancellation-observer"
 runtime_namespaces_seen=("${runtime_namespace}")
 
 record_runtime_namespace() {
@@ -610,6 +612,17 @@ ensure_pull_request_closed_unmerged() {
     [[ "$(jq -r '.state' <<<"${pr_json}")" == "closed" ]]
 }
 
+release_write_task_observer() {
+  [[ -n "${write_task_observer_uid}" ]] || return 0
+  if ! wait_until "write Task/${write_task_name} controller-owned deletion barrier" 300 \
+      task_observer_release_ready "${write_task_name}" "${write_task_observer_uid}"; then
+    return 1
+  fi
+  release_task_observer_finalizer "${write_task_name}" "${write_task_observer_uid}" || return 1
+  wait_until "write Task/${write_task_name} finalizer completion" 300 task_absent "${write_task_name}" || return 1
+  write_task_observer_uid=""
+}
+
 cleanup_remote_effects() {
   [[ "${release_gate}" -eq 1 && "${remote_cleanup_required}" -eq 1 ]] || return 0
   log "Cleaning release-gate remote effects with exact-head guards"
@@ -638,7 +651,8 @@ cleanup_remote_effects() {
       remote_cleanup_preserve=1
       return 1
     fi
-    return 0
+    release_write_task_observer
+    return $?
   fi
 
   if [[ -z "${remote_cleanup_head}" ]]; then
@@ -681,6 +695,11 @@ cleanup_remote_effects() {
     remote_cleanup_preserve=1
     return 1
   fi
+  if ! release_write_task_observer; then
+    warn "write Task did not complete controller-owned deletion after remote cleanup"
+    remote_cleanup_preserve=1
+    return 1
+  fi
   log "Remote PR/branch cleanup completed"
 }
 
@@ -714,6 +733,72 @@ task_absent() {
   [[ "${task_probe_state}" == "absent" ]]
 }
 
+add_task_observer_finalizer() {
+  local task="$1"
+  local uid="$2"
+  local patch
+  probe_task "${task}" || return 1
+  [[ "${task_probe_state}" == "present" ]] || return 1
+  if ! jq -e --arg uid "${uid}" --arg observer "${task_observer_finalizer}" '
+      .metadata.uid == $uid
+      and ((.metadata.deletionTimestamp // "") | length) == 0
+      and ((.metadata.finalizers // []) | index("orka.ai/cleanup") != null)
+      and ((.metadata.finalizers // []) | index($observer) == null)
+    ' "${task_probe_file}" >/dev/null; then
+    warn "Task/${task} is not safe to hold for cancellation observation"
+    return 1
+  fi
+  patch="$(jq -cn --arg uid "${uid}" --arg observer "${task_observer_finalizer}" '[
+    {op:"test",path:"/metadata/uid",value:$uid},
+    {op:"add",path:"/metadata/finalizers/-",value:$observer}
+  ]')"
+  k -n "${namespace}" patch task "${task}" --type=json -p "${patch}" >/dev/null
+}
+
+task_observer_release_ready() {
+  local task="$1"
+  local uid="$2"
+  task_cleanup_settled "${task}" || return 1
+  probe_task "${task}" || return 1
+  [[ "${task_probe_state}" == "present" ]] || return 1
+  jq -e --arg uid "${uid}" --arg observer "${task_observer_finalizer}" '
+    .metadata.uid == $uid
+    and ((.metadata.deletionTimestamp // "") | length) > 0
+    and (.metadata.finalizers // []) == [$observer]
+  ' "${task_probe_file}" >/dev/null
+}
+
+release_task_observer_finalizer() {
+  local task="$1"
+  local uid="$2"
+  local patch
+  task_observer_release_ready "${task}" "${uid}" || return 1
+  patch="$(jq -cn --arg uid "${uid}" --arg observer "${task_observer_finalizer}" '[
+    {op:"test",path:"/metadata/uid",value:$uid},
+    {op:"test",path:"/metadata/finalizers/0",value:$observer},
+    {op:"remove",path:"/metadata/finalizers/0"}
+  ]')"
+  k -n "${namespace}" patch task "${task}" --type=json -p "${patch}" >/dev/null
+}
+
+task_deletion_barrier_complete() {
+  local task="$1"
+  local uid="$2"
+  probe_task "${task}" || return 1
+  [[ "${task_probe_state}" == "absent" ]] && return 0
+  [[ "${task_probe_state}" == "present" ]] || return 1
+  task_observer_release_ready "${task}" "${uid}"
+}
+
+request_task_cancellation() {
+  local task="$1"
+  if [[ "${release_gate}" -eq 1 ]]; then
+    api_request DELETE "/api/v1/tasks/${task}?namespace=${namespace}" >/dev/null
+  else
+    k -n "${namespace}" delete task "${task}" --wait=false >/dev/null
+  fi
+}
+
 runtimepool_absent() {
   probe_runtimepool "$1" || return 1
   [[ "${runtimepool_probe_state}" == "absent" ]]
@@ -723,7 +808,7 @@ settle_and_delete_test_tasks() {
   local owners_file="$1"
   local tasks_file="${temp_root}/cleanup-tasks.json"
   local inventory_file="${temp_root}/cleanup-tasks.tsv"
-  local name uid session_uid state current_uid
+  local name uid session_uid current_uid
   : >"${owners_file}"
   k -n "${namespace}" get task -o json >"${tasks_file}" || return 1
   if ! jq -e --arg run "${run_id}" 'all(.items[]; .metadata.labels["orka.ai/acp-e2e-run"] == $run)' "${tasks_file}" >/dev/null; then
@@ -738,37 +823,27 @@ settle_and_delete_test_tasks() {
     [[ -z "${session_uid}" ]] || printf '%s\n' "${session_uid}" >>"${owners_file}"
     probe_task "${name}" || return 1
     [[ "${task_probe_state}" == "present" ]] || continue
-    if task_cleanup_settled "${name}"; then
-      continue
-    fi
-    state="$(jq -r '.status.execution.state // ""' "${task_probe_file}")"
-    case "${state}" in
-      ""|Queued|Reserved|SessionStarting|Planned|Submitting|SubmittedUnknown|Accepted|Running|Settling)
-        k -n "${namespace}" patch task "${name}" --subresource=status --type=merge \
-          -p '{"status":{"phase":"Cancelled"}}' >/dev/null || return 1
-        ;;
-      *)
-        warn "Task/${name} has terminal execution state ${state} but nonterminal delivery state"
-        return 1
-        ;;
-    esac
-  done <"${inventory_file}"
-  sort -u -o "${owners_file}" "${owners_file}"
-
-  while IFS=$'\t' read -r name uid _; do
-    [[ -n "${name}" ]] || continue
-    if ! wait_until "Task/${name} cleanup settlement" 300 task_cleanup_settled "${name}"; then
-      safe_task_summary "${name}"
-      return 1
-    fi
-    probe_task "${name}" || return 1
-    [[ "${task_probe_state}" == "present" ]] || continue
     current_uid="$(jq -r '.metadata.uid // ""' "${task_probe_file}")"
     if [[ "${current_uid}" != "${uid}" ]]; then
       warn "Task/${name} UID changed during cleanup; refusing deletion"
       return 1
     fi
-    k -n "${namespace}" delete task "${name}" --wait=false >/dev/null || return 1
+    if [[ "$(jq -r '.metadata.deletionTimestamp // ""' "${task_probe_file}")" == "" ]]; then
+      k -n "${namespace}" delete task "${name}" --wait=false >/dev/null || return 1
+    fi
+  done <"${inventory_file}"
+  sort -u -o "${owners_file}" "${owners_file}"
+
+  while IFS=$'\t' read -r name uid _; do
+    [[ -n "${name}" ]] || continue
+    if ! wait_until "Task/${name} controller-owned deletion barrier" 300 \
+        task_deletion_barrier_complete "${name}" "${uid}"; then
+      safe_task_summary "${name}"
+      return 1
+    fi
+    probe_task "${name}" || return 1
+    [[ "${task_probe_state}" == "present" ]] || continue
+    release_task_observer_finalizer "${name}" "${uid}" || return 1
   done <"${inventory_file}"
 
   while IFS=$'\t' read -r name _; do
@@ -997,7 +1072,7 @@ create_api_identity() {
       apiVersion:"rbac.authorization.k8s.io/v1",
       kind:"Role",
       metadata:{name:"acp-release-gate",namespace:$ns},
-      rules:[{apiGroups:["core.orka.ai"],resources:["tasks"],verbs:["get","list","watch","create"]}]
+      rules:[{apiGroups:["core.orka.ai"],resources:["tasks"],verbs:["get","list","watch","create","delete"]}]
     }' | k apply -f - >/dev/null
   jq -n \
     --arg ns "${namespace}" \
@@ -2497,7 +2572,7 @@ run_explicit_cancel_check() {
   local provider="$1"
   local model="$2"
   local agent="$3"
-  local task pool snapshot cancel_requested_at
+  local task pool snapshot uid cancel_requested_at
   task="$(sanitize_name "acp-cancel-${run_id}")"
   log "Validating explicit cancellation after an active Running prompt"
   apply_read_task "${task}" "${agent}" "" false "${blocking_prompt}" "1h" true
@@ -2510,14 +2585,24 @@ run_explicit_cancel_check() {
   snapshot="${temp_root}/${task}-running-pool.json"
   capture_pool_snapshot "${pool}" "${provider}" "${model}" read "${snapshot}"
   pool_running_for_task "${task}" "${pool}" || die "Task/${task} was no longer Running immediately before cancellation"
+  uid="$(k -n "${namespace}" get task "${task}" -o jsonpath='{.metadata.uid}')"
+  [[ -n "${uid}" ]] || die "Task/${task} UID is unavailable before cancellation"
+  add_task_observer_finalizer "${task}" "${uid}" || \
+    die "failed to retain Task/${task} for cancellation settlement observation"
   cancel_requested_at="${SECONDS}"
-  k -n "${namespace}" patch task "${task}" --subresource=status --type=merge \
-    -p '{"status":{"phase":"Cancelled"}}' >/dev/null
+  request_task_cancellation "${task}" || die "failed to request Task/${task} cancellation"
   wait_until "Task/${task} explicit cancellation settlement" "${cancel_settle_seconds}" task_execution_terminal "${task}" || \
     die "Task/${task} did not settle within the explicit cancellation bound"
   (( SECONDS - cancel_requested_at <= cancel_settle_seconds + 2 )) || \
     die "Task/${task} exceeded the explicit cancellation settlement bound"
   assert_cancelled_task "${task}" "${snapshot}"
+  wait_until "Task/${task} controller-owned deletion barrier" "${state_wait_seconds}" \
+    task_observer_release_ready "${task}" "${uid}" || \
+    die "Task/${task} controller cleanup did not reach its finalizer barrier"
+  release_task_observer_finalizer "${task}" "${uid}" || \
+    die "failed to release Task/${task} cancellation observer"
+  wait_until "Task/${task} deletion after observed cancellation" "${state_wait_seconds}" task_absent "${task}" || \
+    die "Task/${task} remained after releasing the cancellation observer"
   wait_until "RuntimePool/${pool} zero transient counters after explicit cancel" "${state_wait_seconds}" pool_transient_counters_zero "${pool}"
 }
 
@@ -3126,6 +3211,7 @@ no_cleanup_pull_request_exists() {
 }
 
 settle_write_task_for_remote_cleanup() {
+  local pool outcome head number uid
   [[ "${write_task_started}" -eq 1 ]] || return 0
   [[ "${namespace_created}" -eq 1 && -n "${write_task_name}" ]] || return 1
   probe_namespace "${namespace}" || return 1
@@ -3135,14 +3221,16 @@ settle_write_task_for_remote_cleanup() {
 
   if ! jq -e '(.status.execution.state // "") as $state | ($state == "Succeeded" or $state == "Failed" or $state == "Cancelled" or $state == "OutcomeUnknown")' \
       "${task_probe_file}" >/dev/null; then
-    k -n "${namespace}" patch task "${write_task_name}" --subresource=status --type=merge \
-      -p '{"status":{"phase":"Cancelled"}}' >/dev/null || return 1
+    uid="$(jq -r '.metadata.uid // ""' "${task_probe_file}")"
+    [[ -n "${uid}" ]] || return 1
+    add_task_observer_finalizer "${write_task_name}" "${uid}" || return 1
+    write_task_observer_uid="${uid}"
+    request_task_cancellation "${write_task_name}" || return 1
   fi
   wait_until "write Task/${write_task_name} cleanup settlement" 300 write_task_cleanup_settled || return 1
   probe_task "${write_task_name}" || return 1
   [[ "${task_probe_state}" == "present" ]] || return 1
 
-  local pool outcome head number
   pool="$(jq -r '.status.execution.runtimePoolName // ""' "${task_probe_file}")" || return 1
   if [[ -n "${pool}" ]]; then
     probe_runtimepool "${pool}" || return 1

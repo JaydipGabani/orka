@@ -387,7 +387,7 @@ run_test() {
 test_controller_epoch_crd_uses_canonical_plural() {
   local generated chart
   generated="${root}/config/crd/bases/core.orka.ai_controllerepochs.yaml"
-  chart="${root}/charts/orka/crds/core.orka.ai_controllerepochs.yaml"
+  chart="${root}/charts/orka/crds/controllerepoch-customresourcedefinition.yaml"
 
   [[ -f "${generated}" ]]
   [[ -f "${chart}" ]]

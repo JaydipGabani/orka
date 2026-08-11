@@ -186,6 +186,7 @@ type SecurityStore interface {
 
 	CreatePatchProposal(ctx context.Context, proposal *PatchProposal) error
 	UpdatePatchProposal(ctx context.Context, proposal *PatchProposal) error
+	BindPatchProposalPublicationEvidence(ctx context.Context, proposal *PatchProposal) error
 	ListPatchProposals(ctx context.Context, namespace, findingID string) ([]PatchProposal, error)
 
 	CreateDroppedFinding(ctx context.Context, dropped *DroppedFinding) error

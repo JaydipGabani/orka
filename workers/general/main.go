@@ -287,6 +287,22 @@ func runSecurityMapper(ctx context.Context) error {
 	if headCommit == "" {
 		headCommit = resolvedHeadCommit
 	}
+	for i := range slices {
+		contextSlice := slices[i]
+		contextSlice.ChangedFiles = append([]string(nil), changedFiles...)
+		contextSlice.ChangedLineRanges = append([]security.ChangedLineRange(nil), changedLineRanges...)
+		_, manifest, err := security.BuildReviewContext(workDir, contextSlice, security.ReviewContextOptions{})
+		if err != nil {
+			return fmt.Errorf("build security review context for %s: %w", contextSlice.ID, err)
+		}
+		manifestData, err := json.Marshal(manifest)
+		if err != nil {
+			return fmt.Errorf("marshal security review context for %s: %w", contextSlice.ID, err)
+		}
+		if err := common.WriteArtifactFile(security.ReviewContextArtifactName(contextSlice.ID), manifestData); err != nil {
+			return err
+		}
+	}
 	artifact := security.ReviewSlicesArtifact{
 		SchemaVersion:        security.SchemaVersionReviewSlices,
 		BaseCommit:           baseCommit,

@@ -46,6 +46,7 @@ func init() {
 
 type options struct {
 	healthProbeBindAddress     string
+	preStopDelay               time.Duration
 	webhookCertPath            string
 	webhookCertName            string
 	webhookCertKey             string
@@ -60,6 +61,8 @@ type options struct {
 func (o *options) bind(fs *flag.FlagSet) {
 	fs.StringVar(&o.healthProbeBindAddress, "health-probe-bind-address", ":8081",
 		"The address on which to serve liveness and readiness probes.")
+	fs.DurationVar(&o.preStopDelay, "pre-stop-delay", 0,
+		"If nonzero, wait for endpoint removal and exit without starting the admission service.")
 	fs.StringVar(&o.webhookCertPath, "webhook-cert-path", "",
 		"The directory containing the webhook serving certificate and private key.")
 	fs.StringVar(&o.webhookCertName, "webhook-cert-name", "tls.crt",
@@ -132,6 +135,13 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zapOptions)))
 	setupLog := ctrl.Log.WithName("setup")
+	if opts.preStopDelay != 0 {
+		if err := runPreStopDelay(opts.preStopDelay, time.Sleep); err != nil {
+			setupLog.Error(err, "invalid admission pre-stop delay")
+			os.Exit(2)
+		}
+		return
+	}
 	if err := opts.validate(); err != nil {
 		setupLog.Error(err, "invalid admission configuration")
 		os.Exit(2)
@@ -211,6 +221,18 @@ func main() {
 		setupLog.Error(err, "admission service stopped with an error")
 		os.Exit(1)
 	}
+}
+
+func runPreStopDelay(delay time.Duration, sleep func(time.Duration)) error {
+	const maxDelay = 20 * time.Second
+	if delay <= 0 || delay > maxDelay {
+		return fmt.Errorf("--pre-stop-delay must be greater than zero and no more than %s", maxDelay)
+	}
+	if sleep == nil {
+		return errors.New("pre-stop delay requires a sleep function")
+	}
+	sleep(delay)
+	return nil
 }
 
 func servingCertificateFilesChecker(directory, certificateName, keyName, serviceDNSName string) healthz.Checker {

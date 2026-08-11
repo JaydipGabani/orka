@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/orka-agents/orka/internal/store"
+	"golang.org/x/sync/semaphore"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -140,6 +141,7 @@ type Store struct {
 	outbox              store.OutboxPersistenceStore
 	sessionCleanup      store.SessionCleanupPersistenceStore
 	branchClaimsEnabled bool
+	epochMutations      *semaphore.Weighted
 }
 
 // NewComposite constructs the hard-cutover DurableControlStore: Kubernetes is
@@ -169,7 +171,10 @@ func New(kubeClient client.Client, controlNamespace string, options ...Option) (
 	if err := validateKubernetesNamespace(controlNamespace); err != nil {
 		return nil, err
 	}
-	result := &Store{client: kubeClient, controlNamespace: controlNamespace, branchClaimsEnabled: true}
+	result := &Store{
+		client: kubeClient, controlNamespace: controlNamespace, branchClaimsEnabled: true,
+		epochMutations: semaphore.NewWeighted(1),
+	}
 	for _, option := range options {
 		if option == nil {
 			return nil, store.ValidationErrorf("Kubernetes control-store option must not be nil")

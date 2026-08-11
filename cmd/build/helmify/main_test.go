@@ -1571,6 +1571,29 @@ func TestStaticChartUsesRegisteredContextTokenTTSEndpointFlag(t *testing.T) {
 	}
 }
 
+func TestStaticChartRendersByteLimitsAsDecimalIntegers(t *testing.T) {
+	publisher := requireHelmRender(t, "--show-only", "templates/publisher-deployment.yaml")
+	scmProxy := requireHelmRender(t, "--show-only", "templates/scm-egress-proxy-deployment.yaml")
+
+	if !strings.Contains(publisher, `value: "4194304"`) {
+		t.Fatalf("publisher deployment did not render max response bytes as a decimal integer:\n%s", publisher)
+	}
+	for _, want := range []string{
+		`--max-request-header-bytes=32768`,
+		`--max-response-header-bytes=65536`,
+		`--max-request-bytes=4194304`,
+		`--max-response-bytes=8388608`,
+		`--max-tunnel-bytes=1073741824`,
+	} {
+		if !strings.Contains(scmProxy, want) {
+			t.Fatalf("SCM proxy deployment is missing decimal byte limit %q:\n%s", want, scmProxy)
+		}
+	}
+	if strings.Contains(publisher, "e+") || strings.Contains(scmProxy, "e+") {
+		t.Fatalf("byte limit render used scientific notation:\npublisher:\n%s\nSCM proxy:\n%s", publisher, scmProxy)
+	}
+}
+
 func TestStaticChartAuthRolloutNoncesTargetOnlyCredentialConsumers(t *testing.T) {
 	args := []string{
 		"--set-string", "publisher.auth.rolloutNonce=publisher-v2",

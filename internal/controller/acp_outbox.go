@@ -20,13 +20,21 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/taskterminal"
 )
 
 func standaloneTaskTerminalProjectionID(task *corev1alpha1.Task, attempt int32) string {
 	if task == nil {
 		return ""
 	}
-	return store.CanonicalControlID("task-terminal-projection", task.Namespace, string(task.UID), fmt.Sprint(attempt))
+	return standaloneTaskTerminalProjectionIDForUID(task.Namespace, task.UID, attempt)
+}
+
+func standaloneTaskTerminalProjectionIDForUID(namespace string, taskUID types.UID, attempt int32) string {
+	if strings.TrimSpace(namespace) == "" || taskUID == "" {
+		return ""
+	}
+	return store.CanonicalControlID("task-terminal-projection", namespace, string(taskUID), fmt.Sprint(attempt))
 }
 
 func (d *ACPDispatcher) enqueueStandaloneTaskProjection(ctx context.Context, task *corev1alpha1.Task, payload taskTerminalProjection) error {
@@ -60,8 +68,25 @@ func enqueueDurableTaskTerminalProjection(
 	task *corev1alpha1.Task,
 	payload taskTerminalProjection,
 ) error {
+	if task == nil {
+		return fmt.Errorf("durable Task terminal projection identity is incomplete")
+	}
+	return enqueueDurableTaskTerminalProjectionForUID(ctx, projectionStore, fence, task, task.UID, payload)
+}
+
+func enqueueDurableTaskTerminalProjectionForUID(
+	ctx context.Context,
+	projectionStore store.OutboxProjectionStore,
+	fence store.ControllerEpochFence,
+	task *corev1alpha1.Task,
+	projectionTaskUID types.UID,
+	payload taskTerminalProjection,
+) error {
 	if projectionStore == nil || task == nil || task.UID == "" || payload.Attempt < 1 {
 		return fmt.Errorf("durable Task terminal projection identity is incomplete")
+	}
+	if projectionTaskUID == "" {
+		return fmt.Errorf("durable Task terminal projection source identity is incomplete")
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -78,8 +103,8 @@ func enqueueDurableTaskTerminalProjection(
 		projectionTime = time.Unix(0, 0).UTC()
 	}
 	projection := &store.OutboxProjection{
-		ID:            standaloneTaskTerminalProjectionID(task, payload.Attempt),
-		AggregateKind: "Task", AggregateID: string(task.UID), ProjectionKind: "TaskTerminalStatus",
+		ID:            standaloneTaskTerminalProjectionIDForUID(task.Namespace, projectionTaskUID, payload.Attempt),
+		AggregateKind: "Task", AggregateID: string(projectionTaskUID), ProjectionKind: "TaskTerminalStatus",
 		PayloadDigest: "sha256:" + hex.EncodeToString(sum[:]), Payload: encoded,
 		AvailableAt: projectionTime, CreatedAt: time.Now().UTC(),
 	}
@@ -203,19 +228,7 @@ func (p *ACPOutboxProjector) projectOnce(ctx context.Context) error {
 	return nil
 }
 
-type taskTerminalProjection struct {
-	Namespace      string                             `json:"namespace"`
-	Task           string                             `json:"task"`
-	TaskUID        string                             `json:"taskUID"`
-	Attempt        int32                              `json:"attempt"`
-	Phase          corev1alpha1.TaskPhase             `json:"phase"`
-	Message        string                             `json:"message,omitempty"`
-	BindingDigest  string                             `json:"bindingDigest,omitempty"`
-	HarnessRuntime *corev1alpha1.HarnessRuntimeStatus `json:"harnessRuntime,omitempty"`
-	ResultRef      *corev1alpha1.ResultReference      `json:"resultRef,omitempty"`
-	Execution      corev1alpha1.TaskExecutionStatus   `json:"execution"`
-	Delivery       *corev1alpha1.TaskDeliveryStatus   `json:"delivery,omitempty"`
-}
+type taskTerminalProjection = taskterminal.Projection
 
 func mergeTerminalExecutionStatus(existing *corev1alpha1.TaskExecutionStatus, projected corev1alpha1.TaskExecutionStatus) corev1alpha1.TaskExecutionStatus {
 	if existing == nil {
@@ -262,7 +275,16 @@ func (p *ACPOutboxProjector) deliver(ctx context.Context, projection store.Outbo
 			return err
 		}
 		if string(task.UID) != payload.TaskUID {
-			return fmt.Errorf("task UID does not match outbox projection")
+			binding := executionBinding(task, corev1alpha1.AgentRuntimeContractHarnessV2)
+			if binding == nil || string(binding.Task.UID) != payload.TaskUID || !acpTaskUsesRestoredSourceIdentity(task) ||
+				task.Status.Execution == nil || task.Status.Execution.Attempt != payload.Attempt {
+				return fmt.Errorf("task UID does not match outbox projection")
+			}
+			// Clean-cluster restore settlement already patched the new Task
+			// incarnation directly. This projection remains immutable source
+			// history, so delivery is an exact no-op against the restored UID.
+			deliveredResourceVersion = task.ResourceVersion
+			return nil
 		}
 		if payload.HarnessRuntime != nil {
 			binding := task.Status.AgentExecutionBinding
@@ -309,7 +331,7 @@ func (p *ACPOutboxProjector) deliver(ctx context.Context, projection store.Outbo
 		execution.LastTransitionTime = &now
 		task.Status.Execution = &execution
 		if payload.Delivery != nil {
-			delivery := *payload.Delivery
+			delivery := taskDeliveryStatusForKubernetes(task, *payload.Delivery)
 			delivery.LastTransitionTime = &now
 			task.Status.Delivery = &delivery
 		}

@@ -897,7 +897,7 @@ func TestRunAgent_ExecutorSuccess(t *testing.T) {
 		return "completed successfully", nil
 	}
 
-	err := RunAgent("test-agent", "/tmp/ws", 50, executor)
+	err := RunAgent("test-agent", t.TempDir(), 50, executor)
 	if err != nil {
 		t.Fatalf("RunAgent should succeed, got: %v", err)
 	}
@@ -1380,7 +1380,7 @@ func TestRunAgent_ExecutorEmptyResultSubmitsPlaceholder(t *testing.T) {
 	defer server.Close()
 	t.Setenv("ORKA_RESULT_ENDPOINT", server.URL)
 
-	err := RunAgent("test-agent", "/tmp/ws", 50, func(_ context.Context, _ *AgentConfig) (string, error) {
+	err := RunAgent("test-agent", t.TempDir(), 50, func(_ context.Context, _ *AgentConfig) (string, error) {
 		return "", nil
 	})
 	if err != nil {
@@ -1413,7 +1413,7 @@ func TestRunAgent_ExecutorFailure(t *testing.T) {
 		return "partial output", fmt.Errorf("agent crashed")
 	}
 
-	err := RunAgent("test-agent", "/tmp/ws", 50, executor)
+	err := RunAgent("test-agent", t.TempDir(), 50, executor)
 	if err == nil {
 		t.Fatal("expected error from executor failure")
 	}

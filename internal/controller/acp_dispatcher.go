@@ -1043,7 +1043,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		}
 		if runtimeSessionRetirementRequired {
 			if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(
-				context.WithoutCancel(ctx), task, string(runtimeFence.RuntimeInstanceID),
+				context.WithoutCancel(ctx), task, task.UID, string(runtimeFence.RuntimeInstanceID),
 				string(runtimeFence.RuntimeSessionUID), int64(runtimeFence.RuntimeSessionGeneration),
 			); markErr != nil {
 				return markErr
@@ -1180,6 +1180,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	}
 	var terminal *harnessv2.Event
 	var assistant strings.Builder
+	assistantOverflow := false
 	accepted := false
 	admissionRetry := 0
 	for {
@@ -1228,10 +1229,14 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 				}
 			case harnessv2.EventUpdate:
 				if event.Update != nil && event.Update.AssistantMessage != nil {
-					if maxResultBytes < 1 || len(event.Update.AssistantMessage.Text) > maxResultBytes-assistant.Len() {
-						return fmt.Errorf("assistant update exceeds the negotiated terminal result limit")
+					text := event.Update.AssistantMessage.Text
+					if !assistantOverflow {
+						if maxResultBytes < 1 || len(text) > maxResultBytes-assistant.Len() {
+							assistantOverflow = true
+						} else {
+							assistant.WriteString(text)
+						}
 					}
-					assistant.WriteString(event.Update.AssistantMessage.Text)
 				}
 			case harnessv2.EventPermissionRequested:
 				return d.resolvePromptPermission(runtimeCtx, runtimeClient, createRequest.RuntimeSessionID, task, runtimeFence, event)
@@ -1300,13 +1305,9 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	if err != nil {
 		return err
 	}
-	resultText := strings.TrimSpace(assistant.String())
-	if resultText == "" && terminal.Completed != nil {
-		for _, block := range terminal.Completed.Result.Content {
-			if block.Type == harnessv2.ContentBlockText {
-				resultText += block.Text
-			}
-		}
+	resultText, err := completedPromptResultText(terminal, assistant.String(), assistantOverflow)
+	if err != nil {
+		return err
 	}
 	if err := d.transitionDelivery(ctx, attemptID, fence, store.PromptDeliveryNotRequested, store.PromptDeliveryValidating, "validate-workspace", ""); err != nil {
 		return err
@@ -1515,6 +1516,24 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	return d.completeSuccessWithDelivery(ctx, task, deliveryStatus, "ACP task completed")
 }
 
+func completedPromptResultText(terminal *harnessv2.Event, streamed string, streamedOverflow bool) (string, error) {
+	var terminalText strings.Builder
+	if terminal != nil && terminal.Completed != nil {
+		for _, block := range terminal.Completed.Result.Content {
+			if block.Type == harnessv2.ContentBlockText {
+				terminalText.WriteString(block.Text)
+			}
+		}
+	}
+	if result := strings.TrimSpace(terminalText.String()); result != "" {
+		return result, nil
+	}
+	if streamedOverflow {
+		return "", fmt.Errorf("assistant updates exceed the negotiated terminal result limit and the terminal result is empty")
+	}
+	return strings.TrimSpace(streamed), nil
+}
+
 func acpWorkspaceDeltaLimits(task *corev1alpha1.Task) harnessv2.WorkspaceDeltaLimits {
 	limits := harnessv2.WorkspaceDeltaLimits{MaxBytes: 100 << 20, MaxEntries: 100_000}
 	if task == nil || task.Spec.Workspace == nil {
@@ -1565,6 +1584,18 @@ func runtimeSessionDeltaAbandonmentFinalization(
 	deltaID harnessv2.WorkspaceDeltaID,
 	delivery corev1alpha1.TaskDeliveryStatus,
 ) (runtimeSessionPublicationFinalization, error) {
+	return runtimeSessionDeltaAbandonmentFinalizationForTaskUID(task, task.UID, deltaID, delivery)
+}
+
+func runtimeSessionDeltaAbandonmentFinalizationForTaskUID(
+	task *corev1alpha1.Task,
+	taskUID types.UID,
+	deltaID harnessv2.WorkspaceDeltaID,
+	delivery corev1alpha1.TaskDeliveryStatus,
+) (runtimeSessionPublicationFinalization, error) {
+	if task == nil || task.Status.Execution == nil || taskUID == "" {
+		return runtimeSessionPublicationFinalization{}, fmt.Errorf("runtime session delta abandonment requires explicit Task identity")
+	}
 	terminal := harnessv2.PublicationTerminalDeliveryConflict
 	switch delivery.State {
 	case corev1alpha1.TaskDeliveryStateCredentialBlocked:
@@ -1574,9 +1605,9 @@ func runtimeSessionDeltaAbandonmentFinalization(
 	case corev1alpha1.TaskDeliveryStatePublicationOutcomeUnknown:
 		terminal = harnessv2.PublicationTerminalOutcomeUnknown
 	}
-	syntheticPublicationID := publicationID(task)
+	syntheticPublicationID := publicationIDForTaskUID(task, taskUID)
 	digest, err := acpDomainDigest("runtime-session-delta-abandonment-receipt", map[string]any{
-		"taskUID": task.UID, "attempt": task.Status.Execution.Attempt, "deltaID": deltaID,
+		"taskUID": taskUID, "attempt": task.Status.Execution.Attempt, "deltaID": deltaID,
 		"publicationID": syntheticPublicationID, "terminal": terminal, "delivery": delivery,
 	})
 	if err != nil {
@@ -1625,16 +1656,26 @@ func (d *ACPDispatcher) finalizeRuntimeSessionPublication(
 	ctx context.Context, runtimeClient *harnessv2.Client, sessionID harnessv2.RuntimeSessionID, task *corev1alpha1.Task,
 	runtimeFence harnessv2.Fence, finalization runtimeSessionPublicationFinalization,
 ) error {
+	return d.finalizeRuntimeSessionPublicationForTaskUID(ctx, runtimeClient, sessionID, task, task.UID, runtimeFence, finalization)
+}
+
+func (d *ACPDispatcher) finalizeRuntimeSessionPublicationForTaskUID(
+	ctx context.Context, runtimeClient *harnessv2.Client, sessionID harnessv2.RuntimeSessionID, task *corev1alpha1.Task,
+	taskUID types.UID, runtimeFence harnessv2.Fence, finalization runtimeSessionPublicationFinalization,
+) error {
 	if runtimeClient == nil {
 		return fmt.Errorf("runtime client is required")
+	}
+	if task == nil || task.Status.Execution == nil || taskUID == "" {
+		return fmt.Errorf("finalize RuntimeSession publication requires explicit Task identity")
 	}
 	finalizeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	now := time.Now().UTC()
 	request := harnessv2.FinalizeRuntimeSessionPublicationRequest{
 		Protocol: harnessv2.ProtocolVersion,
-		Metadata: mutationMetadata(
-			runtimeFence, task, "fp-"+strconv.FormatInt(now.UnixNano(), 36), true, now.Add(30*time.Second),
+		Metadata: mutationMetadataForTaskUID(
+			runtimeFence, task, taskUID, "fp-"+strconv.FormatInt(now.UnixNano(), 36), true, now.Add(30*time.Second),
 		),
 		WorkspaceDeltaID: finalization.WorkspaceDeltaID, PublicationID: finalization.PublicationID,
 		PublicationGeneration: finalization.PublicationGeneration, PublicationVersion: finalization.PublicationVersion,
@@ -1661,25 +1702,41 @@ func (d *ACPDispatcher) deleteRuntimeSession(
 	runtimeFence harnessv2.Fence,
 	reason string,
 ) error {
+	return d.deleteRuntimeSessionForTaskUID(ctx, runtimeClient, sessionID, task, task.UID, runtimeFence, reason)
+}
+
+func (d *ACPDispatcher) deleteRuntimeSessionForTaskUID(
+	ctx context.Context,
+	runtimeClient *harnessv2.Client,
+	sessionID harnessv2.RuntimeSessionID,
+	task *corev1alpha1.Task,
+	taskUID types.UID,
+	runtimeFence harnessv2.Fence,
+	reason string,
+) error {
 	now := time.Now().UTC()
-	request, err := newDeleteRuntimeSessionRequest(task, runtimeFence, reason, now.Add(30*time.Second))
+	request, err := newDeleteRuntimeSessionRequestForTaskUID(task, taskUID, runtimeFence, reason, now.Add(30*time.Second))
 	if err != nil {
 		return err
 	}
 	return d.deleteRuntimeSessionRequest(ctx, runtimeClient, sessionID, request)
 }
 
-func newDeleteRuntimeSessionRequest(
+func newDeleteRuntimeSessionRequestForTaskUID(
 	task *corev1alpha1.Task,
+	taskUID types.UID,
 	runtimeFence harnessv2.Fence,
 	reason string,
 	expiresAt time.Time,
 ) (harnessv2.DeleteRuntimeSessionRequest, error) {
+	if task == nil || task.Status.Execution == nil || taskUID == "" {
+		return harnessv2.DeleteRuntimeSessionRequest{}, fmt.Errorf("delete RuntimeSession requires explicit Task identity")
+	}
 	now := time.Now().UTC()
 	request := harnessv2.DeleteRuntimeSessionRequest{
 		Protocol: harnessv2.ProtocolVersion,
-		Metadata: mutationMetadata(
-			runtimeFence, task, "ds-"+strconv.FormatInt(now.UnixNano(), 36), false, expiresAt.UTC(),
+		Metadata: mutationMetadataForTaskUID(
+			runtimeFence, task, taskUID, "ds-"+strconv.FormatInt(now.UnixNano(), 36), false, expiresAt.UTC(),
 		),
 		Reason: reason,
 	}
@@ -3130,7 +3187,11 @@ func emptyRuntimeWorkspace(task *corev1alpha1.Task) (harnessv2.WorkspaceBaseline
 	if err != nil {
 		return harnessv2.WorkspaceBaseline{}, harnessv2.WorkspaceSpec{}, err
 	}
-	baseline := harnessv2.WorkspaceBaseline{RepositoryIdentity: "empty:" + string(task.UID), Revision: "empty", TreeDigest: digest}
+	baseline := harnessv2.WorkspaceBaseline{
+		RepositoryIdentity: acpNoWorkspaceRevision + ":" + string(task.UID),
+		Revision:           acpNoWorkspaceRevision,
+		TreeDigest:         digest,
+	}
 	intent := harnessv2.WorkspaceIntent(effectiveACPWorkspaceIntent(task))
 	return baseline, harnessv2.WorkspaceSpec{Intent: intent, Baseline: baseline}, nil
 }
@@ -3181,6 +3242,17 @@ func acpPromptInputContent(bootstrap, userPrompt string) []harnessv2.ContentBloc
 }
 
 func mutationMetadata(fence harnessv2.Fence, task *corev1alpha1.Task, operation string, prompt bool, expiry time.Time) harnessv2.MutationMetadata {
+	return mutationMetadataForTaskUID(fence, task, task.UID, operation, prompt, expiry)
+}
+
+func mutationMetadataForTaskUID(
+	fence harnessv2.Fence,
+	task *corev1alpha1.Task,
+	taskUID types.UID,
+	operation string,
+	prompt bool,
+	expiry time.Time,
+) harnessv2.MutationMetadata {
 	if fence.RuntimeSessionUID == "" {
 		fence.RuntimeSessionUID = harnessv2.RuntimeSessionUID(taskRuntimeSessionUID(task))
 	}
@@ -3188,7 +3260,7 @@ func mutationMetadata(fence harnessv2.Fence, task *corev1alpha1.Task, operation 
 		fence.RuntimeSessionGeneration = 1
 	}
 	metadata := harnessv2.MutationMetadata{
-		Fence: fence, TaskUID: harnessv2.TaskUID(task.UID), TaskAttempt: uint32(task.Status.Execution.Attempt),
+		Fence: fence, TaskUID: harnessv2.TaskUID(taskUID), TaskAttempt: uint32(task.Status.Execution.Attempt),
 		OperationID:                harnessv2.OperationID(operation + "-" + task.Status.Execution.PromptID),
 		RequestDigestSchemaVersion: harnessv2.RequestDigestSchemaVersion, ExpiresAt: expiry,
 	}
@@ -3227,11 +3299,15 @@ func exactPodEndpoint(address string) string {
 }
 
 func promptAttemptIDFromTask(task *corev1alpha1.Task) (string, error) {
+	return promptAttemptIDFromTaskUID(task, task.UID)
+}
+
+func promptAttemptIDFromTaskUID(task *corev1alpha1.Task, taskUID types.UID) (string, error) {
 	if task.Status.Execution == nil {
 		return "", fmt.Errorf("task execution status is missing")
 	}
 	return (store.PromptAttemptKey{
-		Namespace: task.Namespace, TaskUID: string(task.UID), Attempt: int64(task.Status.Execution.Attempt), PromptID: task.Status.Execution.PromptID,
+		Namespace: task.Namespace, TaskUID: string(taskUID), Attempt: int64(task.Status.Execution.Attempt), PromptID: task.Status.Execution.PromptID,
 	}).CanonicalID()
 }
 

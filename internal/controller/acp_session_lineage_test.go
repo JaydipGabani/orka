@@ -48,6 +48,7 @@ func newACPLineageTestFixture(t *testing.T, wrapProjection func(store.SessionLin
 	rawClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&corev1alpha1.ControllerEpoch{}, &corev1alpha1.RuntimeSessionControl{}).
 		Build()
+	rawClient = withControllerEpochLeaseUIDs(t, rawClient)
 	controls, err := kubestore.NewComposite(rawClient, "orka-system", persistence)
 	if err != nil {
 		t.Fatal(err)

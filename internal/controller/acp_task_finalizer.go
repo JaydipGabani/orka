@@ -30,13 +30,17 @@ type acpPublicationReclaimTarget struct {
 	generation int64
 }
 
+//nolint:gocyclo // Deletion readiness keeps every durable attempt, publication, effect, and projection barrier in one fail-closed boundary.
 func (r *TaskReconciler) acpTaskDeletionReady(ctx context.Context, task *corev1alpha1.Task) (bool, error) {
 	if task == nil || task.Spec.Type != corev1alpha1.TaskTypeAgent || r.DurableControlStore == nil {
 		return true, nil
 	}
+	if acpTaskHasUnvalidatedSourceIdentity(task) {
+		return false, fmt.Errorf("%w: Task execution binding UID differs from the live Task before validated restore settlement", store.ErrConflict)
+	}
 	if acpTaskRequiresAuthoritativeAttemptDiscovery(task) {
 		if task.Status.Execution != nil && task.Status.Execution.Attempt > 0 && task.Status.Execution.PromptID != "" {
-			projectionID := standaloneTaskTerminalProjectionID(task, task.Status.Execution.Attempt)
+			projectionID := standaloneTaskTerminalProjectionIDForUID(task.Namespace, acpTaskControlUID(task), task.Status.Execution.Attempt)
 			projection, err := r.DurableControlStore.GetOutboxProjection(ctx, projectionID)
 			if err == nil {
 				if projection.State != store.OutboxProjectionDelivered {
@@ -47,7 +51,7 @@ func (r *TaskReconciler) acpTaskDeletionReady(ctx context.Context, task *corev1a
 			} else if !errors.Is(err, store.ErrNotFound) {
 				return false, err
 			} else {
-				publicationID := publicationIDForTask(task)
+				publicationID := publicationIDForTaskUID(task, acpTaskControlUID(task))
 				unsettled, effectErr := r.acpTaskHasUnsettledExternalEffects(ctx, task, publicationID)
 				return !unsettled, effectErr
 			}
@@ -57,7 +61,7 @@ func (r *TaskReconciler) acpTaskDeletionReady(ctx context.Context, task *corev1a
 			// unbound attempt or durably prove that no attempt ever existed.
 			publicationID := ""
 			if task.Status.Execution != nil {
-				publicationID = publicationIDForTask(task)
+				publicationID = publicationIDForTaskUID(task, acpTaskControlUID(task))
 			}
 			unsettled, err := r.acpTaskHasUnsettledExternalEffects(ctx, task, publicationID)
 			return !unsettled, err
@@ -67,11 +71,11 @@ func (r *TaskReconciler) acpTaskDeletionReady(ctx context.Context, task *corev1a
 		return false, nil
 	}
 	if acpTaskTerminalBeforeDurableAttempt(task) {
-		publicationID := publicationIDForTask(task)
+		publicationID := publicationIDForTaskUID(task, acpTaskControlUID(task))
 		unsettled, err := r.acpTaskHasUnsettledExternalEffects(ctx, task, publicationID)
 		return !unsettled, err
 	}
-	attemptID, err := promptAttemptIDFromTask(task)
+	attemptID, err := promptAttemptIDFromTaskUID(task, acpTaskControlUID(task))
 	if err != nil {
 		return false, err
 	}
@@ -84,10 +88,15 @@ func (r *TaskReconciler) acpTaskDeletionReady(ctx context.Context, task *corev1a
 		}
 		return false, err
 	}
+	if acpTaskUsesRestoredSourceIdentity(task) {
+		if err := validateRestoredTaskSourceAttempt(task, attempt, attemptID); err != nil {
+			return false, err
+		}
+	}
 	if !store.IsTerminalPromptExecutionState(attempt.ExecutionState) || !store.IsTerminalPromptDeliveryState(attempt.DeliveryState) {
 		return false, nil
 	}
-	publicationID := publicationIDForTask(task)
+	publicationID := publicationIDForTaskUID(task, acpTaskControlUID(task))
 	if task.Spec.Workspace != nil && task.Spec.Workspace.Intent == corev1alpha1.WorkspaceIntentWrite {
 		publication, publicationErr := r.DurableControlStore.GetPublication(ctx, publicationID)
 		if publicationErr != nil {
@@ -164,7 +173,7 @@ func (r *TaskReconciler) acpTaskHasUnsettledExternalEffects(
 	if err := r.List(ctx, &effects, client.InNamespace(task.Namespace)); err != nil {
 		return false, err
 	}
-	related := map[string]struct{}{string(task.UID): {}, publicationID: {}}
+	related := map[string]struct{}{string(acpTaskControlUID(task)): {}, publicationID: {}}
 	if task.Status.Execution != nil && task.Status.Execution.RuntimeSessionUID != "" {
 		related[task.Status.Execution.RuntimeSessionUID] = struct{}{}
 	}
@@ -203,14 +212,14 @@ func (r *TaskReconciler) acpTaskTerminalProjectionID(
 		leaseGeneration = attempt.SessionLeaseGeneration
 	}
 	if task.Spec.SessionRef == nil || !bound {
-		return standaloneTaskTerminalProjectionID(task, task.Status.Execution.Attempt), nil
+		return standaloneTaskTerminalProjectionIDForUID(task.Namespace, acpTaskControlUID(task), task.Status.Execution.Attempt), nil
 	}
 	if sessionUID == "" || leaseGeneration < 1 {
 		return "", fmt.Errorf("session-backed ACP attempt lacks a frozen SessionTurn identity")
 	}
 	key := store.SessionTurnKey{
 		SessionUID: sessionUID, LeaseGeneration: leaseGeneration,
-		TaskUID: string(task.UID), Attempt: int64(task.Status.Execution.Attempt), PromptID: task.Status.Execution.PromptID,
+		TaskUID: string(acpTaskControlUID(task)), Attempt: int64(task.Status.Execution.Attempt), PromptID: task.Status.Execution.PromptID,
 	}
 	turnID, err := key.CanonicalID()
 	if err != nil {
@@ -237,7 +246,7 @@ func (r *TaskReconciler) reclaimACPTaskPublicationBundles(ctx context.Context, t
 	}
 	for _, target := range targets {
 		operationDigest, digestErr := acpDomainDigest("publication-reclaim-operation", map[string]any{
-			"namespace": task.Namespace, "taskUID": string(task.UID),
+			"namespace": task.Namespace, "taskUID": string(acpTaskControlUID(task)),
 			"publicationID": target.id, "publicationGeneration": target.generation,
 		})
 		if digestErr != nil {
@@ -281,7 +290,7 @@ func (r *TaskReconciler) acpPublicationReclaimTargets(
 	}
 	for i := range publications.Items {
 		publication := &publications.Items[i]
-		if publication.Spec.TaskUID != string(task.UID) {
+		if publication.Spec.TaskUID != string(acpTaskControlUID(task)) {
 			continue
 		}
 		if publication.Spec.ID == "" || publication.Spec.Generation < 1 {
@@ -382,7 +391,7 @@ func (r *TaskReconciler) acpPromptAttemptReclamationRequest(
 		return store.ReclaimPromptAttemptsRequest{}, fmt.Errorf("task is required for ACP prompt attempt reclamation")
 	}
 	request := store.ReclaimPromptAttemptsRequest{
-		Namespace: task.Namespace, TaskName: task.Name, TaskUID: string(task.UID),
+		Namespace: task.Namespace, TaskName: task.Name, TaskUID: string(acpTaskControlUID(task)),
 		ContinuitySession: task.Spec.SessionRef != nil,
 	}
 	if acpTaskRequiresAuthoritativeAttemptDiscovery(task) {
@@ -391,13 +400,13 @@ func (r *TaskReconciler) acpPromptAttemptReclamationRequest(
 		if task.Status.Execution.RuntimeSessionUID != "" {
 			request.RelatedExternalEffectAggregateIDs = append(request.RelatedExternalEffectAggregateIDs, task.Status.Execution.RuntimeSessionUID)
 		}
-		request.RelatedExternalEffectAggregateIDs = append(request.RelatedExternalEffectAggregateIDs, publicationIDForTask(task))
+		request.RelatedExternalEffectAggregateIDs = append(request.RelatedExternalEffectAggregateIDs, publicationIDForTaskUID(task, acpTaskControlUID(task)))
 		if acpTaskTerminalBeforeDurableAttempt(task) {
 			request.Mode = store.PromptAttemptReclamationNoAttempt
 			request.FinalContinuitySession = false
 		} else {
 			request.Mode = store.PromptAttemptReclamationProjected
-			attemptID, err := promptAttemptIDFromTask(task)
+			attemptID, err := promptAttemptIDFromTaskUID(task, acpTaskControlUID(task))
 			if err != nil {
 				return store.ReclaimPromptAttemptsRequest{}, err
 			}
@@ -464,7 +473,7 @@ func (r *TaskReconciler) acpArtifactRetirementIdentities(
 	}
 	for i := range attempts.Items {
 		attempt := &attempts.Items[i]
-		if attempt.Spec.TaskUID != string(task.UID) {
+		if attempt.Spec.TaskUID != string(acpTaskControlUID(task)) {
 			continue
 		}
 		if !store.IsTerminalPromptExecutionState(store.PromptExecutionState(attempt.Status.ExecutionState)) ||
@@ -480,7 +489,7 @@ func (r *TaskReconciler) acpArtifactRetirementIdentities(
 	}
 	for i := range publications.Items {
 		publication := &publications.Items[i]
-		if publication.Spec.TaskUID != string(task.UID) {
+		if publication.Spec.TaskUID != string(acpTaskControlUID(task)) {
 			continue
 		}
 		if !store.IsTerminalPublicationState(store.PublicationState(publication.Status.State)) {
@@ -489,10 +498,10 @@ func (r *TaskReconciler) acpArtifactRetirementIdentities(
 		publicationIDs[publication.Spec.ID] = struct{}{}
 	}
 	if task.Status.Execution != nil && task.Spec.Workspace != nil && task.Spec.Workspace.Intent == corev1alpha1.WorkspaceIntentWrite {
-		publicationIDs[publicationIDForTask(task)] = struct{}{}
+		publicationIDs[publicationIDForTaskUID(task, acpTaskControlUID(task))] = struct{}{}
 	}
 
-	relatedEffects := map[string]struct{}{string(task.UID): {}}
+	relatedEffects := map[string]struct{}{string(acpTaskControlUID(task)): {}}
 	if task.Status.Execution != nil && task.Status.Execution.RuntimeSessionUID != "" {
 		relatedEffects[task.Status.Execution.RuntimeSessionUID] = struct{}{}
 	}
@@ -515,7 +524,7 @@ func (r *TaskReconciler) acpArtifactRetirementIdentities(
 		}
 	}
 
-	identities := []artifactcap.Identity{{Namespace: task.Namespace, TaskID: string(task.UID)}}
+	identities := []artifactcap.Identity{{Namespace: task.Namespace, TaskID: string(acpTaskControlUID(task))}}
 	orderedPublications := make([]string, 0, len(publicationIDs))
 	for publicationID := range publicationIDs {
 		orderedPublications = append(orderedPublications, publicationID)

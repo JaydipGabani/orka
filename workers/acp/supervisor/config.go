@@ -147,11 +147,12 @@ func (c Config) Validate() error {
 }
 
 func (c Config) bearerMatches(value string) bool {
-	value = strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
-	if len(value) != len(c.ControllerBearerToken) {
+	value = strings.TrimSpace(value)
+	token, ok := strings.CutPrefix(value, "Bearer ")
+	if !ok || token == "" || strings.TrimSpace(token) != token || len(token) != len(c.ControllerBearerToken) {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(value), []byte(c.ControllerBearerToken)) == 1
+	return subtle.ConstantTimeCompare([]byte(token), []byte(c.ControllerBearerToken)) == 1
 }
 
 func EmptyWorkspaceMaterializer() WorkspaceMaterializer {

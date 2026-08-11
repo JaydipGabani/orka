@@ -15,6 +15,7 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/taskterminal"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
@@ -177,6 +178,7 @@ const (
 	promptAttemptReclamationNamePrefix = "prompt-reclaim-"
 	promptAttemptReclamationDataKey    = "reclamation.json"
 	promptAttemptReclamationVersion    = 1
+	restoredTaskIdentityChangedReason  = corev1alpha1.TaskExecutionReason("RestoreIdentityChanged")
 
 	promptAttemptReclamationCompleteCondition = "ACPPromptAttemptsReclaimed"
 	promptAttemptReclamationCompleteReason    = "PromptAttemptsReclaimed"
@@ -205,6 +207,7 @@ type promptAttemptReclamationMarker struct {
 	FinalContinuitySession              bool                               `json:"finalContinuitySession,omitempty"`
 	FinalPromptAttemptID                string                             `json:"finalPromptAttemptId,omitempty"`
 	TerminalProjectionID                string                             `json:"terminalProjectionId,omitempty"`
+	TerminalProjectionPayloadDigest     string                             `json:"terminalProjectionPayloadDigest,omitempty"`
 	FinalSessionTurnID                  string                             `json:"finalSessionTurnId,omitempty"`
 	TerminalProjectionAggregateKind     string                             `json:"terminalProjectionAggregateKind,omitempty"`
 	TerminalProjectionAggregateID       string                             `json:"terminalProjectionAggregateId,omitempty"`
@@ -308,12 +311,15 @@ func (s *Store) preparePromptAttemptReclamationLocked(
 	if err := s.readClient().Get(ctx, taskKey, task); err != nil {
 		return promptAttemptReclamationMarker{}, nil, mapKubernetesError("get Task for prompt attempt reclamation", err)
 	}
-	if string(task.UID) != request.TaskUID || task.Spec.Type != corev1alpha1.TaskTypeAgent || task.DeletionTimestamp.IsZero() {
+	if task.Spec.Type != corev1alpha1.TaskTypeAgent || task.DeletionTimestamp.IsZero() {
 		return promptAttemptReclamationMarker{}, nil, controlConflict("Task %s/%s does not match deleting agent Task UID %q", request.Namespace, request.TaskName, request.TaskUID)
 	}
 
 	candidates, err := s.listTaskPromptAttempts(ctx, request.Namespace, request.TaskUID)
 	if err != nil {
+		return promptAttemptReclamationMarker{}, nil, err
+	}
+	if err := validatePromptAttemptReclamationTaskIdentityKube(task, request, candidates); err != nil {
 		return promptAttemptReclamationMarker{}, nil, err
 	}
 	completed, err := promptAttemptReclamationCompleted(task, request)
@@ -523,8 +529,11 @@ func (s *Store) recordPromptAttemptReclamationCompletion(ctx context.Context, re
 		if err := s.readClient().Get(ctx, key, task); err != nil {
 			return err
 		}
-		if string(task.UID) != request.TaskUID || task.Spec.Type != corev1alpha1.TaskTypeAgent || task.DeletionTimestamp.IsZero() {
+		if task.Spec.Type != corev1alpha1.TaskTypeAgent || task.DeletionTimestamp.IsZero() {
 			return controlConflict("Task %s/%s no longer matches deleting agent Task UID %q", request.Namespace, request.TaskName, request.TaskUID)
+		}
+		if err := validatePromptAttemptReclamationTaskIdentityKube(task, request, nil); err != nil {
+			return err
 		}
 		if completed, completedErr := promptAttemptReclamationCompleted(task, request); completedErr != nil {
 			return completedErr
@@ -545,6 +554,108 @@ func (s *Store) recordPromptAttemptReclamationCompletion(ctx context.Context, re
 		return nil
 	})
 	return mapKubernetesError("record PromptAttempt reclamation completion", err)
+}
+
+func validatePromptAttemptReclamationTaskIdentityKube(
+	task *corev1alpha1.Task,
+	request store.ReclaimPromptAttemptsRequest,
+	candidates []*corev1alpha1.PromptAttempt,
+) error {
+	if task == nil {
+		return controlConflict("prompt attempt reclamation Task is missing")
+	}
+	if string(task.UID) == request.TaskUID {
+		return nil
+	}
+	if request.Mode != store.PromptAttemptReclamationProjected {
+		return controlConflict("restored Task %s/%s may only reclaim its projected source PromptAttempt", task.Namespace, task.Name)
+	}
+	binding := task.Status.AgentExecutionBinding
+	execution := task.Status.Execution
+	if binding == nil || execution == nil || binding.ContractVersion != corev1alpha1.AgentRuntimeContractHarnessV2 ||
+		string(binding.Task.UID) != request.TaskUID || binding.Task.UID == task.UID ||
+		execution.Reason != restoredTaskIdentityChangedReason ||
+		execution.Attempt < 1 || strings.TrimSpace(execution.PromptID) == "" ||
+		!restoredTaskExecutionIsTerminal(task) {
+		return controlConflict("Task %s/%s does not contain validated restored source identity %q", task.Namespace, task.Name, request.TaskUID)
+	}
+	snapshotKey := store.AgentExecutionSnapshotKey{TaskUID: request.TaskUID, Digest: binding.Snapshot.Digest}
+	if binding.Snapshot.ID != snapshotKey.ID() || binding.Snapshot.SchemaVersion != store.AgentExecutionSnapshotSchemaVersion {
+		return controlConflict("Task %s/%s restored execution snapshot does not match source identity %q", task.Namespace, task.Name, request.TaskUID)
+	}
+	attemptID, err := (store.PromptAttemptKey{
+		Namespace: task.Namespace,
+		TaskUID:   request.TaskUID,
+		Attempt:   int64(execution.Attempt),
+		PromptID:  execution.PromptID,
+	}).CanonicalID()
+	if err != nil {
+		return err
+	}
+	if request.FinalPromptAttemptID != attemptID {
+		return controlConflict("Task %s/%s restored final PromptAttempt does not match source identity %q", task.Namespace, task.Name, request.TaskUID)
+	}
+	if len(candidates) == 0 {
+		// A prepared retry may observe no candidates after deletion. The immutable
+		// marker and Task-scoped completion digest still revalidate the full request.
+		return nil
+	}
+	for _, object := range candidates {
+		if object.Spec.ID != attemptID {
+			continue
+		}
+		if object.Spec.TaskUID != request.TaskUID || object.Spec.Attempt != int64(execution.Attempt) ||
+			object.Spec.PromptID != execution.PromptID || object.Spec.BindingDigest != binding.BindingDigest ||
+			object.Spec.SnapshotDigest != binding.Snapshot.Digest ||
+			(strings.TrimSpace(execution.RequestDigest) != "" && object.Spec.RequestDigest != execution.RequestDigest) {
+			return controlConflict("Task %s/%s restored final PromptAttempt does not match its frozen execution binding", task.Namespace, task.Name)
+		}
+		return nil
+	}
+	return controlConflict("Task %s/%s restored final PromptAttempt %q is not owned by the source identity", task.Namespace, task.Name, attemptID)
+}
+
+func restoredTaskExecutionIsTerminal(task *corev1alpha1.Task) bool {
+	if task == nil || task.Status.Execution == nil || task.Status.Delivery == nil {
+		return false
+	}
+	execution := task.Status.Execution
+	delivery := task.Status.Delivery
+	deliveryState := store.PromptDeliveryState(delivery.State)
+	if !store.IsTerminalPromptDeliveryState(deliveryState) ||
+		string(delivery.Outcome) != string(delivery.State) {
+		return false
+	}
+	switch execution.State {
+	case corev1alpha1.TaskExecutionStateSucceeded:
+		if execution.Outcome != corev1alpha1.TaskExecutionOutcomeSucceeded {
+			return false
+		}
+		switch deliveryState {
+		case store.PromptDeliveryNotRequested, store.PromptDeliveryReadValidated,
+			store.PromptDeliveryNoChange, store.PromptDeliveryVerifiedExact,
+			store.PromptDeliveryDeliveredSuperseded:
+			return task.Status.Phase == corev1alpha1.TaskPhaseSucceeded
+		case store.PromptDeliveryCancelledBeforePublish:
+			return task.Status.Phase == corev1alpha1.TaskPhaseCancelled
+		case store.PromptDeliveryReadOnlyWorkspaceModified, store.PromptDeliveryConflict,
+			store.PromptDeliveryCredentialBlocked, store.PromptDeliveryPublicationOutcomeUnknown:
+			return task.Status.Phase == corev1alpha1.TaskPhaseFailed
+		default:
+			return false
+		}
+	case corev1alpha1.TaskExecutionStateCancelled:
+		return execution.Outcome == corev1alpha1.TaskExecutionOutcomeCancelled &&
+			task.Status.Phase == corev1alpha1.TaskPhaseCancelled
+	case corev1alpha1.TaskExecutionStateFailed:
+		return execution.Outcome == corev1alpha1.TaskExecutionOutcomeFailed &&
+			task.Status.Phase == corev1alpha1.TaskPhaseFailed
+	case corev1alpha1.TaskExecutionStateOutcomeUnknown:
+		return execution.Outcome == corev1alpha1.TaskExecutionOutcomeOutcomeUnknown &&
+			task.Status.Phase == corev1alpha1.TaskPhaseFailed
+	default:
+		return false
+	}
 }
 
 func normalizePromptAttemptReclamationRequestKube(request store.ReclaimPromptAttemptsRequest) (store.ReclaimPromptAttemptsRequest, error) {
@@ -804,9 +915,11 @@ func (s *Store) buildPromptAttemptReclamationMarkerKube(
 			marker.TerminalProjectionAggregateKind = "Task"
 			marker.TerminalProjectionAggregateID = request.TaskUID
 		}
-		if err := s.verifyPromptAttemptTerminalProjectionMarkerKube(ctx, marker); err != nil {
+		payloadDigest, err := s.verifyPromptAttemptTerminalProjectionMarkerKube(ctx, marker)
+		if err != nil {
 			return promptAttemptReclamationMarker{}, err
 		}
+		marker.TerminalProjectionPayloadDigest = payloadDigest
 	}
 	return marker, nil
 }
@@ -852,7 +965,8 @@ func (s *Store) verifyPreparedPromptAttemptReclamationKube(
 		return err
 	}
 	if marker.Mode == store.PromptAttemptReclamationProjected {
-		return s.verifyPromptAttemptTerminalProjectionMarkerKube(ctx, marker)
+		_, err := s.verifyPromptAttemptTerminalProjectionMarkerKube(ctx, marker)
+		return err
 	}
 	return nil
 }
@@ -961,37 +1075,64 @@ func (s *Store) verifyPromptAttemptPublicationsAndEffectsKube(ctx context.Contex
 	return nil
 }
 
-func (s *Store) verifyPromptAttemptTerminalProjectionMarkerKube(ctx context.Context, marker promptAttemptReclamationMarker) error {
+func (s *Store) verifyPromptAttemptTerminalProjectionMarkerKube(ctx context.Context, marker promptAttemptReclamationMarker) (string, error) {
 	if s.outbox == nil {
-		return ErrOutboxStoreNotConfigured
+		return "", ErrOutboxStoreNotConfigured
 	}
 	projection, err := s.outbox.GetOutboxProjection(ctx, marker.TerminalProjectionID)
 	if errors.Is(err, store.ErrNotFound) {
-		return promptAttemptReclaimNotReady("terminal projection %q is not durable", marker.TerminalProjectionID)
+		return "", promptAttemptReclaimNotReady("terminal projection %q is not durable", marker.TerminalProjectionID)
 	}
 	if err != nil {
-		return fmt.Errorf("load terminal projection for prompt attempt reclamation: %w", err)
+		return "", fmt.Errorf("load terminal projection for prompt attempt reclamation: %w", err)
 	}
 	if projection.State != store.OutboxProjectionDelivered {
-		return promptAttemptReclaimNotReady("terminal projection %q is not delivered", projection.ID)
+		return "", promptAttemptReclaimNotReady("terminal projection %q is not delivered", projection.ID)
 	}
 	if projection.ProjectionKind != "TaskTerminalStatus" ||
 		projection.AggregateKind != marker.TerminalProjectionAggregateKind || projection.AggregateID != marker.TerminalProjectionAggregateID {
-		return controlConflict("terminal projection %q does not match the prepared Task finalization aggregate", projection.ID)
+		return "", controlConflict("terminal projection %q does not match the prepared Task finalization aggregate", projection.ID)
+	}
+	payloadDigest := canonicalBytesDigest(projection.Payload)
+	if projection.PayloadDigest != payloadDigest {
+		return "", controlConflict("terminal projection %q payload does not match its digest", projection.ID)
+	}
+	if marker.TerminalProjectionPayloadDigest != "" && marker.TerminalProjectionPayloadDigest != payloadDigest {
+		return "", controlConflict("terminal projection %q changed after prompt attempt reclamation was prepared", projection.ID)
+	}
+	task := &corev1alpha1.Task{}
+	if err := s.readClient().Get(ctx, client.ObjectKey{Namespace: marker.Namespace, Name: marker.TaskName}, task); err != nil {
+		return "", mapKubernetesError("load Task for terminal projection validation", err)
+	}
+	attemptMissing := false
+	attempt, err := s.GetPromptAttempt(ctx, marker.FinalPromptAttemptID)
+	if errors.Is(err, store.ErrNotFound) {
+		if marker.TerminalProjectionPayloadDigest != payloadDigest {
+			return "", promptAttemptReclaimNotReady("final prompt attempt %q is not durable", marker.FinalPromptAttemptID)
+		}
+		attemptMissing = true
+	}
+	if err != nil && !attemptMissing {
+		return "", fmt.Errorf("load final prompt attempt for terminal projection validation: %w", err)
+	}
+	if !attemptMissing {
+		if _, err := taskterminal.ValidateRestoredProjection(projection.Payload, task, marker.TaskUID, attempt); err != nil {
+			return "", err
+		}
 	}
 	if marker.FinalSessionTurnID != "" {
 		if s.sessionTurns == nil {
-			return ErrSessionTurnStoreNotConfigured
+			return "", ErrSessionTurnStoreNotConfigured
 		}
 		turn, err := s.sessionTurns.GetSessionTurn(ctx, marker.FinalSessionTurnID)
 		if err != nil {
-			return fmt.Errorf("load final SessionTurn for prompt attempt reclamation: %w", err)
+			return "", fmt.Errorf("load final SessionTurn for prompt attempt reclamation: %w", err)
 		}
 		if turn.State != store.SessionTurnFinalized || turn.FinalizedAt == nil || turn.ProjectionID != projection.ID {
-			return controlConflict("terminal projection %q does not match final SessionTurn %q", projection.ID, marker.FinalSessionTurnID)
+			return "", controlConflict("terminal projection %q does not match final SessionTurn %q", projection.ID, marker.FinalSessionTurnID)
 		}
 	}
-	return nil
+	return payloadDigest, nil
 }
 
 func promptAttemptReclaimNotReady(format string, args ...any) error {

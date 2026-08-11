@@ -38,6 +38,27 @@ import (
 	"github.com/orka-agents/orka/internal/store/sqlite"
 )
 
+func TestCompletedPromptResultTextPrefersTerminalContent(t *testing.T) {
+	terminal := &harnessv2.Event{Completed: &harnessv2.CompletedEvent{Result: harnessv2.PromptResult{
+		Content: []harnessv2.ContentBlock{{Type: harnessv2.ContentBlockText, Text: `{"schemaVersion":1,"ok":true}`}},
+	}}}
+	got, err := completedPromptResultText(terminal, "commentary that must not become the result", true)
+	if err != nil {
+		t.Fatalf("terminal result selection: %v", err)
+	}
+	if got != `{"schemaVersion":1,"ok":true}` {
+		t.Fatalf("terminal result = %q", got)
+	}
+
+	got, err = completedPromptResultText(&harnessv2.Event{}, " legacy result ", false)
+	if err != nil || got != "legacy result" {
+		t.Fatalf("legacy fallback = %q, err=%v", got, err)
+	}
+	if _, err = completedPromptResultText(&harnessv2.Event{}, "truncated", true); err == nil {
+		t.Fatal("overflowed fallback without terminal result was accepted")
+	}
+}
+
 func prepareBoundACPDispatcherTaskForTest(
 	t *testing.T,
 	ctx context.Context,
@@ -561,6 +582,7 @@ func TestACPDispatcherExecutesNoChangeTask(t *testing.T) {
 		&corev1alpha1.PromptAttempt{}, &corev1alpha1.RuntimeSessionControl{},
 		&corev1alpha1.BranchClaim{}, &corev1alpha1.Publication{}, &corev1alpha1.ExternalEffect{},
 	).WithObjects(task, pool, secret, agent, namespace).Build()
+	kubeClient = withControllerEpochLeaseUIDs(t, kubeClient)
 	db, err := sqlite.NewDB(filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -2746,6 +2768,7 @@ func TestACPDispatcherReserveTaskRecoversIncompletePreSubmissionRollback(t *test
 		).
 		WithObjects(task.DeepCopy(), pool.DeepCopy()).
 		Build()
+	kubeClient = withControllerEpochLeaseUIDs(t, kubeClient)
 	db, err := sqlite.NewDB(filepath.Join(t.TempDir(), "session-rollback.db"))
 	if err != nil {
 		t.Fatal(err)

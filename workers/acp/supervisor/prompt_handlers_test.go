@@ -62,6 +62,29 @@ func TestPromptStreamErrorClass(t *testing.T) {
 	}
 }
 
+func TestPromptStreamMalformedValidationClassIsBounded(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "not malformed", err: harnessv2.ErrEventRateExceeded},
+		{name: "assistant empty", err: fmt.Errorf("%w: assistant message chunk is required", harnessv2.ErrMalformedEvent), want: "assistant-empty"},
+		{name: "assistant too large", err: fmt.Errorf("%w: assistant message chunk exceeds 4096 bytes", harnessv2.ErrMalformedEvent), want: "assistant-too-large"},
+		{name: "assistant UTF-8", err: fmt.Errorf("%w: assistant message chunk contains invalid UTF-8", harnessv2.ErrMalformedEvent), want: "assistant-invalid-utf8"},
+		{name: "tool status", err: fmt.Errorf("%w: unsupported tool call status provider-secret", harnessv2.ErrMalformedEvent), want: "tool-call-status"},
+		{name: "plan content", err: fmt.Errorf("%w: plan entry content exceeds 4096 bytes", harnessv2.ErrMalformedEvent), want: "plan-content"},
+		{name: "other", err: fmt.Errorf("%w: provider-secret-must-not-leak", harnessv2.ErrMalformedEvent), want: "Other"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := promptStreamMalformedValidationClass(test.err); got != test.want {
+				t.Fatalf("validation class = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestPromptDuplicateClassificationPrecedesCapacityAdmission(t *testing.T) {
 	server, cfg, profile := newTestServer(t, "immediate")
 	create := testCreateSessionRequest(t, cfg, profile)
@@ -381,13 +404,62 @@ func TestWorkspaceDeltaRouteValidatesSettledPromptWithoutPromptPathSegment(t *te
 }
 
 func TestPromptExecutionDiagnosticDoesNotExposeRPCMessage(t *testing.T) {
-	stage, code := promptExecutionDiagnostic(&acp.RPCError{Code: -32001, Message: "provider-secret-must-not-leak"})
-	if stage != "json-rpc-error" || code != -32001 {
-		t.Fatalf("RPC diagnostic = %q/%d", stage, code)
+	stage, code, service, errorName := promptExecutionDiagnostic(&acp.RPCError{
+		Code:    -32001,
+		Message: "provider-secret-must-not-leak",
+		Data:    json.RawMessage(`{"service":"session","errorName":"APIError","detail":"provider-secret-must-not-leak"}`),
+	})
+	if stage != promptExecutionStageJSONRPCError || code != -32001 || service != "session" || errorName != "APIError" {
+		t.Fatalf("RPC diagnostic = %q/%d/%q/%q", stage, code, service, errorName)
 	}
-	stage, code = promptExecutionDiagnostic(acp.ErrClosed)
-	if stage != "transport-closed" || code != 0 {
-		t.Fatalf("closed diagnostic = %q/%d", stage, code)
+	stage, code, service, errorName = promptExecutionDiagnostic(&acp.RPCError{
+		Code: -32603,
+		Data: json.RawMessage(`{"service":"session\nsecret","errorName":"` + strings.Repeat("x", 65) + `"}`),
+	})
+	if stage != promptExecutionStageJSONRPCError || code != -32603 || service != "" || errorName != "" {
+		t.Fatalf("unsafe RPC diagnostic = %q/%d/%q/%q", stage, code, service, errorName)
+	}
+	stage, code, service, errorName = promptExecutionDiagnostic(acp.ErrClosed)
+	if stage != "transport-closed" || code != 0 || service != "" || errorName != "" {
+		t.Fatalf("closed diagnostic = %q/%d/%q/%q", stage, code, service, errorName)
+	}
+}
+
+func TestPromptTerminalDiagnosticAllowsOnlyProtocolEnums(t *testing.T) {
+	tests := []struct {
+		name           string
+		result         acp.PromptResult
+		wantOutcome    string
+		wantStopReason string
+	}{
+		{
+			name: "failed max turn requests",
+			result: acp.PromptResult{
+				Outcome: acp.PromptOutcomeFailed, StopReason: acp.StopReasonMaxTurnRequests,
+			},
+			wantOutcome: "failed", wantStopReason: "max_turn_requests",
+		},
+		{
+			name:        "missing stop reason",
+			result:      acp.PromptResult{Outcome: acp.PromptOutcomeFailed},
+			wantOutcome: "failed", wantStopReason: "",
+		},
+		{
+			name: "unrecognized values",
+			result: acp.PromptResult{
+				Outcome:    acp.PromptOutcome("provider-secret-outcome"),
+				StopReason: acp.StopReason("provider-secret-reason"),
+			},
+			wantOutcome: "Other", wantStopReason: "Other",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			outcome, stopReason := promptTerminalDiagnostic(test.result)
+			if outcome != test.wantOutcome || stopReason != test.wantStopReason {
+				t.Fatalf("terminal diagnostic = %q/%q, want %q/%q", outcome, stopReason, test.wantOutcome, test.wantStopReason)
+			}
+		})
 	}
 }
 

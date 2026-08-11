@@ -192,7 +192,7 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 	streamBroken := false
-	markStreamBroken := func(stage, eventType string, sequence int64, err error) {
+	markStreamBroken := func(stage, eventType, updateKind string, sequence int64, err error) {
 		if streamBroken {
 			return
 		}
@@ -202,8 +202,10 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 			"stage", stage,
 			"promptID", request.Metadata.PromptID,
 			"eventType", eventType,
+			"updateKind", updateKind,
 			"sequence", sequence,
 			"errorClass", promptStreamErrorClass(err),
+			"validationClass", promptStreamMalformedValidationClass(err),
 			"errorDetail", promptStreamErrorDetail(err),
 		)
 	}
@@ -212,7 +214,11 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := encoder.Encode(event); err != nil {
-			markStreamBroken("event-encode", string(event.Type), int64(event.Identity.Sequence), err)
+			updateKind := ""
+			if event.Update != nil {
+				updateKind = string(event.Update.Kind)
+			}
+			markStreamBroken("event-encode", string(event.Type), updateKind, int64(event.Identity.Sequence), err)
 			deactivatePromptCapabilities(state, request.Metadata.PromptID, harnessv2.RuntimeSessionStateCancelling)
 			cancelCtx, cancel := context.WithTimeout(
 				context.Background(), defaultDuration(s.cfg.CancelGrace, acp.DefaultStopGrace)*2,
@@ -226,39 +232,71 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if first.Type != acp.PromptEventAccepted {
-		markStreamBroken("first-event", string(first.Type), first.Sequence, nil)
+		markStreamBroken("first-event", string(first.Type), "", first.Sequence, nil)
 		deactivatePromptCapabilities(state, request.Metadata.PromptID, harnessv2.RuntimeSessionStateCancelling)
 		_, _ = runtimeSession.CancelPrompt(context.Background(), string(request.Metadata.PromptID))
 	}
-	mapped, err := s.mapRuntimeEvent(state, prompt, first)
-	if err != nil {
-		markStreamBroken("event-map", string(first.Type), first.Sequence, err)
-		deactivatePromptCapabilities(state, request.Metadata.PromptID, harnessv2.RuntimeSessionStateCancelling)
-		_, _ = runtimeSession.CancelPrompt(context.Background(), string(request.Metadata.PromptID))
-	} else if mapped != nil {
-		encodeEvent(*mapped)
-	}
-	for event := range run.Events {
+	mapAndEncode := func(event acp.PromptEvent) {
 		mapped, mapErr := s.mapRuntimeEvent(state, prompt, event)
 		if mapErr != nil {
-			markStreamBroken("event-map", string(event.Type), event.Sequence, mapErr)
+			markStreamBroken("event-map", string(event.Type), "", event.Sequence, mapErr)
 			deactivatePromptCapabilities(state, request.Metadata.PromptID, harnessv2.RuntimeSessionStateCancelling)
 			_, _ = runtimeSession.CancelPrompt(context.Background(), string(request.Metadata.PromptID))
-			continue
+			return
 		}
 		if mapped != nil {
 			encodeEvent(*mapped)
 		}
 	}
+	mapAndEncode(first)
+	compactor := newAssistantMessageCompactor()
+	defer compactor.close()
+	events := run.Events
+	for events != nil {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				for _, pending := range compactor.flushPending() {
+					mapAndEncode(pending)
+				}
+				events = nil
+				continue
+			}
+			for _, ready := range compactor.push(event, time.Now()) {
+				mapAndEncode(ready)
+			}
+		case <-compactor.timerChannel():
+			for _, pending := range compactor.flushPending() {
+				mapAndEncode(pending)
+			}
+		}
+	}
 	result := <-run.Result
 	if result.Err != nil {
-		stage, rpcCode := promptExecutionDiagnostic(result.Err)
-		slog.Error("ACP prompt execution failed", "stage", stage, "rpcCode", rpcCode, "accepted", result.Accepted)
+		stage, rpcCode, rpcService, rpcErrorName := promptExecutionDiagnostic(result.Err)
+		slog.Error(
+			"ACP prompt execution failed",
+			"stage", stage,
+			"rpcCode", rpcCode,
+			"rpcService", rpcService,
+			"rpcErrorName", rpcErrorName,
+			"accepted", result.Accepted,
+		)
 	}
 	deactivatePromptCapabilities(state, request.Metadata.PromptID, harnessv2.RuntimeSessionStateCancelling)
 	terminal, settledResult, terminalErr := s.terminalEvent(state, prompt, result)
+	if settledResult.Outcome == acp.PromptOutcomeFailed {
+		outcome, stopReason := promptTerminalDiagnostic(settledResult)
+		slog.Error(
+			"ACP prompt settled failed",
+			"outcome", outcome,
+			"stopReason", stopReason,
+			"accepted", settledResult.Accepted,
+			"errorPresent", settledResult.Err != nil,
+		)
+	}
 	if terminalErr != nil {
-		markStreamBroken("terminal-build", string(terminal.Type), int64(terminal.Identity.Sequence), terminalErr)
+		markStreamBroken("terminal-build", string(terminal.Type), "", int64(terminal.Identity.Sequence), terminalErr)
 	} else {
 		encodeEvent(terminal)
 	}
@@ -274,6 +312,25 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 	s.finishPrompt(state, prompt, settledResult, terminal.Identity.Timestamp)
 	slotHeld = false
 	<-s.promptSlots
+}
+
+func promptTerminalDiagnostic(result acp.PromptResult) (string, string) {
+	const promptDiagnosticOther = "Other"
+
+	outcome := promptDiagnosticOther
+	switch result.Outcome {
+	case acp.PromptOutcomeCompleted, acp.PromptOutcomeCancelled, acp.PromptOutcomeFailed, acp.PromptOutcomeOutcomeUnknown:
+		outcome = string(result.Outcome)
+	}
+	stopReason := promptDiagnosticOther
+	switch result.StopReason {
+	case acp.StopReasonEndTurn, acp.StopReasonMaxTokens, acp.StopReasonMaxTurnRequests,
+		acp.StopReasonRefusal, acp.StopReasonCancelled:
+		stopReason = string(result.StopReason)
+	case "":
+		stopReason = ""
+	}
+	return outcome, stopReason
 }
 
 func promptStreamErrorDetail(err error) string {
@@ -331,20 +388,90 @@ func promptStreamErrorClass(err error) string {
 	}
 }
 
-func promptExecutionDiagnostic(err error) (string, int) {
+func promptStreamMalformedValidationClass(err error) string {
+	const promptDiagnosticOther = "Other"
+
+	if !errors.Is(err, harnessv2.ErrMalformedEvent) {
+		return ""
+	}
+	detail := err.Error()
+	switch {
+	case strings.Contains(detail, "assistant message chunk is required"):
+		return "assistant-empty"
+	case strings.Contains(detail, "assistant message chunk exceeds"):
+		return "assistant-too-large"
+	case strings.Contains(detail, "assistant message chunk contains invalid UTF-8"):
+		return "assistant-invalid-utf8"
+	case strings.Contains(detail, "update event must carry exactly one typed payload"),
+		strings.Contains(detail, "update requires"):
+		return "update-payload"
+	case strings.Contains(detail, "tool call ID"):
+		return "tool-call-id"
+	case strings.Contains(detail, "tool call title"):
+		return "tool-call-title"
+	case strings.Contains(detail, "tool call kind"):
+		return "tool-call-kind"
+	case strings.Contains(detail, "unsupported tool call status"):
+		return "tool-call-status"
+	case strings.Contains(detail, "tool call content"):
+		return "tool-call-content"
+	case strings.Contains(detail, "plan entry count"):
+		return "plan-count"
+	case strings.Contains(detail, "plan entry content"):
+		return "plan-content"
+	case strings.Contains(detail, "plan entry priority"):
+		return "plan-priority"
+	case strings.Contains(detail, "plan entry") && strings.Contains(detail, "unsupported status"):
+		return "plan-status"
+	case strings.Contains(detail, "diagnostic code"):
+		return "diagnostic-code"
+	case strings.Contains(detail, "diagnostic message"):
+		return "diagnostic-message"
+	default:
+		return promptDiagnosticOther
+	}
+}
+
+const promptExecutionStageJSONRPCError = "json-rpc-error"
+
+func promptExecutionDiagnostic(err error) (string, int, string, string) {
 	var rpcErr *acp.RPCError
 	switch {
 	case errors.As(err, &rpcErr):
-		return "json-rpc-error", rpcErr.Code
+		var data struct {
+			Service   string `json:"service"`
+			ErrorName string `json:"errorName"`
+		}
+		if len(rpcErr.Data) > 0 && json.Unmarshal(rpcErr.Data, &data) == nil {
+			return promptExecutionStageJSONRPCError, rpcErr.Code,
+				promptExecutionDiagnosticIdentifier(data.Service),
+				promptExecutionDiagnosticIdentifier(data.ErrorName)
+		}
+		return promptExecutionStageJSONRPCError, rpcErr.Code, "", ""
 	case errors.Is(err, acp.ErrClosed):
-		return "transport-closed", 0
+		return "transport-closed", 0, "", ""
 	case errors.Is(err, context.DeadlineExceeded):
-		return "deadline-exceeded", 0
+		return "deadline-exceeded", 0, "", ""
 	case errors.Is(err, context.Canceled):
-		return "context-canceled", 0
+		return "context-canceled", 0, "", ""
 	default:
-		return "client-error", 0
+		return "client-error", 0, "", ""
 	}
+}
+
+func promptExecutionDiagnosticIdentifier(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 {
+		return ""
+	}
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' || char == '.' || char == '_' || char == '-' {
+			continue
+		}
+		return ""
+	}
+	return value
 }
 
 func (s *Server) handleRenewLease(w http.ResponseWriter, r *http.Request) {
@@ -1416,13 +1543,8 @@ func (s *Server) mapRuntimeEvent(state *sessionState, prompt *promptState, event
 			prompt.sequence--
 			return nil, err
 		}
-		if text != "" && !prompt.terminalResultOverflow {
-			limit := s.cfg.Capabilities.Limits.MaxTerminalResultBytes
-			if len(text) > limit || prompt.assistant.Len() > limit-len(text) {
-				prompt.terminalResultOverflow = true
-			} else {
-				prompt.assistant.WriteString(text)
-			}
+		if text != "" {
+			prompt.appendAssistantText(text, acpAssistantMessagePhase(event.Update), s.cfg.Capabilities.Limits.MaxTerminalResultBytes)
 		}
 		if !ok {
 			prompt.sequence--
@@ -1469,7 +1591,8 @@ func (s *Server) terminalEvent(
 	}
 	event := s.buildTerminalEventLocked(state, prompt, effective, now)
 	limit := s.cfg.Capabilities.Limits.MaxTerminalResultBytes
-	if !prompt.terminalResultOverflow && serializedEventWithinLimit(event, limit) {
+	_, overflow := prompt.terminalResultText()
+	if !overflow && serializedEventWithinLimit(event, limit) {
 		return event, effective, nil
 	}
 
@@ -1506,7 +1629,7 @@ func (s *Server) buildTerminalEventLocked(
 	}
 	switch result.Outcome {
 	case acp.PromptOutcomeCompleted:
-		text := prompt.assistant.String()
+		text, _ := prompt.terminalResultText()
 		if strings.TrimSpace(text) == "" {
 			text = "Prompt completed without textual output."
 		}
@@ -1539,6 +1662,33 @@ func (s *Server) buildTerminalEventLocked(
 		}
 	}
 	return event
+}
+
+func (p *promptState) appendAssistantText(text, phase string, limit int) {
+	appendBoundedPromptText(&p.assistant, &p.assistantOverflow, text, limit)
+	if phase != acpAssistantPhaseFinalAnswer {
+		return
+	}
+	p.finalAnswerSeen = true
+	appendBoundedPromptText(&p.finalAnswer, &p.finalAnswerOverflow, text, limit)
+}
+
+func (p *promptState) terminalResultText() (string, bool) {
+	if p.finalAnswerSeen {
+		return p.finalAnswer.String(), p.finalAnswerOverflow
+	}
+	return p.assistant.String(), p.assistantOverflow
+}
+
+func appendBoundedPromptText(builder *strings.Builder, overflow *bool, text string, limit int) {
+	if *overflow {
+		return
+	}
+	if limit < 1 || len(text) > limit || builder.Len() > limit-len(text) {
+		*overflow = true
+		return
+	}
+	_, _ = builder.WriteString(text)
 }
 
 func providerTurnLimitResult(state *sessionState, prompt *promptState, result acp.PromptResult) acp.PromptResult {

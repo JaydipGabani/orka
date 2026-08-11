@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/artifactcap"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/publisher"
 	publisherservice "github.com/orka-agents/orka/internal/publisher/service"
@@ -60,6 +61,120 @@ func TestDeletingACPTaskReclaimsPromptAttemptsAfterFinalizationBarriers(t *testi
 		request.TerminalProjectionID != standaloneTaskTerminalProjectionID(task, task.Status.Execution.Attempt) ||
 		request.Fence.Name != store.DefaultControllerEpochName || request.Fence.Epoch != 7 || request.Fence.HolderID != "reclaim-controller" {
 		t.Fatalf("reclaim request = %#v, want exact Task/final-attempt/projection/epoch binding", request)
+	}
+}
+
+func TestDeletingRestoredACPTaskUsesFrozenSourceIdentityForCleanup(t *testing.T) {
+	task, attempt := promptAttemptReclaimFinalizerFixture(t)
+	sourceUID := task.UID
+	restoredUID := types.UID("99999999-8888-7777-6666-555555555555")
+	task.UID = restoredUID
+	task.Finalizers = []string{labels.TaskFinalizer}
+	binding := testACPExecuteBindingForDispatcher()
+	binding.Task.UID = sourceUID
+	task.Status.AgentExecutionBinding = binding
+	task.Status.Phase = corev1alpha1.TaskPhaseFailed
+	task.Status.Execution.State = corev1alpha1.TaskExecutionStateOutcomeUnknown
+	task.Status.Execution.Outcome = corev1alpha1.TaskExecutionOutcomeOutcomeUnknown
+	task.Status.Execution.Reason = corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason)
+	task.Status.Execution.RuntimeInstanceID = "runtime-instance"
+	task.Status.Execution.RuntimeSessionUID = "runtime-session"
+	task.Status.Execution.RuntimeSessionGeneration = 1
+	cleanupDigest, err := taskScopedRuntimeSessionCleanupDigest(
+		sourceUID,
+		task.Status.Execution.Attempt,
+		task.Status.Execution.RuntimeInstanceID,
+		task.Status.Execution.RuntimeSessionUID,
+		task.Status.Execution.RuntimeSessionGeneration,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Execution.RuntimeSessionCleanupDigest = cleanupDigest
+	if !taskScopedRuntimeSessionCleanupComplete(task) {
+		t.Fatal("restored Task did not recognize the source-bound RuntimeSession cleanup receipt")
+	}
+	attempt.BindingDigest = binding.BindingDigest
+	attempt.SnapshotDigest = binding.Snapshot.Digest
+
+	sourcePublicationID := publicationIDForTaskUID(task, sourceUID)
+	sourceProjectionID := standaloneTaskTerminalProjectionIDForUID(task.Namespace, sourceUID, task.Status.Execution.Attempt)
+	task.Status.Delivery.PublicationID = sourcePublicationID
+	publication := &store.Publication{
+		ID: sourcePublicationID, Namespace: task.Namespace, Generation: 1, State: store.PublicationVerifiedExact,
+	}
+	controlStore := &promptAttemptReclaimControlStore{
+		attempt: attempt, publication: publication,
+		projection: &store.OutboxProjection{ID: sourceProjectionID, State: store.OutboxProjectionDelivered},
+		reclaimed:  1,
+	}
+	attemptObject := &corev1alpha1.PromptAttempt{
+		ObjectMeta: metav1.ObjectMeta{Namespace: task.Namespace, Name: "restored-source-attempt"},
+		Spec: corev1alpha1.PromptAttemptSpec{
+			ID: attempt.ID, TaskUID: string(sourceUID), Attempt: int64(task.Status.Execution.Attempt), PromptID: task.Status.Execution.PromptID,
+		},
+		Status: corev1alpha1.PromptAttemptStatus{
+			ExecutionState: corev1alpha1.PromptAttemptExecutionState(store.PromptExecutionSucceeded),
+			DeliveryState:  corev1alpha1.PromptAttemptDeliveryState(store.PromptDeliveryVerifiedExact),
+		},
+	}
+	publicationObject := &corev1alpha1.Publication{
+		ObjectMeta: metav1.ObjectMeta{Namespace: task.Namespace, Name: "restored-source-publication"},
+		Spec: corev1alpha1.PublicationSpec{
+			ID: sourcePublicationID, Generation: 1, TaskUID: string(sourceUID), Attempt: int64(task.Status.Execution.Attempt),
+		},
+		Status: corev1alpha1.PublicationStatus{State: corev1alpha1.PublicationControlState(store.PublicationVerifiedExact)},
+	}
+	reconciler := newUnitReconciler(newTestScheme(), task, attemptObject, publicationObject)
+	reconciler.DurableControlStore = controlStore
+	reconciler.ControllerEpochManager = readyPromptAttemptReclaimEpochManager()
+
+	ready, err := reconciler.acpTaskDeletionReady(context.Background(), task)
+	if err != nil || !ready {
+		t.Fatalf("restored Task deletion readiness = %v, %v", ready, err)
+	}
+	request, err := reconciler.acpPromptAttemptReclamationRequest(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.TaskUID != string(sourceUID) || request.FinalPromptAttemptID != attempt.ID ||
+		request.TerminalProjectionID != sourceProjectionID ||
+		len(request.RelatedExternalEffectAggregateIDs) != 2 ||
+		request.RelatedExternalEffectAggregateIDs[0] != task.Status.Execution.RuntimeSessionUID ||
+		request.RelatedExternalEffectAggregateIDs[1] != sourcePublicationID {
+		t.Fatalf("restored reclamation request = %#v", request)
+	}
+	identities, ready, err := reconciler.acpArtifactRetirementIdentities(context.Background(), task)
+	if err != nil || !ready {
+		t.Fatalf("restored artifact identities readiness = %v, %v", ready, err)
+	}
+	wantIdentities := []artifactcap.Identity{
+		{Namespace: task.Namespace, TaskID: string(sourceUID)},
+		{Namespace: task.Namespace, PublicationID: sourcePublicationID},
+	}
+	if !identitySlicesEqual(identities, wantIdentities) {
+		t.Fatalf("restored artifact identities = %#v, want %#v", identities, wantIdentities)
+	}
+}
+
+func TestDeletingACPTaskRejectsUnvalidatedMismatchedBindingUID(t *testing.T) {
+	task, attempt := promptAttemptReclaimFinalizerFixture(t)
+	foreignUID := types.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	binding := testACPExecuteBindingForDispatcher()
+	binding.Task.UID = foreignUID
+	task.Status.AgentExecutionBinding = binding
+	controlStore := &promptAttemptReclaimControlStore{attempt: attempt}
+	reconciler := &TaskReconciler{DurableControlStore: controlStore}
+
+	if got := acpTaskControlUID(task); got != task.UID {
+		t.Fatalf("unvalidated control UID = %q, want live Task UID %q", got, task.UID)
+	}
+	ready, err := reconciler.acpTaskDeletionReady(context.Background(), task)
+	if ready || !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("unvalidated mismatch deletion readiness = %v, %v, want false/ErrConflict", ready, err)
+	}
+	if len(controlStore.getAttemptIDs) != 0 {
+		t.Fatalf("unvalidated mismatch read foreign PromptAttempt IDs: %#v", controlStore.getAttemptIDs)
 	}
 }
 
@@ -306,6 +421,7 @@ func promptAttemptReclaimFinalizerFixture(t *testing.T) (*corev1alpha1.Task, *st
 type promptAttemptReclaimControlStore struct {
 	store.DurableControlStore
 	attempt         *store.PromptAttempt
+	getAttemptIDs   []string
 	reclaimed       int
 	reclaimErr      error
 	reclaimRequests []store.ReclaimPromptAttemptsRequest
@@ -330,6 +446,7 @@ func (s *promptAttemptReclaimControlStore) PreparePromptAttemptReclamation(conte
 }
 
 func (s *promptAttemptReclaimControlStore) GetPromptAttempt(_ context.Context, id string) (*store.PromptAttempt, error) {
+	s.getAttemptIDs = append(s.getAttemptIDs, id)
 	if s.attempt == nil || s.attempt.ID != id {
 		return nil, store.ErrNotFound
 	}

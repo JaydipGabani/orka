@@ -121,6 +121,16 @@ promote-staging-manifest: ## Promote committed staging manifests into release sn
 		mv "$$stage/charts" charts; installed_charts=1; \
 		trap - EXIT; \
 		rm -rf "$$stage" "$$backup"
+	diff --no-dereference --recursive manifest_staging/deploy deploy
+	diff --no-dereference --recursive manifest_staging/charts/orka charts/orka
+
+.PHONY: verify-release-manifest
+verify-release-manifest: ## Validate promoted release snapshots and the harness-v2 Helm render contract.
+	scripts/validate-release-manifest.sh "$(if $(NEWVERSION),$(NEWVERSION),$(VERSION))"
+
+.PHONY: test-release-manifest
+test-release-manifest: ## Test release versioning, image matrices, and the harness-v2 render policy.
+	bash scripts/tests/release-manifest-test.sh
 
 .PHONY: sync-helm-crds
 sync-helm-crds: ## Synchronize generated CRDs into the promoted Helm chart while preserving non-CRD files.

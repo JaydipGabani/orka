@@ -33,6 +33,8 @@ const linuxGOOS = "linux"
 const providerProxyCanaryMode = "provider-proxy-canary"
 const providerProjectionCanaryMode = "provider-projection-canary"
 const providerProjectionCanaryValue = "projected"
+const assistantBurstMode = "assistant-burst"
+const toolBurstRPCErrorMode = "tool-burst-rpc-error"
 const testPromptOneID = "prompt-1"
 const testPromptTwoID = "prompt-2"
 const testPromptOperationTwo = "prompt-operation-2"
@@ -108,6 +110,110 @@ func TestSupervisorCreateAndPrompt(t *testing.T) {
 	}
 	if len(status.Sessions) != 1 || status.Sessions[0].State != harnessv2.RuntimeSessionStateValidating {
 		t.Fatalf("unexpected session status: %#v", status.Sessions)
+	}
+}
+
+func TestSupervisorCompactsAssistantBurstBeforeHarnessRateLimit(t *testing.T) {
+	server, cfg, profile := newTestServer(t, assistantBurstMode)
+	server.cfg.Capabilities.Limits.MaxBufferedEvents = 2048
+	cfg.Capabilities.Limits.MaxBufferedEvents = 2048
+	create := testCreateSessionRequest(t, cfg, profile)
+	response := performMutation(t, server.Handler(), http.MethodPut, "/v2/runtime-sessions/session-1", create, cfg)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", response.Code, response.Body.String())
+	}
+
+	prompt := testStartPromptRequest(t, cfg, create.Metadata.Fence)
+	response = performMutation(t, server.Handler(), http.MethodPut, "/v2/runtime-sessions/session-1/prompts/prompt-1", prompt, cfg)
+	if response.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d body=%s", response.Code, response.Body.String())
+	}
+	decoder, err := harnessv2.NewEventDecoder(
+		bytes.NewReader(response.Body.Bytes()), eventLimits(cfg.Capabilities.Limits),
+		harnessv2.EventExpectationFromMetadata(prompt.Metadata),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := decoder.DecodeAll()
+	if err != nil {
+		t.Fatalf("decode compacted prompt events: %v", err)
+	}
+	if len(events) < 3 || events[0].Type != harnessv2.EventAccepted ||
+		events[len(events)-1].Type != harnessv2.EventCompleted {
+		t.Fatalf("unexpected compacted event sequence: %#v", events)
+	}
+	var streamed strings.Builder
+	for index, event := range events {
+		if event.Identity.Sequence != uint64(index+1) {
+			t.Fatalf("event %d sequence = %d, want %d", index, event.Identity.Sequence, index+1)
+		}
+		if event.Type == harnessv2.EventUpdate && event.Update != nil && event.Update.AssistantMessage != nil {
+			streamed.WriteString(event.Update.AssistantMessage.Text)
+		}
+	}
+	want := strings.Repeat("x", runtimeCodexMaxUpdateEventsPerSecond+1)
+	if streamed.String() != want {
+		t.Fatalf("streamed assistant bytes = %d, want %d exact bytes", streamed.Len(), len(want))
+	}
+	terminal := events[len(events)-1].Completed
+	if terminal == nil || len(terminal.Result.Content) != 1 || terminal.Result.Content[0].Text != want {
+		t.Fatalf("terminal result did not preserve the exact assistant burst")
+	}
+}
+
+func TestSupervisorProjectsRPCFailureAfterToolOutputBurst(t *testing.T) {
+	server, cfg, profile := newTestServer(t, toolBurstRPCErrorMode)
+	server.cfg.Capabilities.Limits.MaxBufferedEvents = 2048
+	server.cfg.Capabilities.Limits.MaxUpdateEventsPerSecond = 2
+	cfg.Capabilities.Limits.MaxBufferedEvents = 2048
+	cfg.Capabilities.Limits.MaxUpdateEventsPerSecond = 2
+	create := testCreateSessionRequest(t, cfg, profile)
+	response := performMutation(t, server.Handler(), http.MethodPut, "/v2/runtime-sessions/session-1", create, cfg)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", response.Code, response.Body.String())
+	}
+
+	prompt := testStartPromptRequest(t, cfg, create.Metadata.Fence)
+	response = performMutation(t, server.Handler(), http.MethodPut, "/v2/runtime-sessions/session-1/prompts/prompt-1", prompt, cfg)
+	if response.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "provider-secret-must-not-leak") {
+		t.Fatalf("prompt response leaked provider error detail: %s", response.Body.String())
+	}
+	decoder, err := harnessv2.NewEventDecoder(
+		bytes.NewReader(response.Body.Bytes()), eventLimits(cfg.Capabilities.Limits),
+		harnessv2.EventExpectationFromMetadata(prompt.Metadata),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := decoder.DecodeAll()
+	if err != nil {
+		t.Fatalf("decode failed prompt events: %v\n%s", err, response.Body.String())
+	}
+	if len(events) != 4 || events[0].Type != harnessv2.EventAccepted ||
+		events[1].Type != harnessv2.EventUpdate || events[1].Update == nil ||
+		events[1].Update.Kind != harnessv2.UpdateToolCall ||
+		events[2].Type != harnessv2.EventUpdate || events[2].Update == nil ||
+		events[2].Update.Kind != harnessv2.UpdateToolCallUpdate ||
+		events[3].Type != harnessv2.EventFailed || events[3].Failed == nil {
+		t.Fatalf("unexpected failed prompt event sequence: %#v", events)
+	}
+	for index, event := range events {
+		if event.Identity.Sequence != uint64(index+1) {
+			t.Fatalf("event %d sequence = %d, want %d", index, event.Identity.Sequence, index+1)
+		}
+	}
+	if events[1].Update.ToolCall == nil ||
+		events[1].Update.ToolCall.Status != harnessv2.ToolCallStatusPending ||
+		events[2].Update.ToolCall == nil ||
+		events[2].Update.ToolCall.Status != harnessv2.ToolCallStatusCompleted {
+		t.Fatalf("tool lifecycle events = %#v / %#v", events[1].Update, events[2].Update)
+	}
+	if events[3].Failed.Code != "acp_prompt_failed" || events[3].Failed.Retryable {
+		t.Fatalf("RPC failure terminal = %#v", events[3].Failed)
 	}
 }
 
@@ -402,11 +508,60 @@ func TestSupervisorMarksAggregateAssistantOverflowForTerminalFailure(t *testing.
 	if got := prompt.assistant.String(); got != "1234567890" {
 		t.Fatalf("assistant result = %q, want bounded aggregate", got)
 	}
-	if !prompt.terminalResultOverflow {
+	if !prompt.assistantOverflow {
 		t.Fatal("aggregate overflow was not retained for terminal failure")
 	}
 	if prompt.sequence != 3 {
 		t.Fatalf("sequence = %d, want 3 emitted updates", prompt.sequence)
+	}
+}
+
+func TestSupervisorUsesCodexFinalAnswerAsTerminalResult(t *testing.T) {
+	server, cfg, _ := newTestServer(t, "immediate")
+	server.cfg.Capabilities.Limits.MaxTerminalResultBytes = 4096
+	fence := cfg.Fence
+	fence.RuntimeSessionUID = "phase-session-uid"
+	fence.RuntimeSessionGeneration = 1
+	prompt := &promptState{request: testStartPromptRequest(t, cfg, fence)}
+	state := &sessionState{descriptor: harnessv2.RuntimeSessionDescriptor{
+		RuntimeSessionUID: fence.RuntimeSessionUID,
+		Generation:        fence.RuntimeSessionGeneration,
+	}}
+	now := time.Now().UTC()
+	events := []acp.PromptEvent{
+		testAssistantMessagePromptEventWithPhase(
+			t, 1, now, "commentary-message", acpAssistantPhaseCommentary, strings.Repeat("x", 4097),
+		),
+		testAssistantMessagePromptEventWithPhase(
+			t, 2, now.Add(time.Millisecond), "final-message", acpAssistantPhaseFinalAnswer, `{"schemaVersion":1,"ok":true}`,
+		),
+	}
+	for _, event := range events {
+		mapped, err := server.mapRuntimeEvent(state, prompt, event)
+		if err != nil {
+			t.Fatalf("map phased assistant event: %v", err)
+		}
+		if mapped == nil || mapped.Update == nil || mapped.Update.AssistantMessage == nil {
+			t.Fatalf("phased assistant event was not visible: %#v", mapped)
+		}
+	}
+	if !prompt.assistantOverflow || !prompt.finalAnswerSeen || prompt.finalAnswerOverflow {
+		t.Fatalf(
+			"prompt aggregation = assistantOverflow=%v finalSeen=%v finalOverflow=%v",
+			prompt.assistantOverflow, prompt.finalAnswerSeen, prompt.finalAnswerOverflow,
+		)
+	}
+	terminal, result, err := server.terminalEvent(state, prompt, acp.PromptResult{
+		Outcome: acp.PromptOutcomeCompleted, StopReason: acp.StopReasonEndTurn,
+		Accepted: true, SettledAt: now.Add(2 * time.Millisecond),
+	})
+	if err != nil {
+		t.Fatalf("build phased terminal result: %v", err)
+	}
+	if result.Outcome != acp.PromptOutcomeCompleted || terminal.Type != harnessv2.EventCompleted ||
+		terminal.Completed == nil || len(terminal.Completed.Result.Content) != 1 ||
+		terminal.Completed.Result.Content[0].Text != `{"schemaVersion":1,"ok":true}` {
+		t.Fatalf("phased terminal result = %#v settled=%#v", terminal, result)
 	}
 }
 
@@ -886,9 +1041,47 @@ func TestSupervisorACPHelper(t *testing.T) {
 					os.Exit(4)
 				}
 			}
-			writeHelperMessage(writer, map[string]any{testJSONRPCKey: testJSONRPCVersion, "method": acp.MethodSessionUpdate, "params": map[string]any{
-				"sessionId": sessionID, "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "hello from ACP"}},
-			}})
+			if mode == toolBurstRPCErrorMode {
+				writeHelperMessage(writer, map[string]any{testJSONRPCKey: testJSONRPCVersion, "method": acp.MethodSessionUpdate, "params": map[string]any{
+					"sessionId": sessionID, "update": map[string]any{
+						"sessionUpdate": "tool_call", "toolCallId": "provider-call-1", "title": "Read repository", "kind": "read",
+					},
+				}})
+				for range runtimeCodexMaxUpdateEventsPerSecond + 1 {
+					writeHelperMessage(writer, map[string]any{testJSONRPCKey: testJSONRPCVersion, "method": acp.MethodSessionUpdate, "params": map[string]any{
+						"sessionId": sessionID, "update": map[string]any{
+							"sessionUpdate": "tool_call_update", "toolCallId": "provider-call-1",
+							"_meta": map[string]any{"terminal_output_delta": map[string]any{"terminal_id": "provider-call-1", "data": "x"}},
+						},
+					}})
+				}
+				writeHelperMessage(writer, map[string]any{testJSONRPCKey: testJSONRPCVersion, "method": acp.MethodSessionUpdate, "params": map[string]any{
+					"sessionId": sessionID, "update": map[string]any{
+						"sessionUpdate": "tool_call_update", "toolCallId": "provider-call-1", "status": "completed",
+					},
+				}})
+				writeHelperMessage(writer, map[string]any{
+					testJSONRPCKey: testJSONRPCVersion, "id": rawID(promptID),
+					"error": map[string]any{
+						"code": -32603, "message": "provider-secret-must-not-leak",
+						"data": map[string]any{"service": "session", "errorName": "APIError", "detail": "provider-secret-must-not-leak"},
+					},
+				})
+				promptID = nil
+				continue
+			}
+			assistantUpdates := []string{"hello from ACP"}
+			if mode == assistantBurstMode {
+				assistantUpdates = make([]string, runtimeCodexMaxUpdateEventsPerSecond+1)
+				for index := range assistantUpdates {
+					assistantUpdates[index] = "x"
+				}
+			}
+			for _, text := range assistantUpdates {
+				writeHelperMessage(writer, map[string]any{testJSONRPCKey: testJSONRPCVersion, "method": acp.MethodSessionUpdate, "params": map[string]any{
+					"sessionId": sessionID, "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": text}},
+				}})
+			}
 			if mode != "wait" {
 				writeHelperMessage(writer, map[string]any{testJSONRPCKey: testJSONRPCVersion, "id": rawID(promptID), "result": map[string]any{"stopReason": acp.StopReasonEndTurn}})
 				promptID = nil

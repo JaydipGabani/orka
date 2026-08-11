@@ -56,6 +56,9 @@ existing_controller="${work_dir}/existing-controller.json"
 runtime_config="${work_dir}/runtime-images-configmap.json"
 admission_runtime_manifest="${work_dir}/admission-runtime-manifest.json"
 workload_manifest="${work_dir}/workload-manifest.json"
+workload_prerequisite_manifest="${work_dir}/workload-prerequisite-manifest.json"
+controller_manifest="${work_dir}/controller-manifest.json"
+workload_dependency_endpoints="${work_dir}/workload-dependency-endpoints.json"
 snapshot_secret="${work_dir}/agent-execution-snapshot-key.json"
 snapshot_key="${work_dir}/snapshot-key"
 snapshot_key_data="${work_dir}/snapshot-key-data"
@@ -134,6 +137,54 @@ jq -sc '
       ))
     }
 ' "${rendered_json}" >"${workload_manifest}"
+jq '
+  {
+    apiVersion: "v1",
+    kind: "List",
+    items: [.items[] | select((
+      .apiVersion == "apps/v1" and
+      .kind == "Deployment" and
+      .metadata.namespace == "orka-system" and
+      .metadata.name == "orka-controller-manager"
+    ) | not)]
+  }
+' "${workload_manifest}" >"${workload_prerequisite_manifest}"
+jq '
+  [.items[] | select(
+    .apiVersion == "apps/v1" and
+    .kind == "Deployment" and
+    .metadata.namespace == "orka-system" and
+    .metadata.name == "orka-controller-manager"
+  )]
+  | if length == 1 then
+      {apiVersion: "v1", kind: "List", items: .}
+    else
+      error("expected exactly one harness-v2 controller Deployment")
+    end
+' "${workload_manifest}" >"${controller_manifest}"
+jq -e '
+  ([.items[] | select(
+    .apiVersion == "apps/v1" and
+    .kind == "Deployment" and
+    .metadata.namespace == "orka-system" and
+    (.metadata.name == "orka-provider-auth-proxy" or
+     .metadata.name == "orka-scm-egress-proxy" or
+     .metadata.name == "orka-workspace-publisher")
+  ) | .metadata.name] | sort) == [
+    "orka-provider-auth-proxy",
+    "orka-scm-egress-proxy",
+    "orka-workspace-publisher"
+  ] and
+  ([.items[] | select(
+    .apiVersion == "apps/v1" and
+    .kind == "Deployment" and
+    .metadata.namespace == "orka-system" and
+    .metadata.name == "orka-controller-manager"
+  )] | length) == 0
+' "${workload_prerequisite_manifest}" >/dev/null || {
+  echo "workload prerequisite wave must contain each publisher/proxy Deployment exactly once and no controller Deployment" >&2
+  exit 1
+}
 jq -esc '
   [.[] | if .kind == "List" then .items[] else . end] as $items
   | ($items | map(select(.apiVersion == "apps/v1" and .kind == "Deployment" and
@@ -374,6 +425,36 @@ wait_for_admission_endpoints() {
   fi
 }
 
+wait_for_workload_dependencies() {
+  local deployment service attempt ready
+  local -a dependencies=(
+    orka-provider-auth-proxy
+    orka-scm-egress-proxy
+    orka-workspace-publisher
+  )
+
+  for deployment in "${dependencies[@]}"; do
+    "${kubectl}" -n orka-system rollout status "deployment/${deployment}" --timeout=2m >/dev/null
+  done
+
+  for service in "${dependencies[@]}"; do
+    ready=0
+    for attempt in {1..50}; do
+      if "${kubectl}" -n orka-system get endpoints "${service}" -o json >"${workload_dependency_endpoints}" \
+        && jq -e '[.subsets[]?.addresses[]?.ip] | unique | length >= 1' \
+          "${workload_dependency_endpoints}" >/dev/null; then
+        ready=1
+        break
+      fi
+      sleep 0.2
+    done
+    if (( ready == 0 )); then
+      echo "${service} Service must expose at least one ready endpoint before controller rollout after ${attempt} attempts" >&2
+      return 1
+    fi
+  done
+}
+
 start_admission_proxy() {
   local attempt line
   admission_proxy_port=""
@@ -495,5 +576,7 @@ wait_for_admission_endpoints
 smoke_admission_handlers
 render_admission_webhooks
 "${kubectl}" apply -f "${admission_webhooks_manifest}"
-"${kubectl}" apply -f "${workload_manifest}"
+"${kubectl}" apply -f "${workload_prerequisite_manifest}"
+wait_for_workload_dependencies
+"${kubectl}" apply -f "${controller_manifest}"
 "${kubectl}" -n orka-system rollout status deployment/orka-controller-manager --timeout=2m >/dev/null

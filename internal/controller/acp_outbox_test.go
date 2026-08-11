@@ -8,12 +8,15 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	types "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/store/sqlite"
 )
@@ -91,6 +94,172 @@ func TestACPOutboxProjectorRepairsTerminalTaskStatus(t *testing.T) {
 	cancelEpoch()
 	if err := <-epochDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+//nolint:gocyclo // This regression intentionally exercises status projection and finalizer settlement end to end.
+func TestACPNoWorkspaceTerminalProjectionSettlesStatusAndFinalizer(t *testing.T) {
+	scheme := newTestScheme()
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default", Name: "no-workspace", UID: types.UID("no-workspace-task-uid"),
+			Finalizers: []string{labels.TaskFinalizer},
+		},
+		Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent},
+		Status: corev1alpha1.TaskStatus{
+			Phase: corev1alpha1.TaskPhaseRunning,
+			Execution: &corev1alpha1.TaskExecutionStatus{
+				Attempt: 1, PromptID: "prompt-1", State: corev1alpha1.TaskExecutionStateSettling,
+			},
+			Delivery: &corev1alpha1.TaskDeliveryStatus{
+				State: corev1alpha1.TaskDeliveryStateNotRequested, Outcome: corev1alpha1.TaskDeliveryOutcomeNotRequested,
+			},
+		},
+	}
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.Task{}).
+		WithObjects(task).
+		Build()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	noWorkspaceDelivery := corev1alpha1.TaskDeliveryStatus{
+		State: corev1alpha1.TaskDeliveryStateNoChange, Outcome: corev1alpha1.TaskDeliveryOutcomeNoChange,
+		StartingSHA: acpNoWorkspaceRevision,
+	}
+	workspaceTask := task.DeepCopy()
+	workspaceTask.Spec.Workspace = &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead}
+	if got := taskDeliveryStatusForKubernetes(workspaceTask, noWorkspaceDelivery); got.StartingSHA != acpNoWorkspaceRevision {
+		t.Fatalf("workspace delivery startingSHA = %q, want invalid sentinel preserved for API validation", got.StartingSHA)
+	}
+	dispatcher := &ACPDispatcher{Client: kubeClient}
+	if err := dispatcher.patchDeliveryStatus(ctx, task, noWorkspaceDelivery); err != nil {
+		t.Fatalf("patch no-workspace delivery status: %v", err)
+	}
+	patched := &corev1alpha1.Task{}
+	key := types.NamespacedName{Namespace: task.Namespace, Name: task.Name}
+	if err := kubeClient.Get(ctx, key, patched); err != nil {
+		t.Fatal(err)
+	}
+	if patched.Status.Delivery == nil || patched.Status.Delivery.StartingSHA != "" {
+		t.Fatalf("pre-terminal delivery status = %#v, want omitted startingSHA", patched.Status.Delivery)
+	}
+	encodedStatus, err := json.Marshal(patched.Status.Delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encodedStatus), `"startingSHA"`) {
+		t.Fatalf("pre-terminal delivery JSON contains unavailable startingSHA: %s", encodedStatus)
+	}
+
+	db, err := sqlite.NewDB(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() //nolint:errcheck
+	controlStore := sqlite.NewStore(db, "test")
+	epochs := NewControllerEpochManager(controlStore, "controller")
+	epochCtx, cancelEpoch := context.WithCancel(context.Background())
+	epochDone := make(chan error, 1)
+	go func() { epochDone <- epochs.Start(epochCtx) }()
+	defer func() {
+		cancelEpoch()
+		if err := <-epochDone; err != nil {
+			t.Errorf("stop epoch manager: %v", err)
+		}
+	}()
+	fence, err := epochs.CurrentFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Bypass any future projection encoding normalization so this remains a
+	// regression for rows persisted by the broken controller version.
+	type legacyTaskTerminalProjection taskTerminalProjection
+	payload, err := json.Marshal(legacyTaskTerminalProjection{
+		Namespace: task.Namespace, Task: task.Name, TaskUID: string(task.UID), Attempt: 1,
+		Phase: corev1alpha1.TaskPhaseSucceeded,
+		Execution: corev1alpha1.TaskExecutionStatus{
+			Attempt: 1, PromptID: "prompt-1", State: corev1alpha1.TaskExecutionStateSucceeded,
+			Outcome: corev1alpha1.TaskExecutionOutcomeSucceeded,
+		},
+		Delivery: &noWorkspaceDelivery,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), `"startingSHA":"empty"`) {
+		t.Fatalf("legacy projection payload = %s, want unavailable startingSHA sentinel", payload)
+	}
+	projection := &store.OutboxProjection{
+		ID: standaloneTaskTerminalProjectionID(task, 1), AggregateKind: "Task", AggregateID: string(task.UID),
+		ProjectionKind: "TaskTerminalStatus", Payload: payload, PayloadDigest: canonicalACPPayloadDigest(payload),
+		AvailableAt: time.Now().UTC(),
+	}
+	if _, err := controlStore.EnqueueOutboxProjection(ctx, projection, fence); err != nil {
+		t.Fatal(err)
+	}
+	projector := &ACPOutboxProjector{Client: kubeClient, Store: controlStore, Epochs: epochs, WorkerID: "worker"}
+	if err := projector.projectOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	terminal := &corev1alpha1.Task{}
+	if err := kubeClient.Get(ctx, key, terminal); err != nil {
+		t.Fatal(err)
+	}
+	if terminal.Status.Phase != corev1alpha1.TaskPhaseSucceeded || terminal.Status.Execution == nil ||
+		terminal.Status.Execution.State != corev1alpha1.TaskExecutionStateSucceeded || terminal.Status.Delivery == nil ||
+		terminal.Status.Delivery.State != corev1alpha1.TaskDeliveryStateNoChange || terminal.Status.Delivery.StartingSHA != "" {
+		t.Fatalf("terminal no-workspace Task status = %#v", terminal.Status)
+	}
+	storedProjection, err := controlStore.GetOutboxProjection(ctx, projection.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedProjection.State != store.OutboxProjectionDelivered {
+		t.Fatalf("terminal projection state = %s, want %s", storedProjection.State, store.OutboxProjectionDelivered)
+	}
+
+	attemptKey := store.PromptAttemptKey{
+		Namespace: task.Namespace, TaskUID: string(task.UID), Attempt: 1, PromptID: "prompt-1",
+	}
+	attemptID, err := attemptKey.CanonicalID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalizerStore := &promptAttemptReclaimControlStore{
+		attempt: &store.PromptAttempt{
+			ID: attemptID, Key: attemptKey, ExecutionState: store.PromptExecutionSucceeded, DeliveryState: store.PromptDeliveryNoChange,
+		},
+		projection: &store.OutboxProjection{ID: projection.ID, State: store.OutboxProjectionDelivered},
+		reclaimed:  1,
+	}
+	if err := kubeClient.Delete(ctx, terminal); err != nil {
+		t.Fatal(err)
+	}
+	deleting := &corev1alpha1.Task{}
+	if err := kubeClient.Get(ctx, key, deleting); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &TaskReconciler{
+		Client: kubeClient, Scheme: scheme, DurableControlStore: finalizerStore,
+		ControllerEpochManager: readyPromptAttemptReclaimEpochManager(), EnforceNamespaceIsolation: true,
+	}
+	if _, err := reconciler.handleDeletion(ctx, deleting); err != nil {
+		t.Fatalf("settle no-workspace Task finalizer: %v", err)
+	}
+	settled := &corev1alpha1.Task{}
+	if err := kubeClient.Get(ctx, key, settled); err != nil {
+		if !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+	} else if controllerutil.ContainsFinalizer(settled, labels.TaskFinalizer) {
+		t.Fatalf("Task finalizer remains after terminal projection settlement: %#v", settled.Finalizers)
+	}
+	if len(finalizerStore.reclaimRequests) != 1 || finalizerStore.reclaimRequests[0].TerminalProjectionID != projection.ID {
+		t.Fatalf("finalizer reclamation requests = %#v, want delivered projection %q", finalizerStore.reclaimRequests, projection.ID)
 	}
 }
 

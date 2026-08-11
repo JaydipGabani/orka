@@ -75,6 +75,10 @@ spec:
             runAsUser: 65532
             capabilities:
               drop: [ALL]
+          lifecycle:
+            preStop:
+              exec:
+                command: [/orka-admission, --pre-stop-delay=5s]
           readinessProbe:
             httpGet:
               path: /readyz

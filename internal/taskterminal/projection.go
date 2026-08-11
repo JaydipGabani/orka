@@ -1,0 +1,200 @@
+package taskterminal
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"reflect"
+	"strings"
+
+	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/store"
+)
+
+const (
+	// ProjectionKind is the durable outbox projection for terminal Task status.
+	ProjectionKind = "TaskTerminalStatus"
+
+	restoreIdentityChangedReason = corev1alpha1.TaskExecutionReason("RestoreIdentityChanged")
+)
+
+// Projection is the canonical payload of a terminal Task outbox projection.
+type Projection struct {
+	Namespace      string                             `json:"namespace"`
+	Task           string                             `json:"task"`
+	TaskUID        string                             `json:"taskUID"`
+	Attempt        int32                              `json:"attempt"`
+	Phase          corev1alpha1.TaskPhase             `json:"phase"`
+	Message        string                             `json:"message,omitempty"`
+	BindingDigest  string                             `json:"bindingDigest,omitempty"`
+	HarnessRuntime *corev1alpha1.HarnessRuntimeStatus `json:"harnessRuntime,omitempty"`
+	ResultRef      *corev1alpha1.ResultReference      `json:"resultRef,omitempty"`
+	Execution      corev1alpha1.TaskExecutionStatus   `json:"execution"`
+	Delivery       *corev1alpha1.TaskDeliveryStatus   `json:"delivery,omitempty"`
+}
+
+// ValidateRestoredProjection decodes and proves that one immutable source
+// terminal projection is compatible with the restored Task incarnation and
+// its final source PromptAttempt. Restore-only status text, controller epoch,
+// and transition timestamps are deliberately not compared with the restored
+// Task because the restored incarnation records a new settlement event.
+//
+//nolint:gocyclo // Keep the complete fail-closed terminal-payload contract in one auditable boundary.
+func ValidateRestoredProjection(
+	payload []byte,
+	task *corev1alpha1.Task,
+	sourceTaskUID string,
+	attempt *store.PromptAttempt,
+) (*Projection, error) {
+	projection, err := decodeProjection(payload)
+	if err != nil {
+		return nil, err
+	}
+	if task == nil || task.Status.Execution == nil || attempt == nil {
+		return nil, conflict("restored terminal projection evidence is incomplete")
+	}
+	sourceTaskUID = strings.TrimSpace(sourceTaskUID)
+	binding := task.Status.AgentExecutionBinding
+	if sourceTaskUID == "" {
+		return nil, conflict("restored terminal projection source binding is invalid")
+	}
+	if string(task.UID) != sourceTaskUID {
+		if binding == nil || binding.ContractVersion != corev1alpha1.AgentRuntimeContractHarnessV2 ||
+			string(binding.Task.UID) != sourceTaskUID {
+			return nil, conflict("restored terminal projection source binding is invalid")
+		}
+	}
+	if projection.HarnessRuntime != nil || projection.ResultRef != nil {
+		return nil, conflict("restored harness v2 terminal projection contains harness v1 payload")
+	}
+	if projection.Namespace != task.Namespace || projection.Task != task.Name || projection.TaskUID != sourceTaskUID ||
+		projection.Attempt < 1 || projection.Attempt != task.Status.Execution.Attempt ||
+		int64(projection.Attempt) != attempt.Key.Attempt || attempt.Key.Namespace != task.Namespace ||
+		attempt.Key.TaskUID != sourceTaskUID {
+		return nil, conflict("restored terminal projection Task identity does not match its source attempt")
+	}
+	if projection.BindingDigest != "" && (binding == nil || projection.BindingDigest != binding.BindingDigest) {
+		return nil, conflict("restored terminal projection binding digest does not match its Task")
+	}
+	if projection.Execution.Attempt != projection.Attempt ||
+		projection.Execution.PromptID == "" || projection.Execution.PromptID != task.Status.Execution.PromptID ||
+		projection.Execution.PromptID != attempt.Key.PromptID {
+		return nil, conflict("restored terminal projection execution identity does not match its source attempt")
+	}
+	if attempt.RequestDigest != "" && projection.Execution.RequestDigest != attempt.RequestDigest {
+		return nil, conflict("restored terminal projection request digest does not match its source attempt")
+	}
+	if task.Status.Execution.RequestDigest != "" && projection.Execution.RequestDigest != task.Status.Execution.RequestDigest {
+		return nil, conflict("restored terminal projection request digest does not match its Task")
+	}
+	wantState, wantOutcome, ok := terminalExecution(attempt.ExecutionState)
+	if !ok || projection.Execution.State != wantState || projection.Execution.Outcome != wantOutcome {
+		return nil, conflict("restored terminal projection execution outcome does not match its source attempt")
+	}
+	if projection.Delivery == nil || !store.IsTerminalPromptDeliveryState(attempt.DeliveryState) ||
+		store.PromptDeliveryState(projection.Delivery.State) != attempt.DeliveryState ||
+		string(projection.Delivery.Outcome) != string(attempt.DeliveryState) {
+		return nil, conflict("restored terminal projection delivery outcome does not match its source attempt")
+	}
+	if projection.Phase != terminalPhase(wantState, attempt.DeliveryState) {
+		return nil, conflict("restored terminal projection phase does not match its terminal outcome")
+	}
+	if task.Status.Delivery == nil || !equalDeliveryEvidence(projection.Delivery, task.Status.Delivery) {
+		return nil, conflict("restored terminal projection delivery evidence does not match its Task")
+	}
+	if err := validateRuntimeIdentity(projection.Execution, *task.Status.Execution, *attempt); err != nil {
+		return nil, err
+	}
+	projectionRestoreReason := projection.Execution.Reason == restoreIdentityChangedReason
+	attemptRestoreReason := attempt.TerminalReason == string(restoreIdentityChangedReason)
+	if projectionRestoreReason != attemptRestoreReason {
+		return nil, conflict("restored terminal projection restore marker does not match its source attempt")
+	}
+	if projectionRestoreReason && (strings.TrimSpace(attempt.OutcomeMarker) == "" ||
+		projection.Execution.Message != attempt.OutcomeMarker || projection.Message != attempt.OutcomeMarker) {
+		return nil, conflict("restored terminal projection restore message does not match its source attempt")
+	}
+	return projection, nil
+}
+
+func decodeProjection(payload []byte) (*Projection, error) {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	projection := &Projection{}
+	if err := decoder.Decode(projection); err != nil {
+		return nil, conflict("decode restored terminal projection: %v", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, conflict("restored terminal projection contains trailing data")
+	}
+	return projection, nil
+}
+
+func terminalExecution(state store.PromptExecutionState) (corev1alpha1.TaskExecutionState, corev1alpha1.TaskExecutionOutcome, bool) {
+	switch state {
+	case store.PromptExecutionSucceeded:
+		return corev1alpha1.TaskExecutionStateSucceeded, corev1alpha1.TaskExecutionOutcomeSucceeded, true
+	case store.PromptExecutionFailed:
+		return corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed, true
+	case store.PromptExecutionCancelled:
+		return corev1alpha1.TaskExecutionStateCancelled, corev1alpha1.TaskExecutionOutcomeCancelled, true
+	case store.PromptExecutionOutcomeUnknown:
+		return corev1alpha1.TaskExecutionStateOutcomeUnknown, corev1alpha1.TaskExecutionOutcomeOutcomeUnknown, true
+	default:
+		return "", "", false
+	}
+}
+
+func terminalPhase(state corev1alpha1.TaskExecutionState, delivery store.PromptDeliveryState) corev1alpha1.TaskPhase {
+	if state == corev1alpha1.TaskExecutionStateCancelled {
+		return corev1alpha1.TaskPhaseCancelled
+	}
+	if state == corev1alpha1.TaskExecutionStateSucceeded {
+		switch delivery {
+		case store.PromptDeliveryNotRequested, store.PromptDeliveryReadValidated, store.PromptDeliveryNoChange,
+			store.PromptDeliveryVerifiedExact, store.PromptDeliveryDeliveredSuperseded:
+			return corev1alpha1.TaskPhaseSucceeded
+		case store.PromptDeliveryCancelledBeforePublish:
+			return corev1alpha1.TaskPhaseCancelled
+		}
+	}
+	return corev1alpha1.TaskPhaseFailed
+}
+
+func equalDeliveryEvidence(left, right *corev1alpha1.TaskDeliveryStatus) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftCopy := left.DeepCopy()
+	rightCopy := right.DeepCopy()
+	leftCopy.State, rightCopy.State = "", ""
+	leftCopy.Outcome, rightCopy.Outcome = "", ""
+	leftCopy.LastTransitionTime, rightCopy.LastTransitionTime = nil, nil
+	return reflect.DeepEqual(leftCopy, rightCopy)
+}
+
+func validateRuntimeIdentity(projected, task corev1alpha1.TaskExecutionStatus, attempt store.PromptAttempt) error {
+	if projected.RuntimePoolName != task.RuntimePoolName || projected.RuntimePoolUID != task.RuntimePoolUID ||
+		projected.AgentRuntimeName != task.AgentRuntimeName || projected.AgentRuntimeUID != task.AgentRuntimeUID ||
+		projected.RuntimeInstanceID != task.RuntimeInstanceID || projected.RuntimeSessionUID != task.RuntimeSessionUID ||
+		projected.RuntimeSessionGeneration != task.RuntimeSessionGeneration ||
+		projected.RuntimeSessionSupervisorBootID != task.RuntimeSessionSupervisorBootID ||
+		projected.RuntimeSessionProfileDigest != task.RuntimeSessionProfileDigest ||
+		projected.RuntimeSessionMCPDigest != task.RuntimeSessionMCPDigest ||
+		projected.RuntimeSessionWorkspaceDigest != task.RuntimeSessionWorkspaceDigest {
+		return conflict("restored terminal projection runtime identity does not match its Task")
+	}
+	if attempt.RuntimeInstanceID != "" && projected.RuntimeInstanceID != attempt.RuntimeInstanceID {
+		return conflict("restored terminal projection runtime instance does not match its source attempt")
+	}
+	if attempt.SessionUID != "" && (projected.RuntimeSessionUID != attempt.SessionUID ||
+		projected.RuntimeSessionGeneration != attempt.SessionLeaseGeneration) {
+		return conflict("restored terminal projection runtime Session does not match its source attempt")
+	}
+	return nil
+}
+
+func conflict(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", store.ErrConflict, fmt.Sprintf(format, args...))
+}

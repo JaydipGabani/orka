@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -41,6 +43,9 @@ func TestSCMEgressProxyRejectsUnlistedProviderHost(t *testing.T) {
 
 func TestSCMEgressProxyRejectsPrivateAndRebindingAnswers(t *testing.T) {
 	for name, addresses := range map[string][]netip.Addr{
+		"kubernetes-service": {
+			netip.MustParseAddr("10.0.0.1"),
+		},
 		"private": {
 			netip.MustParseAddr("10.0.0.8"),
 		},
@@ -281,6 +286,21 @@ func TestSCMEgressProxyRequiresAuthentication(t *testing.T) {
 	proxy.ServeHTTP(response, request)
 	if response.Code != http.StatusProxyAuthRequired {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusProxyAuthRequired)
+	}
+}
+
+func TestSCMEgressProxyRejectsMountedKubernetesServiceAccountToken(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-token")
+	if err := ensureKubernetesServiceAccountTokenAbsent(missing); err != nil {
+		t.Fatalf("missing Kubernetes token rejected: %v", err)
+	}
+
+	mounted := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(mounted, []byte("not-a-real-token"), 0o600); err != nil {
+		t.Fatalf("write mounted Kubernetes token fixture: %v", err)
+	}
+	if err := ensureKubernetesServiceAccountTokenAbsent(mounted); err == nil {
+		t.Fatal("mounted Kubernetes service-account token was accepted")
 	}
 }
 

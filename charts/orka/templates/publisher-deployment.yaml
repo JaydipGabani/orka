@@ -1,7 +1,7 @@
-{{- if and .Values.publisher.enabled (not .Values.scmEgressProxy.enabled) }}
+{{- if and (eq .Values.controller.mode "harness-v2") .Values.publisher.enabled (not .Values.scmEgressProxy.enabled) }}
 {{- fail "publisher.enabled requires scmEgressProxy.enabled so public HTTPS egress remains proxy-only" }}
 {{- end }}
-{{- if .Values.publisher.enabled }}
+{{- if and (eq .Values.controller.mode "harness-v2") .Values.publisher.enabled }}
 {{- $scmProxySecretName := .Values.scmEgressProxy.auth.existingSecret | default (include "orka.scmEgressProxyAuthSecretName" .) }}
 {{- $scmProxyTokenKey := .Values.scmEgressProxy.auth.tokenKey | default "token" }}
 apiVersion: apps/v1
@@ -76,7 +76,7 @@ spec:
             {{- if .Values.publisher.githubPR.enabled }}
             - {name: ORKA_PUBLISHER_GITHUB_API_BASE_URL, value: {{ .Values.publisher.githubPR.apiBaseURL | quote }}}
             - {name: ORKA_PUBLISHER_GITHUB_REQUEST_TIMEOUT, value: {{ .Values.publisher.githubPR.requestTimeout | quote }}}
-            - {name: ORKA_PUBLISHER_GITHUB_MAX_RESPONSE_BYTES, value: {{ .Values.publisher.githubPR.maxResponseBytes | quote }}}
+            - {name: ORKA_PUBLISHER_GITHUB_MAX_RESPONSE_BYTES, value: {{ printf "%d" (int64 .Values.publisher.githubPR.maxResponseBytes) | quote }}}
             {{- end }}
           securityContext:
             allowPrivilegeEscalation: false

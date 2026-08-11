@@ -8871,7 +8871,8 @@ func TestHandleDeletionReclaimsNoAttemptAgentTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer persistDB.Close() //nolint:errcheck
-	controlStore, err := storekube.NewComposite(r.Client, "default", sqlite.NewStore(persistDB, "reclaim-test"))
+	controlClient := withControllerEpochLeaseUIDs(t, r.Client)
+	controlStore, err := storekube.NewComposite(controlClient, "default", sqlite.NewStore(persistDB, "reclaim-test"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -8948,7 +8949,8 @@ func TestHandleDeletionWaitsForHarnessV1AttemptReclamation(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	durable := sqlite.NewStore(db, "v1-finalizer-test")
-	controlStore, err := storekube.NewComposite(r.Client, "default", durable)
+	controlClient := withControllerEpochLeaseUIDs(t, r.Client)
+	controlStore, err := storekube.NewComposite(controlClient, "default", durable)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -156,7 +156,9 @@ jq -e '
   ([.[] | select(.kind == "Deployment" and .metadata.name == "orka-admission" and
     .metadata.namespace == "orka-system" and .spec.replicas == 2 and
     .spec.strategy.type == "RollingUpdate" and .spec.strategy.rollingUpdate.maxUnavailable == 0 and
-    (.spec.template.spec.containers | any(.name == "admission" and (.image | test("@sha256:[a-f0-9]{64}$")))))] | length) == 1 and
+    (.spec.template.spec.containers | any(.name == "admission" and
+      (.image | test("@sha256:[a-f0-9]{64}$")) and
+      .lifecycle.preStop.exec.command == ["/orka-admission", "--pre-stop-delay=5s"])))] | length) == 1 and
   ([.[] | select(.kind == "Service" and .metadata.name == "orka-admission")] | length) == 1 and
   ([.[] | select(.kind == "PodDisruptionBudget" and .metadata.name == "orka-admission" and .spec.minAvailable == 1)] | length) == 1 and
   ([.[] | select(.kind == "ValidatingWebhookConfiguration" and .metadata.name == "orka-admission")] | length) == 0
@@ -616,6 +618,28 @@ if [[ "$1" == "-n" && "$2" == "orka-system" && "$3" == "rollout" && "$4" == "sta
   exit 0
 fi
 
+if [[ "$1" == "-n" && "$2" == "orka-system" && "$3" == "rollout" && "$4" == "status" ]]; then
+  dependency="${5#deployment/}"
+  case "${dependency}" in
+    orka-provider-auth-proxy|orka-scm-egress-proxy|orka-workspace-publisher) ;;
+    *) dependency="" ;;
+  esac
+  if [[ -n "${dependency}" ]]; then
+    [[ -e "${FAKE_KUBE_STATE}/dependency-workload" ]] || {
+      echo "${dependency} rollout waited before dependency apply" >&2
+      exit 50
+    }
+    if [[ "${FAKE_KUBE_FAIL_MODE:-}" == "dependency-rollout" && ! -e "${FAKE_KUBE_STATE}/failed-dependency-rollout" ]]; then
+      : >"${FAKE_KUBE_STATE}/failed-dependency-rollout"
+      printf 'fail-rollout:%s\n' "${dependency}" >>"${FAKE_KUBE_LOG}"
+      exit 51
+    fi
+    : >"${FAKE_KUBE_STATE}/dependency-rollout-${dependency}"
+    printf 'rollout:%s\n' "${dependency}" >>"${FAKE_KUBE_LOG}"
+    exit 0
+  fi
+fi
+
 if [[ "$1" == "-n" && "$2" == "orka-system" && "$3" == "rollout" && "$4" == "status" && "$5" == "deployment/orka-controller-manager" ]]; then
   [[ -e "${FAKE_KUBE_STATE}/controller-workload" ]] || { echo 'controller rollout waited before workload apply' >&2; exit 48; }
   if [[ "${FAKE_KUBE_FAIL_MODE:-}" == "controller-rollout" && ! -e "${FAKE_KUBE_STATE}/failed-controller-rollout" ]]; then
@@ -626,6 +650,28 @@ if [[ "$1" == "-n" && "$2" == "orka-system" && "$3" == "rollout" && "$4" == "sta
   : >"${FAKE_KUBE_STATE}/controller-ready"
   printf 'rollout:orka-controller-manager\n' >>"${FAKE_KUBE_LOG}"
   exit 0
+fi
+
+if [[ "$1" == "-n" && "$2" == "orka-system" && "$3" == "get" && "$4" == "endpoints" ]]; then
+  dependency="$5"
+  case "${dependency}" in
+    orka-provider-auth-proxy|orka-scm-egress-proxy|orka-workspace-publisher) ;;
+    *) dependency="" ;;
+  esac
+  if [[ -n "${dependency}" ]]; then
+    [[ -e "${FAKE_KUBE_STATE}/dependency-rollout-${dependency}" ]] || {
+      echo "${dependency} endpoints inspected before rollout" >&2
+      exit 52
+    }
+    if [[ "${FAKE_KUBE_FAIL_MODE:-}" == "dependency-endpoints" ]]; then
+      printf '%s\n' '{"apiVersion":"v1","kind":"Endpoints","subsets":[]}'
+      exit 0
+    fi
+    : >"${FAKE_KUBE_STATE}/dependency-endpoint-${dependency}"
+    printf 'endpoint:%s\n' "${dependency}" >>"${FAKE_KUBE_LOG}"
+    printf '%s\n' '{"apiVersion":"v1","kind":"Endpoints","subsets":[{"addresses":[{"ip":"10.0.0.3"}]}]}'
+    exit 0
+  fi
 fi
 
 if [[ "$1" == "-n" && "$2" == "orka-system" && "$3" == "get" && "$4" == "endpoints" && "$5" == "orka-admission" ]]; then
@@ -695,6 +741,12 @@ summary="$(printf '%s\n' "${payload}" | jq -sc '
     namespace: (($items | map(select(.kind == "Namespace" and .metadata.name == "orka-system")) | .[0].metadata.name) // ""),
     runtimeConfig: (($items | map(select(.kind == "ConfigMap" and .metadata.labels["orka.ai/acp-runtime-images"] == "true")) | .[0].metadata.name) // ""),
     deploymentRef: (($items | map(select(.kind == "Deployment" and .metadata.name == "orka-controller-manager")) | .[0].spec.template.spec.containers[0].env[]? | select(.name == "ORKA_ACP_CODEX_RUNTIME_IMAGE") | .valueFrom.configMapKeyRef.name) // ""),
+    dependencyDeployments: ($items | map(select(
+      .kind == "Deployment" and
+      (.metadata.name == "orka-provider-auth-proxy" or
+       .metadata.name == "orka-scm-egress-proxy" or
+       .metadata.name == "orka-workspace-publisher")
+    ) | .metadata.name) | sort),
     admissionDeployments: ($items | map(select(.kind == "Deployment" and .metadata.name == "orka-admission")) | length),
     admissionServices: ($items | map(select(.kind == "Service" and .metadata.name == "orka-admission")) | length)
   }
@@ -702,6 +754,7 @@ summary="$(printf '%s\n' "${payload}" | jq -sc '
 namespace_name="$(jq -r .namespace <<<"${summary}")"
 config_name="$(jq -r .runtimeConfig <<<"${summary}")"
 deployment_ref="$(jq -r .deploymentRef <<<"${summary}")"
+dependency_deployments="$(jq -c .dependencyDeployments <<<"${summary}")"
 admission_deployments="$(jq -r .admissionDeployments <<<"${summary}")"
 admission_services="$(jq -r .admissionServices <<<"${summary}")"
 if [[ -n "${namespace_name}" && -z "${config_name}" && -z "${deployment_ref}" ]]; then
@@ -735,6 +788,31 @@ if [[ "${admission_deployments}" != "0" || "${admission_services}" != "0" ]]; th
   fi
   : >"${FAKE_KUBE_STATE}/admission-runtime"
   printf 'admission-runtime:orka-admission\n' >>"${FAKE_KUBE_LOG}"
+  exit 0
+fi
+
+if [[ "${dependency_deployments}" != "[]" ]]; then
+  [[ "${dependency_deployments}" == '["orka-provider-auth-proxy","orka-scm-egress-proxy","orka-workspace-publisher"]' ]] || {
+    echo "dependency workload wave was incomplete: ${dependency_deployments}" >&2
+    exit 53
+  }
+  [[ -z "${deployment_ref}" && -z "${config_name}" ]] || {
+    echo 'dependency workload wave included the controller or runtime ConfigMap' >&2
+    exit 54
+  }
+  [[ -e "${FAKE_KUBE_STATE}/namespace" ]] || { echo 'dependency workloads applied before namespace' >&2; exit 55; }
+  [[ -s "${FAKE_KUBE_STATE}/snapshot-key" ]] || { echo 'dependency workloads applied before snapshot Secret' >&2; exit 56; }
+  [[ -e "${FAKE_KUBE_STATE}/admission-webhooks" ]] || {
+    echo 'dependency workloads applied before fail-closed admission webhooks' >&2
+    exit 57
+  }
+  if [[ "${FAKE_KUBE_FAIL_MODE:-}" == "dependencies" && ! -e "${FAKE_KUBE_STATE}/failed-dependencies" ]]; then
+    : >"${FAKE_KUBE_STATE}/failed-dependencies"
+    printf 'fail-dependencies:%s\n' "${dependency_deployments}" >>"${FAKE_KUBE_LOG}"
+    exit 58
+  fi
+  : >"${FAKE_KUBE_STATE}/dependency-workload"
+  printf 'dependencies:%s\n' "${dependency_deployments}" >>"${FAKE_KUBE_LOG}"
   exit 0
 fi
 
@@ -776,6 +854,12 @@ fi
   echo 'harness-v2 controller applied before fail-closed admission webhooks' >&2
   exit 47
 }
+for dependency in orka-provider-auth-proxy orka-scm-egress-proxy orka-workspace-publisher; do
+  [[ -e "${FAKE_KUBE_STATE}/dependency-endpoint-${dependency}" ]] || {
+    echo "harness-v2 controller applied before ${dependency} became ready" >&2
+    exit 59
+  }
+done
 printf '%s\n' "${deployment_ref}" >"${FAKE_KUBE_STATE}/deployment-ref"
 : >"${FAKE_KUBE_STATE}/controller-workload"
 printf 'full:%s\n' "${deployment_ref}" >>"${FAKE_KUBE_LOG}"
@@ -843,7 +927,10 @@ export PATH="${fake_bin}:${PATH}"
 
 assert_converged() {
   local state_dir="$1"
-  local admission_line admission_rollout_line smoke_line webhooks_line controller_line controller_rollout_line reference
+  local admission_line admission_rollout_line smoke_line webhooks_line dependency_line
+  local dependency_first_rollout_line dependency_last_rollout_line
+  local dependency_first_endpoint_line dependency_last_endpoint_line
+  local controller_line controller_rollout_line reference dependency
   reference="$(cat "${state_dir}/deployment-ref")"
   [[ -e "${state_dir}/namespace" ]]
   [[ -e "${state_dir}/configmaps/${reference}" ]]
@@ -851,6 +938,11 @@ assert_converged() {
   [[ -e "${state_dir}/admission-runtime" ]]
   [[ -e "${state_dir}/admission-endpoints" ]]
   [[ -e "${state_dir}/admission-webhooks" ]]
+  [[ -e "${state_dir}/dependency-workload" ]]
+  for dependency in orka-provider-auth-proxy orka-scm-egress-proxy orka-workspace-publisher; do
+    [[ -e "${state_dir}/dependency-rollout-${dependency}" ]]
+    [[ -e "${state_dir}/dependency-endpoint-${dependency}" ]]
+  done
   [[ -e "${state_dir}/controller-workload" ]]
   [[ -e "${state_dir}/controller-ready" ]]
   [[ "$(grep -c '^proxy-start$' "${state_dir}/apply.log")" -ge 1 ]]
@@ -862,12 +954,20 @@ assert_converged() {
   admission_rollout_line="$(grep -n '^rollout:orka-admission$' "${state_dir}/apply.log" | head -1 | cut -d: -f1)"
   smoke_line="$(grep -n '^smoke:' "${state_dir}/apply.log" | head -1 | cut -d: -f1)"
   webhooks_line="$(grep -n '^webhooks:orka-admission$' "${state_dir}/apply.log" | head -1 | cut -d: -f1)"
+  dependency_line="$(grep -n '^dependencies:' "${state_dir}/apply.log" | head -1 | cut -d: -f1)"
+  dependency_first_rollout_line="$(grep -nE '^rollout:(orka-provider-auth-proxy|orka-scm-egress-proxy|orka-workspace-publisher)$' "${state_dir}/apply.log" | head -1 | cut -d: -f1)"
+  dependency_last_rollout_line="$(grep -nE '^rollout:(orka-provider-auth-proxy|orka-scm-egress-proxy|orka-workspace-publisher)$' "${state_dir}/apply.log" | tail -1 | cut -d: -f1)"
+  dependency_first_endpoint_line="$(grep -nE '^endpoint:(orka-provider-auth-proxy|orka-scm-egress-proxy|orka-workspace-publisher)$' "${state_dir}/apply.log" | head -1 | cut -d: -f1)"
+  dependency_last_endpoint_line="$(grep -nE '^endpoint:(orka-provider-auth-proxy|orka-scm-egress-proxy|orka-workspace-publisher)$' "${state_dir}/apply.log" | tail -1 | cut -d: -f1)"
   controller_line="$(grep -n '^full:' "${state_dir}/apply.log" | head -1 | cut -d: -f1)"
   controller_rollout_line="$(grep -n '^rollout:orka-controller-manager$' "${state_dir}/apply.log" | head -1 | cut -d: -f1)"
   (( admission_line < admission_rollout_line ))
   (( admission_rollout_line < smoke_line ))
   (( smoke_line < webhooks_line ))
-  (( webhooks_line < controller_line ))
+  (( webhooks_line < dependency_line ))
+  (( dependency_line < dependency_first_rollout_line ))
+  (( dependency_last_rollout_line < dependency_first_endpoint_line ))
+  (( dependency_last_endpoint_line < controller_line ))
   (( controller_line < controller_rollout_line ))
 }
 
@@ -894,6 +994,9 @@ run_apply_scenario ""
 run_apply_scenario namespace
 run_apply_scenario config
 run_apply_scenario admission
+run_apply_scenario dependencies
+run_apply_scenario dependency-rollout
+run_apply_scenario dependency-endpoints
 run_apply_scenario full
 run_apply_scenario rollout
 run_apply_scenario controller-rollout
@@ -994,7 +1097,7 @@ for tls_mode in missing missing-ca invalid-cert invalid-key invalid-ca mismatche
     exit 1
   fi
   grep -F 'orka-admission-tls' <<<"${tls_output}" >/dev/null
-  if grep -Eq '^(config|full|smoke|webhooks):' "${tls_state}/apply.log"; then
+  if grep -Eq '^(config|admission-runtime|dependencies|full|smoke|webhooks):' "${tls_state}/apply.log"; then
     echo 'workloads or admission webhooks were applied after TLS validation failed' >&2
     exit 1
   fi
@@ -1015,7 +1118,7 @@ if grep -F "${malformed_sentinel}" <<<"${malformed_output}" >/dev/null; then
   echo 'snapshot key material leaked in deployment output' >&2
   exit 1
 fi
-if grep -Eq '^(config|full):' "${malformed_state}/apply.log"; then
+if grep -Eq '^(config|admission-runtime|dependencies|full):' "${malformed_state}/apply.log"; then
   echo 'workload prerequisites were applied after snapshot-key validation failed' >&2
   exit 1
 fi
@@ -1044,4 +1147,4 @@ done
 
 grep -F 'scripts/apply-acp-production.sh' "${root}/Makefile" >/dev/null
 
-printf '%s\n' 'ok - ACP deployment enforces one static harness-v2 identity, preserves keys, activates seven fail-closed webhooks after readiness, and only then rolls the controller'
+printf '%s\n' 'ok - ACP deployment activates admission, waits for publisher/proxy readiness, and only then rolls one static harness-v2 controller'

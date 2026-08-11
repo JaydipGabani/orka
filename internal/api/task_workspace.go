@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -9,11 +10,66 @@ import (
 	"github.com/orka-agents/orka/internal/security"
 )
 
+type repositoryScanCredentialRef struct {
+	field string
+	ref   *corev1.LocalObjectReference
+}
+
 func taskWorkspaceCredentialReference(ref *corev1.LocalObjectReference) *corev1alpha1.WorkspaceCredentialReference {
 	if ref == nil || strings.TrimSpace(ref.Name) == "" {
 		return nil
 	}
 	return &corev1alpha1.WorkspaceCredentialReference{Name: strings.TrimSpace(ref.Name)}
+}
+
+func repositoryScanReadCredentialRef(scan *corev1alpha1.RepositoryScan) *corev1.LocalObjectReference {
+	if scan == nil {
+		return nil
+	}
+	if scan.Spec.ReadCredentialRef != nil && strings.TrimSpace(scan.Spec.ReadCredentialRef.Name) != "" {
+		return scan.Spec.ReadCredentialRef
+	}
+	return scan.Spec.GitSecretRef
+}
+
+func repositoryScanConfiguredCredentialRefs(scan *corev1alpha1.RepositoryScan) []repositoryScanCredentialRef {
+	if scan == nil {
+		return nil
+	}
+	return []repositoryScanCredentialRef{
+		{field: "spec.gitSecretRef", ref: scan.Spec.GitSecretRef},
+		{field: "spec.readCredentialRef", ref: scan.Spec.ReadCredentialRef},
+		{field: "spec.publicationReadCredentialRef", ref: scan.Spec.PublicationReadCredentialRef},
+		{field: "spec.publicationCredentialRef", ref: scan.Spec.PublicationCredentialRef},
+		{field: "spec.forgeCredentialRef", ref: scan.Spec.ForgeCredentialRef},
+	}
+}
+
+func repositoryScanPatchCredentialRefs(scan *corev1alpha1.RepositoryScan) ([]repositoryScanCredentialRef, error) {
+	if scan == nil {
+		return nil, fmt.Errorf("repository scan is required")
+	}
+	refs := []repositoryScanCredentialRef{
+		{field: "spec.readCredentialRef", ref: scan.Spec.ReadCredentialRef},
+		{field: "spec.publicationReadCredentialRef", ref: scan.Spec.PublicationReadCredentialRef},
+		{field: "spec.publicationCredentialRef", ref: scan.Spec.PublicationCredentialRef},
+		{field: "spec.forgeCredentialRef", ref: scan.Spec.ForgeCredentialRef},
+	}
+	seen := make(map[string]string, len(refs))
+	for _, credential := range refs {
+		name := ""
+		if credential.ref != nil {
+			name = strings.TrimSpace(credential.ref.Name)
+		}
+		if name == "" {
+			return nil, fmt.Errorf("%s is required for repository scan patch publication", credential.field)
+		}
+		if previous := seen[name]; previous != "" {
+			return nil, fmt.Errorf("%s and %s must reference distinct Secrets", previous, credential.field)
+		}
+		seen[name] = credential.field
+	}
+	return refs, nil
 }
 
 func repositoryScanTaskWorkspace(scan *corev1alpha1.RepositoryScan, intent corev1alpha1.WorkspaceIntent) *corev1alpha1.WorkspaceConfig {
@@ -25,7 +81,7 @@ func repositoryScanTaskWorkspace(scan *corev1alpha1.RepositoryScan, intent corev
 		GitRepo:           scan.Spec.RepoURL,
 		Branch:            security.EffectiveWorkspaceBranch(scan),
 		Ref:               security.EffectiveRef(scan),
-		ReadCredentialRef: taskWorkspaceCredentialReference(scan.Spec.GitSecretRef),
+		ReadCredentialRef: taskWorkspaceCredentialReference(repositoryScanReadCredentialRef(scan)),
 		SubPath:           scan.Spec.SubPath,
 		PRBaseBranch:      scan.Spec.PRBaseBranch,
 	}
@@ -34,8 +90,13 @@ func repositoryScanTaskWorkspace(scan *corev1alpha1.RepositoryScan, intent corev
 		if workspace.PublicationGitRepo == "" {
 			workspace.PublicationGitRepo = scan.Spec.RepoURL
 		}
-		workspace.PublicationReadCredentialRef = taskWorkspaceCredentialReference(scan.Spec.GitSecretRef)
-		workspace.PublicationCredentialRef = taskWorkspaceCredentialReference(scan.Spec.GitSecretRef)
+		if strings.TrimSpace(workspace.PRBaseBranch) == "" {
+			workspace.PRBaseBranch = security.EffectiveBranch(scan)
+		}
+		workspace.PublicationReadCredentialRef = taskWorkspaceCredentialReference(scan.Spec.PublicationReadCredentialRef)
+		workspace.PublicationCredentialRef = taskWorkspaceCredentialReference(scan.Spec.PublicationCredentialRef)
+		workspace.ForgeCredentialRef = taskWorkspaceCredentialReference(scan.Spec.ForgeCredentialRef)
+		workspace.CreatePR = true
 	}
 	return workspace
 }

@@ -50,6 +50,7 @@ func TestDeliveryAndPublicationCASRaceStateMachines(t *testing.T) {
 	for _, transition := range [][2]PromptDeliveryState{
 		{PromptDeliveryNotRequested, PromptDeliveryValidating},
 		{PromptDeliveryValidating, PromptDeliveryPreparing},
+		{PromptDeliveryValidating, PromptDeliveryPublicationOutcomeUnknown},
 		{PromptDeliveryPreparing, PromptDeliveryPrepared},
 		{PromptDeliveryPrepared, PromptDeliveryPublishing},
 		{PromptDeliveryPrepared, PromptDeliveryCancelledBeforePublish},

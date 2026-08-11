@@ -32,12 +32,18 @@ done
 (( children_line < claims_line ))
 (( claims_line < namespace_line ))
 
-grep -F "patch task \"\${name}\" --subresource=status" "${script}" >/dev/null
+if grep -F -- '--subresource=status' "${script}" >/dev/null; then
+  echo 'live ACP validator still mutates controller-owned Task status' >&2
+  exit 1
+fi
+grep -F 'task_observer_finalizer="acp-e2e.orka.ai/cancellation-observer"' "${script}" >/dev/null
+grep -F 'Task/${name} controller-owned deletion barrier' "${script}" >/dev/null
+grep -F 'release_task_observer_finalizer "${name}" "${uid}"' "${script}" >/dev/null
 grep -F "Task/\${name} finalizer completion" "${script}" >/dev/null
 grep -F "patch runtimepool \"\${name}\" --type=merge" "${script}" >/dev/null
 grep -F '.spec.ownerUid' "${script}" >/dev/null
 
-printf '%s\n' 'ok - release-gate cleanup settles owned Tasks, pools, and BranchClaims before namespace deletion'
+printf '%s\n' 'ok - release-gate cleanup uses deletion and controller-owned settlement before namespace teardown'
 
 
 dry_run_body="$(awk '/^assert_dry_run_rejected\(\) \{/,/^\}$/' "${script}")"
@@ -434,12 +440,30 @@ grep -F 'apply_agent codex "${codex_model}" "${codex_tool_agent}" 12 true' "${sc
 [[ "$(grep -Fc 'apply_agent codex "${codex_model}" "${codex_tool_agent}" 12 true' "${script}")" == "1" ]]
 grep -F 'explicit-cancel check selected RuntimePool/${pool}, want shared tool RuntimePool/${tool_profile_pool}' "${script}" >/dev/null
 grep -F 'controller-restart check selected RuntimePool/${pool}, want shared tool RuntimePool/${tool_profile_pool}' "${script}" >/dev/null
+grep -F 'verbs:["get","list","watch","create","delete"]' "${script}" >/dev/null
+cancel_body="$(awk '/^run_explicit_cancel_check\(\) \{/,/^\}/' "${script}")"
+cancel_hold_line="$(grep -nF 'add_task_observer_finalizer "${task}" "${uid}"' <<<"${cancel_body}" | cut -d: -f1)"
+cancel_request_line="$(grep -nF 'request_task_cancellation "${task}"' <<<"${cancel_body}" | cut -d: -f1)"
+cancel_assert_line="$(grep -nF 'assert_cancelled_task "${task}" "${snapshot}"' <<<"${cancel_body}" | cut -d: -f1)"
+cancel_release_line="$(grep -nF 'release_task_observer_finalizer "${task}" "${uid}"' <<<"${cancel_body}" | cut -d: -f1)"
+for value in "${cancel_hold_line}" "${cancel_request_line}" "${cancel_assert_line}" "${cancel_release_line}"; do
+  [[ "${value}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "explicit cancellation assertion could not locate every required barrier" >&2
+    exit 1
+  }
+done
+(( cancel_hold_line < cancel_request_line ))
+(( cancel_request_line < cancel_assert_line ))
+(( cancel_assert_line < cancel_release_line ))
+grep -F 'api_request DELETE "/api/v1/tasks/${task}?namespace=${namespace}"' "${script}" >/dev/null
+write_cleanup_body="$(awk '/^settle_write_task_for_remote_cleanup\(\) \{/,/^\}/' "${script}")"
+grep -F 'request_task_cancellation "${write_task_name}"' <<<"${write_cleanup_body}" >/dev/null
 if grep -Eq 'acp-(timeout|cancel|restart)-agent-' "${script}"; then
   echo "profile-specific checks still create distinct Agents" >&2
   exit 1
 fi
 
-printf '%s\n' 'ok - timeout, cancellation, and restart share one immutable tool profile'
+printf '%s\n' 'ok - timeout, authenticated deletion cancellation, and restart share one immutable tool profile'
 
 grep -F 'Running OpenCode native ACP read, continuation, and read-policy validation' "${script}" >/dev/null
 grep -F 'run_opencode_read_policy_check "${opencode_policy_agent}" "${opencode_model}"' "${script}" >/dev/null

@@ -83,6 +83,7 @@ func TestReserveTaskSettlesFrozenWorkspaceCredentialBlocked(t *testing.T) {
 					&corev1alpha1.ControllerEpoch{}, &corev1alpha1.PromptAttempt{},
 				).
 				Build()
+			kubeClient = withControllerEpochLeaseUIDs(t, kubeClient)
 
 			db, err := sqlite.NewDB(filepath.Join(t.TempDir(), "credential-blocked.db"))
 			if err != nil {

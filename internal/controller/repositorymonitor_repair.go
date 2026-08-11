@@ -19,7 +19,6 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
-	"github.com/orka-agents/orka/workers/common"
 )
 
 const (
@@ -241,6 +240,10 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorRepairJobConsumesBudget(c
 }
 
 func (r *RepositoryMonitorReconciler) createRepositoryMonitorRepairTask(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, run *store.MonitorRun, command *store.CommandEvent, owner, repository string, pr repositoryMonitorPullRequest, item *store.MonitorItem, repairCountPR, repairCountHead int) (int, error) {
+	credentialRefs, err := repositoryMonitorCredentialRefsForWrite(monitor)
+	if err != nil {
+		return 0, err
+	}
 	monitoredRepo := owner + "/" + repository
 	taskName := repositoryMonitorRepairTaskName(monitor, pr, command)
 	job := &store.RepairJob{
@@ -276,17 +279,16 @@ func (r *RepositoryMonitorReconciler) createRepositoryMonitorRepairTask(ctx cont
 	priority := int32(820)
 	timeout := metav1.Duration{Duration: repositoryMonitorReviewTaskTimeout}
 	repairer := *monitor.Spec.Agents.Repairer
-	credentialRef := workspaceCredentialReference(monitor.Spec.GitSecretRef)
 	workspace := &corev1alpha1.WorkspaceConfig{
 		Intent:                       corev1alpha1.WorkspaceIntentWrite,
 		GitRepo:                      repositoryMonitorHTTPSCloneURL(owner, repository),
 		Branch:                       pr.HeadBranch,
 		Ref:                          pr.HeadSHA,
-		ReadCredentialRef:            credentialRef,
+		ReadCredentialRef:            workspaceCredentialReference(credentialRefs.read),
 		PublicationGitRepo:           repositoryMonitorHTTPSCloneURL(owner, repository),
-		PublicationReadCredentialRef: credentialRef,
-		PublicationCredentialRef:     credentialRef,
-		ForgeCredentialRef:           credentialRef,
+		PublicationReadCredentialRef: workspaceCredentialReference(credentialRefs.publicationRead),
+		PublicationCredentialRef:     workspaceCredentialReference(credentialRefs.publication),
+		ForgeCredentialRef:           workspaceCredentialReference(credentialRefs.forge),
 		PRBaseBranch:                 pr.BaseBranch,
 		PushBranch:                   pr.HeadBranch,
 		ExpectedRemoteSHA:            pr.HeadSHA,
@@ -474,7 +476,7 @@ func (r *RepositoryMonitorReconciler) ingestCompletedRepositoryMonitorRepairTask
 					job.Phase = repositoryMonitorRepairPhaseSucceeded
 					job.LastError = ""
 				}
-			} else if task.Status.Delivery != nil && task.Status.Delivery.Outcome == corev1alpha1.TaskDeliveryOutcomeNoChange && job.Intent == repositoryMonitorCommandIntentUpdateBranch {
+			} else if repositoryMonitorACPNoChangeReceipt(&task, job.HeadSHA) && job.Intent == repositoryMonitorCommandIntentUpdateBranch {
 				containsBase, verifyErr := r.repositoryMonitorHeadContainsBase(ctx, monitor, &job)
 				if verifyErr != nil {
 					return ingested, verifyErr
@@ -486,21 +488,8 @@ func (r *RepositoryMonitorReconciler) ingestCompletedRepositoryMonitorRepairTask
 				} else {
 					job.LastError = "PR head does not contain the requested base revision"
 				}
-			} else if r.ResultStore != nil {
-				if raw, err := r.ResultStore.GetResult(ctx, task.Namespace, task.Name); err == nil {
-					sr := common.ParseStructuredResult(string(raw))
-					job.PushedSHA = sr.HeadSHA
-					if strings.TrimSpace(sr.PushError) != "" {
-						job.LastError = sr.PushError
-					} else if strings.TrimSpace(sr.PushBranch) == "" {
-						job.LastError = "repair task did not report a pushed branch"
-					} else {
-						job.Phase = repositoryMonitorRepairPhaseSucceeded
-						job.LastError = ""
-					}
-				} else {
-					job.LastError = err.Error()
-				}
+			} else {
+				job.LastError = "repair delivery " + repositoryMonitorACPDeliveryFailureReason(&task)
 			}
 		} else {
 			job.Phase = repositoryMonitorRepairPhaseFailed

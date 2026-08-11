@@ -200,6 +200,7 @@ var promptDeliveryTransitions = map[PromptDeliveryState]map[PromptDeliveryState]
 	PromptDeliveryValidating: {
 		PromptDeliveryPreparing: {}, PromptDeliveryReadValidated: {}, PromptDeliveryNoChange: {},
 		PromptDeliveryReadOnlyWorkspaceModified: {}, PromptDeliveryCredentialBlocked: {}, PromptDeliveryConflict: {},
+		PromptDeliveryPublicationOutcomeUnknown: {},
 	},
 	PromptDeliveryPreparing: {
 		PromptDeliveryPrepared: {}, PromptDeliveryCredentialBlocked: {}, PromptDeliveryConflict: {}, PromptDeliveryPublicationOutcomeUnknown: {},
@@ -208,7 +209,7 @@ var promptDeliveryTransitions = map[PromptDeliveryState]map[PromptDeliveryState]
 		PromptDeliveryPublishing: {}, PromptDeliveryCancelledBeforePublish: {},
 	},
 	PromptDeliveryPublishing: {
-		PromptDeliveryVerifying: {},
+		PromptDeliveryVerifying: {}, PromptDeliveryPublicationOutcomeUnknown: {},
 	},
 	PromptDeliveryVerifying: {
 		PromptDeliveryVerifiedExact: {}, PromptDeliveryDeliveredSuperseded: {},
@@ -753,7 +754,7 @@ var publicationTransitions = map[PublicationState]map[PublicationState]struct{}{
 		PublicationPublishing: {}, PublicationCancelledBeforePublish: {},
 	},
 	PublicationPublishing: {
-		PublicationVerifying: {},
+		PublicationVerifying: {}, PublicationOutcomeUnknown: {},
 	},
 	PublicationVerifying: {
 		PublicationVerifiedExact: {}, PublicationDeliveredSuperseded: {}, PublicationDeliveryConflict: {}, PublicationOutcomeUnknown: {},

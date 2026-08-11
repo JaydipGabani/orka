@@ -517,7 +517,13 @@ func validatePublicationTransitionReceipts(publication store.Publication, transi
 			return store.ValidationErrorf("Verifying transition requires only a publish receipt")
 		}
 		receiptErr = validatePublishReceipt(publication, transition, *transition.PublishReceipt)
-	case store.PublicationVerifiedExact, store.PublicationDeliveredSuperseded, store.PublicationOutcomeUnknown:
+	case store.PublicationOutcomeUnknown:
+		if (transition.ExpectedState == store.PublicationPreparing || transition.ExpectedState == store.PublicationPublishing) &&
+			transition.VerificationReceipt == nil && transition.PreparedReceipt == nil && transition.PublishReceipt == nil {
+			break
+		}
+		fallthrough
+	case store.PublicationVerifiedExact, store.PublicationDeliveredSuperseded:
 		if transition.VerificationReceipt == nil || transition.PreparedReceipt != nil || transition.PublishReceipt != nil {
 			return store.ValidationErrorf("%s transition requires only a verification receipt", transition.NewState)
 		}

@@ -40,6 +40,18 @@ func loadProxyAuthenticator(path string) (*proxyAuthenticator, error) {
 	return newProxyAuthenticator(value)
 }
 
+func ensureKubernetesServiceAccountTokenAbsent(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("kubernetes service-account token path must be absolute and clean")
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return fmt.Errorf("kubernetes service-account token is mounted")
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect Kubernetes service-account token path: %w", err)
+	}
+	return nil
+}
+
 func newProxyAuthenticator(token []byte) (*proxyAuthenticator, error) {
 	if err := validateProxyToken(token); err != nil {
 		return nil, err

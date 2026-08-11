@@ -56,6 +56,26 @@ func TestOptionsValidate(t *testing.T) {
 	}
 }
 
+func TestRunPreStopDelay(t *testing.T) {
+	t.Parallel()
+
+	var slept time.Duration
+	if err := runPreStopDelay(5*time.Second, func(delay time.Duration) { slept = delay }); err != nil {
+		t.Fatalf("runPreStopDelay() error = %v", err)
+	}
+	if slept != 5*time.Second {
+		t.Fatalf("sleep delay = %s, want 5s", slept)
+	}
+	for _, delay := range []time.Duration{-time.Second, 21 * time.Second} {
+		if err := runPreStopDelay(delay, func(time.Duration) {}); err == nil {
+			t.Errorf("runPreStopDelay(%s) error = nil, want validation failure", delay)
+		}
+	}
+	if err := runPreStopDelay(time.Second, nil); err == nil {
+		t.Fatal("runPreStopDelay() with nil sleep error = nil")
+	}
+}
+
 func TestServingCertificateFilesChecker(t *testing.T) {
 	t.Parallel()
 	now := time.Now()

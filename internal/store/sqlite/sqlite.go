@@ -363,6 +363,10 @@ func migrate(db *sql.DB) error {
 			tests_json        TEXT NOT NULL DEFAULT '[]',
 			tags_json         TEXT NOT NULL DEFAULT '[]',
 			trust_boundaries_json TEXT NOT NULL DEFAULT '[]',
+			changed_files_json TEXT NOT NULL DEFAULT '[]',
+			changed_line_ranges_json TEXT NOT NULL DEFAULT '[]',
+			review_context_json TEXT NOT NULL DEFAULT '',
+			review_context_hash TEXT NOT NULL DEFAULT '',
 			last_scan_run_id  TEXT NOT NULL DEFAULT '',
 			last_reviewed_at  TIMESTAMP,
 			created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -394,6 +398,7 @@ func migrate(db *sql.DB) error {
 			status            TEXT NOT NULL,
 			pr_number         INTEGER,
 			pr_url            TEXT NOT NULL DEFAULT '',
+			publication_evidence_json TEXT NOT NULL DEFAULT '',
 			created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -1045,11 +1050,18 @@ func migrate(db *sql.DB) error {
 	if err := ensureSQLiteColumns(db, "security_review_slices", []sqliteColumnMigration{
 		{Name: "changed_files_json", Definition: "changed_files_json TEXT NOT NULL DEFAULT '[]'"},
 		{Name: "changed_line_ranges_json", Definition: "changed_line_ranges_json TEXT NOT NULL DEFAULT '[]'"},
+		{Name: "review_context_json", Definition: "review_context_json TEXT NOT NULL DEFAULT ''"},
+		{Name: "review_context_hash", Definition: "review_context_hash TEXT NOT NULL DEFAULT ''"},
 	}); err != nil {
 		return err
 	}
 	if err := ensureSQLiteColumns(db, "security_dropped_findings", []sqliteColumnMigration{
 		{Name: "layer", Definition: "layer TEXT NOT NULL DEFAULT ''"},
+	}); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumns(db, "security_patch_proposals", []sqliteColumnMigration{
+		{Name: "publication_evidence_json", Definition: "publication_evidence_json TEXT NOT NULL DEFAULT ''"},
 	}); err != nil {
 		return err
 	}
@@ -1191,6 +1203,8 @@ func ensureSecurityReviewSlicesScopedPrimaryKey(db *sql.DB) error {
 		trust_boundaries_json TEXT NOT NULL DEFAULT '[]',
 		changed_files_json TEXT NOT NULL DEFAULT '[]',
 		changed_line_ranges_json TEXT NOT NULL DEFAULT '[]',
+		review_context_json TEXT NOT NULL DEFAULT '',
+		review_context_hash TEXT NOT NULL DEFAULT '',
 		last_scan_run_id  TEXT NOT NULL DEFAULT '',
 		last_reviewed_at  TIMESTAMP,
 		created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1202,10 +1216,12 @@ func ensureSecurityReviewSlicesScopedPrimaryKey(db *sql.DB) error {
 	if _, err := tx.Exec(`INSERT INTO security_review_slices_migration
 		(id, namespace, repository_scan, source, title, summary, kind, confidence, status,
 		 entrypoints_json, owned_files_json, context_files_json, tests_json, tags_json,
-		 trust_boundaries_json, changed_files_json, changed_line_ranges_json, last_scan_run_id, last_reviewed_at, created_at, updated_at)
+		 trust_boundaries_json, changed_files_json, changed_line_ranges_json, review_context_json,
+		 review_context_hash, last_scan_run_id, last_reviewed_at, created_at, updated_at)
 		SELECT id, namespace, repository_scan, source, title, summary, kind, confidence, status,
 		 entrypoints_json, owned_files_json, context_files_json, tests_json, tags_json,
-		 trust_boundaries_json, changed_files_json, changed_line_ranges_json, last_scan_run_id, last_reviewed_at, created_at, updated_at
+		 trust_boundaries_json, changed_files_json, changed_line_ranges_json, review_context_json,
+		 review_context_hash, last_scan_run_id, last_reviewed_at, created_at, updated_at
 		FROM security_review_slices`); err != nil {
 		return fmt.Errorf("migration failed: %w", err)
 	}
@@ -1305,7 +1321,7 @@ func OpenLockedStore(path string) (*Store, error) {
 }
 
 // Start runs background maintenance and blocks until ctx is cancelled,
-// then optimizes and closes the database.
+// then closes the database without issuing any final writes.
 // It satisfies the controller-runtime manager.Runnable interface.
 func (s *Store) Start(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("sqlite-store")
@@ -1322,7 +1338,6 @@ func (s *Store) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			s.db.Exec("PRAGMA optimize") //nolint:errcheck
 			return s.close()
 		case <-ticker.C:
 			s.updateDBSizeMetric()

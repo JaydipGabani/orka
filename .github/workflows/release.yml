@@ -31,82 +31,7 @@ jobs:
           persist-credentials: false
 
       - name: Validate tag and promoted chart
-        run: |
-          set -euo pipefail
-
-          tag=${GITHUB_REF_NAME}
-          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$ ]]; then
-            echo "Release tag must match vX.Y.Z, vX.Y.Z-beta.N, or vX.Y.Z-rc.N; got ${tag}." >&2
-            exit 1
-          fi
-
-          chart_field() {
-            local field=$1
-            local value
-            value=$(awk -v key="${field}:" '$1 == key { print $2; exit }' charts/orka/Chart.yaml)
-            value=${value#\"}
-            value=${value%\"}
-            value=${value#\'}
-            value=${value%\'}
-            if [[ -z "${value}" ]]; then
-              echo "Could not read ${field} from charts/orka/Chart.yaml." >&2
-              return 1
-            fi
-            printf '%s\n' "${value}"
-          }
-
-          expected_version=${tag#v}
-          chart_version=$(chart_field version)
-          app_version=$(chart_field appVersion)
-          if [[ "${chart_version}" != "${expected_version}" ]]; then
-            echo "Tag ${tag} requires charts/orka version ${expected_version}; found ${chart_version}." >&2
-            exit 1
-          fi
-          if [[ "${app_version}" != "${tag}" ]]; then
-            echo "Tag ${tag} requires charts/orka appVersion ${tag}; found ${app_version}." >&2
-            exit 1
-          fi
-
-          diff --no-dereference --recursive --unified manifest_staging/charts/orka charts/orka
-          diff --no-dereference --recursive --unified manifest_staging/deploy deploy
-          helm lint charts/orka
-          expected_crds=$(find config/crd/bases -maxdepth 1 -type f -name '*.yaml' | wc -l | tr -d ' ')
-          test "$(helm show crds charts/orka | grep -c '^kind: CustomResourceDefinition$')" -eq "${expected_crds}"
-
-          rendered_chart=$(mktemp)
-          trap 'rm -f "${rendered_chart}"' EXIT
-          helm template release-validation charts/orka \
-            --namespace orka-system \
-            > "${rendered_chart}"
-
-          runtime_images=()
-          while IFS= read -r image_line; do
-            image_ref=${image_line#*image: }
-            image_ref=${image_ref#\"}
-            image_ref=${image_ref%\"}
-            runtime_images+=("${image_ref}")
-          done < <(grep -E '^[[:space:]]+image:[[:space:]]+' "${rendered_chart}" | sort -u)
-          if [[ ${#runtime_images[@]} -ne 2 ]]; then
-            echo "Expected two unique rendered controller/publisher images; found ${#runtime_images[@]}." >&2
-            exit 1
-          fi
-          for image_ref in "${runtime_images[@]}"; do
-            if [[ "${image_ref##*:}" != "${expected_version}" ]]; then
-              echo "Tag ${tag} requires runtime image ${image_ref} to use ${expected_version}." >&2
-              exit 1
-            fi
-          done
-
-          for worker in ai general; do
-            worker_refs=()
-            while IFS= read -r worker_line; do
-              worker_refs+=("${worker_line#*=}")
-            done < <(grep -E "^[[:space:]]+- --${worker}-worker-image=" "${rendered_chart}")
-            if [[ ${#worker_refs[@]} -ne 1 || "${worker_refs[0]##*:}" != "${expected_version}" ]]; then
-              echo "Tag ${tag} requires exactly one rendered ${worker} worker image using ${expected_version}." >&2
-              exit 1
-            fi
-          done
+        run: scripts/validate-release-manifest.sh "${GITHUB_REF_NAME}"
 
       - name: Package promoted chart
         run: |
@@ -205,6 +130,8 @@ jobs:
       contents: read
       packages: write
     strategy:
+      # Tagged application releases publish the default harness-v2 stack and
+      # the digest-pinned harness-v1 compatibility wrapper.
       matrix:
         include:
           - image: controller
@@ -218,6 +145,10 @@ jobs:
           - image: general-worker
             image_suffix: "/general-worker"
             dockerfile: workers/general/Dockerfile
+            context: .
+          - image: agent-harness-wrapper
+            image_suffix: "/agent-harness-wrapper"
+            dockerfile: workers/harness/Dockerfile
             context: .
           - image: acp-codex-runtime
             image_suffix: "/acp-codex-runtime"
@@ -353,6 +284,14 @@ jobs:
             image_suffix: "/general-worker"
             platform: linux/arm64
             platform_slug: linux-arm64
+          - image: agent-harness-wrapper
+            image_suffix: "/agent-harness-wrapper"
+            platform: linux/amd64
+            platform_slug: linux-amd64
+          - image: agent-harness-wrapper
+            image_suffix: "/agent-harness-wrapper"
+            platform: linux/arm64
+            platform_slug: linux-arm64
           - image: acp-codex-runtime
             image_suffix: "/acp-codex-runtime"
             platform: linux/amd64
@@ -449,6 +388,8 @@ jobs:
             image_suffix: "/ai-worker"
           - image: general-worker
             image_suffix: "/general-worker"
+          - image: agent-harness-wrapper
+            image_suffix: "/agent-harness-wrapper"
           - image: acp-codex-runtime
             image_suffix: "/acp-codex-runtime"
           - image: acp-claude-runtime
@@ -576,6 +517,7 @@ jobs:
           promote_image controller ""
           promote_image ai-worker "/ai-worker"
           promote_image general-worker "/general-worker"
+          promote_image agent-harness-wrapper "/agent-harness-wrapper"
           promote_image acp-codex-runtime "/acp-codex-runtime"
           promote_image acp-claude-runtime "/acp-claude-runtime"
           promote_image acp-copilot-runtime "/acp-copilot-runtime"

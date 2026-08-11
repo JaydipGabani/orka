@@ -1671,11 +1671,12 @@ func main() {
 	}
 
 	if err := (&controller.RepositoryScanReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		SecurityStore: sqliteStore,
-		ArtifactStore: sqliteStore,
-		ResultStore:   sqliteStore,
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		SecurityStore:    sqliteStore,
+		ArtifactStore:    sqliteStore,
+		ResultStore:      sqliteStore,
+		PublicationStore: sqliteStore,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RepositoryScan")
 		os.Exit(1)

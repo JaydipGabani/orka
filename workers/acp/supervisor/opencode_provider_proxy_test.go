@@ -29,7 +29,18 @@ func TestProviderProxyAcceptsOpenCodeChatCompletions(t *testing.T) {
 	defer session.close()
 	response := doProviderProxyRequest(
 		t, http.MethodPost, binding.BaseURL+"/v1/chat/completions", binding.Credential,
-		[]byte(`{"model":"openai/test-model","max_tokens":32000,"max_completion_tokens":16000}`), nil,
+		[]byte(`{
+			"model":"openai/test-model",
+			"max_tokens":32000,
+			"max_completion_tokens":16000,
+			"reasoning_effort":"medium",
+			"verbosity":"low",
+			"stream":true,
+			"stream_options":{"include_usage":true},
+			"messages":[{"role":"user","content":"inspect the workspace"}],
+			"tool_choice":"auto",
+			"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}]
+		}`), nil,
 	)
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
@@ -52,6 +63,34 @@ func TestProviderProxyAcceptsOpenCodeChatCompletions(t *testing.T) {
 	}
 	if payload["max_completion_tokens"] != float64(4096) {
 		t.Fatalf("OpenCode upstream output limit = %#v, want 4096", payload["max_completion_tokens"])
+	}
+	if _, exists := payload[providerVerbosityField]; exists {
+		t.Fatalf("OpenCode upstream request retained unsupported verbosity: %#v", payload)
+	}
+	if _, exists := payload[providerReasoningEffortField]; exists {
+		t.Fatalf("OpenCode upstream tool request retained unsupported reasoning effort: %#v", payload)
+	}
+	if payload["stream"] != true {
+		t.Fatalf("OpenCode upstream request lost stream setting: %#v", payload)
+	}
+	streamOptions, ok := payload["stream_options"].(map[string]any)
+	if !ok || streamOptions["include_usage"] != true {
+		t.Fatalf("OpenCode upstream request lost stream usage setting: %#v", payload)
+	}
+	tools, ok := payload["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("OpenCode upstream request lost tools: %#v", payload)
+	}
+	tool, ok := tools[0].(map[string]any)
+	if !ok || tool["type"] != "function" {
+		t.Fatalf("OpenCode upstream request changed tool declaration: %#v", payload)
+	}
+	if payload["tool_choice"] != "auto" {
+		t.Fatalf("OpenCode upstream request changed tool choice: %#v", payload)
+	}
+	messages, ok := payload["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("OpenCode upstream request lost messages: %#v", payload)
 	}
 }
 
@@ -91,12 +130,25 @@ func TestNormalizeOpenCodeProviderRequestEnforcesOutputLimit(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		model     string
+		path      string
 		body      string
 		wantField string
 		want      int64
+		verbosity string
+		reasoning string
 		wantErr   bool
 	}{
 		{name: "OpenAI translates max tokens", model: "openai/gpt-5.4", body: `{"model":"openai/gpt-5.4","max_tokens":1024}`, wantField: "max_completion_tokens", want: 1024},
+		{name: "OpenAI strips unsupported verbosity", model: "openai/gpt-5.4", body: `{"model":"openai/gpt-5.4","max_tokens":1024,"reasoning_effort":"medium","verbosity":"low","stream":true}`, wantField: "max_completion_tokens", want: 1024, reasoning: "medium"},
+		{name: "OpenAI strips reasoning effort with tools", model: "openai/gpt-5.4", body: `{"model":"openai/gpt-5.4","max_tokens":1024,"reasoning_effort":"medium","tools":[{"type":"function","function":{"name":"read_file"}}]}`, wantField: "max_completion_tokens", want: 1024},
+		{name: "mixed-case OpenAI strips reasoning effort on unversioned path", model: "OpEnAi/gpt-5.4", path: providerOpenAIChatCompletionsPath, body: `{"model":"OpEnAi/gpt-5.4","max_tokens":1024,"reasoning_effort":"medium","tools":[{"type":"function","function":{"name":"read_file"}}]}`, wantField: "max_completion_tokens", want: 1024},
+		{name: "OpenAI preserves reasoning effort without tools", model: "openai/gpt-5.4", body: `{"model":"openai/gpt-5.4","max_tokens":1024,"reasoning_effort":"high"}`, wantField: "max_completion_tokens", want: 1024, reasoning: "high"},
+		{name: "OpenAI preserves reasoning effort with empty tools", model: "openai/gpt-5.4", body: `{"model":"openai/gpt-5.4","max_tokens":1024,"reasoning_effort":"low","tools":[]}`, wantField: "max_completion_tokens", want: 1024, reasoning: "low"},
+		{name: "OpenAI preserves reasoning effort with null tools", model: "openai/gpt-5.4", body: `{"model":"openai/gpt-5.4","max_tokens":1024,"reasoning_effort":"low","tools":null}`, wantField: "max_completion_tokens", want: 1024, reasoning: "low"},
+		{name: "OpenAI preserves reasoning effort with malformed tools", model: "openai/gpt-5.4", body: `{"model":"openai/gpt-5.4","max_tokens":1024,"reasoning_effort":"low","tools":{"unexpected":true}}`, wantField: "max_completion_tokens", want: 1024, reasoning: "low"},
+		{name: "OpenAI preserves reasoning effort with tool choice only", model: "openai/gpt-5.4", body: `{"model":"openai/gpt-5.4","max_tokens":1024,"reasoning_effort":"low","tool_choice":"auto"}`, wantField: "max_completion_tokens", want: 1024, reasoning: "low"},
+		{name: "OpenAI tools do not insert reasoning effort", model: "openai/gpt-5.4", body: `{"model":"openai/gpt-5.4","max_tokens":1024,"tools":[null]}`, wantField: "max_completion_tokens", want: 1024},
+		{name: "preserves non-OpenAI compatibility fields", model: "openrouter/openai/gpt-5.4", body: `{"model":"openrouter/openai/gpt-5.4","max_tokens":1024,"reasoning_effort":"medium","verbosity":"high","tools":[{"type":"function","function":{"name":"read_file"}}]}`, wantField: "max_tokens", want: 1024, verbosity: "high", reasoning: "medium"},
 		{name: "injects missing limit", model: "openrouter/anthropic/test-model", body: `{"model":"openrouter/anthropic/test-model"}`, wantField: "max_tokens", want: 4096},
 		{name: "clamps max tokens", model: "openrouter/anthropic/test-model", body: `{"model":"openrouter/anthropic/test-model","max_tokens":9000}`, wantField: "max_tokens", want: 4096},
 		{name: "preserves lower max tokens", model: "openrouter/anthropic/test-model", body: `{"model":"openrouter/anthropic/test-model","max_tokens":1024}`, wantField: "max_tokens", want: 1024},
@@ -105,10 +157,14 @@ func TestNormalizeOpenCodeProviderRequestEnforcesOutputLimit(t *testing.T) {
 		{name: "rejects fractional", model: "openrouter/anthropic/test-model", body: `{"model":"openrouter/anthropic/test-model","max_tokens":1.5}`, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			requestPath := test.path
+			if requestPath == "" {
+				requestPath = providerOpenAIChatCompletionsV1Path
+			}
 			got, err := normalizeProviderRequestBody(
 				providerKindOpencode,
 				test.model,
-				providerOpenAIChatCompletionsV1Path,
+				requestPath,
 				4096,
 				[]byte(test.body),
 			)
@@ -125,7 +181,7 @@ func TestNormalizeOpenCodeProviderRequestEnforcesOutputLimit(t *testing.T) {
 			if err := json.Unmarshal(got, &payload); err != nil {
 				t.Fatal(err)
 			}
-			_, wantModel, _ := strings.Cut(test.model, "/")
+			providerID, wantModel, _ := strings.Cut(test.model, "/")
 			if payload["model"] != wantModel {
 				t.Fatalf("model = %#v, want %s", payload["model"], wantModel)
 			}
@@ -138,6 +194,25 @@ func TestNormalizeOpenCodeProviderRequestEnforcesOutputLimit(t *testing.T) {
 			}
 			if _, exists := payload[other]; exists {
 				t.Fatalf("unexpected alternate output limit %s in %#v", other, payload)
+			}
+			verbosity, exists := payload[providerVerbosityField]
+			if test.verbosity != "" {
+				if !exists || verbosity != test.verbosity {
+					t.Fatalf("OpenCode upstream request verbosity = %#v, want %q in %#v", verbosity, test.verbosity, payload)
+				}
+			} else if exists {
+				t.Fatalf("OpenAI-backed OpenCode request retained unsupported verbosity: %#v", payload)
+			}
+			reasoning, exists := payload[providerReasoningEffortField]
+			if test.reasoning != "" {
+				if !exists || reasoning != test.reasoning {
+					t.Fatalf("OpenCode upstream reasoning effort = %#v, want %q in %#v", reasoning, test.reasoning, payload)
+				}
+			} else if exists {
+				t.Fatalf("OpenAI tool-bearing request retained unsupported reasoning effort: %#v", payload)
+			}
+			if strings.EqualFold(providerID, "openai") && strings.Contains(test.body, providerVerbosityField) && payload["stream"] != true {
+				t.Fatalf("OpenCode upstream request lost stream setting: %#v", payload)
 			}
 		})
 	}

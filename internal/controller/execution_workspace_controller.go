@@ -813,7 +813,7 @@ func (r *ExecutionWorkspaceReconciler) projectWorkspaceToOwnerWithTerminalDeleti
 		}
 	}
 	switch owner.Kind {
-	case "Task":
+	case taskResourceKind:
 		return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 			task := &corev1alpha1.Task{}
 			if err := r.Get(ctx, key, task); err != nil {

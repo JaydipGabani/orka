@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -27,9 +29,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
+	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
 	kubestore "github.com/orka-agents/orka/internal/store/kube"
 	"github.com/orka-agents/orka/internal/store/sqlite"
@@ -45,6 +49,23 @@ type missingRecoveryPromptAttemptStore struct {
 func (s *missingRecoveryPromptAttemptStore) GetPromptAttempt(context.Context, string) (*store.PromptAttempt, error) {
 	s.calls.Add(1)
 	return nil, store.ErrNotFound
+}
+
+type failOnceRecoveryProjectionStore struct {
+	store.DurableControlStore
+	err   error
+	calls atomic.Int32
+}
+
+func (s *failOnceRecoveryProjectionStore) EnqueueOutboxProjection(
+	ctx context.Context,
+	projection *store.OutboxProjection,
+	fence store.ControllerEpochFence,
+) (*store.OutboxProjection, error) {
+	if s.calls.Add(1) == 1 {
+		return nil, s.err
+	}
+	return s.DurableControlStore.EnqueueOutboxProjection(ctx, projection, fence)
 }
 
 func TestACPDispatcherRecoverySkipsTaskDeletedAfterCachedList(t *testing.T) {
@@ -147,6 +168,990 @@ func TestACPDispatcherMakesAcceptedOldEpochAttemptOutcomeUnknown(t *testing.T) {
 	}
 }
 
+func TestACPDispatcherFailsRestoredPreSubmissionTaskWithoutReplayingUnderNewUID(t *testing.T) {
+	fixture := newACPRecoveryFixture(t, store.PromptExecutionPlanned)
+	defer fixture.close(t)
+
+	sourceUID, restoredUID := restoreACPRecoveryFixtureTask(t, fixture)
+	if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	attempt, err := fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Key.TaskUID != string(sourceUID) || attempt.ExecutionState != store.PromptExecutionFailed {
+		t.Fatalf("source attempt = %#v", attempt)
+	}
+	targetAttemptID, err := (store.PromptAttemptKey{
+		Namespace: "default", TaskUID: string(restoredUID), Attempt: 1, PromptID: attempt.Key.PromptID,
+	}).CanonicalID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controlStore.GetPromptAttempt(fixture.ctx, targetAttemptID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("target-incarnation attempt lookup error = %v, want ErrNotFound", err)
+	}
+	projection := assertRestoredTaskTerminalProjection(t, fixture, sourceUID, restoredUID,
+		corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed, acpRestorePreSubmissionMessage)
+
+	task := &corev1alpha1.Task{}
+	if err := fixture.kubeClient.Get(fixture.ctx, types.NamespacedName{Namespace: "default", Name: "task"}, task); err != nil {
+		t.Fatal(err)
+	}
+	if task.UID != restoredUID || task.Status.Phase != corev1alpha1.TaskPhaseFailed || task.Status.CompletionTime == nil ||
+		task.Status.Execution == nil || task.Status.Execution.State != corev1alpha1.TaskExecutionStateFailed ||
+		task.Status.Execution.Outcome != corev1alpha1.TaskExecutionOutcomeFailed ||
+		task.Status.Execution.Reason != corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason) ||
+		task.Status.Execution.ControllerEpoch != fixture.fence.Epoch {
+		t.Fatalf("restored task status = %#v", task.Status)
+	}
+
+	version, completion, projectionVersion := attempt.Version, task.Status.CompletionTime.DeepCopy(), projection.Version
+	if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err = fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Version != version {
+		t.Fatalf("idempotent recovery changed source attempt version: got %d, want %d", attempt.Version, version)
+	}
+	if err := fixture.kubeClient.Get(fixture.ctx, types.NamespacedName{Namespace: "default", Name: "task"}, task); err != nil {
+		t.Fatal(err)
+	}
+	if task.Status.CompletionTime == nil || !task.Status.CompletionTime.Equal(completion) {
+		t.Fatalf("idempotent recovery changed completion time: got %v, want %v", task.Status.CompletionTime, completion)
+	}
+	projection = assertRestoredTaskTerminalProjection(t, fixture, sourceUID, restoredUID,
+		corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed, acpRestorePreSubmissionMessage)
+	if projection.Version != projectionVersion {
+		t.Fatalf("idempotent recovery changed source projection version: got %d, want %d", projection.Version, projectionVersion)
+	}
+}
+
+func TestACPDispatcherRestoredTaskRecoveryReconstructsProjectionAfterCommittedAttemptTransition(t *testing.T) {
+	fixture := newACPRecoveryFixture(t, store.PromptExecutionPlanned)
+	defer fixture.close(t)
+
+	sourceUID, restoredUID := restoreACPRecoveryFixtureTask(t, fixture)
+	injectedErr := errors.New("injected projection enqueue failure")
+	failingStore := &failOnceRecoveryProjectionStore{DurableControlStore: fixture.controlStore, err: injectedErr}
+	fixture.dispatcher.Store = failingStore
+	if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); !errors.Is(err, injectedErr) {
+		t.Fatalf("first recoverStaleAttempts() error = %v, want injected enqueue failure", err)
+	}
+
+	attempt, err := fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.ExecutionState != store.PromptExecutionFailed ||
+		attempt.TerminalReason != acpRestoreIdentityChangedReason || attempt.OutcomeMarker != acpRestorePreSubmissionMessage {
+		t.Fatalf("committed source attempt = %#v", attempt)
+	}
+	committedVersion := attempt.Version
+	projectionID := standaloneTaskTerminalProjectionIDForUID("default", sourceUID, 1)
+	if _, err := fixture.controlStore.GetOutboxProjection(fixture.ctx, projectionID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("projection after injected failure lookup error = %v, want ErrNotFound", err)
+	}
+	task := &corev1alpha1.Task{}
+	if err := fixture.kubeClient.Get(fixture.ctx, types.NamespacedName{Namespace: "default", Name: "task"}, task); err != nil {
+		t.Fatal(err)
+	}
+	if task.Status.Execution == nil || task.Status.Execution.Reason == corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason) {
+		t.Fatalf("Task was terminally patched before projection durability: %#v", task.Status.Execution)
+	}
+
+	if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err = fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Version != committedVersion {
+		t.Fatalf("projection reconstruction changed source attempt version: got %d, want %d", attempt.Version, committedVersion)
+	}
+	assertRestoredTaskTerminalProjection(t, fixture, sourceUID, restoredUID,
+		corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed, acpRestorePreSubmissionMessage)
+}
+
+func TestACPDispatcherMarksRestoredPostWriteTaskOutcomeUnknown(t *testing.T) {
+	fixture := newACPRecoveryFixture(t, store.PromptExecutionAccepted)
+	defer fixture.close(t)
+
+	sourceUID, restoredUID := restoreACPRecoveryFixtureTask(t, fixture)
+	if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.ExecutionState != store.PromptExecutionOutcomeUnknown ||
+		attempt.TerminalReason != acpRestoreIdentityChangedReason || attempt.OutcomeMarker == "" {
+		t.Fatalf("source attempt = %#v", attempt)
+	}
+	task := &corev1alpha1.Task{}
+	if err := fixture.kubeClient.Get(fixture.ctx, types.NamespacedName{Namespace: "default", Name: "task"}, task); err != nil {
+		t.Fatal(err)
+	}
+	if task.Status.Execution == nil || task.Status.Execution.State != corev1alpha1.TaskExecutionStateOutcomeUnknown ||
+		task.Status.Execution.Outcome != corev1alpha1.TaskExecutionOutcomeOutcomeUnknown ||
+		task.Status.Execution.Reason != corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason) {
+		t.Fatalf("restored task execution = %#v", task.Status.Execution)
+	}
+	assertRestoredTaskTerminalProjection(t, fixture, sourceUID, restoredUID,
+		corev1alpha1.TaskExecutionStateOutcomeUnknown, corev1alpha1.TaskExecutionOutcomeOutcomeUnknown, acpRestorePostWriteMessage)
+}
+
+func TestACPDispatcherRestoredTaskRecordsSourceBoundCleanupWhenRuntimeIsAbsent(t *testing.T) {
+	fixture := newACPRecoveryFixture(t, store.PromptExecutionAccepted)
+	defer fixture.close(t)
+
+	sourceUID, _ := restoreACPRecoveryFixtureTask(t, fixture)
+	task := &corev1alpha1.Task{}
+	key := types.NamespacedName{Namespace: "default", Name: "task"}
+	if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Execution.RuntimePoolName = "absent-restored-pool"
+	task.Status.Execution.RuntimeInstanceID = "source-runtime-instance"
+	task.Status.Execution.RuntimeSessionUID = "source-runtime-session"
+	task.Status.Execution.RuntimeSessionGeneration = 3
+	task.Status.Execution.RuntimeSessionCleanupDigest = ""
+	if err := fixture.kubeClient.Status().Update(fixture.ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, err := taskScopedRuntimeSessionCleanupDigest(
+		sourceUID, task.Status.Execution.Attempt, task.Status.Execution.RuntimeInstanceID,
+		task.Status.Execution.RuntimeSessionUID, task.Status.Execution.RuntimeSessionGeneration,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status.Execution.RuntimeSessionCleanupDigest != wantDigest || !taskScopedRuntimeSessionCleanupComplete(task) {
+		t.Fatalf("restored cleanup receipt = %q, want source-bound %q", task.Status.Execution.RuntimeSessionCleanupDigest, wantDigest)
+	}
+
+	projector := &ACPOutboxProjector{
+		Client: fixture.kubeClient, Store: fixture.controlStore, Epochs: fixture.dispatcher.Epochs,
+		WorkerID: "restored-cleanup-projector", MaxAttempts: 3,
+	}
+	if err := projector.projectOnce(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	projectionID := standaloneTaskTerminalProjectionIDForUID(task.Namespace, sourceUID, task.Status.Execution.Attempt)
+	projection, err := fixture.controlStore.GetOutboxProjection(fixture.ctx, projectionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.State != store.OutboxProjectionDelivered {
+		t.Fatalf("restored source projection state = %s, want Delivered", projection.State)
+	}
+	reconciler := &TaskReconciler{Client: fixture.kubeClient, DurableControlStore: fixture.controlStore}
+	ready, err := reconciler.acpTaskDeletionReady(fixture.ctx, task)
+	if err != nil || !ready {
+		t.Fatalf("restored Task deletion readiness = %v, %v", ready, err)
+	}
+}
+
+//nolint:gocyclo // The restored publication states intentionally share one complete recovery/idempotency/finalizer matrix.
+func TestACPDispatcherRestoredTerminalExecutionSettlesNonterminalDeliveryAndPublication(t *testing.T) {
+	tests := []struct {
+		name                 string
+		deliveryState        store.PromptDeliveryState
+		publicationState     store.PublicationState
+		wantDeliveryState    store.PromptDeliveryState
+		wantPublicationState store.PublicationState
+		wantPreparedReceipt  bool
+		wantPhase            corev1alpha1.TaskPhase
+	}{
+		{
+			name: "validating before publication creation", deliveryState: store.PromptDeliveryValidating,
+			wantDeliveryState: store.PromptDeliveryConflict, wantPhase: corev1alpha1.TaskPhaseFailed,
+		},
+		{
+			name: "validating after publication creation", deliveryState: store.PromptDeliveryValidating,
+			publicationState: store.PublicationPreparing, wantDeliveryState: store.PromptDeliveryPublicationOutcomeUnknown,
+			wantPublicationState: store.PublicationOutcomeUnknown, wantPhase: corev1alpha1.TaskPhaseFailed,
+		},
+		{
+			name: "prepared before remote write", deliveryState: store.PromptDeliveryPrepared,
+			publicationState: store.PublicationPrepared, wantDeliveryState: store.PromptDeliveryCancelledBeforePublish,
+			wantPublicationState: store.PublicationCancelledBeforePublish, wantPreparedReceipt: true,
+			wantPhase: corev1alpha1.TaskPhaseCancelled,
+		},
+		{
+			name: "publishing with remote outcome unknown", deliveryState: store.PromptDeliveryPublishing,
+			publicationState: store.PublicationPublishing, wantDeliveryState: store.PromptDeliveryPublicationOutcomeUnknown,
+			wantPublicationState: store.PublicationOutcomeUnknown, wantPreparedReceipt: true,
+			wantPhase: corev1alpha1.TaskPhaseFailed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newACPRecoveryFixture(t, store.PromptExecutionAccepted)
+			defer fixture.close(t)
+
+			attempt, err := fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, next := range []store.PromptExecutionState{
+				store.PromptExecutionRunning, store.PromptExecutionSettling, store.PromptExecutionSucceeded,
+			} {
+				attempt, err = fixture.controlStore.TransitionPromptAttemptExecution(fixture.ctx, store.PromptAttemptExecutionTransition{
+					ID: attempt.ID, Fence: fixture.fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
+					NewState: next, OperationID: "restore-terminal-" + string(next),
+					OperationDigest: testControlDigestForDispatcher("restore-terminal-" + string(next)), UpdatedAt: time.Now().UTC(),
+				})
+				if err != nil {
+					t.Fatalf("transition source execution to %s: %v", next, err)
+				}
+			}
+			deliveryPath := []store.PromptDeliveryState{store.PromptDeliveryValidating}
+			switch tt.deliveryState {
+			case store.PromptDeliveryValidating:
+			case store.PromptDeliveryPrepared:
+				deliveryPath = append(deliveryPath, store.PromptDeliveryPreparing, store.PromptDeliveryPrepared)
+			case store.PromptDeliveryPublishing:
+				deliveryPath = append(deliveryPath, store.PromptDeliveryPreparing, store.PromptDeliveryPrepared)
+				deliveryPath = append(deliveryPath, store.PromptDeliveryPublishing)
+			default:
+				t.Fatalf("unsupported delivery fixture state %s", tt.deliveryState)
+			}
+			for _, next := range deliveryPath {
+				attempt, err = fixture.controlStore.TransitionPromptAttemptDelivery(fixture.ctx, store.PromptAttemptDeliveryTransition{
+					ID: attempt.ID, Fence: fixture.fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.DeliveryState,
+					NewState: next, OperationID: "restore-delivery-" + string(next),
+					OperationDigest: testControlDigestForDispatcher("restore-delivery-" + string(next)), UpdatedAt: time.Now().UTC(),
+				})
+				if err != nil {
+					t.Fatalf("transition source delivery to %s: %v", next, err)
+				}
+			}
+
+			key := types.NamespacedName{Namespace: "default", Name: "task"}
+			task := &corev1alpha1.Task{}
+			if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+				t.Fatal(err)
+			}
+			task.Spec.Workspace = &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite}
+			if err := fixture.kubeClient.Update(fixture.ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+				t.Fatal(err)
+			}
+			task.Status.Phase = corev1alpha1.TaskPhaseRunning
+			task.Status.Execution.State = corev1alpha1.TaskExecutionStateSucceeded
+			task.Status.Execution.Outcome = corev1alpha1.TaskExecutionOutcomeSucceeded
+			evidenceTransition := metav1.NewTime(time.Date(2026, 8, 10, 11, 0, 0, 0, time.UTC))
+			task.Status.Delivery = restoredDeliveryEvidenceFixture(tt.deliveryState, "", evidenceTransition)
+			publicationID := publicationIDForTask(task)
+			task.Status.Delivery.PublicationID = publicationID
+			var publication *store.Publication
+			if tt.publicationState != "" {
+				publication = createACPRecoveryPublication(t, fixture, task, tt.publicationState)
+			}
+			sourceDeliveryEvidence := task.Status.Delivery.DeepCopy()
+			if err := fixture.kubeClient.Status().Update(fixture.ctx, task); err != nil {
+				t.Fatal(err)
+			}
+
+			sourceUID, restoredUID := restoreACPRecoveryFixtureTask(t, fixture)
+			if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			attempt, err = fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if attempt.ExecutionState != store.PromptExecutionSucceeded || attempt.DeliveryState != tt.wantDeliveryState {
+				t.Fatalf("settled source PromptAttempt = %#v", attempt)
+			}
+			if tt.wantPublicationState == "" {
+				if _, err := fixture.controlStore.GetPublication(fixture.ctx, publicationID); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("restored recovery invented Publication %q: %v", publicationID, err)
+				}
+			} else {
+				publication, err = fixture.controlStore.GetPublication(fixture.ctx, publicationID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if publication.TaskUID != string(sourceUID) || publication.State != tt.wantPublicationState ||
+					(publication.PreparedReceipt != nil) != tt.wantPreparedReceipt {
+					t.Fatalf("settled source Publication = %#v", publication)
+				}
+			}
+			if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+				t.Fatal(err)
+			}
+			if task.UID != restoredUID || task.Status.Phase != tt.wantPhase || task.Status.Execution == nil ||
+				task.Status.Execution.State != corev1alpha1.TaskExecutionStateSucceeded ||
+				task.Status.Execution.Outcome != corev1alpha1.TaskExecutionOutcomeSucceeded ||
+				task.Status.Execution.Reason != corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason) ||
+				task.Status.Delivery == nil || store.PromptDeliveryState(task.Status.Delivery.State) != tt.wantDeliveryState {
+				t.Fatalf("settled restored Task status = %#v", task.Status)
+			}
+			assertRestoredDeliveryEvidence(t, task.Status.Delivery, sourceDeliveryEvidence, tt.wantDeliveryState)
+			if task.Status.Delivery.LastTransitionTime.Equal(sourceDeliveryEvidence.LastTransitionTime) {
+				t.Fatal("restored delivery settlement did not advance its transition time")
+			}
+			firstRestoredDelivery := task.Status.Delivery.DeepCopy()
+			projectionID := standaloneTaskTerminalProjectionIDForUID(task.Namespace, sourceUID, task.Status.Execution.Attempt)
+			projection, err := fixture.controlStore.GetOutboxProjection(fixture.ctx, projectionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload taskTerminalProjection
+			if err := json.Unmarshal(projection.Payload, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.TaskUID != string(sourceUID) || payload.Phase != tt.wantPhase ||
+				payload.Execution.State != corev1alpha1.TaskExecutionStateSucceeded || payload.Delivery == nil ||
+				store.PromptDeliveryState(payload.Delivery.State) != tt.wantDeliveryState {
+				t.Fatalf("settled source projection payload = %#v", payload)
+			}
+			assertRestoredDeliveryEvidence(t, payload.Delivery, sourceDeliveryEvidence, tt.wantDeliveryState)
+			if !reflect.DeepEqual(payload.Delivery, task.Status.Delivery) {
+				t.Fatalf("projection and restored Task delivery evidence differ: projection=%#v task=%#v", payload.Delivery, task.Status.Delivery)
+			}
+
+			attemptVersion, projectionVersion := attempt.Version, projection.Version
+			publicationVersion := int64(0)
+			if publication != nil {
+				publicationVersion = publication.Version
+			}
+			if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
+				t.Fatalf("idempotent restored recovery: %v", err)
+			}
+			attempt, err = fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantPublicationState == "" {
+				if _, err := fixture.controlStore.GetPublication(fixture.ctx, publicationID); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("idempotent recovery invented Publication %q: %v", publicationID, err)
+				}
+			} else {
+				publication, err = fixture.controlStore.GetPublication(fixture.ctx, publicationID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if publication.Version != publicationVersion {
+					t.Fatalf("idempotent recovery changed Publication version: got %d, want %d", publication.Version, publicationVersion)
+				}
+			}
+			projection, err = fixture.controlStore.GetOutboxProjection(fixture.ctx, projectionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if attempt.Version != attemptVersion || projection.Version != projectionVersion {
+				t.Fatalf("idempotent recovery changed versions: attempt %d/%d projection %d/%d",
+					attemptVersion, attempt.Version, projectionVersion, projection.Version)
+			}
+			if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(task.Status.Delivery, firstRestoredDelivery) {
+				t.Fatalf("idempotent recovery changed restored delivery evidence: before=%#v after=%#v", firstRestoredDelivery, task.Status.Delivery)
+			}
+
+			projector := &ACPOutboxProjector{
+				Client: fixture.kubeClient, Store: fixture.controlStore, Epochs: fixture.dispatcher.Epochs,
+				WorkerID: "restored-publication-projector", MaxAttempts: 3,
+			}
+			if err := projector.projectOnce(fixture.ctx); err != nil {
+				t.Fatal(err)
+			}
+			reconciler := &TaskReconciler{Client: fixture.kubeClient, DurableControlStore: fixture.controlStore}
+			ready, err := reconciler.acpTaskDeletionReady(fixture.ctx, task)
+			if err != nil || !ready {
+				t.Fatalf("settled restored Task deletion readiness = %v, %v", ready, err)
+			}
+		})
+	}
+}
+
+// TestDeletingRestoredACPTaskReclaimsSourcePromptAttemptAndRemovesFinalizer
+// isolates the Kubernetes-backed PromptAttempt reclamation/finalizer boundary.
+// The recovery matrix above separately proves source-UID Publication settlement
+// and projection continuity for write workspaces.
+//
+//nolint:gocyclo // The matrix keeps each crash-tail step and its exactly-once assertions visible together.
+func TestDeletingRestoredACPTaskReclaimsSourcePromptAttemptAndRemovesFinalizer(t *testing.T) {
+	tests := []struct {
+		name     string
+		delivery store.PromptDeliveryState
+		phase    corev1alpha1.TaskPhase
+	}{
+		{name: "succeeded verified exact", delivery: store.PromptDeliveryVerifiedExact, phase: corev1alpha1.TaskPhaseSucceeded},
+		{name: "succeeded cancelled before publish", delivery: store.PromptDeliveryCancelledBeforePublish, phase: corev1alpha1.TaskPhaseCancelled},
+		{name: "succeeded publication outcome unknown", delivery: store.PromptDeliveryPublicationOutcomeUnknown, phase: corev1alpha1.TaskPhaseFailed},
+	}
+	for index, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			sourceUID := types.UID(fmt.Sprintf("55555555-5555-5555-5555-%012d", index+1))
+			restoredUID := types.UID(fmt.Sprintf("66666666-6666-6666-6666-%012d", index+1))
+			taskName := "restored-finalizer-" + strconv.Itoa(index+1)
+			promptID := "prompt-" + string(sourceUID) + "-1"
+			sourceTask := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: taskName, UID: sourceUID},
+				Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent},
+			}
+			reconciler := newUnitReconciler(newTestScheme(), sourceTask)
+			base := withControllerEpochLeaseUIDs(t, reconciler.Client)
+			var promptAttemptDeletes atomic.Int32
+			var finalizerPatches atomic.Int32
+			intercepted := interceptor.NewClient(base, interceptor.Funcs{
+				Delete: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.DeleteOption) error {
+					if _, isPromptAttempt := object.(*corev1alpha1.PromptAttempt); isPromptAttempt {
+						promptAttemptDeletes.Add(1)
+					}
+					return delegate.Delete(ctx, object, options...)
+				},
+				Patch: func(ctx context.Context, delegate client.WithWatch, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+					if _, isTask := object.(*corev1alpha1.Task); isTask {
+						call := finalizerPatches.Add(1)
+						if call == 1 {
+							return errors.New("simulated crash after durable PromptAttempt reclamation")
+						}
+					}
+					return delegate.Patch(ctx, object, patch, options...)
+				},
+			})
+			reconciler.Client = intercepted
+			reconciler.APIReader = intercepted
+
+			db, err := sqlite.NewDB(filepath.Join(t.TempDir(), "restored-finalizer.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close() //nolint:errcheck
+			persistence := sqlite.NewStore(db, "restored-finalizer")
+			controlStore, err := kubestore.NewComposite(intercepted, "default", persistence, kubestore.WithAPIReader(intercepted))
+			if err != nil {
+				t.Fatal(err)
+			}
+			epochs, stopEpoch := startACPRecoveryEpochManager(t, ctx, controlStore, "restored-finalizer-"+strconv.Itoa(index+1))
+			defer stopEpoch()
+			fence, err := epochs.CurrentFence(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reconciler.DurableControlStore = controlStore
+			reconciler.ControllerEpochManager = epochs
+
+			attemptKey := store.PromptAttemptKey{Namespace: sourceTask.Namespace, TaskUID: string(sourceUID), Attempt: 1, PromptID: promptID}
+			attempt, err := controlStore.CreatePromptAttempt(ctx, boundPromptAttemptForTest(&store.PromptAttempt{
+				Key: attemptKey, RequestDigest: testControlDigestForDispatcher("restored-finalizer-" + strconv.Itoa(index+1)),
+			}), fence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, state := range []store.PromptExecutionState{
+				store.PromptExecutionReserved, store.PromptExecutionSessionStarting, store.PromptExecutionPlanned,
+				store.PromptExecutionSubmitting, store.PromptExecutionAccepted, store.PromptExecutionRunning,
+				store.PromptExecutionSettling, store.PromptExecutionSucceeded,
+			} {
+				attempt = transitionACPRecoveryAttempt(t, ctx, controlStore, fence, attempt, state, nil)
+			}
+			attempt = transitionRestoredFinalizerDelivery(t, ctx, controlStore, fence, attempt, tt.delivery)
+
+			transitionTime := metav1.NewTime(time.Date(2026, 8, 10, 14, index, 0, 0, time.UTC))
+			execution := corev1alpha1.TaskExecutionStatus{
+				State: corev1alpha1.TaskExecutionStateSucceeded, Outcome: corev1alpha1.TaskExecutionOutcomeSucceeded,
+				Attempt: 1, PromptID: promptID, RequestDigest: attempt.RequestDigest, LastTransitionTime: &transitionTime,
+			}
+			delivery := &corev1alpha1.TaskDeliveryStatus{
+				State: corev1alpha1.TaskDeliveryState(tt.delivery), Outcome: corev1alpha1.TaskDeliveryOutcome(tt.delivery),
+				LastTransitionTime: &transitionTime,
+			}
+			projectionPayload := taskTerminalProjection{
+				Namespace: sourceTask.Namespace, Task: sourceTask.Name, TaskUID: string(sourceUID), Attempt: 1,
+				Phase: tt.phase, Execution: execution, Delivery: delivery.DeepCopy(),
+			}
+			if err := enqueueDurableTaskTerminalProjectionForUID(ctx, controlStore, fence, sourceTask, sourceUID, projectionPayload); err != nil {
+				t.Fatal(err)
+			}
+			projectionID := standaloneTaskTerminalProjectionIDForUID(sourceTask.Namespace, sourceUID, 1)
+			claims, err := controlStore.ClaimOutboxProjections(ctx, store.ClaimOutboxProjectionsRequest{
+				Fence: fence, WorkerID: "restored-finalizer", Limit: 1, LeaseDuration: time.Minute, Now: time.Now().UTC(),
+			})
+			if err != nil || len(claims) != 1 || claims[0].ID != projectionID {
+				t.Fatalf("claim restored source projection: claims=%#v err=%v", claims, err)
+			}
+			projection, err := controlStore.CompleteOutboxProjection(ctx, store.CompleteOutboxProjectionRequest{
+				ID: claims[0].ID, Fence: fence, ExpectedVersion: claims[0].Version, LeaseOwner: claims[0].LeaseOwner,
+				OperationID: "deliver-restored-finalizer", OperationDigest: testControlDigestForDispatcher("deliver-restored-finalizer-" + strconv.Itoa(index+1)),
+				NewState: store.OutboxProjectionDelivered, DeliveryDigest: testControlDigestForDispatcher("delivered-restored-finalizer-" + strconv.Itoa(index+1)),
+				UpdatedAt: time.Now().UTC(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := intercepted.Delete(ctx, sourceTask); err != nil {
+				t.Fatal(err)
+			}
+			binding := testACPExecuteBindingForDispatcher()
+			binding.Task.UID = sourceUID
+			binding.Snapshot.ID = (store.AgentExecutionSnapshotKey{TaskUID: string(sourceUID), Digest: attempt.SnapshotDigest}).ID()
+			binding.Snapshot.SchemaVersion = store.AgentExecutionSnapshotSchemaVersion
+			restored := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: sourceTask.Namespace, Name: sourceTask.Name, UID: restoredUID,
+					Finalizers: []string{labels.TaskFinalizer},
+				},
+				Spec: sourceTask.Spec,
+			}
+			if err := intercepted.Create(ctx, restored); err != nil {
+				t.Fatal(err)
+			}
+			restored.Status = corev1alpha1.TaskStatus{
+				Phase: tt.phase, Attempts: 1, AgentExecutionBinding: binding,
+				Execution: &corev1alpha1.TaskExecutionStatus{
+					State: corev1alpha1.TaskExecutionStateSucceeded, Outcome: corev1alpha1.TaskExecutionOutcomeSucceeded,
+					Attempt: 1, PromptID: promptID, RequestDigest: attempt.RequestDigest, LastTransitionTime: &transitionTime,
+				},
+				Delivery: delivery.DeepCopy(),
+			}
+			if err := intercepted.Status().Update(ctx, restored); err != nil {
+				t.Fatal(err)
+			}
+			if err := intercepted.Delete(ctx, restored); err != nil {
+				t.Fatal(err)
+			}
+			key := types.NamespacedName{Namespace: restored.Namespace, Name: restored.Name}
+			if err := intercepted.Get(ctx, key, restored); err != nil {
+				t.Fatal(err)
+			}
+			if !acpTaskHasUnvalidatedSourceIdentity(restored) || restored.Status.Execution.RuntimePoolName != "" ||
+				restored.Status.Execution.AgentRuntimeName != "" || restored.DeletionTimestamp.IsZero() {
+				t.Fatalf("pre-recovery deleting restore did not exercise the unvalidated no-runtime selector: %#v", restored)
+			}
+
+			dispatcher := &ACPDispatcher{
+				Client: intercepted, APIReader: intercepted, Store: controlStore, ResultStore: persistence, Epochs: epochs,
+			}
+			if err := dispatcher.recoverStaleAttempts(ctx); err != nil {
+				t.Fatalf("recover deleting restored Task: %v", err)
+			}
+			if err := intercepted.Get(ctx, key, restored); err != nil {
+				t.Fatal(err)
+			}
+			if !acpTaskUsesRestoredSourceIdentity(restored) || restored.DeletionTimestamp.IsZero() ||
+				restored.Status.Execution.RuntimePoolName != "" || restored.Status.Execution.AgentRuntimeName != "" {
+				t.Fatalf("recovered deleting restore = %#v", restored)
+			}
+
+			if _, err := reconciler.handleDeletion(ctx, restored); err == nil || !strings.Contains(err.Error(), "simulated crash") {
+				t.Fatalf("first handleDeletion() error = %v, want simulated finalizer-patch crash", err)
+			}
+			if got := promptAttemptDeletes.Load(); got != 1 {
+				t.Fatalf("source PromptAttempt delete calls after crash = %d, want 1", got)
+			}
+			if _, err := controlStore.GetPromptAttempt(ctx, attempt.ID); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("source PromptAttempt after crash = %v, want ErrNotFound", err)
+			}
+			if err := intercepted.Get(ctx, key, restored); err != nil {
+				t.Fatal(err)
+			}
+			condition := apiMeta.FindStatusCondition(restored.Status.Conditions, "ACPPromptAttemptsReclaimed")
+			if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "PromptAttemptsReclaimed" || condition.Message == "" {
+				t.Fatalf("durable PromptAttempt reclamation receipt after crash = %#v", condition)
+			}
+			if !controllerutil.ContainsFinalizer(restored, labels.TaskFinalizer) || finalizerPatches.Load() != 1 {
+				t.Fatalf("Task finalizer after crash = %#v, patch calls=%d", restored.Finalizers, finalizerPatches.Load())
+			}
+			assertNoRestoredFinalizerReclamationMarker(t, ctx, intercepted)
+			storedProjection, err := controlStore.GetOutboxProjection(ctx, projectionID)
+			if err != nil || storedProjection.Version != projection.Version || storedProjection.State != store.OutboxProjectionDelivered {
+				t.Fatalf("source projection after crash = %#v err=%v, want unchanged delivered version %d", storedProjection, err, projection.Version)
+			}
+
+			missingStore := &missingRecoveryPromptAttemptStore{DurableControlStore: controlStore}
+			dispatcher.Store = missingStore
+			if err := dispatcher.recoverStaleAttempts(ctx); err != nil {
+				t.Fatalf("dispatcher restart after source attempt reclamation: %v", err)
+			}
+			if got := missingStore.calls.Load(); got != 0 {
+				t.Fatalf("dispatcher restart read reclaimed source PromptAttempt %d times, want 0", got)
+			}
+			if _, err := controlStore.GetPromptAttempt(ctx, attempt.ID); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("dispatcher restart recreated source PromptAttempt: %v", err)
+			}
+
+			if _, err := reconciler.handleDeletion(ctx, restored); err != nil {
+				t.Fatalf("retry handleDeletion(): %v", err)
+			}
+			if got := promptAttemptDeletes.Load(); got != 1 {
+				t.Fatalf("source PromptAttempt delete calls after retry = %d, want exactly 1", got)
+			}
+			if got := finalizerPatches.Load(); got != 2 {
+				t.Fatalf("Task finalizer patch calls = %d, want failed call plus successful retry", got)
+			}
+			if err := intercepted.Get(ctx, key, &corev1alpha1.Task{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("restored Task after finalizer retry = %v, want NotFound", err)
+			}
+			assertNoRestoredFinalizerReclamationMarker(t, ctx, intercepted)
+			storedProjection, err = controlStore.GetOutboxProjection(ctx, projectionID)
+			if err != nil || storedProjection.Version != projection.Version || storedProjection.State != store.OutboxProjectionDelivered {
+				t.Fatalf("source projection after retry = %#v err=%v, want unchanged delivered version %d", storedProjection, err, projection.Version)
+			}
+		})
+	}
+}
+
+func transitionRestoredFinalizerDelivery(
+	t *testing.T,
+	ctx context.Context,
+	controlStore store.PromptAttemptStore,
+	fence store.ControllerEpochFence,
+	attempt *store.PromptAttempt,
+	target store.PromptDeliveryState,
+) *store.PromptAttempt {
+	t.Helper()
+	path := []store.PromptDeliveryState{store.PromptDeliveryValidating, store.PromptDeliveryPreparing, store.PromptDeliveryPrepared}
+	switch target {
+	case store.PromptDeliveryVerifiedExact:
+		path = append(path, store.PromptDeliveryPublishing, store.PromptDeliveryVerifying, target)
+	case store.PromptDeliveryCancelledBeforePublish:
+		path = append(path, target)
+	case store.PromptDeliveryPublicationOutcomeUnknown:
+		path = append(path, store.PromptDeliveryPublishing, target)
+	default:
+		t.Fatalf("unsupported restored finalizer delivery target %q", target)
+	}
+	for index, next := range path {
+		updated, err := controlStore.TransitionPromptAttemptDelivery(ctx, store.PromptAttemptDeliveryTransition{
+			ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.DeliveryState,
+			NewState: next, OperationID: "restored-finalizer-delivery-" + strconv.Itoa(index),
+			OperationDigest: testControlDigestForDispatcher("restored-finalizer-delivery-" + string(target) + "-" + strconv.Itoa(index)),
+			UpdatedAt:       time.Now().UTC(),
+		})
+		if err != nil {
+			t.Fatalf("transition restored finalizer delivery to %s: %v", next, err)
+		}
+		attempt = updated
+	}
+	return attempt
+}
+
+func assertNoRestoredFinalizerReclamationMarker(t *testing.T, ctx context.Context, kubeClient client.Client) {
+	t.Helper()
+	markers := &corev1.ConfigMapList{}
+	if err := kubeClient.List(ctx, markers, client.InNamespace("default")); err != nil {
+		t.Fatal(err)
+	}
+	for i := range markers.Items {
+		if strings.HasPrefix(markers.Items[i].Name, "prompt-reclaim-") {
+			t.Fatalf("PromptAttempt reclamation marker remained: %s", markers.Items[i].Name)
+		}
+	}
+}
+
+func createACPRecoveryPublication(
+	t *testing.T,
+	fixture *recoveryFixture,
+	task *corev1alpha1.Task,
+	target store.PublicationState,
+) *store.Publication {
+	t.Helper()
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	publicationID := publicationIDForTask(task)
+	targetRepositoryID := "github.com/orka/target"
+	targetRef := "refs/heads/restore"
+	baseline := store.RemoteRefState{Absent: true}
+	claimID, err := store.CanonicalBranchClaimID(targetRepositoryID, targetRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimDigest, err := branchClaimRequestDigest(
+		targetRepositoryID, targetRef, store.BranchClaimOwnerTask, string(task.UID), baseline, publicationID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := fixture.controlStore.CreateBranchClaim(fixture.ctx, &store.BranchClaim{
+		ID: claimID, RepositoryID: targetRepositoryID, Ref: targetRef,
+		OwnerKind: store.BranchClaimOwnerTask, OwnerUID: string(task.UID), Generation: 1,
+		LastVerified: baseline, RequestDigest: claimDigest, CreatedAt: now,
+	}, fixture.fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := fixture.controlStore.CreatePublication(fixture.ctx, &store.Publication{
+		ID: publicationID, Namespace: task.Namespace, Generation: 1,
+		TaskUID: string(task.UID), Attempt: int64(task.Status.Execution.Attempt), PromptID: task.Status.Execution.PromptID,
+		BranchClaimID: claim.ID, BranchClaimGeneration: claim.Generation,
+		SourceRepositoryID: "github.com/orka/source", SourceRef: "refs/heads/main", SourceBaselineSHA: strings.Repeat("1", 40),
+		TargetRepositoryID: targetRepositoryID, TargetRef: targetRef, Baseline: baseline,
+		ArtifactID: "restore-artifact", ArtifactDigest: testControlDigestForDispatcher("restore-artifact"), ArtifactSizeBytes: 1,
+		ArtifactMediaType: "application/vnd.orka.workspace-delta.v1+tar", PublicationCredentialRef: "secret/default/publisher#token",
+		CommitIdentity: "Orka <orka@example.invalid>", CommitMessage: "restore publication fixture", CommitTimestamp: now,
+		RequestDigest: testControlDigestForDispatcher("restore-publication"), CreatedAt: now,
+	}, fixture.fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target == store.PublicationPreparing {
+		return publication
+	}
+	prepared := &store.PreparedPublicationReceipt{
+		OperationID: "restore-prepare", RequestDigest: testControlDigestForDispatcher("restore-prepare"),
+		TreeSHA: strings.Repeat("2", 40), CommitSHA: strings.Repeat("3", 40),
+		ManifestDigest: testControlDigestForDispatcher("restore-manifest"), RelativeRoot: ".",
+		BundleArtifactID: "restore-bundle", BundleDigest: testControlDigestForDispatcher("restore-bundle"),
+		BundleSizeBytes: 1, BundleMediaType: store.PreparedBundleMediaType,
+		BundleRef: "refs/orka/publications/" + strings.Repeat("4", 64), PreparedAt: now.Add(time.Minute),
+	}
+	publication, err = fixture.controlStore.TransitionPublication(fixture.ctx, store.PublicationTransition{
+		ID: publication.ID, Fence: fixture.fence, ExpectedVersion: publication.Version, ExpectedGeneration: publication.Generation,
+		ExpectedState: publication.State, NewState: store.PublicationPrepared,
+		OperationID: prepared.OperationID, OperationDigest: prepared.RequestDigest, PreparedReceipt: prepared, UpdatedAt: prepared.PreparedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target == store.PublicationPublishing {
+		publication, err = fixture.controlStore.TransitionPublication(fixture.ctx, store.PublicationTransition{
+			ID: publication.ID, Fence: fixture.fence, ExpectedVersion: publication.Version, ExpectedGeneration: publication.Generation,
+			ExpectedState: publication.State, NewState: store.PublicationPublishing,
+			OperationID: "restore-publishing", OperationDigest: testControlDigestForDispatcher("restore-publishing"), UpdatedAt: now.Add(2 * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if publication.State != target {
+		t.Fatalf("publication fixture state = %s, want %s", publication.State, target)
+	}
+	return publication
+}
+
+func assertRestoredTaskTerminalProjection(
+	t *testing.T,
+	fixture *recoveryFixture,
+	sourceUID types.UID,
+	restoredUID types.UID,
+	state corev1alpha1.TaskExecutionState,
+	outcome corev1alpha1.TaskExecutionOutcome,
+	message string,
+) *store.OutboxProjection {
+	t.Helper()
+	projectionID := standaloneTaskTerminalProjectionIDForUID("default", sourceUID, 1)
+	projection, err := fixture.controlStore.GetOutboxProjection(fixture.ctx, projectionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.AggregateKind != "Task" || projection.AggregateID != string(sourceUID) ||
+		projection.ProjectionKind != "TaskTerminalStatus" {
+		t.Fatalf("source projection metadata = %#v", projection)
+	}
+	var payload taskTerminalProjection
+	if err := json.Unmarshal(projection.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.TaskUID != string(sourceUID) || payload.Attempt != 1 || payload.Phase != corev1alpha1.TaskPhaseFailed ||
+		payload.Execution.State != state || payload.Execution.Outcome != outcome ||
+		payload.Execution.Reason != corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason) ||
+		payload.Message != message {
+		t.Fatalf("source projection payload = %#v", payload)
+	}
+	targetProjectionID := standaloneTaskTerminalProjectionIDForUID("default", restoredUID, 1)
+	if _, err := fixture.controlStore.GetOutboxProjection(fixture.ctx, targetProjectionID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("target-incarnation projection lookup error = %v, want ErrNotFound", err)
+	}
+	return projection
+}
+
+func restoredDeliveryEvidenceFixture(
+	state store.PromptDeliveryState,
+	outcome corev1alpha1.TaskDeliveryOutcome,
+	transition metav1.Time,
+) *corev1alpha1.TaskDeliveryStatus {
+	remoteBefore := strings.Repeat("2", 40)
+	return &corev1alpha1.TaskDeliveryStatus{
+		State:                 corev1alpha1.TaskDeliveryState(state),
+		Outcome:               outcome,
+		Reason:                corev1alpha1.TaskDeliveryReason("RestoreEvidencePreserved"),
+		PublicationID:         "publication-restore-evidence",
+		SourceRepository:      &corev1alpha1.RepositoryIdentity{Provider: "github", ID: "github.com/orka/source"},
+		PublicationRepository: &corev1alpha1.RepositoryIdentity{Provider: "github", ID: "github.com/orka/target"},
+		Branch:                "restore-evidence",
+		StartingSHA:           strings.Repeat("1", 40),
+		RemoteBeforeSHA:       &remoteBefore,
+		TreeSHA:               strings.Repeat("3", 40),
+		ExpectedCommitSHA:     strings.Repeat("4", 40),
+		VerifiedRemoteSHA:     strings.Repeat("5", 40),
+		SupersedingRemoteSHA:  strings.Repeat("6", 40),
+		ArtifactDigest:        testControlDigestForDispatcher("restore-delivery-evidence"),
+		PRReceipt: &corev1alpha1.TaskPullRequestReceipt{
+			ID: "restore-evidence-pr", Number: 42, URL: "https://github.com/orka/target/pull/42", State: "open",
+		},
+		Message:            "bounded restore delivery evidence",
+		LastTransitionTime: &transition,
+	}
+}
+
+func assertRestoredDeliveryEvidence(
+	t *testing.T,
+	got *corev1alpha1.TaskDeliveryStatus,
+	wantEvidence *corev1alpha1.TaskDeliveryStatus,
+	terminalState store.PromptDeliveryState,
+) {
+	t.Helper()
+	if got == nil || wantEvidence == nil || got.LastTransitionTime == nil {
+		t.Fatalf("restored delivery evidence is incomplete: got=%#v want=%#v", got, wantEvidence)
+	}
+	want := wantEvidence.DeepCopy()
+	want.State = corev1alpha1.TaskDeliveryState(terminalState)
+	want.Outcome = corev1alpha1.TaskDeliveryOutcome(terminalState)
+	want.LastTransitionTime = got.LastTransitionTime
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("restored delivery evidence = %#v, want %#v", got, want)
+	}
+}
+
+func TestACPDispatcherRejectsCorruptRestoredSourceAttemptBinding(t *testing.T) {
+	fixture := newACPRecoveryFixture(t, store.PromptExecutionPlanned)
+	defer fixture.close(t)
+
+	restoreACPRecoveryFixtureTask(t, fixture)
+	task := markRestoredACPRecoveryTaskDeleting(t, fixture, func(task *corev1alpha1.Task) {
+		task.Status.Execution.RuntimePoolName = ""
+		task.Status.Execution.AgentRuntimeName = ""
+		task.Status.AgentExecutionBinding.Snapshot.Digest = testControlDigestForDispatcher("corrupt-restore-snapshot")
+	})
+	if !acpTaskHasUnvalidatedSourceIdentity(task) || task.DeletionTimestamp.IsZero() {
+		t.Fatalf("corrupt restored Task did not exercise deleting recovery selector: %#v", task)
+	}
+	before, err := fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fixture.dispatcher.recoverStaleAttempts(fixture.ctx)
+	if !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("recoverStaleAttempts() error = %v, want ErrConflict", err)
+	}
+	attempt, getErr := fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if attempt.ExecutionState != store.PromptExecutionPlanned || attempt.Version != before.Version {
+		t.Fatalf("corrupt restore mutated source attempt: before=%#v after=%#v", before, attempt)
+	}
+}
+
+func TestACPDispatcherRejectsDeletingRestoredTaskWithMissingExecutionBeforeRuntimeSelector(t *testing.T) {
+	fixture := newACPRecoveryFixture(t, store.PromptExecutionPlanned)
+	defer fixture.close(t)
+
+	restoreACPRecoveryFixtureTask(t, fixture)
+	task := markRestoredACPRecoveryTaskDeleting(t, fixture, func(task *corev1alpha1.Task) {
+		task.Status.Execution = nil
+	})
+	if !acpTaskHasUnvalidatedSourceIdentity(task) || task.DeletionTimestamp.IsZero() {
+		t.Fatalf("missing-execution restored Task did not exercise deleting recovery selector: %#v", task)
+	}
+	missingStore := &missingRecoveryPromptAttemptStore{DurableControlStore: fixture.controlStore}
+	fixture.dispatcher.Store = missingStore
+
+	err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx)
+	if !errors.Is(err, store.ErrConflict) || !strings.Contains(err.Error(), "execution status is missing") {
+		t.Fatalf("recoverStaleAttempts() error = %v, want missing-execution ErrConflict", err)
+	}
+	if got := missingStore.calls.Load(); got != 0 {
+		t.Fatalf("missing-execution restore read source PromptAttempt %d times, want 0", got)
+	}
+	attempt, getErr := fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if attempt.ExecutionState != store.PromptExecutionPlanned {
+		t.Fatalf("missing-execution restore mutated source attempt to %s", attempt.ExecutionState)
+	}
+}
+
+func restoreACPRecoveryFixtureTask(t *testing.T, fixture *recoveryFixture) (types.UID, types.UID) {
+	t.Helper()
+	task := &corev1alpha1.Task{}
+	key := types.NamespacedName{Namespace: "default", Name: "task"}
+	if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+		t.Fatal(err)
+	}
+	sourceUID := task.UID
+	restoredUID := types.UID("44444444-4444-4444-4444-444444444444")
+	task.UID = restoredUID
+	task.ResourceVersion = ""
+	binding := *task.Status.AgentExecutionBinding
+	binding.Task.UID = sourceUID
+	task.Status.AgentExecutionBinding = &binding
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	fixture.kubeClient = fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.Task{}).WithObjects(task).Build()
+	fixture.dispatcher.Client = fixture.kubeClient
+	fixture.dispatcher.APIReader = fixture.kubeClient
+	return sourceUID, restoredUID
+}
+
+func markRestoredACPRecoveryTaskDeleting(
+	t *testing.T,
+	fixture *recoveryFixture,
+	mutateStatus func(*corev1alpha1.Task),
+) *corev1alpha1.Task {
+	t.Helper()
+	key := types.NamespacedName{Namespace: "default", Name: "task"}
+	task := &corev1alpha1.Task{}
+	if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+		t.Fatal(err)
+	}
+	controllerutil.AddFinalizer(task, labels.TaskFinalizer)
+	if err := fixture.kubeClient.Update(fixture.ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+		t.Fatal(err)
+	}
+	mutateStatus(task)
+	if err := fixture.kubeClient.Status().Update(fixture.ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.kubeClient.Delete(fixture.ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
+		t.Fatal(err)
+	}
+	if task.DeletionTimestamp.IsZero() {
+		t.Fatal("restored Task deletion timestamp is missing")
+	}
+	return task
+}
+
 //nolint:gocyclo // This intentionally exercises the full production recovery boundary in one scenario.
 func TestACPDispatcherRecoveryReusesExistingTaskScopedTerminalProjection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -177,12 +1182,14 @@ func TestACPDispatcherRecoveryReusesExistingTaskScopedTerminalProjection(t *test
 				Attempt: 1, PromptID: promptID, RuntimePoolName: "pool", RuntimePoolUID: "pool-uid", ControllerEpoch: oldFence.Epoch,
 				RequestDigest: testControlDigestForDispatcher("task-projection-request"), LastTransitionTime: &fixedTransition,
 			},
-			Delivery: &corev1alpha1.TaskDeliveryStatus{
-				State: corev1alpha1.TaskDeliveryStateReadValidated, Outcome: corev1alpha1.TaskDeliveryOutcomeReadValidated,
-				StartingSHA: "740310bf8ecfbce4963628a51b6a11e26d7ee7be", LastTransitionTime: &fixedTransition,
-			},
+			Delivery: restoredDeliveryEvidenceFixture(
+				store.PromptDeliveryReadValidated,
+				corev1alpha1.TaskDeliveryOutcomeReadValidated,
+				fixedTransition,
+			),
 		},
 	}
+	task.Status.AgentExecutionBinding.Task.UID = uid
 	key := store.PromptAttemptKey{Namespace: task.Namespace, TaskUID: string(task.UID), Attempt: 1, PromptID: promptID}
 	attempt, err := controlStore.CreatePromptAttempt(ctx, boundPromptAttemptForTest(&store.PromptAttempt{
 		Key: key, RequestDigest: task.Status.Execution.RequestDigest,
@@ -206,11 +1213,8 @@ func TestACPDispatcherRecoveryReusesExistingTaskScopedTerminalProjection(t *test
 	payload := taskTerminalProjection{
 		Namespace: task.Namespace, Task: task.Name, TaskUID: string(task.UID), Attempt: 1,
 		Phase: corev1alpha1.TaskPhaseSucceeded, Message: "ACP task completed",
-		Execution: corev1alpha1.TaskExecutionStatus{
-			State: corev1alpha1.TaskExecutionStateSucceeded, Outcome: corev1alpha1.TaskExecutionOutcomeSucceeded,
-			Attempt: 1, PromptID: promptID,
-		},
-		Delivery: task.Status.Delivery.DeepCopy(),
+		Execution: *task.Status.Execution.DeepCopy(),
+		Delivery:  task.Status.Delivery.DeepCopy(),
 	}
 	if err := oldDispatcher.enqueueStandaloneTaskProjection(ctx, task, payload); err != nil {
 		t.Fatal(err)
@@ -221,9 +1225,13 @@ func TestACPDispatcherRecoveryReusesExistingTaskScopedTerminalProjection(t *test
 	if err := corev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.Task{}).WithObjects(task).Build()
-	projector := &ACPOutboxProjector{Client: kubeClient, Store: controlStore, Epochs: oldEpochs, WorkerID: "task-projection-test"}
+	sourceClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.Task{}).WithObjects(task).Build()
+	projector := &ACPOutboxProjector{Client: sourceClient, Store: controlStore, Epochs: oldEpochs, WorkerID: "task-projection-test"}
 	if err := projector.projectOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sourceTerminal := &corev1alpha1.Task{}
+	if err := sourceClient.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, sourceTerminal); err != nil {
 		t.Fatal(err)
 	}
 	original, err := controlStore.GetOutboxProjection(ctx, projectionID)
@@ -233,6 +1241,14 @@ func TestACPDispatcherRecoveryReusesExistingTaskScopedTerminalProjection(t *test
 	if original.State != store.OutboxProjectionDelivered || original.DeliveryDigest == "" || original.DeliveredAt == nil {
 		t.Fatalf("projection was not delivered before restart: %#v", original)
 	}
+	restoredUID := types.UID("88888888-8888-8888-8888-888888888888")
+	restoredTask := sourceTerminal.DeepCopy()
+	restoredTask.UID = restoredUID
+	restoredTask.ResourceVersion = ""
+	binding := *restoredTask.Status.AgentExecutionBinding
+	binding.Task.UID = uid
+	restoredTask.Status.AgentExecutionBinding = &binding
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.Task{}).WithObjects(restoredTask).Build()
 	stopOld()
 	newEpochs, stopNew := startACPRecoveryEpochManager(t, ctx, controlStore, "controller-new-task-projection")
 	defer stopNew()
@@ -251,19 +1267,24 @@ func TestACPDispatcherRecoveryReusesExistingTaskScopedTerminalProjection(t *test
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, recoveredTask); err != nil {
 		t.Fatal(err)
 	}
-	if recoveredTask.Status.Execution == nil || recoveredTask.Status.Execution.ControllerEpoch != newFence.Epoch || recoveredTask.Status.Message != "ACP task completed" || recoveredTask.Status.Delivery == nil || recoveredTask.Status.Delivery.StartingSHA != task.Status.Delivery.StartingSHA {
-		var recoveredEpoch int64
-		if recoveredTask.Status.Execution != nil {
-			recoveredEpoch = recoveredTask.Status.Execution.ControllerEpoch
-		}
-		var recoveredSHA string
-		if recoveredTask.Status.Delivery != nil {
-			recoveredSHA = recoveredTask.Status.Delivery.StartingSHA
-		}
-		t.Fatalf("terminal Task identity changed during projection recovery: epoch=%d want=%d message=%q sha=%q wantSHA=%q", recoveredEpoch, newFence.Epoch, recoveredTask.Status.Message, recoveredSHA, task.Status.Delivery.StartingSHA)
+	if recoveredTask.UID != restoredUID || recoveredTask.Status.Phase != corev1alpha1.TaskPhaseSucceeded ||
+		recoveredTask.Status.Execution == nil || recoveredTask.Status.Execution.ControllerEpoch != newFence.Epoch ||
+		recoveredTask.Status.Execution.State != corev1alpha1.TaskExecutionStateSucceeded ||
+		recoveredTask.Status.Execution.Outcome != corev1alpha1.TaskExecutionOutcomeSucceeded ||
+		recoveredTask.Status.Execution.Reason != corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason) ||
+		recoveredTask.Status.Delivery == nil || recoveredTask.Status.Delivery.State != corev1alpha1.TaskDeliveryStateReadValidated {
+		t.Fatalf("restored terminal Task status = %#v", recoveredTask.Status)
 	}
+	assertRestoredDeliveryEvidence(t, recoveredTask.Status.Delivery, task.Status.Delivery, store.PromptDeliveryReadValidated)
+	firstRecoveredDelivery := recoveredTask.Status.Delivery.DeepCopy()
 	if err := dispatcher.recoverStaleAttempts(ctx); err != nil {
 		t.Fatalf("same-epoch recovery retry: %v", err)
+	}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, recoveredTask); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(recoveredTask.Status.Delivery, firstRecoveredDelivery) {
+		t.Fatalf("same-epoch recovery changed restored delivery evidence: before=%#v after=%#v", firstRecoveredDelivery, recoveredTask.Status.Delivery)
 	}
 	recovered, err := controlStore.GetOutboxProjection(ctx, projectionID)
 	if err != nil {
@@ -275,6 +1296,56 @@ func TestACPDispatcherRecoveryReusesExistingTaskScopedTerminalProjection(t *test
 		recovered.State != original.State || recovered.Version != original.Version || recovered.Attempts != original.Attempts ||
 		recovered.DeliveryDigest != original.DeliveryDigest || !deliveredAtMatches || recovered.ControllerEpoch != original.ControllerEpoch {
 		t.Fatalf("recovery changed existing task projection: before=%#v after=%#v", original, recovered)
+	}
+}
+
+func TestValidateRestoredSourceTerminalProjectionRejectsForgedOutcome(t *testing.T) {
+	sourceUID := types.UID("99999999-9999-9999-9999-999999999999")
+	restoredUID := types.UID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	requestDigest := testControlDigestForDispatcher("forged-source-projection-request")
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "forged-source-projection", UID: restoredUID},
+		Status: corev1alpha1.TaskStatus{
+			Phase: corev1alpha1.TaskPhaseSucceeded,
+			Execution: &corev1alpha1.TaskExecutionStatus{
+				State: corev1alpha1.TaskExecutionStateSucceeded, Outcome: corev1alpha1.TaskExecutionOutcomeSucceeded,
+				Reason: corev1alpha1.TaskExecutionReason(acpRestoreIdentityChangedReason), Attempt: 1,
+				PromptID: "prompt-final", RequestDigest: requestDigest,
+			},
+			Delivery: &corev1alpha1.TaskDeliveryStatus{
+				State: corev1alpha1.TaskDeliveryStateVerifiedExact, Outcome: corev1alpha1.TaskDeliveryOutcomeVerifiedExact,
+			},
+			AgentExecutionBinding: testACPExecuteBindingForDispatcher(),
+		},
+	}
+	task.Status.AgentExecutionBinding.Task.UID = sourceUID
+	attempt := &store.PromptAttempt{
+		Key: store.PromptAttemptKey{
+			Namespace: task.Namespace, TaskUID: string(sourceUID), Attempt: 1, PromptID: task.Status.Execution.PromptID,
+		},
+		RequestDigest: requestDigest, ExecutionState: store.PromptExecutionSucceeded,
+		DeliveryState: store.PromptDeliveryVerifiedExact,
+	}
+	payload, err := json.Marshal(taskTerminalProjection{
+		Namespace: task.Namespace, Task: task.Name, TaskUID: string(sourceUID), Attempt: 1,
+		Phase: corev1alpha1.TaskPhaseSucceeded,
+		Execution: corev1alpha1.TaskExecutionStatus{
+			State: corev1alpha1.TaskExecutionStateSucceeded, Outcome: corev1alpha1.TaskExecutionOutcomeFailed,
+			Attempt: 1, PromptID: task.Status.Execution.PromptID, RequestDigest: requestDigest,
+		},
+		Delivery: task.Status.Delivery.DeepCopy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection := &store.OutboxProjection{
+		ID:            standaloneTaskTerminalProjectionIDForUID(task.Namespace, sourceUID, 1),
+		AggregateKind: taskResourceKind, AggregateID: string(sourceUID), ProjectionKind: taskTerminalProjectionKind,
+		Payload: payload,
+	}
+
+	if err := validateRestoredSourceTerminalProjection(task, sourceUID, attempt, projection); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("validateRestoredSourceTerminalProjection() error = %v, want ErrConflict", err)
 	}
 }
 
@@ -511,7 +1582,7 @@ func TestRecoveredWriteSessionPublicationCleanupByRuntimeState(t *testing.T) {
 				}
 				request := finalizations[0]
 				if request.WorkspaceDeltaID != harnessv2.WorkspaceDeltaID("delta-"+fixture.task.Status.Execution.PromptID) ||
-					request.PublicationID != publicationIDForTask(fixture.task) ||
+					request.PublicationID != publicationIDForTaskUID(fixture.task, fixture.controlUID) ||
 					request.PublicationGeneration != uint64(fixture.publication.Generation) ||
 					request.PublicationVersion != uint64(fixture.publication.Version) ||
 					request.TerminalState != harnessv2.PublicationTerminalVerifiedExact || request.TerminalReceiptDigest == "" {
@@ -521,6 +1592,123 @@ func TestRecoveredWriteSessionPublicationCleanupByRuntimeState(t *testing.T) {
 				t.Fatalf("finalizing RuntimeSession was finalized again: %#v", finalizations)
 			}
 			fixture.assertCleanupReceipt(t)
+		})
+	}
+}
+
+//nolint:gocyclo // The two rows intentionally prove the full finalize/delete crash tail and retry boundary.
+func TestRestoredWriteSessionCleanupUsesFrozenSourceUID(t *testing.T) {
+	sourceUID := types.UID("cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd")
+	restoredUID := types.UID("abababab-abab-abab-abab-abababababab")
+	for _, test := range []struct {
+		name                   string
+		omitPublication        bool
+		abortFirstDelete       bool
+		omitDeletedFromStatus  bool
+		wantFirstComplete      bool
+		wantFirstError         bool
+		wantTerminalState      harnessv2.PublicationTerminalState
+		setAbandonmentDelivery bool
+	}{
+		{
+			name: "durable source publication", wantFirstComplete: true,
+			wantTerminalState: harnessv2.PublicationTerminalVerifiedExact,
+		},
+		{
+			name:            "source-bound abandonment survives lost delete response",
+			omitPublication: true, abortFirstDelete: true, omitDeletedFromStatus: true,
+			wantFirstError: true, wantTerminalState: harnessv2.PublicationTerminalDeliveryConflict,
+			setAbandonmentDelivery: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRecoveredWriteCleanupFixture(t, recoveredWriteCleanupOptions{
+				state: harnessv2.RuntimeSessionStatePublicationPrepared, sourceTaskUID: sourceUID,
+				omitPublication: test.omitPublication, abortFirstDeleteResponse: test.abortFirstDelete,
+				omitDeletedSessionFromStatus: test.omitDeletedFromStatus,
+			})
+			if fixture.task.UID != restoredUID || fixture.controlUID != sourceUID || fixture.task.Status.AgentExecutionBinding == nil ||
+				fixture.task.Status.AgentExecutionBinding.Task.UID != sourceUID {
+				t.Fatalf("restored fixture identity = uid:%q control:%q binding:%#v", fixture.task.UID, fixture.controlUID, fixture.task.Status.AgentExecutionBinding)
+			}
+			if test.setAbandonmentDelivery {
+				fixture.task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{
+					State: corev1alpha1.TaskDeliveryStateDeliveryConflict, Outcome: corev1alpha1.TaskDeliveryOutcomeDeliveryConflict,
+					Reason: "RestorePublicationMissing", Message: "source publication was not durably created",
+				}
+			}
+
+			complete, err := fixture.dispatcher.cleanupRecoveredTaskScopedRuntimeSessionForUID(
+				fixture.ctx, fixture.task.DeepCopy(), sourceUID,
+			)
+			if complete != test.wantFirstComplete || (err != nil) != test.wantFirstError {
+				t.Fatalf("first cleanup = complete:%v err:%v", complete, err)
+			}
+			var retryTask corev1alpha1.Task
+			if getErr := fixture.kubeClient.Get(
+				fixture.ctx, types.NamespacedName{Namespace: fixture.task.Namespace, Name: fixture.task.Name}, &retryTask,
+			); getErr != nil {
+				t.Fatal(getErr)
+			}
+			if test.wantFirstError && retryTask.Status.Execution.RuntimeSessionCleanupDigest != "" {
+				t.Fatalf("cleanup receipt persisted before delete response-loss reconciliation: %q", retryTask.Status.Execution.RuntimeSessionCleanupDigest)
+			}
+			complete, err = fixture.dispatcher.cleanupRecoveredTaskScopedRuntimeSessionForUID(fixture.ctx, &retryTask, sourceUID)
+			if err != nil || !complete {
+				t.Fatalf("idempotent cleanup retry = complete:%v err:%v", complete, err)
+			}
+
+			operations, finalizations, deletes := fixture.trace.snapshot()
+			if fmt.Sprint(operations) != "[finalize delete]" || len(finalizations) != 1 || len(deletes) != 1 {
+				t.Fatalf("restored cleanup operations = %v finalizations=%d deletes=%d", operations, len(finalizations), len(deletes))
+			}
+			finalizeRequest := finalizations[0]
+			deleteRequest := deletes[0]
+			if finalizeRequest.Metadata.TaskUID != harnessv2.TaskUID(sourceUID) ||
+				deleteRequest.Metadata.TaskUID != harnessv2.TaskUID(sourceUID) ||
+				finalizeRequest.Metadata.TaskUID == harnessv2.TaskUID(restoredUID) ||
+				deleteRequest.Metadata.TaskUID == harnessv2.TaskUID(restoredUID) ||
+				finalizeRequest.Metadata.TaskAttempt != 1 || deleteRequest.Metadata.TaskAttempt != 1 ||
+				finalizeRequest.Metadata.PromptID != harnessv2.PromptID(fixture.task.Status.Execution.PromptID) ||
+				deleteRequest.Metadata.PromptID != "" || finalizeRequest.Metadata.RequestDigest == "" ||
+				deleteRequest.Metadata.RequestDigest == "" {
+				t.Fatalf("restored cleanup mutation metadata = finalize:%#v delete:%#v", finalizeRequest.Metadata, deleteRequest.Metadata)
+			}
+			wantPublicationID := publicationIDForTaskUID(fixture.task, sourceUID)
+			if finalizeRequest.PublicationID != wantPublicationID ||
+				finalizeRequest.PublicationID == publicationIDForTask(fixture.task) ||
+				finalizeRequest.TerminalState != test.wantTerminalState {
+				t.Fatalf("restored finalization identity = %#v, want publication %q state %q", finalizeRequest, wantPublicationID, test.wantTerminalState)
+			}
+			if test.omitPublication {
+				want, finalizationErr := runtimeSessionDeltaAbandonmentFinalizationForTaskUID(
+					fixture.task, sourceUID, harnessv2.WorkspaceDeltaID("delta-"+fixture.task.Status.Execution.PromptID), *fixture.task.Status.Delivery,
+				)
+				if finalizationErr != nil {
+					t.Fatal(finalizationErr)
+				}
+				wrong, finalizationErr := runtimeSessionDeltaAbandonmentFinalizationForTaskUID(
+					fixture.task, restoredUID, harnessv2.WorkspaceDeltaID("delta-"+fixture.task.Status.Execution.PromptID), *fixture.task.Status.Delivery,
+				)
+				if finalizationErr != nil {
+					t.Fatal(finalizationErr)
+				}
+				if finalizeRequest.TerminalReceiptDigest != want.TerminalReceiptDigest ||
+					finalizeRequest.TerminalReceiptDigest == wrong.TerminalReceiptDigest {
+					t.Fatalf("abandonment receipt digest = %q, want source %q and not restored %q", finalizeRequest.TerminalReceiptDigest, want.TerminalReceiptDigest, wrong.TerminalReceiptDigest)
+				}
+			}
+			fixture.assertCleanupReceipt(t)
+			var recovered corev1alpha1.Task
+			if getErr := fixture.kubeClient.Get(
+				fixture.ctx, types.NamespacedName{Namespace: fixture.task.Namespace, Name: fixture.task.Name}, &recovered,
+			); getErr != nil {
+				t.Fatal(getErr)
+			}
+			if recovered.UID != restoredUID || recovered.Status.AgentExecutionBinding == nil ||
+				recovered.Status.AgentExecutionBinding.Task.UID != sourceUID {
+				t.Fatalf("cleanup changed restored/source identity: uid=%q binding=%#v", recovered.UID, recovered.Status.AgentExecutionBinding)
+			}
 		})
 	}
 }
@@ -736,7 +1924,7 @@ func TestACPDispatcherRecoveryResumesCommittedSessionTurnFinalization(t *testing
 			AgentExecutionBinding: testACPExecuteBindingForDispatcher(),
 		},
 	}
-	rawClient := fake.NewClientBuilder().
+	rawClient := withControllerEpochLeaseUIDs(t, fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(
 			&corev1alpha1.Task{}, &corev1alpha1.ControllerEpoch{}, &corev1alpha1.PromptAttempt{},
@@ -744,7 +1932,7 @@ func TestACPDispatcherRecoveryResumesCommittedSessionTurnFinalization(t *testing
 			&corev1alpha1.ExternalEffect{},
 		).
 		WithObjects(task).
-		Build()
+		Build())
 	controlStore, err := kubestore.NewComposite(rawClient, "orka-system", sqliteStore)
 	if err != nil {
 		t.Fatal(err)
@@ -908,6 +2096,8 @@ type recoveredWriteCleanupOptions struct {
 	state                        harnessv2.RuntimeSessionState
 	abortFirstDeleteResponse     bool
 	omitDeletedSessionFromStatus bool
+	sourceTaskUID                types.UID
+	omitPublication              bool
 }
 
 type recoveredWriteCleanupTrace struct {
@@ -934,6 +2124,7 @@ func (t *recoveredWriteCleanupTrace) snapshot() (
 type recoveredWriteCleanupFixture struct {
 	ctx         context.Context
 	task        *corev1alpha1.Task
+	controlUID  types.UID
 	publication *store.Publication
 	kubeClient  client.Client
 	dispatcher  *ACPDispatcher
@@ -950,13 +2141,14 @@ func (f *recoveredWriteCleanupFixture) assertCleanupReceipt(t *testing.T) {
 		t.Fatal("recovered task execution status is missing")
 	}
 	wantDigest, err := taskScopedRuntimeSessionCleanupDigest(
-		recovered.UID, recovered.Status.Execution.Attempt, recovered.Status.Execution.RuntimeInstanceID,
+		f.controlUID, recovered.Status.Execution.Attempt, recovered.Status.Execution.RuntimeInstanceID,
 		recovered.Status.Execution.RuntimeSessionUID, recovered.Status.Execution.RuntimeSessionGeneration,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered.Status.Execution.RuntimeSessionCleanupDigest != wantDigest || !taskScopedRuntimeSessionCleanupComplete(&recovered) {
+	if recovered.Status.Execution.RuntimeSessionCleanupDigest != wantDigest ||
+		!taskScopedRuntimeSessionCleanupCompleteForUID(&recovered, f.controlUID) {
 		t.Fatalf("write SessionRef cleanup receipt = %q, want %q", recovered.Status.Execution.RuntimeSessionCleanupDigest, wantDigest)
 	}
 }
@@ -1139,6 +2331,13 @@ func newRecoveredWriteCleanupFixture(t *testing.T, options recoveredWriteCleanup
 			},
 		},
 	}
+	controlUID := task.UID
+	if options.sourceTaskUID != "" {
+		controlUID = options.sourceTaskUID
+		binding := testACPExecuteBindingForDispatcher()
+		binding.Task.UID = controlUID
+		task.Status.AgentExecutionBinding = binding
+	}
 	pool := &corev1alpha1.RuntimePool{
 		ObjectMeta: metav1.ObjectMeta{Namespace: task.Namespace, Name: "pool", UID: types.UID("pool-uid"), Generation: 1},
 		Spec: corev1alpha1.RuntimePoolSpec{RuntimeNamespace: "orka-runtimes", Runtime: corev1alpha1.RuntimePoolRuntimeSpec{
@@ -1166,29 +2365,33 @@ func newRecoveredWriteCleanupFixture(t *testing.T, options recoveredWriteCleanup
 	}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.Task{}).WithObjects(task, pool, secret).Build()
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
-	publication := &store.Publication{
-		ID: publicationIDForTask(task), Namespace: task.Namespace, Generation: 1, Version: 7,
-		TaskUID: string(task.UID), Attempt: 1, PromptID: task.Status.Execution.PromptID,
-		State: store.PublicationVerifiedExact,
-		PreparedReceipt: &store.PreparedPublicationReceipt{
-			OperationID: "prepare", RequestDigest: testControlDigestForDispatcher("recovered-prepare"),
-			TreeSHA: strings.Repeat("2", 40), CommitSHA: strings.Repeat("3", 40),
-			ManifestDigest: "sha256:" + strings.Repeat("4", 64), PreparedAt: now.Add(-2 * time.Minute),
-		},
-		PublishReceipt: &store.PublishOperationReceipt{
-			OperationID: "publish", RequestDigest: testControlDigestForDispatcher("recovered-publish"),
-			ExpectedCommitSHA: strings.Repeat("3", 40), PublishedAt: now.Add(-time.Minute),
-		},
-		VerificationReceipt: &store.PublicationVerificationReceipt{
-			OperationID: "verify", RequestDigest: testControlDigestForDispatcher("recovered-verify"),
-			Outcome: store.PublicationVerifiedExact, ExpectedCommitSHA: strings.Repeat("3", 40),
-			ObservedRemote: store.RemoteRefState{SHA: strings.Repeat("3", 40)}, VerifiedAt: now,
-		},
+	var publication *store.Publication
+	if !options.omitPublication {
+		publication = &store.Publication{
+			ID: publicationIDForTaskUID(task, controlUID), Namespace: task.Namespace, Generation: 1, Version: 7,
+			TaskUID: string(controlUID), Attempt: 1, PromptID: task.Status.Execution.PromptID,
+			State: store.PublicationVerifiedExact,
+			PreparedReceipt: &store.PreparedPublicationReceipt{
+				OperationID: "prepare", RequestDigest: testControlDigestForDispatcher("recovered-prepare"),
+				TreeSHA: strings.Repeat("2", 40), CommitSHA: strings.Repeat("3", 40),
+				ManifestDigest: "sha256:" + strings.Repeat("4", 64), PreparedAt: now.Add(-2 * time.Minute),
+			},
+			PublishReceipt: &store.PublishOperationReceipt{
+				OperationID: "publish", RequestDigest: testControlDigestForDispatcher("recovered-publish"),
+				ExpectedCommitSHA: strings.Repeat("3", 40), PublishedAt: now.Add(-time.Minute),
+			},
+			VerificationReceipt: &store.PublicationVerificationReceipt{
+				OperationID: "verify", RequestDigest: testControlDigestForDispatcher("recovered-verify"),
+				Outcome: store.PublicationVerifiedExact, ExpectedCommitSHA: strings.Repeat("3", 40),
+				ObservedRemote: store.RemoteRefState{SHA: strings.Repeat("3", 40)}, VerifiedAt: now,
+			},
+		}
 	}
 	publicationStore := &recoveredPublicationStore{DurableControlStore: controlStore, publication: publication}
 	dispatcher := &ACPDispatcher{Client: kubeClient, APIReader: kubeClient, Store: publicationStore, Epochs: epochs}
 	return &recoveredWriteCleanupFixture{
-		ctx: ctx, task: task, publication: publication, kubeClient: kubeClient, dispatcher: dispatcher, trace: trace,
+		ctx: ctx, task: task, controlUID: controlUID, publication: publication,
+		kubeClient: kubeClient, dispatcher: dispatcher, trace: trace,
 	}
 }
 

@@ -3,15 +3,22 @@ set -Eeuo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 kustomize="${KUSTOMIZE:-${root}/bin/kustomize}"
-kubectl="${KUBECTL:-kubectl}"
 helm="${HELM:-helm}"
 
-for command in "${kustomize}" "${kubectl}" "${helm}" jq; do
+for command in "${kustomize}" "${helm}" jq ruby; do
   command -v "${command}" >/dev/null 2>&1 || {
     echo "required command not found: ${command}" >&2
     exit 1
   }
 done
+
+yaml_to_json() {
+  ruby -rjson -ryaml -e '
+    YAML.load_stream(STDIN.read).each do |document|
+      puts JSON.generate(document) unless document.nil?
+    end
+  '
+}
 
 assert_secret_mounts() {
   local label="$1"
@@ -65,17 +72,25 @@ assert_secret_mounts() {
 }
 
 "${kustomize}" build "${root}/config/acp-production" \
-  | "${kubectl}" create --dry-run=client --validate=false -f - -o json \
+  | yaml_to_json \
   | assert_secret_mounts "Kustomize production overlay"
 
 "${helm}" template orka "${root}/charts/orka" \
+  --namespace orka-system \
+  --set-string controller.mode=harness-v2 \
+  --set-string controller.watchNamespace=orka-system \
   --set publisher.enabled=true \
+  --set providerProxy.enabled=true \
   --set scmEgressProxy.enabled=true \
   --set controller.image.repository=docker.io/sozercan/orka \
   --set controller.image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --set-string controller.agentExecutionSnapshot.existingSecret=agent-execution-snapshot-key \
+  --set-string controller.agentExecutionSnapshot.key=key \
+  --set-string webhooks.tls.existingSecret=controller-webhook-tls \
+  --set-string webhooks.caBundle=Y2E= \
   --set publisher.image.repository=docker.io/sozercan/orka-workspace-publisher \
   --set publisher.image.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-  | "${kubectl}" create --dry-run=client --validate=false -f - -o json \
+  | yaml_to_json \
   | assert_secret_mounts "Helm chart"
 
 

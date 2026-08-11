@@ -315,23 +315,11 @@ func (r *RepositoryMonitorReconciler) validateRepositoryMonitorReviewerAgent(ctx
 		if err := ValidateOpenCodeAgentSpec(&agent); err != nil {
 			return repositoryMonitorReasonUnsupportedReviewerAgent, fmt.Sprintf("spec.agents.reviewer %q has an invalid OpenCode configuration: %v", reviewer.Name, err), nil
 		}
-		return "", "", nil
 	default:
 		return repositoryMonitorReasonUnsupportedReviewerAgent, fmt.Sprintf("spec.agents.reviewer %q runtime %q is not supported for read-only repository monitor reviews; use claude, codex, or opencode", reviewer.Name, agent.Spec.Runtime.Type), nil
 	}
-	if agent.Spec.SecretRef == nil || strings.TrimSpace(agent.Spec.SecretRef.Name) == "" {
-		return repositoryMonitorReasonReviewerCredentialsInvalid, fmt.Sprintf("spec.agents.reviewer %q must reference a Secret with credentials for runtime %q", reviewer.Name, agent.Spec.Runtime.Type), nil
-	}
-	secretName := strings.TrimSpace(agent.Spec.SecretRef.Name)
-	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: monitor.Namespace}, &secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			return repositoryMonitorReasonReviewerCredentialsInvalid, fmt.Sprintf("spec.agents.reviewer %q credential Secret %q not found in monitor namespace %q", reviewer.Name, secretName, monitor.Namespace), nil
-		}
-		return "", "", err
-	}
-	if !readOnlyAgentRuntimeSecretHasCredential(&secret, &agent) {
-		return repositoryMonitorReasonReviewerCredentialsInvalid, fmt.Sprintf("spec.agents.reviewer %q credential Secret %q must contain a supported auth key for runtime %q", reviewer.Name, secretName, agent.Spec.Runtime.Type), nil
+	if err := validateBuiltInACPAgentCredentialSecretRef(&agent); err != nil {
+		return repositoryMonitorReasonReviewerCredentialsInvalid, fmt.Sprintf("spec.agents.reviewer %q must omit spec.secretRef; provider credentials are supplied by the controller-managed runtime proxy", reviewer.Name), nil
 	}
 	return "", "", nil
 }
@@ -370,22 +358,8 @@ func (r *RepositoryMonitorReconciler) validateRepositoryMonitorImplementerAgent(
 	}
 	switch agent.Spec.Runtime.Type {
 	case corev1alpha1.AgentRuntimeCodex, corev1alpha1.AgentRuntimeClaude:
-		if agent.Spec.SecretRef == nil || strings.TrimSpace(agent.Spec.SecretRef.Name) == "" {
-			return repositoryMonitorReasonImplementerAuthInvalid, fmt.Sprintf("spec.agents.implementer %q must reference a runtime credential Secret", ref.Name), nil
-		}
-		secretName := strings.TrimSpace(agent.Spec.SecretRef.Name)
-		var secret corev1.Secret
-		if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: monitor.Namespace}, &secret); err != nil {
-			if apierrors.IsNotFound(err) {
-				return repositoryMonitorReasonImplementerAuthInvalid, fmt.Sprintf("spec.agents.implementer %q credential Secret %q not found in monitor namespace %q", ref.Name, secretName, monitor.Namespace), nil
-			}
-			return "", "", err
-		}
-		if !scopedAgentRuntimeSecretHasCredential(&secret, &agent) {
-			return repositoryMonitorReasonImplementerAuthInvalid, fmt.Sprintf("spec.agents.implementer %q credential Secret %q has no supported key for runtime %q", ref.Name, secretName, agent.Spec.Runtime.Type), nil
-		}
-		if agent.Spec.Runtime.Type == corev1alpha1.AgentRuntimeClaude && repositoryMonitorClaudeFoundryConfigured(secret.Data) {
-			return repositoryMonitorReasonImplementerAuthInvalid, fmt.Sprintf("spec.agents.implementer %q cannot use Azure AI Foundry credentials because implementation tasks require the local runtime auth proxy", ref.Name), nil
+		if err := validateBuiltInACPAgentCredentialSecretRef(&agent); err != nil {
+			return repositoryMonitorReasonImplementerAuthInvalid, fmt.Sprintf("spec.agents.implementer %q must omit spec.secretRef; provider credentials are supplied by the controller-managed runtime proxy", ref.Name), nil
 		}
 		return "", "", nil
 	case corev1alpha1.AgentRuntimeCopilot:
@@ -449,47 +423,18 @@ func (r *RepositoryMonitorReconciler) validateRepositoryMonitorIssueReadOnlyAgen
 		if err := ValidateOpenCodeAgentSpec(&agent); err != nil {
 			return "Unsupported" + reasonPrefix + "Agent", fmt.Sprintf("%s %q has an invalid OpenCode configuration: %v", field, ref.Name, err), nil
 		}
-		return "", "", nil
 	case corev1alpha1.AgentRuntimeClaude:
 	default:
 		return "Unsupported" + reasonPrefix + "Agent", fmt.Sprintf("%s %q runtime %q is not supported for read-only repository monitor tasks; use claude or opencode", field, ref.Name, agent.Spec.Runtime.Type), nil
 	}
-	if agent.Spec.SecretRef == nil || strings.TrimSpace(agent.Spec.SecretRef.Name) == "" {
-		return reasonPrefix + "CredentialsInvalid", fmt.Sprintf("%s %q must reference a Secret with Claude credentials for read-only repository monitor tasks", field, ref.Name), nil
-	}
-	secretName := strings.TrimSpace(agent.Spec.SecretRef.Name)
-	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: monitor.Namespace}, &secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			return reasonPrefix + "CredentialsInvalid", fmt.Sprintf("%s %q credential Secret %q not found in monitor namespace %q", field, ref.Name, secretName, monitor.Namespace), nil
-		}
-		return "", "", err
-	}
-	if !readOnlyAgentRuntimeSecretHasCredential(&secret, &agent) {
-		return reasonPrefix + "CredentialsInvalid", fmt.Sprintf("%s %q credential Secret %q must contain a supported Claude auth key", field, ref.Name, secretName), nil
+	if err := validateBuiltInACPAgentCredentialSecretRef(&agent); err != nil {
+		return reasonPrefix + "CredentialsInvalid", fmt.Sprintf("%s %q must omit spec.secretRef; provider credentials are supplied by the controller-managed runtime proxy", field, ref.Name), nil
 	}
 	return "", "", nil
 }
 
 func (r *RepositoryMonitorReconciler) validateRepositoryMonitorGitSecret(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor) (string, string, error) {
-	if monitor.Spec.GitSecretRef == nil || strings.TrimSpace(monitor.Spec.GitSecretRef.Name) == "" {
-		if monitor.Spec.Triggers.GitHub.Labels.Enabled {
-			return repositoryMonitorReasonGitSecretInvalid, "spec.gitSecretRef is required when GitHub label triggers are enabled", nil
-		}
-		return "", "", nil
-	}
-	secretName := strings.TrimSpace(monitor.Spec.GitSecretRef.Name)
-	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: monitor.Namespace}, &secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			return repositoryMonitorReasonGitSecretInvalid, fmt.Sprintf("spec.gitSecretRef %q not found in namespace %q", secretName, monitor.Namespace), nil
-		}
-		return "", "", err
-	}
-	if !repositoryMonitorGitSecretHasToken(&secret) {
-		return repositoryMonitorReasonGitSecretInvalid, fmt.Sprintf("spec.gitSecretRef %q must contain a non-empty token, password, or %s key", secretName, workerenv.GitHubToken), nil
-	}
-	return "", "", nil
+	return r.validateRepositoryMonitorCredentialRefs(ctx, monitor)
 }
 
 func repositoryMonitorGitSecretHasToken(secret *corev1.Secret) bool {

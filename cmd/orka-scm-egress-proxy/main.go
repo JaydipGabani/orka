@@ -109,6 +109,9 @@ func main() {
 	)
 	flag.Parse()
 
+	if err := ensureKubernetesServiceAccountTokenAbsent(defaultKubernetesTokenFile); err != nil {
+		log.Fatal("SCM egress proxy must not have Kubernetes API credentials")
+	}
 	hosts, err := allowedHosts(*allowedHostsValue, *forgeAPIBaseURL)
 	if err != nil {
 		log.Fatal("invalid SCM egress host policy")

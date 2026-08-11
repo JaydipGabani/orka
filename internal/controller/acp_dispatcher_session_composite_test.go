@@ -60,6 +60,7 @@ func TestPrepareTaskSessionCompositeStoreOpensTurn(t *testing.T) {
 		).
 		WithObjects(namespace, task.DeepCopy()).
 		Build()
+	kubeClient = withControllerEpochLeaseUIDs(t, kubeClient)
 	testPrepareTaskSessionCompositeStoreOpensTurn(t, kubeClient, task, namespaceUID)
 }
 

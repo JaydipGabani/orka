@@ -9,6 +9,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -19,7 +20,10 @@ import (
 	"github.com/orka-agents/orka/internal/store"
 )
 
-const acpPublicationGeneration int64 = 1
+const (
+	acpPublicationGeneration int64 = 1
+	acpNoWorkspaceRevision         = "empty"
+)
 
 type acpPublicationResult struct {
 	PublicationID string
@@ -1265,7 +1269,11 @@ func publisherPreparedFromPublication(publication *store.Publication, source, ta
 }
 
 func publicationID(task *corev1alpha1.Task) string {
-	digest := mustACPDomainDigest("publication-id", map[string]any{"taskUID": string(task.UID), "attempt": task.Status.Execution.Attempt, "promptID": task.Status.Execution.PromptID})
+	return publicationIDForTaskUID(task, task.UID)
+}
+
+func publicationIDForTaskUID(task *corev1alpha1.Task, taskUID types.UID) string {
+	digest := mustACPDomainDigest("publication-id", map[string]any{"taskUID": string(taskUID), "attempt": task.Status.Execution.Attempt, "promptID": task.Status.Execution.PromptID})
 	return "pub-" + strings.TrimPrefix(digest, "sha256:")[:48]
 }
 
@@ -1300,6 +1308,17 @@ func clientObjectKey(task *corev1alpha1.Task) client.ObjectKey {
 	return client.ObjectKey{Namespace: task.Namespace, Name: task.Name}
 }
 
+func taskDeliveryStatusForKubernetes(task *corev1alpha1.Task, status corev1alpha1.TaskDeliveryStatus) corev1alpha1.TaskDeliveryStatus {
+	// Harness v2 uses "empty" as a protocol-only revision for Tasks without a
+	// repository workspace. It is not a Git object ID and must not escape into
+	// the schema-validated Task status. Preserve every other value so malformed
+	// real-workspace revisions continue to fail closed at the API boundary.
+	if task != nil && task.Spec.Workspace == nil && status.StartingSHA == acpNoWorkspaceRevision {
+		status.StartingSHA = ""
+	}
+	return status
+}
+
 func (d *ACPDispatcher) patchDeliveryStatus(ctx context.Context, task *corev1alpha1.Task, status corev1alpha1.TaskDeliveryStatus) error {
 	key := clientObjectKey(task)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -1308,7 +1327,7 @@ func (d *ACPDispatcher) patchDeliveryStatus(ctx context.Context, task *corev1alp
 			return err
 		}
 		base := latest.DeepCopy()
-		copyStatus := status
+		copyStatus := taskDeliveryStatusForKubernetes(latest, status)
 		latest.Status.Delivery = &copyStatus
 		return d.Client.Status().Patch(ctx, latest, client.MergeFrom(base))
 	})
@@ -1325,6 +1344,7 @@ func (d *ACPDispatcher) completeSuccessWithDelivery(ctx context.Context, task *c
 	}); err != nil {
 		return err
 	}
+	status = taskDeliveryStatusForKubernetes(task, status)
 	key := clientObjectKey(task)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &corev1alpha1.Task{}
@@ -1359,6 +1379,7 @@ func (d *ACPDispatcher) failTaskForDelivery(ctx context.Context, task *corev1alp
 	}); err != nil {
 		return err
 	}
+	status = taskDeliveryStatusForKubernetes(task, status)
 	key := clientObjectKey(task)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &corev1alpha1.Task{}
@@ -1393,6 +1414,7 @@ func (d *ACPDispatcher) cancelTaskAfterExecution(ctx context.Context, task *core
 	}); err != nil {
 		return err
 	}
+	status = taskDeliveryStatusForKubernetes(task, status)
 	key := clientObjectKey(task)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &corev1alpha1.Task{}

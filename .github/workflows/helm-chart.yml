@@ -19,7 +19,12 @@ on:
       - "Makefile"
       - "workers/harness/**"
       - "scripts/apply-helm-crds.sh"
+      - "scripts/tests/release-manifest-test.sh"
       - "scripts/static-mode-crd-validate.sh"
+      - "scripts/update-release-version.py"
+      - "scripts/validate-release-manifest.sh"
+      - ".github/workflows/release-pr.yml"
+      - ".github/workflows/release.yml"
       - ".github/workflows/helm-chart.yml"
   pull_request:
     paths:
@@ -36,7 +41,12 @@ on:
       - "Makefile"
       - "workers/harness/**"
       - "scripts/apply-helm-crds.sh"
+      - "scripts/tests/release-manifest-test.sh"
       - "scripts/static-mode-crd-validate.sh"
+      - "scripts/update-release-version.py"
+      - "scripts/validate-release-manifest.sh"
+      - ".github/workflows/release-pr.yml"
+      - ".github/workflows/release.yml"
       - ".github/workflows/helm-chart.yml"
   workflow_dispatch:
 
@@ -78,6 +88,8 @@ jobs:
           set -euo pipefail
 
           bash -n scripts/static-mode-crd-validate.sh
+          bash -n scripts/validate-release-manifest.sh scripts/tests/release-manifest-test.sh
+          bash scripts/tests/release-manifest-test.sh
           make manifests
           if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
             echo "Generated staging manifests are stale." >&2

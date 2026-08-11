@@ -376,6 +376,7 @@ func TestGeneratedSecurityTaskNamesStayLabelSafe(t *testing.T) {
 		ScanStageTaskName(scanName, "initial", "threat-model", ""),
 		ScanStageTaskName(scanName, "initial", "discovery", "ci-cd-supply-chain"),
 		ScanStageTaskName(scanName, "initial", "discovery", "ci-cd-supply-chain-4"),
+		ScanStageRetryTaskName(scanName, "scan_1234567890abcdef", StageReview, "ci-cd-supply-chain", 1),
 		PatchTaskName(scanName, "fnd_1234567890abcdef"),
 	}
 
@@ -386,6 +387,22 @@ func TestGeneratedSecurityTaskNamesStayLabelSafe(t *testing.T) {
 		if strings.Contains(name, "--") {
 			t.Fatalf("generated task name %q should not contain duplicate separators", name)
 		}
+	}
+}
+
+func TestScanStageRetryTaskNameIsDeterministicAndAttemptBound(t *testing.T) {
+	first := ScanStageRetryTaskName("demo-security-repository", "scan_1234567890abcdef", StageReview, "slice_api", 1)
+	repeated := ScanStageRetryTaskName("demo-security-repository", "scan_1234567890abcdef", StageReview, "slice_api", 1)
+	secondAttempt := ScanStageRetryTaskName("demo-security-repository", "scan_1234567890abcdef", StageReview, "slice_api", 2)
+
+	if first != repeated {
+		t.Fatalf("ScanStageRetryTaskName() = %q then %q, want deterministic", first, repeated)
+	}
+	if first == secondAttempt {
+		t.Fatalf("ScanStageRetryTaskName() = %q for attempts 1 and 2, want attempt-bound names", first)
+	}
+	if len(first) > maxGeneratedTaskName || len(secondAttempt) > maxGeneratedTaskName {
+		t.Fatalf("retry task names lengths = %d/%d, want <= %d", len(first), len(secondAttempt), maxGeneratedTaskName)
 	}
 }
 

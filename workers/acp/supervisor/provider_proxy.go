@@ -38,6 +38,9 @@ const (
 	providerModelsV1Path                  = "/v1/models"
 	providerMaxTokensField                = "max_tokens"
 	providerMaxCompletionTokensField      = "max_completion_tokens"
+	providerReasoningEffortField          = "reasoning_effort"
+	providerToolsField                    = "tools"
+	providerVerbosityField                = "verbosity"
 	defaultProviderProxyMaxRequestBytes   = 32 << 20
 	defaultProviderProxyMaxResponseBytes  = 64 << 20
 	defaultProviderProxyHeaderTimeout     = 30 * time.Second
@@ -707,6 +710,10 @@ func normalizeProviderRequestBody(providerKind, model, requestPath string, model
 	outputField := providerMaxTokensField
 	if strings.EqualFold(providerID, "openai") {
 		outputField = providerMaxCompletionTokensField
+		delete(payload, providerVerbosityField)
+		if tools, ok := payload[providerToolsField].([]any); ok && len(tools) > 0 {
+			delete(payload, providerReasoningEffortField)
+		}
 	}
 	if hasMaxTokens && maxTokens < outputLimit {
 		outputLimit = maxTokens

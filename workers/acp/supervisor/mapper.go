@@ -7,12 +7,23 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/orka-agents/orka/internal/acp"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 )
 
 const acpUpdateToolCall = "tool_call"
+
+const (
+	maxACPToolCallTitleBytes = 1024
+	acpToolCallTitleEllipsis = "…"
+)
+
+const (
+	acpAssistantPhaseCommentary  = "commentary"
+	acpAssistantPhaseFinalAnswer = "final_answer"
+)
 
 func promptContentToACP(blocks []harnessv2.ContentBlock) ([]acp.ContentBlock, error) {
 	result := make([]acp.ContentBlock, 0, len(blocks))
@@ -73,6 +84,14 @@ func mapACPUpdate(notification *acp.SessionNotification) (*harnessv2.UpdateEvent
 		if err != nil {
 			return nil, "", false, err
 		}
+		// ACP adapters may stream tool output through provider-specific fields
+		// that harness v2 deliberately does not project. A status-less update
+		// with no visible metadata would otherwise become an unbounded series of
+		// synthetic in_progress events carrying identical state.
+		if envelope.SessionUpdate == "tool_call_update" && envelope.Status == "" &&
+			envelope.Title == "" && envelope.Kind == "" {
+			return nil, "", false, nil
+		}
 		status := envelope.Status
 		if status == "" {
 			if envelope.SessionUpdate == acpUpdateToolCall {
@@ -88,7 +107,7 @@ func mapACPUpdate(notification *acp.SessionNotification) (*harnessv2.UpdateEvent
 		return &harnessv2.UpdateEvent{
 			Kind: kind,
 			ToolCall: &harnessv2.ToolCallUpdate{
-				ToolCallID: toolCallID, Title: envelope.Title, Kind: envelope.Kind, Status: status,
+				ToolCallID: toolCallID, Title: boundACPToolCallTitle(envelope.Title), Kind: envelope.Kind, Status: status,
 			},
 		}, "", true, nil
 	case "plan":
@@ -102,6 +121,40 @@ func mapACPUpdate(notification *acp.SessionNotification) (*harnessv2.UpdateEvent
 		return nil, "", false, nil
 	default:
 		return nil, "", false, nil
+	}
+}
+
+func boundACPToolCallTitle(value string) string {
+	if len(value) <= maxACPToolCallTitleBytes {
+		return value
+	}
+	limit := maxACPToolCallTitleBytes - len(acpToolCallTitleEllipsis)
+	for limit > 0 && !utf8.RuneStart(value[limit]) {
+		limit--
+	}
+	return value[:limit] + acpToolCallTitleEllipsis
+}
+
+func acpAssistantMessagePhase(notification *acp.SessionNotification) string {
+	if notification == nil {
+		return ""
+	}
+	var envelope struct {
+		SessionUpdate string `json:"sessionUpdate"`
+		Meta          struct {
+			Codex struct {
+				Phase string `json:"phase"`
+			} `json:"codex"`
+		} `json:"_meta"`
+	}
+	if json.Unmarshal(notification.Update, &envelope) != nil || envelope.SessionUpdate != "agent_message_chunk" {
+		return ""
+	}
+	switch envelope.Meta.Codex.Phase {
+	case acpAssistantPhaseCommentary, acpAssistantPhaseFinalAnswer:
+		return envelope.Meta.Codex.Phase
+	default:
+		return ""
 	}
 }
 

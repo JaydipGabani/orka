@@ -17,6 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+const targetReadCredentialName = "target-read"
+
 func TestReclaimStandaloneTaskBranchClaimAdvancesThenDeletes(t *testing.T) {
 	ctx := context.Background()
 	controlStore, fence := newBranchClaimReclamationStore(t)
@@ -329,7 +331,7 @@ func TestLoadPersistedPublicationRecoveryUsesContinuationTargetSource(t *testing
 		GitRepo:                      "https://github.com/orka/upstream.git",
 		ReadCredentialRef:            &corev1alpha1.WorkspaceCredentialReference{Name: "source-read"},
 		PublicationGitRepo:           "https://github.com/orka/fork.git",
-		PublicationReadCredentialRef: &corev1alpha1.WorkspaceCredentialReference{Name: "target-read"},
+		PublicationReadCredentialRef: &corev1alpha1.WorkspaceCredentialReference{Name: targetReadCredentialName},
 		PublicationCredentialRef:     &corev1alpha1.WorkspaceCredentialReference{Name: "target-write"},
 		ForgeCredentialRef:           &corev1alpha1.WorkspaceCredentialReference{Name: "forge-only"},
 	}
@@ -375,7 +377,7 @@ func TestLoadPersistedPublicationRecoveryUsesContinuationTargetSource(t *testing
 		t.Fatal(err)
 	}
 	if recovery.source.ID != target.ID || recovery.pullRequestBase.ID != "github.com/orka/upstream" ||
-		recovery.sourceCredential == nil || recovery.sourceCredential.Name != "target-read" || recovery.sourceCredential.Role != publisherservice.CredentialRoleTargetRead ||
+		recovery.sourceCredential == nil || recovery.sourceCredential.Name != targetReadCredentialName || recovery.sourceCredential.Role != publisherservice.CredentialRoleTargetRead ||
 		recovery.targetReadCredential == nil || recovery.targetReadCredential.Role != publisherservice.CredentialRoleTargetRead ||
 		recovery.writeCredential == nil || recovery.writeCredential.Role != publisherservice.CredentialRoleTargetWrite ||
 		recovery.forgeCredential == nil || recovery.forgeCredential.Name != "forge-only" ||
@@ -393,7 +395,7 @@ func TestLoadPersistedPublicationRecoveryUsesTargetReadForSameRepositoryContinua
 		Intent: corev1alpha1.WorkspaceIntentWrite, GitRepo: "https://github.com/orka/repo.git",
 		ReadCredentialRef:            &corev1alpha1.WorkspaceCredentialReference{Name: "source-read"},
 		PublicationGitRepo:           "https://github.com/orka/repo.git",
-		PublicationReadCredentialRef: &corev1alpha1.WorkspaceCredentialReference{Name: "target-read"},
+		PublicationReadCredentialRef: &corev1alpha1.WorkspaceCredentialReference{Name: targetReadCredentialName},
 		PublicationCredentialRef:     &corev1alpha1.WorkspaceCredentialReference{Name: "target-write"},
 	}
 	repository, err := workspacePublicationRepository(task.Spec.Workspace)
@@ -432,7 +434,7 @@ func TestLoadPersistedPublicationRecoveryUsesTargetReadForSameRepositoryContinua
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovery.sourceCredential == nil || recovery.sourceCredential.Name != "target-read" ||
+	if recovery.sourceCredential == nil || recovery.sourceCredential.Name != targetReadCredentialName ||
 		recovery.sourceCredential.Role != publisherservice.CredentialRoleTargetRead {
 		t.Fatalf("same-repository continuation source credential = %#v", recovery.sourceCredential)
 	}

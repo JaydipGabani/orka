@@ -87,16 +87,19 @@ type sessionState struct {
 }
 
 type promptState struct {
-	request                harnessv2.StartPromptRequest
-	operation              harnessv2.OperationRecord
-	lease                  harnessv2.PromptLease
-	startedAt              time.Time
-	acceptedAt             time.Time
-	sequence               uint64
-	assistant              strings.Builder
-	terminalResultOverflow bool
-	settlement             *harnessv2.PromptSettlement
-	settlementDigest       string
+	request             harnessv2.StartPromptRequest
+	operation           harnessv2.OperationRecord
+	lease               harnessv2.PromptLease
+	startedAt           time.Time
+	acceptedAt          time.Time
+	sequence            uint64
+	assistant           strings.Builder
+	assistantOverflow   bool
+	finalAnswer         strings.Builder
+	finalAnswerSeen     bool
+	finalAnswerOverflow bool
+	settlement          *harnessv2.PromptSettlement
+	settlementDigest    string
 }
 
 type promptMutationExecutor interface {

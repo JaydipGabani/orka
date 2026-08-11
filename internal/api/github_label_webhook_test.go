@@ -1205,7 +1205,7 @@ func TestGitHubWebhook_OrkaIssueLabelCreatesDurableCommandAndIssueRun(t *testing
 	secret := configureGitHubWebhookTest(t, map[string]string{githubAPIBaseURLEnv: permissionServer.URL})
 	pullRequestsEnabled := false
 	monitor := githubWebhookRepositoryMonitor("issue-loop", false)
-	monitor.Spec.GitSecretRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
+	monitor.Spec.ForgeCredentialRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
 	monitor.Spec.Targets.PullRequests.Enabled = &pullRequestsEnabled
 	monitor.Spec.Targets.Issues.Enabled = true
 	monitor.Spec.Triggers.GitHub.Labels.Enabled = true
@@ -1292,7 +1292,7 @@ func TestGitHubWebhook_CustomOrkaPRLabelDoesNotAlsoQueueExactEventRun(t *testing
 	t.Cleanup(permissionServer.Close)
 	secret := configureGitHubWebhookTest(t, map[string]string{githubAPIBaseURLEnv: permissionServer.URL})
 	monitor := githubWebhookRepositoryMonitor("custom-pr-command", true)
-	monitor.Spec.GitSecretRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
+	monitor.Spec.ForgeCredentialRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
 	monitor.Spec.Triggers.GitHub.Labels.Enabled = true
 	monitor.Spec.Triggers.GitHub.Labels.PullRequests.Review = "bot:review"
 	fc := newGitHubWebhookFakeClient(t, monitor, githubWebhookGitSecret())
@@ -1328,7 +1328,7 @@ func TestGitHubWebhook_OrkaGuardLabelBlocksCommandWithoutRun(t *testing.T) {
 	secret := configureGitHubWebhookTest(t, map[string]string{githubAPIBaseURLEnv: permissionServer.URL})
 	pullRequestsEnabled := false
 	monitor := githubWebhookRepositoryMonitor("guarded-issue-loop", false)
-	monitor.Spec.GitSecretRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
+	monitor.Spec.ForgeCredentialRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
 	monitor.Spec.Targets.PullRequests.Enabled = &pullRequestsEnabled
 	monitor.Spec.Targets.Issues.Enabled = true
 	monitor.Spec.Triggers.GitHub.Labels.Enabled = true
@@ -1374,7 +1374,7 @@ func TestGitHubWebhook_OrkaEquivalentCommandsCoalesceActiveWorkAction(t *testing
 	secret := configureGitHubWebhookTest(t, map[string]string{githubAPIBaseURLEnv: permissionServer.URL})
 	pullRequestsEnabled := false
 	monitor := githubWebhookRepositoryMonitor("coalesce-issue-loop", false)
-	monitor.Spec.GitSecretRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
+	monitor.Spec.ForgeCredentialRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
 	monitor.Spec.Targets.PullRequests.Enabled = &pullRequestsEnabled
 	monitor.Spec.Targets.Issues.Enabled = true
 	monitor.Spec.Triggers.GitHub.Labels.Enabled = true
@@ -1431,7 +1431,7 @@ func TestGitHubWebhook_OrkaResumeDoesNotBypassGuardLabel(t *testing.T) {
 	secret := configureGitHubWebhookTest(t, map[string]string{githubAPIBaseURLEnv: permissionServer.URL})
 	pullRequestsEnabled := false
 	monitor := githubWebhookRepositoryMonitor("guarded-resume", false)
-	monitor.Spec.GitSecretRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
+	monitor.Spec.ForgeCredentialRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
 	monitor.Spec.Targets.PullRequests.Enabled = &pullRequestsEnabled
 	monitor.Spec.Targets.Issues.Enabled = true
 	monitor.Spec.Triggers.GitHub.Labels.Enabled = true
@@ -1496,7 +1496,7 @@ func TestGitHubWebhook_DuplicateAcceptedCommandEnsuresMissingRun(t *testing.T) {
 	secret := configureGitHubWebhookTest(t, map[string]string{githubAPIBaseURLEnv: permissionServer.URL})
 	pullRequestsEnabled := false
 	monitor := githubWebhookRepositoryMonitor("dedupe-run", false)
-	monitor.Spec.GitSecretRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
+	monitor.Spec.ForgeCredentialRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
 	monitor.Spec.Targets.PullRequests.Enabled = &pullRequestsEnabled
 	monitor.Spec.Targets.Issues.Enabled = true
 	monitor.Spec.Triggers.GitHub.Labels.Enabled = true
@@ -1564,7 +1564,7 @@ func TestGitHubWebhook_DuplicateAcceptedCommandRetriesFailedRunSignal(t *testing
 	secret := configureGitHubWebhookTest(t, map[string]string{githubAPIBaseURLEnv: permissionServer.URL})
 	pullRequestsEnabled := false
 	monitor := githubWebhookRepositoryMonitor("dedupe-failed-run", false)
-	monitor.Spec.GitSecretRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
+	monitor.Spec.ForgeCredentialRef = &corev1.LocalObjectReference{Name: githubWebhookTestGitSecret}
 	monitor.Spec.Targets.PullRequests.Enabled = &pullRequestsEnabled
 	monitor.Spec.Targets.Issues.Enabled = true
 	monitor.Spec.Triggers.GitHub.Labels.Enabled = true

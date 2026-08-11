@@ -53,7 +53,10 @@ func (d *ACPDispatcher) prepareRuntimeWorkspace(
 		bindingSpec := spec
 		// The empty filesystem is the same reusable workspace across Session
 		// turns even though the task-scoped protocol baseline carries a Task UID.
-		bindingSpec.Baseline = harnessv2.WorkspaceBaseline{RepositoryIdentity: "empty", Revision: "empty"}
+		bindingSpec.Baseline = harnessv2.WorkspaceBaseline{
+			RepositoryIdentity: acpNoWorkspaceRevision,
+			Revision:           acpNoWorkspaceRevision,
+		}
 		bindingDigest, err := acpRuntimeWorkspaceBindingDigest("", bindingSpec)
 		if err != nil {
 			return preparedACPRuntimeWorkspace{}, err
@@ -88,7 +91,7 @@ func (d *ACPDispatcher) prepareRuntimeWorkspace(
 	resolveIdentity := store.ExternalEffectIdentity{
 		Kind: "workspace.resolve", Namespace: task.Namespace, AggregateID: string(task.UID), OperationID: metadata.OperationID,
 	}
-	resolved, err := runACPExternalEffect(ctx, d, fence, resolveIdentity, resolveRequest, func(callCtx context.Context) (publisherservice.WorkspaceResolveResponse, error) {
+	resolved, err := runACPExternalEffectWithRetry(ctx, d, fence, resolveIdentity, resolveRequest, func(callCtx context.Context) (publisherservice.WorkspaceResolveResponse, error) {
 		return d.Publisher.ResolveWorkspace(callCtx, resolveRequest)
 	})
 	if err != nil {
@@ -110,7 +113,7 @@ func (d *ACPDispatcher) prepareRuntimeWorkspace(
 	prepareIdentity := store.ExternalEffectIdentity{
 		Kind: "workspace.prepare", Namespace: task.Namespace, AggregateID: string(task.UID), OperationID: metadata.OperationID,
 	}
-	prepared, err := runACPExternalEffect(ctx, d, fence, prepareIdentity, prepareRequest, func(callCtx context.Context) (publisherservice.WorkspacePrepareResponse, error) {
+	prepared, err := runACPExternalEffectWithRetry(ctx, d, fence, prepareIdentity, prepareRequest, func(callCtx context.Context) (publisherservice.WorkspacePrepareResponse, error) {
 		return d.Publisher.PrepareWorkspace(callCtx, prepareRequest)
 	})
 	if err != nil {
