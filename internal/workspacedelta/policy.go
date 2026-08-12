@@ -17,6 +17,13 @@ const (
 	defaultMaxArtifactBytes int64 = 3 << 30
 	defaultMaxPathBytes           = 4 << 10
 	defaultMaxSymlinkBytes        = 4 << 10
+
+	// Repository tool conventions commonly expose the same checked-in skill
+	// tree to multiple agents. This exact alias is read-only: both the link and
+	// its protected target are fingerprinted and excluded from publication.
+	readOnlySkillsAliasPath     = ".agents/skills"
+	readOnlySkillsAliasTarget   = "../.claude/skills"
+	readOnlySkillsAliasResolved = ".claude/skills"
 )
 
 var mandatoryExcludedNames = []string{
@@ -221,4 +228,10 @@ func (o normalizedOptions) classifyPath(path string) (protected bool, err error)
 		}
 	}
 	return protected, nil
+}
+
+func isReadOnlySkillsAlias(linkPath, target, resolved string) bool {
+	return linkPath == readOnlySkillsAliasPath &&
+		target == readOnlySkillsAliasTarget &&
+		resolved == readOnlySkillsAliasResolved
 }

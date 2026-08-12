@@ -219,9 +219,11 @@ func captureSymlink(filePath, relative string, initial os.FileInfo, protected bo
 	if err != nil {
 		return entry{}, pathError("read symlink", relative, err)
 	}
-	if _, err := validateSymlinkTarget(relative, target, options); err != nil {
+	resolved, err := validateSymlinkTarget(relative, target, options)
+	if err != nil {
 		return entry{}, err
 	}
+	protected = protected || isReadOnlySkillsAlias(relative, target, resolved)
 	after, err := os.Lstat(filePath)
 	if err != nil {
 		return entry{}, pathError("revalidate symlink", relative, err)

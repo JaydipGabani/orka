@@ -78,7 +78,7 @@ func validateSymlinkTarget(linkPath, target string, options normalizedOptions) (
 		if err != nil {
 			return "", pathError("validate symlink", linkPath, fmt.Errorf("%w: %v", ErrUnsafeSymlink, err))
 		}
-		if protected {
+		if protected && !isReadOnlySkillsAlias(linkPath, target, resolved) {
 			return "", pathError("validate symlink", linkPath, ErrUnsafeSymlink)
 		}
 	}
@@ -93,6 +93,12 @@ func validateSymlinkGraph(entries map[string]entry, options normalizedOptions) e
 		resolved, err := validateSymlinkTarget(start, current.target, options)
 		if err != nil {
 			return err
+		}
+		if isReadOnlySkillsAlias(start, current.target, resolved) {
+			target, found := entries[resolved]
+			if !found || target.kind != EntryDirectory || !target.protected {
+				return pathError("validate symlink", start, ErrUnsafeSymlink)
+			}
 		}
 		if err := resolveSymlinkPath(start, resolved, entries, options, map[string]struct{}{start: {}}); err != nil {
 			return err

@@ -236,6 +236,84 @@ func TestCaptureRejectsUnsafeSymlinks(t *testing.T) {
 	}
 }
 
+func TestReadOnlySkillsAliasIsAcceptedButRemainsProtected(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, ".claude/skills/example/SKILL.md", "baseline\n", 0o644)
+	if err := os.MkdirAll(filepath.Join(root, ".agents"), 0o755); err != nil {
+		t.Fatalf("create .agents: %v", err)
+	}
+	aliasPath := filepath.Join(root, readOnlySkillsAliasPath)
+	if err := os.Symlink(readOnlySkillsAliasTarget, aliasPath); err != nil {
+		t.Fatalf("create skills alias: %v", err)
+	}
+
+	baseline := captureTestBaseline(t, root, Options{})
+	unchanged, err := Build(baseline, root, IntentWrite)
+	if err != nil {
+		t.Fatalf("Build unchanged alias: %v", err)
+	}
+	if unchanged.Classification != ClassificationNoChange {
+		t.Fatalf("classification = %q, want %q", unchanged.Classification, ClassificationNoChange)
+	}
+
+	writeTestFile(t, root, ".claude/skills/example/SKILL.md", "modified\n", 0o644)
+	if _, err := Build(baseline, root, IntentWrite); !errors.Is(err, ErrExcludedPathModified) {
+		t.Fatalf("Build modified alias target error = %v, want ErrExcludedPathModified", err)
+	}
+
+	writeTestFile(t, root, ".claude/skills/example/SKILL.md", "baseline\n", 0o644)
+	if err := os.Remove(aliasPath); err != nil {
+		t.Fatalf("remove skills alias: %v", err)
+	}
+	if err := os.Symlink("../src", aliasPath); err != nil {
+		t.Fatalf("replace skills alias: %v", err)
+	}
+	if _, err := Build(baseline, root, IntentWrite); !errors.Is(err, ErrExcludedPathModified) {
+		t.Fatalf("Build replaced alias error = %v, want ErrExcludedPathModified", err)
+	}
+}
+
+func TestReadOnlySkillsAliasExceptionIsExact(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   string
+		target string
+		setup  func(t *testing.T, root string)
+	}{
+		{
+			name: "different link path", path: ".agents/other", target: readOnlySkillsAliasTarget,
+			setup: func(t *testing.T, root string) {
+				writeTestFile(t, root, ".claude/skills/example/SKILL.md", "baseline\n", 0o644)
+			},
+		},
+		{
+			name: "different protected target", path: readOnlySkillsAliasPath, target: "../.claude/settings.json",
+			setup: func(t *testing.T, root string) {
+				writeTestFile(t, root, ".claude/settings.json", "{}\n", 0o644)
+			},
+		},
+		{
+			name: "missing target", path: readOnlySkillsAliasPath, target: readOnlySkillsAliasTarget,
+			setup: func(t *testing.T, root string) {},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			test.setup(t, root)
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(root, test.path)), 0o755); err != nil {
+				t.Fatalf("create alias parent: %v", err)
+			}
+			if err := os.Symlink(test.target, filepath.Join(root, test.path)); err != nil {
+				t.Fatalf("create alias: %v", err)
+			}
+			if _, err := Capture(root, Options{}); !errors.Is(err, ErrUnsafeSymlink) {
+				t.Fatalf("Capture error = %v, want ErrUnsafeSymlink", err)
+			}
+		})
+	}
+}
+
 func TestBuildRejectsGitAndExcludedRootMutation(t *testing.T) {
 	for _, protectedPath := range []string{".git/config", ".codex/config.toml"} {
 		t.Run(protectedPath, func(t *testing.T) {
