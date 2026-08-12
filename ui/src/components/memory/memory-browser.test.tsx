@@ -87,3 +87,80 @@ describe('MemoryBrowser', () => {
     expect(posted.namespace).toBe('default')
   })
 })
+
+describe('MemoryBrowser edit and delete', () => {
+  beforeEach(() => {
+    useUIStore.setState({ namespace: 'default', sidebarCollapsed: false, theme: 'light' })
+  })
+
+  it('edits a memory through the prefilled dialog', async () => {
+    let putBody: any
+    server.use(
+      http.get('/api/v1/memories', () => HttpResponse.json({ items: [sampleMemory], metadata: {} })),
+      http.put('/api/v1/memories/:id', async ({ request }) => {
+        putBody = await request.json()
+        return HttpResponse.json({ ...sampleMemory, ...putBody })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<MemoryBrowser />)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const content = await screen.findByLabelText('Memory content')
+    expect((content as HTMLTextAreaElement).value).toContain('Deploys require')
+    await user.clear(content)
+    await user.type(content, 'updated fact')
+    await user.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(putBody).toBeTruthy())
+    expect(putBody.content).toBe('updated fact')
+    expect(putBody.tags).toEqual(['infra'])
+  })
+
+  it('soft-deletes a memory', async () => {
+    let deleted = false
+    server.use(
+      http.get('/api/v1/memories', () => HttpResponse.json({ items: [sampleMemory], metadata: {} })),
+      http.delete('/api/v1/memories/:id', () => {
+        deleted = true
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<MemoryBrowser />)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: 'Delete' }))
+    await waitFor(() => expect(deleted).toBe(true))
+  })
+
+  it('hides row actions for deleted memories and filters via switches', async () => {
+    server.use(
+      http.get('/api/v1/memories', ({ request }) => {
+        const url = new URL(request.url)
+        if (url.searchParams.get('includeDeleted') === 'true') {
+          return HttpResponse.json({
+            items: [{ ...sampleMemory, id: 'm-del', deleted: true }],
+            metadata: {},
+          })
+        }
+        return HttpResponse.json({ items: [], metadata: {} })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<MemoryBrowser />)
+    await user.click(screen.getByRole('switch', { name: 'Include deleted' }))
+    // "Deleted" also labels the filter switch; assert on the state badge.
+    await waitFor(() =>
+      expect(screen.getByText('Deleted', { selector: '[data-slot="badge"]' })).toBeInTheDocument(),
+    )
+    expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument()
+  })
+
+  it('requires content when saving a new memory', async () => {
+    const user = userEvent.setup()
+    render(<MemoryBrowser />)
+    await user.click(screen.getByRole('button', { name: /new memory/i }))
+    await user.click(await screen.findByRole('button', { name: /create memory/i }))
+    // Dialog stays open because validation failed client-side.
+    expect(screen.getByLabelText('Memory content')).toBeInTheDocument()
+  })
+})

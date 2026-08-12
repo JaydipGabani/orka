@@ -109,3 +109,62 @@ describe('ProposalInbox', () => {
     await waitFor(() => expect(screen.getByText(/proposal store is not enabled/i)).toBeInTheDocument())
   })
 })
+
+describe('ProposalInbox decisions', () => {
+  beforeEach(() => {
+    useUIStore.setState({ namespace: 'default', sidebarCollapsed: false, theme: 'light' })
+  })
+
+  it('rejects a pending proposal', async () => {
+    let reviewBody: any
+    server.use(
+      http.get('/api/v1/memory-proposals', () =>
+        HttpResponse.json({ items: [proposal()], metadata: {} }),
+      ),
+      http.post('/api/v1/memory-proposals/:id/review', async ({ request }) => {
+        reviewBody = await request.json()
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<ProposalInbox />)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Reject' })).toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: 'Reject' }))
+    await waitFor(() => expect(reviewBody).toBeTruthy())
+    expect(reviewBody.status).toBe('rejected')
+  })
+
+  it('archives a rejected proposal', async () => {
+    let archived = false
+    server.use(
+      http.get('/api/v1/memory-proposals', () =>
+        HttpResponse.json({ items: [proposal({ status: 'rejected' })], metadata: {} }),
+      ),
+      http.post('/api/v1/memory-proposals/:id/archive', () => {
+        archived = true
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<ProposalInbox />)
+    await user.click(screen.getByRole('button', { name: 'rejected' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Archive' })).toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: 'Archive' }))
+    await waitFor(() => expect(archived).toBe(true))
+  })
+
+  it('shows applied linkage on applied proposals', async () => {
+    server.use(
+      http.get('/api/v1/memory-proposals', () =>
+        HttpResponse.json({
+          items: [proposal({ status: 'applied', appliedMemoryId: 'mem-7', reviewer: 'admin' })],
+          metadata: {},
+        }),
+      ),
+    )
+    const user = userEvent.setup()
+    render(<ProposalInbox />)
+    await user.click(screen.getByRole('button', { name: 'applied' }))
+    await waitFor(() => expect(screen.getByText(/memory mem-7/)).toBeInTheDocument())
+  })
+})

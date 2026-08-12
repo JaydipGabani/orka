@@ -95,3 +95,43 @@ describe('SubstratePoolsPanel', () => {
     await waitFor(() => expect(deleted).toBe(true))
   })
 })
+
+describe('SubstratePoolsPanel edit', () => {
+  beforeEach(() => {
+    useUIStore.setState({ namespace: 'default', sidebarCollapsed: false, theme: 'light' })
+  })
+
+  it('edits a pool through the prefilled dialog', async () => {
+    let putBody: any
+    server.use(
+      http.get('/api/v1/substrate-actor-pools', () =>
+        HttpResponse.json({ items: [pool], metadata: {} }),
+      ),
+      http.put('/api/v1/substrate-actor-pools/:name', async ({ request }) => {
+        putBody = await request.json()
+        return HttpResponse.json({ metadata: { name: 'warm-pool', namespace: 'default' }, spec: putBody.spec })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<SubstratePoolsPanel />)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const actors = await screen.findByLabelText('Target actors')
+    expect((actors as HTMLInputElement).value).toBe('4')
+    await user.clear(actors)
+    await user.type(actors, '6')
+    await user.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(putBody).toBeTruthy())
+    expect(putBody.spec.targetActors).toBe(6)
+    expect(putBody.spec.templateRef).toEqual({ name: 'mcp-template' })
+  })
+
+  it('requires a name when creating', async () => {
+    const user = userEvent.setup()
+    render(<SubstratePoolsPanel />)
+    await user.click(screen.getByRole('button', { name: /new actor pool/i }))
+    await user.click(await screen.findByRole('button', { name: /create pool/i }))
+    // Dialog stays open; nothing submitted without a name.
+    expect(screen.getByLabelText('Name')).toBeInTheDocument()
+  })
+})
