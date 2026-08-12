@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { dump, load } from 'js-yaml'
 
 import { Button } from '@/components/ui/button'
@@ -39,15 +39,23 @@ export function ManifestEditor({
       return ''
     }
   }, [initialValue])
-  const [text, setText] = useState(initialText)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (open) {
-      setText(initialText)
-      setError(null)
-    }
-  }, [open, initialText])
+  // Guarded render-time adjustment (not an effect): the editor re-seeds from
+  // initialText each time the dialog transitions to open, discarding edits
+  // from the previous session.
+  const [editor, setEditor] = useState<{ openedWith: string | null; text: string; error: string | null }>({
+    openedWith: null,
+    text: initialText,
+    error: null,
+  })
+  if (open && editor.openedWith === null) {
+    setEditor({ openedWith: initialText, text: initialText, error: null })
+  } else if (!open && editor.openedWith !== null) {
+    setEditor({ openedWith: null, text: '', error: null })
+  }
+  const text = editor.text
+  const error = editor.error
+  const setText = (value: string) => setEditor((state) => ({ ...state, text: value }))
+  const setError = (value: string | null) => setEditor((state) => ({ ...state, error: value }))
 
   const handleSubmit = async () => {
     let parsed: unknown
