@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/store/sqlite"
+	"github.com/orka-agents/orka/internal/taskterminal"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -23,6 +25,74 @@ const (
 	acpSessionTestSHA  = "0123456789012345678901234567890123456789"
 	acpSessionTestSHA2 = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
 )
+
+func TestTaskSessionProjectionExecutionPreservesFrozenIdentity(t *testing.T) {
+	transition := metav1.NewTime(time.Date(2026, 8, 11, 22, 9, 40, 0, time.UTC))
+	execution := &corev1alpha1.TaskExecutionStatus{
+		State: corev1alpha1.TaskExecutionStateRunning, Attempt: 1, PromptID: "prompt-session-terminal",
+		RuntimePoolName: "codex-pool", RuntimePoolUID: "pool-uid", RuntimeInstanceID: "runtime-instance",
+		RuntimeSessionUID: "session-uid", RuntimeSessionGeneration: 3, RuntimeSessionSupervisorBootID: "boot-id",
+		RuntimeSessionProfileDigest: acpSessionTestDigest("profile"), RuntimeSessionMCPDigest: acpSessionTestDigest("mcp"),
+		RuntimeSessionWorkspaceDigest: acpSessionTestDigest("workspace"), RuntimeSessionRecreationPending: true,
+		RuntimeSessionCleanupDigest: acpSessionTestDigest("cleanup"), RequestDigest: acpSessionTestDigest("request"),
+		ControllerEpoch: 7, ReadCredentialResourceVersion: "read-rv", PublicationReadCredentialResourceVersion: "target-read-rv",
+		PublicationCredentialResourceVersion: "target-write-rv", ForgeCredentialResourceVersion: "forge-rv",
+		Message: "running", LastTransitionTime: &transition,
+	}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "orka-system", Name: "session-terminal", UID: types.UID("task-session-terminal")},
+		Spec: corev1alpha1.TaskSpec{
+			Type:       corev1alpha1.TaskTypeAgent,
+			SessionRef: &corev1alpha1.SessionReference{Name: "session-transcript", Create: true},
+		},
+		Status: corev1alpha1.TaskStatus{
+			Phase: corev1alpha1.TaskPhaseCancelled, Execution: execution,
+			Delivery: &corev1alpha1.TaskDeliveryStatus{
+				State: corev1alpha1.TaskDeliveryStateNotRequested, Outcome: corev1alpha1.TaskDeliveryOutcomeNotRequested,
+			},
+		},
+	}
+	terminal := corev1alpha1.TaskExecutionStatus{
+		State: corev1alpha1.TaskExecutionStateCancelled, Outcome: corev1alpha1.TaskExecutionOutcomeCancelled,
+		Attempt: 1, PromptID: execution.PromptID, Reason: "Cancelled", Message: "prompt cancelled",
+	}
+	projected, err := taskSessionProjectionExecution(task, terminal)
+	if err != nil {
+		t.Fatalf("taskSessionProjectionExecution() error = %v", err)
+	}
+	expected := *execution.DeepCopy()
+	expected.State = terminal.State
+	expected.Outcome = terminal.Outcome
+	expected.Reason = terminal.Reason
+	expected.Message = terminal.Message
+	if !reflect.DeepEqual(projected, expected) {
+		t.Fatalf("projected execution = %#v, want %#v", projected, expected)
+	}
+	attempt := &store.PromptAttempt{
+		ID: "prompt-attempt-session-terminal",
+		Key: store.PromptAttemptKey{
+			Namespace: task.Namespace, TaskUID: string(task.UID), Attempt: 1, PromptID: execution.PromptID,
+		},
+		RequestDigest: execution.RequestDigest, RuntimeInstanceID: execution.RuntimeInstanceID,
+		SessionUID: execution.RuntimeSessionUID, SessionLeaseGeneration: execution.RuntimeSessionGeneration,
+		ExecutionState: store.PromptExecutionCancelled, DeliveryState: store.PromptDeliveryNotRequested,
+	}
+	payload, err := json.Marshal(taskTerminalProjection{
+		Namespace: task.Namespace, Task: task.Name, TaskUID: string(task.UID), Attempt: 1,
+		Phase: task.Status.Phase, Execution: projected, Delivery: task.Status.Delivery,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := taskterminal.ValidateRestoredProjection(payload, task, string(task.UID), attempt); err != nil {
+		t.Fatalf("new Session terminal projection failed reclamation validation: %v", err)
+	}
+
+	terminal.Attempt = 2
+	if _, err := taskSessionProjectionExecution(task, terminal); err == nil {
+		t.Fatal("mismatched terminal attempt was accepted")
+	}
+}
 
 func TestACPSessionContinuityConcurrentLeaseDenial(t *testing.T) {
 	ctx := context.Background()

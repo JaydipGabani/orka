@@ -2,6 +2,7 @@ package taskterminal
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,8 +40,6 @@ type Projection struct {
 // its final source PromptAttempt. Restore-only status text, controller epoch,
 // and transition timestamps are deliberately not compared with the restored
 // Task because the restored incarnation records a new settlement event.
-//
-//nolint:gocyclo // Keep the complete fail-closed terminal-payload contract in one auditable boundary.
 func ValidateRestoredProjection(
 	payload []byte,
 	task *corev1alpha1.Task,
@@ -51,6 +50,51 @@ func ValidateRestoredProjection(
 	if err != nil {
 		return nil, err
 	}
+	return validateProjection(projection, task, sourceTaskUID, attempt)
+}
+
+// ValidateFinalizedSessionProjection validates a Session-backed terminal
+// projection and its immutable SessionTurn. It accepts the one legacy payload
+// shape produced before Session projections copied the frozen execution
+// identity: every execution field other than the terminal classification was
+// omitted. That compatibility path is authorized only by an exact finalized
+// SessionTurn which pins this payload digest and the same PromptAttempt.
+func ValidateFinalizedSessionProjection(
+	payload []byte,
+	task *corev1alpha1.Task,
+	sourceTaskUID string,
+	attempt *store.PromptAttempt,
+	turn *store.SessionTurn,
+) (*Projection, error) {
+	projection, err := decodeProjection(payload)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateFinalizedSessionTurn(payload, task, sourceTaskUID, attempt, turn); err != nil {
+		return nil, err
+	}
+	if legacySessionExecutionIdentityOmitted(projection.Execution) {
+		execution := *task.Status.Execution.DeepCopy()
+		execution.State = projection.Execution.State
+		execution.Outcome = projection.Execution.Outcome
+		execution.Reason = projection.Execution.Reason
+		execution.Attempt = projection.Execution.Attempt
+		execution.PromptID = projection.Execution.PromptID
+		execution.Message = projection.Execution.Message
+		normalized := *projection
+		normalized.Execution = execution
+		projection = &normalized
+	}
+	return validateProjection(projection, task, sourceTaskUID, attempt)
+}
+
+//nolint:gocyclo // Keep the complete fail-closed terminal-payload contract in one auditable boundary.
+func validateProjection(
+	projection *Projection,
+	task *corev1alpha1.Task,
+	sourceTaskUID string,
+	attempt *store.PromptAttempt,
+) (*Projection, error) {
 	if task == nil || task.Status.Execution == nil || attempt == nil {
 		return nil, conflict("restored terminal projection evidence is incomplete")
 	}
@@ -116,6 +160,53 @@ func ValidateRestoredProjection(
 		return nil, conflict("restored terminal projection restore message does not match its source attempt")
 	}
 	return projection, nil
+}
+
+func validateFinalizedSessionTurn(
+	payload []byte,
+	task *corev1alpha1.Task,
+	sourceTaskUID string,
+	attempt *store.PromptAttempt,
+	turn *store.SessionTurn,
+) error {
+	if task == nil || task.Status.Execution == nil || attempt == nil || turn == nil {
+		return conflict("finalized Session terminal projection evidence is incomplete")
+	}
+	if task.Spec.SessionRef == nil || turn.State != store.SessionTurnFinalized || turn.FinalizedAt == nil ||
+		turn.ProjectionID == "" || turn.ProjectionKind != ProjectionKind ||
+		turn.ProjectionDigest != fmt.Sprintf("sha256:%x", sha256.Sum256(payload)) {
+		return conflict("finalized Session terminal projection is not pinned by its SessionTurn")
+	}
+	canonicalID, err := turn.Key.CanonicalID()
+	if err != nil || canonicalID != turn.ID {
+		return conflict("finalized SessionTurn identity is invalid")
+	}
+	sourceTaskUID = strings.TrimSpace(sourceTaskUID)
+	if turn.Key.TaskUID != sourceTaskUID || turn.Key.Attempt != attempt.Key.Attempt ||
+		turn.Key.PromptID != attempt.Key.PromptID || turn.PromptAttemptID != attempt.ID ||
+		turn.Key.SessionUID != attempt.SessionUID || turn.Key.LeaseGeneration != attempt.SessionLeaseGeneration ||
+		turn.Key.SessionUID != task.Status.Execution.RuntimeSessionUID ||
+		turn.Key.LeaseGeneration != task.Status.Execution.RuntimeSessionGeneration {
+		return conflict("finalized SessionTurn does not match its Task and PromptAttempt")
+	}
+	wantTerminalKind := store.SessionTurnOutcomeMarker
+	if attempt.ExecutionState == store.PromptExecutionSucceeded {
+		wantTerminalKind = store.SessionTurnAssistantResult
+	}
+	if turn.TerminalKind != wantTerminalKind {
+		return conflict("finalized SessionTurn terminal kind does not match its PromptAttempt")
+	}
+	return nil
+}
+
+func legacySessionExecutionIdentityOmitted(execution corev1alpha1.TaskExecutionStatus) bool {
+	execution.State = ""
+	execution.Outcome = ""
+	execution.Reason = ""
+	execution.Attempt = 0
+	execution.PromptID = ""
+	execution.Message = ""
+	return reflect.DeepEqual(execution, corev1alpha1.TaskExecutionStatus{})
 }
 
 func decodeProjection(payload []byte) (*Projection, error) {

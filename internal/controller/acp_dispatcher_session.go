@@ -659,9 +659,12 @@ func (d *ACPDispatcher) finalizeTaskSessionResult(
 	if session == nil || session.Turn == nil {
 		return nil
 	}
-	execution := corev1alpha1.TaskExecutionStatus{
+	execution, err := taskSessionProjectionExecution(task, corev1alpha1.TaskExecutionStatus{
 		State: corev1alpha1.TaskExecutionStateSucceeded, Outcome: corev1alpha1.TaskExecutionOutcomeSucceeded,
 		Attempt: task.Status.Execution.Attempt, PromptID: task.Status.Execution.PromptID,
+	})
+	if err != nil {
+		return err
 	}
 	payload, err := json.Marshal(taskTerminalProjection{
 		Namespace: task.Namespace, Task: task.Name, TaskUID: string(task.UID), Attempt: task.Status.Execution.Attempt,
@@ -687,10 +690,13 @@ func (d *ACPDispatcher) finalizeTaskSessionUnknown(ctx context.Context, task *co
 	if session == nil || session.Turn == nil || session.finalized {
 		return nil
 	}
-	execution := corev1alpha1.TaskExecutionStatus{
+	execution, err := taskSessionProjectionExecution(task, corev1alpha1.TaskExecutionStatus{
 		State: corev1alpha1.TaskExecutionStateOutcomeUnknown, Outcome: corev1alpha1.TaskExecutionOutcomeOutcomeUnknown,
 		Attempt: task.Status.Execution.Attempt, PromptID: task.Status.Execution.PromptID,
 		Reason: "RuntimeLost", Message: reason,
+	})
+	if err != nil {
+		return err
 	}
 	payload, err := json.Marshal(taskTerminalProjection{
 		Namespace: task.Namespace, Task: task.Name, TaskUID: string(task.UID), Attempt: task.Status.Execution.Attempt,
@@ -723,6 +729,11 @@ func (d *ACPDispatcher) finalizeTaskSessionMarker(
 	if session == nil || session.Turn == nil || session.finalized {
 		return nil
 	}
+	var err error
+	execution, err = taskSessionProjectionExecution(task, execution)
+	if err != nil {
+		return err
+	}
 	payload, err := json.Marshal(taskTerminalProjection{
 		Namespace: task.Namespace, Task: task.Name, TaskUID: string(task.UID), Attempt: execution.Attempt,
 		Phase: phase, Message: reason, Execution: execution, Delivery: task.Status.Delivery,
@@ -740,6 +751,35 @@ func (d *ACPDispatcher) finalizeTaskSessionMarker(
 		d.removeRuntimeSessionBinding(session.Binding.SessionUID)
 	}
 	return err
+}
+
+// taskSessionProjectionExecution overlays only the terminal classification on
+// the Task's frozen execution identity. Session finalization projections are
+// immutable reclamation evidence, so omitting the request digest or runtime
+// identity would make the source PromptAttempt impossible to retire safely.
+func taskSessionProjectionExecution(
+	task *corev1alpha1.Task,
+	terminal corev1alpha1.TaskExecutionStatus,
+) (corev1alpha1.TaskExecutionStatus, error) {
+	if task == nil || task.Status.Execution == nil {
+		return corev1alpha1.TaskExecutionStatus{}, fmt.Errorf("task execution status is required for Session terminal projection")
+	}
+	if terminal.State == "" || terminal.Outcome == "" {
+		return corev1alpha1.TaskExecutionStatus{}, fmt.Errorf("session terminal projection requires execution state and outcome")
+	}
+	current := task.Status.Execution
+	if terminal.Attempt != 0 && terminal.Attempt != current.Attempt {
+		return corev1alpha1.TaskExecutionStatus{}, fmt.Errorf("session terminal projection attempt does not match the Task")
+	}
+	if terminal.PromptID != "" && terminal.PromptID != current.PromptID {
+		return corev1alpha1.TaskExecutionStatus{}, fmt.Errorf("session terminal projection prompt ID does not match the Task")
+	}
+	execution := *current.DeepCopy()
+	execution.State = terminal.State
+	execution.Outcome = terminal.Outcome
+	execution.Reason = terminal.Reason
+	execution.Message = terminal.Message
+	return execution, nil
 }
 
 func (d *ACPDispatcher) currentRuntimeSessionBinding(sessionUID string) *ACPRuntimeSessionBinding {

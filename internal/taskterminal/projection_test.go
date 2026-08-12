@@ -1,8 +1,10 @@
 package taskterminal
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +50,80 @@ func TestValidateRestoredProjectionAcceptsExactRestoreMarker(t *testing.T) {
 
 	if _, err := ValidateRestoredProjection(marshalProjection(t, projection), task, sourceUID, attempt); err != nil {
 		t.Fatalf("ValidateRestoredProjection(restore marker) error = %v", err)
+	}
+}
+
+func TestValidateFinalizedSessionProjectionAcceptsPinnedLegacySparseExecution(t *testing.T) {
+	task, sourceUID, attempt, projection := restoredProjectionFixture()
+	task.Spec.SessionRef = &corev1alpha1.SessionReference{Name: "session-transcript", Create: true}
+	legacyExecution := corev1alpha1.TaskExecutionStatus{
+		State: projection.Execution.State, Outcome: projection.Execution.Outcome,
+		Reason: projection.Execution.Reason, Attempt: projection.Execution.Attempt,
+		PromptID: projection.Execution.PromptID, Message: projection.Execution.Message,
+	}
+	projection.Execution = legacyExecution
+	payload := marshalProjection(t, projection)
+	turn := finalizedSessionProjectionTurn(t, payload, attempt)
+
+	validated, err := ValidateFinalizedSessionProjection(payload, task, sourceUID, attempt, turn)
+	if err != nil {
+		t.Fatalf("ValidateFinalizedSessionProjection() error = %v", err)
+	}
+	if validated.Execution.RequestDigest != attempt.RequestDigest ||
+		validated.Execution.RuntimeSessionUID != attempt.SessionUID ||
+		validated.Execution.RuntimeSessionGeneration != attempt.SessionLeaseGeneration {
+		t.Fatalf("legacy Session projection did not recover frozen execution identity: %#v", validated.Execution)
+	}
+}
+
+func TestValidateFinalizedSessionProjectionRejectsUnpinnedOrPartialLegacyPayload(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*corev1alpha1.Task, *store.PromptAttempt, *Projection, *store.SessionTurn)
+	}{
+		{name: "no Session reference", mutate: func(task *corev1alpha1.Task, _ *store.PromptAttempt, _ *Projection, _ *store.SessionTurn) {
+			task.Spec.SessionRef = nil
+		}},
+		{name: "projection digest", mutate: func(_ *corev1alpha1.Task, _ *store.PromptAttempt, _ *Projection, turn *store.SessionTurn) {
+			turn.ProjectionDigest = digest("different-payload")
+		}},
+		{name: "prompt attempt identity", mutate: func(_ *corev1alpha1.Task, _ *store.PromptAttempt, _ *Projection, turn *store.SessionTurn) {
+			turn.PromptAttemptID = "different-attempt"
+		}},
+		{name: "Session identity", mutate: func(_ *corev1alpha1.Task, _ *store.PromptAttempt, _ *Projection, turn *store.SessionTurn) {
+			turn.Key.SessionUID = "different-session"
+		}},
+		{name: "terminal kind", mutate: func(_ *corev1alpha1.Task, _ *store.PromptAttempt, _ *Projection, turn *store.SessionTurn) {
+			turn.TerminalKind = store.SessionTurnOutcomeMarker
+		}},
+		{name: "partial request identity", mutate: func(_ *corev1alpha1.Task, _ *store.PromptAttempt, projection *Projection, _ *store.SessionTurn) {
+			projection.Execution.RequestDigest = digest("different-request")
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task, sourceUID, attempt, projection := restoredProjectionFixture()
+			task.Spec.SessionRef = &corev1alpha1.SessionReference{Name: "session-transcript", Create: true}
+			projection.Execution = corev1alpha1.TaskExecutionStatus{
+				State: projection.Execution.State, Outcome: projection.Execution.Outcome,
+				Reason: projection.Execution.Reason, Attempt: projection.Execution.Attempt,
+				PromptID: projection.Execution.PromptID, Message: projection.Execution.Message,
+			}
+			payload := marshalProjection(t, projection)
+			turn := finalizedSessionProjectionTurn(t, payload, attempt)
+			tt.mutate(task, attempt, &projection, turn)
+			payload = marshalProjection(t, projection)
+			if tt.name != "partial request identity" {
+				// Mutations above target authoritative evidence, not the payload.
+				turn.ProjectionDigest = fmt.Sprintf("sha256:%x", sha256.Sum256(payload))
+				if tt.name == "projection digest" {
+					turn.ProjectionDigest = digest("different-payload")
+				}
+			}
+			if _, err := ValidateFinalizedSessionProjection(payload, task, sourceUID, attempt, turn); !errors.Is(err, store.ErrConflict) {
+				t.Fatalf("ValidateFinalizedSessionProjection() error = %v, want ErrConflict", err)
+			}
+		})
 	}
 }
 
@@ -195,6 +271,25 @@ func marshalProjection(t *testing.T, projection Projection) []byte {
 		t.Fatalf("json.Marshal(): %v", err)
 	}
 	return payload
+}
+
+func finalizedSessionProjectionTurn(t *testing.T, payload []byte, attempt *store.PromptAttempt) *store.SessionTurn {
+	t.Helper()
+	key := store.SessionTurnKey{
+		SessionUID: attempt.SessionUID, LeaseGeneration: attempt.SessionLeaseGeneration,
+		TaskUID: attempt.Key.TaskUID, Attempt: attempt.Key.Attempt, PromptID: attempt.Key.PromptID,
+	}
+	id, err := key.CanonicalID()
+	if err != nil {
+		t.Fatalf("SessionTurnKey.CanonicalID(): %v", err)
+	}
+	finalizedAt := time.Date(2026, 8, 11, 12, 10, 0, 0, time.UTC)
+	return &store.SessionTurn{
+		ID: id, Key: key, PromptAttemptID: attempt.ID, State: store.SessionTurnFinalized,
+		TerminalKind: store.SessionTurnAssistantResult, ProjectionID: "outbox:session-terminal",
+		ProjectionKind: ProjectionKind, ProjectionDigest: fmt.Sprintf("sha256:%x", sha256.Sum256(payload)),
+		FinalizedAt: &finalizedAt,
+	}
 }
 
 func digest(value string) string {

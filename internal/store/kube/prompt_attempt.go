@@ -1100,6 +1100,20 @@ func (s *Store) verifyPromptAttemptTerminalProjectionMarkerKube(ctx context.Cont
 	if marker.TerminalProjectionPayloadDigest != "" && marker.TerminalProjectionPayloadDigest != payloadDigest {
 		return "", controlConflict("terminal projection %q changed after prompt attempt reclamation was prepared", projection.ID)
 	}
+	var finalTurn *store.SessionTurn
+	if marker.FinalSessionTurnID != "" {
+		if s.sessionTurns == nil {
+			return "", ErrSessionTurnStoreNotConfigured
+		}
+		turn, err := s.sessionTurns.GetSessionTurn(ctx, marker.FinalSessionTurnID)
+		if err != nil {
+			return "", fmt.Errorf("load final SessionTurn for prompt attempt reclamation: %w", err)
+		}
+		if turn.State != store.SessionTurnFinalized || turn.FinalizedAt == nil || turn.ProjectionID != projection.ID {
+			return "", controlConflict("terminal projection %q does not match final SessionTurn %q", projection.ID, marker.FinalSessionTurnID)
+		}
+		finalTurn = turn
+	}
 	task := &corev1alpha1.Task{}
 	if err := s.readClient().Get(ctx, client.ObjectKey{Namespace: marker.Namespace, Name: marker.TaskName}, task); err != nil {
 		return "", mapKubernetesError("load Task for terminal projection validation", err)
@@ -1116,20 +1130,16 @@ func (s *Store) verifyPromptAttemptTerminalProjectionMarkerKube(ctx context.Cont
 		return "", fmt.Errorf("load final prompt attempt for terminal projection validation: %w", err)
 	}
 	if !attemptMissing {
-		if _, err := taskterminal.ValidateRestoredProjection(projection.Payload, task, marker.TaskUID, attempt); err != nil {
-			return "", err
+		var validationErr error
+		if finalTurn != nil {
+			_, validationErr = taskterminal.ValidateFinalizedSessionProjection(
+				projection.Payload, task, marker.TaskUID, attempt, finalTurn,
+			)
+		} else {
+			_, validationErr = taskterminal.ValidateRestoredProjection(projection.Payload, task, marker.TaskUID, attempt)
 		}
-	}
-	if marker.FinalSessionTurnID != "" {
-		if s.sessionTurns == nil {
-			return "", ErrSessionTurnStoreNotConfigured
-		}
-		turn, err := s.sessionTurns.GetSessionTurn(ctx, marker.FinalSessionTurnID)
-		if err != nil {
-			return "", fmt.Errorf("load final SessionTurn for prompt attempt reclamation: %w", err)
-		}
-		if turn.State != store.SessionTurnFinalized || turn.FinalizedAt == nil || turn.ProjectionID != projection.ID {
-			return "", controlConflict("terminal projection %q does not match final SessionTurn %q", projection.ID, marker.FinalSessionTurnID)
+		if validationErr != nil {
+			return "", validationErr
 		}
 	}
 	return payloadDigest, nil

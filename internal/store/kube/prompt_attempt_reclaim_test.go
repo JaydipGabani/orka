@@ -471,6 +471,193 @@ func TestReclaimPromptAttemptsCompletionAllowsUnboundContinuityProjectionRetry(t
 	}
 }
 
+func TestReclaimPromptAttemptsAcceptsPinnedLegacySessionProjectionAfterPreparedDelete(t *testing.T) {
+	ctx := context.Background()
+	kubeStore, kubeClient, fence := newPromptAttemptReclaimStore(t)
+	persistence, ok := kubeStore.sessionTurns.(*sqlitestore.Store)
+	if !ok {
+		t.Fatalf("SessionTurn persistence = %T, want *sqlite.Store", kubeStore.sessionTurns)
+	}
+	const (
+		namespace   = "tenant-a"
+		taskUID     = "task-legacy-session-projection"
+		sessionName = "legacy-session-projection"
+		sessionUID  = "legacy-session-projection-uid"
+		promptID    = "prompt-legacy-session-projection"
+	)
+	if err := persistence.CreateSession(ctx, &controlstore.SessionRecord{
+		Namespace: namespace, Name: sessionName, SessionType: "task",
+	}); err != nil {
+		t.Fatalf("CreateSession(): %v", err)
+	}
+	task := ensureActiveAgentTask(t, ctx, kubeClient, namespace, taskUID, taskUID)
+	task.Spec.SessionRef = &corev1alpha1.SessionReference{Name: sessionName, Create: true}
+	if err := kubeClient.Update(ctx, task); err != nil {
+		t.Fatalf("record Task SessionRef: %v", err)
+	}
+	control, err := kubeStore.CreateSessionControl(ctx, &controlstore.SessionControl{
+		Namespace: namespace, SessionName: sessionName, SessionUID: sessionUID,
+		RequestDigest: testDigest("legacy-session-control"),
+	}, fence)
+	if err != nil {
+		t.Fatalf("CreateSessionControl(): %v", err)
+	}
+	promptRequestDigest := testDigest("legacy-session-prompt")
+	leaseRequestDigest, err := controlstore.SessionMutationLeaseRequestDigest(
+		control.SessionUID, control.LeaseGeneration+1, taskUID, 1, promptID, promptRequestDigest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseExpires := testNow.Add(15 * time.Minute)
+	control, err = kubeStore.AcquireSessionMutationLease(ctx, controlstore.AcquireSessionMutationLeaseRequest{
+		Namespace: namespace, SessionName: sessionName, SessionUID: sessionUID,
+		Fence: fence, ExpectedVersion: control.Version, ExpectedLeaseGeneration: control.LeaseGeneration,
+		TaskUID: taskUID, Attempt: 1, PromptID: promptID, RequestDigest: leaseRequestDigest,
+		AcquiredAt: testNow, ExpiresAt: &leaseExpires, Lineage: testSessionLineageClaim(control),
+	})
+	if err != nil {
+		t.Fatalf("AcquireSessionMutationLease(): %v", err)
+	}
+	attempt, err := kubeStore.CreatePromptAttempt(ctx, boundPromptAttemptForKubeTest(&controlstore.PromptAttempt{
+		Key:           controlstore.PromptAttemptKey{Namespace: namespace, TaskUID: taskUID, Attempt: 1, PromptID: promptID},
+		RequestDigest: promptRequestDigest,
+	}), fence)
+	if err != nil {
+		t.Fatalf("CreatePromptAttempt(): %v", err)
+	}
+	for i, state := range []controlstore.PromptExecutionState{
+		controlstore.PromptExecutionReserved,
+		controlstore.PromptExecutionSessionStarting,
+		controlstore.PromptExecutionPlanned,
+	} {
+		transition := controlstore.PromptAttemptExecutionTransition{
+			ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
+			NewState: state, OperationID: "legacy-session-" + string(state),
+			OperationDigest: testDigest("legacy-session-" + string(state)), UpdatedAt: testNow.Add(time.Duration(i+1) * time.Minute),
+		}
+		if state == controlstore.PromptExecutionSessionStarting {
+			transition.SessionUID = sessionUID
+			transition.SessionLeaseGeneration = control.LeaseGeneration
+			transition.RuntimeInstanceID = "legacy-runtime-instance"
+		}
+		attempt, err = kubeStore.TransitionPromptAttemptExecution(ctx, transition)
+		if err != nil {
+			t.Fatalf("TransitionPromptAttemptExecution(%s): %v", state, err)
+		}
+	}
+	turnKey := controlstore.SessionTurnKey{
+		SessionUID: sessionUID, LeaseGeneration: control.LeaseGeneration,
+		TaskUID: taskUID, Attempt: 1, PromptID: promptID,
+	}
+	turn, err := kubeStore.CreateSessionTurn(ctx, controlstore.CreateSessionTurnRequest{
+		Turn: controlstore.SessionTurn{
+			Key: turnKey, PromptAttemptID: attempt.ID, RequestDigest: testDigest("legacy-session-turn"), UserPrompt: "cancel safely",
+		},
+		Fence: fence, ExpectedSessionVersion: control.Version,
+	})
+	if err != nil {
+		t.Fatalf("CreateSessionTurn(): %v", err)
+	}
+	attempt, err = kubeStore.TransitionPromptAttemptExecution(ctx, controlstore.PromptAttemptExecutionTransition{
+		ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
+		NewState: controlstore.PromptExecutionCancelled, OperationID: "legacy-session-cancelled",
+		OperationDigest: testDigest("legacy-session-cancelled"), TerminalReason: "Cancelled",
+		UpdatedAt: testNow.Add(4 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("TransitionPromptAttemptExecution(Cancelled): %v", err)
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: taskUID}, task); err != nil {
+		t.Fatalf("reload Task: %v", err)
+	}
+	task.Status.Phase = corev1alpha1.TaskPhaseCancelled
+	task.Status.Execution = &corev1alpha1.TaskExecutionStatus{
+		State: corev1alpha1.TaskExecutionStateCancelled, Outcome: corev1alpha1.TaskExecutionOutcomeCancelled,
+		Reason: "Cancelled", Attempt: 1, PromptID: promptID, RuntimeInstanceID: attempt.RuntimeInstanceID,
+		RuntimeSessionUID: sessionUID, RuntimeSessionGeneration: control.LeaseGeneration,
+		RequestDigest: promptRequestDigest, ControllerEpoch: fence.Epoch,
+	}
+	task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{
+		State: corev1alpha1.TaskDeliveryStateNotRequested, Outcome: corev1alpha1.TaskDeliveryOutcomeNotRequested,
+	}
+	if err := kubeClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("record terminal Task status: %v", err)
+	}
+	legacyPayload, err := json.Marshal(taskterminal.Projection{
+		Namespace: namespace, Task: taskUID, TaskUID: taskUID, Attempt: 1, Phase: corev1alpha1.TaskPhaseCancelled,
+		Message: "controller restart recovered terminal cancellation",
+		Execution: corev1alpha1.TaskExecutionStatus{
+			State: corev1alpha1.TaskExecutionStateCancelled, Outcome: corev1alpha1.TaskExecutionOutcomeCancelled,
+			Attempt: 1, PromptID: promptID,
+		},
+		Delivery: task.Status.Delivery.DeepCopy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectionID := controlstore.CanonicalControlID("outbox", turn.ID, "TaskTerminalStatus")
+	projection := controlstore.OutboxProjection{
+		ID: projectionID, AggregateKind: sessionTurnAggregateKind, AggregateID: turn.ID,
+		ProjectionKind: "TaskTerminalStatus", Payload: legacyPayload, PayloadDigest: testBytesDigest(legacyPayload),
+		AvailableAt: testNow.Add(5 * time.Minute),
+	}
+	if _, err := kubeStore.FinalizeSessionTurn(ctx, controlstore.FinalizeSessionTurnRequest{
+		Key: turnKey, Fence: fence, ExpectedSessionVersion: control.Version, ExpectedTurnVersion: turn.Version,
+		FinalizationDigest: testDigest("legacy-session-finalization"), TerminalKind: controlstore.SessionTurnOutcomeMarker,
+		TerminalContent: `{"kind":"Cancelled","reason":"controller restart recovered terminal cancellation","assistantResultRecorded":false}`,
+		Projection:      projection, FinalizedAt: testNow.Add(5 * time.Minute),
+	}); err != nil {
+		t.Fatalf("FinalizeSessionTurn(): %v", err)
+	}
+	claims, err := kubeStore.ClaimOutboxProjections(ctx, controlstore.ClaimOutboxProjectionsRequest{
+		Fence: fence, WorkerID: "legacy-session-projector", Limit: 1,
+		LeaseDuration: time.Minute, Now: testNow.Add(6 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ClaimOutboxProjections(): %v", err)
+	}
+	if len(claims) != 1 || claims[0].ID != projectionID {
+		t.Fatalf("claimed projections = %#v, want %q", claims, projectionID)
+	}
+	claimed := claims[0]
+	if _, err := kubeStore.CompleteOutboxProjection(ctx, controlstore.CompleteOutboxProjectionRequest{
+		ID: claimed.ID, Fence: fence, ExpectedVersion: claimed.Version, LeaseOwner: claimed.LeaseOwner,
+		OperationID: "deliver-legacy-session-projection", OperationDigest: testDigest("deliver-legacy-session-projection"),
+		NewState: controlstore.OutboxProjectionDelivered, DeliveryDigest: testDigest("legacy-session-projection-delivered"),
+		UpdatedAt: testNow.Add(7 * time.Minute),
+	}); err != nil {
+		t.Fatalf("CompleteOutboxProjection(Delivered): %v", err)
+	}
+	createDeletingAgentTask(t, ctx, kubeClient, namespace, taskUID, taskUID)
+	request := controlstore.ReclaimPromptAttemptsRequest{
+		Namespace: namespace, TaskName: taskUID, TaskUID: taskUID,
+		Mode: controlstore.PromptAttemptReclamationProjected, ContinuitySession: true, FinalContinuitySession: true,
+		FinalPromptAttemptID: attempt.ID, TerminalProjectionID: projectionID, Fence: fence,
+	}
+	if err := kubeStore.PreparePromptAttemptReclamation(ctx, request); err != nil {
+		t.Fatalf("PreparePromptAttemptReclamation(legacy Session): %v", err)
+	}
+	assertPromptAttemptReclamationMarker(t, ctx, kubeClient, taskUID, true)
+	attemptObject := &corev1alpha1.PromptAttempt{}
+	if err := kubeClient.Get(ctx, client.ObjectKey{
+		Namespace: namespace, Name: objectName(promptAttemptNamePrefix, attempt.ID),
+	}, attemptObject); err != nil {
+		t.Fatalf("load prepared PromptAttempt: %v", err)
+	}
+	if err := kubeClient.Delete(ctx, attemptObject); err != nil {
+		t.Fatalf("simulate committed PromptAttempt deletion: %v", err)
+	}
+	if err := kubeStore.PreparePromptAttemptReclamation(ctx, request); err != nil {
+		t.Fatalf("PreparePromptAttemptReclamation(post-delete retry): %v", err)
+	}
+	if deleted, err := kubeStore.ReclaimPromptAttempts(ctx, request); err != nil || deleted != 0 {
+		t.Fatalf("ReclaimPromptAttempts(post-delete retry) = deleted:%d err:%v, want 0,nil", deleted, err)
+	}
+	assertPromptAttemptReclamationMarker(t, ctx, kubeClient, taskUID, false)
+	assertPromptAttemptReclamationCompleted(t, ctx, kubeClient, request, true)
+}
+
 func TestPreparePromptAttemptReclamationRejectsUnprovenEmptyProjectedState(t *testing.T) {
 	ctx := context.Background()
 	kubeStore, kubeClient, fence := newPromptAttemptReclaimStore(t)
