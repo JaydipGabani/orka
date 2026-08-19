@@ -98,9 +98,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          helm lint cmd/build/helmify/static
-          helm lint charts/orka
-          test "$(helm show crds charts/orka | grep -c '^kind: CustomResourceDefinition$')" -eq 17
+          make verify-release-manifest NEWVERSION="${NEWVERSION}"
           git diff --check
 
       - name: Create release pull request

@@ -738,37 +738,18 @@ func buildGitHubLabelTask(namespace, agentName, action, replayKey, delivery, eve
 				Name: agentName,
 			},
 			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				MaxTurns:  githubMaxTurns(),
-				Workspace: workspace,
+				MaxTurns: githubMaxTurns(),
 			},
-			Timeout: githubTimeout(),
-			Env: []corev1.EnvVar{
-				{Name: "ORKA_GITHUB_EVENT", Value: event},
-				{Name: "ORKA_GITHUB_DELIVERY", Value: delivery},
-				{Name: "ORKA_GITHUB_LABEL", Value: payload.Label.Name},
-				{Name: "ORKA_GITHUB_ACTION", Value: action},
-				{Name: "ORKA_GITHUB_REPOSITORY", Value: payload.Repository.FullName},
-				{Name: "ORKA_GITHUB_TARGET_URL", Value: target.HTMLURL},
-			},
+			Workspace: workspace,
+			Timeout:   githubTimeout(),
 		},
 	}
-	if action == githubActionReview && workspace != nil && workspace.GitSecretRef != nil {
+	if action == githubActionReview && workspace != nil && workspace.ReadCredentialRef != nil {
 		task.Annotations[labels.AnnotationWorkspaceInitContainer] = queryTrue
 	}
 	if target.Number > 0 {
 		task.Labels[labels.LabelGitHubNumber] = labels.SelectorValue(strconv.Itoa(target.Number))
 		task.Annotations[labels.AnnotationGitHubNumber] = strconv.Itoa(target.Number)
-	}
-	if target.IsPR {
-		if baseRepo := repoURL(target.BaseRepo); baseRepo != "" {
-			task.Spec.Env = append(task.Spec.Env, corev1.EnvVar{Name: workerenv.PRBaseRepo, Value: baseRepo})
-		}
-		if target.BaseSHA != "" {
-			task.Spec.Env = append(task.Spec.Env, corev1.EnvVar{Name: workerenv.PRBaseSHA, Value: target.BaseSHA})
-		}
-	}
-	if action == githubActionUpdateBranch {
-		task.Spec.Env = append(task.Spec.Env, corev1.EnvVar{Name: workerenv.AllowEmptyPushBranch, Value: "true"})
 	}
 	return task
 }
@@ -807,6 +788,7 @@ func githubWorkspace(action string, target githubLabelTarget, replayKey string) 
 		repo = target.HeadRepo
 	}
 	ws := &corev1alpha1.WorkspaceConfig{
+		Intent:  corev1alpha1.WorkspaceIntentRead,
 		GitRepo: repoURL(repo),
 	}
 
@@ -838,9 +820,19 @@ func githubWorkspace(action string, target githubLabelTarget, replayKey string) 
 	}
 
 	if gitSecret != "" {
-		ws.GitSecretRef = &corev1.LocalObjectReference{Name: gitSecret}
+		ws.ReadCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: gitSecret}
 	}
-	if target.IsPR && target.BaseBranch != "" {
+	if ws.PushBranch != "" {
+		ws.Intent = corev1alpha1.WorkspaceIntentWrite
+		ws.PublicationGitRepo = ws.GitRepo
+		if gitSecret != "" {
+			ws.PublicationReadCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: gitSecret}
+			ws.PublicationCredentialRef = &corev1alpha1.WorkspaceCredentialReference{Name: gitSecret}
+		}
+	}
+	// prBaseBranch is a publication field: the ACP workspace preflight rejects it
+	// on non-write intents, and read flows carry base-branch context in the prompt.
+	if target.IsPR && target.BaseBranch != "" && ws.Intent == corev1alpha1.WorkspaceIntentWrite {
 		ws.PRBaseBranch = target.BaseBranch
 	}
 	return ws

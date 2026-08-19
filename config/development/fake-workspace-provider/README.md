@@ -18,14 +18,18 @@ Run `make kustomize` first if `bin/kustomize` is not present. The relaxed local
 load restriction lets this package reuse the generated CRDs and RBAC in their
 canonical directories instead of maintaining copies.
 
-For Helm, also set both required controller gates:
+The production ACP Helm chart does not expose these development-only gates.
+When running the controller directly or from a dedicated development overlay,
+enable both required controller flags:
 
-```bash
-helm upgrade --install orka <chart> \
-  --namespace orka-system \
-  --set controller.workspaceProvider.apiEnabled=true \
-  --set controller.workspaceProvider.fakeProviderEnabled=true
+```text
+--enable-workspace-provider-api=true
+--enable-fake-workspace-provider=true
 ```
+
+The equivalent environment variables are
+`ORKA_ENABLE_WORKSPACE_PROVIDER_API=true` and
+`ORKA_ENABLE_FAKE_WORKSPACE_PROVIDER=true`.
 
 The package is not a standalone Orka installation. Removing either fake CRD
 also deletes all custom resources stored under that kind.

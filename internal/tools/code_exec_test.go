@@ -715,6 +715,26 @@ func TestCodeExecTool_Execute_EnvironmentScrubbed(t *testing.T) {
 	}
 }
 
+func TestScrubCodeExecEnvDropsDeveloperOverridesAndUsesStableToolPath(t *testing.T) {
+	env := scrubCodeExecEnv([]string{
+		"DEVELOPER_DIR=/Applications/Missing-Xcode.app/Contents/Developer",
+		"SystemRoot=C:\\Windows",
+		"ORKA_SECRET_TOKEN=secret",
+	})
+	joined := strings.Join(env, "\n")
+	if !strings.Contains(joined, "PATH="+safeCodeExecPath) {
+		t.Fatalf("scrubbed environment is missing the stable tool path: %q", env)
+	}
+	if !strings.Contains(joined, "SystemRoot=C:\\Windows") {
+		t.Fatalf("scrubbed environment dropped required Windows system state: %q", env)
+	}
+	for _, forbidden := range []string{"DEVELOPER_DIR=", "ORKA_SECRET_TOKEN="} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("scrubbed environment retained %q: %q", forbidden, env)
+		}
+	}
+}
+
 func TestCodeExecTool_Execute_OutputCapsStdoutAndStderr(t *testing.T) {
 	tmpDir := t.TempDir()
 	tool := newInProcessCodeExecTestTool(tmpDir, 30*time.Second, map[string]bool{codeLanguageBash: true})

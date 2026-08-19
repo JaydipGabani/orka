@@ -104,6 +104,97 @@ func TestParseGitHubRepositoryURL(t *testing.T) {
 	}
 }
 
+func TestCanonicalRepositoryCloneURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		repoURL string
+		want    string
+	}{
+		{
+			name:    "SSH GitHub root converted to HTTPS",
+			repoURL: "git@github.com:example/project.git",
+			want:    "https://github.com/example/project",
+		},
+		{
+			name:    "SSH GitHub root without git suffix",
+			repoURL: "git@github.com:example/project",
+			want:    "https://github.com/example/project",
+		},
+		{
+			name:    "HTTPS GitHub URL normalized",
+			repoURL: " https://github.com/example/project.git ",
+			want:    "https://github.com/example/project",
+		},
+		{
+			name:    "canonical HTTPS GitHub URL unchanged",
+			repoURL: "https://github.com/example/project",
+			want:    "https://github.com/example/project",
+		},
+		{
+			name:    "non-GitHub HTTPS URL passes through",
+			repoURL: "https://git.example.com/example/project.git",
+			want:    "https://git.example.com/example/project.git",
+		},
+		{
+			name:    "credentialed URL passes through for downstream rejection",
+			repoURL: "https://token@github.com/example/project",
+			want:    "https://token@github.com/example/project",
+		},
+		{
+			name:    "empty URL stays empty",
+			repoURL: "  ",
+			want:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CanonicalRepositoryCloneURL(tt.repoURL); got != tt.want {
+				t.Fatalf("CanonicalRepositoryCloneURL(%q) = %q, want %q", tt.repoURL, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalWorkspaceRepositoryCloneURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		repoURL string
+		want    string
+		wantErr string
+	}{
+		{name: "empty URL is allowed", repoURL: "  ", want: ""},
+		{name: "GitHub SSH root canonicalized", repoURL: "git@github.com:example/project.git", want: "https://github.com/example/project"},
+		{name: "non-GitHub HTTPS URL accepted", repoURL: "https://git.example.com/example/project.git", want: "https://git.example.com/example/project.git"},
+		{name: "plain HTTP rejected", repoURL: "http://github.com/example/project", wantErr: "credential-free HTTPS URL"},
+		{name: "credentialed URL rejected", repoURL: "https://user:token@git.example.com/example/project", wantErr: "credential-free HTTPS URL"},
+		{name: "non-GitHub SSH rejected", repoURL: "git@git.example.com:example/project.git", wantErr: "credential-free HTTPS URL"},
+		{name: "query rejected", repoURL: "https://git.example.com/example/project?x=1", wantErr: "credential-free HTTPS URL"},
+		{name: "non-default port rejected", repoURL: "https://git.example.com:8443/example/project", wantErr: "default HTTPS port"},
+		{name: "escaped path separator rejected", repoURL: "https://git.example.com/example%2Fproject", wantErr: "non-canonical escaped path"},
+		{name: "trailing slash rejected", repoURL: "https://git.example.com/example/project/", wantErr: "path is invalid"},
+		{name: "empty path rejected", repoURL: "https://git.example.com/", wantErr: "path is invalid"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := CanonicalWorkspaceRepositoryCloneURL(tt.repoURL)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("CanonicalWorkspaceRepositoryCloneURL(%q) error = %v, want %q", tt.repoURL, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CanonicalWorkspaceRepositoryCloneURL(%q) error = %v", tt.repoURL, err)
+			}
+			if got != tt.want {
+				t.Fatalf("CanonicalWorkspaceRepositoryCloneURL(%q) = %q, want %q", tt.repoURL, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestEffectiveWorkspaceBranch(t *testing.T) {
 	tests := []struct {
 		name string
@@ -376,6 +467,7 @@ func TestGeneratedSecurityTaskNamesStayLabelSafe(t *testing.T) {
 		ScanStageTaskName(scanName, "initial", "threat-model", ""),
 		ScanStageTaskName(scanName, "initial", "discovery", "ci-cd-supply-chain"),
 		ScanStageTaskName(scanName, "initial", "discovery", "ci-cd-supply-chain-4"),
+		ScanStageRetryTaskName(scanName, "scan_1234567890abcdef", StageReview, "ci-cd-supply-chain", 1),
 		PatchTaskName(scanName, "fnd_1234567890abcdef"),
 	}
 
@@ -386,6 +478,22 @@ func TestGeneratedSecurityTaskNamesStayLabelSafe(t *testing.T) {
 		if strings.Contains(name, "--") {
 			t.Fatalf("generated task name %q should not contain duplicate separators", name)
 		}
+	}
+}
+
+func TestScanStageRetryTaskNameIsDeterministicAndAttemptBound(t *testing.T) {
+	first := ScanStageRetryTaskName("demo-security-repository", "scan_1234567890abcdef", StageReview, "slice_api", 1)
+	repeated := ScanStageRetryTaskName("demo-security-repository", "scan_1234567890abcdef", StageReview, "slice_api", 1)
+	secondAttempt := ScanStageRetryTaskName("demo-security-repository", "scan_1234567890abcdef", StageReview, "slice_api", 2)
+
+	if first != repeated {
+		t.Fatalf("ScanStageRetryTaskName() = %q then %q, want deterministic", first, repeated)
+	}
+	if first == secondAttempt {
+		t.Fatalf("ScanStageRetryTaskName() = %q for attempts 1 and 2, want attempt-bound names", first)
+	}
+	if len(first) > maxGeneratedTaskName || len(secondAttempt) > maxGeneratedTaskName {
+		t.Fatalf("retry task names lengths = %d/%d, want <= %d", len(first), len(secondAttempt), maxGeneratedTaskName)
 	}
 }
 

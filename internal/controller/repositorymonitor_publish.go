@@ -171,9 +171,9 @@ func (r *RepositoryMonitorReconciler) publishRepositoryMonitorReview(ctx context
 		return skip(repositoryMonitorPublishSkipHeadSHAChanged, fmt.Sprintf("Pull request #%d review publishing skipped: reviewed head does not match task binding", item.Number), map[string]any{"recordHeadSHA": record.HeadSHA, "taskHeadSHA": task.Annotations[labels.AnnotationMonitorHeadSHA]})
 	}
 
-	token, err := r.repositoryMonitorGitHubToken(ctx, monitor)
+	token, err := r.repositoryMonitorForgeToken(ctx, monitor)
 	if err != nil || strings.TrimSpace(token) == "" {
-		message := "spec.gitSecretRef is required for GitHub publishing and must contain token, password, or GITHUB_TOKEN"
+		message := "spec.forgeCredentialRef is required for GitHub publishing and must contain token, password, or GITHUB_TOKEN"
 		if err != nil {
 			message = err.Error()
 		}
