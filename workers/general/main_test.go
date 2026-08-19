@@ -921,3 +921,22 @@ func TestMarshalMapperArtifactWithinBudgetKeepsSmallInventories(t *testing.T) {
 		t.Fatalf("small inventory was truncated: %v", decoded.DiscoveredFiles)
 	}
 }
+
+func TestMarshalMapperArtifactWithinBudgetFailsClosedForPinnedV2(t *testing.T) {
+	artifact := &security.ReviewSlicesArtifact{
+		SchemaVersion: security.SchemaVersionReviewSlicesV2,
+	}
+	longPath := strings.Repeat("b", 4000)
+	for i := range 3000 {
+		artifact.DiscoveredFiles = append(artifact.DiscoveredFiles, security.MapperFileInventoryEntry{
+			Path: fmt.Sprintf("%s/%d.go", longPath, i), Disposition: "reviewable", Reason: "source",
+		})
+	}
+	if _, err := marshalMapperArtifactWithinBudget(artifact); err == nil ||
+		!strings.Contains(err.Error(), "cannot be truncated") {
+		t.Fatalf("marshalMapperArtifactWithinBudget(v2 oversized) error = %v, want fail-closed budget error", err)
+	}
+	if len(artifact.DiscoveredFiles) == 0 {
+		t.Fatal("v2 inventories must not be truncated")
+	}
+}

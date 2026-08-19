@@ -532,10 +532,16 @@ func (h *Handlers) createSecurityScanRun(
 				scan, mode, baseCommit, headCommit, activeInput.Content, policy.PromptPolicy(),
 			)
 		}
+		if recoveryErr := h.terminalizeScanRunIfOwnerGone(ctx, scan, activeRun); recoveryErr != nil {
+			return nil, recoveryErr
+		}
 		if recoveryErr := h.ensureSecurityScanRunTask(ctx, scan, activeRun, recoveredTask, true); recoveryErr != nil {
 			return nil, recoveryErr
 		}
 		return activeRun, nil
+	}
+	if err := h.terminalizeScanRunIfOwnerGone(ctx, scan, run); err != nil {
+		return nil, err
 	}
 	if err := h.ensureSecurityScanRunTask(ctx, scan, run, task, false); err != nil {
 		return nil, err
@@ -710,6 +716,33 @@ func (h *Handlers) recoveredInitialSecurityScanTask(
 		security.AnnotationSecurityScanRunID: run.ID,
 	})
 	return task, nil
+}
+
+// terminalizeScanRunIfOwnerGone releases a reservation created concurrently
+// with RepositoryScan deletion. The controller's finalizer release lists runs
+// before removing the finalizer, so a reservation inserted after that listing
+// must be terminalized here once the owner is observed deleting or gone —
+// otherwise the active-repository index would outlive the object forever.
+func (h *Handlers) terminalizeScanRunIfOwnerGone(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) error {
+	current := &corev1alpha1.RepositoryScan{}
+	err := h.client.Get(ctx, types.NamespacedName{Namespace: scan.Namespace, Name: scan.Name}, current)
+	ownerGone := apierrors.IsNotFound(err) ||
+		(err == nil && (!current.DeletionTimestamp.IsZero() || current.UID != scan.UID))
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to verify repository scan owner: %v", err))
+	}
+	if !ownerGone {
+		return nil
+	}
+	now := time.Now().UTC()
+	run.Phase = "failed"
+	run.CompletedAt = &now
+	run.ErrorMessage = "repository scan was deleted before the run could start"
+	run.Summary = run.ErrorMessage
+	if updateErr := h.securityStore.UpdateScanRun(ctx, run); updateErr != nil && !errors.Is(updateErr, store.ErrNotFound) {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to release scan reservation for deleted repository scan: %v", updateErr))
+	}
+	return fiber.NewError(fiber.StatusConflict, "repository scan is being deleted")
 }
 
 // ensureRepositoryScanRunFinalizer guarantees the run-reservation finalizer is

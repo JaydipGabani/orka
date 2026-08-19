@@ -327,9 +327,12 @@ func runSecurityMapper(ctx context.Context) error {
 // be silently skipped and the controller could never ingest the run.
 const maxMapperArtifactBytes = 9 << 20
 
-// marshalMapperArtifactWithinBudget serializes the mapper artifact and, when
-// the full inventories would exceed the upload budget, drops the detailed path
-// lists (keeping the summary counts) with an explicit coverage reason code.
+// marshalMapperArtifactWithinBudget serializes the mapper artifact and keeps
+// it under the upload budget. Schema-v1 artifacts degrade by dropping the
+// detailed inventory lists (summary counts remain) with an explicit coverage
+// reason code. Schema-v2 pinned-target inventories are accountable by design
+// and cannot be truncated without failing controller validation, so an
+// oversized v2 artifact fails loudly instead of being silently skipped.
 func marshalMapperArtifactWithinBudget(artifact *security.ReviewSlicesArtifact) ([]byte, error) {
 	data, err := json.MarshalIndent(artifact, "", "  ")
 	if err != nil {
@@ -337,6 +340,13 @@ func marshalMapperArtifactWithinBudget(artifact *security.ReviewSlicesArtifact) 
 	}
 	if len(data) <= maxMapperArtifactBytes {
 		return data, nil
+	}
+	if artifact.SchemaVersion == security.SchemaVersionReviewSlicesV2 {
+		return nil, fmt.Errorf(
+			"pinned-target mapper artifact is %d bytes, over the %d byte upload budget; "+
+				"the accountable inventory cannot be truncated",
+			len(data), maxMapperArtifactBytes,
+		)
 	}
 	artifact.OmittedFiles = nil
 	artifact.DiscoveredFiles = nil

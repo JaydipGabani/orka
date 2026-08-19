@@ -1049,15 +1049,18 @@ func (r *RepositoryScanReconciler) retireStaleScanRunReservation(
 	scan *corev1alpha1.RepositoryScan,
 	run *store.ScanRun,
 ) (bool, error) {
-	if !activeScanRunPhase(run.Phase) || !scanRunExplicitlyMismatchesRepositoryScan(run, scan) {
+	if !scanRunExplicitlyMismatchesRepositoryScan(run, scan) {
 		return false, nil
 	}
-	if err := r.markScanRunTerminalError(ctx, scan, run,
-		errors.New("scan run does not match the current repository scan identity; retiring the stale reservation")); err != nil {
-		return false, err
+	if activeScanRunPhase(run.Phase) {
+		if err := r.markScanRunTerminalError(ctx, scan, run,
+			errors.New("scan run does not match the current repository scan identity; retiring the stale reservation")); err != nil {
+			return false, err
+		}
 	}
 	// Status projection intentionally skips mismatched runs, so the stale
-	// binding must be cleared explicitly or the CR would stay Scanning and no
+	// binding must be cleared explicitly — for terminal runs as well as active
+	// ones — or the CR would keep pointing at the old-generation run and no
 	// current-generation run could ever start.
 	if err := r.updateStatusWithRetry(ctx, scan, func(s *corev1alpha1.RepositoryScan) {
 		if s.Status.LastScanID != run.ID {
@@ -1070,7 +1073,7 @@ func (r *RepositoryScanReconciler) retireStaleScanRunReservation(
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
 			Reason:             "Pending",
-			Message:            "Previous scan run was retired after the repository scan changed; waiting for a new scan run",
+			Message:            "Previous scan run no longer matches the repository scan; waiting for a new scan run",
 			LastTransitionTime: metav1.Now(),
 			ObservedGeneration: s.Generation,
 		})
@@ -1513,11 +1516,11 @@ func (r *RepositoryScanReconciler) progressLatestScanRun(ctx context.Context, sc
 	if err != nil {
 		return false, err
 	}
-	if run.Phase == scanRunPhaseFailed {
-		return false, nil
-	}
 	if retired, err := r.retireStaleScanRunReservation(ctx, scan, run); err != nil || retired {
 		return retired, err
+	}
+	if run.Phase == scanRunPhaseFailed {
+		return false, nil
 	}
 
 	if scanRunUsesPinnedTarget(run) {
