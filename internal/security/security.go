@@ -31,6 +31,11 @@ const (
 	AnnotationSecurityFindingID    = "orka.ai/security-finding-id"
 	AnnotationSecurityOccurrenceID = "orka.ai/security-occurrence-id"
 
+	// RepositoryScanRunFinalizer releases durable scan-run reservations before
+	// a RepositoryScan disappears. It must be present before any run is
+	// reserved so a delete can never leak the repository-wide reservation.
+	RepositoryScanRunFinalizer = "orka.ai/repositoryscan-run-reservation"
+
 	schemeHTTPS      = "https"
 	evidenceKindFile = "file"
 	// ArtifactWorkspaceDir is the repo-root symlink the worker exposes for

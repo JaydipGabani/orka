@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/orka-agents/orka/internal/security"
+	storepkg "github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/workerenv"
 	"github.com/orka-agents/orka/workers/common"
 )
@@ -860,5 +861,63 @@ func TestBuildSecurityMapperArtifactLegacyModeSkipsPinnedReceipt(t *testing.T) {
 	}
 	if artifact.SchemaVersion != security.SchemaVersionReviewSlices || artifact.TargetReceipt != nil {
 		t.Fatalf("legacy mapper artifact = %#v", artifact)
+	}
+}
+
+func TestMarshalMapperArtifactWithinBudgetTruncatesInventories(t *testing.T) {
+	artifact := &security.ReviewSlicesArtifact{
+		SchemaVersion: security.SchemaVersionReviewSlices,
+		Slices:        []storepkg.ReviewSlice{{ID: "slice_api"}},
+	}
+	longPath := strings.Repeat("a", 4000)
+	for i := range 3000 {
+		artifact.DiscoveredFiles = append(artifact.DiscoveredFiles, security.MapperFileInventoryEntry{
+			Path: fmt.Sprintf("%s/%d.go", longPath, i), Disposition: "discovered", Reason: "source",
+		})
+	}
+	data, err := marshalMapperArtifactWithinBudget(artifact)
+	if err != nil {
+		t.Fatalf("marshalMapperArtifactWithinBudget() error = %v", err)
+	}
+	if len(data) > maxMapperArtifactBytes {
+		t.Fatalf("len(data) = %d, want <= %d", len(data), maxMapperArtifactBytes)
+	}
+	if len(artifact.DiscoveredFiles) != 0 || len(artifact.ReviewableFiles) != 0 || len(artifact.OmittedFiles) != 0 {
+		t.Fatalf("inventories were not truncated: %d/%d/%d",
+			len(artifact.DiscoveredFiles), len(artifact.ReviewableFiles), len(artifact.OmittedFiles))
+	}
+	truncated := false
+	for _, code := range artifact.CoverageReasonCodes {
+		if code == "inventory_truncated" {
+			truncated = true
+		}
+	}
+	if !truncated {
+		t.Fatalf("coverage reason codes = %v, want inventory_truncated", artifact.CoverageReasonCodes)
+	}
+	var decoded security.ReviewSlicesArtifact
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(decoded.Slices) != 1 {
+		t.Fatalf("len(slices) = %d, want slices preserved", len(decoded.Slices))
+	}
+}
+
+func TestMarshalMapperArtifactWithinBudgetKeepsSmallInventories(t *testing.T) {
+	artifact := &security.ReviewSlicesArtifact{
+		SchemaVersion:   security.SchemaVersionReviewSlices,
+		DiscoveredFiles: []security.MapperFileInventoryEntry{{Path: "main.go", Disposition: "discovered", Reason: "source"}},
+	}
+	data, err := marshalMapperArtifactWithinBudget(artifact)
+	if err != nil {
+		t.Fatalf("marshalMapperArtifactWithinBudget() error = %v", err)
+	}
+	var decoded security.ReviewSlicesArtifact
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(decoded.DiscoveredFiles) != 1 {
+		t.Fatalf("small inventory was truncated: %v", decoded.DiscoveredFiles)
 	}
 }

@@ -109,7 +109,7 @@ const (
 	// repositoryScanRunFinalizer releases durable scan-run reservations before
 	// the RepositoryScan object disappears, so the repository-wide active-run
 	// index cannot stay occupied by a deleted owner.
-	repositoryScanRunFinalizer = "orka.ai/repositoryscan-run-reservation"
+	repositoryScanRunFinalizer = security.RepositoryScanRunFinalizer
 )
 
 var errScannerPolicyDigestChanged = errors.New("scanner policy digest changed during scan run")

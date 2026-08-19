@@ -394,6 +394,9 @@ func (h *Handlers) createSecurityScanRun(
 		return nil, err
 	}
 
+	if err := h.ensureRepositoryScanRunFinalizer(ctx, scan); err != nil {
+		return nil, err
+	}
 	runUID, err := security.NewRunUID()
 	if err != nil {
 		return nil, fiber.NewError(fiber.StatusInternalServerError, err.Error())
@@ -413,7 +416,7 @@ func (h *Handlers) createSecurityScanRun(
 		RepositoryScanGeneration: scan.Generation,
 		TaskName:                 taskName,
 		Mode:                     mode,
-		Phase:                    "pending",
+		Phase:                    securityScanRunPhasePending,
 		BaseCommit:               baseCommit,
 		HeadCommit:               headCommit,
 		ScannerPolicyVersion:     security.ScannerPolicyVersion,
@@ -707,6 +710,24 @@ func (h *Handlers) recoveredInitialSecurityScanTask(
 		security.AnnotationSecurityScanRunID: run.ID,
 	})
 	return task, nil
+}
+
+// ensureRepositoryScanRunFinalizer guarantees the run-reservation finalizer is
+// persisted before any durable scan run is reserved, closing the window where
+// deleting a freshly created RepositoryScan could leak its reservation.
+func (h *Handlers) ensureRepositoryScanRunFinalizer(ctx context.Context, scan *corev1alpha1.RepositoryScan) error {
+	if scan == nil || !scan.DeletionTimestamp.IsZero() {
+		return fiber.NewError(fiber.StatusConflict, "repository scan is being deleted")
+	}
+	if slices.Contains(scan.Finalizers, security.RepositoryScanRunFinalizer) {
+		return nil
+	}
+	patch := client.MergeFrom(scan.DeepCopy())
+	scan.Finalizers = append(scan.Finalizers, security.RepositoryScanRunFinalizer)
+	if err := h.client.Patch(ctx, scan, patch); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to install repository scan finalizer: %v", err))
+	}
+	return nil
 }
 
 func (h *Handlers) ensureSecurityScanRunTask(
@@ -1081,7 +1102,7 @@ func (h *Handlers) createSecurityValidationTask(ctx context.Context, ui *UserInf
 			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to revalidate source scan bundle: %v", bundleErr))
 		}
 	}
-	finding.ValidationStatus = "pending"
+	finding.ValidationStatus = securityScanRunPhasePending
 	if err := h.securityStore.UpsertFinding(ctx, finding); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to update finding: %v", err))
 	}
@@ -1309,10 +1330,9 @@ func (h *Handlers) createSecurityPatchTask(ctx context.Context, ui *UserInfo, sc
 	if err := h.authorizeAndStampPinnedSecurityTask(ctx, ui, scan, task, "createSecurityPatchTask"); err != nil {
 		return nil, err
 	}
-	if err := h.client.Create(ctx, task); err != nil {
-		return nil, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create patch task: %v", err))
-	}
-
+	// Record the durable proposal intent before creating the deterministic
+	// Task. A retry after a partial failure then recovers idempotently instead
+	// of leaving an orphan Task that blocks every later attempt.
 	proposal := &store.PatchProposal{
 		ID:              proposalID,
 		Namespace:       scan.Namespace,
@@ -1323,14 +1343,56 @@ func (h *Handlers) createSecurityPatchTask(ctx context.Context, ui *UserInfo, sc
 		SourceHeadSHA:   sourceHead,
 		TaskName:        taskName,
 		Branch:          branch,
-		Status:          "pending",
+		Status:          securityScanRunPhasePending,
 		CreatedAt:       time.Now(),
 		UpdatedAt:       time.Now(),
 	}
 	if err := h.securityStore.CreatePatchProposal(ctx, proposal); err != nil {
-		return nil, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create patch proposal: %v", err))
+		existing, matchErr := h.matchingPendingPatchProposal(ctx, scan.Namespace, finding.ID, proposal)
+		if matchErr != nil {
+			return nil, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create patch proposal: %v", err))
+		}
+		proposal = existing
+	}
+	if err := h.client.Create(ctx, task); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return nil, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create patch task: %v", err))
+		}
+		existing := &corev1alpha1.Task{}
+		if getErr := h.client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, existing); getErr != nil {
+			return nil, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to verify existing patch task: %v", getErr))
+		}
+		if !securityTaskMatchesExpected(existing, task, scan) {
+			return nil, fiber.NewError(fiber.StatusConflict, "existing patch task does not match the deterministic patch binding")
+		}
 	}
 	return proposal, nil
+}
+
+// matchingPendingPatchProposal recovers the deterministic proposal row created
+// by a previous partially-failed request for the same run and occurrence.
+func (h *Handlers) matchingPendingPatchProposal(
+	ctx context.Context,
+	namespace, findingID string,
+	desired *store.PatchProposal,
+) (*store.PatchProposal, error) {
+	proposals, err := h.securityStore.ListPatchProposals(ctx, namespace, findingID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range proposals {
+		existing := &proposals[i]
+		if existing.ID != desired.ID {
+			continue
+		}
+		if existing.Status == securityScanRunPhasePending && existing.TaskName == desired.TaskName && existing.Branch == desired.Branch &&
+			existing.OccurrenceID == desired.OccurrenceID && existing.SourceScanRunID == desired.SourceScanRunID &&
+			existing.SourceHeadSHA == desired.SourceHeadSHA {
+			return existing, nil
+		}
+		return nil, fmt.Errorf("patch proposal %s already exists with a different binding", desired.ID)
+	}
+	return nil, fmt.Errorf("patch proposal %s could not be created or recovered", desired.ID)
 }
 
 type repositoryScanListResponse struct {
@@ -1480,6 +1542,11 @@ func (h *Handlers) CreateRepositoryScan(c fiber.Ctx) error {
 	scan := &corev1alpha1.RepositoryScan{
 		ObjectMeta: objectMetaFromRequest(name, namespace, req.Metadata),
 		Spec:       req.Spec,
+	}
+	// Install the run-reservation finalizer at creation so a scan deleted
+	// before its first reconciliation can never leak an active reservation.
+	if !slices.Contains(scan.Finalizers, security.RepositoryScanRunFinalizer) {
+		scan.Finalizers = append(scan.Finalizers, security.RepositoryScanRunFinalizer)
 	}
 	if err := h.authorizeContextTokenSecurityScanTask(c, "createRepositoryScan", scan, scan.Spec.AnalysisAgentRef); err != nil {
 		return err

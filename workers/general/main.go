@@ -310,7 +310,7 @@ func runSecurityMapper(ctx context.Context) error {
 			return err
 		}
 	}
-	data, err := json.MarshalIndent(artifact, "", "  ")
+	data, err := marshalMapperArtifactWithinBudget(artifact)
 	if err != nil {
 		return err
 	}
@@ -320,6 +320,39 @@ func runSecurityMapper(ctx context.Context) error {
 	output := fmt.Sprintf("security mapper wrote %d review slices\n", len(artifact.Slices))
 	fmt.Print(output)
 	return submitResult(workDir, output)
+}
+
+// maxMapperArtifactBytes keeps the authoritative slices artifact safely under
+// the worker artifact uploader's 10 MiB per-file cap; an oversized file would
+// be silently skipped and the controller could never ingest the run.
+const maxMapperArtifactBytes = 9 << 20
+
+// marshalMapperArtifactWithinBudget serializes the mapper artifact and, when
+// the full inventories would exceed the upload budget, drops the detailed path
+// lists (keeping the summary counts) with an explicit coverage reason code.
+func marshalMapperArtifactWithinBudget(artifact *security.ReviewSlicesArtifact) ([]byte, error) {
+	data, err := json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if len(data) <= maxMapperArtifactBytes {
+		return data, nil
+	}
+	artifact.OmittedFiles = nil
+	artifact.DiscoveredFiles = nil
+	artifact.ReviewableFiles = nil
+	artifact.CoverageReasonCodes = append(artifact.CoverageReasonCodes, "inventory_truncated")
+	data, err = json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxMapperArtifactBytes {
+		return nil, fmt.Errorf(
+			"security mapper artifact is %d bytes even without inventories; refusing to exceed the %d byte upload budget",
+			len(data), maxMapperArtifactBytes,
+		)
+	}
+	return data, nil
 }
 
 func buildSecurityMapperArtifact(
