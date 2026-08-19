@@ -5429,6 +5429,13 @@ func TestProgressLatestScanRunRetiresStaleGenerationReservation(t *testing.T) {
 	if len(tasks.Items) != 0 {
 		t.Fatalf("len(tasks) = %d, want no pipeline work for a stale-generation run", len(tasks.Items))
 	}
+	refreshed := &corev1alpha1.RepositoryScan{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: defaultNS, Name: currentScan.Name}, refreshed); err != nil {
+		t.Fatalf("Get(RepositoryScan) error = %v", err)
+	}
+	if refreshed.Status.LastScanID != "" || refreshed.Status.LastScanTaskName != "" || refreshed.Status.Phase != repositoryScanPhasePending {
+		t.Fatalf("status after retirement = %q/%q/%q, want cleared stale binding", refreshed.Status.Phase, refreshed.Status.LastScanID, refreshed.Status.LastScanTaskName)
+	}
 }
 
 func TestRepositoryScanDeletionReleasesActiveRunReservation(t *testing.T) {

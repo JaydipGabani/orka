@@ -1056,6 +1056,27 @@ func (r *RepositoryScanReconciler) retireStaleScanRunReservation(
 		errors.New("scan run does not match the current repository scan identity; retiring the stale reservation")); err != nil {
 		return false, err
 	}
+	// Status projection intentionally skips mismatched runs, so the stale
+	// binding must be cleared explicitly or the CR would stay Scanning and no
+	// current-generation run could ever start.
+	if err := r.updateStatusWithRetry(ctx, scan, func(s *corev1alpha1.RepositoryScan) {
+		if s.Status.LastScanID != run.ID {
+			return
+		}
+		s.Status.LastScanID = ""
+		s.Status.LastScanTaskName = ""
+		s.Status.Phase = repositoryScanPhasePending
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             "Pending",
+			Message:            "Previous scan run was retired after the repository scan changed; waiting for a new scan run",
+			LastTransitionTime: metav1.Now(),
+			ObservedGeneration: s.Generation,
+		})
+	}); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
@@ -2199,19 +2220,17 @@ func (r *RepositoryScanReconciler) appendStageReceiptCreated(
 			JobName:  task.Status.JobName,
 		},
 	}
-	if task.Annotations != nil {
-		runtimeSessionID := strings.TrimSpace(securityTaskRuntimeSessionID(task))
-		turnID := strings.TrimSpace(securityTaskTurnID(task))
-		correlationID := strings.TrimSpace(task.Annotations["orka.ai/harness-wrapper-correlation-id"])
-		if runtimeSessionID != "" && turnID != "" && correlationID != "" {
-			provenance = store.ExecutionProvenance{
-				Kind: store.ExecutionProvenanceHarness,
-				Harness: &store.HarnessExecutionProvenance{
-					RuntimeSessionID: runtimeSessionID,
-					TurnID:           turnID,
-					CorrelationID:    correlationID,
-				},
-			}
+	runtimeSessionID := strings.TrimSpace(securityTaskRuntimeSessionID(task))
+	turnID := strings.TrimSpace(securityTaskTurnID(task))
+	correlationID := strings.TrimSpace(securityTaskExecutionCorrelationID(task))
+	if runtimeSessionID != "" && turnID != "" && correlationID != "" {
+		provenance = store.ExecutionProvenance{
+			Kind: store.ExecutionProvenanceHarness,
+			Harness: &store.HarnessExecutionProvenance{
+				RuntimeSessionID: runtimeSessionID,
+				TurnID:           turnID,
+				CorrelationID:    correlationID,
+			},
 		}
 	}
 	sourceGeneration := int64(0)

@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"fmt"
+
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 )
 
@@ -38,4 +40,19 @@ func securityTaskTurnID(task *corev1alpha1.Task) string {
 		return ""
 	}
 	return task.Status.Execution.PromptID
+}
+
+// securityTaskExecutionCorrelationID derives a deterministic correlation value
+// from the controller-owned ACP attempt identity so stage receipts keep a
+// harness execution identity now that the legacy wrapper correlation
+// annotation no longer exists.
+func securityTaskExecutionCorrelationID(task *corev1alpha1.Task) string {
+	if task == nil || task.Status.Execution == nil {
+		return ""
+	}
+	execution := task.Status.Execution
+	if execution.RuntimeSessionUID == "" || execution.PromptID == "" || execution.Attempt <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("acp:%s:%d:%s", execution.RuntimeSessionUID, execution.Attempt, execution.PromptID)
 }

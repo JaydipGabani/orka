@@ -106,7 +106,9 @@ func securityArtifactNameAllowedForStage(filename, stage string) bool {
 	case filename == security.ArtifactFindingsV2:
 		return stage == security.StageReview
 	case strings.HasPrefix(filename, "security-review-context-") && strings.HasSuffix(filename, ".json"):
-		return stage == security.StageReview
+		// The mapper generates every trusted review-context manifest; review
+		// tasks may still re-upload the copy echoed into their workspace.
+		return stage == security.StageMapper || stage == security.StageReview
 	case filename == security.ArtifactValidation || filename == security.ArtifactValidationText:
 		return stage == security.StageValidation
 	case filename == security.ArtifactDroppedFindings:
