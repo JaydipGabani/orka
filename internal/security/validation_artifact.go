@@ -467,7 +467,7 @@ func normalizeValidationEvidence(ref *store.FindingEvidenceRef, opts ValidationA
 		}
 		ref.Path, ref.Name, ref.Symbol, ref.Quote = "", "", "", ""
 		ref.StartLine, ref.EndLine = 0, 0
-	case "file":
+	case evidenceKindFile:
 		if ref.Path == "" {
 			return errors.New("file evidence requires path")
 		}

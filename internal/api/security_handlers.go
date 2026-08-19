@@ -29,8 +29,6 @@ import (
 	"github.com/orka-agents/orka/internal/security"
 	securitybundle "github.com/orka-agents/orka/internal/security/bundle"
 	"github.com/orka-agents/orka/internal/store"
-	"github.com/orka-agents/orka/internal/tools"
-	"github.com/orka-agents/orka/internal/workerenv"
 )
 
 type CreateRepositoryScanRequest struct {
@@ -275,6 +273,59 @@ func authorizeContextTokenRepositoryScanPolicyRefsForUser(
 	return nil
 }
 
+func (h *Handlers) authorizeContextTokenRepositoryScanCredentialRefs(
+	c fiber.Ctx,
+	action string,
+	namespace string,
+	refs []repositoryScanCredentialRef,
+) error {
+	seen := map[string]struct{}{}
+	for _, credential := range refs {
+		name := ""
+		if credential.ref != nil {
+			name = strings.TrimSpace(credential.ref.Name)
+		}
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		if err := h.authorizeContextTokenGitCredentialSecretName(c, action+":"+credential.field, namespace, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func authorizeContextTokenRepositoryScanCredentialRefsForUser(
+	ui *UserInfo,
+	cfg ContextTokenAuthorizationConfig,
+	action string,
+	namespace string,
+	refs []repositoryScanCredentialRef,
+) error {
+	seen := map[string]struct{}{}
+	for _, credential := range refs {
+		name := ""
+		if credential.ref != nil {
+			name = strings.TrimSpace(credential.ref.Name)
+		}
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		if err := authorizeContextTokenGitCredentialSecretForUser(ui, cfg, action+":"+credential.field, namespace, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (h *Handlers) securityAnalysisTaskAnnotations(
 	ctx context.Context,
 	scan *corev1alpha1.RepositoryScan,
@@ -412,11 +463,7 @@ func (h *Handlers) createSecurityScanRun(
 				{Name: security.EnvScanHeadCommit, Value: headCommit},
 				{Name: security.EnvPinnedScanTargetsEnabled, Value: "true"},
 			},
-			Workspace: &corev1alpha1.WorkspaceConfig{
-				GitRepo: scan.Spec.RepoURL, Branch: security.EffectiveWorkspaceBranch(scan), Ref: security.EffectiveRef(scan),
-				GitSecretRef: scan.Spec.GitSecretRef, SubPath: scan.Spec.SubPath,
-				ForkRepo: scan.Spec.ForkRepo, PRBaseBranch: scan.Spec.PRBaseBranch,
-			},
+			Workspace: repositoryScanTaskWorkspace(scan, ""),
 		}
 	} else {
 		annotations, annotationErr := h.securityAnalysisTaskAnnotations(ctx, scan)
@@ -433,30 +480,25 @@ func (h *Handlers) createSecurityScanRun(
 		}
 		task.Annotations = annotations
 		task.Spec = corev1alpha1.TaskSpec{
-			Type:     corev1alpha1.TaskTypeAgent,
-			AgentRef: &scan.Spec.AnalysisAgentRef,
-			Prompt:   security.BuildThreatModelPrompt(scan, mode, baseCommit, headCommit, threatModelInput.Content, policy.PromptPolicy()),
-			Timeout:  &timeout,
-			Priority: &priority,
-			Env: []corev1.EnvVar{
-				{Name: security.EnvRepositoryScanName, Value: scan.Name},
-				{Name: security.EnvStage, Value: security.StageThreatModel},
-				{Name: security.EnvScanID, Value: scanID},
-				{Name: security.EnvScannerPolicyVersion, Value: security.ScannerPolicyVersion},
-				{Name: security.EnvPolicyDigest, Value: policy.Digest},
-				{Name: security.EnvPolicyProvenance, Value: security.PolicyProvenanceEnv(policy)},
-			},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{
-				GitRepo: scan.Spec.RepoURL, Branch: security.EffectiveWorkspaceBranch(scan), Ref: security.EffectiveRef(scan),
-				GitSecretRef: scan.Spec.GitSecretRef, SubPath: scan.Spec.SubPath,
-				ForkRepo: scan.Spec.ForkRepo, PRBaseBranch: scan.Spec.PRBaseBranch,
-			}},
+			Type:      corev1alpha1.TaskTypeAgent,
+			AgentRef:  &scan.Spec.AnalysisAgentRef,
+			Prompt:    security.BuildThreatModelPrompt(scan, mode, baseCommit, headCommit, threatModelInput.Content, policy.PromptPolicy()),
+			Timeout:   &timeout,
+			Priority:  &priority,
+			Workspace: repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead),
 		}
 	}
-	if scan.Spec.GitSecretRef != nil {
-		if err := authorizeContextTokenGitCredentialSecretForUser(ui, h.contextTokenAuthorization, "createSecurityScanTaskGitSecret", scan.Namespace, scan.Spec.GitSecretRef.Name); err != nil {
-			return nil, err
-		}
+	task.Annotations = mergeSecurityAnnotations(task.Annotations, map[string]string{
+		security.AnnotationSecurityScanRunID: scanID,
+	})
+	if err := authorizeContextTokenRepositoryScanCredentialRefsForUser(
+		ui,
+		h.contextTokenAuthorization,
+		"createSecurityScanTaskCredential",
+		scan.Namespace,
+		[]repositoryScanCredentialRef{{field: "source-read", ref: repositoryScanReadCredentialRef(scan)}},
+	); err != nil {
+		return nil, err
 	}
 	if err := authorizeAndStampTaskContext(ctx, h.client, h.clientset, contextTokenFromUserInfo(ui), h.contextTokenAuthorization, "createSecurityScanTask", ui, task); err != nil {
 		return nil, err
@@ -655,9 +697,15 @@ func (h *Handlers) recoveredInitialSecurityScanTask(
 		scanIDEnv = i
 		task.Spec.Env[i].Value = run.ID
 	}
-	if scanIDEnv < 0 {
+	if scanIDEnv < 0 && len(task.Spec.Env) > 0 {
 		return nil, fmt.Errorf("deterministic initial task is missing the scan ID environment binding")
 	}
+	if scanIDEnv < 0 && strings.TrimSpace(task.Annotations[security.AnnotationSecurityScanRunID]) == "" {
+		return nil, fmt.Errorf("deterministic initial task is missing the scan ID binding")
+	}
+	task.Annotations = mergeSecurityAnnotations(task.Annotations, map[string]string{
+		security.AnnotationSecurityScanRunID: run.ID,
+	})
 	return task, nil
 }
 
@@ -942,7 +990,11 @@ func (h *Handlers) createSecurityValidationTask(ctx context.Context, ui *UserInf
 		return err
 	}
 
-	bindingAnnotations := map[string]string{}
+	bindingAnnotations := map[string]string{
+		security.AnnotationSecurityScanRunID:    finding.ScanRunID,
+		security.AnnotationSecurityFindingID:    finding.ID,
+		security.AnnotationSecurityOccurrenceID: finding.CurrentOccurrenceID,
+	}
 	if security.ValidRunUID(sourceRun.RunUID) {
 		bindingAnnotations[security.AnnotationValidationBindingVersion] = security.ValidationBindingVersion
 	}
@@ -964,37 +1016,22 @@ func (h *Handlers) createSecurityValidationTask(ctx context.Context, ui *UserInf
 			OwnerReferences: []metav1.OwnerReference{h.ownerRefForRepositoryScan(scan)},
 		},
 		Spec: corev1alpha1.TaskSpec{
-			Type:     corev1alpha1.TaskTypeAgent,
-			AgentRef: &scan.Spec.AnalysisAgentRef,
-			Prompt:   security.BuildValidationPrompt(scan, finding, policy.PromptPolicy()),
-			Timeout:  &timeout,
-			Priority: &priority,
-			Env: []corev1.EnvVar{
-				{Name: security.EnvRepositoryScanName, Value: scan.Name},
-				{Name: security.EnvStage, Value: security.StageValidation},
-				{Name: security.EnvScanID, Value: finding.ScanRunID},
-				{Name: security.EnvPolicyDigest, Value: policy.Digest},
-				{Name: security.EnvPolicyProvenance, Value: security.PolicyProvenanceEnv(policy)},
-				{Name: security.EnvFindingID, Value: finding.ID},
-				{Name: security.EnvOccurrenceID, Value: finding.CurrentOccurrenceID},
-			},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					GitRepo:      scan.Spec.RepoURL,
-					Branch:       security.EffectiveWorkspaceBranch(scan),
-					Ref:          pinnedSourceRef(scan, sourceRun),
-					GitSecretRef: scan.Spec.GitSecretRef,
-					SubPath:      scan.Spec.SubPath,
-					ForkRepo:     scan.Spec.ForkRepo,
-					PRBaseBranch: scan.Spec.PRBaseBranch,
-				},
-			},
+			Type:      corev1alpha1.TaskTypeAgent,
+			AgentRef:  &scan.Spec.AnalysisAgentRef,
+			Prompt:    security.BuildValidationPrompt(scan, finding, policy.PromptPolicy()),
+			Timeout:   &timeout,
+			Priority:  &priority,
+			Workspace: securityValidationTaskWorkspace(scan, sourceRun),
 		},
 	}
-	if scan.Spec.GitSecretRef != nil {
-		if err := authorizeContextTokenGitCredentialSecretForUser(ui, h.contextTokenAuthorization, "createSecurityValidationTaskGitSecret", scan.Namespace, scan.Spec.GitSecretRef.Name); err != nil {
-			return err
-		}
+	if err := authorizeContextTokenRepositoryScanCredentialRefsForUser(
+		ui,
+		h.contextTokenAuthorization,
+		"createSecurityValidationTaskCredential",
+		scan.Namespace,
+		[]repositoryScanCredentialRef{{field: "source-read", ref: repositoryScanReadCredentialRef(scan)}},
+	); err != nil {
+		return err
 	}
 	if err := h.authorizeAndStampPinnedSecurityTask(ctx, ui, scan, task, "createSecurityValidationTask"); err != nil {
 		return err
@@ -1146,6 +1183,10 @@ func (h *Handlers) authorizeAndStampPinnedSecurityTask(
 		authorizationTask.Spec.AgentRuntime.Workspace.Branch = security.EffectiveWorkspaceBranch(scan)
 		authorizationTask.Spec.AgentRuntime.Workspace.Ref = security.EffectiveRef(scan)
 	}
+	if authorizationTask.Spec.Workspace != nil {
+		authorizationTask.Spec.Workspace.Branch = security.EffectiveWorkspaceBranch(scan)
+		authorizationTask.Spec.Workspace.Ref = security.EffectiveRef(scan)
+	}
 	if err := authorizeAndStampTaskContext(ctx, h.client, h.clientset, contextTokenFromUserInfo(ui),
 		h.contextTokenAuthorization, action, ui, authorizationTask); err != nil {
 		return err
@@ -1172,9 +1213,29 @@ func pinnedSourceRef(scan *corev1alpha1.RepositoryScan, run *store.ScanRun) stri
 	return security.EffectiveRef(scan)
 }
 
+func securityPatchTaskWorkspace(scan *corev1alpha1.RepositoryScan, branch, sourceHead string) *corev1alpha1.WorkspaceConfig {
+	workspace := repositoryScanPatchTaskWorkspace(scan, branch)
+	if workspace != nil && strings.TrimSpace(sourceHead) != "" {
+		workspace.Ref = strings.TrimSpace(sourceHead)
+	}
+	return workspace
+}
+
+func securityValidationTaskWorkspace(scan *corev1alpha1.RepositoryScan, run *store.ScanRun) *corev1alpha1.WorkspaceConfig {
+	workspace := repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead)
+	if workspace != nil {
+		workspace.Ref = pinnedSourceRef(scan, run)
+	}
+	return workspace
+}
+
 func (h *Handlers) createSecurityPatchTask(ctx context.Context, ui *UserInfo, scan *corev1alpha1.RepositoryScan, finding *store.Finding) (*store.PatchProposal, error) {
 	if err := h.ensureSecurityStore(); err != nil {
 		return nil, err
+	}
+	credentialRefs, err := repositoryScanPatchCredentialRefs(scan)
+	if err != nil {
+		return nil, fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 
 	sourceRunID := strings.TrimSpace(finding.ScanRunID)
@@ -1228,38 +1289,22 @@ func (h *Handlers) createSecurityPatchTask(ctx context.Context, ui *UserInfo, sc
 			OwnerReferences: []metav1.OwnerReference{h.ownerRefForRepositoryScan(scan)},
 		},
 		Spec: corev1alpha1.TaskSpec{
-			Type:     corev1alpha1.TaskTypeAgent,
-			AgentRef: &agentRef,
-			Prompt:   security.BuildPatchPrompt(scan, finding, branch),
-			Timeout:  &timeout,
-			Priority: &priority,
-			Env: []corev1.EnvVar{
-				{Name: workerenv.RequirePushBranch, Value: "true"},
-				{Name: security.EnvRepositoryScanName, Value: scan.Name},
-				{Name: security.EnvStage, Value: security.StagePatch},
-				{Name: security.EnvScanID, Value: finding.ScanRunID},
-				{Name: security.EnvFindingID, Value: finding.ID},
-				{Name: security.EnvOccurrenceID, Value: finding.CurrentOccurrenceID},
-				{Name: security.EnvPatchBranch, Value: branch},
-			},
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					GitRepo:      scan.Spec.RepoURL,
-					Branch:       security.EffectiveWorkspaceBranch(scan),
-					Ref:          sourceHead,
-					GitSecretRef: scan.Spec.GitSecretRef,
-					SubPath:      scan.Spec.SubPath,
-					ForkRepo:     scan.Spec.ForkRepo,
-					PRBaseBranch: scan.Spec.PRBaseBranch,
-					PushBranch:   branch,
-				},
-			},
+			Type:      corev1alpha1.TaskTypeAgent,
+			AgentRef:  &agentRef,
+			Prompt:    security.BuildPatchPrompt(scan, finding, branch),
+			Timeout:   &timeout,
+			Priority:  &priority,
+			Workspace: securityPatchTaskWorkspace(scan, branch, sourceHead),
 		},
 	}
-	if scan.Spec.GitSecretRef != nil {
-		if err := authorizeContextTokenGitCredentialSecretForUser(ui, h.contextTokenAuthorization, "createSecurityPatchTaskGitSecret", scan.Namespace, scan.Spec.GitSecretRef.Name); err != nil {
-			return nil, err
-		}
+	if err := authorizeContextTokenRepositoryScanCredentialRefsForUser(
+		ui,
+		h.contextTokenAuthorization,
+		"createSecurityPatchTaskCredential",
+		scan.Namespace,
+		credentialRefs,
+	); err != nil {
+		return nil, err
 	}
 	if err := h.authorizeAndStampPinnedSecurityTask(ctx, ui, scan, task, "createSecurityPatchTask"); err != nil {
 		return nil, err
@@ -1439,10 +1484,13 @@ func (h *Handlers) CreateRepositoryScan(c fiber.Ctx) error {
 	if err := h.authorizeContextTokenSecurityScanTask(c, "createRepositoryScan", scan, scan.Spec.AnalysisAgentRef); err != nil {
 		return err
 	}
-	if scan.Spec.GitSecretRef != nil {
-		if err := h.authorizeContextTokenGitCredentialSecretName(c, "createRepositoryScanGitSecret", namespace, scan.Spec.GitSecretRef.Name); err != nil {
-			return err
-		}
+	if err := h.authorizeContextTokenRepositoryScanCredentialRefs(
+		c,
+		"createRepositoryScanCredential",
+		namespace,
+		repositoryScanConfiguredCredentialRefs(scan),
+	); err != nil {
+		return err
 	}
 	if err := h.client.Create(c.Context(), scan); err != nil {
 		if apierrors.IsAlreadyExists(err) {
@@ -1498,10 +1546,13 @@ func (h *Handlers) UpdateRepositoryScan(c fiber.Ctx) error {
 	if err := h.authorizeContextTokenSecurityScanTask(c, "updateRepositoryScan", updated, updated.Spec.AnalysisAgentRef); err != nil {
 		return err
 	}
-	if updated.Spec.GitSecretRef != nil {
-		if err := h.authorizeContextTokenGitCredentialSecretName(c, "updateRepositoryScanGitSecret", namespace, updated.Spec.GitSecretRef.Name); err != nil {
-			return err
-		}
+	if err := h.authorizeContextTokenRepositoryScanCredentialRefs(
+		c,
+		"updateRepositoryScanCredential",
+		namespace,
+		repositoryScanConfiguredCredentialRefs(updated),
+	); err != nil {
+		return err
 	}
 	if err := h.client.Update(c.Context(), updated); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to update repository scan: %v", err))
@@ -2772,29 +2823,7 @@ func (h *Handlers) authorizeContextTokenSecurityScanTask(c fiber.Ctx, action str
 	return h.handleContextTokenAuthorizationFailures(token, action, failures)
 }
 
-func extractGitToken(secret *corev1.Secret) string {
-	for _, key := range []string{"token", "password", workerenv.GitHubToken} {
-		if value, ok := secret.Data[key]; ok {
-			token := strings.TrimSpace(string(value))
-			if token != "" {
-				return token
-			}
-		}
-	}
-	return ""
-}
-
-var githubPullRequestAPIBaseURL = "https://api.github.com"
-
-func createGitHubPullRequest(ctx context.Context, token, owner, repo, head, base, title, body string) (string, int, string, error) {
-	pr, err := tools.CreateOrGetGitHubPullRequest(ctx, token, owner, repo, head, base, title, body, githubPullRequestAPIBaseURL)
-	if err != nil {
-		return "", 0, "", err
-	}
-	return pr.HTMLURL, pr.Number, pr.Status, nil
-}
-
-// CreateSecurityPullRequest opens a pull request from the latest successful patch proposal.
+// CreateSecurityPullRequest returns the pull request reconciled by the governed patch Task.
 func (h *Handlers) CreateSecurityPullRequest(c fiber.Ctx) error {
 	authorized, err := h.authorizedSecurityFindingWithAgent(
 		c, "createSecurityPullRequest", true, securityPatchAgentRef,
@@ -2803,7 +2832,6 @@ func (h *Handlers) CreateSecurityPullRequest(c fiber.Ctx) error {
 		return err
 	}
 	finding := authorized.finding
-	scan := authorized.scan
 	namespace := finding.Namespace
 
 	proposals, err := h.securityStore.ListPatchProposals(c.Context(), namespace, finding.ID)
@@ -2811,79 +2839,28 @@ func (h *Handlers) CreateSecurityPullRequest(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list patch proposals: %v", err))
 	}
 	var proposal *store.PatchProposal
-	hasUnboundSuccessfulProposal := false
+	hasUnboundOpenedProposal := false
 	for i := range proposals {
-		if proposals[i].Status != githubMutationStatusSucceeded {
+		if proposals[i].Status != "pr_opened" || proposals[i].PRNumber == nil || proposals[i].PRURL == "" {
 			continue
 		}
 		if !patchProposalMatchesAuthorizedFinding(&proposals[i], authorized) {
-			hasUnboundSuccessfulProposal = true
+			hasUnboundOpenedProposal = true
 			continue
 		}
 		proposal = &proposals[i]
 		break
 	}
 	if proposal == nil {
-		if hasUnboundSuccessfulProposal {
-			return fiber.NewError(fiber.StatusConflict, "no successful patch proposal is bound to the finding's current occurrence and source target")
+		if hasUnboundOpenedProposal {
+			return fiber.NewError(fiber.StatusConflict, "no governed pull request receipt is bound to the finding's current occurrence and source target")
 		}
-		return fiber.NewError(fiber.StatusBadRequest, "no successful patch proposal available")
-	}
-	if proposal.Branch == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "patch proposal does not have branch metadata")
-	}
-	if scan.Spec.GitSecretRef == nil {
-		return fiber.NewError(fiber.StatusBadRequest, "repository scan does not have git credentials configured")
-	}
-	if err := h.authorizeContextTokenGitCredentialSecretName(c, "createSecurityPullRequestGitSecret", namespace, scan.Spec.GitSecretRef.Name); err != nil {
-		return err
-	}
-
-	secret := &corev1.Secret{}
-	if err := h.client.Get(c.Context(), types.NamespacedName{Name: scan.Spec.GitSecretRef.Name, Namespace: namespace}, secret); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get git secret: %v", err))
-	}
-	token := extractGitToken(secret)
-	if token == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "git secret does not contain a GitHub token")
-	}
-
-	owner, repo := security.ParseRepositoryURL(scan.Spec.RepoURL)
-	if owner == "" || repo == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "repository URL must be a GitHub repository")
-	}
-
-	baseBranch := scan.Spec.PRBaseBranch
-	if baseBranch == "" {
-		baseBranch = security.EffectiveBranch(scan)
-	}
-	title := fmt.Sprintf("fix(security): %s", finding.Title)
-	body := fmt.Sprintf("Security remediation for finding `%s`.\n\nSummary:\n%s\n\nRoot cause:\n%s\n\nRemediation guidance:\n%s\n",
-		finding.ID, finding.Summary, finding.RootCause, finding.Remediation)
-
-	prURL, prNumber, prStatus, err := createGitHubPullRequest(c.Context(), token, owner, repo, proposal.Branch, baseBranch, title, body)
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create pull request: %v", err))
-	}
-
-	proposal.Status = "pr_opened"
-	proposal.PRNumber = &prNumber
-	proposal.PRURL = prURL
-	if err := h.securityStore.UpdatePatchProposal(c.Context(), proposal); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to update patch proposal: %v", err))
-	}
-
-	finding.State = "pr_open"
-	finding.PRNumber = &prNumber
-	finding.PRURL = prURL
-	finding.PatchProposalID = proposal.ID
-	if err := h.securityStore.UpsertFinding(c.Context(), finding); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to update finding: %v", err))
+		return fiber.NewError(fiber.StatusConflict, "governed pull request receipt is not available yet")
 	}
 
 	return c.JSON(fiber.Map{
-		"prNumber": prNumber,
-		"prURL":    prURL,
-		"status":   prStatus,
+		"prNumber": *proposal.PRNumber,
+		"prURL":    proposal.PRURL,
+		"status":   "Open",
 	})
 }

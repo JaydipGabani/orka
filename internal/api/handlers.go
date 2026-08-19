@@ -27,10 +27,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/controller"
+	"github.com/orka-agents/orka/internal/executionmode"
 	gatewayruntime "github.com/orka-agents/orka/internal/gateway"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/security"
 	"github.com/orka-agents/orka/internal/store"
+	storekube "github.com/orka-agents/orka/internal/store/kube"
 	"github.com/orka-agents/orka/internal/tools"
 	"github.com/orka-agents/orka/internal/tracing"
 )
@@ -87,11 +90,13 @@ type Handlers struct {
 	apiReader                 client.Reader
 	clientset                 kubernetes.Interface
 	watchNamespace            string
+	executionMode             executionmode.Mode
 	enforceNamespaceIsolation bool
 	contextTokenAuthorization ContextTokenAuthorizationConfig
 	integrityConfig           security.IntegrityConfig
 	resultStore               store.ResultStore
 	sessionStore              store.SessionStore
+	sessionManager            *controller.SessionManager
 	planStore                 store.PlanStore
 	healthChecker             store.HealthChecker
 	artifactStore             store.ArtifactStore
@@ -116,11 +121,13 @@ type HandlersConfig struct {
 	Client                    client.Client
 	APIReader                 client.Reader
 	WatchNamespace            string
+	ExecutionMode             executionmode.Mode
 	EnforceNamespaceIsolation bool
 	ContextTokenAuthorization ContextTokenAuthorizationConfig
 	IntegrityConfig           security.IntegrityConfig
 	ResultStore               store.ResultStore
 	SessionStore              store.SessionStore
+	SessionManager            *controller.SessionManager
 	PlanStore                 store.PlanStore
 	KubeClient                kubernetes.Interface
 	HealthChecker             store.HealthChecker
@@ -149,11 +156,13 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		apiReader:                 cfg.APIReader,
 		clientset:                 cfg.KubeClient,
 		watchNamespace:            cfg.WatchNamespace,
+		executionMode:             cfg.ExecutionMode,
 		enforceNamespaceIsolation: cfg.EnforceNamespaceIsolation,
 		contextTokenAuthorization: cfg.ContextTokenAuthorization,
 		integrityConfig:           cfg.IntegrityConfig,
 		resultStore:               cfg.ResultStore,
 		sessionStore:              cfg.SessionStore,
+		sessionManager:            cfg.SessionManager,
 		planStore:                 cfg.PlanStore,
 		healthChecker:             cfg.HealthChecker,
 		artifactStore:             cfg.ArtifactStore,
@@ -387,10 +396,21 @@ func (h *Handlers) Readyz(c fiber.Ctx) error {
 		checks["store"] = "ok"
 	}
 
-	// Verify Kubernetes API connectivity
-	if h.client != nil {
-		var ns corev1.NamespaceList
-		if err := h.client.List(ctx, &ns, client.Limit(1)); err != nil {
+	// Verify Kubernetes API connectivity without starting a cache informer. In
+	// namespace-isolated mode, use the exact read covered by the controller's
+	// narrow Namespace RBAC grant.
+	reader := h.apiReader
+	if reader == nil {
+		reader = h.client
+	}
+	if reader != nil {
+		var err error
+		if h.watchNamespace != "" {
+			err = reader.Get(ctx, client.ObjectKey{Name: h.watchNamespace}, &corev1.Namespace{})
+		} else {
+			err = reader.List(ctx, &corev1.NamespaceList{}, client.Limit(1))
+		}
+		if err != nil {
 			checks["kubernetes"] = "unhealthy"
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"status": "not ready",
@@ -454,6 +474,15 @@ func rejectReservedTaskAnnotations(annotations map[string]string) error {
 	return nil
 }
 
+func rejectReservedTaskLabels(taskLabels map[string]string) error {
+	for key := range taskLabels {
+		if strings.HasPrefix(key, "orka.ai/") {
+			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("label %q is reserved", key))
+		}
+	}
+	return nil
+}
+
 // CreateTask creates a new task
 func (h *Handlers) CreateTask(c fiber.Ctx) error {
 	if err := rejectRequestedByTampering(c.Body()); err != nil {
@@ -478,6 +507,9 @@ func (h *Handlers) CreateTask(c fiber.Ctx) error {
 		annotations = req.Metadata.Annotations
 	}
 	if err := rejectReservedTaskAnnotations(annotations); err != nil {
+		return err
+	}
+	if err := rejectReservedTaskLabels(req.Metadata.Labels); err != nil {
 		return err
 	}
 
@@ -957,6 +989,11 @@ func (h *Handlers) GetSession(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusNotFound, "session not found")
 	}
 
+	executionControl, err := h.getSessionExecutionControl(ctx, namespace, id)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get session execution control: %v", err))
+	}
+
 	// Build JSONL transcript from messages for backward compatibility
 	var transcript string
 	if len(session.Messages) > 0 {
@@ -971,7 +1008,7 @@ func (h *Handlers) GetSession(c fiber.Ctx) error {
 		transcript = strings.Join(lines, "\n")
 	}
 
-	return c.JSON(fiber.Map{
+	response := fiber.Map{
 		"name":         id,
 		"namespace":    namespace,
 		"transcript":   transcript,
@@ -981,7 +1018,70 @@ func (h *Handlers) GetSession(c fiber.Ctx) error {
 		"activeTask":   session.ActiveTask,
 		"createdAt":    session.CreatedAt.Format(time.RFC3339),
 		"updatedAt":    session.UpdatedAt.Format(time.RFC3339),
-	})
+	}
+	if executionControl != nil {
+		response["executionControl"] = executionControl
+	}
+
+	return c.JSON(response)
+}
+
+// getSessionExecutionControl projects Kubernetes-authoritative Session state
+// into the public read API. The projection intentionally excludes mutation
+// Lease contents, controller epoch tokens, and other internal fencing data.
+func (h *Handlers) getSessionExecutionControl(
+	ctx context.Context,
+	namespace, sessionName string,
+) (fiber.Map, error) {
+	reader := h.apiReader
+	if reader == nil {
+		reader = h.client
+	}
+	if reader == nil {
+		return nil, nil
+	}
+
+	control := &corev1alpha1.RuntimeSessionControl{}
+	key := client.ObjectKey{
+		Namespace: namespace,
+		Name:      storekube.RuntimeSessionControlObjectName(sessionName),
+	}
+	if err := reader.Get(ctx, key, control); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if control.Spec.SessionName != sessionName {
+		return nil, fmt.Errorf("control record %s/%s has a mismatched immutable Session name", namespace, control.Name)
+	}
+
+	projection := fiber.Map{
+		"resourceVersion":         control.ResourceVersion,
+		"sessionUID":              control.Spec.SessionUID,
+		"runtimePoolRef":          control.Spec.RuntimePoolRef,
+		"runtimeProfileDigest":    control.Spec.RuntimeProfileDigest,
+		"generation":              control.Status.Generation,
+		"lifecycle":               control.Status.Lifecycle,
+		"availability":            control.Status.Availability,
+		"mutationLeaseGeneration": control.Status.MutationLeaseGeneration,
+		"blockedReason":           control.Status.BlockedReason,
+		"relatedPromptAttemptID":  control.Status.RelatedPromptAttemptID,
+		"relatedPublicationID":    control.Status.RelatedPublicationID,
+	}
+	if control.Status.Lineage != nil {
+		projection["lineage"] = fiber.Map{
+			"namespaceUID":    control.Status.Lineage.NamespaceUID,
+			"sessionUID":      control.Status.Lineage.SessionUID,
+			"contractVersion": control.Status.Lineage.ContractVersion,
+			"generation":      control.Status.Lineage.Generation,
+			"runtimeIdentity": control.Status.Lineage.RuntimeIdentity,
+			"configDigest":    control.Status.Lineage.ConfigDigest,
+			"establishedAt":   control.Status.Lineage.EstablishedAt,
+		}
+	}
+
+	return projection, nil
 }
 
 // DeleteSession deletes a session
@@ -996,12 +1096,16 @@ func (h *Handlers) DeleteSession(c fiber.Ctx) error {
 	}
 
 	ctx := c.Context()
-	if err := h.sessionStore.DeleteSession(ctx, namespace, id); err != nil {
+	deleteSession := h.sessionStore.DeleteSession
+	if h.sessionManager != nil {
+		deleteSession = h.sessionManager.DeleteSession
+	}
+	if err := deleteSession(ctx, namespace, id); err != nil {
 		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrGatewayOwnedSession) {
 			return fiber.NewError(fiber.StatusNotFound, "session not found")
 		}
 		if errors.Is(err, store.ErrConflict) {
-			return fiber.NewError(fiber.StatusConflict, "session has pending gateway events")
+			return fiber.NewError(fiber.StatusConflict, "session has active or unsettled work")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to delete session: %v", err))
 	}
@@ -1038,7 +1142,7 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 	}
 
 	// Add built-in tools to the response
-	toolItems := make([]fiber.Map, 0, len(toolList.Items)+len(builtinToolsList))
+	toolItems := make([]fiber.Map, 0)
 	for _, tool := range builtinToolsList {
 		name, _ := tool["name"].(string)
 		allowed, err := contextTokenAllowsToolMetadata(c, h.contextTokenAuthorization, "listTools", name)
@@ -1225,6 +1329,9 @@ func (h *Handlers) CreateAgent(c fiber.Ctx) error {
 	agent := &corev1alpha1.Agent{
 		ObjectMeta: objectMetaFromRequest(name, namespace, req.Metadata),
 		Spec:       req.Spec,
+	}
+	if err := executionmode.DefaultBuiltInAgentContract(agent, h.executionMode); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	if err := authorizeContextTokenAgentContext(c, h.contextTokenAuthorization, "createAgent", agent.Namespace, agent.Name); err != nil {
 		return err

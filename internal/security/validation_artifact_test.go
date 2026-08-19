@@ -49,7 +49,7 @@ func TestParseValidationArtifactNormalizesAndBinds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseValidationArtifact() error = %v", err)
 	}
-	if parsed.Artifact.Status != "validated" || parsed.Artifact.Summary != "confirmed" {
+	if parsed.Artifact.Status != validationStatusValidated || parsed.Artifact.Summary != "confirmed" {
 		t.Fatalf("artifact = %#v", parsed.Artifact)
 	}
 	if got := parsed.Artifact.Evidence[1].TaskName; got != "trusted-task" {

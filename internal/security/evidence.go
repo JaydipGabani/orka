@@ -278,7 +278,7 @@ func ToFindingV2(
 	evidence := make([]store.FindingEvidenceRef, 0, len(item.Evidence))
 	for _, ref := range canonicalEvidenceRefs(item.Evidence) {
 		evidence = append(evidence, store.FindingEvidenceRef{
-			Kind:      "file",
+			Kind:      evidenceKindFile,
 			TaskName:  taskName,
 			Path:      ref.Path,
 			StartLine: ref.StartLine,

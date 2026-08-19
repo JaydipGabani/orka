@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -76,6 +77,17 @@ func TestApplyScanRunProgressPreservesTerminalErrorWithActiveTasks(t *testing.T)
 	}
 }
 
+func TestApplyScanRunProgressStampsTerminalErrorCompletion(t *testing.T) {
+	completed := mustParseTime(t, "2026-05-04T03:02:01Z")
+	run := &storepkg.ScanRun{ErrorMessage: "terminal result binding mismatch"}
+
+	applyScanRunProgress(run, scanRunProgress{latestCompletion: &completed})
+
+	if run.Phase != scanRunPhaseFailed || run.Summary != run.ErrorMessage || run.CompletedAt == nil || !run.CompletedAt.Equal(completed) {
+		t.Fatalf("run = %#v, want terminal failure stamped with pipeline completion", run)
+	}
+}
+
 func TestIngestMapperTaskSkipsFailedRun(t *testing.T) {
 	reconciler := &RepositoryScanReconciler{}
 	run := &storepkg.ScanRun{Phase: scanRunPhaseFailed, ErrorMessage: "scanner policy digest changed"}
@@ -89,57 +101,183 @@ func TestIngestMapperTaskSkipsFailedRun(t *testing.T) {
 	}
 }
 
-func TestLatestTerminalScanTaskPrefersNewestCompletedScan(t *testing.T) {
-	tasks := []corev1alpha1.Task{
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "older-failed-scan",
-				CreationTimestamp: metav1.NewTime(mustParseTime(t, "2026-04-10T04:45:33Z")),
-				Labels: map[string]string{
-					labels.LabelSecurityTarget: "kaset",
-				},
-			},
-			Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseFailed},
-		},
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "patch-task",
-				CreationTimestamp: metav1.NewTime(mustParseTime(t, "2026-04-10T04:58:00Z")),
-				Labels: map[string]string{
-					labels.LabelSecurityTarget:    "kaset",
-					labels.LabelSecurityFindingID: "fnd_123",
-				},
-			},
-			Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseSucceeded},
-		},
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "newest-succeeded-scan",
-				CreationTimestamp: metav1.NewTime(mustParseTime(t, "2026-04-10T04:59:05Z")),
-				Labels: map[string]string{
-					labels.LabelSecurityTarget: "kaset",
-				},
-			},
-			Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseSucceeded},
-		},
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "running-scan",
-				CreationTimestamp: metav1.NewTime(mustParseTime(t, "2026-04-10T05:00:00Z")),
-				Labels: map[string]string{
-					labels.LabelSecurityTarget: "kaset",
-				},
-			},
-			Status: corev1alpha1.TaskStatus{},
-		},
+//nolint:gocyclo // This table-driven regression intentionally verifies terminal state across the run, scan, slice, and retry paths.
+func TestRepositoryScanReconcileTreatsCancelledPipelineTasksAsTerminalFailures(t *testing.T) {
+	tests := []struct {
+		name        string
+		stage       string
+		sliceID     string
+		wantMessage string
+	}{
+		{name: "threat model", stage: security.StageThreatModel, wantMessage: "threat model stage cancelled"},
+		{name: "mapper", stage: security.StageMapper, wantMessage: "mapper stage cancelled"},
+		{name: "review", stage: security.StageReview, sliceID: "slice_api", wantMessage: "review stage cancelled"},
 	}
 
-	got := latestTerminalScanTask(tasks)
-	if got == nil {
-		t.Fatal("latestTerminalScanTask() = nil, want newest terminal scan task")
-	}
-	if got.Name != "newest-succeeded-scan" {
-		t.Fatalf("latestTerminalScanTask() = %q, want %q", got.Name, "newest-succeeded-scan")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			securityStore := setupControllerSQLiteStore(t)
+			scheme := runtime.NewScheme()
+			if err := corev1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme() error = %v", err)
+			}
+
+			nameSuffix := strings.ReplaceAll(tt.stage, "-", "")
+			scanName := "cancelled-" + nameSuffix
+			runID := "scan_cancelled_" + nameSuffix
+			taskName := scanName + "-" + tt.stage
+			completed := metav1.NewTime(mustParseTime(t, "2026-05-08T03:04:05Z"))
+			scan := &corev1alpha1.RepositoryScan{
+				TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       scanName,
+					Namespace:  defaultNS,
+					UID:        types.UID(scanName + "-uid"),
+					Generation: 1,
+				},
+				Spec: corev1alpha1.RepositoryScanSpec{
+					RepoURL:          "https://github.com/example/repo",
+					AnalysisAgentRef: corev1alpha1.AgentReference{Name: "scan-reviewer"},
+				},
+				Status: corev1alpha1.RepositoryScanStatus{
+					Phase:            repositoryScanPhaseScanning,
+					LastScanID:       runID,
+					LastScanTaskName: taskName,
+				},
+			}
+			controllerRef := true
+			taskLabels := map[string]string{
+				labels.LabelSecurityTarget: labels.SelectorValue(scanName),
+				labels.LabelSecurityScanID: runID,
+				labels.LabelSecurityMode:   scanModeManual,
+				labels.LabelSecurityStage:  tt.stage,
+			}
+			if tt.sliceID != "" {
+				taskLabels[labels.LabelSecuritySliceID] = tt.sliceID
+			}
+			task := &corev1alpha1.Task{
+				TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "Task"},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              taskName,
+					Namespace:         defaultNS,
+					CreationTimestamp: metav1.NewTime(completed.Add(-time.Minute)),
+					Labels:            taskLabels,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan",
+						Name: scanName, UID: scan.UID, Controller: &controllerRef,
+					}},
+				},
+				Status: corev1alpha1.TaskStatus{
+					Phase:          corev1alpha1.TaskPhaseCancelled,
+					CompletionTime: &completed,
+				},
+			}
+			run := &storepkg.ScanRun{
+				ID:             runID,
+				Namespace:      defaultNS,
+				RepositoryScan: scanName,
+				TaskName:       taskName,
+				Mode:           scanModeManual,
+				Phase:          scanRunPhaseRunning,
+				StartedAt:      completed.Add(-2 * time.Minute),
+			}
+			reserveScanRunForIngestionTest(t, ctx, securityStore, scan, run)
+			if tt.sliceID != "" {
+				if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{
+					ID:             tt.sliceID,
+					Namespace:      defaultNS,
+					RepositoryScan: scanName,
+					Status:         reviewSliceStatusPending,
+					LastScanRunID:  runID,
+				}); err != nil {
+					t.Fatalf("UpsertReviewSlice() error = %v", err)
+				}
+			}
+
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&corev1alpha1.RepositoryScan{}).
+				WithObjects(scan, task).
+				Build()
+			reconciler := &RepositoryScanReconciler{
+				Client:        cl,
+				Scheme:        scheme,
+				SecurityStore: securityStore,
+			}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(scan)}
+
+			assertTerminalFailure := func() (*storepkg.ScanRun, metav1.Condition) {
+				t.Helper()
+				storedRun, err := securityStore.GetScanRun(ctx, defaultNS, runID)
+				if err != nil {
+					t.Fatalf("GetScanRun() error = %v", err)
+				}
+				if storedRun.Phase != scanRunPhaseFailed || storedRun.ErrorMessage != tt.wantMessage || storedRun.Summary != tt.wantMessage {
+					t.Fatalf("run phase/error/summary = %q/%q/%q, want failed/%q/%q", storedRun.Phase, storedRun.ErrorMessage, storedRun.Summary, tt.wantMessage, tt.wantMessage)
+				}
+				if storedRun.CompletedAt == nil || !storedRun.CompletedAt.Equal(completed.Time) {
+					t.Fatalf("run.CompletedAt = %v, want %v", storedRun.CompletedAt, completed.Time)
+				}
+
+				current := &corev1alpha1.RepositoryScan{}
+				if err := cl.Get(ctx, client.ObjectKeyFromObject(scan), current); err != nil {
+					t.Fatalf("Get(RepositoryScan) error = %v", err)
+				}
+				condition := meta.FindStatusCondition(current.Status.Conditions, "Ready")
+				if current.Status.Phase != repositoryScanPhaseError || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != readyReasonScanFailed || condition.Message != tt.wantMessage {
+					t.Fatalf("scan status/condition = %q/%#v, want Error/ScanFailed %q", current.Status.Phase, condition, tt.wantMessage)
+				}
+				if current.Status.LastScanAt == nil || !current.Status.LastScanAt.Time.Equal(completed.Time) {
+					t.Fatalf("scan.Status.LastScanAt = %v, want %v", current.Status.LastScanAt, completed.Time)
+				}
+				if current.Status.LastSuccessfulScanAt != nil {
+					t.Fatalf("scan.Status.LastSuccessfulScanAt = %v, want nil", current.Status.LastSuccessfulScanAt)
+				}
+				if tt.sliceID != "" {
+					reviewSlice, err := securityStore.GetReviewSlice(ctx, defaultNS, scanName, tt.sliceID)
+					if err != nil {
+						t.Fatalf("GetReviewSlice() error = %v", err)
+					}
+					if reviewSlice.Status != reviewSliceStatusFailed {
+						t.Fatalf("review slice status = %q, want %q", reviewSlice.Status, reviewSliceStatusFailed)
+					}
+				}
+				return storedRun, *condition
+			}
+
+			result, err := reconciler.Reconcile(ctx, req)
+			if err != nil {
+				t.Fatalf("first Reconcile() error = %v", err)
+			}
+			if result != (ctrl.Result{}) {
+				t.Fatalf("first Reconcile() result = %#v, want no requeue", result)
+			}
+			firstRun, firstCondition := assertTerminalFailure()
+
+			result, err = reconciler.Reconcile(ctx, req)
+			if err != nil {
+				t.Fatalf("second Reconcile() error = %v", err)
+			}
+			if result != (ctrl.Result{}) {
+				t.Fatalf("second Reconcile() result = %#v, want no requeue", result)
+			}
+			secondRun, secondCondition := assertTerminalFailure()
+			if secondRun.ErrorMessage != firstRun.ErrorMessage || secondRun.Summary != firstRun.Summary || secondRun.CompletedAt == nil || firstRun.CompletedAt == nil || !secondRun.CompletedAt.Equal(*firstRun.CompletedAt) {
+				t.Fatalf("second reconcile changed terminal run: first=%#v second=%#v", firstRun, secondRun)
+			}
+			if !secondCondition.LastTransitionTime.Time.Equal(firstCondition.LastTransitionTime.Time) {
+				t.Fatalf("Ready transition time changed across idempotent reconcile: first=%v second=%v", firstCondition.LastTransitionTime, secondCondition.LastTransitionTime)
+			}
+
+			var tasks corev1alpha1.TaskList
+			if err := cl.List(ctx, &tasks, client.InNamespace(defaultNS), client.MatchingLabels(map[string]string{labels.LabelSecurityScanID: runID})); err != nil {
+				t.Fatalf("List(Tasks) error = %v", err)
+			}
+			if len(tasks.Items) != 1 {
+				t.Fatalf("len(tasks) = %d, want 1 after idempotent reconcile", len(tasks.Items))
+			}
+		})
 	}
 }
 
@@ -449,6 +587,557 @@ func TestIngestScanTaskRequiresCompleteImmutableRunBinding(t *testing.T) {
 	}
 }
 
+func testReviewContext(t *testing.T, sliceID string, paths ...string) (security.ReviewContextManifest, string, string) {
+	t.Helper()
+	prompt := "Trusted mapper review context for " + sliceID + "\n"
+	manifest := security.ReviewContextManifest{
+		SchemaVersion:     security.SchemaVersionReviewContext,
+		SliceID:           sliceID,
+		PromptBytes:       len(prompt),
+		ApproximateTokens: (len(prompt) + 3) / 4,
+		Prompt:            prompt,
+	}
+	seen := map[string]struct{}{}
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		manifest.IncludedFiles = append(manifest.IncludedFiles, security.ReviewContextIncludedFile{
+			Path:               path,
+			Role:               "owned",
+			IncludedLineRanges: []security.ReviewContextLineRange{{StartLine: 1, EndLine: 10000}},
+			Readable:           true,
+		})
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("json.Marshal(review context) error = %v", err)
+	}
+	parsed, digest, err := security.ParseTrustedReviewContextManifest(data)
+	if err != nil {
+		t.Fatalf("ParseTrustedReviewContextManifest() error = %v", err)
+	}
+	canonical, err := json.Marshal(parsed)
+	if err != nil {
+		t.Fatalf("json.Marshal(canonical review context) error = %v", err)
+	}
+	return *parsed, string(canonical), digest
+}
+
+func reviewSlicePaths(slice storepkg.ReviewSlice) []string {
+	paths := make([]string, 0, len(slice.OwnedFiles)+len(slice.ContextFiles)+len(slice.Tests))
+	for _, file := range slice.OwnedFiles {
+		paths = append(paths, file.Path)
+	}
+	for _, file := range slice.ContextFiles {
+		paths = append(paths, file.Path)
+	}
+	for _, test := range slice.Tests {
+		paths = append(paths, test.Path)
+	}
+	return paths
+}
+
+func saveMapperArtifactWithContexts(t *testing.T, store *sqlitestore.Store, task *corev1alpha1.Task, artifact security.ReviewSlicesArtifact) {
+	t.Helper()
+	ctx := context.Background()
+	data, err := json.Marshal(artifact)
+	if err != nil {
+		t.Fatalf("json.Marshal(review slices) error = %v", err)
+	}
+	if err := store.SaveArtifact(ctx, task.Namespace, task.Name, security.ArtifactSlices, "application/json", data); err != nil {
+		t.Fatalf("SaveArtifact(slices) error = %v", err)
+	}
+	for _, slice := range artifact.Slices {
+		_, contextJSON, _ := testReviewContext(t, slice.ID, reviewSlicePaths(slice)...)
+		if err := store.SaveArtifact(ctx, task.Namespace, task.Name, security.ReviewContextArtifactName(slice.ID), "application/json", []byte(contextJSON)); err != nil {
+			t.Fatalf("SaveArtifact(review context %s) error = %v", slice.ID, err)
+		}
+	}
+}
+
+func bindReviewSliceContext(t *testing.T, slice *storepkg.ReviewSlice) security.ReviewContextManifest {
+	t.Helper()
+	manifest, contextJSON, digest := testReviewContext(t, slice.ID, reviewSlicePaths(*slice)...)
+	slice.ReviewContextJSON = contextJSON
+	slice.ReviewContextHash = digest
+	return manifest
+}
+
+func saveFindingsTaskResult(
+	t *testing.T,
+	store *sqlitestore.Store,
+	task *corev1alpha1.Task,
+	repositoryScan, scanID, policyDigest, contextDigest, sliceID string,
+	findings security.FindingsV2Artifact,
+) {
+	t.Helper()
+	_ = repositoryScan
+	_ = scanID
+	_ = policyDigest
+	_ = contextDigest
+	_ = sliceID
+	data, err := json.Marshal(findings)
+	if err != nil {
+		t.Fatalf("json.Marshal(findings artifact) error = %v", err)
+	}
+	if err := store.SaveArtifact(context.Background(), task.Namespace, task.Name, security.ArtifactFindingsV2, "application/json", data); err != nil {
+		t.Fatalf("SaveArtifact(findings) error = %v", err)
+	}
+	task.Status.ResultRef = &corev1alpha1.ResultReference{Available: true}
+}
+
+type reviewResultRetryFixture struct {
+	ctx        context.Context
+	store      *sqlitestore.Store
+	client     client.Client
+	reconciler *RepositoryScanReconciler
+	scan       *corev1alpha1.RepositoryScan
+	run        *storepkg.ScanRun
+	slice      *storepkg.ReviewSlice
+	sourceTask *corev1alpha1.Task
+}
+
+func newReviewResultRetryFixture(t *testing.T) *reviewResultRetryFixture {
+	t.Helper()
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "retry-scan",
+			Namespace:  defaultNS,
+			UID:        types.UID("retry-scan-uid"),
+			Generation: 1,
+		},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:          "https://github.com/example/repo",
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "scan-reviewer"},
+		},
+		Status: corev1alpha1.RepositoryScanStatus{Phase: repositoryScanPhaseScanning, LastScanID: "scan_retry_result"},
+	}
+	policyDigest := security.ScannerPolicyDigest(security.ScannerPolicy{})
+	run := &storepkg.ScanRun{
+		ID:             "scan_retry_result",
+		Namespace:      defaultNS,
+		RepositoryScan: scan.Name,
+		TaskName:       "retry-scan-initial-threat-model",
+		Mode:           "initial",
+		Phase:          scanRunPhaseRunning,
+		PolicyDigest:   policyDigest,
+		StartedAt:      time.Now().Add(-time.Minute),
+	}
+	reserveScanRunForIngestionTest(t, ctx, securityStore, scan, run)
+	if err := securityStore.SaveThreatModel(ctx, &storepkg.ThreatModel{
+		Namespace:       defaultNS,
+		RepositoryScan:  scan.Name,
+		Content:         "# Threat model\n\nReview authentication boundaries.",
+		Source:          "generated",
+		GeneratedByScan: run.ID,
+	}); err != nil {
+		t.Fatalf("SaveThreatModel() error = %v", err)
+	}
+	reviewSlice := &storepkg.ReviewSlice{
+		SchemaVersion:  1,
+		ID:             "slice_api",
+		Namespace:      defaultNS,
+		RepositoryScan: scan.Name,
+		Source:         "deterministic-go-package",
+		Title:          "Go package internal/api",
+		Summary:        "API handlers",
+		Kind:           "package",
+		OwnedFiles:     []storepkg.ReviewSliceFile{{Path: "internal/api/security.go", Reason: "source"}},
+		Confidence:     "high",
+		Status:         reviewSliceStatusPending,
+		LastScanRunID:  run.ID,
+	}
+	bindReviewSliceContext(t, reviewSlice)
+	if err := securityStore.UpsertReviewSlice(ctx, reviewSlice); err != nil {
+		t.Fatalf("UpsertReviewSlice() error = %v", err)
+	}
+
+	sourceTask := &corev1alpha1.Task{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "Task"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "retry-scan-review-source",
+			Namespace: defaultNS,
+			Labels: map[string]string{
+				labels.LabelManaged:         "true",
+				labels.LabelCreatedBy:       "repository-security",
+				labels.LabelSecurityTarget:  labels.SelectorValue(scan.Name),
+				labels.LabelSecurityScanID:  run.ID,
+				labels.LabelSecurityMode:    run.Mode,
+				labels.LabelSecurityStage:   security.StageReview,
+				labels.LabelSecuritySliceID: reviewSlice.ID,
+			},
+			Annotations: map[string]string{labels.AnnotationSecurityReviewAttempt: "0"},
+		},
+		Spec: corev1alpha1.TaskSpec{
+			Type:     corev1alpha1.TaskTypeAgent,
+			AgentRef: &corev1alpha1.AgentReference{Name: "poison-source-agent"},
+			Prompt:   "POISON SOURCE PROMPT MUST NOT BE COPIED",
+		},
+		Status: corev1alpha1.TaskStatus{
+			Phase:     corev1alpha1.TaskPhaseSucceeded,
+			ResultRef: &corev1alpha1.ResultReference{Available: true},
+		},
+	}
+	if err := controllerutil.SetControllerReference(scan, sourceTask, scheme); err != nil {
+		t.Fatalf("SetControllerReference() error = %v", err)
+	}
+	if err := securityStore.SaveArtifact(ctx, sourceTask.Namespace, sourceTask.Name, security.ArtifactFindingsV2, "application/json", []byte(`{"not":"a findings artifact"`)); err != nil {
+		t.Fatalf("SaveArtifact(malformed) error = %v", err)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.RepositoryScan{}).
+		WithObjects(scan, sourceTask).
+		Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore, ResultStore: securityStore, ArtifactStore: securityStore}
+
+	return &reviewResultRetryFixture{
+		ctx:        ctx,
+		store:      securityStore,
+		client:     cl,
+		reconciler: reconciler,
+		scan:       scan,
+		run:        run,
+		slice:      reviewSlice,
+		sourceTask: sourceTask,
+	}
+}
+
+func (f *reviewResultRetryFixture) retryTaskName() string {
+	return security.ScanStageRetryTaskName(f.scan.Name, f.run.ID, security.StageReview, f.slice.ID, securityReviewRetryAttempt)
+}
+
+func (f *reviewResultRetryFixture) getRetryTask(t *testing.T) *corev1alpha1.Task {
+	t.Helper()
+	task := &corev1alpha1.Task{}
+	if err := f.client.Get(f.ctx, client.ObjectKey{Namespace: defaultNS, Name: f.retryTaskName()}, task); err != nil {
+		t.Fatalf("Get(retry Task) error = %v", err)
+	}
+	return task
+}
+
+func TestIngestReviewTaskCreatesOneControllerRebuiltRetry(t *testing.T) {
+	fixture := newReviewResultRetryFixture(t)
+	if err := fixture.reconciler.ingestScanTask(fixture.ctx, fixture.scan, fixture.sourceTask); err != nil {
+		t.Fatalf("ingestScanTask(source) error = %v", err)
+	}
+
+	retryTask := fixture.getRetryTask(t)
+	if retryTask.Annotations[labels.AnnotationSecurityReviewAttempt] != "1" {
+		t.Fatalf("retry attempt annotation = %q, want 1", retryTask.Annotations[labels.AnnotationSecurityReviewAttempt])
+	}
+	if !metav1.IsControlledBy(retryTask, fixture.scan) {
+		t.Fatalf("retry owner references = %#v, want RepositoryScan controller", retryTask.OwnerReferences)
+	}
+	if retryTask.Spec.AgentRef == nil || retryTask.Spec.AgentRef.Name != fixture.scan.Spec.AnalysisAgentRef.Name {
+		t.Fatalf("retry AgentRef = %#v, want controller-rebuilt %q", retryTask.Spec.AgentRef, fixture.scan.Spec.AnalysisAgentRef.Name)
+	}
+	if strings.Contains(retryTask.Spec.Prompt, "POISON SOURCE PROMPT") ||
+		!strings.Contains(retryTask.Spec.Prompt, "Trusted mapper review context for slice_api") ||
+		!strings.Contains(retryTask.Spec.Prompt, "only automatic result retry") {
+		t.Fatalf("retry prompt was not rebuilt from trusted context: %q", retryTask.Spec.Prompt)
+	}
+	if retryTask.Spec.Workspace == nil || retryTask.Spec.Workspace.Intent != corev1alpha1.WorkspaceIntentRead || len(retryTask.Spec.Env) != 0 {
+		t.Fatalf("retry workspace/env = %#v/%#v, want read workspace and empty env", retryTask.Spec.Workspace, retryTask.Spec.Env)
+	}
+
+	run, err := fixture.store.GetScanRun(fixture.ctx, defaultNS, fixture.run.ID)
+	if err != nil {
+		t.Fatalf("GetScanRun() error = %v", err)
+	}
+	if run.Phase != scanRunPhaseRunning || run.ErrorMessage != "" || !strings.Contains(run.Summary, "Retrying review slice") {
+		t.Fatalf("run after retry creation = %#v, want running retry state", run)
+	}
+	reviewSlice, err := fixture.store.GetReviewSlice(fixture.ctx, defaultNS, fixture.scan.Name, fixture.slice.ID)
+	if err != nil {
+		t.Fatalf("GetReviewSlice() error = %v", err)
+	}
+	if reviewSlice.Status != reviewSliceStatusPending {
+		t.Fatalf("review slice status = %q, want pending during retry", reviewSlice.Status)
+	}
+
+	if err := fixture.reconciler.ingestScanTask(fixture.ctx, fixture.scan, fixture.sourceTask); err != nil {
+		t.Fatalf("second ingestScanTask(source) error = %v", err)
+	}
+	var tasks corev1alpha1.TaskList
+	if err := fixture.client.List(fixture.ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
+		t.Fatalf("List(Tasks) error = %v", err)
+	}
+	if len(tasks.Items) != 2 {
+		t.Fatalf("len(tasks) = %d, want source plus one deterministic retry", len(tasks.Items))
+	}
+	progress := fixture.reconciler.collectScanRunProgress(fixture.ctx, tasks.Items)
+	if progress.reviewCount != 1 || progress.reviewSucceeded != 0 || !progress.hasActive {
+		t.Fatalf("logical retry progress = %#v, want one active review slice", progress)
+	}
+}
+
+func TestIngestReviewTaskAcceptsRetryOnceAndCountsOneLogicalSlice(t *testing.T) {
+	fixture := newReviewResultRetryFixture(t)
+	if err := fixture.reconciler.ingestScanTask(fixture.ctx, fixture.scan, fixture.sourceTask); err != nil {
+		t.Fatalf("ingestScanTask(source) error = %v", err)
+	}
+	retryTask := fixture.getRetryTask(t)
+	findings := security.FindingsV2Artifact{
+		SchemaVersion: security.SchemaVersionFindingsV2,
+		Repository: security.FindingsV2Repository{
+			RepoURL: fixture.scan.Spec.RepoURL,
+			Branch:  "main",
+		},
+		Scan:     security.FindingsV2Scan{Mode: fixture.run.Mode, SliceID: fixture.slice.ID, Summary: "retry completed"},
+		Findings: []security.FindingsV2Finding{},
+	}
+	saveFindingsTaskResult(
+		t, fixture.store, retryTask, fixture.scan.Name, fixture.run.ID, fixture.run.PolicyDigest,
+		fixture.slice.ReviewContextHash, fixture.slice.ID, findings,
+	)
+	retryTask.Status.Phase = corev1alpha1.TaskPhaseSucceeded
+	retryTask.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+	if err := fixture.client.Update(fixture.ctx, retryTask); err != nil {
+		t.Fatalf("Update(retry Task) error = %v", err)
+	}
+
+	if err := fixture.reconciler.ingestOwnedTasks(fixture.ctx, fixture.scan); err != nil {
+		t.Fatalf("ingestOwnedTasks() error = %v", err)
+	}
+	run, err := fixture.store.GetScanRun(fixture.ctx, defaultNS, fixture.run.ID)
+	if err != nil {
+		t.Fatalf("GetScanRun() error = %v", err)
+	}
+	if run.Phase != scanRunPhaseSucceeded || run.ReviewedSliceCount != 1 || run.ErrorMessage != "" {
+		t.Fatalf("run after successful retry = %#v, want one succeeded review slice", run)
+	}
+	reviewSlice, err := fixture.store.GetReviewSlice(fixture.ctx, defaultNS, fixture.scan.Name, fixture.slice.ID)
+	if err != nil {
+		t.Fatalf("GetReviewSlice() error = %v", err)
+	}
+	if reviewSlice.Status != reviewSliceStatusReviewed {
+		t.Fatalf("review slice status = %q, want reviewed", reviewSlice.Status)
+	}
+
+	if err := fixture.reconciler.ingestOwnedTasks(fixture.ctx, fixture.scan); err != nil {
+		t.Fatalf("second ingestOwnedTasks() error = %v", err)
+	}
+	run, err = fixture.store.GetScanRun(fixture.ctx, defaultNS, fixture.run.ID)
+	if err != nil {
+		t.Fatalf("GetScanRun(second) error = %v", err)
+	}
+	if run.ReviewedSliceCount != 1 || run.Phase != scanRunPhaseSucceeded {
+		t.Fatalf("idempotent run = %#v, want one succeeded review slice", run)
+	}
+	var tasks corev1alpha1.TaskList
+	if err := fixture.client.List(fixture.ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
+		t.Fatalf("List(Tasks) error = %v", err)
+	}
+	progress := fixture.reconciler.collectScanRunProgress(fixture.ctx, tasks.Items)
+	if progress.reviewCount != 1 || progress.reviewSucceeded != 1 {
+		t.Fatalf("logical completed progress = %#v, want 1/1", progress)
+	}
+}
+
+func TestIngestReviewTaskMalformedRetryExhaustsWithoutAttemptTwo(t *testing.T) {
+	fixture := newReviewResultRetryFixture(t)
+	if err := fixture.reconciler.ingestScanTask(fixture.ctx, fixture.scan, fixture.sourceTask); err != nil {
+		t.Fatalf("ingestScanTask(source) error = %v", err)
+	}
+	retryTask := fixture.getRetryTask(t)
+	if err := fixture.store.SaveArtifact(fixture.ctx, retryTask.Namespace, retryTask.Name, security.ArtifactFindingsV2, "application/json", []byte(`{"still":"invalid"`)); err != nil {
+		t.Fatalf("SaveArtifact(retry malformed) error = %v", err)
+	}
+	retryTask.Status.Phase = corev1alpha1.TaskPhaseSucceeded
+	retryTask.Status.ResultRef = &corev1alpha1.ResultReference{Available: true}
+	retryTask.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+	if err := fixture.client.Update(fixture.ctx, retryTask); err != nil {
+		t.Fatalf("Update(retry Task) error = %v", err)
+	}
+
+	if err := fixture.reconciler.ingestOwnedTasks(fixture.ctx, fixture.scan); err != nil {
+		t.Fatalf("ingestOwnedTasks() error = %v", err)
+	}
+	run, err := fixture.store.GetScanRun(fixture.ctx, defaultNS, fixture.run.ID)
+	if err != nil {
+		t.Fatalf("GetScanRun() error = %v", err)
+	}
+	if run.Phase != scanRunPhaseFailed || !strings.Contains(run.ErrorMessage, security.ArtifactFindingsV2) {
+		t.Fatalf("run after malformed retry = %#v, want terminal parse failure", run)
+	}
+	reviewSlice, err := fixture.store.GetReviewSlice(fixture.ctx, defaultNS, fixture.scan.Name, fixture.slice.ID)
+	if err != nil {
+		t.Fatalf("GetReviewSlice() error = %v", err)
+	}
+	if reviewSlice.Status != reviewSliceStatusFailed {
+		t.Fatalf("review slice status = %q, want failed", reviewSlice.Status)
+	}
+	var tasks corev1alpha1.TaskList
+	if err := fixture.client.List(fixture.ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
+		t.Fatalf("List(Tasks) error = %v", err)
+	}
+	if len(tasks.Items) != 2 {
+		t.Fatalf("len(tasks) = %d, want no attempt two", len(tasks.Items))
+	}
+	if err := fixture.reconciler.ingestOwnedTasks(fixture.ctx, fixture.scan); err != nil {
+		t.Fatalf("second ingestOwnedTasks() error = %v", err)
+	}
+	if err := fixture.client.List(fixture.ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
+		t.Fatalf("List(Tasks second) error = %v", err)
+	}
+	if len(tasks.Items) != 2 {
+		t.Fatalf("len(tasks after repeat) = %d, want exhausted retry budget", len(tasks.Items))
+	}
+}
+
+func TestIngestReviewTaskRejectsConflictingDeterministicRetry(t *testing.T) {
+	fixture := newReviewResultRetryFixture(t)
+	conflict := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: fixture.retryTaskName(), Namespace: defaultNS}}
+	if err := fixture.client.Create(fixture.ctx, conflict); err != nil {
+		t.Fatalf("Create(conflicting retry) error = %v", err)
+	}
+
+	err := fixture.reconciler.ingestScanTask(fixture.ctx, fixture.scan, fixture.sourceTask)
+	if err == nil || !strings.Contains(err.Error(), "conflicts with the expected retry identity") {
+		t.Fatalf("ingestScanTask(source) error = %v, want deterministic-name conflict", err)
+	}
+	run, getErr := fixture.store.GetScanRun(fixture.ctx, defaultNS, fixture.run.ID)
+	if getErr != nil {
+		t.Fatalf("GetScanRun() error = %v", getErr)
+	}
+	if run.Phase != scanRunPhaseRunning || run.ErrorMessage != "" {
+		t.Fatalf("run after collision = %#v, want unchanged active run", run)
+	}
+}
+
+func TestIngestReviewTaskRejectsInvalidAttemptIdentityWithoutRetry(t *testing.T) {
+	tests := []struct {
+		name         string
+		annotation   string
+		useRetryName bool
+	}{
+		{name: "malformed", annotation: "not-a-number"},
+		{name: "negative", annotation: "-1"},
+		{name: "out of range", annotation: "2"},
+		{name: "retry attempt on source name", annotation: "1"},
+		{name: "initial attempt on retry name", annotation: "0", useRetryName: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newReviewResultRetryFixture(t)
+			fixture.sourceTask.Annotations[labels.AnnotationSecurityReviewAttempt] = tt.annotation
+			if tt.useRetryName {
+				fixture.sourceTask.Name = fixture.retryTaskName()
+			}
+
+			if err := fixture.reconciler.ingestScanTask(fixture.ctx, fixture.scan, fixture.sourceTask); err != nil {
+				t.Fatalf("ingestScanTask() error = %v", err)
+			}
+			run, err := fixture.store.GetScanRun(fixture.ctx, defaultNS, fixture.run.ID)
+			if err != nil {
+				t.Fatalf("GetScanRun() error = %v", err)
+			}
+			if run.Phase != scanRunPhaseFailed || !strings.Contains(run.ErrorMessage, "invalid security review attempt identity") {
+				t.Fatalf("run = %#v, want invalid attempt failure", run)
+			}
+			var tasks corev1alpha1.TaskList
+			if err := fixture.client.List(fixture.ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
+				t.Fatalf("List(Tasks) error = %v", err)
+			}
+			if len(tasks.Items) != 1 {
+				t.Fatalf("len(tasks) = %d, want no retry", len(tasks.Items))
+			}
+		})
+	}
+}
+
+func TestIngestReviewTaskResultRetryEligibility(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*reviewResultRetryFixture)
+		wantRetry bool
+		wantError string
+	}{
+		{
+			name: "result reference unavailable",
+			mutate: func(f *reviewResultRetryFixture) {
+				f.sourceTask.Status.ResultRef = nil
+			},
+			wantRetry: true,
+		},
+		{
+			name: "result missing after available reference",
+			mutate: func(f *reviewResultRetryFixture) {
+				f.sourceTask.Name = "retry-scan-review-result-missing"
+			},
+			wantRetry: true,
+		},
+		{
+			name: "artifact store unavailable",
+			mutate: func(f *reviewResultRetryFixture) {
+				f.reconciler.ArtifactStore = nil
+			},
+			wantError: "artifact store is not configured",
+		},
+		{
+			name: "trusted context corrupt",
+			mutate: func(f *reviewResultRetryFixture) {
+				f.slice.ReviewContextJSON = `{"schemaVersion":1,"sliceId":"wrong"}`
+				f.slice.ReviewContextHash = "sha256:wrong"
+				if err := f.store.UpsertReviewSlice(f.ctx, f.slice); err != nil {
+					t.Fatalf("UpsertReviewSlice(corrupt) error = %v", err)
+				}
+			},
+			wantError: "trusted review context",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newReviewResultRetryFixture(t)
+			tt.mutate(fixture)
+			if err := fixture.reconciler.ingestScanTask(fixture.ctx, fixture.scan, fixture.sourceTask); err != nil {
+				t.Fatalf("ingestScanTask() error = %v", err)
+			}
+
+			var tasks corev1alpha1.TaskList
+			if err := fixture.client.List(fixture.ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
+				t.Fatalf("List(Tasks) error = %v", err)
+			}
+			wantTasks := 1
+			if tt.wantRetry {
+				wantTasks = 2
+			}
+			if len(tasks.Items) != wantTasks {
+				t.Fatalf("len(tasks) = %d, want %d", len(tasks.Items), wantTasks)
+			}
+			run, err := fixture.store.GetScanRun(fixture.ctx, defaultNS, fixture.run.ID)
+			if err != nil {
+				t.Fatalf("GetScanRun() error = %v", err)
+			}
+			if tt.wantRetry {
+				if run.Phase != scanRunPhaseRunning || run.ErrorMessage != "" {
+					t.Fatalf("retryable run = %#v, want active", run)
+				}
+				return
+			}
+			if run.Phase != scanRunPhaseFailed || !strings.Contains(run.ErrorMessage, tt.wantError) {
+				t.Fatalf("non-retryable run = %#v, want failure containing %q", run, tt.wantError)
+			}
+		})
+	}
+}
+
 func TestIngestMapperTaskPersistsReviewSlices(t *testing.T) {
 	ctx := context.Background()
 	store := setupControllerSQLiteStore(t)
@@ -490,13 +1179,7 @@ func TestIngestMapperTaskPersistsReviewSlices(t *testing.T) {
 			Status:         reviewSliceStatusPending,
 		}},
 	}
-	data, err := json.Marshal(artifact)
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
-	if err := store.SaveArtifact(ctx, task.Namespace, task.Name, security.ArtifactSlices, "application/json", data); err != nil {
-		t.Fatalf("SaveArtifact(slices) error = %v", err)
-	}
+	saveMapperArtifactWithContexts(t, store, task, artifact)
 
 	if err := reconciler.ingestScanTask(ctx, scan, task); err != nil {
 		t.Fatalf("ingestScanTask() error = %v", err)
@@ -507,6 +1190,16 @@ func TestIngestMapperTaskPersistsReviewSlices(t *testing.T) {
 	}
 	if got.LastScanRunID != "scan_mapper" || got.Namespace != defaultNS {
 		t.Fatalf("review slice = %#v, want scan metadata", got)
+	}
+	if got.ReviewContextJSON == "" || got.ReviewContextHash == "" {
+		t.Fatalf("review slice context = %q/%q, want persisted mapper context", got.ReviewContextJSON, got.ReviewContextHash)
+	}
+	parsedContext, digest, err := security.ParseTrustedReviewContextManifest([]byte(got.ReviewContextJSON))
+	if err != nil {
+		t.Fatalf("ParseTrustedReviewContextManifest(stored) error = %v", err)
+	}
+	if parsedContext.SliceID != got.ID || digest != got.ReviewContextHash {
+		t.Fatalf("stored review context = slice %q digest %q, want %q/%q", parsedContext.SliceID, digest, got.ID, got.ReviewContextHash)
 	}
 	run, err := store.GetScanRun(ctx, defaultNS, "scan_mapper")
 	if err != nil {
@@ -587,13 +1280,7 @@ func TestIngestMapperTaskSelectsIncrementalSlicesFromChangedFiles(t *testing.T) 
 			},
 		},
 	}
-	data, err := json.Marshal(artifact)
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
-	if err := store.SaveArtifact(ctx, task.Namespace, task.Name, security.ArtifactSlices, "application/json", data); err != nil {
-		t.Fatalf("SaveArtifact(slices) error = %v", err)
-	}
+	saveMapperArtifactWithContexts(t, store, task, artifact)
 	reserveScanRunForIngestionTest(t, ctx, store, scan, &storepkg.ScanRun{
 		ID:             "scan_incremental_mapper",
 		Namespace:      defaultNS,
@@ -687,13 +1374,7 @@ func TestMapperReingestPreservesReviewedSliceForCurrentRun(t *testing.T) {
 			Status:         reviewSliceStatusPending,
 		}},
 	}
-	mapperData, err := json.Marshal(mapperArtifact)
-	if err != nil {
-		t.Fatalf("json.Marshal(mapperArtifact) error = %v", err)
-	}
-	if err := store.SaveArtifact(ctx, mapperTask.Namespace, mapperTask.Name, security.ArtifactSlices, "application/json", mapperData); err != nil {
-		t.Fatalf("SaveArtifact(slices) error = %v", err)
-	}
+	saveMapperArtifactWithContexts(t, store, mapperTask, mapperArtifact)
 
 	reviewTask := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1052,6 +1733,55 @@ func TestCreateScanRunLeavesPendingRunAfterTaskAdmissionError(t *testing.T) {
 	}
 }
 
+func TestCreateScanRunConcurrentReconcilesCreateOnePipeline(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta:   metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{Name: "concurrent-security", Namespace: defaultNS, UID: types.UID("concurrent-security-uid"), Generation: 1},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:          "https://github.com/example/repo",
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "scan-reviewer"},
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.RepositoryScan{}).WithObjects(scan).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore}
+
+	start := make(chan struct{})
+	results := make(chan error, 4)
+	for range 4 {
+		go func() {
+			<-start
+			results <- reconciler.createScanRun(ctx, scan, "manual", "base", "")
+		}()
+	}
+	close(start)
+	for range 4 {
+		if err := <-results; err != nil {
+			t.Fatalf("createScanRun() error = %v", err)
+		}
+	}
+
+	var tasks corev1alpha1.TaskList
+	if err := cl.List(ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
+		t.Fatalf("List(Task) error = %v", err)
+	}
+	if len(tasks.Items) != 1 || taskSecurityStage(&tasks.Items[0]) != security.StageThreatModel {
+		t.Fatalf("tasks = %#v, want one threat-model task", tasks.Items)
+	}
+	runs, _, err := securityStore.ListScanRuns(ctx, defaultNS, scan.Name, 10, "")
+	if err != nil {
+		t.Fatalf("ListScanRuns() error = %v", err)
+	}
+	if len(runs) != 1 || runs[0].Phase != scanRunPhasePending {
+		t.Fatalf("runs = %#v, want one pending run", runs)
+	}
+}
+
 func TestProgressLatestScanRunStartsReviewTasksForPendingSlices(t *testing.T) {
 	ctx := context.Background()
 	store := setupControllerSQLiteStore(t)
@@ -1317,6 +2047,7 @@ func TestProgressLatestScanRunRetriesPendingSlicesWithoutTasks(t *testing.T) {
 			LastScanRunID:  "scan_partial_review",
 		},
 	} {
+		bindReviewSliceContext(t, &slice)
 		if err := store.UpsertReviewSlice(ctx, &slice); err != nil {
 			t.Fatalf("UpsertReviewSlice(%s) error = %v", slice.ID, err)
 		}
@@ -2802,7 +3533,7 @@ func TestCreateScanRunTreatsLegacyTaskAsActiveBlocker(t *testing.T) {
 		Spec: corev1alpha1.TaskSpec{
 			Type:     corev1alpha1.TaskTypeAgent,
 			AgentRef: &scan.Spec.AnalysisAgentRef,
-			Prompt:   security.BuildThreatModelPrompt(scan, "initial", "", "", ""),
+			Prompt:   security.BuildThreatModelResultPrompt(scan, "initial", "", "", "", security.AgentResultBinding{RepositoryScan: scan.Name, ScanID: scanID}),
 			Timeout:  &timeout,
 			Priority: &priority,
 		},
@@ -3051,11 +3782,29 @@ func TestCreateScanRunRejectsConflictingRunWithDifferentHeadCommit(t *testing.T)
 }
 
 type patchIngestFixture struct {
-	store      *sqlitestore.Store
-	reconciler *RepositoryScanReconciler
-	scan       *corev1alpha1.RepositoryScan
-	finding    *storepkg.Finding
-	proposal   *storepkg.PatchProposal
+	store            *sqlitestore.Store
+	publicationStore *patchPublicationStore
+	reconciler       *RepositoryScanReconciler
+	scan             *corev1alpha1.RepositoryScan
+	finding          *storepkg.Finding
+	proposal         *storepkg.PatchProposal
+}
+
+type patchPublicationStore struct {
+	storepkg.PublicationStore
+	publication *storepkg.Publication
+	err         error
+}
+
+func (s *patchPublicationStore) GetPublication(_ context.Context, id string) (*storepkg.Publication, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.publication == nil || s.publication.ID != id {
+		return nil, storepkg.ErrNotFound
+	}
+	copyValue := *s.publication
+	return &copyValue, nil
 }
 
 func newPatchIngestFixture(t *testing.T, id string) patchIngestFixture {
@@ -3071,15 +3820,24 @@ func newPatchIngestFixtureWithSourceRun(t *testing.T, id, sourceScanRunID string
 	findingID := "fnd_patch_" + id
 	taskName := "kaset-patch-" + id
 	branch := "orka/security/" + findingID
+	publicationStore := &patchPublicationStore{}
 	fixture := patchIngestFixture{
-		store: securityStore,
+		store:            securityStore,
+		publicationStore: publicationStore,
 		reconciler: &RepositoryScanReconciler{
-			SecurityStore: securityStore,
-			ArtifactStore: securityStore,
-			ResultStore:   securityStore,
+			SecurityStore:    securityStore,
+			ArtifactStore:    securityStore,
+			ResultStore:      securityStore,
+			PublicationStore: publicationStore,
 		},
 		scan: &corev1alpha1.RepositoryScan{
 			ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
+			Spec: corev1alpha1.RepositoryScanSpec{
+				RepoURL:      "https://github.com/example/kaset",
+				ForkRepo:     "https://github.com/example/kaset",
+				Branch:       "main",
+				PRBaseBranch: "main",
+			},
 		},
 		finding: &storepkg.Finding{
 			ID:               findingID,
@@ -3120,10 +3878,13 @@ func newPatchIngestFixtureWithSourceRun(t *testing.T, id, sourceScanRunID string
 func patchTaskForFixture(fixture patchIngestFixture, resultAvailable bool) *corev1alpha1.Task {
 	diffName := fmt.Sprintf("security-patch-%s.diff", fixture.finding.ID)
 	summaryName := fmt.Sprintf("security-patch-%s.json", fixture.finding.ID)
-	return &corev1alpha1.Task{
+	remoteBeforeSHA := ""
+	headSHA := strings.Repeat("b", 40)
+	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fixture.proposal.TaskName,
 			Namespace: fixture.proposal.Namespace,
+			UID:       types.UID("uid-" + fixture.proposal.TaskName),
 			Labels: map[string]string{
 				labels.LabelSecurityTarget:    fixture.scan.Name,
 				labels.LabelSecurityFindingID: fixture.finding.ID,
@@ -3132,17 +3893,80 @@ func patchTaskForFixture(fixture patchIngestFixture, resultAvailable bool) *core
 			},
 		},
 		Spec: corev1alpha1.TaskSpec{
+			Type:   corev1alpha1.TaskTypeAgent,
 			Prompt: fmt.Sprintf("REQUIRED_SECURITY_ARTIFACTS: %s, %s\n", diffName, summaryName),
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
-				Workspace: &corev1alpha1.WorkspaceConfig{
-					PushBranch: fixture.proposal.Branch,
-				},
+			Workspace: &corev1alpha1.WorkspaceConfig{
+				Intent:             corev1alpha1.WorkspaceIntentWrite,
+				GitRepo:            fixture.scan.Spec.RepoURL,
+				PublicationGitRepo: fixture.scan.Spec.ForkRepo,
+				PushBranch:         fixture.proposal.Branch,
+				ExpectedRemoteSHA:  remoteBeforeSHA,
+				PRBaseBranch:       fixture.scan.Spec.PRBaseBranch,
+				CreatePR:           true,
 			},
 		},
 		Status: corev1alpha1.TaskStatus{
 			Phase:     corev1alpha1.TaskPhaseSucceeded,
 			ResultRef: &corev1alpha1.ResultReference{Available: resultAvailable},
+			Execution: &corev1alpha1.TaskExecutionStatus{Attempt: 1, PromptID: "prompt-" + fixture.proposal.TaskName},
+			Delivery: &corev1alpha1.TaskDeliveryStatus{
+				State:         corev1alpha1.TaskDeliveryStateVerifiedExact,
+				Outcome:       corev1alpha1.TaskDeliveryOutcomeVerifiedExact,
+				PublicationID: "publication-" + fixture.proposal.TaskName,
+				PublicationRepository: &corev1alpha1.RepositoryIdentity{
+					Provider: "github",
+					ID:       "github.com/example/kaset",
+				},
+				Branch:            fixture.proposal.Branch,
+				RemoteBeforeSHA:   &remoteBeforeSHA,
+				ExpectedCommitSHA: headSHA,
+				VerifiedRemoteSHA: headSHA,
+				ArtifactDigest:    "sha256:" + strings.Repeat("a", 64),
+				PRReceipt: &corev1alpha1.TaskPullRequestReceipt{
+					ID:         "github:101:42",
+					Number:     42,
+					URL:        fixture.scan.Spec.RepoURL + "/pull/42",
+					State:      "Open",
+					BaseBranch: fixture.scan.Spec.PRBaseBranch,
+					HeadBranch: fixture.proposal.Branch,
+					HeadSHA:    headSHA,
+				},
+			},
 		},
+	}
+	fixture.publicationStore.publication = patchPublicationForTask(fixture, task)
+	return task
+}
+
+func patchPublicationForTask(fixture patchIngestFixture, task *corev1alpha1.Task) *storepkg.Publication {
+	sourceSHA := strings.Repeat("1", 40)
+	headSHA := strings.Repeat("b", 40)
+	repositoryID := "github.com/example/kaset"
+	targetRef := "refs/heads/" + fixture.proposal.Branch
+	baseRef := "refs/heads/" + fixture.scan.Spec.PRBaseBranch
+	now := time.Now().UTC()
+	return &storepkg.Publication{
+		ID:                  publicationIDForTask(task),
+		Namespace:           task.Namespace,
+		Generation:          1,
+		TaskUID:             string(task.UID),
+		Attempt:             int64(task.Status.Execution.Attempt),
+		PromptID:            task.Status.Execution.PromptID,
+		SourceRepositoryID:  repositoryID,
+		SourceRef:           sourceSHA,
+		SourceBaselineSHA:   sourceSHA,
+		TargetRepositoryID:  repositoryID,
+		TargetRef:           targetRef,
+		Baseline:            storepkg.RemoteRefState{Absent: true},
+		ArtifactDigest:      "sha256:" + strings.Repeat("a", 64),
+		State:               storepkg.PublicationVerifiedExact,
+		PreparedReceipt:     &storepkg.PreparedPublicationReceipt{CommitSHA: headSHA},
+		PublishReceipt:      &storepkg.PublishOperationReceipt{TargetRepositoryID: repositoryID, TargetRef: targetRef, RemoteBefore: storepkg.RemoteRefState{Absent: true}, ExpectedCommitSHA: headSHA},
+		VerificationReceipt: &storepkg.PublicationVerificationReceipt{Outcome: storepkg.PublicationVerifiedExact, ExpectedCommitSHA: headSHA, ObservedRemote: storepkg.RemoteRefState{SHA: headSHA}},
+		PRIntent:            &storepkg.PullRequestIntent{BaseRepositoryID: repositoryID, BaseRef: baseRef, HeadRepositoryID: repositoryID, HeadRef: targetRef, PublicationGeneration: 1, ExpectedHeadSHA: headSHA},
+		PullRequestReceipt:  &storepkg.PullRequestOperationReceipt{IntentKey: "sha256:" + strings.Repeat("c", 64), ForgeID: "github:101:42", URL: fixture.scan.Spec.RepoURL + "/pull/42", State: "Open", HeadSHA: headSHA, ReconciledAt: now},
+		CreatedAt:           now,
+		UpdatedAt:           now,
 	}
 }
 
@@ -3217,7 +4041,7 @@ func TestIngestPatchTaskRejectsStaleSourceRunWithoutOccurrenceBindings(t *testin
 	assertPatchIngestState(t, fixture, "stale", findingStateOpen)
 }
 
-func TestIngestPatchTaskMarksPatchReadyAfterConfirmedPush(t *testing.T) {
+func TestIngestPatchTaskMarksPROpenAfterExactPublicationReceipt(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "ready")
 	diff := testPatchDiffHeader
@@ -3232,7 +4056,21 @@ func TestIngestPatchTaskMarksPatchReadyAfterConfirmedPush(t *testing.T) {
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {
 		t.Fatalf("ingestPatchTask() error = %v", err)
 	}
-	assertPatchIngestState(t, fixture, scanRunPhaseSucceeded, findingStatePatchReady)
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
+	proposals, err := fixture.store.ListPatchProposals(ctx, fixture.proposal.Namespace, fixture.finding.ID)
+	if err != nil {
+		t.Fatalf("ListPatchProposals() error = %v", err)
+	}
+	if len(proposals) != 1 || proposals[0].PRNumber == nil || *proposals[0].PRNumber != 42 || proposals[0].PRURL != fixture.scan.Spec.RepoURL+"/pull/42" {
+		t.Fatalf("proposal publication receipt = %#v, want PR #42", proposals)
+	}
+	updatedFinding, err := fixture.store.GetFinding(ctx, fixture.proposal.Namespace, fixture.finding.ID)
+	if err != nil {
+		t.Fatalf("GetFinding() error = %v", err)
+	}
+	if updatedFinding.PRNumber == nil || *updatedFinding.PRNumber != 42 || updatedFinding.PRURL != fixture.scan.Spec.RepoURL+"/pull/42" {
+		t.Fatalf("finding publication receipt = %#v, want PR #42", updatedFinding)
+	}
 }
 
 func TestIngestPatchTaskAcceptsDiffArtifactWithDifferentIndexFormatting(t *testing.T) {
@@ -3269,7 +4107,7 @@ func TestIngestPatchTaskAcceptsDiffArtifactWithDifferentIndexFormatting(t *testi
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {
 		t.Fatalf("ingestPatchTask() error = %v", err)
 	}
-	assertPatchIngestState(t, fixture, scanRunPhaseSucceeded, findingStatePatchReady)
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
 }
 
 func TestIngestPatchTaskAcceptsSubPathRelativeChangedFiles(t *testing.T) {
@@ -3288,7 +4126,92 @@ func TestIngestPatchTaskAcceptsSubPathRelativeChangedFiles(t *testing.T) {
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {
 		t.Fatalf("ingestPatchTask() error = %v", err)
 	}
-	assertPatchIngestState(t, fixture, scanRunPhaseSucceeded, findingStatePatchReady)
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
+}
+
+func TestIngestPatchTaskUsesDurablePublicationWhenTaskDeliveryReceiptIsMissing(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPatchIngestFixture(t, "task-receipt-missing")
+	diff := testPatchDiffHeader
+	savePatchArtifacts(t, fixture, diff, []string{"app.py"})
+	task := patchTaskForFixture(fixture, true)
+	task.Status.Delivery = nil
+
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, task); err != nil {
+		t.Fatalf("ingestPatchTask() error = %v", err)
+	}
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
+}
+
+func TestIngestPatchTaskRejectsMissingDurablePullRequestReceipt(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPatchIngestFixture(t, "durable-pr-receipt-missing")
+	diff := testPatchDiffHeader
+	savePatchArtifacts(t, fixture, diff, []string{"app.py"})
+	task := patchTaskForFixture(fixture, true)
+	fixture.publicationStore.publication.PullRequestReceipt = nil
+
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, task); err != nil {
+		t.Fatalf("ingestPatchTask() error = %v", err)
+	}
+	assertPatchIngestState(t, fixture, scanRunPhaseFailed, findingStateOpen)
+}
+
+func TestVerifiedSecurityPatchPublicationRejectsDurableRecordDrift(t *testing.T) {
+	const mismatchedBranchRef = "refs/heads/other"
+
+	tests := []struct {
+		name              string
+		mutateTask        func(*corev1alpha1.Task)
+		mutatePublication func(*storepkg.Publication)
+	}{
+		{name: "create PR not requested", mutateTask: func(task *corev1alpha1.Task) { task.Spec.Workspace.CreatePR = false }},
+		{name: "task UID mismatch", mutatePublication: func(publication *storepkg.Publication) { publication.TaskUID = "mismatched-task-uid" }},
+		{name: "publication not verified", mutatePublication: func(publication *storepkg.Publication) { publication.State = storepkg.PublicationVerifying }},
+		{name: "source repository mismatch", mutatePublication: func(publication *storepkg.Publication) { publication.SourceRepositoryID = "github.com/example/other" }},
+		{name: "source baseline mismatch", mutatePublication: func(publication *storepkg.Publication) { publication.SourceRef = strings.Repeat("2", 40) }},
+		{name: "target repository mismatch", mutatePublication: func(publication *storepkg.Publication) { publication.TargetRepositoryID = "github.com/example/other" }},
+		{name: "target ref mismatch", mutatePublication: func(publication *storepkg.Publication) { publication.TargetRef = mismatchedBranchRef }},
+		{name: "target baseline mismatch", mutatePublication: func(publication *storepkg.Publication) {
+			publication.Baseline = storepkg.RemoteRefState{SHA: strings.Repeat("2", 40)}
+		}},
+		{name: "prepared receipt missing", mutatePublication: func(publication *storepkg.Publication) { publication.PreparedReceipt = nil }},
+		{name: "publish target mismatch", mutatePublication: func(publication *storepkg.Publication) { publication.PublishReceipt.TargetRef = mismatchedBranchRef }},
+		{name: "verification head mismatch", mutatePublication: func(publication *storepkg.Publication) {
+			publication.VerificationReceipt.ObservedRemote.SHA = strings.Repeat("c", 40)
+		}},
+		{name: "PR intent base mismatch", mutatePublication: func(publication *storepkg.Publication) { publication.PRIntent.BaseRef = "refs/heads/release" }},
+		{name: "PR intent head mismatch", mutatePublication: func(publication *storepkg.Publication) { publication.PRIntent.HeadRef = mismatchedBranchRef }},
+		{name: "PR receipt missing", mutatePublication: func(publication *storepkg.Publication) { publication.PullRequestReceipt = nil }},
+		{name: "PR forge ID invalid", mutatePublication: func(publication *storepkg.Publication) {
+			publication.PullRequestReceipt.ForgeID = "github:101:not-a-number"
+		}},
+		{name: "PR URL mismatch", mutatePublication: func(publication *storepkg.Publication) {
+			publication.PullRequestReceipt.URL = "https://github.com/example/other/pull/42"
+		}},
+		{name: "PR not open", mutatePublication: func(publication *storepkg.Publication) { publication.PullRequestReceipt.State = "Closed" }},
+		{name: "PR head mismatch", mutatePublication: func(publication *storepkg.Publication) {
+			publication.PullRequestReceipt.HeadSHA = strings.Repeat("c", 40)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newPatchIngestFixture(t, strings.ReplaceAll(tt.name, " ", "-"))
+			task := patchTaskForFixture(fixture, true)
+			if tt.mutateTask != nil {
+				tt.mutateTask(task)
+			}
+			if tt.mutatePublication != nil {
+				tt.mutatePublication(fixture.publicationStore.publication)
+			}
+			if receipt, reason, err := fixture.reconciler.verifiedSecurityPatchPublication(context.Background(), fixture.scan, task, fixture.proposal.Branch); err != nil {
+				t.Fatalf("verifiedSecurityPatchPublication() error = %v", err)
+			} else if reason == "" {
+				t.Fatalf("verifiedSecurityPatchPublication() receipt = %#v, want rejection", receipt)
+			}
+		})
+	}
 }
 
 func TestIngestPatchTaskRejectsMissingDiffArtifact(t *testing.T) {
@@ -3327,7 +4250,7 @@ func TestIngestPatchTaskRejectsMissingDiffArtifactWhenEarlierDirectiveIsSpoofed(
 	assertPatchIngestState(t, fixture, scanRunPhaseFailed, findingStateOpen)
 }
 
-func TestIngestPatchTaskRejectsStaleDiffArtifact(t *testing.T) {
+func TestIngestPatchTaskIgnoresLegacyStructuredResultDiff(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "stale-diff")
 	actualDiff := strings.Join([]string{
@@ -3359,7 +4282,7 @@ func TestIngestPatchTaskRejectsStaleDiffArtifact(t *testing.T) {
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {
 		t.Fatalf("ingestPatchTask() error = %v", err)
 	}
-	assertPatchIngestState(t, fixture, scanRunPhaseFailed, findingStateOpen)
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
 }
 
 func TestIngestPatchTaskRejectsConfirmedPushWithoutArtifactContract(t *testing.T) {
@@ -3390,7 +4313,7 @@ func TestIngestPatchTaskRejectsMismatchedChangedFiles(t *testing.T) {
 		Files:      []string{"app.py", "extra.py"},
 		PushBranch: fixture.proposal.Branch,
 	})
-	savePatchArtifacts(t, fixture, diff, []string{"app.py"})
+	savePatchArtifacts(t, fixture, diff, []string{"extra.py"})
 
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {
 		t.Fatalf("ingestPatchTask() error = %v", err)
@@ -3398,7 +4321,7 @@ func TestIngestPatchTaskRejectsMismatchedChangedFiles(t *testing.T) {
 	assertPatchIngestState(t, fixture, scanRunPhaseFailed, findingStateOpen)
 }
 
-func TestIngestPatchTaskFailsSucceededTaskWhenPushFails(t *testing.T) {
+func TestIngestPatchTaskIgnoresLegacyStructuredResultPushError(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "failed")
 	savePatchStructuredResult(t, fixture, &common.StructuredResult{
@@ -3406,45 +4329,49 @@ func TestIngestPatchTaskFailsSucceededTaskWhenPushFails(t *testing.T) {
 		Diff:      testPatchDiffHeader,
 		PushError: "git push failed: remote rejected",
 	})
+	savePatchArtifacts(t, fixture, testPatchDiffHeader, []string{"app.py"})
 
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {
 		t.Fatalf("ingestPatchTask() error = %v", err)
 	}
-	assertPatchIngestState(t, fixture, scanRunPhaseFailed, findingStateOpen)
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
 }
 
-func TestIngestPatchTaskFailsSucceededTaskWithoutConfirmedPushBranch(t *testing.T) {
+func TestIngestPatchTaskIgnoresLegacyStructuredResultWithoutPushBranch(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "missing-push")
 	savePatchStructuredResult(t, fixture, &common.StructuredResult{
 		Summary: "patch created without confirmed push",
 		Diff:    testPatchDiffHeader,
 	})
+	savePatchArtifacts(t, fixture, testPatchDiffHeader, []string{"app.py"})
 
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {
 		t.Fatalf("ingestPatchTask() error = %v", err)
 	}
-	assertPatchIngestState(t, fixture, scanRunPhaseFailed, findingStateOpen)
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
 }
 
-func TestIngestPatchTaskKeepsPatchPendingUntilResultIsAvailable(t *testing.T) {
+func TestIngestPatchTaskDoesNotRequireLegacyResultReference(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "pending-ref")
+	savePatchArtifacts(t, fixture, testPatchDiffHeader, []string{"app.py"})
 
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, false)); err != nil {
 		t.Fatalf("ingestPatchTask() error = %v", err)
 	}
-	assertPatchIngestState(t, fixture, scanRunPhasePending, findingStatePatchPending)
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
 }
 
-func TestIngestPatchTaskKeepsPatchPendingUntilResultExists(t *testing.T) {
+func TestIngestPatchTaskDoesNotRequireLegacyResultRecord(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPatchIngestFixture(t, "pending-result")
+	savePatchArtifacts(t, fixture, testPatchDiffHeader, []string{"app.py"})
 
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {
 		t.Fatalf("ingestPatchTask() error = %v", err)
 	}
-	assertPatchIngestState(t, fixture, scanRunPhasePending, findingStatePatchPending)
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
 }
 
 func TestTerminalScanStatusRechecksLatestRunInsideStatusUpdate(t *testing.T) {

@@ -88,6 +88,7 @@ const (
 	AnnotationMonitorHeadSHA                = "orka.ai/monitor-head-sha"
 	AnnotationAgentReadOnly                 = "orka.ai/agent-read-only"
 	AnnotationAgentRuntimeAuthOnly          = "orka.ai/agent-runtime-auth-only"
+	AnnotationSecurityReviewAttempt         = "orka.ai/security-review-attempt"
 	AnnotationWorkspaceInitContainer        = "orka.ai/workspace-init-container"
 	AnnotationDisableCoordinationToolInject = "orka.ai/disable-coordination-tool-injection"
 	AnnotationApprovalDecidedAt             = "orka.ai/approval-decided-at"

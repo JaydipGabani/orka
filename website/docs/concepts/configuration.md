@@ -8,7 +8,7 @@ slug: /configuration
 
 ### Task
 
-The core work unit. Supports container commands, AI agent prompts, or external agent CLI runtimes.
+The core work unit. Supports container commands, native AI prompts, or ACP v2 coding-agent RuntimeSessions.
 
 ```yaml
 apiVersion: core.orka.ai/v1alpha1
@@ -45,6 +45,34 @@ spec:
   successfulRunsHistoryLimit: 3
   failedRunsHistoryLimit: 1
 ```
+
+For `type: agent`, repository and delivery policy belong at top-level `spec.workspace`:
+
+```yaml
+workspace:
+  intent: write
+  gitRepo: https://github.com/example/project.git
+  branch: main
+  readCredentialRef:
+    name: project-source-read
+  publicationGitRepo: https://github.com/example/project.git
+  publicationReadCredentialRef:
+    name: project-target-read
+  publicationCredentialRef:
+    name: project-target-write
+  forgeCredentialRef:
+    name: project-forge
+  pushBranch: orka/example-change
+  prBaseBranch: main
+  createPR: true
+```
+
+`readCredentialRef` is source-read only;
+`publicationReadCredentialRef` is target preflight/verification only;
+`publicationCredentialRef` is target-write only; and `forgeCredentialRef` is
+PR-reconciliation only. The controller freezes each selected Secret version and
+the credential broker releases it only to the Workspace/Publisher for the exact
+operation. None enters the ACP runtime process tree.
 
 ### Agent
 
@@ -300,7 +328,7 @@ See [Repository Monitors](../guides/repository-monitors.md) for the workflow, AP
 
 ### Execution
 
-Tasks and Agents both support `spec.execution` for harness wrapper pod runtime selection and placement. Agent Tasks can also set `Task.spec.execution.workspace` to request experimental workspace-backed execution through upstream `agent-sandbox` or Agent Substrate; see [Agent Sandbox Workspaces](agent-sandbox.md) and [Substrate Execution Workspaces](substrate.md).
+Native `ai` and container Tasks support `spec.execution` for worker Pod runtime selection and placement. Built-in ACP agent Tasks do not accept per-Task placement, custom resources, or `spec.execution.workspace`; reviewed RuntimePool profiles own those settings.
 
 ```yaml
 execution:
@@ -325,10 +353,10 @@ execution:
 | Field | Type | Description |
 |-------|------|-------------|
 | `runtimeClassName` | string | Selects a Kubernetes `RuntimeClass` such as `gvisor` or `kata-qemu` |
-| `nodeSelector` | map[string]string | Restricts harness wrapper pods to nodes with matching labels |
-| `tolerations` | list | Allows harness wrapper pods onto tainted runtime-specific node pools |
-| `affinity` | object | Adds Kubernetes affinity or anti-affinity rules for harness wrapper pods |
-| `workspace` | object | Experimental execution workspace request under `Task.spec.execution.workspace`. Use only on `type: agent` Tasks. |
+| `nodeSelector` | map[string]string | Restricts native worker Pods to nodes with matching labels |
+| `tolerations` | list | Allows native worker Pods onto tainted runtime-specific node pools |
+| `affinity` | object | Adds Kubernetes affinity or anti-affinity rules for native worker Pods |
+| `workspace` | object | Legacy experimental execution-workspace request. The ACP core runtime rejects it; use top-level `Task.spec.workspace`. |
 
 Resolution order:
 
@@ -339,49 +367,9 @@ Resolution order:
 
 #### Execution Workspace Requests
 
-`Task.spec.execution.workspace` is alpha support for durable, claimable agent workspaces backed by an existing upstream `agent-sandbox` or Agent Substrate installation. When `workspace.enabled: true`, the Task controller validates the request, resolves defaults, and passes workspace settings to the harness wrapper turn. Orka still creates the outer Kubernetes worker Job; the worker wrapper claims and waits for the upstream workspace, runs the configured agent runtime inside it, and then deletes or retains/releases the workspace according to `cleanupPolicy`.
+`Task.spec.execution.workspace` remains in the alpha API for earlier execution-workspace experiments, but the ACP core runtime rejects it and does not create a worker Job fallback. Use top-level `Task.spec.workspace` for the current verified source/publication contract.
 
-This field is distinct from `Task.spec.agentRuntime.workspace`, which configures the git checkout prepared for the agent runtime inside the current execution environment.
-
-```yaml
-apiVersion: core.orka.ai/v1alpha1
-kind: Task
-metadata:
-  name: coding-agent-task
-spec:
-  type: agent
-  agentRef:
-    name: claude-agent
-  prompt: "Continue implementing the feature in this session."
-  sessionRef:
-    name: feature-123
-    create: true
-  execution:
-    runtimeClassName: gvisor
-    workspace:
-      enabled: true
-      provider: agent-sandbox
-      templateRef:
-        name: coding-agent
-      reusePolicy: session
-      cleanupPolicy: retain
-```
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | boolean | `false` | Enables experimental workspace-backed execution. When false or omitted, sandbox settings are not propagated. |
-| `provider` | string | Controller default provider, defaulting to `agent-sandbox` | Workspace backend: `agent-sandbox` or `substrate`. |
-| `templateRef.name` | string | Controller default template, if configured | Workspace template name. Required when enabled unless the controller has a default template. |
-| `templateRef.namespace` | string | Task namespace | Namespace containing the workspace template. Orka propagates this value in its worker environment/request identity. |
-| `reusePolicy` | string | `none` | Reuse behavior: `none` or `session`. `session` requires `spec.sessionRef.name`. |
-| `cleanupPolicy` | string | Controller default cleanup policy, defaulting to `delete` | Cleanup behavior after execution: `delete` or `retain`. |
-| `boot` | boolean | `false` | Substrate only. Boots the actor from scratch on first resume. |
-| `poolRef.name` | string | empty | Substrate only. Places the workspace on a `SubstrateActorPool`; pooled workspaces currently require `cleanupPolicy: delete`. |
-| `poolRef.namespace` | string | Task namespace | Substrate only. Namespace containing the referenced pool. |
-| `snapshot` | object | empty | Substrate only, reserved. Non-empty restore/checkpoint settings are currently rejected. |
-| `hibernation` | object | empty | Substrate only, reserved. `processMode: resident` is currently rejected. |
-
-See [Agent Sandbox Workspaces](agent-sandbox.md) and [Substrate Execution Workspaces](substrate.md) for validation rules, controller flags, execution flow, and operational limitations.
+Upstream `agent-sandbox` and Agent Substrate integration are deferred behind the ACP v2 RuntimeSession seam. See [Agent Sandbox Workspaces](agent-sandbox.md) and [Agent Substrate Workspaces](substrate.md) for the required future invariants.
 
 #### SubstrateActorPool
 
@@ -413,6 +401,12 @@ spec:
 | `targetActors` | integer | `0` | Desired stateful actor count, capped at `1000`. References from Tasks or Tools require at least `1`. |
 | `targetWorkers` | integer | `0` | Intended physical worker budget. `targetActors` may exceed this value to express oversubscription. |
 | `precreateActors` | boolean | `false` | Pre-create deterministic warm actors up to `targetActors`. |
+
+For built-in OpenCode Agents, `spec.model.name` must use literal
+`provider/model` form and both `spec.model.contextWindow` and
+`spec.model.maxTokens` are required positive reviewed ceilings, with
+`contextWindow > maxTokens`. They are included in the immutable runtime profile;
+Orka does not discover or guess them from a mutable model catalog.
 
 ### Provider Fallback Chain
 
@@ -458,7 +452,9 @@ spec:
 
 ### Agent (with Runtime)
 
-Agent configuration for external CLI runtimes (Claude Code CLI, GitHub Copilot CLI, or Codex CLI).
+Agent configuration for the supported built-in ACP runtime profiles: Claude,
+Codex, Copilot, and OpenCode. Built-in ACP Agents do not reference provider Secrets; RuntimePools reach
+Vekil through the central authenticated provider proxy.
 
 ```yaml
 apiVersion: core.orka.ai/v1alpha1
@@ -466,14 +462,12 @@ kind: Agent
 metadata:
   name: claude-agent
 spec:
-  secretRef:
-    name: claude-credentials
   model:
     name: "claude-sonnet-4-20250514"
   systemPrompt:
     inline: "You are a senior software engineer."
   runtime:
-    type: claude         # or "copilot" / "codex"
+    type: claude         # or "codex" / "copilot"
     defaultMaxTurns: 50
     defaultAllowBash: true
     defaultAllowedTools:
@@ -482,6 +476,16 @@ spec:
       - Edit
       - Bash
 ```
+
+OpenCode Agents must omit `spec.systemPrompt` because the runtime cannot enforce
+Agent-level prompts; put instructions in each Task's `spec.prompt` instead. OpenCode
+model IDs use provider/model form, for example `openai/gpt-5.4`, and require reviewed
+`contextWindow` and `maxTokens` values.
+
+Operator-owned runtimes outside the built-in set can use `orka.harness.v2`
+`AgentRuntime` registration and conformance, but Task planning through
+`runtime.runtimeRef` remains fail-closed until the external v2 dispatcher
+support boundary is enabled.
 
 Agent runtime tasks reference an Agent with `runtime` configured:
 
@@ -494,14 +498,15 @@ spec:
   type: agent
   agentRef:
     name: claude-agent
-  prompt: "Review the code in this repo for security issues"
+  prompt: "Review the code in this repo for security issues. Do not modify files."
+  workspace:
+    intent: read
+    gitRepo: "https://github.com/example/repo.git"
+    branch: main
+    # readCredentialRef:
+    #   name: repository-read
+    # subPath: "services/api"
   agentRuntime:
-    workspace:
-      gitRepo: "https://github.com/example/repo.git"
-      branch: main
-      # gitSecretRef:
-      #   name: git-credentials
-      # subPath: "services/api"
     maxTurns: 100
     allowBash: true
     allowedTools:
@@ -684,17 +689,42 @@ Key configuration values for the Helm chart:
 |-----------|---------|-------------|
 | `controller.replicas` | `1` | Controller replicas |
 | `controller.image.repository` | `ghcr.io/orka-agents/orka` | Controller image |
-| `controller.watchNamespace` | `""` | Namespace scope (empty = cluster-wide) |
+| `controller.mode` | `harness-v2` | Static agent execution mode: `harness-v1` or `harness-v2`. Select v1 explicitly for a compatibility release; a release never serves both or changes mode in place. |
+| `controller.watchNamespace` | required | One non-empty namespace labeled `orka.ai/controller-mode` with the matching mode. Cluster-wide watch is rejected. |
 | `controller.enforceNamespaceIsolation` | `true` | Restrict namespace-bound API callers and default Helm RBAC to their namespace |
-| `controller.apiPort` | `8080` | REST API port |
+| `service.port` | `8080` | Controller Service port used by controller and Publisher in-cluster URLs. |
+| `controller.apiPort` | `8080` | Controller container listener and Service target port. |
 | `controller.metricsPort` | `8081` | Metrics endpoint port |
 | `controller.healthPort` | `8082` | Health probe port |
 | `controller.logLevel` | `info` | Log level (debug/info/warn/error) |
-| `controller.workspaceProvider.apiEnabled` | `false` | Enable provider-neutral `workspace.orka.ai` coordination controllers |
-| `controller.workspaceProvider.fakeProviderEnabled` | `false` | Enable the development-only fake workspace adapter |
-| `controller.workspaceProvider.classUseAdmission.enabled` | `false` | Install and enable fail-closed Task/Tool class-use admission; required when `apiEnabled=true` |
-| `controller.workspaceProvider.classUseAdmission.existingSecret` | `""` | Existing TLS Secret containing `tls.crt` and `tls.key` for the chart webhook Service DNS name |
-| `controller.workspaceProvider.classUseAdmission.caBundle` | `""` | Base64-encoded PEM CA bundle for the class-use ValidatingWebhookConfiguration |
+| `controller.acpRuntime.namespace` | `orka-runtimes` | Namespace for controller-owned RuntimePool workloads. |
+| `controller.acpRuntime.providerProxyNamespace` | `""` | Compatibility guard for the chart-managed provider proxy. Leave empty or set exactly to the Helm release namespace; any other nonempty value is rejected when the proxy is enabled. |
+| `controller.acpRuntime.codexImage` | `""` | Digest-pinned Codex ACP image; Tasks fail closed when empty. |
+| `controller.acpRuntime.claudeImage` | `""` | Digest-pinned Claude ACP image; Tasks fail closed when empty. |
+| `controller.acpRuntime.copilotImage` | `""` | Digest-pinned GitHub Copilot ACP image; Tasks fail closed when empty. |
+| `controller.acpRuntime.opencodeImage` | `""` | Digest-pinned OpenCode ACP image; Tasks fail closed when empty. |
+| `controller.acpRuntime.upgradeDrain.*` | enabled | Two-phase planned-upgrade admission closure and RuntimePool drain settings. |
+| `harnessV1.image.digest` | `""` | Required immutable wrapper image digest for a `harness-v1` release. |
+| `harnessV1.auth.existingSecret` | `""` | Dedicated v1 wrapper bearer/TLS Secret. Never share it with v2. |
+| `providerProxy.enabled` | `false` | Deploy the authenticated provider boundary in front of Vekil. Required for built-in ACP profiles. |
+| `providerProxy.upstreamBaseURL` | `http://vekil.vekil-system.svc:1337` | Exact supported Vekil upstream. An optional trailing slash is normalized; alternate hosts, namespaces, and ports are rejected to preserve the fixed NetworkPolicies. |
+| `providerProxy.auth.existingSecret` | `""` | Existing current/optional-overlap proxy bearer Secret. RuntimePool copies are controller-managed. |
+| `providerProxy.tokenReloadInterval` | `5s` | Atomic projected-Secret reload interval. Invalid generations fail readiness and forwarding closed. |
+| `publisher.enabled` | `true` | Deploy the separate clean-room Workspace/Publisher service. |
+| `publisher.image.repository` / `publisher.image.tag` | workspace publisher image / `latest` | Publisher image; production deployments should pin an immutable digest. |
+| `publisher.allowedSCMHosts` | `github.com` | Exact lower-case SCM hosts accepted by both Publisher validation and the SCM egress proxy. |
+| `publisher.auth.existingSecret` | `""` | Existing controller-auth/capability Secret for publisher operations. |
+| `publisher.auth.rolloutNonce` | `""` | Non-secret revision marker that restarts controller and Publisher during coordinated publisher-auth Secret rotation. |
+| `scmEgressProxy.enabled` | `true` | Require all Publisher Git and forge HTTPS traffic to traverse the dedicated authenticated proxy. The chart rejects `publisher.enabled=true` when this is false. |
+| `scmEgressProxy.auth.existingSecret` | `""` | Existing Secret shared only by Publisher and proxy. Its token must contain 32-256 RFC 3986 unreserved characters. |
+| `scmEgressProxy.auth.rolloutNonce` | `""` | Non-secret revision marker that restarts Publisher and SCM proxy during coordinated proxy-auth Secret rotation. |
+| `scmEgressProxy.maxTunnelBytes` | `1073741824` | Maximum bytes allowed in each CONNECT tunnel direction. |
+| `scmEgressProxy.maxConcurrent` | `8` | Maximum concurrent forward requests and CONNECT tunnels. |
+| `webhooks.tls.existingSecret` | `""` | Required existing TLS Secret for the controller-served admission webhooks; the chart never generates webhook certificates. |
+| `webhooks.tls.certKey` / `webhooks.tls.privateKeyKey` | `tls.crt` / `tls.key` | Certificate and private-key keys inside the webhook TLS Secret. |
+| `webhooks.caBundle` | `""` | Base64-encoded PEM CA bundle for the chart ValidatingWebhookConfiguration. Leave empty when `webhooks.caInjectionAnnotations` configures an injector. |
+| `webhooks.caInjectionAnnotations` | `{}` | CA-injection annotations (for example cert-manager) placed on the chart ValidatingWebhookConfiguration. Rendering fails unless this or `webhooks.caBundle` is set. |
+| `webhooks.timeoutSeconds` | `10` | Admission webhook timeout. |
 | `controller.agentSandbox.enabled` | `false` | Enable experimental workspace-backed execution for agent Tasks that set `execution.workspace` |
 | `controller.agentSandbox.routerUrl` | `""` | Optional upstream agent-sandbox router base URL used for workspace claims |
 | `controller.agentSandbox.defaultTemplate` | `""` | Default agent-sandbox `SandboxWarmPool` name when a Task omits `templateRef.name` |
@@ -706,24 +736,62 @@ Key configuration values for the Helm chart:
 | `workers.ai.image.repository` | `ghcr.io/orka-agents/orka/ai-worker` | AI worker image |
 | `workers.general.image.repository` | `ghcr.io/orka-agents/orka/general-worker` | General worker image |
 | `service.type` | `ClusterIP` | Service type |
-| `monitoring.enabled` | `false` | Enable Prometheus ServiceMonitor |
 | `client.create` | `true` | Create client ServiceAccount for API access |
 | `client.name` | `orka-client` | Client ServiceAccount name |
 | `client.namespace` | `""` | Client ServiceAccount namespace override. Empty defaults to `controller.watchNamespace` when namespace isolation is enforced and `watchNamespace` is set, otherwise the release namespace. |
 
+### Helm authentication Secret rotation
+
+The Publisher, SCM proxy, and controller clients load these credentials at process startup. Update the Secret and bump its corresponding nonce in the same Helm upgrade: use `publisher.auth.rolloutNonce` for the publisher-auth Secret, and `scmEgressProxy.auth.rolloutNonce` for the SCM proxy-auth Secret. The publisher nonce is applied only to controller and Publisher Pod templates; the SCM nonce is applied only to Publisher and SCM proxy Pod templates. Nonces are safe revision strings, not Secret values. Coordinated rotation can briefly fail closed while Pods roll but prevents stale or split credential generations from persisting.
+
+### Canonical Kustomize overlay
+
+Direct Kustomize deployments must use:
+
+```bash
+kubectl apply -k config/acp-production
+```
+
+`config/acp-production` composes the CRD-free `config/acp-workload` base with the cross-namespace Vekil
+ingress NetworkPolicy. Applying `config/default` alone omits the boundary that
+prevents runtime Pods from bypassing the authenticated provider proxy. Configure
+the required system Secrets and digest-pinned controller, Publisher, Codex,
+Claude, Copilot, and OpenCode images before applying the overlay. `make deploy` validates those image
+references and applies the equivalent resource set.
+
+### ACP storage split
+
+The `--store-backend=sqlite` flag does not make SQLite authoritative for ACP
+control transitions. `ControllerEpoch`, `PromptAttempt`,
+`RuntimeSessionControl`, `BranchClaim`, `Publication`, and `ExternalEffect`
+status plus coordination Leases are the control authority. SQLite stores
+transcript/SessionTurn payloads, deferred outbox projections, and artifacts
+behind those Kubernetes fences.
+
+
+For the Kustomize deployment, create the proxy-auth Secret before applying
+`config/acp-production` (the Secret is intentionally not stored in Git):
+
+```bash
+token="$(openssl rand -hex 32)"
+kubectl -n orka-system create secret generic scm-egress-proxy-auth \
+  --from-literal=token="$token"
+unset token
+```
+
+The token is an ingress credential for the proxy only; it is not a Git or forge credential. `config/publisher` sets `HTTPS_PROXY`/`NO_PROXY`, and the Publisher copies only those validated proxy variables into its otherwise empty Git subprocess environments. The Publisher NetworkPolicy has no public `0.0.0.0/0` rule. Only the SCM egress proxy may reach public port 443.
+
+`cmd/orka-workspace-publisher` also requires `ORKA_PUBLISHER_ARTIFACT_AUTHORIZATION_BROKER_URL`, `ORKA_PUBLISHER_CREDENTIAL_BROKER_URL`, and `ORKA_PUBLISHER_SCM_EGRESS_PROXY_REQUIRED=true` in normal startup. For isolated local tests only, `ORKA_PUBLISHER_ALLOW_DEVELOPMENT_FALLBACKS=true` permits the legacy local artifact signing key, filesystem credential root, and proxy-less mode. Do not set that flag in cluster manifests.
+
+When `ORKA_PUBLISHER_PUBLISH_TIMEOUT` is raised above the default on the Publisher, set the same value on the controller Deployment as well. The controller bounds each publisher-backed external-effect call and sizes the effect's ledger lease from this timeout plus a settlement margin; without the controller-side value, publisher operations are clamped to the default four-minute call bound. Brokered custom-Tool calls always keep the fixed four-minute clamp that their Tool descriptors were admitted under.
+
 ### Helm CRD lifecycle
 
-CRD behavior is not controlled through chart values. A fresh install creates
-the twelve CRDs unless `--skip-crds` is used. Because CRDs are cluster-scoped,
-designate one lifecycle owner and use `--skip-crds` for other Orka releases.
+CRD behavior is not controlled through chart values. A fresh install creates all CRDs in the chart unless `--skip-crds` is used. Because CRDs are cluster-scoped, designate one lifecycle owner and use `--skip-crds` for other Orka releases. Helm does not update CRDs during `helm upgrade`; apply the CRDs from the exact target chart before upgrading the controller. Helm retains CRDs and Orka custom resources on uninstall. See the [Helm CRD lifecycle guide](https://github.com/orka-agents/orka/blob/main/charts/orka/README.md).
 
-Helm does not update CRDs during `helm upgrade`. Apply the CRDs from the exact
-target chart before upgrading the controller. Helm retains CRDs and Orka custom
-resources on uninstall.
-
-See the
-[Helm CRD lifecycle guide](https://github.com/orka-agents/orka/blob/main/charts/orka/README.md)
-for the CRD-first upgrade and replacement-install commands.
+Harness v1 and v2 use separate releases, endpoints, watched namespaces, RBAC,
+Leases, stores, and data planes. They do not migrate Tasks or continue Sessions
+across modes. See [Operating harness v1 and v2 on one cluster](../operations/harness-modes.md).
 
 Context-token flags can also be configured through Helm under
 `controller.contextToken`. For example:
@@ -793,7 +861,8 @@ See [charts/orka/values.yaml](https://github.com/orka-agents/orka/blob/main/char
 | `--gateway-claim-lease` | `1m` | Event and delivery claim lease |
 | `--gateway-poll-interval` | `500ms` | Dispatcher and delivery poll interval |
 | `--gateway-batch-size` | `25` | Maximum gateway records processed per iteration |
-| `--watch-namespace` | `""` | Namespace to watch (empty = all) |
+| `--controller-mode` / `ORKA_CONTROLLER_MODE` | required | Static controller mode: `harness-v1` or `harness-v2`. `dual`, `auto`, and drain modes are rejected. |
+| `--watch-namespace` | required | One non-empty watched namespace carrying the matching `orka.ai/controller-mode` label. |
 | `--enforce-namespace-isolation` | `false` | Restrict users to their ServiceAccount's namespace |
 | `--max-tasks-per-namespace` | `0` | Max active tasks per namespace (0 = unlimited) |
 | `--agent-sandbox-enabled` | `ORKA_AGENT_SANDBOX_ENABLED` env or `false` | Enable experimental workspace-backed execution for agent Tasks that set `execution.workspace` |
@@ -853,14 +922,26 @@ See [charts/orka/values.yaml](https://github.com/orka-agents/orka/blob/main/char
 | `--outbound-access-trusted-token-endpoint-services` | `ORKA_OUTBOUND_ACCESS_TRUSTED_TOKEN_ENDPOINT_SERVICES` env or `""` | Comma-separated exact `namespace/name:port` cross-namespace token endpoint Service refs; wildcards are rejected |
 | `--task-provenance-admission-enabled` | `ORKA_TASK_PROVENANCE_ADMISSION_ENABLED` env or `false` | Enable validating admission that rejects untrusted direct Kubernetes Task writes to Orka-managed provenance fields (`spec.requestedBy`, `spec.transaction`, and transaction metadata labels/annotations) |
 | `--task-provenance-admission-trusted-users` | `ORKA_TASK_PROVENANCE_ADMISSION_TRUSTED_USERS` env or controller ServiceAccount usernames | Comma-separated Kubernetes usernames trusted to set Orka-managed Task provenance fields |
+| `--task-provenance-admission-trusted-service-accounts` | `ORKA_TASK_PROVENANCE_ADMISSION_TRUSTED_SERVICE_ACCOUNTS` env or `orka-ai-worker` | Comma-separated ServiceAccount names trusted in the target Task namespace to set Orka-managed Task provenance fields for child Task creation |
+| `--ai-worker-image` | `ghcr.io/orka-agents/orka/ai-worker:latest` | Native AI worker container image |
+| `--acp-runtime-namespace` / `ORKA_ACP_RUNTIME_NAMESPACE` | `orka-runtimes` | Namespace for managed runtime Deployments, Services, Secrets, and policies. |
+| `--acp-provider-proxy-namespace` / `ORKA_ACP_PROVIDER_PROXY_NAMESPACE` | `vekil-system` | Approved provider-proxy namespace selector. |
+| `--acp-provider-proxy-base-url` / `ORKA_ACP_PROVIDER_PROXY_BASE_URL` | unset | Authenticated provider-proxy URL injected into built-in RuntimePools. |
+| `--acp-provider-proxy-pod-labels` / `ORKA_ACP_PROVIDER_PROXY_POD_LABELS` | `orka.ai/network-role=provider-auth-proxy` | Exact Pod labels selected by RuntimePool egress policy. |
+| `--acp-provider-proxy-token-file` / `ORKA_ACP_PROVIDER_PROXY_TOKEN_FILE` | unset | Controller-mounted bearer file copied into generation-scoped immutable RuntimePool Secrets. |
+| `--acp-codex-runtime-image` / `ORKA_ACP_CODEX_RUNTIME_IMAGE` | unset | Required digest-pinned Codex runtime image when Codex Tasks are used. |
+| `--acp-claude-runtime-image` / `ORKA_ACP_CLAUDE_RUNTIME_IMAGE` | unset | Required digest-pinned Claude runtime image when Claude Tasks are used. |
+| `--acp-copilot-runtime-image` / `ORKA_ACP_COPILOT_RUNTIME_IMAGE` | unset | Required digest-pinned GitHub Copilot runtime image when Copilot Tasks are used. |
+| `--acp-opencode-runtime-image` / `ORKA_ACP_OPENCODE_RUNTIME_IMAGE` | unset | Required digest-pinned OpenCode runtime image when OpenCode Tasks are used. |
+| `--general-worker-image` | `ghcr.io/orka-agents/orka/general-worker:latest` | General worker container image |
+| `--store-backend` | `sqlite` | Payload/read-model backend. ACP control authority remains Kubernetes CRDs and Leases. |
+| `--store-path` | `/data/orka.db` | Path to the SQLite transcript/outbox/artifact database file. |
+
 | `--task-provenance-admission-trusted-service-accounts` | `ORKA_TASK_PROVENANCE_ADMISSION_TRUSTED_SERVICE_ACCOUNTS` env or configured AI/vendor worker ServiceAccounts | Comma-separated ServiceAccount names trusted in the target Task namespace to set Orka-managed Task provenance fields for child Task creation. Explicit values override the worker ServiceAccount defaults. |
 | `--ai-worker-image` | `ghcr.io/orka-agents/orka/ai-worker:latest` | AI worker container image |
-| `--general-worker-image` | `ghcr.io/orka-agents/orka/general-worker:latest` | General worker container image |
 | `--ai-worker-service-account-name` | `orka-ai-worker` | ServiceAccount name for AI worker Jobs and dynamically ensured worker RBAC |
 | `--vendor-worker-service-account-name` | `orka-vendor-worker` | ServiceAccount name for vendor/agent worker Jobs and dynamically ensured worker RBAC |
 | `--container-worker-service-account-name` | `orka-container-worker` | ServiceAccount name for container worker Jobs and dynamically ensured worker RBAC |
-| `ORKA_HARNESS_WRAPPER_ENDPOINT` | unset | Required controller environment variable for agent Tasks; points at the CLI harness wrapper HTTP endpoint. |
-| `ORKA_HARNESS_WRAPPER_BEARER_TOKEN_FILE` | unset | Optional controller token file for authenticated wrapper endpoints. |
 | `--store-backend` | `sqlite` | Storage backend (sqlite) |
 | `--store-path` | `/data/orka.db` | Path to SQLite database file |
 | `--chat-enabled` | `true` | Enable the chat endpoint |
@@ -872,7 +953,7 @@ See [charts/orka/values.yaml](https://github.com/orka-agents/orka/blob/main/char
 | `--chat-max-concurrent` | `10` | Max concurrent chat sessions |
 | `--chat-max-tasks-per-turn` | `5` | Max tasks created per chat turn |
 | `--chat-max-session-size` | `512000` | Soft limit for session size before truncation (bytes) |
-| `--leader-elect` | `false` | Enable leader election |
+| `--leader-elect` | `false` | Enable leader election. Static controller installations require `true`; the Lease is stored in the watched namespace. |
 | `--metrics-bind-address` | `0` | Metrics endpoint address |
 | `--health-probe-bind-address` | `:8081` | Health probe address |
 | `--metrics-secure` | `true` | Serve metrics via HTTPS |
@@ -881,17 +962,17 @@ See [charts/orka/values.yaml](https://github.com/orka-agents/orka/blob/main/char
 
 ### Provider-neutral Workspace Controller Settings
 
-The `workspace.orka.ai/v1alpha1` control plane is installed additively and its controllers are disabled by default during rollout. Enable the generic provider, class, pool, and workspace reconcilers with `--enable-workspace-provider-api` (or `ORKA_ENABLE_WORKSPACE_PROVIDER_API=true`). The development-only fake adapter additionally requires `--enable-fake-workspace-provider` (or `ORKA_ENABLE_FAKE_WORKSPACE_PROVIDER=true`). In Helm these map to `controller.workspaceProvider.apiEnabled` and `controller.workspaceProvider.fakeProviderEnabled`.
+The `workspace.orka.ai/v1alpha1` control plane is installed additively and its controllers are disabled by default during rollout. Enable the generic provider, class, pool, and workspace reconcilers with `--enable-workspace-provider-api` (or `ORKA_ENABLE_WORKSPACE_PROVIDER_API=true`). The development-only fake adapter additionally requires `--enable-fake-workspace-provider` (or `ORKA_ENABLE_FAKE_WORKSPACE_PROVIDER=true`). These are controller flags/environment variables only; the Helm chart does not expose values for them. The release chart intentionally excludes the fake adapter's two CRDs; before enabling it, install the development package from a matching source checkout with `bin/kustomize build --load-restrictor LoadRestrictionsNone config/development/fake-workspace-provider | kubectl apply -f -`.
 
-Helm installs files from a chart's `crds/` directory on a fresh install but does not upgrade an existing CRD schema. Before enabling `controller.workspaceProvider.apiEnabled=true` during an upgrade, apply the current chart CRDs explicitly, for example with `helm show crds <chart> | kubectl apply --server-side -f -`. The chart checks the live `ExecutionWorkspace` schema and fails before rolling out workspace controllers when the required admission fields are absent. Offline `helm template --is-upgrade` cannot perform that lookup; after independently verifying the schema, set `controller.workspaceProvider.crdUpgradeSchemaVerified=true` only for the offline render.
+Helm installs files from a chart's `crds/` directory on a fresh install but does not upgrade an existing CRD schema. Before enabling the workspace provider API on an upgraded cluster, apply the current chart CRDs explicitly, for example with `helm show crds <chart> | kubectl apply --server-side -f -`, so the `workspace.orka.ai` schemas match the controller.
 
-Task and Tool `classRef` selection is always protected by shipped `ValidatingAdmissionPolicy` resources that perform a live Kubernetes `use` authorization check, even while workspace execution gates are disabled. When the workspace provider API is enabled, the manager also requires the TLS-backed `--workspace-class-use-admission-enabled` webhook as defense in depth. The webhooks submit a Kubernetes `SubjectAccessReview` for the live admission caller using verb `use` on the selected namespaced `ExecutionWorkspaceClass`; requests are denied when the SAR is denied or unavailable. Kustomize users enable `config/webhook` plus `manager_webhook_patch.yaml` after provisioning TLS and CA injection. Helm users set `controller.workspaceProvider.classUseAdmission.enabled=true`, provide an existing TLS Secret, and supply the base64-encoded CA bundle; the chart installs the Service and fail-closed ValidatingWebhookConfiguration.
+Task and Tool `classRef` selection is always protected by shipped `ValidatingAdmissionPolicy` resources that perform a live Kubernetes `use` authorization check, even while workspace execution gates are disabled. When the workspace provider API is enabled, the manager also requires the TLS-backed `--workspace-class-use-admission-enabled` webhook as defense in depth. The webhooks submit a Kubernetes `SubjectAccessReview` for the live admission caller using verb `use` on the selected namespaced `ExecutionWorkspaceClass`; requests are denied when the SAR is denied or unavailable. How the class-use webhooks are installed depends on the installation method. A `harness-v2` Helm release installs them automatically: the chart renders the fail-closed `task-workspace-class.harness-v2.orka.ai` and `tool-workspace-class.harness-v2.orka.ai` webhooks against the release-local controller webhook Service and runs the controller with `--workspace-class-use-admission-enabled=true`; rendering requires `webhooks.tls.existingSecret` plus either `webhooks.caBundle` or `webhooks.caInjectionAnnotations`. Do not additionally apply the Kustomize admission packages to a Helm release; that installs a duplicate second set of validating webhooks. Kustomize installations instead serve the class-use webhooks (`taskworkspaceclassuse.core.orka.ai` and `toolworkspaceclassuse.core.orka.ai`) from the dedicated admission runtime: install `config/orka-admission` first, then apply the fail-closed `config/orka-admission-webhooks` configuration after the readiness and TLS prerequisites in its README are met.
 
 Task and Tool users select namespaced `ExecutionWorkspaceClass` objects. Provider identity, provider-specific parameters, pool implementation, and provider versions remain operator-owned. The legacy direct Agent Sandbox and Substrate settings below remain available during migration.
 
 ### Agent Sandbox Controller Settings
 
-Agent sandbox settings are disabled by default. When enabled, the controller validates `Task.spec.execution.workspace`, resolves/defaults the effective `SandboxWarmPool` and workspace settings, injects the resolved settings into harness wrapper turns, and the worker wrapper owns upstream sandbox claim, execution, and cleanup. Settings can be supplied as flags, environment variables, or Helm values:
+These settings belong to the earlier execution-workspace prototype and remain disabled. The current ACP core path rejects `Task.spec.execution.workspace`; enabling these flags does not create an ACP fallback. They are retained only for local/deferred provider work:
 
 | Flag | Environment variable | Helm value | Default |
 |------|----------------------|------------|---------|
@@ -904,9 +985,9 @@ Agent sandbox settings are disabled by default. When enabled, the controller val
 | `--agent-sandbox-command-timeout` | `ORKA_AGENT_SANDBOX_COMMAND_TIMEOUT` | `controller.agentSandbox.commandTimeout` | `30m` |
 | `--agent-sandbox-cleanup-policy` | `ORKA_AGENT_SANDBOX_CLEANUP_POLICY` | `controller.agentSandbox.cleanupPolicy` | `delete` |
 
-Supported values are `disabled` or `template` for the legacy warm pool policy setting, `task` or `controller` for namespace strategy, and `delete` or `retain` for cleanup policy. `task` defaults sandbox claims to the Task namespace; `controller` defaults them to the controller namespace when discoverable, and explicit `templateRef.namespace` values are honored as the claim/warm-pool namespace. See [Agent Sandbox Workspaces](agent-sandbox.md) for examples, live smoke-test steps, and limitations.
+Supported values are `disabled` or `template` for the legacy warm pool policy setting, `task` or `controller` for namespace strategy, and `delete` or `retain` for cleanup policy. `task` defaults sandbox claims to the Task namespace; `controller` defaults them to the controller namespace when discoverable, and explicit `templateRef.namespace` values are honored as the claim/warm-pool namespace. See [Agent Sandbox Workspaces](agent-sandbox.md) for the deferred status and the invariants a future ACP-backed provider must preserve.
 
-When this feature is enabled, harness wrapper pods need RBAC for the upstream sandbox API: create/delete/patch `sandboxclaims`, read `sandboxtemplates`, `sandboxwarmpools`, and `sandboxes`, create `pods/portforward`, and read `endpointslices`. The Helm chart and generated worker RBAC include these permissions; custom deployments must include equivalent rules for the worker ServiceAccount.
+Any future ACP-backed integration will need a separately reviewed identity and RBAC design. Do not grant these permissions to managed ACP RuntimePods; they intentionally run without Kubernetes service-account tokens or Kubernetes RBAC.
 
 ### External API OIDC Authentication
 
@@ -988,17 +1069,18 @@ The REST API rejects client-supplied `requestedBy` and `transaction` fields and 
 
 The webhook denies untrusted `CREATE` or `UPDATE` requests that set or modify Orka-managed provenance fields: `spec.requestedBy`, `spec.transaction`, `orka.ai/transaction-*` labels/annotations, `orka.ai/context-token-profile`, and the child token Secret annotation. By default, trusted writers are the Orka controller ServiceAccount usernames in the controller namespace and the `orka-ai-worker` ServiceAccount name in the target Task namespace; override them with `--task-provenance-admission-trusted-users` and `--task-provenance-admission-trusted-service-accounts`.
 
-Admission deployment is opt-in. To install the manifests, uncomment the `[WEBHOOK]` resource and patch in `config/default/kustomization.yaml`, provide a `webhook-server-cert` TLS Secret for the manager, and set the webhook `caBundle` (or configure certificate-manager CA injection) before applying the webhook configuration. The bundled webhook manifest defaults to `failurePolicy: Ignore`; switch it to `Fail` only after webhook TLS and availability are configured.
+How admission is deployed depends on the installation method. Helm releases install and enable Task-provenance admission automatically: the chart renders `task-provenance.<mode>.orka.ai` with `failurePolicy: Fail` against the release-local controller webhook Service and runs the controller with `--task-provenance-admission-enabled=true`, trusting the release controller identity. For Kustomize installations, admission deployment is opt-in and served by the dedicated admission runtime, not the controller manager: install `config/orka-admission` (Deployment, Service, NetworkPolicy, and RBAC for the admission runtime), then apply `config/orka-admission-webhooks` — which includes `taskprovenance.core.orka.ai` with `failurePolicy: Fail` — only after the readiness, TLS Secret, and CA-injection prerequisites in `config/orka-admission-webhooks/README.md` are met and the trusted identities embedded in `validating_webhook.yaml` match the admission-runtime arguments.
 
 ## Prometheus Metrics
 
-Orka registers the following Prometheus metrics on the controller-runtime registry. Enable monitoring with the Helm chart:
+Orka registers the following Prometheus metrics on the controller-runtime registry. The metrics endpoint is disabled by default (`--metrics-bind-address=0`); enable it by setting an explicit bind address, for example:
 
-```yaml
-monitoring:
-  enabled: true
-  interval: 30s
+```bash
+--metrics-bind-address=:8443   # HTTPS (default when --metrics-secure=true)
+--metrics-bind-address=:8080   # HTTP, with --metrics-secure=false
 ```
+
+Scrape configuration (for example a Prometheus Operator ServiceMonitor) is not shipped with the chart; point your monitoring stack at the metrics port directly.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -1055,9 +1137,7 @@ copies non-secret OTLP endpoint/protocol/insecure/timeout/compression settings
 to AI worker Pods and intentionally does not copy OTLP headers, certificate or
 client-key env vars, `OTEL_RESOURCE_ATTRIBUTES`, or baggage.
 
-Harness-wrapper and agent-runtime worker telemetry is explicit opt-in. Set
-`ORKA_ENABLE_TELEMETRY=true` and OTLP exporter env on those workloads when you
-want their process-local `task.run` spans exported.
+ACP supervisor telemetry is explicit opt-in on the managed RuntimePool workload. Keep endpoint configuration non-secret and do not inject credential-bearing OTLP headers into provider children.
 
 ### Instrumented Components
 
@@ -1065,7 +1145,7 @@ want their process-local `task.run` spans exported.
 |--------|------|------------|
 | `orka.api` | HTTP/API middleware spans | HTTP request/route/status metadata |
 | `orka.chat` | `chat.request`, `chat.tool_loop.iteration` | session metadata; `chat.iteration`, `orka.tenant`, requested model, tool-call count |
-| `orka.worker` / `orka.harness` | `task.run` | `orka.task.id`, `orka.task.namespace`, `orka.tenant`, `orka.agent.name` when known |
+| `orka.worker` / `orka.acp` | `task.run` and ACP attempt/session spans | `orka.task.id`, namespace, runtime pool/session identity, and agent name when known |
 | `orka.agent` | `agent.step` | iteration, requested model/provider, tool-call count, Orka task metadata |
 | `orka.gen_ai` | `chat {model}` | `gen_ai.*` provider/model/token metadata and `error.type` |
 | `orka.gen_ai` | `execute_tool {tool.name}` | `gen_ai.tool.*`, `orka.tool.name`, `orka.tool.kind`, `orka.tool.result.size_bytes`, parent/child task fields for delegation |

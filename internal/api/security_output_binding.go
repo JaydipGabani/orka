@@ -11,7 +11,6 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -126,23 +125,11 @@ func (h *InternalHandlers) verifySecurityTaskOutputWriter(
 		return nil, fiber.NewError(fiber.StatusForbidden, "target task not found")
 	}
 	userInfo := GetUserInfo(c)
-	if userInfo != nil && serviceAccountNameFromUsername(userInfo.Username) == expectedHarnessWrapperServiceAccountName() {
-		if err := authorizer.verifyHarnessWrapperArtifactUpload(c.Context(), userInfo, task.Namespace, task.Name); err != nil {
-			return nil, err
-		}
-		if err := verifyHarnessWrapperPodIdentity(c.Context(), authorizer, userInfo); err != nil {
-			return nil, err
-		}
-		if err := verifyHarnessWrapperOutputHeaders(c, task); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := authorizer.verifyNamespace(c, task.Namespace); err != nil {
-			return nil, err
-		}
-		if err := authorizer.verifyTaskWorker(c.Context(), userInfo, task); err != nil {
-			return nil, err
-		}
+	if err := authorizer.verifyNamespace(c, task.Namespace); err != nil {
+		return nil, err
+	}
+	if err := authorizer.verifyTaskWorker(c.Context(), userInfo, task); err != nil {
+		return nil, err
 	}
 	if !task.DeletionTimestamp.IsZero() {
 		return nil, fiber.NewError(fiber.StatusGone, "task is deleting")
@@ -170,22 +157,12 @@ func outputProvenanceForWriter(
 	}
 	podUID := firstUserExtra(userInfo, "authentication.kubernetes.io/pod-uid")
 	producerKind := store.OutputProducerKubernetesWorker
-	jobUID := ""
 	runtimeSessionID, turnID, correlationID := "", "", ""
-	if serviceAccountNameFromUsername(userInfo.Username) == expectedHarnessWrapperServiceAccountName() {
-		producerKind = store.OutputProducerHarnessWrapper
-		if task.Annotations != nil {
-			runtimeSessionID = strings.TrimSpace(task.Annotations[harnessWrapperRuntimeAnnotation])
-			turnID = strings.TrimSpace(task.Annotations[harnessWrapperTurnIDAnnotation])
-			correlationID = strings.TrimSpace(task.Annotations["orka.ai/harness-wrapper-correlation-id"])
-		}
-	} else {
-		job := &batchv1.Job{}
-		if err := authorizer.k8sReader.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Status.JobName}, job); err != nil {
-			return nil, fiber.NewError(fiber.StatusForbidden, "caller job not found")
-		}
-		jobUID = string(job.UID)
+	job := &batchv1.Job{}
+	if err := authorizer.k8sReader.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Status.JobName}, job); err != nil {
+		return nil, fiber.NewError(fiber.StatusForbidden, "caller job not found")
 	}
+	jobUID := string(job.UID)
 	attempt := taskBoundOutputAttempt(task)
 	bindingInput := strings.Join([]string{
 		"output-writer-v1", string(task.UID), fmt.Sprint(attempt), jobUID, podUID,
@@ -203,47 +180,6 @@ func outputProvenanceForWriter(
 		CorrelationID:         correlationID,
 		SubmissionNonceDigest: "sha256:" + hex.EncodeToString(bindingDigest[:]),
 	}, nil
-}
-
-func verifyHarnessWrapperPodIdentity(
-	ctx context.Context,
-	authorizer internalCallerAuthorizer,
-	userInfo *UserInfo,
-) error {
-	podName := firstUserExtra(userInfo, "authentication.kubernetes.io/pod-name")
-	podUID := firstUserExtra(userInfo, "authentication.kubernetes.io/pod-uid")
-	if podName == "" || podUID == "" {
-		return fiber.NewError(fiber.StatusForbidden, "caller pod identity required")
-	}
-	namespace := strings.TrimSpace(userInfo.Namespace)
-	if namespace == "" {
-		namespace = parseServiceAccountNamespace(userInfo.Username)
-	}
-	pod := &corev1.Pod{}
-	if err := authorizer.k8sReader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, pod); err != nil {
-		return fiber.NewError(fiber.StatusForbidden, "caller pod not found")
-	}
-	if string(pod.UID) != podUID || pod.Spec.ServiceAccountName != expectedHarnessWrapperServiceAccountName() {
-		return fiber.NewError(fiber.StatusForbidden, "caller pod identity mismatch")
-	}
-	return nil
-}
-
-func verifyHarnessWrapperOutputHeaders(c fiber.Ctx, task *corev1alpha1.Task) error {
-	for header, annotation := range map[string]string{
-		"X-Orka-Runtime-Session-ID": harnessWrapperRuntimeAnnotation,
-		"X-Orka-Turn-ID":            harnessWrapperTurnIDAnnotation,
-		"X-Orka-Correlation-ID":     "orka.ai/harness-wrapper-correlation-id",
-	} {
-		expected := ""
-		if task.Annotations != nil {
-			expected = strings.TrimSpace(task.Annotations[annotation])
-		}
-		if expected == "" || strings.TrimSpace(c.Get(header)) != expected {
-			return fiber.NewError(fiber.StatusForbidden, "harness wrapper output identity mismatch")
-		}
-	}
-	return nil
 }
 
 func (h *InternalHandlers) legacyOutputWriteAuthorization(c fiber.Ctx, kind, namespace, taskName string) error {

@@ -198,7 +198,7 @@ func canonicalRepositoryPort(transport, port string) string {
 	switch transport {
 	case "http":
 		defaultPort = "80"
-	case "https":
+	case schemeHTTPS:
 		defaultPort = "443"
 	case repositoryTransportSSH:
 		defaultPort = "22"

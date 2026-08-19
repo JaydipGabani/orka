@@ -174,6 +174,7 @@ type ReviewContextManifest struct {
 	OmittedFiles      []ReviewContextOmittedFile  `json:"omittedFiles,omitempty"`
 	PromptBytes       int                         `json:"promptBytes"`
 	ApproximateTokens int                         `json:"approximateTokens"`
+	Prompt            string                      `json:"prompt,omitempty"`
 }
 
 type ReviewContextIncludedFile struct {

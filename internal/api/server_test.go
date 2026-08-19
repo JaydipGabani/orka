@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/executionmode"
 	"github.com/orka-agents/orka/internal/security"
 	"github.com/orka-agents/orka/internal/store/sqlite"
 )
@@ -37,6 +38,7 @@ func TestNewServer(t *testing.T) {
 		Port:           8080,
 		MetricsPort:    9090,
 		WatchNamespace: "default",
+		ExecutionMode:  executionmode.HarnessV1,
 		SecurityIntegrity: security.IntegrityConfig{
 			WorkerOutputBindingMode: security.WorkerOutputBindingAudit,
 		},
@@ -64,6 +66,11 @@ func TestNewServer(t *testing.T) {
 		if mode != security.WorkerOutputBindingAudit {
 			t.Errorf("%s worker output binding mode = %q, want audit", name, mode)
 		}
+	}
+	if server.config.Chat.ExecutionMode != executionmode.HarnessV1 ||
+		server.handlers.executionMode != executionmode.HarnessV1 ||
+		server.chatHandler.config.ExecutionMode != executionmode.HarnessV1 {
+		t.Fatal("execution mode was not propagated to every Agent producer")
 	}
 }
 

@@ -395,7 +395,7 @@ func TestStageReceiptReplayUsesAttemptBoundTargets(t *testing.T) {
 			Labels:            map[string]string{labels.LabelSecurityStage: security.StageThreatModel},
 		},
 		Spec: corev1alpha1.TaskSpec{
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: head}},
+			Workspace: &corev1alpha1.WorkspaceConfig{Ref: head},
 		},
 		Status: corev1alpha1.TaskStatus{
 			Phase: corev1alpha1.TaskPhaseSucceeded, Attempts: 1, CompletionTime: &completed,

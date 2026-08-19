@@ -48,6 +48,7 @@ type AgentConfig struct {
 	SystemPrompt       string
 	MaxTurns           int
 	AllowedTools       []string
+	AllowedToolsSet    bool
 	DisallowedTools    []string
 	GitRepo            string
 	GitBranch          string
@@ -104,8 +105,11 @@ func loadConfig(defaultMaxTurns int, requirePrompt bool) (*AgentConfig, error) {
 		cfg.MaxTurns = n
 	}
 
-	if v := os.Getenv(workerenv.AllowedTools); v != "" {
-		cfg.AllowedTools = strings.Split(v, ",")
+	if v, ok := os.LookupEnv(workerenv.AllowedTools); ok {
+		cfg.AllowedToolsSet = true
+		if v != "" {
+			cfg.AllowedTools = strings.Split(v, ",")
+		}
 	}
 	if v := os.Getenv(workerenv.DisallowedTools); v != "" {
 		cfg.DisallowedTools = strings.Split(v, ",")

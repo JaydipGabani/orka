@@ -1,0 +1,439 @@
+package supervisor
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/orka-agents/orka/internal/acp"
+	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
+)
+
+func TestMapACPUpdateDecodesAgentMessageContent(t *testing.T) {
+	update, text, ok, err := mapACPUpdate(&acp.SessionNotification{Update: json.RawMessage(`{
+		"sessionUpdate":"agent_message_chunk",
+		"content":{"type":"text","text":"hello"}
+	}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || text != "hello" || update == nil || update.Kind != harnessv2.UpdateAssistantMessageChunk ||
+		update.AssistantMessage == nil || update.AssistantMessage.Text != "hello" {
+		t.Fatalf("mapped update = %#v text=%q ok=%v", update, text, ok)
+	}
+}
+
+func TestACPAssistantMessagePhaseAllowsOnlyCodexProtocolEnums(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "commentary",
+			raw:  `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"checking"},"_meta":{"codex":{"phase":"commentary"}}}`,
+			want: acpAssistantPhaseCommentary,
+		},
+		{
+			name: "final answer",
+			raw:  `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"},"_meta":{"codex":{"phase":"final_answer"}}}`,
+			want: acpAssistantPhaseFinalAnswer,
+		},
+		{
+			name: "unknown phase",
+			raw:  `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"},"_meta":{"codex":{"phase":"provider-private"}}}`,
+		},
+		{
+			name: "other update",
+			raw:  `{"sessionUpdate":"tool_call","toolCallId":"call-1"}`,
+		},
+		{name: "malformed", raw: `{`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := acpAssistantMessagePhase(&acp.SessionNotification{Update: json.RawMessage(test.raw)})
+			if got != test.want {
+				t.Fatalf("phase = %q, want %q", got, test.want)
+			}
+		})
+	}
+	if got := acpAssistantMessagePhase(nil); got != "" {
+		t.Fatalf("nil phase = %q", got)
+	}
+}
+
+func TestMapACPUpdatePreservesWhitespaceChunkWithoutEvent(t *testing.T) {
+	update, text, ok, err := mapACPUpdate(&acp.SessionNotification{Update: json.RawMessage(`{
+		"sessionUpdate":"agent_message_chunk",
+		"content":{"type":"text","text":" \n"}
+	}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || update != nil || text != " \n" {
+		t.Fatalf("mapped whitespace update = %#v text=%q ok=%v", update, text, ok)
+	}
+}
+
+func TestMapACPUpdateIgnoresToolCallContentArray(t *testing.T) {
+	update, text, ok, err := mapACPUpdate(&acp.SessionNotification{Update: json.RawMessage(`{
+		"sessionUpdate":"tool_call_update",
+		"toolCallId":"call-1",
+		"title":"Read LICENSE",
+		"kind":"read",
+		"status":"completed",
+		"content":[{"type":"content","content":{"type":"text","text":"tool output"}}]
+	}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || text != "" || update == nil || update.Kind != harnessv2.UpdateToolCallUpdate || update.ToolCall == nil {
+		t.Fatalf("mapped update = %#v text=%q ok=%v", update, text, ok)
+	}
+	wantID, err := canonicalACPToolCallID("call-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update.ToolCall.ToolCallID != wantID || update.ToolCall.Status != harnessv2.ToolCallStatusCompleted {
+		t.Fatalf("tool call = %#v", update.ToolCall)
+	}
+}
+
+func TestMapACPUpdateIgnoresStatuslessToolOutputDelta(t *testing.T) {
+	update, text, ok, err := mapACPUpdate(&acp.SessionNotification{Update: json.RawMessage(`{
+		"sessionUpdate":"tool_call_update",
+		"toolCallId":"call-1",
+		"_meta":{"terminal_output_delta":{"terminal_id":"call-1","data":"provider output"}}
+	}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || update != nil || text != "" {
+		t.Fatalf("mapped status-less tool output = %#v text=%q ok=%v", update, text, ok)
+	}
+}
+
+func TestMapACPUpdateRejectsStatuslessToolOutputWithoutCallID(t *testing.T) {
+	update, text, ok, err := mapACPUpdate(&acp.SessionNotification{Update: json.RawMessage(`{
+		"sessionUpdate":"tool_call_update",
+		"_meta":{"terminal_output_delta":{"data":"provider output"}}
+	}`)})
+	if err == nil || !strings.Contains(err.Error(), "omitted toolCallId") {
+		t.Fatalf("missing-ID tool output error = %v", err)
+	}
+	if ok || update != nil || text != "" {
+		t.Fatalf("mapped malformed tool output = %#v text=%q ok=%v", update, text, ok)
+	}
+}
+
+func TestMapACPUpdatePreservesToolCallLifecycleTransitions(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        string
+		wantKind   harnessv2.UpdateKind
+		wantStatus harnessv2.ToolCallStatus
+		wantTitle  string
+	}{
+		{
+			name:       "start defaults pending",
+			raw:        `{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Read repository","kind":"read"}`,
+			wantKind:   harnessv2.UpdateToolCall,
+			wantStatus: harnessv2.ToolCallStatusPending,
+			wantTitle:  "Read repository",
+		},
+		{
+			name:       "explicit in progress",
+			raw:        `{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress"}`,
+			wantKind:   harnessv2.UpdateToolCallUpdate,
+			wantStatus: harnessv2.ToolCallStatusInProgress,
+		},
+		{
+			name:       "explicit completed",
+			raw:        `{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed"}`,
+			wantKind:   harnessv2.UpdateToolCallUpdate,
+			wantStatus: harnessv2.ToolCallStatusCompleted,
+		},
+		{
+			name:       "visible metadata defaults in progress",
+			raw:        `{"sessionUpdate":"tool_call_update","toolCallId":"call-1","title":"Reading repository","kind":"read"}`,
+			wantKind:   harnessv2.UpdateToolCallUpdate,
+			wantStatus: harnessv2.ToolCallStatusInProgress,
+			wantTitle:  "Reading repository",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			update, text, ok, err := mapACPUpdate(&acp.SessionNotification{Update: json.RawMessage(test.raw)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || text != "" || update == nil || update.Kind != test.wantKind || update.ToolCall == nil ||
+				update.ToolCall.Status != test.wantStatus || update.ToolCall.Title != test.wantTitle {
+				t.Fatalf("mapped lifecycle update = %#v text=%q ok=%v", update, text, ok)
+			}
+		})
+	}
+}
+
+func TestMapACPUpdateBoundsProviderToolCallTitle(t *testing.T) {
+	exactBoundary := strings.Repeat("x", maxACPToolCallTitleBytes)
+	fullCommand := strings.Repeat("git diff --no-ext-diff && ", 64) + "go test ./..."
+	multibyte := strings.Repeat("x", maxACPToolCallTitleBytes-len(acpToolCallTitleEllipsis)-1) + "界界"
+	tests := []struct {
+		name  string
+		title string
+		want  string
+	}{
+		{name: "exact boundary is unchanged", title: exactBoundary, want: exactBoundary},
+		{
+			name:  "codex full command is bounded",
+			title: fullCommand,
+			want:  fullCommand[:maxACPToolCallTitleBytes-len(acpToolCallTitleEllipsis)] + acpToolCallTitleEllipsis,
+		},
+		{
+			name:  "multibyte cutoff remains valid UTF-8",
+			title: multibyte,
+			want:  strings.Repeat("x", maxACPToolCallTitleBytes-len(acpToolCallTitleEllipsis)-1) + acpToolCallTitleEllipsis,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{
+				"sessionUpdate": "tool_call",
+				"toolCallId":    "call-1",
+				"title":         test.title,
+				"kind":          "execute",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			update, text, ok, err := mapACPUpdate(&acp.SessionNotification{Update: raw})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || text != "" || update == nil || update.ToolCall == nil {
+				t.Fatalf("mapped tool call = %#v text=%q ok=%v", update, text, ok)
+			}
+			if update.ToolCall.Title != test.want {
+				t.Fatalf("title = %q, want %q", update.ToolCall.Title, test.want)
+			}
+			if len(update.ToolCall.Title) > maxACPToolCallTitleBytes || !utf8.ValidString(update.ToolCall.Title) {
+				t.Fatalf("bounded title length = %d validUTF8=%v", len(update.ToolCall.Title), utf8.ValidString(update.ToolCall.Title))
+			}
+			if err := update.Validate(); err != nil {
+				t.Fatalf("mapped update violates harness v2: %v", err)
+			}
+		})
+	}
+}
+
+func TestMapRuntimeEventSuppressesStatuslessToolOutputBurstWithoutWeakeningRateLimit(t *testing.T) {
+	server, cfg, _ := newTestServer(t, "immediate")
+	server.cfg.Capabilities.Limits.MaxUpdateEventsPerSecond = 2
+	fence := cfg.Fence
+	fence.RuntimeSessionUID = "mapper-session-uid"
+	fence.RuntimeSessionGeneration = 1
+	newStateAndPrompt := func() (*sessionState, *promptState) {
+		return &sessionState{
+			descriptor: harnessv2.RuntimeSessionDescriptor{
+				RuntimeSessionUID: fence.RuntimeSessionUID,
+				Generation:        fence.RuntimeSessionGeneration,
+			},
+			operations:  make(map[harnessv2.OperationID]harnessv2.OperationRecord),
+			permissions: make(map[harnessv2.PermissionRequestID]permissionState),
+		}, &promptState{request: testStartPromptRequest(t, cfg, fence)}
+	}
+	mapEvent := func(prompt *promptState, state *sessionState, eventType acp.PromptEventType, update string, at time.Time) *harnessv2.Event {
+		event := acp.PromptEvent{Type: eventType, Timestamp: at}
+		if update != "" {
+			event.Update = &acp.SessionNotification{SessionID: "provider-session", Update: json.RawMessage(update)}
+		}
+		mapped, err := server.mapRuntimeEvent(state, prompt, event)
+		if err != nil {
+			t.Fatalf("map %s event: %v", eventType, err)
+		}
+		return mapped
+	}
+
+	state, prompt := newStateAndPrompt()
+	limits := eventLimits(server.cfg.Capabilities.Limits)
+	var stream bytes.Buffer
+	encoder, err := harnessv2.NewEventEncoder(&stream, limits, harnessv2.EventExpectationFromMetadata(prompt.request.Metadata))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	acceptedEvent := func(prompt *promptState, state *sessionState) harnessv2.Event {
+		prompt.sequence = 1
+		return harnessv2.Event{
+			Protocol: harnessv2.ProtocolVersion,
+			Type:     harnessv2.EventAccepted,
+			Identity: eventIdentity(server.cfg.Fence, state.descriptor, prompt.request.Metadata, prompt.sequence, now),
+			Accepted: &harnessv2.AcceptedEvent{
+				AcceptedAt: now,
+				Lease:      prompt.request.Lease,
+				ACPVersion: harnessv2.ACPProfileV1,
+			},
+		}
+	}
+	accepted := acceptedEvent(prompt, state)
+	if err := encoder.Encode(accepted); err != nil {
+		t.Fatalf("encode accepted: %v", err)
+	}
+
+	ignoredDelta := `{"sessionUpdate":"tool_call_update","toolCallId":"call-1","_meta":{"terminal_output_delta":{"terminal_id":"call-1","data":"x"}}}`
+	for index := range runtimeCodexMaxUpdateEventsPerSecond + 1 {
+		if mapped := mapEvent(prompt, state, acp.PromptEventUpdate, ignoredDelta, now); mapped != nil {
+			t.Fatalf("status-less tool output delta %d mapped to %#v", index, mapped)
+		}
+	}
+	visibleUpdates := []string{
+		`{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Read repository","kind":"read"}`,
+		`{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed"}`,
+	}
+	for _, update := range visibleUpdates {
+		mapped := mapEvent(prompt, state, acp.PromptEventUpdate, update, now)
+		if mapped == nil {
+			t.Fatalf("visible tool lifecycle update was suppressed: %s", update)
+		}
+		if err := encoder.Encode(*mapped); err != nil {
+			t.Fatalf("encode visible tool lifecycle update: %v", err)
+		}
+	}
+	terminal, _, err := server.terminalEvent(state, prompt, acp.PromptResult{
+		Outcome: acp.PromptOutcomeCompleted, StopReason: acp.StopReasonEndTurn,
+		Accepted: true, SettledAt: now,
+	})
+	if err != nil {
+		t.Fatalf("build terminal event: %v", err)
+	}
+	if err := encoder.Encode(terminal); err != nil {
+		t.Fatalf("encode terminal event: %v", err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatalf("close event stream: %v", err)
+	}
+	decoder, err := harnessv2.NewEventDecoder(bytes.NewReader(stream.Bytes()), limits, harnessv2.EventExpectationFromMetadata(prompt.request.Metadata))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := decoder.DecodeAll()
+	if err != nil {
+		t.Fatalf("decode event stream: %v", err)
+	}
+	if len(events) != 4 || events[0].Type != harnessv2.EventAccepted || events[1].Update == nil ||
+		events[1].Update.Kind != harnessv2.UpdateToolCall || events[2].Update == nil ||
+		events[2].Update.Kind != harnessv2.UpdateToolCallUpdate || events[3].Type != harnessv2.EventCompleted {
+		t.Fatalf("event stream = %#v", events)
+	}
+	if prompt.sequence != 4 {
+		t.Fatalf("harness sequence = %d, want 4 visible events", prompt.sequence)
+	}
+
+	state, prompt = newStateAndPrompt()
+	var guarded bytes.Buffer
+	guardedEncoder, err := harnessv2.NewEventEncoder(&guarded, limits, harnessv2.EventExpectationFromMetadata(prompt.request.Metadata))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := guardedEncoder.Encode(acceptedEvent(prompt, state)); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 3 {
+		mapped := mapEvent(prompt, state, acp.PromptEventUpdate,
+			`{"sessionUpdate":"tool_call","toolCallId":"call-`+string(rune('a'+index))+`","title":"Visible","kind":"read"}`, now)
+		err = guardedEncoder.Encode(*mapped)
+		if index < 2 && err != nil {
+			t.Fatalf("visible update %d: %v", index, err)
+		}
+	}
+	if !errors.Is(err, harnessv2.ErrEventRateExceeded) {
+		t.Fatalf("third visible update error = %v, want %v", err, harnessv2.ErrEventRateExceeded)
+	}
+}
+
+func TestMapACPUpdateCanonicalizesOversizedToolCallIDAcrossEvents(t *testing.T) {
+	rawID := strings.Repeat("provider-tool-call-", 24)
+	encoded, err := json.Marshal(map[string]any{
+		"sessionUpdate": "tool_call", "toolCallId": rawID,
+		"title": "Read repository", "kind": "read", "status": "pending",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, _, ok, err := mapACPUpdate(&acp.SessionNotification{Update: encoded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err = json.Marshal(map[string]any{
+		"sessionUpdate": "tool_call_update", "toolCallId": rawID,
+		"title": "Read repository", "kind": "read", "status": "completed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, _, updateOK, err := mapACPUpdate(&acp.SessionNotification{Update: encoded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || !updateOK || created == nil || completed == nil || created.ToolCall == nil || completed.ToolCall == nil {
+		t.Fatalf("mapped tool calls = created %#v completed %#v", created, completed)
+	}
+	canonicalID, err := canonicalACPToolCallID(rawID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonicalID == rawID || !strings.HasPrefix(canonicalID, canonicalACPToolCallIDPrefix) || len(canonicalID) > 253 {
+		t.Fatalf("canonical tool call ID = %q", canonicalID)
+	}
+	spaceVariant, err := canonicalACPToolCallID(" " + rawID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservedLooking, err := canonicalACPToolCallID(canonicalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spaceVariant == canonicalID || reservedLooking == canonicalID {
+		t.Fatalf("canonical tool call IDs collided: raw=%q space=%q reserved=%q", canonicalID, spaceVariant, reservedLooking)
+	}
+	if created.ToolCall.ToolCallID != canonicalID || completed.ToolCall.ToolCallID != canonicalID {
+		t.Fatalf("tool call correlation changed: created=%q completed=%q want=%q", created.ToolCall.ToolCallID, completed.ToolCall.ToolCallID, canonicalID)
+	}
+	if err := created.Validate(); err != nil {
+		t.Fatalf("created event validation: %v", err)
+	}
+	if err := completed.Validate(); err != nil {
+		t.Fatalf("completed event validation: %v", err)
+	}
+
+	permissionToolCall, err := json.Marshal(map[string]any{
+		"toolCallId": rawID, "name": "Read", "title": "Read repository",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	permission, err := mapPermission(&acp.PermissionRequestEvent{
+		RequestID: "permission-1",
+		Request: acp.RequestPermissionRequest{
+			ToolCall: permissionToolCall,
+			Options: []acp.PermissionOption{{
+				OptionID: "allow-once", Name: "Allow", Kind: string(harnessv2.PermissionOptionAllowOnce),
+			}},
+		},
+	}, now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if permission.ToolCallID != canonicalID {
+		t.Fatalf("permission tool call ID = %q, want %q", permission.ToolCallID, canonicalID)
+	}
+	if err := permission.Validate(now); err != nil {
+		t.Fatalf("permission event validation: %v", err)
+	}
+}

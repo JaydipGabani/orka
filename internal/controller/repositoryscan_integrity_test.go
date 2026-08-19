@@ -499,7 +499,7 @@ func TestDownstreamStageReceiptDoesNotFabricateTargetObservation(t *testing.T) {
 			Labels: map[string]string{labels.LabelSecurityStage: security.StageReview},
 		},
 		Spec: corev1alpha1.TaskSpec{
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit}},
+			Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit},
 		},
 		Status: corev1alpha1.TaskStatus{Attempts: 1},
 	}
@@ -878,7 +878,7 @@ func TestImmutableValidationRetryAppendsCorrectiveAttemptAndReplaysExactly(t *te
 			Labels: map[string]string{labels.LabelSecurityStage: security.StageReview, labels.LabelSecuritySliceID: "slice-1"},
 		},
 		Spec: corev1alpha1.TaskSpec{
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit}},
+			Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit},
 		},
 		Status: corev1alpha1.TaskStatus{Attempts: 1},
 	}
@@ -945,7 +945,7 @@ func TestImmutableValidationRetryAppendsCorrectiveAttemptAndReplaysExactly(t *te
 			Annotations: map[string]string{security.AnnotationValidationBindingVersion: security.ValidationBindingVersion},
 		},
 		Spec: corev1alpha1.TaskSpec{
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit}},
+			Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit},
 		},
 		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseSucceeded, Attempts: 1},
 	}
@@ -1092,7 +1092,7 @@ func TestHistoricalValidationIsRejectedAfterRepositoryScanGenerationChange(t *te
 			labels.LabelSecurityStage: security.StageReview, labels.LabelSecuritySliceID: "slice-1",
 		}},
 		Spec: corev1alpha1.TaskSpec{
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit}},
+			Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit},
 		},
 		Status: corev1alpha1.TaskStatus{Attempts: 1},
 	}
@@ -1162,7 +1162,7 @@ func TestHistoricalValidationIsRejectedAfterRepositoryScanGenerationChange(t *te
 			Annotations: map[string]string{security.AnnotationValidationBindingVersion: security.ValidationBindingVersion},
 		},
 		Spec: corev1alpha1.TaskSpec{
-			AgentRuntime: &corev1alpha1.AgentRuntimeSpec{Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit}},
+			Workspace: &corev1alpha1.WorkspaceConfig{Ref: run.HeadCommit},
 		},
 		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseSucceeded, Attempts: 1},
 	}

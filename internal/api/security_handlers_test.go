@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -590,7 +591,7 @@ func TestCreateSecurityScanRunRecoversIdempotentRunAfterUnknownTaskAdmission(t *
 			}, task))
 			require.True(t, metav1.IsControlledBy(task, scan))
 			require.Equal(t, originalRun.ID, task.Labels[labels.LabelSecurityScanID])
-			require.Equal(t, originalRun.ID, taskEnvValue(task.Spec.Env, security.EnvScanID))
+			require.Equal(t, originalRun.ID, task.Annotations[security.AnnotationSecurityScanRunID])
 
 			updated := &corev1alpha1.RepositoryScan{}
 			require.NoError(t, cl.Get(context.Background(), client.ObjectKeyFromObject(scan), updated))
@@ -1073,15 +1074,6 @@ func TestScanRunMatchesIdempotencyKeySupportsCurrentAndLegacyAliases(t *testing.
 	}
 }
 
-func taskEnvValue(env []corev1.EnvVar, name string) string {
-	for i := range env {
-		if env[i].Name == name {
-			return env[i].Value
-		}
-	}
-	return ""
-}
-
 func TestGenerateSecurityPatch_ContextTokenTransactionContextAuthorization(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")
@@ -1153,10 +1145,14 @@ func TestGenerateSecurityPatch_ContextTokenTransactionContextAuthorization(t *te
 					Name: "scan-1", Namespace: "demo", UID: types.UID("scan-1-uid"), Generation: 1,
 				},
 				Spec: corev1alpha1.RepositoryScanSpec{
-					RepoURL:          repoURL,
-					Branch:           "main",
-					AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
-					PatchAgentRef:    &patchAgent,
+					RepoURL:                      repoURL,
+					Branch:                       "main",
+					ReadCredentialRef:            &corev1.LocalObjectReference{Name: "source-read"},
+					PublicationReadCredentialRef: &corev1.LocalObjectReference{Name: "target-read"},
+					PublicationCredentialRef:     &corev1.LocalObjectReference{Name: "target-write"},
+					ForgeCredentialRef:           &corev1.LocalObjectReference{Name: "forge"},
+					AnalysisAgentRef:             corev1alpha1.AgentReference{Name: "analysis"},
+					PatchAgentRef:                &patchAgent,
 				},
 			}
 			app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan)
@@ -1185,7 +1181,7 @@ func TestGenerateSecurityPatch_ContextTokenTransactionContextAuthorization(t *te
 			}))
 
 			token := issueTestContextToken(t, provider, nil, map[string]any{
-				"scope": ContextTokenScopeSecurityWrite,
+				"scope": ContextTokenScopeSecurityWrite + " " + ContextTokenScopeSecretsCredentialsRead,
 				"tctx":  tt.tctx,
 			})
 			req := httptest.NewRequest(http.MethodPost, "/security/findings/finding-1/patch?namespace=demo", nil)
@@ -1341,10 +1337,9 @@ func TestCreateManualSecurityScan_ContextTokenAllowsRefOnlyWorkspaceWithBranchAn
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&run))
 	task := &corev1alpha1.Task{}
 	require.NoError(t, handlers.client.Get(context.Background(), clientObjectKey(run.TaskName), task))
-	require.NotNil(t, task.Spec.AgentRuntime)
-	require.NotNil(t, task.Spec.AgentRuntime.Workspace)
-	require.Empty(t, task.Spec.AgentRuntime.Workspace.Branch)
-	require.Equal(t, "refs/tags/v1.0.0", task.Spec.AgentRuntime.Workspace.Ref)
+	require.NotNil(t, task.Spec.Workspace)
+	require.Empty(t, task.Spec.Workspace.Branch)
+	require.Equal(t, "refs/tags/v1.0.0", task.Spec.Workspace.Ref)
 
 	updatedScan := &corev1alpha1.RepositoryScan{}
 	require.NoError(t, handlers.client.Get(context.Background(), client.ObjectKey{Namespace: "demo", Name: "scan-1"}, updatedScan))
@@ -2986,65 +2981,97 @@ func TestCreateManualSecurityScan_ContextTokenStampsTaskRequesterAndTransaction(
 	require.Equal(t, testContextTokenTransactionID, task.Spec.Transaction.ID)
 	require.Equal(t, labels.SelectorValue(testContextTokenTransactionID), task.Labels[labels.LabelTransactionID])
 	require.Equal(t, testContextTokenTransactionID, task.Annotations[labels.AnnotationTransactionID])
-	require.Equal(t, security.StageThreatModel, envValue(task.Spec.Env, security.EnvStage))
-	require.Equal(t, "scan-1", envValue(task.Spec.Env, security.EnvRepositoryScanName))
-	require.NotNil(t, task.Spec.AgentRuntime)
-	require.NotNil(t, task.Spec.AgentRuntime.Workspace)
-	require.Empty(t, task.Spec.AgentRuntime.Workspace.Branch)
-	require.Equal(t, "refs/tags/v1.0.0", task.Spec.AgentRuntime.Workspace.Ref)
+	require.Equal(t, security.StageThreatModel, task.Labels[labels.LabelSecurityStage])
+	require.Equal(t, labels.SelectorValue("scan-1"), task.Labels[labels.LabelSecurityTarget])
+	require.Equal(t, run.ID, task.Annotations[security.AnnotationSecurityScanRunID])
+	require.Empty(t, task.Spec.Env)
+	require.NotNil(t, task.Spec.Workspace)
+	require.Empty(t, task.Spec.Workspace.Branch)
+	require.Equal(t, "refs/tags/v1.0.0", task.Spec.Workspace.Ref)
 }
 
-func TestCreateSecurityPullRequest_ExistingPR(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			w.WriteHeader(http.StatusUnprocessableEntity)
-			fmt.Fprint(w, `{"message":"Validation Failed","errors":[{"message":"A pull request already exists for sozercan:orka/security/fnd-123."}]}`) //nolint:errcheck
-		case http.MethodGet:
-			require.Equal(t, "sozercan:orka/security/fnd-123", r.URL.Query().Get("head"))
-			require.Equal(t, "main", r.URL.Query().Get("base"))
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, `[{"html_url":%q,"number":99}]`, securityTestRepoPRURL) //nolint:errcheck
-		default:
-			t.Fatalf("unexpected method: %s", r.Method)
+func TestCreateManualSecurityScanConcurrentRequestsReturnCreatedAndConflict(t *testing.T) {
+	provider := newTestOIDCProvider(t)
+	ctxTokenConfig := testContextTokenConfig(t, provider, "")
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "scan-concurrent", Namespace: "demo", UID: types.UID("scan-concurrent-uid"), Generation: 1},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:          securityTestRepoURL,
+			Branch:           "main",
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	}
+	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan)
+	token := issueTestContextToken(t, provider, nil, map[string]any{"scope": ContextTokenScopeSecurityWrite})
+
+	type response struct {
+		status int
+		body   string
+		err    error
+	}
+	start := make(chan struct{})
+	responses := make(chan response, 2)
+	for range 2 {
+		go func() {
+			<-start
+			req := httptest.NewRequest(http.MethodPost, "/security/repositories/scan-concurrent/scans?namespace=demo", nil)
+			req.Header.Set(TransactionTokenHeaderName, token)
+			resp, err := app.Test(req)
+			if err != nil {
+				responses <- response{err: err}
+				return
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			responses <- response{status: resp.StatusCode, body: string(body), err: readErr}
+		}()
+	}
+	close(start)
+
+	created := 0
+	for range 2 {
+		result := <-responses
+		require.NoError(t, result.err)
+		if result.status != http.StatusCreated {
+			t.Fatalf("concurrent scan status = %d body=%q", result.status, result.body)
 		}
+		created++
+	}
+	// Identical concurrent requests converge idempotently on the single
+	// admitted run instead of surfacing a client-visible conflict.
+	require.Equal(t, 2, created)
+
+	var tasks corev1alpha1.TaskList
+	require.NoError(t, handlers.client.List(context.Background(), &tasks, client.InNamespace("demo")))
+	require.Len(t, tasks.Items, 1)
+	runs, _, err := handlers.securityStore.ListScanRuns(context.Background(), "demo", "scan-concurrent", 10, "")
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	require.Equal(t, "pending", runs[0].Phase)
+}
+
+func TestCreateSecurityPullRequestReturnsGovernedReceiptWithoutGitHubMutation(t *testing.T) {
+	githubCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		githubCalled = true
+		t.Fatalf("receipt lookup must not call the repository forge: %s %s", r.Method, r.URL.Path)
 	}))
 	defer server.Close()
 
-	previousBaseURL := githubPullRequestAPIBaseURL
-	githubPullRequestAPIBaseURL = server.URL
-	t.Cleanup(func() {
-		githubPullRequestAPIBaseURL = previousBaseURL
-	})
-
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1alpha1.AddToScheme(scheme))
-	require.NoError(t, corev1.AddToScheme(scheme))
 
 	scan := &corev1alpha1.RepositoryScan{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "scan-1", Namespace: "demo", UID: types.UID("scan-existing-pr-uid"), Generation: 1,
 		},
 		Spec: corev1alpha1.RepositoryScanSpec{
-			RepoURL: securityTestRepoURL,
+			RepoURL: server.URL,
 			Branch:  "main",
-			GitSecretRef: &corev1.LocalObjectReference{
-				Name: "git-creds",
-			},
 		},
 	}
 
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "git-creds",
-			Namespace: "demo",
-		},
-		Data: map[string][]byte{
-			"token": []byte("test-token"),
-		},
-	}
-
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, secret).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan).Build()
 	db, err := sqlite.NewDB(":memory:")
 	require.NoError(t, err)
 	securityStore := sqlite.NewStore(db, ":memory:")
@@ -3062,6 +3089,8 @@ func TestCreateSecurityPullRequest_ExistingPR(t *testing.T) {
 		TaskName: "scan-task", Mode: "manual", Phase: "succeeded", StartedAt: time.Now().UTC(),
 		Quality: store.LegacyScanQuality(),
 	}))
+	prNumber := 99
+	prURL := server.URL + "/pull/99"
 	require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
 		ID:                  "finding-1",
 		Namespace:           "demo",
@@ -3073,9 +3102,11 @@ func TestCreateSecurityPullRequest_ExistingPR(t *testing.T) {
 		Summary:             "Unsanitized user input reaches shell execution.",
 		Severity:            "critical",
 		Confidence:          "high",
-		State:               "validated",
+		State:               "pr_open",
 		RootCause:           "Shell command arguments are concatenated directly.",
 		Remediation:         "Use argument arrays and validate inputs.",
+		PRNumber:            &prNumber,
+		PRURL:               prURL,
 	}))
 	require.NoError(t, securityStore.CreatePatchProposal(ctx, &store.PatchProposal{
 		ID:              "patch-1",
@@ -3087,7 +3118,9 @@ func TestCreateSecurityPullRequest_ExistingPR(t *testing.T) {
 		SourceHeadSHA:   strings.Repeat("c", 40),
 		TaskName:        "patch-task-1",
 		Branch:          "orka/security/fnd-123",
-		Status:          "succeeded",
+		Status:          "pr_opened",
+		PRNumber:        &prNumber,
+		PRURL:           prURL,
 		CreatedAt:       time.Now().Add(-time.Minute),
 	}))
 	require.NoError(t, securityStore.CreatePatchProposal(ctx, &store.PatchProposal{
@@ -3111,16 +3144,16 @@ func TestCreateSecurityPullRequest_ExistingPR(t *testing.T) {
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var result struct {
+	var body struct {
 		PRNumber int    `json:"prNumber"`
 		PRURL    string `json:"prURL"`
 		Status   string `json:"status"`
 	}
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-	require.Equal(t, 99, result.PRNumber)
-	require.Equal(t, securityTestRepoPRURL, result.PRURL)
-	require.Equal(t, "existing", result.Status)
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.Equal(t, prNumber, body.PRNumber)
+	require.Equal(t, prURL, body.PRURL)
+	require.Equal(t, "Open", body.Status)
+	require.False(t, githubCalled)
 
 	proposals, err := securityStore.ListPatchProposals(ctx, "demo", "finding-1")
 	require.NoError(t, err)
@@ -3131,37 +3164,40 @@ func TestCreateSecurityPullRequest_ExistingPR(t *testing.T) {
 	}
 	current := proposalsByID["patch-1"]
 	require.Equal(t, "pr_opened", current.Status)
-	require.Equal(t, securityTestRepoPRURL, current.PRURL)
+	require.Equal(t, prURL, current.PRURL)
 	require.NotNil(t, current.PRNumber)
-	require.Equal(t, 99, *current.PRNumber)
+	require.Equal(t, prNumber, *current.PRNumber)
 	require.Equal(t, "succeeded", proposalsByID["patch-stale"].Status)
 
 	finding, err := securityStore.GetFinding(ctx, "demo", "finding-1")
 	require.NoError(t, err)
 	require.Equal(t, "pr_open", finding.State)
-	require.Equal(t, securityTestRepoPRURL, finding.PRURL)
-	require.NotNil(t, finding.PRNumber)
-	require.Equal(t, 99, *finding.PRNumber)
+	require.Equal(t, prURL, finding.PRURL)
+	require.Equal(t, prNumber, *finding.PRNumber)
 }
 
-func TestCreateSecurityPatchTaskRequiresPushedBranch(t *testing.T) {
+func TestCreateSecurityPatchTaskRequestsGovernedPublication(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1alpha1.AddToScheme(scheme))
 
 	scan := &corev1alpha1.RepositoryScan{
 		ObjectMeta: metav1.ObjectMeta{Name: "scan-1", Namespace: "demo", UID: types.UID("scan-1-uid"), Generation: 1},
 		Spec: corev1alpha1.RepositoryScanSpec{
-			RepoURL: securityTestRepoURL,
-			Ref:     "f00dbabe",
-			GitSecretRef: &corev1.LocalObjectReference{
-				Name: "git-creds",
-			},
-			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
-			PatchAgentRef:    &corev1alpha1.AgentReference{Name: "patch"},
+			RepoURL:                      securityTestRepoURL,
+			ForkRepo:                     securityTestRepoURL,
+			Branch:                       "main",
+			Ref:                          "f00dbabe",
+			PRBaseBranch:                 "main",
+			ReadCredentialRef:            &corev1.LocalObjectReference{Name: "source-read"},
+			PublicationReadCredentialRef: &corev1.LocalObjectReference{Name: "target-read"},
+			PublicationCredentialRef:     &corev1.LocalObjectReference{Name: "target-write"},
+			ForgeCredentialRef:           &corev1.LocalObjectReference{Name: "forge"},
+			AnalysisAgentRef:             corev1alpha1.AgentReference{Name: "analysis"},
+			PatchAgentRef:                &corev1alpha1.AgentReference{Name: "patch"},
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan).Build()
 	db, err := sqlite.NewDB(":memory:")
 	require.NoError(t, err)
 	securityStore := sqlite.NewStore(db, ":memory:")
@@ -3187,6 +3223,8 @@ func TestCreateSecurityPatchTaskRequiresPushedBranch(t *testing.T) {
 
 	proposal, err := handlers.createSecurityPatchTask(context.Background(), nil, scan, finding)
 	require.NoError(t, err)
+	require.NotNil(t, proposal)
+	require.Equal(t, "pending", proposal.Status)
 	require.Equal(t, security.ScanStageTaskNameForRun(
 		scan.Name, "patch", security.StagePatch, finding.CurrentOccurrenceID,
 		"run_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -3195,27 +3233,50 @@ func TestCreateSecurityPatchTaskRequiresPushedBranch(t *testing.T) {
 		"run_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", finding.CurrentOccurrenceID,
 	), proposal.ID)
 	require.Regexp(t, `^orka/security/.+-[a-f0-9]{12}$`, proposal.Branch)
+	require.Equal(t, headSHA, proposal.SourceHeadSHA)
 
-	task := &corev1alpha1.Task{}
-	require.NoError(t, fakeClient.Get(context.Background(), clientObjectKey(proposal.TaskName), task))
-	require.Equal(t, "true", envValue(task.Spec.Env, "ORKA_REQUIRE_PUSH_BRANCH"))
-	require.NotNil(t, task.Spec.AgentRuntime)
-	require.NotNil(t, task.Spec.AgentRuntime.Workspace)
-	require.Equal(t, security.StagePatch, envValue(task.Spec.Env, security.EnvStage))
-	require.Equal(t, "scan-1", envValue(task.Spec.Env, security.EnvRepositoryScanName))
-	require.Equal(t, finding.ID, envValue(task.Spec.Env, security.EnvFindingID))
-	require.Equal(t, finding.CurrentOccurrenceID, envValue(task.Spec.Env, security.EnvOccurrenceID))
+	var tasks corev1alpha1.TaskList
+	require.NoError(t, fakeClient.List(context.Background(), &tasks, client.InNamespace("demo")))
+	require.Len(t, tasks.Items, 1)
+	task := tasks.Items[0]
+	require.Equal(t, proposal.TaskName, task.Name)
+	require.Equal(t, corev1alpha1.TaskTypeAgent, task.Spec.Type)
+	require.Equal(t, "patch", task.Spec.AgentRef.Name)
+	require.Empty(t, task.Spec.Env)
+	require.Contains(t, task.Spec.Prompt, proposal.Branch)
 	require.Equal(t, labels.SelectorValue(finding.ID), task.Labels[labels.LabelSecurityFindingID])
 	require.Equal(t, labels.SelectorValue(finding.CurrentOccurrenceID), task.Labels[labels.LabelSecurityOccurrenceID])
 	require.LessOrEqual(t, len(task.Labels[labels.LabelSecurityFindingID]), 63)
 	require.LessOrEqual(t, len(task.Labels[labels.LabelSecurityOccurrenceID]), 63)
 	require.Empty(t, k8svalidation.IsValidLabelValue(task.Labels[labels.LabelSecurityFindingID]))
 	require.Empty(t, k8svalidation.IsValidLabelValue(task.Labels[labels.LabelSecurityOccurrenceID]))
-	require.Equal(t, proposal.Branch, envValue(task.Spec.Env, security.EnvPatchBranch))
-	require.Empty(t, task.Spec.AgentRuntime.Workspace.Branch)
-	require.Equal(t, headSHA, task.Spec.AgentRuntime.Workspace.Ref)
-	require.Equal(t, proposal.Branch, task.Spec.AgentRuntime.Workspace.PushBranch)
-	require.Equal(t, headSHA, proposal.SourceHeadSHA)
+	require.NotNil(t, task.Spec.Workspace)
+	workspace := task.Spec.Workspace
+	require.Equal(t, corev1alpha1.WorkspaceIntentWrite, workspace.Intent)
+	require.Equal(t, securityTestRepoURL, workspace.GitRepo)
+	require.Equal(t, securityTestRepoURL, workspace.PublicationGitRepo)
+	require.Equal(t, "main", workspace.Branch)
+	require.Equal(t, headSHA, workspace.Ref)
+	require.Equal(t, proposal.Branch, workspace.PushBranch)
+	require.Equal(t, "main", workspace.PRBaseBranch)
+	require.True(t, workspace.CreatePR)
+	for name, tc := range map[string]struct {
+		ref  *corev1alpha1.WorkspaceCredentialReference
+		want string
+	}{
+		"read":             {ref: workspace.ReadCredentialRef, want: "source-read"},
+		"publication read": {ref: workspace.PublicationReadCredentialRef, want: "target-read"},
+		"publication":      {ref: workspace.PublicationCredentialRef, want: "target-write"},
+		"forge":            {ref: workspace.ForgeCredentialRef, want: "forge"},
+	} {
+		require.NotNil(t, tc.ref, name)
+		require.Equal(t, tc.want, tc.ref.Name, name)
+	}
+	proposals, err := securityStore.ListPatchProposals(context.Background(), "demo", finding.ID)
+	require.NoError(t, err)
+	require.Len(t, proposals, 1)
+	require.Equal(t, proposal.ID, proposals[0].ID)
+	require.Equal(t, proposal.Branch, proposals[0].Branch)
 }
 
 func TestCreateSecurityPatchTaskScopesGateOffIdentityToSourceRun(t *testing.T) {
@@ -3228,8 +3289,12 @@ func TestCreateSecurityPatchTaskScopesGateOffIdentityToSourceRun(t *testing.T) {
 			UID: types.UID("scan-gate-off-uid"), Generation: 3,
 		},
 		Spec: corev1alpha1.RepositoryScanSpec{
-			RepoURL:          securityTestRepoURL,
-			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+			RepoURL:                      securityTestRepoURL,
+			ReadCredentialRef:            &corev1.LocalObjectReference{Name: "source-read"},
+			PublicationReadCredentialRef: &corev1.LocalObjectReference{Name: "target-read"},
+			PublicationCredentialRef:     &corev1.LocalObjectReference{Name: "target-write"},
+			ForgeCredentialRef:           &corev1.LocalObjectReference{Name: "forge"},
+			AnalysisAgentRef:             corev1alpha1.AgentReference{Name: "analysis"},
 		},
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
@@ -3314,7 +3379,14 @@ func TestCreateSecurityPatchTaskRejectsUnsafeLegacySourceBindings(t *testing.T) 
 			require.NoError(t, corev1alpha1.AddToScheme(scheme))
 			scan := &corev1alpha1.RepositoryScan{
 				ObjectMeta: metav1.ObjectMeta{Name: "scan-1", Namespace: "demo", UID: types.UID("scan-1-uid"), Generation: 4},
-				Spec:       corev1alpha1.RepositoryScanSpec{RepoURL: securityTestRepoURL, AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"}},
+				Spec: corev1alpha1.RepositoryScanSpec{
+					RepoURL:                      securityTestRepoURL,
+					ReadCredentialRef:            &corev1.LocalObjectReference{Name: "source-read"},
+					PublicationReadCredentialRef: &corev1.LocalObjectReference{Name: "target-read"},
+					PublicationCredentialRef:     &corev1.LocalObjectReference{Name: "target-write"},
+					ForgeCredentialRef:           &corev1.LocalObjectReference{Name: "forge"},
+					AnalysisAgentRef:             corev1alpha1.AgentReference{Name: "analysis"},
+				},
 			}
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 			db, err := sqlite.NewDB(":memory:")
@@ -3349,17 +3421,41 @@ func TestCreateSecurityPatchTaskRejectsUnsafeLegacySourceBindings(t *testing.T) 
 	}
 }
 
-func clientObjectKey(name string) client.ObjectKey {
-	return client.ObjectKey{Namespace: "demo", Name: name}
+func TestCreateSecurityPatchTaskRejectsLegacyCredentialReuse(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "scan-legacy", Namespace: "demo"},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:          securityTestRepoURL,
+			GitSecretRef:     &corev1.LocalObjectReference{Name: "legacy-all-powerful"},
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan).Build()
+	db, err := sqlite.NewDB(":memory:")
+	require.NoError(t, err)
+	securityStore := sqlite.NewStore(db, ":memory:")
+	handlers := NewHandlers(HandlersConfig{Client: fakeClient, SecurityStore: securityStore})
+	finding := &store.Finding{ID: "fnd_legacy", Namespace: "demo", Title: "Legacy authority reuse"}
+
+	proposal, err := handlers.createSecurityPatchTask(context.Background(), nil, scan, finding)
+	require.Nil(t, proposal)
+	var fiberErr *fiber.Error
+	require.ErrorAs(t, err, &fiberErr)
+	require.Equal(t, http.StatusBadRequest, fiberErr.Code)
+	require.Contains(t, fiberErr.Message, "spec.readCredentialRef is required")
+
+	var tasks corev1alpha1.TaskList
+	require.NoError(t, fakeClient.List(context.Background(), &tasks, client.InNamespace("demo")))
+	require.Empty(t, tasks.Items)
+	proposals, err := securityStore.ListPatchProposals(context.Background(), "demo", finding.ID)
+	require.NoError(t, err)
+	require.Empty(t, proposals)
 }
 
-func envValue(envs []corev1.EnvVar, name string) string {
-	for _, env := range envs {
-		if env.Name == name {
-			return env.Value
-		}
-	}
-	return ""
+func clientObjectKey(name string) client.ObjectKey {
+	return client.ObjectKey{Namespace: "demo", Name: name}
 }
 
 func TestSecurityBundleReadsAuthorizeAgainstHistoricalGeneration(t *testing.T) {

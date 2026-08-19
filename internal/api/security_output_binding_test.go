@@ -284,26 +284,6 @@ func TestSecurityOutputBindingRevalidatesBeforeCommit(t *testing.T) {
 	}
 }
 
-func TestHarnessOutputProvenanceUsesPlannedAttempt(t *testing.T) {
-	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{
-		Name: "task", Namespace: "ns", UID: types.UID("task-uid"),
-		Annotations: map[string]string{
-			harnessWrapperRuntimeAnnotation: "runtime-1", harnessWrapperTurnIDAnnotation: "turn-1",
-			"orka.ai/harness-wrapper-correlation-id": "corr-1", "orka.ai/harness-wrapper-attempt": "2",
-		},
-	}}
-	user := &UserInfo{Username: "system:serviceaccount:orka-system:agent-harness-wrapper", Extra: map[string]authenticationv1.ExtraValue{
-		"authentication.kubernetes.io/pod-uid": {"pod-uid"},
-	}}
-	provenance, err := outputProvenanceForWriter(context.Background(), internalCallerAuthorizer{}, user, task)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if provenance.TaskAttempt != 2 || provenance.ProducerKind != store.OutputProducerHarnessWrapper {
-		t.Fatalf("provenance = %#v", provenance)
-	}
-}
-
 func TestTaskBoundOutputAttemptUsesFrozenHarnessAttempt(t *testing.T) {
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{harnessWrapperAttemptAnnotationAPI: "2"}},

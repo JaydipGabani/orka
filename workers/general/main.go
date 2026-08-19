@@ -252,6 +252,9 @@ func submitResult(workDir, output string) error {
 	resultDir := ""
 	if workDir != "" {
 		resultDir = workspaceDir
+		if err := configurePublicationRemote(resultDir); err != nil {
+			return err
+		}
 	}
 	resultBytes, err := common.FinalizeResult(resultDir, output)
 	if err != nil {
@@ -261,6 +264,18 @@ func submitResult(workDir, output string) error {
 		return err
 	}
 	return common.UploadArtifacts()
+}
+
+func configurePublicationRemote(workDir string) error {
+	publicationRepo := strings.TrimSpace(os.Getenv(workerenv.ForkRepo))
+	if publicationRepo == "" || strings.TrimSpace(os.Getenv(workerenv.PushBranch)) == "" {
+		return nil
+	}
+	command := exec.Command("git", "-C", workDir, "remote", "set-url", "origin", publicationRepo)
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("configure publication Git remote: %w", err)
+	}
+	return nil
 }
 
 func runSecurityMapper(ctx context.Context) error {
@@ -278,6 +293,22 @@ func runSecurityMapper(ctx context.Context) error {
 	artifact, err := buildSecurityMapperArtifact(ctx, workDir, repositoryScan, baseCommit, headCommit, pinnedTargets)
 	if err != nil {
 		return err
+	}
+	for i := range artifact.Slices {
+		contextSlice := artifact.Slices[i]
+		contextSlice.ChangedFiles = append([]string(nil), artifact.ChangedFiles...)
+		contextSlice.ChangedLineRanges = append([]security.ChangedLineRange(nil), artifact.ChangedLineRanges...)
+		_, manifest, err := security.BuildReviewContext(workDir, contextSlice, security.ReviewContextOptions{})
+		if err != nil {
+			return fmt.Errorf("build security review context for %s: %w", contextSlice.ID, err)
+		}
+		manifestData, err := json.Marshal(manifest)
+		if err != nil {
+			return fmt.Errorf("marshal security review context for %s: %w", contextSlice.ID, err)
+		}
+		if err := common.WriteArtifactFile(security.ReviewContextArtifactName(contextSlice.ID), manifestData); err != nil {
+			return err
+		}
 	}
 	data, err := json.MarshalIndent(artifact, "", "  ")
 	if err != nil {
@@ -853,10 +884,6 @@ func defaultChangedLineRangesForSecurityScan(
 }
 
 var unifiedDiffHunkRE = regexp.MustCompile(`^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,([0-9]+))? @@`)
-
-func parseChangedLineRangesFromUnifiedDiff(diff []byte) ([]security.ChangedLineRange, error) {
-	return parseChangedLineRangesFromUnifiedDiffReader(bytes.NewReader(diff))
-}
 
 func parseChangedLineRangesFromUnifiedDiffReader(r io.Reader) ([]security.ChangedLineRange, error) {
 	reader := bufio.NewReaderSize(r, 64*1024)
