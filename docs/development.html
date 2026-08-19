@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="generator" content="Docusaurus v3.10.1">
 <title data-rh="true">Development | Orka</title><meta data-rh="true" name="viewport" content="width=device-width,initial-scale=1"><meta data-rh="true" name="twitter:card" content="summary_large_image"><meta data-rh="true" property="og:url" content="https://orka-agents.github.io/orka/docs/development"><meta data-rh="true" property="og:locale" content="en"><meta data-rh="true" name="docusaurus_locale" content="en"><meta data-rh="true" name="docsearch:language" content="en"><meta data-rh="true" name="docusaurus_version" content="current"><meta data-rh="true" name="docusaurus_tag" content="docs-default-current"><meta data-rh="true" name="docsearch:version" content="current"><meta data-rh="true" name="docsearch:docusaurus_tag" content="docs-default-current"><meta data-rh="true" property="og:title" content="Development | Orka"><meta data-rh="true" name="description" content="Prerequisites"><meta data-rh="true" property="og:description" content="Prerequisites"><link data-rh="true" rel="canonical" href="https://orka-agents.github.io/orka/docs/development"><link data-rh="true" rel="alternate" href="https://orka-agents.github.io/orka/docs/development" hreflang="en"><link data-rh="true" rel="alternate" href="https://orka-agents.github.io/orka/docs/development" hreflang="x-default"><script data-rh="true" type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Development","item":"https://orka-agents.github.io/orka/docs/development"}]}</script><link rel="stylesheet" href="/orka/assets/css/styles.01a08f18.css">
-<script src="/orka/assets/js/runtime~main.423129b4.js" defer="defer"></script>
+<script src="/orka/assets/js/runtime~main.04924546.js" defer="defer"></script>
 <script src="/orka/assets/js/main.843ed4cf.js" defer="defer"></script>
 </head>
 <body>
@@ -95,7 +95,11 @@ and pick a short or long request body via
 <code>DEMO_REQUEST_PRESET=quiet-flag|readme-fix|vekil-metrics</code>. See
 <code>hack/demos/RECORDING.md</code> for the full design.</p>
 <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="generate-installer-yaml">Generate Installer YAML<a href="#generate-installer-yaml" class="hash-link" aria-label="Direct link to Generate Installer YAML" title="Direct link to Generate Installer YAML" translate="no">​</a></h2>
-<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"><div class="token-line" style="color:#393A34"><span class="token plain">make build-installer IMG=ghcr.io/orka-agents/orka:latest</span><br></div></code></pre></div></div>
+<p>The installer manifest is generated into <code>manifest_staging/deploy/orka.yaml</code> by
+the staged manifest flow:</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"><div class="token-line" style="color:#393A34"><span class="token plain">make manifests</span><br></div></code></pre></div></div>
+<p>See <a href="#helm-chart-generation-and-releases" class="">Helm Chart Generation and Releases</a>
+for how staging output is promoted into <code>deploy/</code> at release time.</p>
 <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="build-gotchas">Build Gotchas<a href="#build-gotchas" class="hash-link" aria-label="Direct link to Build Gotchas" title="Direct link to Build Gotchas" translate="no">​</a></h2>
 <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id="ui-embedding">UI Embedding<a href="#ui-embedding" class="hash-link" aria-label="Direct link to UI Embedding" title="Direct link to UI Embedding" translate="no">​</a></h3>
 <p><code>make build</code> embeds the React UI into the controller binary via <code>//go:embed</code>. The UI must be built first:</p>
