@@ -963,7 +963,7 @@ func (h *Handlers) createSecurityValidationTask(ctx context.Context, ui *UserInf
 	if h.securityIntegrityStore != nil && strings.TrimSpace(finding.CurrentOccurrenceID) != "" {
 		assessments, _, err := h.securityIntegrityStore.ListFindingAssessments(ctx, store.FindingAssessmentFilter{
 			Namespace: scan.Namespace, RepositoryScan: finding.RepositoryScan, OccurrenceID: finding.CurrentOccurrenceID,
-			Kind: store.FindingAssessmentValidation, Limit: 1,
+			Kind: store.FindingAssessmentValidation, Limit: 1000,
 		})
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to check existing validation assessment: %v", err))

@@ -105,6 +105,11 @@ const (
 	maxThreatModelFallbackBytes = 1 << 20
 
 	securityJSONContentType = "application/json"
+
+	// repositoryScanRunFinalizer releases durable scan-run reservations before
+	// the RepositoryScan object disappears, so the repository-wide active-run
+	// index cannot stay occupied by a deleted owner.
+	repositoryScanRunFinalizer = "orka.ai/repositoryscan-run-reservation"
 )
 
 var errScannerPolicyDigestChanged = errors.New("scanner policy digest changed during scan run")
@@ -253,6 +258,28 @@ func (r *RepositoryScanReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	if !scan.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(scan, repositoryScanRunFinalizer) {
+			if err := r.releaseScanRunReservations(ctx, scan); err != nil {
+				logger.Error(err, "failed to release scan run reservations for deleted RepositoryScan")
+				return ctrl.Result{}, err
+			}
+			patch := client.MergeFrom(scan.DeepCopy())
+			controllerutil.RemoveFinalizer(scan, repositoryScanRunFinalizer)
+			if err := r.Patch(ctx, scan, patch); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+	if r.SecurityStore != nil && !controllerutil.ContainsFinalizer(scan, repositoryScanRunFinalizer) {
+		patch := client.MergeFrom(scan.DeepCopy())
+		controllerutil.AddFinalizer(scan, repositoryScanRunFinalizer)
+		if err := r.Patch(ctx, scan, patch); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if scan.Status.Phase == "" {
@@ -1005,6 +1032,72 @@ func (r *RepositoryScanReconciler) markScanRunTerminalError(ctx context.Context,
 	return r.refreshScanRunStatus(ctx, scan, currentRun, currentRun.ID, true)
 }
 
+func latestScanPipelineRunIDForScan(scan *corev1alpha1.RepositoryScan, tasks []corev1alpha1.Task) string {
+	if scanID := latestOwnedScanPipelineRunID(tasks); scanID != "" {
+		return scanID
+	}
+	return strings.TrimSpace(scan.Status.LastScanID)
+}
+
+// retireStaleScanRunReservation terminalizes an active run whose immutable
+// RepositoryScan identity no longer matches the live object. The spec changed
+// (or the object was recreated) after the run was reserved, so the stale
+// reservation must never progress with the new mutable spec; retiring it lets
+// a current-generation run start.
+func (r *RepositoryScanReconciler) retireStaleScanRunReservation(
+	ctx context.Context,
+	scan *corev1alpha1.RepositoryScan,
+	run *store.ScanRun,
+) (bool, error) {
+	if !activeScanRunPhase(run.Phase) || !scanRunExplicitlyMismatchesRepositoryScan(run, scan) {
+		return false, nil
+	}
+	if err := r.markScanRunTerminalError(ctx, scan, run,
+		errors.New("scan run does not match the current repository scan identity; retiring the stale reservation")); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// releaseScanRunReservations terminalizes every active or sealing scan run for
+// a RepositoryScan that is being deleted. Without this, the durable
+// active-repository reservation would outlive the Kubernetes object and block
+// a recreated RepositoryScan with the same namespace and name forever.
+func (r *RepositoryScanReconciler) releaseScanRunReservations(ctx context.Context, scan *corev1alpha1.RepositoryScan) error {
+	if r.SecurityStore == nil || scan == nil {
+		return nil
+	}
+	cursor := ""
+	for {
+		runs, next, err := r.SecurityStore.ListScanRuns(ctx, scan.Namespace, scan.Name, 100, cursor)
+		if err != nil {
+			return err
+		}
+		for i := range runs {
+			run := &runs[i]
+			if !activeScanRunPhase(run.Phase) && run.Quality.BundleStatus != store.BundleStatusSealing {
+				continue
+			}
+			now := time.Now().UTC()
+			run.Phase = scanRunPhaseFailed
+			run.CompletedAt = &now
+			run.ErrorMessage = "repository scan was deleted before the run completed"
+			run.Summary = run.ErrorMessage
+			if run.Quality.BundleStatus == store.BundleStatusSealing {
+				run.Quality.BundleStatus = store.BundleStatusFailed
+			}
+			if err := r.SecurityStore.UpdateScanRun(ctx, run); err != nil && !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	return nil
+}
+
 func (r *RepositoryScanReconciler) createMapperTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) error {
 	policy, err := security.LoadScannerPolicy(ctx, r.Client, scan.Namespace, scan.Spec)
 	if err != nil {
@@ -1386,10 +1479,7 @@ func (r *RepositoryScanReconciler) progressLatestScanRun(ctx context.Context, sc
 	}
 
 	tasks.Items = repositoryScanControlledTasks(scan, tasks.Items)
-	scanID := latestOwnedScanPipelineRunID(tasks.Items)
-	if scanID == "" {
-		scanID = strings.TrimSpace(scan.Status.LastScanID)
-	}
+	scanID := latestScanPipelineRunIDForScan(scan, tasks.Items)
 	if scanID == "" {
 		return false, nil
 	}
@@ -1404,6 +1494,9 @@ func (r *RepositoryScanReconciler) progressLatestScanRun(ctx context.Context, sc
 	}
 	if run.Phase == scanRunPhaseFailed {
 		return false, nil
+	}
+	if retired, err := r.retireStaleScanRunReservation(ctx, scan, run); err != nil || retired {
+		return retired, err
 	}
 
 	if scanRunUsesPinnedTarget(run) {

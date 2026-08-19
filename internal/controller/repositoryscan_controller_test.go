@@ -5384,3 +5384,104 @@ func TestTerminalScannerPolicyLoadErrorOnlyTerminalForDeterministicErrors(t *tes
 		t.Fatal("terminalScannerPolicyLoadError() = true, want false for context deadline")
 	}
 }
+
+func TestProgressLatestScanRunRetiresStaleGenerationReservation(t *testing.T) {
+	ctx := context.Background()
+	store := setupControllerSQLiteStore(t)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	reservedScan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "stale-gen", Namespace: defaultNS, UID: types.UID("stale-gen-uid"), Generation: 1},
+		Spec:       corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"}},
+	}
+	run := &storepkg.ScanRun{
+		ID: "scan_stale_gen", Namespace: defaultNS, RepositoryScan: reservedScan.Name,
+		TaskName: "stale-gen-initial-threat-model", Mode: "initial", Phase: scanRunPhaseRunning, StartedAt: time.Now(),
+	}
+	reserveScanRunForIngestionTest(t, ctx, store, reservedScan, run)
+
+	currentScan := reservedScan.DeepCopy()
+	currentScan.Generation = 2
+	currentScan.Status.LastScanID = run.ID
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.RepositoryScan{}).WithObjects(currentScan).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: store}
+
+	progressed, err := reconciler.progressLatestScanRun(ctx, currentScan)
+	if err != nil {
+		t.Fatalf("progressLatestScanRun() error = %v", err)
+	}
+	if !progressed {
+		t.Fatal("progressLatestScanRun() = false, want stale reservation retirement")
+	}
+	updated, err := store.GetScanRun(ctx, defaultNS, run.ID)
+	if err != nil {
+		t.Fatalf("GetScanRun() error = %v", err)
+	}
+	if updated.Phase != scanRunPhaseFailed || !strings.Contains(updated.ErrorMessage, "does not match the current repository scan identity") {
+		t.Fatalf("stale run phase/error = %q/%q, want retired reservation", updated.Phase, updated.ErrorMessage)
+	}
+	var tasks corev1alpha1.TaskList
+	if err := cl.List(ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
+		t.Fatalf("List(Tasks) error = %v", err)
+	}
+	if len(tasks.Items) != 0 {
+		t.Fatalf("len(tasks) = %d, want no pipeline work for a stale-generation run", len(tasks.Items))
+	}
+}
+
+func TestRepositoryScanDeletionReleasesActiveRunReservation(t *testing.T) {
+	ctx := context.Background()
+	store := setupControllerSQLiteStore(t)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "deleted-scan", Namespace: defaultNS, UID: types.UID("deleted-scan-uid"), Generation: 1,
+			Finalizers: []string{repositoryScanRunFinalizer},
+		},
+		Spec:   corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"}},
+		Status: corev1alpha1.RepositoryScanStatus{Phase: repositoryScanPhaseScanning},
+	}
+	run := &storepkg.ScanRun{
+		ID: "scan_deleted_owner", Namespace: defaultNS, RepositoryScan: scan.Name,
+		TaskName: "deleted-scan-initial-threat-model", Mode: "initial", Phase: scanRunPhaseRunning, StartedAt: time.Now(),
+	}
+	reserveScanRunForIngestionTest(t, ctx, store, scan, run)
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.RepositoryScan{}).WithObjects(scan).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: store}
+	if err := cl.Delete(ctx, scan); err != nil {
+		t.Fatalf("Delete(RepositoryScan) error = %v", err)
+	}
+
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: scan.Namespace, Name: scan.Name}}); err != nil {
+		t.Fatalf("Reconcile(deleting) error = %v", err)
+	}
+
+	released, err := store.GetScanRun(ctx, defaultNS, run.ID)
+	if err != nil {
+		t.Fatalf("GetScanRun() error = %v", err)
+	}
+	if released.Phase != scanRunPhaseFailed || released.CompletedAt == nil ||
+		!strings.Contains(released.ErrorMessage, "repository scan was deleted") {
+		t.Fatalf("released run = %q/%q, want terminalized reservation", released.Phase, released.ErrorMessage)
+	}
+	remaining := &corev1alpha1.RepositoryScan{}
+	if getErr := cl.Get(ctx, types.NamespacedName{Namespace: scan.Namespace, Name: scan.Name}, remaining); !apierrors.IsNotFound(getErr) {
+		t.Fatalf("RepositoryScan after finalization = %v, want deleted", getErr)
+	}
+
+	recreated := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: scan.Name, Namespace: defaultNS, UID: types.UID("deleted-scan-uid-2"), Generation: 1},
+		Spec:       scan.Spec,
+	}
+	newRun := &storepkg.ScanRun{
+		ID: "scan_recreated_owner", Namespace: defaultNS, RepositoryScan: recreated.Name,
+		TaskName: "deleted-scan-initial-threat-model-2", Mode: "initial", Phase: scanRunPhasePending, StartedAt: time.Now(),
+	}
+	reserveScanRunForIngestionTest(t, ctx, store, recreated, newRun)
+}
