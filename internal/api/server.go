@@ -43,7 +43,7 @@ type ControllerEpochFenceSource interface {
 }
 
 type ControllerEpochReader interface {
-	GetControllerEpoch(context.Context, string) (*store.ControllerEpoch, error)
+	GetControllerEpochFence(context.Context, string) (store.ControllerEpochFence, error)
 }
 
 // ControllerEpochStoreFenceSource reads the current fence directly from the
@@ -61,14 +61,7 @@ func (s *ControllerEpochStoreFenceSource) CurrentFence(ctx context.Context) (sto
 	if s == nil || s.epochs == nil {
 		return store.ControllerEpochFence{}, fmt.Errorf("controller epoch store is unavailable")
 	}
-	epoch, err := s.epochs.GetControllerEpoch(ctx, store.DefaultControllerEpochName)
-	if err != nil {
-		return store.ControllerEpochFence{}, err
-	}
-	if epoch == nil {
-		return store.ControllerEpochFence{}, fmt.Errorf("controller epoch is unavailable")
-	}
-	return store.ControllerEpochFence{Name: epoch.Name, Epoch: epoch.Epoch, HolderID: epoch.HolderID}, nil
+	return s.epochs.GetControllerEpochFence(ctx, store.DefaultControllerEpochName)
 }
 
 // ServerConfig holds configuration for the API server
@@ -89,6 +82,7 @@ type ServerConfig struct {
 	MessageStore              store.MessageStore
 	ArtifactStore             store.ArtifactStore
 	ArtifactReservations      artifactcap.CapabilityReservationRecorder
+	ExternalEffects           store.ExternalEffectIdentityReader
 	MemoryStore               store.MemoryStore
 	MemoryProposalStore       store.MemoryProposalStore
 	SecurityStore             store.SecurityStore
