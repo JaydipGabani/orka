@@ -139,6 +139,10 @@ type TaskReconciler struct {
 	MaxTasksPerNamespace              int32
 	ExecutionWorkspaceDefaultProvider corev1alpha1.WorkspaceProvider
 	WorkspaceProviderAPIEnabled       bool
+	// ACPWorkspaceDispatchEnabled admits workspace-provider-backed ACP
+	// RuntimeSession dispatch. When false, workspace-backed agent Tasks fail
+	// closed before any workspace or RuntimePool demand exists.
+	ACPWorkspaceDispatchEnabled       bool
 	AgentSandboxEnabled               bool
 	AgentSandboxConfig                AgentSandboxConfig
 	SubstrateEnabled                  bool
@@ -362,6 +366,10 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			"Task status initialized to Pending",
 		)
 		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
+	if err := r.projectACPExecutionWorkspaceStatus(ctx, task); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Handle based on current phase
@@ -3037,6 +3045,24 @@ func (r *TaskReconciler) validateExecutionWorkspace(task *corev1alpha1.Task) err
 	if err := validateExecutionWorkspaceBasics(task, provider); err != nil {
 		return err
 	}
+	return validateExecutionWorkspacePolicyShape(task, ws)
+}
+
+// validateExecutionWorkspaceRequest retains the provider-specific validation
+// used by the legacy workspace request resolver. Agent execution admission
+// deliberately runs only validateExecutionWorkspace before contract routing:
+// planAgentExecution owns ACP-only provider and template gates so harness-v1
+// requests receive the v1-specific unsupported-workspace error.
+func (r *TaskReconciler) validateExecutionWorkspaceRequest(task *corev1alpha1.Task) error {
+	if err := r.validateExecutionWorkspace(task); err != nil {
+		return err
+	}
+	if task.Spec.Execution == nil || task.Spec.Execution.Workspace == nil || !task.Spec.Execution.Workspace.Enabled {
+		return nil
+	}
+
+	ws := task.Spec.Execution.Workspace
+	provider := resolveWorkspaceProvider(ws, r.ExecutionWorkspaceDefaultProvider)
 	if err := validateExecutionWorkspaceSubstrateOptions(ws, provider); err != nil {
 		return err
 	}
@@ -3107,19 +3133,22 @@ func (r *TaskReconciler) validateExecutionWorkspaceProviderConfig(
 		if !r.AgentSandboxEnabled {
 			return fmt.Errorf("execution workspace provider %q requires agent sandbox to be enabled", provider)
 		}
-		cfg := r.AgentSandboxConfig.WithDefaults()
-		if err := cfg.Validate(); err != nil {
-			return err
-		}
-		if executionWorkspaceTemplateName(ws, cfg) == "" {
-			return fmt.Errorf("execution workspace templateRef.name is required when no agent sandbox default template is configured")
+		// ACP RuntimeSessions execute only in controller-rendered sandbox
+		// templates: the immutable runtime image, epoch-scoped Secret mounts,
+		// and fence environment cannot be hosted by an operator-provided
+		// template without exposing credentials through the provider API.
+		if ws.TemplateRef != nil {
+			return fmt.Errorf("execution workspace templateRef selects a legacy worker-path sandbox template; ACP RuntimeSessions run only in controller-rendered sandbox templates, so templateRef must be omitted")
 		}
 	case corev1alpha1.WorkspaceProviderSubstrate:
 		if !r.SubstrateEnabled {
 			return fmt.Errorf("execution workspace provider %q requires substrate to be enabled", provider)
 		}
 		cfg := r.SubstrateConfig.WithDefaults()
-		if err := cfg.Validate(); err != nil {
+		// Agent Tasks always use the ACP RuntimePool backend. The legacy
+		// workspace-agent bootstrap Secret is validated only by the separate
+		// workspace-provider API path and must not mask the ACP dispatch gate.
+		if err := cfg.ValidateACPRuntimePool(); err != nil {
 			return err
 		}
 		if substrateTemplateName(ws, cfg) == "" {
@@ -3130,6 +3159,17 @@ func (r *TaskReconciler) validateExecutionWorkspaceProviderConfig(
 }
 
 func validateExecutionWorkspacePolicies(task *corev1alpha1.Task, ws *corev1alpha1.ExecutionWorkspaceSpec) error {
+	if err := validateExecutionWorkspacePolicyShape(task, ws); err != nil {
+		return err
+	}
+	if ws.PoolRef != nil && ws.CleanupPolicy == corev1alpha1.WorkspaceCleanupPolicyRetain {
+		return fmt.Errorf("execution workspace poolRef does not support cleanupPolicy %q until substrate workspace reset is available", ws.CleanupPolicy)
+	}
+
+	return nil
+}
+
+func validateExecutionWorkspacePolicyShape(task *corev1alpha1.Task, ws *corev1alpha1.ExecutionWorkspaceSpec) error {
 	if !statusrules.IsOptionalReusePolicy(ws.ReusePolicy) {
 		return fmt.Errorf("unsupported execution workspace reusePolicy %q", ws.ReusePolicy)
 	}
@@ -3137,10 +3177,6 @@ func validateExecutionWorkspacePolicies(task *corev1alpha1.Task, ws *corev1alpha
 	if !statusrules.IsOptionalCleanupPolicy(ws.CleanupPolicy) {
 		return fmt.Errorf("unsupported execution workspace cleanupPolicy %q", ws.CleanupPolicy)
 	}
-	if ws.PoolRef != nil && ws.CleanupPolicy == corev1alpha1.WorkspaceCleanupPolicyRetain {
-		return fmt.Errorf("execution workspace poolRef does not support cleanupPolicy %q until substrate workspace reset is available", ws.CleanupPolicy)
-	}
-
 	if ws.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession && (task.Spec.SessionRef == nil || task.Spec.SessionRef.Name == "") {
 		return fmt.Errorf("execution workspace reusePolicy %q requires spec.sessionRef.name", ws.ReusePolicy)
 	}

@@ -17,9 +17,33 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 	if _, err := acp.HardenSupervisorProcess(); err != nil {
 		logger.Error("failed to harden ACP supervisor", "error", err)
 		os.Exit(1)
+	}
+	if supervisor.CredentialBootstrapConfigured() {
+		// Provider-hosted supervisors boot credential-free (their workload
+		// template is provider-visible and may be golden-snapshotted) and wait
+		// for the controller to seed the pool credentials.
+		logger.Info("awaiting controller credential bootstrap")
+		seeded, err := supervisor.AwaitCredentialBootstrap(ctx)
+		if err != nil {
+			logger.Error("credential bootstrap failed", "error", err)
+			os.Exit(1)
+		}
+		for name, value := range map[string]string{
+			supervisor.EnvControllerTokenBootstrap:  seeded.ControllerToken,
+			supervisor.EnvCapabilitySecretBootstrap: seeded.CapabilitySecret,
+			supervisor.EnvProviderTokenBootstrap:    seeded.ProviderToken,
+		} {
+			if err := os.Setenv(name, value); err != nil {
+				logger.Error("stage bootstrapped credential", "error", err)
+				os.Exit(1)
+			}
+		}
+		logger.Info("credential bootstrap complete")
 	}
 	cfg, err := supervisor.LoadConfigFromEnv()
 	if err != nil {
@@ -45,8 +69,6 @@ func main() {
 		MaxHeaderBytes: 32 << 10,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
 	shutdownResult := make(chan error, 1)
 	go func() {
 		<-ctx.Done()

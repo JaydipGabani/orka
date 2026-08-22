@@ -408,6 +408,7 @@ type ACPUpgradeDrainCoordinator struct {
 	Barriers         ACPUpgradeDrainBarrierObserver
 	SupervisorClient RuntimePoolSupervisorClient
 	HTTPClient       *http.Client
+	SubstrateConfig  SubstrateConfig
 	Options          ACPUpgradeDrainOptions
 	Now              func() time.Time
 
@@ -718,6 +719,32 @@ func (c *ACPUpgradeDrainCoordinator) observeAndDrainRuntimePool(
 		return nil
 	}
 	active := pool.Status.ActiveInstance
+	if active != nil && (active.ControllerEpoch != fence.Epoch || pool.Status.ControllerEpoch != fence.Epoch) {
+		return fmt.Errorf("active instance is fenced to controller epoch %d instead of %d", active.ControllerEpoch, fence.Epoch)
+	}
+	if pool.Spec.ExecutionWorkspace != nil && active == nil {
+		if pool.Status.Lifecycle == corev1alpha1.RuntimePoolLifecycleStopped {
+			if pool.Status.ObservedGeneration != pool.Generation {
+				return fmt.Errorf(
+					"workspace stopped status observed generation %d instead of current generation %d",
+					pool.Status.ObservedGeneration,
+					pool.Generation,
+				)
+			}
+			return nil
+		}
+		return fmt.Errorf(
+			"has no authenticated active instance but workspace lifecycle %q does not prove the provider workspace is stopped",
+			pool.Status.Lifecycle,
+		)
+	}
+	if runtimePoolIsSubstrateBacked(pool) {
+		pod, err := upgradeDrainSubstrateInstancePod(pool, active)
+		if err != nil {
+			return err
+		}
+		return c.observeAndDrainRuntimeInstance(ctx, fence, pool, active, pod, snapshot)
+	}
 	pods, err := c.listRuntimePoolPodsForUpgradeDrain(ctx, pool, active)
 	if err != nil {
 		return err
@@ -727,9 +754,6 @@ func (c *ACPUpgradeDrainCoordinator) observeAndDrainRuntimePool(
 			return nil
 		}
 		return fmt.Errorf("has %d live runtime Pods but no authenticated active instance", len(pods))
-	}
-	if active.ControllerEpoch != fence.Epoch || pool.Status.ControllerEpoch != fence.Epoch {
-		return fmt.Errorf("active instance is fenced to controller epoch %d instead of %d", active.ControllerEpoch, fence.Epoch)
 	}
 	var pod *corev1.Pod
 	for i := range pods {
@@ -748,12 +772,24 @@ func (c *ACPUpgradeDrainCoordinator) observeAndDrainRuntimePool(
 	if len(pods) != 1 {
 		return fmt.Errorf("found %d live owned runtime Pods during planned drain", len(pods))
 	}
+	return c.observeAndDrainRuntimeInstance(ctx, fence, pool, active, pod, snapshot)
+}
+
+func (c *ACPUpgradeDrainCoordinator) observeAndDrainRuntimeInstance(
+	ctx context.Context,
+	fence store.ControllerEpochFence,
+	pool *corev1alpha1.RuntimePool,
+	active *corev1alpha1.RuntimePoolActiveInstanceStatus,
+	pod *corev1.Pod,
+	snapshot *ACPUpgradeDrainSnapshot,
+) error {
 	auth, err := c.runtimePoolAuthSecret(ctx, pool, active, fence.Epoch)
 	if err != nil {
 		return err
 	}
-	supervisor := c.supervisorClient()
-	probe, err := supervisor.Probe(ctx, runtimePoolPodEndpoint(pod), string(auth.Data[runtimePoolControllerTokenKey]), auth.Data[runtimePoolCapabilitySecretKey])
+	supervisor := c.supervisorClientForPool(pool)
+	endpoint := runtimePoolInstanceEndpoint(pool, pod)
+	probe, err := supervisor.Probe(ctx, endpoint, string(auth.Data[runtimePoolControllerTokenKey]), auth.Data[runtimePoolCapabilitySecretKey])
 	if err != nil {
 		return fmt.Errorf("authenticated supervisor probe failed: %w", err)
 	}
@@ -772,7 +808,7 @@ func (c *ACPUpgradeDrainCoordinator) observeAndDrainRuntimePool(
 	if !probe.Status.Drain.Requested {
 		if err := supervisor.RequestDrain(
 			ctx,
-			runtimePoolPodEndpoint(pod),
+			endpoint,
 			string(auth.Data[runtimePoolControllerTokenKey]),
 			auth.Data[runtimePoolCapabilitySecretKey],
 			probe.Status,
@@ -786,6 +822,35 @@ func (c *ACPUpgradeDrainCoordinator) observeAndDrainRuntimePool(
 		return fmt.Errorf("authenticated supervisor is still draining")
 	}
 	return nil
+}
+
+func upgradeDrainSubstrateInstancePod(
+	pool *corev1alpha1.RuntimePool,
+	active *corev1alpha1.RuntimePoolActiveInstanceStatus,
+) (*corev1.Pod, error) {
+	if pool == nil || active == nil {
+		return nil, fmt.Errorf("substrate RuntimePool active instance is required")
+	}
+	namespace := strings.TrimSpace(active.PodNamespace)
+	name := strings.TrimSpace(active.PodName)
+	uid := strings.TrimSpace(active.PodUID)
+	address := strings.TrimSpace(active.PodAddress)
+	providerGeneration := strings.TrimSpace(active.ProviderTokenGeneration)
+	if namespace == "" || name == "" || uid == "" || address == "" || !validRuntimePoolProviderTokenGeneration(providerGeneration) {
+		return nil, fmt.Errorf("substrate RuntimePool active instance identity is incomplete")
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+			UID:       types.UID(uid),
+			Annotations: map[string]string{
+				runtimePoolProfileAnnotation:                 pool.Spec.Runtime.Profile.Digest,
+				runtimePoolProviderTokenGenerationAnnotation: providerGeneration,
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: address},
+	}, nil
 }
 
 func (c *ACPUpgradeDrainCoordinator) listRuntimePoolPodsForUpgradeDrain(
@@ -862,10 +927,9 @@ func (c *ACPUpgradeDrainCoordinator) runtimePoolAuthSecret(
 	active *corev1alpha1.RuntimePoolActiveInstanceStatus,
 	epoch int64,
 ) (*corev1.Secret, error) {
-	name := runtimePoolChildName(runtimePoolResourceName(pool.Namespace, pool.Name), "auth-e"+strconv.FormatInt(epoch, 10))
-	secret := &corev1.Secret{}
-	if err := c.APIReader.Get(ctx, types.NamespacedName{Namespace: active.PodNamespace, Name: name}, secret); err != nil {
-		return nil, fmt.Errorf("get RuntimePool auth Secret: %w", err)
+	secret, err := resolveRuntimePoolAuthSecret(ctx, c.APIReader, pool, active.PodNamespace, epoch)
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(string(secret.Data[runtimePoolControllerTokenKey])) == "" || len(secret.Data[runtimePoolCapabilitySecretKey]) == 0 {
 		return nil, fmt.Errorf("RuntimePool auth Secret is missing controller credentials")
@@ -873,9 +937,14 @@ func (c *ACPUpgradeDrainCoordinator) runtimePoolAuthSecret(
 	return secret, nil
 }
 
-func (c *ACPUpgradeDrainCoordinator) supervisorClient() RuntimePoolSupervisorClient {
-	reconciler := &RuntimePoolReconciler{SupervisorClient: c.SupervisorClient, HTTPClient: c.HTTPClient, Now: c.Now}
-	return reconciler.supervisorClient()
+func (c *ACPUpgradeDrainCoordinator) supervisorClientForPool(pool *corev1alpha1.RuntimePool) RuntimePoolSupervisorClient {
+	reconciler := &RuntimePoolReconciler{
+		SupervisorClient: c.SupervisorClient,
+		HTTPClient:       c.HTTPClient,
+		SubstrateConfig:  c.SubstrateConfig,
+		Now:              c.Now,
+	}
+	return reconciler.supervisorClientForPool(pool)
 }
 
 func (c *ACPUpgradeDrainCoordinator) setRuntimePoolDesiredReplicasZero(ctx context.Context, key types.NamespacedName) error {

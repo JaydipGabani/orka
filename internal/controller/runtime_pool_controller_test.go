@@ -35,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -49,7 +50,10 @@ var (
 	runtimePoolTestProviderTokenNext = []byte("fedcba9876543210fedcba9876543210")
 )
 
-const runtimePoolTestNextModel = "gpt-next"
+const (
+	runtimePoolTestNextModel     = "gpt-next"
+	runtimePoolTestTamperedImage = "attacker.invalid/runtime:latest"
+)
 
 type fakeRuntimePoolSupervisorClient struct {
 	probe       RuntimePoolProbeResult
@@ -71,6 +75,26 @@ type runtimePoolNamespaceReadClient struct {
 	client.Client
 	namespaceReads       int
 	rejectNamespaceReads bool
+}
+
+func TestRuntimePoolWorkspaceDeletionDrainCompleteRequiresCurrentGeneration(t *testing.T) {
+	pool := &corev1alpha1.RuntimePool{
+		ObjectMeta: metav1.ObjectMeta{Generation: 2},
+		Status: corev1alpha1.RuntimePoolStatus{
+			ObservedGeneration: 1,
+			DesiredReplicas:    0,
+			CurrentReplicas:    0,
+			Lifecycle:          corev1alpha1.RuntimePoolLifecycleStopped,
+		},
+	}
+	if runtimePoolWorkspaceDeletionDrainComplete(pool) {
+		t.Fatal("stale Stopped status completed workspace deletion drain")
+	}
+
+	pool.Status.ObservedGeneration = pool.Generation
+	if !runtimePoolWorkspaceDeletionDrainComplete(pool) {
+		t.Fatal("current Stopped status did not complete workspace deletion drain")
+	}
 }
 
 func (c *runtimePoolNamespaceReadClient) Get(
@@ -508,10 +532,20 @@ func TestRuntimePoolReconcilerPrunesStaleEpochSecretsAfterAuthenticatedRollout(t
 
 	oldDeployment, oldPod := runtimePoolTestStartServing(t, r, pool, supervisor, "epoch-old-pod", "epoch-old-uid", "10.0.0.63", "epoch-old-boot")
 	oldAuthName := runtimePoolTestVolume(oldDeployment.Spec.Template.Spec.Volumes, "pool-auth").Secret.SecretName
-	oldProviderName := runtimePoolTestVolume(oldDeployment.Spec.Template.Spec.Volumes, "provider-capability").Secret.SecretName
+	oldProviderName := runtimePoolTestVolume(oldDeployment.Spec.Template.Spec.Volumes, runtimePoolProviderCapabilityVolume).Secret.SecretName
 	oldAuth := &corev1.Secret{}
 	if err := r.Get(context.Background(), types.NamespacedName{Namespace: pool.Namespace, Name: oldAuthName}, oldAuth); err != nil {
 		t.Fatalf("get old epoch auth Secret: %v", err)
+	}
+	legacyAuth := oldAuth.DeepCopy()
+	legacyAuth.ObjectMeta = metav1.ObjectMeta{
+		Name:      runtimePoolAuthSuffixPattern.ReplaceAllString(oldAuthName, "auth-e6"),
+		Namespace: pool.Namespace,
+		Labels:    cloneStringMap(oldAuth.Labels),
+	}
+	delete(legacyAuth.Data, runtimePoolBootstrapNonceKey)
+	if err := r.Create(context.Background(), legacyAuth); err != nil {
+		t.Fatalf("create stale legacy two-key auth Secret: %v", err)
 	}
 	unrelated := oldAuth.DeepCopy()
 	unrelated.ObjectMeta = metav1.ObjectMeta{Name: "user-managed-auth", Namespace: pool.Namespace, Labels: cloneStringMap(oldAuth.Labels)}
@@ -536,7 +570,7 @@ func TestRuntimePoolReconcilerPrunesStaleEpochSecretsAfterAuthenticatedRollout(t
 			volume.Projected = &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{
 				Secret: &corev1.SecretProjection{LocalObjectReference: corev1.LocalObjectReference{Name: oldAuthName}},
 			}}}
-		case "provider-capability":
+		case runtimePoolProviderCapabilityVolume:
 			volume.Secret = nil
 		}
 	}
@@ -645,6 +679,9 @@ func TestRuntimePoolReconcilerPrunesStaleEpochSecretsAfterAuthenticatedRollout(t
 		secret := &secrets.Items[i]
 		if secret.Name == unrelated.Name {
 			continue
+		}
+		if secret.Name == legacyAuth.Name {
+			t.Fatalf("stale legacy two-key RuntimePool auth Secret survived epoch rotation: %s", secret.Name)
 		}
 		if !strings.Contains(secret.Name, "-e8") {
 			t.Fatalf("stale RuntimePool Secret survived epoch rotation: %s", secret.Name)
@@ -1973,6 +2010,14 @@ func runtimePoolTestReconciler(
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&corev1alpha1.RuntimePool{}, &appsv1.Deployment{}, &corev1.Pod{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, delegate client.WithWatch, object client.Object, opts ...client.CreateOption) error {
+				if secret, ok := object.(*corev1.Secret); ok && secret.UID == "" {
+					secret.UID = types.UID("test-uid-" + secret.Name)
+				}
+				return delegate.Create(ctx, object, opts...)
+			},
+		}).
 		WithObjects(objects...).
 		Build()
 	r := &RuntimePoolReconciler{
@@ -1984,10 +2029,26 @@ func runtimePoolTestReconciler(
 			PodLabels:   map[string]string{"app.kubernetes.io/name": "orka", "app.kubernetes.io/component": "provider-auth-proxy"},
 			BearerToken: bytes.Clone(runtimePoolTestProviderToken),
 		},
-		AllowedImages: ACPRuntimeImages{Codex: "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("a", 64)},
-		Rand:          bytes.NewReader(bytes.Repeat([]byte{0x5a}, 4096)), Now: func() time.Time { return runtimePoolTestNow },
+		AgentSandboxEnabled: true,
+		AllowedImages:       ACPRuntimeImages{Codex: "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("a", 64)},
+		Rand:                &runtimePoolTestEntropyReader{}, Now: func() time.Time { return runtimePoolTestNow },
+		WorkspaceCredentialSeeder: func(context.Context, string, string, []byte, harnessv2.CredentialBootstrapRequest) (bool, error) {
+			return false, nil
+		},
 	}
 	return r
+}
+
+type runtimePoolTestEntropyReader struct {
+	next byte
+}
+
+func (r *runtimePoolTestEntropyReader) Read(buffer []byte) (int, error) {
+	r.next++
+	for i := range buffer {
+		buffer[i] = r.next
+	}
+	return len(buffer), nil
 }
 
 func runtimePoolTestStartServing(
@@ -2127,6 +2188,21 @@ func runtimePoolReconcile(t *testing.T, r *RuntimePoolReconciler, pool *corev1al
 		t.Fatalf("Reconcile: %v", err)
 	}
 	return result
+}
+
+func runtimePoolTestFinalize(
+	r *RuntimePoolReconciler,
+	pool *corev1alpha1.RuntimePool,
+) (ctrl.Result, bool, error) {
+	current := &corev1alpha1.RuntimePool{}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(pool), current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, true, nil
+		}
+		return ctrl.Result{}, false, err
+	}
+	result, err := r.finalizeRuntimePool(context.Background(), current)
+	return result, false, err
 }
 
 func runtimePoolReadyPod(pool *corev1alpha1.RuntimePool, namespace, name, uid, ip string) corev1.Pod {

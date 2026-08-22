@@ -13,6 +13,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -126,8 +127,13 @@ func (s *Server) issueACPArtifactAuthorization(c fiber.Ctx) error {
 }
 
 const (
-	runtimePoolControllerTokenKeyAPI  = "controller-token"
-	runtimePoolCapabilitySecretKeyAPI = "capability-secret"
+	runtimePoolControllerTokenKeyAPI   = "controller-token"
+	runtimePoolCapabilitySecretKeyAPI  = "capability-secret"
+	runtimePoolAuthLabelAPI            = "orka.ai/runtime-pool-auth"
+	runtimePoolAuthLabelValueAPI       = "true"
+	runtimePoolUIDLabelAPI             = "orka.ai/runtime-pool-uid"
+	runtimePoolCredentialEpochLabelAPI = "orka.ai/runtime-pool-controller-epoch"
+	runtimePoolPrivateAuthBindingAPI   = "orka.ai/private-auth-secret-e"
 )
 
 func (s *Server) authorizationReader() client.Reader {
@@ -158,19 +164,28 @@ func (s *Server) resolveArtifactRuntimePoolByIdentity(ctx context.Context, poolN
 	if pool == nil || pool.Status.ActiveInstance == nil {
 		return nil, nil, fmt.Errorf("runtime pool not found")
 	}
+	if pool.Spec.ExecutionWorkspace != nil {
+		secret, err := resolveBoundArtifactRuntimePoolAuthSecret(ctx, reader, pool)
+		if err != nil {
+			return nil, nil, err
+		}
+		return pool, secret, nil
+	}
 	var secrets corev1.SecretList
 	if err := reader.List(ctx, &secrets, client.InNamespace(pool.Status.ActiveInstance.PodNamespace), client.MatchingLabels{
-		"orka.ai/runtime-pool-auth": "true", "orka.ai/runtime-pool-uid": string(pool.UID),
+		runtimePoolAuthLabelAPI: runtimePoolAuthLabelValueAPI, runtimePoolUIDLabelAPI: string(pool.UID),
 	}); err != nil {
 		return nil, nil, err
 	}
 	// During graceful epoch replacement both the draining instance's Secret
 	// and the next epoch's Secret exist; select the one mounted by the
 	// pool's exact active instance instead of requiring one Secret globally.
-	suffix := "auth-e" + strconv.FormatInt(pool.Status.ActiveInstance.ControllerEpoch, 10)
+	epoch := strconv.FormatInt(pool.Status.ActiveInstance.ControllerEpoch, 10)
+	legacySuffix := "auth-e" + epoch
 	var matched []*corev1.Secret
 	for i := range secrets.Items {
-		if strings.HasSuffix(secrets.Items[i].Name, suffix) {
+		secretEpoch := strings.TrimSpace(secrets.Items[i].Labels[runtimePoolCredentialEpochLabelAPI])
+		if secretEpoch == epoch || (secretEpoch == "" && strings.HasSuffix(secrets.Items[i].Name, legacySuffix)) {
 			matched = append(matched, &secrets.Items[i])
 		}
 	}
@@ -178,6 +193,35 @@ func (s *Server) resolveArtifactRuntimePoolByIdentity(ctx context.Context, poolN
 		return nil, nil, fmt.Errorf("runtime pool auth secret is ambiguous for controller epoch %d", pool.Status.ActiveInstance.ControllerEpoch)
 	}
 	return pool, matched[0].DeepCopy(), nil
+}
+
+func resolveBoundArtifactRuntimePoolAuthSecret(
+	ctx context.Context,
+	reader client.Reader,
+	pool *corev1alpha1.RuntimePool,
+) (*corev1.Secret, error) {
+	epoch := strconv.FormatInt(pool.Status.ActiveInstance.ControllerEpoch, 10)
+	binding := strings.TrimSpace(pool.Annotations[runtimePoolPrivateAuthBindingAPI+epoch])
+	name, rawUID, ok := strings.Cut(binding, "/")
+	if !ok || len(validation.IsDNS1123Subdomain(name)) != 0 || strings.TrimSpace(rawUID) == "" {
+		return nil, fmt.Errorf("private runtime pool auth Secret binding is invalid")
+	}
+	secret := &corev1.Secret{}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: pool.Status.ActiveInstance.PodNamespace, Name: name}, secret); err != nil {
+		return nil, fmt.Errorf("read bound private runtime pool auth Secret: %w", err)
+	}
+	if string(secret.UID) != rawUID {
+		return nil, fmt.Errorf("bound private runtime pool auth Secret UID changed")
+	}
+	if secret.Immutable == nil || !*secret.Immutable ||
+		secret.Labels[runtimePoolAuthLabelAPI] != runtimePoolAuthLabelValueAPI ||
+		secret.Labels[runtimePoolUIDLabelAPI] != string(pool.UID) ||
+		secret.Labels[runtimePoolCredentialEpochLabelAPI] != epoch ||
+		strings.TrimSpace(string(secret.Data[runtimePoolControllerTokenKeyAPI])) == "" ||
+		len(secret.Data[runtimePoolCapabilitySecretKeyAPI]) == 0 {
+		return nil, fmt.Errorf("bound private runtime pool auth Secret does not carry the exact immutable pool identity")
+	}
+	return secret.DeepCopy(), nil
 }
 
 func (s *Server) findTaskByUID(ctx context.Context, namespace, uid string) (*corev1alpha1.Task, error) {

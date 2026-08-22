@@ -109,6 +109,64 @@ spec:
                 maximum: 1
                 minimum: 0
                 type: integer
+              executionWorkspace:
+                description: |-
+                  ExecutionWorkspace, when set, materializes the pool's single runtime
+                  instance through an externally operated execution-workspace provider
+                  instead of a controller-owned Deployment. The binding is immutable;
+                  workspace-backed pools host exactly one resident RuntimeSession.
+                properties:
+                  bindingDigest:
+                    description: |-
+                      BindingDigest is the canonical digest of the frozen workspace binding
+                      (provider, policies, and session key) that names this pool. It is part of
+                      the pool identity and carries no provider-native or secret material.
+                    pattern: ^sha256:[a-f0-9]{64}$
+                    type: string
+                  provider:
+                    allOf:
+                    - enum:
+                      - agent-sandbox
+                      - substrate
+                    - enum:
+                      - agent-sandbox
+                      - substrate
+                    description: |-
+                      Provider selects the execution-workspace provider control plane hosting
+                      this pool's single runtime instance.
+                    type: string
+                  substrate:
+                    description: Substrate configures the Substrate-provider backend.
+                    properties:
+                      baseTemplateName:
+                        description: BaseTemplateName names the operator-owned infrastructure
+                          ActorTemplate.
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      baseTemplateNamespace:
+                        description: |-
+                          BaseTemplateNamespace is the namespace of the operator-owned
+                          infrastructure ActorTemplate. Controller-rendered runtime templates are
+                          created in the same namespace so the provider can resolve them. It must
+                          differ from the resolved runtime namespace so provider template
+                          principals cannot resolve pool Secrets.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                    required:
+                    - baseTemplateName
+                    - baseTemplateNamespace
+                    type: object
+                required:
+                - bindingDigest
+                - provider
+                type: object
+                x-kubernetes-validations:
+                - message: substrate settings are required exactly when provider is
+                    substrate
+                  rule: (self.provider == 'substrate') == has(self.substrate)
               runtime:
                 description: Runtime pins the immutable supervisor image and behavior
                   profile.
@@ -303,6 +361,9 @@ spec:
                 (!has(self.runtimeNamespace) || self.runtimeNamespace == oldSelf.runtimeNamespace)
             - message: runtime image and profile are immutable
               rule: self.runtime == oldSelf.runtime
+            - message: executionWorkspace binding is immutable
+              rule: has(self.executionWorkspace) == has(oldSelf.executionWorkspace)
+                && (!has(self.executionWorkspace) || self.executionWorkspace == oldSelf.executionWorkspace)
           status:
             description: RuntimePoolStatus defines the observed state of a controller-owned
               pool.

@@ -95,10 +95,34 @@ type ACPDispatcher struct {
 	AdmissionGate            *ACPAdmissionGate
 	runtimeContextFactory    func(context.Context, *corev1alpha1.Task) (context.Context, context.CancelFunc)
 
+	// SubstrateRouterURL and SubstrateActorDNSSuffix route Substrate-backed
+	// RuntimePool instances through the provider router while preserving the
+	// exact actor route host. Empty values fail closed for substrate pools.
+	SubstrateRouterURL      string
+	SubstrateActorDNSSuffix string
+
 	mu              sync.Mutex
 	active          map[types.UID]struct{}
 	sem             chan struct{}
 	runtimeSessions map[string]ACPRuntimeSessionBinding
+
+	substrateRouteOnce  sync.Once
+	substrateRouteHTTP  *http.Client
+	substrateRouteSetup error
+}
+
+// substrateRouteHTTPClient lazily builds the router-pinned transport for
+// Substrate-backed RuntimePool instances.
+func (d *ACPDispatcher) substrateRouteHTTPClient() (*http.Client, error) {
+	d.substrateRouteOnce.Do(func() {
+		transport, err := substrateRouteHTTPTransport(d.SubstrateRouterURL, d.SubstrateActorDNSSuffix)
+		if err != nil {
+			d.substrateRouteSetup = fmt.Errorf("substrate route transport is not configured: %w", err)
+			return
+		}
+		d.substrateRouteHTTP = &http.Client{Transport: transport}
+	})
+	return d.substrateRouteHTTP, d.substrateRouteSetup
 }
 
 func (d *ACPDispatcher) NeedLeaderElection() bool { return true }
@@ -469,6 +493,12 @@ func (d *ACPDispatcher) reapIdlePools(ctx context.Context, tasks []corev1alpha1.
 			continue
 		}
 		pool = latest
+		if pool.Spec.DesiredReplicas == 0 {
+			if err := d.reapStoppedWorkspacePool(ctx, pool, activeByPool[key], now); err != nil {
+				return err
+			}
+			continue
+		}
 		if runtimePoolHasActiveDemand(pool, activeByPool[key]) {
 			continue
 		}
@@ -495,9 +525,45 @@ func (d *ACPDispatcher) reapIdlePools(ctx context.Context, tasks []corev1alpha1.
 	return nil
 }
 
+// reapStoppedWorkspacePool retires a scaled-to-zero workspace-backed pool
+// object after it has proven Stopped (drained, provider workspace deleted) and
+// stayed idle for another TTL. Recovery treats a missing pool as proof of
+// RuntimeSession cleanup, and fresh demand deterministically recreates the pool
+// by name. Plain pools are never deleted here; they are shared infrastructure.
+func (d *ACPDispatcher) reapStoppedWorkspacePool(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+	activeTasks int,
+	now time.Time,
+) error {
+	if pool == nil || pool.Spec.ExecutionWorkspace == nil || activeTasks > 0 ||
+		pool.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopped ||
+		pool.Status.ObservedGeneration != pool.Generation ||
+		pool.Status.Capacity.QueuedTasks > 0 || pool.Status.Capacity.FinalizingSessions > 0 ||
+		len(pool.Status.Capacity.Reservations) > 0 {
+		return nil
+	}
+	lastDemand, err := time.Parse(time.RFC3339Nano, pool.Annotations[acpRuntimeLastDemandAnnotation])
+	if err != nil || now.Sub(lastDemand) < 2*d.IdlePoolTTL {
+		return nil
+	}
+	if err := d.Client.Delete(ctx, pool, deleteCurrentObjectPreconditions(pool)...); err != nil &&
+		!apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+		return err
+	}
+	return nil
+}
+
 func runtimePoolHasActiveDemand(pool *corev1alpha1.RuntimePool, activeTasks int) bool {
-	return pool == nil || pool.Spec.DesiredReplicas == 0 || activeTasks > 0 ||
-		pool.Status.Capacity.ResidentSessions > 0 || pool.Status.Capacity.RunningPrompts > 0 ||
+	if pool == nil || pool.Spec.DesiredReplicas == 0 || activeTasks > 0 {
+		return true
+	}
+	// Workspace-backed pools are single-session physical workspaces. Once no
+	// Task, prompt, permission, reservation, or finalization work remains, their
+	// authenticated scale-down drain retires an idle reusable RuntimeSession.
+	// Plain shared pools must stay resident while any RuntimeSession remains.
+	residentSessionsBlockScaleDown := pool.Spec.ExecutionWorkspace == nil && pool.Status.Capacity.ResidentSessions > 0
+	return residentSessionsBlockScaleDown || pool.Status.Capacity.RunningPrompts > 0 ||
 		pool.Status.Capacity.ReservedSessions > 0 || pool.Status.Capacity.ReservedPrompts > 0 ||
 		pool.Status.Capacity.FinalizingSessions > 0 || pool.Status.Capacity.PendingPermissions > 0
 }
@@ -709,6 +775,9 @@ func validateFrozenACPDispatchTarget(
 		task.Status.Execution.RuntimePoolUID != string(target.pool.UID) {
 		return errors.New("reserved RuntimePool does not exactly match the immutable execution snapshot")
 	}
+	if !acpRuntimePoolWorkspaceMatchesPlan(target.pool, bound.plan) {
+		return errors.New("reserved RuntimePool execution workspace binding does not exactly match the immutable execution snapshot")
+	}
 	return nil
 }
 
@@ -784,6 +853,16 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		return d.requeueReservedTask(ctx, task, acpReservedRetryMCPConfiguration, err)
 	}
 	lineage := acpSessionLineageIdentity{RuntimeIdentity: bound.body.RuntimeType}
+	if task.Spec.SessionRef != nil {
+		lineageConfigDigest, lineageErr := acpSessionLineageConfigDigest(bound.plan)
+		if lineageErr != nil {
+			return d.requeueReservedTask(ctx, task, acpReservedRetrySessionConfiguration, lineageErr)
+		}
+		lineage.ConfigDigest = lineageConfigDigest
+	}
+	if bound.plan.Workspace != nil && bound.plan.Workspace.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession {
+		lineage.WorkspaceSessionUID = bound.plan.Workspace.SessionUID
+	}
 	if task.Spec.SessionRef != nil && d.Sessions.RecordsLineage() {
 		taskNamespace := &corev1.Namespace{}
 		if err := d.APIReader.Get(runtimeCtx, client.ObjectKey{Name: task.Namespace}, taskNamespace); err != nil {
@@ -3445,8 +3524,7 @@ func (d *ACPDispatcher) runtimePoolClient(ctx context.Context, pool *corev1alpha
 		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, fmt.Errorf("RuntimePool auth Secret is incomplete")
 	}
 	endpoint := exactPodEndpoint(active.PodAddress)
-	runtimeClient, err := harnessv2.NewClient(
-		endpoint,
+	options := []harnessv2.ClientOption{
 		harnessv2.WithControlTimeout(runtimeSessionCreateTimeout(acpDispatchTarget{pool: pool})),
 		harnessv2.WithControllerBearerToken(controllerToken),
 		harnessv2.WithOperationCapabilitySecret(capabilitySecret),
@@ -3454,7 +3532,19 @@ func (d *ACPDispatcher) runtimePoolClient(ctx context.Context, pool *corev1alpha
 			RuntimeProfileDigest: harnessv2.ProfileDigest(pool.Spec.Runtime.Profile.Digest),
 			RuntimeInstanceID:    harnessv2.RuntimeInstanceID(active.RuntimeInstanceID),
 		}),
-	)
+	}
+	if runtimePoolIsSubstrateBacked(pool) {
+		// Substrate-backed instances are reached through the provider router:
+		// the endpoint is the exact actor route host, and the pinned router
+		// transport preserves it as the logical Host header.
+		endpoint = urlSchemeHTTP + "://" + strings.TrimSpace(active.PodAddress)
+		substrateHTTPClient, substrateErr := d.substrateRouteHTTPClient()
+		if substrateErr != nil {
+			return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, substrateErr
+		}
+		options = append(options, harnessv2.WithHTTPClient(substrateHTTPClient))
+	}
+	runtimeClient, err := harnessv2.NewClient(endpoint, options...)
 	if err != nil {
 		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, err
 	}
@@ -3584,16 +3674,9 @@ func (d *ACPDispatcher) runtimeAuthSecret(ctx context.Context, pool *corev1alpha
 	if pool.Status.ActiveInstance == nil {
 		return nil, fmt.Errorf("RuntimePool has no active instance")
 	}
-	var secrets corev1.SecretList
-	if err := d.APIReader.List(ctx, &secrets, client.InNamespace(namespace), client.MatchingLabels{
-		runtimePoolAuthLabel: "true", runtimePoolUIDLabel: string(pool.UID),
-	}); err != nil {
-		return nil, err
-	}
-	// During graceful epoch replacement the draining instance's Secret and the
-	// next epoch's Secret coexist; select the one bound to the active
-	// instance's epoch instead of requiring exactly one globally.
-	secret, err := runtimePoolAuthSecretForEpoch(secrets.Items, pool.Status.ActiveInstance.ControllerEpoch)
+	secret, err := resolveRuntimePoolAuthSecret(
+		ctx, d.APIReader, pool, namespace, pool.Status.ActiveInstance.ControllerEpoch,
+	)
 	if err != nil {
 		return nil, err
 	}

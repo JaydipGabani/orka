@@ -21,12 +21,14 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/workspace/statusrules"
 )
 
 const (
 	acpRuntimePoolLabel                      = "orka.ai/acp-runtime-pool"
 	acpRuntimeTrustLabel                     = "orka.ai/acp-trust-domain"
 	acpRuntimeProfileLabel                   = "orka.ai/acp-profile"
+	acpRuntimeWorkspaceProviderLabel         = "orka.ai/acp-execution-workspace-provider"
 	acpRuntimeTaskPoolLabel                  = "orka.ai/runtime-pool"
 	acpRuntimeSessionCleanupAnnotation       = "orka.ai/runtime-session-cleanup"
 	acpExternalRuntimeTaskLabel              = "orka.ai/agent-runtime"
@@ -64,12 +66,18 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 	if err := validateACPWorkspacePreflight(frozenTask); err != nil {
 		return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), err.Error())
 	}
+	if err := validateACPRuntimeWorkspaceNamespace(plan, task.Namespace, r.ACPRuntimeNamespace); err != nil {
+		return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), err.Error())
+	}
 	reader := r.APIReader
 	if reader == nil {
 		reader = r.Client
 	}
-	pool, err := r.ensureACPRuntimePool(ctx, task.Namespace, plan)
+	pool, poolPreexisting, err := r.ensureACPRuntimePool(ctx, task.Namespace, plan)
 	if err != nil {
+		if errors.Is(err, store.ErrValidation) {
+			return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidRuntimeProfile"), err.Error())
+		}
 		return ctrl.Result{}, err
 	}
 	if task.Status.Execution != nil && !taskExecutionStateTerminal(task.Status.Execution.State) {
@@ -150,6 +158,20 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 	task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{
 		State: corev1alpha1.TaskDeliveryStateNotRequested, Outcome: corev1alpha1.TaskDeliveryOutcomeNotRequested, LastTransitionTime: &now,
 	}
+	if plan.Workspace != nil {
+		// Provider-neutral projection only: no claim, sandbox, or other
+		// provider-native identifier ever enters public Task status.
+		task.Status.ExecutionWorkspace = statusrules.Update{
+			Provider:      plan.Workspace.Provider,
+			Phase:         corev1alpha1.ExecutionWorkspacePhasePending,
+			Reason:        corev1alpha1.ExecutionWorkspaceReasonPending,
+			ReusePolicy:   plan.Workspace.ReusePolicy,
+			CleanupPolicy: plan.Workspace.CleanupPolicy,
+			Reused:        acpWorkspaceRuntimePoolReused(pool, poolPreexisting),
+			Message:       "RuntimeSession is queued for a workspace-provider-backed RuntimePool",
+			ObservedAt:    &now,
+		}.Status()
+	}
 	if err := r.Status().Patch(ctx, task, client.MergeFrom(statusBase)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -157,6 +179,11 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 		r.Recorder.Eventf(task, corev1.EventTypeNormal, "ACPTaskQueued", "Queued attempt %d for RuntimePool %s", attemptNumber, pool.Name)
 	}
 	return ctrl.Result{RequeueAfter: time.Second}, nil
+}
+
+func acpWorkspaceRuntimePoolReused(pool *corev1alpha1.RuntimePool, preexisting bool) bool {
+	return preexisting && pool != nil && pool.Spec.ExecutionWorkspace != nil &&
+		pool.Status.ActiveInstance != nil && pool.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopped
 }
 
 //nolint:gocyclo // Rebinding keeps every queued-attempt fence and optimistic-lock check auditable together.
@@ -1043,47 +1070,108 @@ func validateACPWorkspacePreflight(task *corev1alpha1.Task) error {
 	return nil
 }
 
-func (r *TaskReconciler) ensureACPRuntimePool(ctx context.Context, namespace string, plan ACPRuntimePlan) (*corev1alpha1.RuntimePool, error) {
+func validateACPRuntimeWorkspaceNamespace(
+	plan ACPRuntimePlan,
+	taskNamespace, configuredRuntimeNamespace string,
+) error {
+	if plan.Workspace == nil || plan.Workspace.Provider != corev1alpha1.WorkspaceProviderSubstrate {
+		return nil
+	}
+	runtimeNamespace := strings.TrimSpace(configuredRuntimeNamespace)
+	if runtimeNamespace == "" {
+		runtimeNamespace = strings.TrimSpace(taskNamespace)
+	}
+	return validateSubstrateTemplateRuntimeNamespace(plan.Workspace.TemplateNamespace, runtimeNamespace)
+}
+
+func (r *TaskReconciler) ensureACPRuntimePool(
+	ctx context.Context,
+	namespace string,
+	plan ACPRuntimePlan,
+) (*corev1alpha1.RuntimePool, bool, error) {
+	if err := validateACPRuntimeWorkspaceNamespace(plan, namespace, r.ACPRuntimeNamespace); err != nil {
+		return nil, false, err
+	}
 	pool := &corev1alpha1.RuntimePool{}
 	key := types.NamespacedName{Namespace: namespace, Name: plan.PoolName}
 	err := r.Get(ctx, key, pool)
 	if apierrors.IsNotFound(err) {
+		capacity := &corev1alpha1.RuntimePoolCapacitySpec{
+			MaxResidentSessions: corev1alpha1.DefaultRuntimePoolMaxResidentSessions,
+			MaxRunningPrompts:   corev1alpha1.DefaultRuntimePoolMaxRunningPrompts,
+		}
+		labels := map[string]string{
+			acpRuntimePoolLabel: booleanTrueValue, acpRuntimeTrustLabel: namespace,
+			acpRuntimeProfileLabel: strings.TrimPrefix(string(plan.Digest), "sha256:")[:16],
+		}
+		var executionWorkspace *corev1alpha1.RuntimePoolExecutionWorkspaceSpec
+		if plan.Workspace != nil {
+			// A workspace-backed pool hosts exactly one logical RuntimeSession
+			// inside one provider-owned physical workspace.
+			capacity = &corev1alpha1.RuntimePoolCapacitySpec{MaxResidentSessions: 1, MaxRunningPrompts: 1}
+			labels[acpRuntimeWorkspaceProviderLabel] = string(plan.Workspace.Provider)
+			executionWorkspace = &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
+				Provider:      plan.Workspace.Provider,
+				BindingDigest: plan.Workspace.BindingDigest,
+			}
+			if plan.Workspace.Provider == corev1alpha1.WorkspaceProviderSubstrate {
+				executionWorkspace.Substrate = &corev1alpha1.RuntimePoolSubstrateWorkspaceSpec{
+					BaseTemplateNamespace: plan.Workspace.TemplateNamespace,
+					BaseTemplateName:      plan.Workspace.TemplateName,
+				}
+			}
+		}
 		pool = &corev1alpha1.RuntimePool{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: namespace, Name: plan.PoolName,
 				Annotations: map[string]string{acpRuntimeLastDemandAnnotation: time.Now().UTC().Format(time.RFC3339Nano)},
-				Labels: map[string]string{
-					acpRuntimePoolLabel: "true", acpRuntimeTrustLabel: namespace,
-					acpRuntimeProfileLabel: strings.TrimPrefix(string(plan.Digest), "sha256:")[:16],
-				},
+				Labels:      labels,
 			},
 			Spec: corev1alpha1.RuntimePoolSpec{
-				TrustDomain:      corev1alpha1.RuntimePoolTrustDomain{Namespace: namespace, Identity: "namespace:" + namespace},
-				RuntimeNamespace: strings.TrimSpace(r.ACPRuntimeNamespace),
-				Runtime:          corev1alpha1.RuntimePoolRuntimeSpec{Image: plan.Image, Profile: RuntimePoolProfileFromPlan(plan)},
-				DesiredReplicas:  1,
-				Capacity: &corev1alpha1.RuntimePoolCapacitySpec{
-					MaxResidentSessions: corev1alpha1.DefaultRuntimePoolMaxResidentSessions,
-					MaxRunningPrompts:   corev1alpha1.DefaultRuntimePoolMaxRunningPrompts,
-				},
+				TrustDomain:             corev1alpha1.RuntimePoolTrustDomain{Namespace: namespace, Identity: "namespace:" + namespace},
+				RuntimeNamespace:        strings.TrimSpace(r.ACPRuntimeNamespace),
+				Runtime:                 corev1alpha1.RuntimePoolRuntimeSpec{Image: plan.Image, Profile: RuntimePoolProfileFromPlan(plan)},
+				ExecutionWorkspace:      executionWorkspace,
+				DesiredReplicas:         1,
+				Capacity:                capacity,
 				ColdStartTimeoutSeconds: corev1alpha1.DefaultRuntimePoolColdStartTimeoutSeconds,
 			},
 		}
-		if err := r.Create(ctx, pool); err != nil {
-			if !apierrors.IsAlreadyExists(err) {
-				return nil, fmt.Errorf("create RuntimePool: %w", err)
+		createErr := r.Create(ctx, pool)
+		if createErr != nil {
+			if !apierrors.IsAlreadyExists(createErr) {
+				return nil, false, fmt.Errorf("create RuntimePool: %w", createErr)
 			}
-			if err := r.Get(ctx, key, pool); err != nil {
-				return nil, err
+			if getErr := r.Get(ctx, key, pool); getErr != nil {
+				return nil, false, getErr
 			}
+			// Another creator won the deterministic-name race. Validate and
+			// activate that observed object through the same path as a pool that
+			// existed before this reconcile; never bind a Task to an unchecked
+			// same-name winner.
+			err = nil
+		} else {
+			return pool, false, nil
 		}
-		return pool, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	if !acpRuntimePoolWorkspaceMatchesPlan(pool, plan) {
+		if plan.Workspace != nil && plan.Workspace.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession {
+			return nil, false, store.ValidationErrorf(
+				"execution workspace reusePolicy session cannot change the workspace provider, template, cleanup policy, or slot without replacing the physical workspace; create a new Session or keep the original workspace configuration",
+			)
+		}
+		return nil, false, fmt.Errorf("RuntimePool %s execution workspace binding does not match queued Task", pool.Name)
 	}
 	if pool.Spec.Runtime.Image != plan.Image || pool.Spec.Runtime.Profile.Digest != string(plan.Digest) {
-		return nil, fmt.Errorf("RuntimePool %s profile does not match queued Task", pool.Name)
+		if plan.Workspace != nil && plan.Workspace.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession {
+			return nil, false, store.ValidationErrorf(
+				"execution workspace reusePolicy session cannot rotate the runtime image or profile without replacing the physical workspace; create a new Session or keep the original runtime configuration",
+			)
+		}
+		return nil, false, fmt.Errorf("RuntimePool %s profile does not match queued Task", pool.Name)
 	}
 	base := pool.DeepCopy()
 	changed := false
@@ -1101,10 +1189,10 @@ func (r *TaskReconciler) ensureACPRuntimePool(ctx context.Context, namespace str
 	}
 	if changed {
 		if err := r.Patch(ctx, pool, client.MergeFrom(base)); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
-	return pool, nil
+	return pool, true, nil
 }
 
 func acpBoundTaskRequestDigest(bound *verifiedAgentExecution, attempt int32, promptID string) (string, error) {

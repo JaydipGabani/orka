@@ -27,6 +27,9 @@ type ACPRuntimePlan struct {
 	Image    string
 	Profile  harnessv2.RuntimeProfile
 	Digest   harnessv2.ProfileDigest
+	// Workspace, when set, binds the pool to an execution-workspace provider.
+	// It changes PoolName so workspace-backed sessions never share a plain pool.
+	Workspace *ACPRuntimeWorkspaceBinding
 }
 
 // validateACPRuntimePlanningAgent gates ACP planning on a complete built-in
@@ -161,6 +164,35 @@ func RuntimePoolProfileFromPlan(plan ACPRuntimePlan) corev1alpha1.RuntimePoolPro
 		WorkspaceIntent:     corev1alpha1.WorkspaceIntent(plan.Profile.WorkspaceIntent),
 		ProxyCredentialRole: plan.Profile.ProxyCredentialRole, ProxyCredentialScope: plan.Profile.ProxyCredentialScope,
 		ResourceClass: plan.Profile.ResourceClass,
+	}
+}
+
+// acpRuntimePoolWorkspaceMatchesPlan requires an exact match between the
+// pool's immutable execution-workspace binding and the frozen plan: plain
+// plans never bind to workspace-backed pools and vice versa.
+func acpRuntimePoolWorkspaceMatchesPlan(pool *corev1alpha1.RuntimePool, plan ACPRuntimePlan) bool {
+	if pool == nil {
+		return false
+	}
+	if plan.Workspace == nil {
+		return pool.Spec.ExecutionWorkspace == nil
+	}
+	workspace := pool.Spec.ExecutionWorkspace
+	if workspace == nil ||
+		workspace.Provider != plan.Workspace.Provider ||
+		workspace.BindingDigest != plan.Workspace.BindingDigest {
+		return false
+	}
+	switch plan.Workspace.Provider {
+	case corev1alpha1.WorkspaceProviderAgentSandbox:
+		return workspace.Substrate == nil &&
+			plan.Workspace.TemplateNamespace == "" && plan.Workspace.TemplateName == ""
+	case corev1alpha1.WorkspaceProviderSubstrate:
+		return workspace.Substrate != nil &&
+			workspace.Substrate.BaseTemplateNamespace == plan.Workspace.TemplateNamespace &&
+			workspace.Substrate.BaseTemplateName == plan.Workspace.TemplateName
+	default:
+		return false
 	}
 }
 

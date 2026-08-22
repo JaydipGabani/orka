@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -30,12 +32,19 @@ import (
 	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
 	"github.com/orka-agents/orka/internal/artifactcap"
 	"github.com/orka-agents/orka/internal/contexttoken"
+	"github.com/orka-agents/orka/internal/controller"
 	"github.com/orka-agents/orka/internal/executionmode"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/outboundaccess"
 	publisherservice "github.com/orka-agents/orka/internal/publisher/service"
 	storekube "github.com/orka-agents/orka/internal/store/kube"
 )
+
+func TestManagerSchemeRegistersAgentSandboxCoreAPI(t *testing.T) {
+	if _, err := scheme.New(sandboxv1beta1.GroupVersion.WithKind(sandboxv1beta1.SandboxKind)); err != nil {
+		t.Fatalf("create core Sandbox from manager scheme: %v", err)
+	}
+}
 
 func TestBrokeredDelegateTaskSubjectTokenResolverUsesOwnedIncomingSecret(t *testing.T) {
 	parent := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{
@@ -71,6 +80,96 @@ func TestControllerHolderIDIsProcessIncarnationUnique(t *testing.T) {
 	}
 	if first == "workstation" || second == "workstation" {
 		t.Fatal("holder ID omitted its process incarnation")
+	}
+}
+
+func TestValidateEnabledSubstrateConfigSelectsActivePathRequirements(t *testing.T) {
+	cfg := controller.SubstrateConfig{
+		APIEndpoint:           "api.ate-system.svc:443",
+		APIInsecureSkipVerify: true,
+		RouterURL:             "http://atenet-router.ate-system.svc",
+		ActorDNSSuffix:        "actors.resources.substrate.ate.dev",
+	}
+	if err := validateEnabledSubstrateConfig(cfg, false); err != nil {
+		t.Fatalf("ACP-only Substrate configuration rejected: %v", err)
+	}
+	if err := validateEnabledSubstrateConfig(cfg, true); err == nil ||
+		!strings.Contains(err.Error(), "bootstrap token secret name") {
+		t.Fatalf("legacy workspace-provider configuration error = %v, want bootstrap Secret requirement", err)
+	}
+}
+
+func TestValidateDisabledSubstrateRecoveryConfig(t *testing.T) {
+	validConfig := controller.SubstrateConfig{
+		APIEndpoint:           "api.ate-system.svc:443",
+		APIInsecureSkipVerify: true,
+		RouterURL:             "http://atenet-router.ate-system.svc",
+		ActorDNSSuffix:        "actors.resources.substrate.ate.dev",
+	}
+	invalidConfig := validConfig
+	invalidConfig.APIInsecureSkipVerify = false
+
+	pool := func(name string, provider corev1alpha1.WorkspaceProvider) *corev1alpha1.RuntimePool {
+		return &corev1alpha1.RuntimePool{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "team-a"},
+			Spec: corev1alpha1.RuntimePoolSpec{
+				ExecutionWorkspace: &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{Provider: provider},
+			},
+		}
+	}
+	tests := []struct {
+		name      string
+		objects   []client.Object
+		config    controller.SubstrateConfig
+		configErr error
+		wantError string
+	}{
+		{
+			name:      "no existing pools ignores disabled provider configuration",
+			config:    invalidConfig,
+			configErr: errors.New("invalid disabled-only duration"),
+		},
+		{
+			name:    "agent sandbox pool does not require substrate recovery",
+			objects: []client.Object{pool("sandbox", corev1alpha1.WorkspaceProviderAgentSandbox)},
+			config:  invalidConfig,
+		},
+		{
+			name:      "existing substrate pool preserves environment parse failures",
+			objects:   []client.Object{pool("substrate", corev1alpha1.WorkspaceProviderSubstrate)},
+			config:    validConfig,
+			configErr: errors.New("invalid disabled-only duration"),
+			wantError: "parse substrate recovery configuration",
+		},
+		{
+			name:      "existing substrate pool requires provider trust",
+			objects:   []client.Object{pool("substrate", corev1alpha1.WorkspaceProviderSubstrate)},
+			config:    invalidConfig,
+			wantError: "requires valid recovery configuration",
+		},
+		{
+			name:    "existing substrate pool accepts valid recovery configuration",
+			objects: []client.Object{pool("substrate", corev1alpha1.WorkspaceProviderSubstrate)},
+			config:  validConfig,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.objects...).Build()
+			err := validateDisabledSubstrateRecoveryConfig(
+				context.Background(), reader, "team-a", tt.config, tt.configErr,
+			)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("validate disabled substrate recovery config: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("validation error = %v, want substring %q", err, tt.wantError)
+			}
+		})
 	}
 }
 

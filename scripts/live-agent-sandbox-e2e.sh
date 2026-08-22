@@ -15,21 +15,35 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 # shellcheck source=scripts/lib/e2e-admission-tls.sh
 . "${script_dir}/lib/e2e-admission-tls.sh"
 
-agent_sandbox_version="${AGENT_SANDBOX_VERSION:-v0.5.0}"
+agent_sandbox_version="${AGENT_SANDBOX_VERSION:-v0.5.4}"
 kind_cluster="${KIND_CLUSTER:-orka-live-agent-sandbox-e2e}"
 orka_namespace="${ORKA_NAMESPACE:-orka-system}"
 orka_controller_deployment="${ORKA_CONTROLLER_DEPLOYMENT:-orka-controller-manager}"
 orka_api_service="${ORKA_API_SERVICE:-orka-api}"
 orka_api_service_port="${ORKA_API_SERVICE_PORT:-8080}"
 orka_api_local_port="${ORKA_API_LOCAL_PORT:-18084}"
+orka_api_client_service_account="${ORKA_API_CLIENT_SERVICE_ACCOUNT:-orka-client}"
 router_api_local_port="${ORKA_AGENT_SANDBOX_ROUTER_LOCAL_PORT:-18085}"
 e2e_run_id="$(sanitize_image_tag "${ORKA_AGENT_SANDBOX_RUN_ID:-${GITHUB_RUN_ID:-manual}-$(date -u +%Y%m%d%H%M%S)}")"
 manager_image="${ORKA_MANAGER_IMAGE:-orka-controller:live-agent-sandbox-e2e-${e2e_run_id}}"
 publisher_image="${ORKA_WORKSPACE_PUBLISHER_IMAGE:-orka-workspace-publisher:live-agent-sandbox-e2e-${e2e_run_id}}"
 sandbox_fixture_image="${ORKA_AGENT_SANDBOX_FIXTURE_IMAGE:-orka-agent-sandbox-fixture:live-agent-sandbox-e2e-${e2e_run_id}}"
 sandbox_router_image="${ORKA_AGENT_SANDBOX_ROUTER_IMAGE:-orka-agent-sandbox-router:live-agent-sandbox-e2e-${e2e_run_id}}"
+responses_fixture_image="${ORKA_RESPONSES_FIXTURE_IMAGE:-orka-openai-responses-fixture:live-agent-sandbox-e2e-${e2e_run_id}}"
 sandbox_template_name="${ORKA_AGENT_SANDBOX_TEMPLATE:-orka-agent-sandbox-e2e-template}"
 smoke_claim_name="${ORKA_AGENT_SANDBOX_SMOKE_CLAIM:-orka-agent-sandbox-e2e-retained-smoke}"
+# The workspace-backed ACP Task smoke builds the real Codex runtime image and
+# proves the workspace-provider-backed RuntimePool path live against upstream
+# agent-sandbox (admission, claim materialization, authenticated Serving, and
+# cleanup), then completes a real prompt through the authenticated provider
+# proxy and the local Responses-compatible fixture. Set to 0 to skip the
+# runtime image build and smoke.
+acp_task_smoke_enabled="${ORKA_AGENT_SANDBOX_ACP_TASK_SMOKE:-1}"
+acp_codex_runtime_image="${ORKA_ACP_CODEX_RUNTIME_IMAGE:-orka-acp-codex-runtime:live-agent-sandbox-e2e-${e2e_run_id}}"
+acp_runtime_namespace="${ORKA_ACP_RUNTIME_NAMESPACE:-orka-runtimes}"
+acp_task_namespace="${ORKA_AGENT_SANDBOX_ACP_TASK_NAMESPACE:-${orka_namespace}}"
+acp_task_name="orka-ws-sandbox-smoke"
+acp_agent_name="orka-ws-sandbox-agent"
 api_pf_pid=""
 router_pf_pid=""
 router_namespace=""
@@ -44,8 +58,8 @@ smoke_go_dir="${repo_root}/.tmp-live-agent-sandbox-smoke-${e2e_run_id}"
 manager_kustomization="${repo_root}/config/manager/kustomization.yaml"
 manager_kustomization_backup="${work_dir}/manager-kustomization.yaml.bak"
 
-if [[ "${agent_sandbox_version}" != "v0.5.0" ]]; then
-  die "this e2e is pinned to agent-sandbox v0.5.0 to match go.mod"
+if [[ "${agent_sandbox_version}" != "v0.5.4" ]]; then
+  die "this e2e is pinned to agent-sandbox v0.5.4 to match go.mod"
 fi
 
 cleanup_one_port_forward() {
@@ -83,6 +97,20 @@ dump_diagnostics() {
     echo
     echo "=== Agent Sandbox Resources ==="
     kubectl get pods,svc,deploy,sandboxclaims,sandboxes,sandboxtemplates,sandboxwarmpools -A -o wide 2>/dev/null || true
+    echo
+    echo "=== Workspace-backed RuntimePools ==="
+    kubectl get runtimepools -A -o wide 2>/dev/null || true
+    kubectl get runtimepools -A -o yaml 2>/dev/null || true
+    echo
+    echo "=== ACP Runtime Namespace Resources ==="
+    kubectl get pods,secrets,sandboxclaims,sandboxes,sandboxtemplates,sandboxwarmpools -n "${acp_runtime_namespace}" -o wide 2>/dev/null || true
+    echo
+    echo "=== Responses Fixture ==="
+    kubectl get pods,svc,deploy -n vekil-system -o wide 2>/dev/null || true
+    kubectl logs deployment/vekil -n vekil-system --tail=300 2>/dev/null || true
+    echo
+    echo "=== Workspace-backed ACP Task ==="
+    kubectl -n "${acp_task_namespace}" get task "${acp_task_name}" -o yaml 2>/dev/null || true
     echo
     echo "=== Orka Namespace Events ==="
     kubectl get events -n "${orka_namespace}" --sort-by=.lastTimestamp 2>/dev/null || true
@@ -205,6 +233,139 @@ wait_for_http() {
   done
 
   die "${description} never became available at ${url}"
+}
+
+assert_task_result_contains() {
+  local namespace_arg="$1"
+  local task_name="$2"
+  local expected_marker="$3"
+  local api_base="http://127.0.0.1:${orka_api_local_port}"
+  local api_token result_file status attempts_remaining
+
+  wait_for_http "${api_base}/readyz" "Orka API /readyz"
+  api_token="$(kubectl -n "${namespace_arg}" create token "${orka_api_client_service_account}")"
+  result_file="${work_dir}/${task_name}-result.json"
+  attempts_remaining=15
+  while (( attempts_remaining > 0 )); do
+    status="$(curl --silent --show-error --connect-timeout 5 --max-time 30 \
+      --header "Authorization: Bearer ${api_token}" \
+      --output "${result_file}" --write-out '%{http_code}' \
+      "${api_base}/api/v1/tasks/${task_name}/result?namespace=${namespace_arg}" \
+      2>>"${api_pf_log}" || true)"
+    if [[ "${status}" == "200" ]] &&
+      jq -er '.result' "${result_file}" | grep -Fq "${expected_marker}"; then
+      log "Task/${task_name} result contains ${expected_marker}"
+      return 0
+    fi
+    attempts_remaining=$((attempts_remaining - 1))
+    sleep 2
+  done
+
+  die "Task/${task_name} result did not contain the expected marker ${expected_marker} (last HTTP status: ${status:-none})"
+}
+
+deploy_responses_fixture() {
+  log "Deploying local Responses-compatible provider fixture"
+  kubectl -n vekil-system apply -f - <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vekil
+  labels:
+    app.kubernetes.io/name: vekil
+    app.kubernetes.io/component: responses-fixture
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vekil
+      app.kubernetes.io/component: responses-fixture
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vekil
+        app.kubernetes.io/component: responses-fixture
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: responses
+          image: ${responses_fixture_image}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 1337
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vekil
+  labels:
+    app.kubernetes.io/name: vekil
+spec:
+  selector:
+    app.kubernetes.io/name: vekil
+    app.kubernetes.io/component: responses-fixture
+  ports:
+    - name: http
+      port: 1337
+      targetPort: http
+YAML
+  run kubectl -n vekil-system rollout status deployment/vekil --timeout=2m
+}
+
+ensure_api_client_identity() {
+  log "Creating scoped Orka API client identity ${acp_task_namespace}/${orka_api_client_service_account}"
+  kubectl apply -f - <<YAML
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${orka_api_client_service_account}
+  namespace: ${acp_task_namespace}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ${orka_api_client_service_account}
+  namespace: ${acp_task_namespace}
+rules:
+  - apiGroups: ["core.orka.ai"]
+    resources: ["tasks"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ${orka_api_client_service_account}
+  namespace: ${acp_task_namespace}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ${orka_api_client_service_account}
+subjects:
+  - kind: ServiceAccount
+    name: ${orka_api_client_service_account}
+    namespace: ${acp_task_namespace}
+YAML
 }
 
 write_sandbox_fixture_dockerfile() {
@@ -424,7 +585,7 @@ DOCKERFILE
 
 install_agent_sandbox() {
   log "Installing upstream agent-sandbox ${agent_sandbox_version}"
-  run kubectl apply -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${agent_sandbox_version}/manifest.yaml"
+  run kubectl apply -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${agent_sandbox_version}/sandbox.yaml"
   run kubectl apply -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${agent_sandbox_version}/extensions.yaml"
 
   for crd in \
@@ -523,6 +684,7 @@ patch_controller_for_agent_sandbox() {
           | .args = ((.args // []) | upsert_arg("--agent-sandbox-claim-timeout"; "3m"))
           | .args = ((.args // []) | upsert_arg("--agent-sandbox-command-timeout"; "5m"))
           | .args = ((.args // []) | upsert_arg("--agent-sandbox-cleanup-policy"; "delete"))
+          | .args = ((.args // []) | upsert_arg("--acp-workspace-dispatch-enabled"; "true"))
         else . end
       )
     ' | kubectl apply -f -
@@ -793,6 +955,8 @@ run_workspace_smoke() {
 
 reset_e2e_resources() {
   log "Resetting fixed-name agent-sandbox e2e resources"
+  run kubectl -n "${acp_task_namespace}" delete task "${acp_task_name}"     --ignore-not-found=true --wait=true --timeout=2m
+  run kubectl -n "${acp_task_namespace}" delete agent "${acp_agent_name}"     --ignore-not-found=true --wait=true --timeout=1m
   run kubectl -n "${orka_namespace}" delete sandboxclaim "${smoke_claim_name}" \
     --ignore-not-found=true \
     --wait=true \
@@ -805,6 +969,173 @@ reset_e2e_resources() {
     --ignore-not-found=true \
     --wait=true \
     --timeout=2m
+}
+
+wait_for_jsonpath() {
+  local kind="$1" namespace="$2" name="$3" path="$4" want="$5" timeout_seconds="$6"
+  local started now value
+  started="$(date +%s)"
+  while true; do
+    value="$(kubectl -n "${namespace}" get "${kind}" "${name}" -o jsonpath="${path}" 2>/dev/null || true)"
+    if [[ "${value}" == "${want}" ]]; then
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now - started >= timeout_seconds )); then
+      die "timed out waiting for ${kind}/${name} ${path}=${want} (last: ${value:-<empty>})"
+    fi
+    sleep 3
+  done
+}
+
+wait_for_nonempty_jsonpath() {
+  local kind="$1" namespace="$2" name="$3" path="$4" timeout_seconds="$5"
+  local started now value
+  started="$(date +%s)"
+  while true; do
+    value="$(kubectl -n "${namespace}" get "${kind}" "${name}" -o jsonpath="${path}" 2>/dev/null || true)"
+    if [[ -n "${value}" ]]; then
+      printf '%s' "${value}"
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now - started >= timeout_seconds )); then
+      die "timed out waiting for ${kind}/${name} ${path} to be set"
+    fi
+    sleep 3
+  done
+}
+
+# run_workspace_backed_acp_task_smoke proves the Phase-1 workspace-provider
+# adapter live against upstream agent-sandbox:
+#   1. a Task.spec.execution.workspace agent Task is admitted (not rejected
+#      with WorkspaceValidationFailed) and binds a dedicated acp-ws-* pool;
+#   2. the pool materializes a controller-rendered SandboxTemplate, a
+#      zero-replica SandboxWarmPool, and one SandboxClaim through the real
+#      provider controller, and the sandbox Pod runs the immutable Codex
+#      runtime image;
+#   3. the authenticated exact-instance fence probe reaches Serving/Accepting;
+#   4. a real Codex prompt succeeds through the authenticated provider proxy;
+#   5. Task status stays provider-neutral (no claim identifiers);
+#   6. pool deletion removes the claim, warm pool, and template.
+run_workspace_backed_acp_task_smoke() {
+  log "Running workspace-backed ACP Task infrastructure smoke"
+
+  bash "${repo_root}/scripts/lib/ensure-static-mode-namespace.sh" \
+    kubectl "${acp_task_namespace}" harness-v2
+
+  kubectl apply -f - <<YAML
+apiVersion: core.orka.ai/v1alpha1
+kind: Agent
+metadata:
+  name: ${acp_agent_name}
+  namespace: ${acp_task_namespace}
+spec:
+  runtime:
+    type: codex
+    contractVersion: orka.harness.v2
+    defaultMaxTurns: 1
+  model:
+    name: gpt-5.5
+---
+apiVersion: core.orka.ai/v1alpha1
+kind: Task
+metadata:
+  name: ${acp_task_name}
+  namespace: ${acp_task_namespace}
+spec:
+  type: agent
+  agentRef:
+    name: ${acp_agent_name}
+  agentRuntime:
+    maxTurns: 1
+  timeout: 10m0s
+  execution:
+    workspace:
+      enabled: true
+      provider: agent-sandbox
+      reusePolicy: none
+      cleanupPolicy: delete
+  prompt: "Reply exactly: ORKA_WS_SANDBOX_OK"
+YAML
+
+  local pool_name
+  pool_name="$(wait_for_nonempty_jsonpath task "${acp_task_namespace}" "${acp_task_name}"     '{.status.execution.runtimePoolName}' 120)"
+  log "Workspace-backed Task bound RuntimePool ${pool_name}"
+  [[ "${pool_name}" == acp-ws-codex-* ]] ||
+    die "runtime pool ${pool_name} is not a workspace-backed pool"
+
+  local workspace_provider workspace_reason
+  workspace_provider="$(kubectl -n "${acp_task_namespace}" get task "${acp_task_name}"     -o jsonpath='{.status.executionWorkspace.provider}')"
+  workspace_reason="$(kubectl -n "${acp_task_namespace}" get task "${acp_task_name}"     -o jsonpath='{.status.executionWorkspace.reason}')"
+  [[ "${workspace_provider}" == "agent-sandbox" ]] ||
+    die "workspace status provider ${workspace_provider}, want agent-sandbox"
+  [[ "${workspace_reason}" != "WorkspaceValidationFailed" ]] ||
+    die "workspace-backed Task was rejected with WorkspaceValidationFailed"
+
+  log "Waiting for workspace-backed RuntimePool ${pool_name} to reach Serving"
+  wait_for_jsonpath runtimepool "${acp_task_namespace}" "${pool_name}"     '{.status.lifecycle}' "Serving" 480
+
+  local active_pod_uid
+  active_pod_uid="$(kubectl -n "${acp_task_namespace}" get runtimepool "${pool_name}"     -o jsonpath='{.status.activeInstance.podUID}')"
+  [[ -n "${active_pod_uid}" ]] || die "Serving pool has no active instance"
+
+  local claim_count claim_name
+  claim_count="$(kubectl get sandboxclaims -A     -l "orka.ai/runtime-pool-name=${pool_name}" -o name | wc -l | tr -d ' ')"
+  [[ "${claim_count}" == "1" ]] ||
+    die "expected exactly one SandboxClaim for ${pool_name}, found ${claim_count}"
+  claim_name="$(kubectl get sandboxclaims -n "${acp_runtime_namespace}"     -l "orka.ai/runtime-pool-name=${pool_name}" -o jsonpath='{.items[0].metadata.name}')"
+  log "Workspace-backed pool is Serving through SandboxClaim ${claim_name}"
+
+  local sandbox_pod_image
+  sandbox_pod_image="$(kubectl get pods -n "${acp_runtime_namespace}"     -l "orka.ai/runtime-pool-name=${pool_name}"     -o jsonpath='{.items[0].spec.containers[0].image}')"
+  [[ "${sandbox_pod_image}" == *"acp-codex"* ]] ||
+    die "sandbox Pod image ${sandbox_pod_image} is not the immutable Codex runtime image"
+
+  if kubectl -n "${acp_task_namespace}" get task "${acp_task_name}" -o yaml | grep -q "${claim_name}"; then
+    die "public Task status leaked the provider claim identifier ${claim_name}"
+  fi
+
+  log "Waiting for the workspace-backed Task to succeed"
+  local started now task_payload phase execution_state execution_outcome result_available
+  started="$(date +%s)"
+  while true; do
+    task_payload="$(kubectl -n "${acp_task_namespace}" get task "${acp_task_name}" -o json 2>/dev/null || true)"
+    phase="$(jq -r '.status.phase // ""' <<<"${task_payload}")"
+    execution_state="$(jq -r '.status.execution.state // ""' <<<"${task_payload}")"
+    execution_outcome="$(jq -r '.status.execution.outcome // ""' <<<"${task_payload}")"
+    result_available="$(jq -r '.status.resultRef.available // false' <<<"${task_payload}")"
+    if [[ "${phase}" == "Succeeded" && "${execution_state}" == "Succeeded" &&
+          "${execution_outcome}" == "Succeeded" && "${result_available}" == "true" ]]; then
+      break
+    fi
+    if [[ "${phase}" == "Failed" || "${phase}" == "Cancelled" ||
+          "${execution_state}" == "Failed" || "${execution_state}" == "Cancelled" ]]; then
+      kubectl -n "${acp_task_namespace}" get task "${acp_task_name}" -o yaml >&2 || true
+      die "workspace-backed Task reached terminal failure (phase=${phase:-<empty>}, state=${execution_state:-<empty>}, outcome=${execution_outcome:-<empty>})"
+    fi
+    now="$(date +%s)"
+    if (( now - started >= 300 )); then
+      kubectl -n "${acp_task_namespace}" get task "${acp_task_name}" -o yaml >&2 || true
+      die "workspace-backed Task did not succeed (phase=${phase:-<empty>}, state=${execution_state:-<empty>}, outcome=${execution_outcome:-<empty>}, resultAvailable=${result_available})"
+    fi
+    sleep 3
+  done
+  log "Workspace-backed Task reached Succeeded/Succeeded with an available result"
+  assert_task_result_contains "${acp_task_namespace}" "${acp_task_name}" "ORKA_WS_SANDBOX_OK"
+
+  workspace_reason="$(kubectl -n "${acp_task_namespace}" get task "${acp_task_name}"     -o jsonpath='{.status.executionWorkspace.reason}')"
+  [[ "${workspace_reason}" != "WorkspaceValidationFailed" ]] ||
+    die "workspace-backed Task regressed to WorkspaceValidationFailed after dispatch"
+
+  log "Cleaning up the workspace-backed Task and pool"
+  run kubectl -n "${acp_task_namespace}" delete task "${acp_task_name}" --wait=true --timeout=3m
+  run kubectl -n "${acp_task_namespace}" delete runtimepool "${pool_name}" --wait=true --timeout=4m
+  local remaining
+  remaining="$(kubectl get sandboxclaims,sandboxwarmpools,sandboxtemplates -n "${acp_runtime_namespace}"     -l "orka.ai/runtime-pool-name=${pool_name}" -o name | wc -l | tr -d ' ')"
+  [[ "${remaining}" == "0" ]] ||
+    die "pool finalization left ${remaining} provider objects for ${pool_name}"
+  log "Workspace-backed ACP Task infrastructure smoke passed"
 }
 
 main() {
@@ -837,6 +1168,12 @@ main() {
   run make docker-build IMG="${manager_image}"
   log "Building workspace publisher image ${publisher_image}"
   run make docker-build-workspace-publisher WORKSPACE_PUBLISHER_IMG="${publisher_image}"
+  if [[ "${acp_task_smoke_enabled}" == "1" ]]; then
+    log "Building immutable Codex ACP runtime image ${acp_codex_runtime_image} for the workspace-backed Task smoke"
+    run make docker-build-acp-codex-runtime ACP_CODEX_RUNTIME_IMG="${acp_codex_runtime_image}"
+    log "Building local Responses-compatible provider fixture image ${responses_fixture_image}"
+    run docker build -t "${responses_fixture_image}" -f scripts/fixtures/openai-responses/Dockerfile .
+  fi
 
   write_sandbox_fixture_dockerfile
   log "Building agent-sandbox HTTP fixture image ${sandbox_fixture_image}"
@@ -847,25 +1184,37 @@ main() {
   run kind load docker-image "${manager_image}" --name "${kind_cluster}"
   run kind load docker-image "${sandbox_fixture_image}" --name "${kind_cluster}"
   run kind load docker-image "${sandbox_router_image}" --name "${kind_cluster}"
+  if [[ "${acp_task_smoke_enabled}" == "1" ]]; then
+    run kind load docker-image "${responses_fixture_image}" --name "${kind_cluster}"
+  fi
 
   local manager_ref publisher_ref
   manager_ref="$(orka_kind_registry_push "${manager_image}" "orka/controller")"
   publisher_ref="$(orka_kind_registry_push "${publisher_image}" "orka/workspace-publisher")"
+  local placeholder_digest codex_runtime_ref
+  placeholder_digest="sha256:$(printf '0%.0s' {1..64})"
+  codex_runtime_ref="example.invalid/orka/acp-codex@${placeholder_digest}"
+  if [[ "${acp_task_smoke_enabled}" == "1" ]]; then
+    codex_runtime_ref="$(orka_kind_registry_push "${acp_codex_runtime_image}" "orka/acp-codex-runtime")"
+  fi
 
   log "Bootstrapping test-only admission TLS"
   orka_e2e_bootstrap_admission_tls
 
-  log "Deploying Orka manager with inert digest-pinned ACP images (agent-sandbox RuntimeSession dispatch is deferred)"
-  local placeholder_digest
-  placeholder_digest="sha256:$(printf '0%.0s' {1..64})"
+  if [[ "${acp_task_smoke_enabled}" == "1" ]]; then
+    deploy_responses_fixture
+  fi
+
+  log "Deploying Orka manager (Codex runtime image real when the workspace-backed Task smoke is enabled; other runtimes inert)"
   run make deploy \
     IMG="${manager_ref}" \
     WORKSPACE_PUBLISHER_IMG="${publisher_ref}" \
-    ACP_CODEX_RUNTIME_IMG="example.invalid/orka/acp-codex@${placeholder_digest}" \
+    ACP_CODEX_RUNTIME_IMG="${codex_runtime_ref}" \
     ACP_CLAUDE_RUNTIME_IMG="example.invalid/orka/acp-claude@${placeholder_digest}" \
     ACP_COPILOT_RUNTIME_IMG="example.invalid/orka/acp-copilot@${placeholder_digest}" \
     ACP_OPENCODE_RUNTIME_IMG="example.invalid/orka/acp-opencode@${placeholder_digest}"
   run kubectl wait --for=condition=Established crd/tasks.core.orka.ai --timeout=60s
+  ensure_api_client_identity
   deploy_sandbox_router
   patch_controller_for_agent_sandbox
 
@@ -886,7 +1235,11 @@ main() {
 
   run_workspace_smoke "${router_base}"
 
-  log "Skipping workspace-backed ACP Task smoke: Task.spec.execution.workspace is intentionally unsupported until RuntimeSession-to-agent-sandbox dispatch is implemented; the direct workspace adapter path was validated above"
+  if [[ "${acp_task_smoke_enabled}" == "1" ]]; then
+    run_workspace_backed_acp_task_smoke
+  else
+    log "Skipping workspace-backed ACP Task smoke (ORKA_AGENT_SANDBOX_ACP_TASK_SMOKE=0)"
+  fi
   log "Live agent-sandbox installation/configuration/workspace-adapter e2e passed"
 }
 

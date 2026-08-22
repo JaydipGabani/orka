@@ -115,6 +115,35 @@ type acpSessionLineageIdentity struct {
 	NamespaceUID    string
 	RuntimeIdentity string
 	ConfigDigest    string
+	// WorkspaceSessionUID is the immutable SessionControl identity frozen into
+	// a session-reused execution-workspace binding.
+	WorkspaceSessionUID string
+}
+
+func acpSessionLineageConfigDigest(plan ACPRuntimePlan) (string, error) {
+	if err := harnessv2.ValidateProfileDigest(plan.Digest); err != nil {
+		return "", fmt.Errorf("session lineage runtime profile digest: %w", err)
+	}
+	if plan.Workspace == nil || plan.Workspace.ReusePolicy != corev1alpha1.WorkspaceReusePolicySession {
+		return string(plan.Digest), nil
+	}
+	runtimeImage := strings.TrimSpace(plan.Image)
+	if !digestPinnedImagePattern.MatchString(runtimeImage) {
+		return "", fmt.Errorf("session lineage runtime image must be pinned by sha256 digest")
+	}
+	workspaceBindingDigest := strings.TrimSpace(plan.Workspace.BindingDigest)
+	if err := store.ValidateCanonicalDigest("session lineage workspace binding digest", workspaceBindingDigest); err != nil {
+		return "", err
+	}
+	return acpDomainDigest("runtime-session-lineage-configuration/v1", struct {
+		RuntimeProfileDigest   string `json:"runtimeProfileDigest"`
+		RuntimeImage           string `json:"runtimeImage"`
+		WorkspaceBindingDigest string `json:"workspaceBindingDigest"`
+	}{
+		RuntimeProfileDigest:   string(plan.Digest),
+		RuntimeImage:           runtimeImage,
+		WorkspaceBindingDigest: workspaceBindingDigest,
+	})
 }
 
 func (d *ACPDispatcher) prepareTaskSession(
@@ -136,7 +165,9 @@ func (d *ACPDispatcher) prepareTaskSession(
 	if lineage.ConfigDigest == "" {
 		lineage.ConfigDigest = string(profileDigest)
 	}
-	preparation, err := d.planTaskSession(ctx, task, fence, profileDigest, mcpBindingDigest, runtimeInstanceID, supervisorBootID)
+	preparation, err := d.planTaskSession(
+		ctx, task, fence, profileDigest, mcpBindingDigest, runtimeInstanceID, supervisorBootID, lineage.WorkspaceSessionUID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -192,6 +223,7 @@ func (d *ACPDispatcher) planTaskSession(
 	mcpBindingDigest string,
 	runtimeInstanceID harnessv2.RuntimeInstanceID,
 	supervisorBootID harnessv2.SupervisorBootID,
+	expectedSessionUID string,
 ) (*acpTaskSessionPreparation, error) {
 	name := strings.TrimSpace(task.Spec.SessionRef.Name)
 	if name == "" {
@@ -213,6 +245,7 @@ func (d *ACPDispatcher) planTaskSession(
 	}
 	control, err := d.Sessions.EnsureSession(ctx, ACPEnsureSessionRequest{
 		Namespace: task.Namespace, SessionName: name, SessionType: sessionType,
+		ExpectedSessionUID:        expectedSessionUID,
 		RequireExistingTranscript: transcriptBackedPrompt && !task.Spec.SessionRef.Create,
 		Fence:                     fence, CreatedAt: time.Now().UTC(),
 	})

@@ -49,6 +49,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	sandboxextv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 
 	fakeworkspacev1alpha1 "github.com/orka-agents/orka/api/fake.workspace/v1alpha1"
@@ -99,6 +100,7 @@ func init() {
 
 	utilruntime.Must(corev1alpha1.AddToScheme(scheme))
 	utilruntime.Must(gatewayv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(sandboxv1beta1.AddToScheme(scheme))
 	utilruntime.Must(sandboxextv1beta1.AddToScheme(scheme))
 	utilruntime.Must(workspacev1alpha1.AddToScheme(scheme))
 	utilruntime.Must(fakeworkspacev1alpha1.AddToScheme(scheme))
@@ -165,6 +167,48 @@ func workspaceCleanupAPIsInstalled(mapper meta.RESTMapper) (bool, error) {
 
 func managerWebhookAdmissionEnabled(taskProvenanceEnabled, workspaceClassUseEnabled bool) bool {
 	return taskProvenanceEnabled || workspaceClassUseEnabled
+}
+
+func validateDisabledSubstrateRecoveryConfig(
+	ctx context.Context,
+	reader crclient.Reader,
+	watchNamespace string,
+	cfg controller.SubstrateConfig,
+	configErr error,
+) error {
+	if reader == nil {
+		return fmt.Errorf("kubernetes reader is required to discover existing substrate RuntimePools")
+	}
+
+	pools := &corev1alpha1.RuntimePoolList{}
+	if err := reader.List(ctx, pools, crclient.InNamespace(strings.TrimSpace(watchNamespace))); err != nil {
+		return fmt.Errorf("list RuntimePools for disabled substrate recovery: %w", err)
+	}
+	for i := range pools.Items {
+		workspace := pools.Items[i].Spec.ExecutionWorkspace
+		if workspace == nil || workspace.Provider != corev1alpha1.WorkspaceProviderSubstrate {
+			continue
+		}
+		pool := &pools.Items[i]
+		if configErr != nil {
+			return fmt.Errorf(
+				"parse substrate recovery configuration for existing RuntimePool %s/%s: %w",
+				pool.Namespace,
+				pool.Name,
+				configErr,
+			)
+		}
+		if err := cfg.ValidateACPRuntimePool(); err != nil {
+			return fmt.Errorf(
+				"existing substrate RuntimePool %s/%s requires valid recovery configuration: %w",
+				pool.Namespace,
+				pool.Name,
+				err,
+			)
+		}
+		return nil
+	}
+	return nil
 }
 
 // nolint:gocyclo
@@ -241,6 +285,7 @@ func main() {
 	var acpProviderProxyPodLabels string
 	var acpProviderProxyTokenFile string
 	var agentSandboxEnabled bool
+	var acpWorkspaceDispatchEnabled bool
 	var agentSandboxCleanupPolicy string
 	var oidcIssuer string
 	var oidcAudience string
@@ -298,6 +343,7 @@ func main() {
 	executionWorkspaceDefaultProvider := controller.ExecutionWorkspaceDefaultProviderFromEnv(os.Getenv)
 	executionWorkspaceDefaultProviderFlag := string(executionWorkspaceDefaultProvider)
 	agentSandboxEnabled = strings.EqualFold(os.Getenv("ORKA_AGENT_SANDBOX_ENABLED"), "true")
+	acpWorkspaceDispatchEnabled = strings.EqualFold(os.Getenv("ORKA_ACP_WORKSPACE_DISPATCH_ENABLED"), "true")
 	agentSandboxConfig, agentSandboxConfigErr := controller.AgentSandboxConfigFromEnv(os.Getenv)
 	agentSandboxCleanupPolicy = string(agentSandboxConfig.CleanupPolicy)
 	substrateEnabled := strings.EqualFold(os.Getenv("ORKA_SUBSTRATE_ENABLED"), "true")
@@ -465,6 +511,8 @@ func main() {
 		"Default execution workspace provider when Task execution.workspace.provider is omitted (agent-sandbox, substrate).")
 	flag.BoolVar(&agentSandboxEnabled, "agent-sandbox-enabled", agentSandboxEnabled,
 		"Enable experimental agent sandbox workspace execution for agent Tasks.")
+	flag.BoolVar(&acpWorkspaceDispatchEnabled, "acp-workspace-dispatch-enabled", acpWorkspaceDispatchEnabled,
+		"Admit workspace-provider-backed ACP RuntimeSession dispatch (requires the matching --agent-sandbox-enabled or --substrate-enabled provider flag); when false, Task.spec.execution.workspace agent Tasks fail closed.")
 	flag.StringVar(&agentSandboxConfig.RouterURL, "agent-sandbox-router-url", agentSandboxConfig.RouterURL,
 		"Agent sandbox router base URL used by worker Jobs for workspace claims.")
 	flag.StringVar(&agentSandboxConfig.DefaultTemplate, "agent-sandbox-default-template",
@@ -806,7 +854,7 @@ func main() {
 			setupLog.Error(substrateConfigErr, "invalid substrate configuration from environment")
 			os.Exit(1)
 		}
-		if err := substrateConfig.Validate(); err != nil {
+		if err := validateEnabledSubstrateConfig(substrateConfig, workspaceProviderAPIEnabled); err != nil {
 			setupLog.Error(err, "invalid substrate configuration")
 			os.Exit(1)
 		}
@@ -1007,6 +1055,21 @@ func main() {
 	if err := executionmode.ValidateNamespace(modeNamespace, mode); err != nil {
 		setupLog.Error(err, "controller-mode namespace claim failed")
 		os.Exit(1)
+	}
+	if acpRuntimeEnabled && !substrateEnabled {
+		checkCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := validateDisabledSubstrateRecoveryConfig(
+			checkCtx,
+			mgr.GetAPIReader(),
+			watchNamespace,
+			substrateConfig,
+			substrateConfigErr,
+		)
+		cancel()
+		if err != nil {
+			setupLog.Error(err, "disabled substrate recovery configuration is unusable")
+			os.Exit(1)
+		}
 	}
 	controllerHolderID := currentControllerHolderID()
 	if gatewayEnabled {
@@ -1343,6 +1406,12 @@ func main() {
 		}
 		runtimePoolReconciler.Epochs = controllerEpochManager
 		runtimePoolReconciler.EnablePDB = true
+		runtimePoolReconciler.AgentSandboxEnabled = agentSandboxEnabled
+		runtimePoolReconciler.SubstrateEnabled = substrateEnabled
+		// Keep the provider connection and trust configuration available after
+		// admission is disabled so existing Substrate-backed pools can still
+		// destroy actors and release their finalizers.
+		runtimePoolReconciler.SubstrateConfig = substrateConfig
 		runtimePoolReconciler.AllowedImages = controller.ACPRuntimeImages{
 			Codex: acpCodexRuntimeImage, Claude: acpClaudeRuntimeImage, Copilot: acpCopilotRuntimeImage,
 			Opencode: acpOpencodeRuntimeImage,
@@ -1393,6 +1462,7 @@ func main() {
 		MaxTasksPerNamespace:              maxTasksPerNamespaceValue,
 		ExecutionWorkspaceDefaultProvider: executionWorkspaceDefaultProvider,
 		WorkspaceProviderAPIEnabled:       workspaceProviderAPIEnabled,
+		ACPWorkspaceDispatchEnabled:       acpWorkspaceDispatchEnabled,
 		AgentSandboxEnabled:               agentSandboxEnabled,
 		AgentSandboxConfig:                agentSandboxConfig,
 		SubstrateEnabled:                  substrateEnabled,
@@ -1482,6 +1552,11 @@ func main() {
 			AdmissionGate:        acpAdmissionGate,
 			IdlePoolTTL:          acpIdlePoolTTL,
 			MCPRegistry:          acpMCPRegistry,
+			// Keep routing available after new Substrate admission is disabled:
+			// existing Tasks and RuntimeSessions still need authenticated recovery,
+			// cancellation, finalization, drain, and cleanup against their actors.
+			SubstrateRouterURL:      substrateConfig.RouterURL,
+			SubstrateActorDNSSuffix: substrateConfig.ActorDNSSuffix,
 		}
 		if err := mgr.Add(acpDispatcher); err != nil {
 			setupLog.Error(err, "unable to add ACP dispatcher")
@@ -1495,6 +1570,7 @@ func main() {
 			&controller.KubernetesACPUpgradeDrainBarrierObserver{Reader: mgr.GetAPIReader(), Outbox: sqliteStore},
 			acpAdmissionGate, acpUpgradeDrainOptions,
 		)
+		upgradeDrain.SubstrateConfig = substrateConfig
 		if err := mgr.Add(upgradeDrain); err != nil {
 			setupLog.Error(err, "unable to add ACP planned-upgrade drain coordinator")
 			os.Exit(1)
@@ -1816,6 +1892,13 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func validateEnabledSubstrateConfig(cfg controller.SubstrateConfig, legacyWorkspaceProviderAPIEnabled bool) error {
+	if legacyWorkspaceProviderAPIEnabled {
+		return cfg.Validate()
+	}
+	return cfg.ValidateACPRuntimePool()
 }
 
 func newBrokeredDelegateTaskSubjectTokenResolver(
