@@ -4170,6 +4170,12 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 ) {
 	log := logf.FromContext(ctx).WithValues("namespace", task.Namespace, "task", task.Name)
 	retryDelay := time.Duration(0)
+	// pending is the exact sealed mutation of a renewal whose outcome is
+	// ambiguous (transient failure after the request may have been written).
+	// It is replayed verbatim so a renewal the supervisor already applied is
+	// classified as a duplicate of the same operation instead of a
+	// digest_conflict on a rebuilt request with fresh timestamps.
+	var pending *harnessv2.RenewPromptLeaseRequest
 	for {
 		wait := max(time.Until(lease.ExpiresAt)/2, 5*time.Second)
 		if retryDelay > 0 {
@@ -4184,46 +4190,68 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 		case <-timer.C:
 		}
 		now := time.Now().UTC()
-		proposed := harnessv2.PromptLease{Generation: lease.Generation + 1, IssuedAt: now, ExpiresAt: now.Add(90 * time.Second)}
-		metadata := mutationMetadata(
-			fence, task, "renew-lease-"+strconv.FormatUint(proposed.Generation, 10), true, now.Add(30*time.Second),
-		)
-		authorization.LeaseGeneration = proposed.Generation
-		authorization.ExpiresAt = proposed.ExpiresAt
-		if maximum := now.Add(60 * time.Second); authorization.ExpiresAt.After(maximum) {
-			authorization.ExpiresAt = maximum
+		var request harnessv2.RenewPromptLeaseRequest
+		if pending != nil && pending.Metadata.ExpiresAt.After(now.Add(promptLeaseRenewalRetryMargin)) {
+			request = *pending
+		} else {
+			pending = nil
+			proposed := harnessv2.PromptLease{Generation: lease.Generation + 1, IssuedAt: now, ExpiresAt: now.Add(90 * time.Second)}
+			metadata := mutationMetadata(
+				fence, task, "renew-lease-"+strconv.FormatUint(proposed.Generation, 10), true, now.Add(30*time.Second),
+			)
+			authorization.LeaseGeneration = proposed.Generation
+			authorization.ExpiresAt = proposed.ExpiresAt
+			if maximum := now.Add(60 * time.Second); authorization.ExpiresAt.After(maximum) {
+				authorization.ExpiresAt = maximum
+			}
+			authorization.RuntimeSessionUID = metadata.Fence.RuntimeSessionUID
+			authorization.SessionGeneration = metadata.Fence.RuntimeSessionGeneration
+			authorization.TaskUID = metadata.TaskUID
+			authorization.TaskAttempt = metadata.TaskAttempt
+			authorization.PromptID = metadata.PromptID
+			request = harnessv2.RenewPromptLeaseRequest{
+				Protocol: harnessv2.ProtocolVersion, Metadata: metadata,
+				ExpectedLeaseGeneration: lease.Generation, Lease: proposed, MCPAuthorization: authorization,
+			}
+			if err := sealMutation(&request.Metadata.RequestDigest, request); err != nil {
+				cancelRuntime()
+				return
+			}
 		}
-		authorization.RuntimeSessionUID = metadata.Fence.RuntimeSessionUID
-		authorization.SessionGeneration = metadata.Fence.RuntimeSessionGeneration
-		authorization.TaskUID = metadata.TaskUID
-		authorization.TaskAttempt = metadata.TaskAttempt
-		authorization.PromptID = metadata.PromptID
-		request := harnessv2.RenewPromptLeaseRequest{
-			Protocol: harnessv2.ProtocolVersion, Metadata: metadata,
-			ExpectedLeaseGeneration: lease.Generation, Lease: proposed, MCPAuthorization: authorization,
-		}
-		if err := sealMutation(&request.Metadata.RequestDigest, request); err != nil {
-			cancelRuntime()
-			return
-		}
+		proposed := request.Lease
 		response, err := runtimeClient.RenewPromptLease(ctx, sessionID, request)
 		if err == nil && response.Lease.Generation == proposed.Generation {
+			pending = nil
 			lease = response.Lease
 			continue
 		}
+		// A prompt that already settled on the supervisor no longer needs a
+		// lease: its terminal event is delivered (or recovered) through the
+		// prompt stream, so renewal simply stops. Cancelling the runtime
+		// context here would abort that stream and turn a completed prompt
+		// into a client-error or outcome-unknown settlement.
+		if promptLeaseRenewalSettled(err) {
+			log.Info("ACP prompt lease renewal found the prompt settled; stopping renewal", "leaseGeneration", lease.Generation)
+			return
+		}
 		// One slow or dropped renewal under load must not cancel a healthy
 		// prompt: a transient failure is retried while the current lease is
-		// still valid. Only a definitive supervisor rejection, a generation
-		// mismatch, or an expired lease ends the prompt.
+		// still valid, replaying the identical sealed request. Only a
+		// definitive supervisor rejection, a generation mismatch, or an
+		// expired lease ends the prompt.
 		if remaining := time.Until(lease.ExpiresAt); err != nil && promptLeaseRenewalRetryable(err) && remaining > promptLeaseRenewalRetryMargin {
+			replay := request
+			pending = &replay
 			retryDelay = min(promptLeaseRenewalRetryDelay, remaining/4)
 			log.Info("ACP prompt lease renewal failed; retrying while the lease is valid",
 				"errorClass", promptLeaseRenewalErrorClass(err), "leaseGeneration", lease.Generation,
 				"leaseRemaining", remaining.Round(time.Second).String(), "retryIn", retryDelay.Round(time.Millisecond).String())
 			continue
 		}
+		// Only the low-cardinality class is logged: a supervisor rejection
+		// message is runtime-supplied text and must not reach controller logs.
 		if err != nil {
-			log.Error(err, "ACP prompt lease renewal failed; cancelling the prompt",
+			log.Info("ACP prompt lease renewal rejected; cancelling the prompt",
 				"errorClass", promptLeaseRenewalErrorClass(err), "leaseGeneration", lease.Generation)
 		} else {
 			log.Info("ACP prompt lease renewal returned an unexpected generation; cancelling the prompt",
@@ -4263,6 +4291,15 @@ func promptLeaseRenewalErrorClass(err error) string {
 		return "cancelled"
 	}
 	return "unclassified"
+}
+
+// promptLeaseRenewalSettled reports whether the supervisor rejected a lease
+// renewal because the prompt has already settled (HTTP 410 with the v2
+// "settled" code).
+func promptLeaseRenewalSettled(err error) bool {
+	var clientErr *harnessv2.ClientError
+	return errors.As(err, &clientErr) && clientErr.Kind == harnessv2.ClientErrorHTTP &&
+		clientErr.StatusCode == http.StatusGone && clientErr.Code == harnessv2.ErrorCodeSettled
 }
 
 // promptLeaseRenewalRetryable reports whether a failed lease renewal may be
