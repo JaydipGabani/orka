@@ -28,6 +28,7 @@ export function ChatPage() {
     setProvider,
     setModel,
     selectNamespace,
+    activeNamespace,
     isStreaming,
   } = useChatStore()
   // Providers are namespace-scoped, so the persisted picker choice is too.
@@ -40,7 +41,15 @@ export function ChatPage() {
   // forbidden). Sending that stale name would fail provider resolution on
   // every turn, so fall back to the server default once the list has
   // answered and does not contain it.
-  const providerGone = provider !== '' && (providersForbidden || (providersData !== undefined && !providers.some((p) => p.name === provider)))
+  // Gated on the store having switched to the rendered namespace: during a
+  // namespace change this render still holds the previous namespace's pick
+  // while the list already belongs to the new one, and clearing then would
+  // erase the new namespace's valid selection right after selectNamespace
+  // restores it.
+  const providerGone =
+    activeNamespace === namespace &&
+    provider !== '' &&
+    (providersForbidden || (providersData !== undefined && !providers.some((p) => p.name === provider)))
   useEffect(() => {
     if (!providerGone) return
     setProvider('')

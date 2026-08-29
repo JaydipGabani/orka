@@ -711,9 +711,9 @@ func TestRepositoryMonitorReviewContextAlteredPathMarksChangeSetIncomplete(t *te
 		name string
 		file repositoryMonitorPullRequestFileResponse
 	}{
-		{name: "deleted long path", file: repositoryMonitorPullRequestFileResponse{Filename: longPath, Status: "removed", Deletions: 1, Patch: "@@ -1 +0,0 @@\n-old\n"}},
+		{name: "deleted long path", file: repositoryMonitorPullRequestFileResponse{Filename: longPath, Status: repositoryMonitorReviewContextStatusRemoved, Deletions: 1, Patch: "@@ -1 +0,0 @@\n-old\n"}},
 		{name: "renamed from long path", file: repositoryMonitorPullRequestFileResponse{Filename: repositoryMonitorReviewContextTestShort, PreviousFilename: longPath, Status: repositoryMonitorReviewContextTestRenamed}},
-		{name: "deleted path with credential-shaped segment", file: repositoryMonitorPullRequestFileResponse{Filename: "config/api_key=ak-live-0123456789abcdef.env", Status: "removed", Deletions: 1}},
+		{name: "deleted path with credential-shaped segment", file: repositoryMonitorPullRequestFileResponse{Filename: "config/api_key=ak-live-0123456789abcdef.env", Status: repositoryMonitorReviewContextStatusRemoved, Deletions: 1}},
 		{name: "renamed from control-character path", file: repositoryMonitorPullRequestFileResponse{Filename: repositoryMonitorReviewContextTestShort, PreviousFilename: "old\x00name.go", Status: repositoryMonitorReviewContextTestRenamed}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -731,6 +731,22 @@ func TestRepositoryMonitorReviewContextAlteredPathMarksChangeSetIncomplete(t *te
 	short := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{{Filename: repositoryMonitorReviewContextTestShort, Status: repositoryMonitorReviewContextTestStatus, Patch: repositoryMonitorReviewContextTestPatch}})
 	if short.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=false for an in-bound path", short.Truncated)
+	}
+}
+
+func TestRepositoryMonitorReviewContextRemovedFileWithoutPatchMarksChangeSetIncomplete(t *testing.T) {
+	t.Parallel()
+	build := func(files ...repositoryMonitorPullRequestFileResponse) repositoryMonitorReviewContext {
+		return repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), files)
+	}
+	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "gone.bin", Status: repositoryMonitorReviewContextStatusRemoved, Deletions: 0}); !got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=true for a removed file whose patch is unavailable", got.Truncated)
+	}
+	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "gone.go", Status: repositoryMonitorReviewContextStatusRemoved, Deletions: 1, Patch: "@@ -1 +0,0 @@\n-old\n"}); got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=false for a removed file with its patch", got.Truncated)
+	}
+	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "image.png", Status: repositoryMonitorReviewContextTestAdded, Additions: 0}); got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=false for a present path without a patch (reviewed from the checkout)", got.Truncated)
 	}
 }
 

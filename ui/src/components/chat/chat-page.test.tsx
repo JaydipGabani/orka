@@ -157,6 +157,24 @@ describe('ChatPage', () => {
     expect(useChatStore.getState().model).toBe('')
   })
 
+  it('does not clear the new namespace selection while switching namespaces', async () => {
+    useChatStore.setState({
+      activeNamespace: 'default', provider: 'openai-proxy', model: 'gpt-5',
+      selections: { default: { provider: 'openai-proxy', model: 'gpt-5' }, team: { provider: 'anthropic', model: 'claude-sonnet-4-20250514' } },
+    })
+    render(<ChatPage />)
+    await waitFor(() => expect(useChatStore.getState().provider).toBe('openai-proxy'))
+
+    // Namespace "team" only lists anthropic; the previous namespace's pick is
+    // not in it, but that must not clear team's own valid selection.
+    providerList.current = { data: { items: [{ name: 'anthropic', type: 'anthropic', defaultModel: 'claude-sonnet-4-20250514', ready: true }] }, error: null }
+    useUIStore.setState({ namespace: 'team' })
+    await waitFor(() => expect(useChatStore.getState().activeNamespace).toBe('team'))
+    await waitFor(() => expect(useChatStore.getState().provider).toBe('anthropic'))
+    expect(useChatStore.getState().selections.team).toEqual({ provider: 'anthropic', model: 'claude-sonnet-4-20250514' })
+    expect(useChatStore.getState().selections.default).toEqual({ provider: 'openai-proxy', model: 'gpt-5' })
+  })
+
   it('keeps a persisted provider while the Provider list is still loading', () => {
     providerList.current = { data: undefined, error: null }
     useChatStore.setState({ provider: 'openai-proxy', model: 'gpt-5', selections: { default: { provider: 'openai-proxy', model: 'gpt-5' } } })

@@ -34,6 +34,7 @@ const (
 	repositoryMonitorReviewContextMaxPathBytes     = 512
 	repositoryMonitorReviewContextMaxStatusBytes   = 32
 	repositoryMonitorReviewContextPatchTruncated   = "truncated"
+	repositoryMonitorReviewContextStatusRemoved    = "removed"
 	repositoryMonitorReviewContextPatchUnavailable = "unavailable"
 	repositoryMonitorReviewContextPatchCapped      = "capped"
 	repositoryMonitorReviewContextBeginMarker      = "--- BEGIN orka.prReview.context.v1 ---"
@@ -229,7 +230,23 @@ func repositoryMonitorReviewContextFromFiles(owner, repository string, pr reposi
 		used += delta
 	}
 	reviewContext.Files = entries
-	return repositoryMonitorReviewContextTrimToBudget(reviewContext)
+	reviewContext = repositoryMonitorReviewContextTrimToBudget(reviewContext)
+	return repositoryMonitorReviewContextMarkUnreviewableRemovals(reviewContext)
+}
+
+// repositoryMonitorReviewContextMarkUnreviewableRemovals marks the change set
+// incomplete when a removed file's patch is omitted (unavailable, truncated, or
+// capped): the Git-free head checkout cannot contain a deleted file, so the
+// reviewer has no way to inspect what was removed, unlike an omitted patch
+// for a present path which is reviewed from the checkout itself.
+func repositoryMonitorReviewContextMarkUnreviewableRemovals(reviewContext repositoryMonitorReviewContext) repositoryMonitorReviewContext {
+	for _, file := range reviewContext.Files {
+		if file.Status == repositoryMonitorReviewContextStatusRemoved && file.PatchOmitted != "" {
+			reviewContext.Truncated.Files = true
+			return reviewContext
+		}
+	}
+	return reviewContext
 }
 
 // repositoryMonitorReviewContextTrimToBudget verifies the final encoding,
