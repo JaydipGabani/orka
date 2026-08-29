@@ -46,6 +46,7 @@ const (
 	acpTestDurableCapacity    = "1Gi"
 	acpTestSessionPoolName    = "acp-ws-session-0123456789abcdef"
 	acpTestStorageProvisioner = "test.orka.ai/provisioner"
+	acpTestInfraTemplateName  = "infra-template"
 )
 
 const acpTestSandboxPoolName = "acp-ws-agent-sandbox-0123456789abcdef"
@@ -171,7 +172,7 @@ func newACPClassFixture(t *testing.T, backend acpworkspacev1alpha1.RuntimeProvid
 	}
 	if backend == acpworkspacev1alpha1.RuntimeProviderBackendSubstrate {
 		fixture.profile.Spec.Substrate = &acpworkspacev1alpha1.SubstrateProfileSpec{
-			TemplateRef: acpworkspacev1alpha1.SubstrateTemplateReference{Name: "infra-template", Namespace: acpTestSubstrateNamespace},
+			TemplateRef: acpworkspacev1alpha1.SubstrateTemplateReference{Name: acpTestInfraTemplateName, Namespace: acpTestSubstrateNamespace},
 		}
 	} else {
 		fixture.provider.Status.SupportedFeatures = append(
@@ -379,7 +380,7 @@ func TestResolveACPWorkspaceClassMatrix(t *testing.T) {
 				if resolved.Backend != corev1alpha1.WorkspaceProviderSubstrate {
 					t.Fatalf("backend = %s", resolved.Backend)
 				}
-				if resolved.SubstrateTemplateNamespace != acpTestSubstrateNamespace || resolved.SubstrateTemplateName != "infra-template" {
+				if resolved.SubstrateTemplateNamespace != acpTestSubstrateNamespace || resolved.SubstrateTemplateName != acpTestInfraTemplateName {
 					t.Fatalf("substrate template = %s/%s", resolved.SubstrateTemplateNamespace, resolved.SubstrateTemplateName)
 				}
 			},
@@ -635,7 +636,7 @@ func TestResolveACPWorkspaceClassAllowsDeleteContinuationAfterSuspendWithdrawal(
 				BindingDigest: "sha256:" + strings.Repeat("a", 64),
 				Substrate: &corev1alpha1.RuntimePoolSubstrateWorkspaceSpec{
 					BaseTemplateNamespace: acpTestSubstrateNamespace,
-					BaseTemplateName:      "infra-template",
+					BaseTemplateName:      acpTestInfraTemplateName,
 				},
 			},
 		},

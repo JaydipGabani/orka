@@ -1410,38 +1410,7 @@ func TestResolveACPClassWorkspaceContinuationReusesFrozenSandboxVolume(t *testin
 	if _, err := r.resolveACPWorkspaceClassWithSessionUID(ctx, holder, sessionUID); err != nil {
 		t.Fatalf("resolve continuation while the initial linked RuntimePool is still pending: %v", err)
 	}
-	pool := &corev1alpha1.RuntimePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:  holder.Namespace,
-			Name:       plan.PoolName,
-			Generation: 1,
-			Labels: map[string]string{
-				acpExecutionWorkspaceLinkLabel:   workspace.Name,
-				acpRuntimeWorkspaceProviderLabel: string(corev1alpha1.WorkspaceProviderAgentSandbox),
-			},
-			Annotations: map[string]string{
-				acpExecutionWorkspaceUIDAnnotation: string(workspace.UID),
-			},
-		},
-		Spec: corev1alpha1.RuntimePoolSpec{ExecutionWorkspace: &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
-			Provider:      corev1alpha1.WorkspaceProviderAgentSandbox,
-			BindingDigest: originalBinding.BindingDigest,
-			AgentSandbox: &corev1alpha1.RuntimePoolAgentSandboxWorkspaceSpec{
-				SuspendMode: originalBinding.Class.SuspendMode,
-				SuspendVolume: &corev1alpha1.RuntimePoolSandboxDurableVolumeSpec{
-					StorageClassName: originalBinding.Class.SandboxVolume.StorageClassName,
-					StorageClassUID:  originalBinding.Class.SandboxVolume.StorageClassUID,
-					AccessModes:      append([]string(nil), originalBinding.Class.SandboxVolume.AccessModes...),
-					Capacity:         originalBinding.Class.SandboxVolume.Capacity,
-				},
-			},
-		}},
-		Status: corev1alpha1.RuntimePoolStatus{
-			ObservedGeneration: 1,
-			Lifecycle:          corev1alpha1.RuntimePoolLifecycleServing,
-			AdmissionState:     corev1alpha1.RuntimePoolAdmissionAccepting,
-		},
-	}
+	pool := suspendableSandboxLinkedRuntimePool(holder, plan.PoolName, workspace, originalBinding)
 	if err := r.Create(ctx, pool); err != nil {
 		t.Fatalf("create linked RuntimePool: %v", err)
 	}
@@ -1493,6 +1462,65 @@ func TestResolveACPClassWorkspaceContinuationReusesFrozenSandboxVolume(t *testin
 		t, ctx, r, holder, continuation, replacement, sessionUID,
 	)
 
+	assertACPClassWorkspaceContinuationFailsClosedOnCorruptedLinkage(t, ctx, r, continuation, pool, workspace, sessionUID)
+}
+
+// suspendableSandboxLinkedRuntimePool builds the Serving, Accepting RuntimePool
+// that a materialized sandbox workspace links to, carrying the frozen binding
+// digest and durable volume identity.
+func suspendableSandboxLinkedRuntimePool(
+	holder *corev1alpha1.Task,
+	poolName string,
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+	originalBinding *ACPRuntimeWorkspaceBinding,
+) *corev1alpha1.RuntimePool {
+	return &corev1alpha1.RuntimePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  holder.Namespace,
+			Name:       poolName,
+			Generation: 1,
+			Labels: map[string]string{
+				acpExecutionWorkspaceLinkLabel:   workspace.Name,
+				acpRuntimeWorkspaceProviderLabel: string(corev1alpha1.WorkspaceProviderAgentSandbox),
+			},
+			Annotations: map[string]string{
+				acpExecutionWorkspaceUIDAnnotation: string(workspace.UID),
+			},
+		},
+		Spec: corev1alpha1.RuntimePoolSpec{ExecutionWorkspace: &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
+			Provider:      corev1alpha1.WorkspaceProviderAgentSandbox,
+			BindingDigest: originalBinding.BindingDigest,
+			AgentSandbox: &corev1alpha1.RuntimePoolAgentSandboxWorkspaceSpec{
+				SuspendMode: originalBinding.Class.SuspendMode,
+				SuspendVolume: &corev1alpha1.RuntimePoolSandboxDurableVolumeSpec{
+					StorageClassName: originalBinding.Class.SandboxVolume.StorageClassName,
+					StorageClassUID:  originalBinding.Class.SandboxVolume.StorageClassUID,
+					AccessModes:      append([]string(nil), originalBinding.Class.SandboxVolume.AccessModes...),
+					Capacity:         originalBinding.Class.SandboxVolume.Capacity,
+				},
+			},
+		}},
+		Status: corev1alpha1.RuntimePoolStatus{
+			ObservedGeneration: 1,
+			Lifecycle:          corev1alpha1.RuntimePoolLifecycleServing,
+			AdmissionState:     corev1alpha1.RuntimePoolAdmissionAccepting,
+		},
+	}
+}
+
+// assertACPClassWorkspaceContinuationFailsClosedOnCorruptedLinkage corrupts
+// the linked RuntimePool binding digest and then removes the pool from a
+// resumed lineage, expecting continuation resolution to reject both.
+func assertACPClassWorkspaceContinuationFailsClosedOnCorruptedLinkage(
+	t *testing.T,
+	ctx context.Context,
+	r *TaskReconciler,
+	continuation *corev1alpha1.Task,
+	pool *corev1alpha1.RuntimePool,
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+	sessionUID string,
+) {
+	t.Helper()
 	currentPool := &corev1alpha1.RuntimePool{}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(pool), currentPool); err != nil {
 		t.Fatalf("read linked RuntimePool: %v", err)

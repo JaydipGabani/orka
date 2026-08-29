@@ -363,62 +363,87 @@ func (r *ExecutionWorkspaceClassReconciler) validateACPClassProfile(
 	}
 	switch config.Spec.Backend {
 	case acpworkspacev1alpha1.RuntimeProviderBackendSubstrate:
-		substrate := profile.Spec.Substrate
-		if substrate == nil || profile.Spec.AgentSandbox != nil {
-			return false, false, nil
-		}
-		templateName := strings.TrimSpace(substrate.TemplateRef.Name)
-		templateNamespace := strings.TrimSpace(substrate.TemplateRef.Namespace)
-		if templateNamespace == "" {
-			templateNamespace = class.Namespace
-		}
-		if err := validateSubstrateWorkspaceTemplateReference(templateNamespace, templateName); err != nil {
-			return false, false, nil
-		}
-		if substrate.Suspend == nil {
-			return true, false, nil
-		}
-		if substrate.Suspend.Mode != acpworkspacev1alpha1.SubstrateSuspendModeDataOnly {
-			return false, false, nil
-		}
-		if suspendAllowed && !expiryBounded {
-			return false, false, nil
-		}
-		return true, true, nil
+		valid, permitsSuspend = validateACPClassSubstrateProfile(class, profile, suspendAllowed, expiryBounded)
+		return valid, permitsSuspend, nil
 	case acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox:
-		sandbox := profile.Spec.AgentSandbox
-		if profile.Spec.Substrate != nil {
-			return false, false, nil
-		}
-		if sandbox == nil || sandbox.Suspend == nil {
-			return true, false, nil
-		}
-		// The SAME validators resolution runs decide readiness: the frozen
-		// volume shape (mode, positive capacity, writable access modes) and
-		// the pinned storage class (existing, Delete reclaim,
-		// non-terminating, or a resolvable cluster default).
-		volume, volumeErr := frozenACPSandboxDurableVolume(sandbox.Suspend, class.Spec.ParametersRef.Name)
-		if volumeErr != nil {
-			return false, false, nil
-		}
-		if _, classErr := validateDurableStorageClassReclaim(
-			ctx, reader, volume.StorageClassName, class.Spec.ParametersRef.Name,
-		); classErr != nil {
-			if isRetryableACPWorkspaceClassResolutionError(classErr) {
-				// A live reader failure is transient: surface it so the
-				// reconcile retries instead of latching a false not-ready
-				// verdict.
-				return false, false, classErr
-			}
-			return false, false, nil
-		}
-		if suspendAllowed && !expiryBounded {
-			return false, false, nil
-		}
-		return true, true, nil
+		return validateACPClassAgentSandboxProfile(ctx, reader, class, profile, suspendAllowed, expiryBounded)
 	default:
 		return false, false, nil
 	}
+}
+
+// validateACPClassSubstrateProfile validates the Substrate half of an ACP
+// class profile: the infrastructure template reference and, when present,
+// the DataOnly suspend policy.
+func validateACPClassSubstrateProfile(
+	class *workspacev1alpha1.ExecutionWorkspaceClass,
+	profile *acpworkspacev1alpha1.RuntimeWorkspaceProfile,
+	suspendAllowed, expiryBounded bool,
+) (valid, permitsSuspend bool) {
+	substrate := profile.Spec.Substrate
+	if substrate == nil || profile.Spec.AgentSandbox != nil {
+		return false, false
+	}
+	templateName := strings.TrimSpace(substrate.TemplateRef.Name)
+	templateNamespace := strings.TrimSpace(substrate.TemplateRef.Namespace)
+	if templateNamespace == "" {
+		templateNamespace = class.Namespace
+	}
+	if err := validateSubstrateWorkspaceTemplateReference(templateNamespace, templateName); err != nil {
+		return false, false
+	}
+	if substrate.Suspend == nil {
+		return true, false
+	}
+	if substrate.Suspend.Mode != acpworkspacev1alpha1.SubstrateSuspendModeDataOnly {
+		return false, false
+	}
+	if suspendAllowed && !expiryBounded {
+		return false, false
+	}
+	return true, true
+}
+
+// validateACPClassAgentSandboxProfile validates the agent-sandbox half of an
+// ACP class profile, including the frozen durable volume shape and the pinned
+// storage class when suspension is requested.
+func validateACPClassAgentSandboxProfile(
+	ctx context.Context,
+	reader client.Reader,
+	class *workspacev1alpha1.ExecutionWorkspaceClass,
+	profile *acpworkspacev1alpha1.RuntimeWorkspaceProfile,
+	suspendAllowed, expiryBounded bool,
+) (valid, permitsSuspend bool, err error) {
+	sandbox := profile.Spec.AgentSandbox
+	if profile.Spec.Substrate != nil {
+		return false, false, nil
+	}
+	if sandbox == nil || sandbox.Suspend == nil {
+		return true, false, nil
+	}
+	// The SAME validators resolution runs decide readiness: the frozen
+	// volume shape (mode, positive capacity, writable access modes) and
+	// the pinned storage class (existing, Delete reclaim,
+	// non-terminating, or a resolvable cluster default).
+	volume, volumeErr := frozenACPSandboxDurableVolume(sandbox.Suspend, class.Spec.ParametersRef.Name)
+	if volumeErr != nil {
+		return false, false, nil
+	}
+	if _, classErr := validateDurableStorageClassReclaim(
+		ctx, reader, volume.StorageClassName, class.Spec.ParametersRef.Name,
+	); classErr != nil {
+		if isRetryableACPWorkspaceClassResolutionError(classErr) {
+			// A live reader failure is transient: surface it so the
+			// reconcile retries instead of latching a false not-ready
+			// verdict.
+			return false, false, classErr
+		}
+		return false, false, nil
+	}
+	if suspendAllowed && !expiryBounded {
+		return false, false, nil
+	}
+	return true, true, nil
 }
 
 func (r *ExecutionWorkspaceClassReconciler) resolveDirectParameters(
