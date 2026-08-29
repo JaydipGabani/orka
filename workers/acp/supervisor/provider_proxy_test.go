@@ -841,3 +841,154 @@ func assertProviderProxyStatus(t *testing.T, endpoint, credential string, want i
 		t.Fatalf("provider proxy status = %d, want %d body=%s", response.StatusCode, want, body)
 	}
 }
+
+func TestProviderProxyUpstreamFailureAccountingPassesErrorThrough(t *testing.T) {
+	const quotaBody = `{"error":{"message":"You have exceeded your monthly quota","type":"quota_exceeded"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Upstream-Marker", "quota")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = io.WriteString(w, quotaBody)
+	}))
+	defer upstream.Close()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+
+	response := doProviderProxyRequest(
+		t, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential,
+		[]byte(`{"model":"test-model"}`), nil,
+	)
+	defer func() { _ = response.Body.Close() }()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusPaymentRequired || string(body) != quotaBody {
+		t.Fatalf("passed-through upstream error = %d %s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("X-Upstream-Marker"); got != "quota" {
+		t.Fatalf("passed-through upstream header = %q", got)
+	}
+	failed, status, detail := session.upstreamFailureOnly(testPromptOneID)
+	if !failed || status != http.StatusPaymentRequired || detail != "You have exceeded your monthly quota" {
+		t.Fatalf("upstreamFailureOnly = %v/%d/%q", failed, status, detail)
+	}
+	if failed, _, _ := session.upstreamFailureOnly("other-prompt"); failed {
+		t.Fatal("upstream failure accounting leaked to another prompt")
+	}
+}
+
+func TestProviderProxyUpstreamFailureAccountingClearsAfterStreamedSuccess(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = io.WriteString(w, `{"error":{"message":"You have exceeded your monthly quota"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for _, chunk := range []string{"event: response.created\ndata: {}\n\n", "event: response.completed\ndata: {}\n\n"} {
+			_, _ = io.WriteString(w, chunk)
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+
+	assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusPaymentRequired)
+	if failed, _, _ := session.upstreamFailureOnly(testPromptOneID); !failed {
+		t.Fatal("first failed inference response was not accounted")
+	}
+
+	response := doProviderProxyRequest(
+		t, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential,
+		[]byte(`{"model":"test-model","stream":true}`), nil,
+	)
+	defer func() { _ = response.Body.Close() }()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "response.completed") {
+		t.Fatalf("streamed success = %d %s", response.StatusCode, body)
+	}
+	if failed, status, detail := session.upstreamFailureOnly(testPromptOneID); failed || status != 0 || detail != "" {
+		t.Fatalf("upstreamFailureOnly after success = %v/%d/%q, want false", failed, status, detail)
+	}
+}
+
+func TestProviderProxyUpstreamFailureAccountingResetsOnActivation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "upstream\x00unavailable\n at /_orka/provider/secret-route/v1/responses")
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProviderProxy(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	session, binding, err := proxy.newSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.close()
+	now := time.Now().UTC()
+	if err := session.activate("prompt-one", now.Add(time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusServiceUnavailable)
+	failed, status, detail := session.upstreamFailureOnly("prompt-one")
+	if !failed || status != http.StatusServiceUnavailable {
+		t.Fatalf("upstreamFailureOnly = %v/%d/%q", failed, status, detail)
+	}
+	if detail != "upstreamunavailable at" || strings.Contains(detail, providerProxyPathPrefix) {
+		t.Fatalf("sanitized upstream detail = %q", detail)
+	}
+
+	session.deactivate("prompt-one")
+	if failed, _, _ := session.upstreamFailureOnly("prompt-one"); !failed {
+		t.Fatal("deactivation cleared upstream failure accounting before settlement")
+	}
+	secondNow := time.Now().UTC()
+	if err := session.activate("prompt-two", secondNow.Add(time.Minute), secondNow); err != nil {
+		t.Fatal(err)
+	}
+	for _, promptID := range []string{"prompt-one", "prompt-two"} {
+		if failed, status, detail := session.upstreamFailureOnly(promptID); failed || status != 0 || detail != "" {
+			t.Fatalf("upstreamFailureOnly(%q) after activation = %v/%d/%q, want reset", promptID, failed, status, detail)
+		}
+	}
+	session.mu.Lock()
+	successes, failures := session.inferenceSuccesses, session.inferenceFailures
+	session.mu.Unlock()
+	if successes != 0 || failures != 0 {
+		t.Fatalf("inference accounting after activation = %d/%d, want 0/0", successes, failures)
+	}
+}
+
+func TestSanitizeProviderUpstreamDetailIsBounded(t *testing.T) {
+	long := strings.Repeat("y", providerUpstreamDetailMaxBytes+10) + "界"
+	if got := sanitizeProviderUpstreamDetail(long); len(got) > providerUpstreamDetailMaxBytes {
+		t.Fatalf("sanitized detail length = %d, want <= %d", len(got), providerUpstreamDetailMaxBytes)
+	}
+	if got := sanitizeProviderUpstreamDetail("quota\tex\x1bceeded\n"); got != "quota exceeded" {
+		t.Fatalf("sanitized control characters = %q", got)
+	}
+	if got := providerUpstreamErrorDetail([]byte(`{"error":"plain string error"}`)); got != "plain string error" {
+		t.Fatalf("string error detail = %q", got)
+	}
+	if got := providerUpstreamErrorDetail([]byte("  <html>bad gateway</html>  ")); got != "<html>bad gateway</html>" {
+		t.Fatalf("raw error detail = %q", got)
+	}
+}

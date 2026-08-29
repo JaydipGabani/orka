@@ -120,6 +120,17 @@ func validateToolLoopCompletion(resp *llm.CompletionResponse) error {
 	switch outcome {
 	case llm.CompletionOutcomeCompleted, llm.CompletionOutcomeToolCalls:
 		return nil
+	case llm.CompletionOutcomeIncomplete:
+		// A response truncated by the caller's max_tokens budget is a valid
+		// terminal outcome for the compatibility APIs: Anthropic and OpenAI
+		// clients expect the partial text with stop_reason "max_tokens" /
+		// finish_reason "length" (and typically raise the budget and retry).
+		// Only a truncated tool call is unusable, because its arguments are
+		// incomplete and must not be executed.
+		if resp != nil && len(resp.ToolCalls) == 0 {
+			return nil
+		}
+		return fmt.Errorf("LLM returned %s completion outcome with truncated tool calls (stop reason %q)", outcome, strings.TrimSpace(resp.StopReason))
 	default:
 		reason := ""
 		if resp != nil {

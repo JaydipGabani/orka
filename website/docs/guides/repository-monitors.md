@@ -60,12 +60,12 @@ metadata:
 spec:
   runtime:
     type: claude
+    contractVersion: orka.harness.v2
     defaultMaxTurns: 50
     defaultAllowedTools:
       - Read
       - Grep
       - Glob
-      - LS
   systemPrompt:
     inline: |
       Review the exact pull request head for correctness, tests, security, and maintainability.

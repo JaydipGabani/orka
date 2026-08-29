@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/orka-agents/orka/internal/providerproxy"
 )
@@ -51,6 +53,9 @@ const (
 	defaultProviderProxyReadTimeout       = 30 * time.Second
 	defaultProviderProxySessionRequests   = 2
 	defaultProviderProxyGlobalRequests    = 8
+	providerUpstreamDetailProbeBytes      = 4 << 10
+	providerUpstreamDetailMaxBytes        = 256
+	providerUpstreamTransportFailure      = "provider upstream request failed"
 )
 
 type ProviderProxyConfig struct {
@@ -119,10 +124,18 @@ type providerProxySession struct {
 	maxTurns          int32
 	inferenceRequests int32
 	turnLimitExceeded bool
-	inflight          int
-	drained           chan struct{}
-	closed            bool
-	requestSlots      chan struct{}
+	// Per-prompt upstream inference response accounting. ACP agents such as
+	// Codex and Copilot report provider errors as ordinary assistant text and
+	// end their turn, so the supervisor needs its own evidence that at least
+	// one inference call succeeded before it trusts an end_turn settlement.
+	inferenceSuccesses int32
+	inferenceFailures  int32
+	lastUpstreamStatus int
+	lastUpstreamDetail string
+	inflight           int
+	drained            chan struct{}
+	closed             bool
+	requestSlots       chan struct{}
 }
 
 type providerProxyAuthorization struct {
@@ -328,6 +341,10 @@ func (s *providerProxySession) activateWithMaxTurns(promptID string, maxTurns in
 	s.maxTurns = maxTurns
 	s.inferenceRequests = 0
 	s.turnLimitExceeded = false
+	s.inferenceSuccesses = 0
+	s.inferenceFailures = 0
+	s.lastUpstreamStatus = 0
+	s.lastUpstreamDetail = ""
 	s.leaseVersion++
 	version := s.leaseVersion
 	s.gateContext, s.gateCancel = context.WithCancel(context.Background())
@@ -506,6 +523,107 @@ func (s *providerProxySession) maxTurnsExceeded(promptID string) bool {
 	return s.turnPromptID == strings.TrimSpace(promptID) && s.turnLimitExceeded
 }
 
+// recordInferenceResponse accounts one upstream inference response for the
+// prompt that owns the current turn. Status codes below 400 count as
+// successes; everything else is a failure whose bounded, sanitized detail is
+// kept for the terminal failure message. Metadata requests and responses for
+// other prompts are ignored.
+func (s *providerProxySession) recordInferenceResponse(promptID string, class providerRequestClass, statusCode int, detail string) {
+	if s == nil || class != providerRequestInference {
+		return
+	}
+	promptID = strings.TrimSpace(promptID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if promptID == "" || s.turnPromptID != promptID {
+		return
+	}
+	if statusCode < http.StatusBadRequest {
+		s.inferenceSuccesses++
+		return
+	}
+	s.inferenceFailures++
+	s.lastUpstreamStatus = statusCode
+	s.lastUpstreamDetail = sanitizeProviderUpstreamDetail(detail)
+}
+
+// upstreamFailureOnly reports whether every accounted inference response for
+// promptID failed. It is false when the prompt made no inference requests or
+// when at least one inference response succeeded.
+func (s *providerProxySession) upstreamFailureOnly(promptID string) (bool, int, string) {
+	if s == nil {
+		return false, 0, ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnPromptID != strings.TrimSpace(promptID) || s.inferenceSuccesses != 0 || s.inferenceFailures == 0 {
+		return false, 0, ""
+	}
+	return true, s.lastUpstreamStatus, s.lastUpstreamDetail
+}
+
+// sanitizeProviderUpstreamDetail bounds an upstream error detail to printable
+// text of at most providerUpstreamDetailMaxBytes and strips any private
+// provider-proxy route path that an upstream might echo back.
+func sanitizeProviderUpstreamDetail(detail string) string {
+	fields := strings.Fields(detail)
+	kept := fields[:0]
+	for _, field := range fields {
+		if strings.Contains(field, providerProxyPathPrefix) {
+			continue
+		}
+		kept = append(kept, field)
+	}
+	var builder strings.Builder
+	for _, r := range strings.Join(kept, " ") {
+		if r == utf8.RuneError || !unicode.IsPrint(r) {
+			continue
+		}
+		builder.WriteRune(r)
+	}
+	sanitized := strings.TrimSpace(builder.String())
+	limit := providerUpstreamDetailMaxBytes
+	if len(sanitized) <= limit {
+		return sanitized
+	}
+	for limit > 0 && !utf8.RuneStart(sanitized[limit]) {
+		limit--
+	}
+	return strings.TrimSpace(sanitized[:limit])
+}
+
+// providerUpstreamErrorDetail extracts a bounded human-readable detail from a
+// buffered upstream error body prefix: the JSON error.message when present,
+// otherwise the trimmed raw prefix.
+func providerUpstreamErrorDetail(prefix []byte) string {
+	var payload struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(prefix, &payload); err == nil && len(payload.Error) > 0 {
+		var nested struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(payload.Error, &nested); err == nil && strings.TrimSpace(nested.Message) != "" {
+			return nested.Message
+		}
+		var message string
+		if err := json.Unmarshal(payload.Error, &message); err == nil && strings.TrimSpace(message) != "" {
+			return message
+		}
+	}
+	raw := strings.TrimSpace(string(prefix))
+	if len(raw) > providerUpstreamDetailMaxBytes {
+		raw = raw[:providerUpstreamDetailMaxBytes]
+	}
+	return raw
+}
+
+// errorTailReader replays the read error observed while probing an upstream
+// error body so the relayed stream terminates exactly as the upstream did.
+type errorTailReader struct{ err error }
+
+func (r errorTailReader) Read([]byte) (int, error) { return 0, r.err }
+
 func requestHasCredential(r *http.Request, expected []byte) bool {
 	for _, value := range r.Header.Values(providerAuthorizationHeader) {
 		value = strings.TrimSpace(value)
@@ -655,28 +773,59 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	response, err := p.client.Do(upstreamRequest)
 	if err != nil {
-		providerproxy.WriteError(w, http.StatusBadGateway, "provider upstream request failed")
+		session.recordInferenceResponse(authorization.promptID, requestClass, http.StatusBadGateway, providerUpstreamTransportFailure)
+		providerproxy.WriteError(w, http.StatusBadGateway, providerUpstreamTransportFailure)
 		return
 	}
 	defer response.Body.Close() //nolint:errcheck
+	p.relayUpstreamResponse(w, session, authorization.promptID, requestClass, response)
+}
+
+// relayUpstreamResponse forwards an upstream response to the ACP child and
+// accounts the inference outcome for the owning prompt. Successful responses
+// stream through untouched; error responses have a bounded prefix probed for
+// a detail message before the identical bytes are relayed.
+func (p *providerProxy) relayUpstreamResponse(
+	w http.ResponseWriter,
+	session *providerProxySession,
+	promptID string,
+	requestClass providerRequestClass,
+	response *http.Response,
+) {
+	rejectUpstream := func(message string) {
+		session.recordInferenceResponse(promptID, requestClass, http.StatusBadGateway, message)
+		providerproxy.WriteError(w, http.StatusBadGateway, message)
+	}
 	if response.StatusCode >= http.StatusMultipleChoices && response.StatusCode < http.StatusBadRequest {
-		providerproxy.WriteError(w, http.StatusBadGateway, "provider upstream redirects are forbidden")
+		rejectUpstream("provider upstream redirects are forbidden")
 		return
 	}
 	if providerproxy.HasDisallowedContentEncoding(response.Header) {
-		providerproxy.WriteError(w, http.StatusBadGateway, "compressed provider responses are forbidden")
+		rejectUpstream("compressed provider responses are forbidden")
 		return
 	}
 	if response.ContentLength > p.maxResponseBytes {
-		providerproxy.WriteError(w, http.StatusBadGateway, "provider upstream response exceeds limit")
+		rejectUpstream("provider upstream response exceeds limit")
 		return
 	}
+	var body io.Reader = response.Body
+	detail := ""
+	if response.StatusCode >= http.StatusBadRequest {
+		prefix, readErr := io.ReadAll(io.LimitReader(response.Body, providerUpstreamDetailProbeBytes))
+		detail = providerUpstreamErrorDetail(prefix)
+		if readErr != nil {
+			body = io.MultiReader(bytes.NewReader(prefix), errorTailReader{err: readErr})
+		} else {
+			body = io.MultiReader(bytes.NewReader(prefix), response.Body)
+		}
+	}
+	session.recordInferenceResponse(promptID, requestClass, response.StatusCode, detail)
 	providerproxy.CopyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
 	// Flushing after every chunk keeps streamed provider responses (SSE)
 	// flowing to the ACP child without buffering delays.
 	flusher, _ := w.(http.Flusher)
-	if err := providerproxy.StreamBoundedResponse(w, response.Body, p.maxResponseBytes, flusher); err != nil {
+	if err := providerproxy.StreamBoundedResponse(w, body, p.maxResponseBytes, flusher); err != nil {
 		panic(http.ErrAbortHandler)
 	}
 }

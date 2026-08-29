@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -878,6 +879,119 @@ func TestProviderProxyMaxTurnsMapsToTerminalFailure(t *testing.T) {
 		prompt.settlement.StopReason != harnessv2.ACPStopReasonMaxTurnRequests {
 		t.Fatalf("turn-limit settlement = state=%s settlement=%#v", state.descriptor.State, prompt.settlement)
 	}
+}
+
+type upstreamFailureFixture struct {
+	server   *Server
+	state    *sessionState
+	prompt   *promptState
+	proxy    *providerProxySession
+	promptID string
+	now      time.Time
+}
+
+func newUpstreamFailureFixture(t *testing.T) upstreamFailureFixture {
+	t.Helper()
+	server, cfg, _ := newTestServer(t, "immediate")
+	fence := cfg.Fence
+	fence.RuntimeSessionUID = "upstream-failure-session-uid"
+	fence.RuntimeSessionGeneration = 1
+	prompt := &promptState{request: testStartPromptRequest(t, cfg, fence)}
+	prompt.assistant.WriteString("unexpected status 402 Payment Required: You have exceeded your monthly quota")
+	promptID := string(prompt.request.Metadata.PromptID)
+	now := time.Now().UTC()
+	proxy := &providerProxySession{}
+	if err := proxy.activateWithMaxTurns(promptID, 5, now.Add(time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(proxy.close)
+	state := &sessionState{
+		descriptor: harnessv2.RuntimeSessionDescriptor{
+			RuntimeSessionUID: fence.RuntimeSessionUID,
+			Generation:        fence.RuntimeSessionGeneration,
+		},
+		operations:    make(map[harnessv2.OperationID]harnessv2.OperationRecord),
+		permissions:   make(map[harnessv2.PermissionRequestID]permissionState),
+		providerProxy: proxy,
+	}
+	return upstreamFailureFixture{server: server, state: state, prompt: prompt, proxy: proxy, promptID: promptID, now: now}
+}
+
+func (f upstreamFailureFixture) recordInference(t *testing.T, status int, detail string) {
+	t.Helper()
+	if err := f.proxy.consumeInferenceRequest(f.promptID, providerRequestInference, f.now); err != nil {
+		t.Fatal(err)
+	}
+	f.proxy.recordInferenceResponse(f.promptID, providerRequestInference, status, detail)
+}
+
+func (f upstreamFailureFixture) settleCompleted(t *testing.T) (harnessv2.Event, acp.PromptResult) {
+	t.Helper()
+	f.proxy.deactivate(f.promptID)
+	terminal, settledResult, err := f.server.terminalEvent(f.state, f.prompt, acp.PromptResult{
+		Outcome: acp.PromptOutcomeCompleted, StopReason: acp.StopReasonEndTurn,
+		Accepted: true, SettledAt: f.now,
+	})
+	if err != nil {
+		t.Fatalf("build terminal event: %v", err)
+	}
+	return terminal, settledResult
+}
+
+func TestProviderUpstreamFailureOnlyMapsToTerminalFailure(t *testing.T) {
+	fixture := newUpstreamFailureFixture(t)
+	for range 2 {
+		fixture.recordInference(
+			t, http.StatusPaymentRequired,
+			"You have exceeded your monthly quota\n token=/_orka/provider/secret-route",
+		)
+	}
+
+	terminal, settledResult := fixture.settleCompleted(t)
+	wantMessage := "provider upstream returned HTTP 402 for every inference request: You have exceeded your monthly quota"
+	if terminal.Type != harnessv2.EventFailed || terminal.Failed == nil ||
+		terminal.Failed.StopReason != harnessv2.ACPStopReasonRefusal ||
+		terminal.Failed.Code != "provider_upstream_error" || terminal.Failed.Retryable ||
+		terminal.Failed.Message != wantMessage {
+		t.Fatalf("upstream-failure terminal event = %#v", terminal.Failed)
+	}
+	if len(terminal.Failed.Message) > 512 || strings.Contains(terminal.Failed.Message, providerProxyPathPrefix) {
+		t.Fatalf("upstream-failure message is unbounded or leaks route: %q", terminal.Failed.Message)
+	}
+	upstreamErr, ok := errors.AsType[*providerUpstreamFailureError](settledResult.Err)
+	if settledResult.Outcome != acp.PromptOutcomeFailed || settledResult.StopReason != acp.StopReasonRefusal ||
+		!settledResult.Accepted || !ok || upstreamErr.Status != http.StatusPaymentRequired {
+		t.Fatalf("upstream-failure settled result = %#v", settledResult)
+	}
+
+	fixture.server.finishPrompt(fixture.state, fixture.prompt, settledResult, terminal.Identity.Timestamp)
+	if fixture.prompt.settlement == nil || fixture.prompt.settlement.TerminalEvent != harnessv2.EventFailed ||
+		fixture.prompt.settlement.StopReason != harnessv2.ACPStopReasonRefusal {
+		t.Fatalf("upstream-failure settlement = state=%s settlement=%#v", fixture.state.descriptor.State, fixture.prompt.settlement)
+	}
+}
+
+func TestProviderUpstreamSuccessKeepsPromptCompleted(t *testing.T) {
+	t.Run("one success among failures", func(t *testing.T) {
+		fixture := newUpstreamFailureFixture(t)
+		for _, status := range []int{http.StatusPaymentRequired, http.StatusOK, http.StatusPaymentRequired} {
+			fixture.recordInference(t, status, "detail")
+		}
+		terminal, settledResult := fixture.settleCompleted(t)
+		if terminal.Type != harnessv2.EventCompleted || terminal.Completed == nil ||
+			settledResult.Outcome != acp.PromptOutcomeCompleted || settledResult.Err != nil {
+			t.Fatalf("mixed-outcome terminal event = %#v result=%#v", terminal, settledResult)
+		}
+	})
+
+	t.Run("no inference requests", func(t *testing.T) {
+		fixture := newUpstreamFailureFixture(t)
+		fixture.proxy.recordInferenceResponse(fixture.promptID, providerRequestMetadata, http.StatusPaymentRequired, "detail")
+		terminal, settledResult := fixture.settleCompleted(t)
+		if terminal.Type != harnessv2.EventCompleted || settledResult.Outcome != acp.PromptOutcomeCompleted {
+			t.Fatalf("metadata-only terminal event = %#v result=%#v", terminal, settledResult)
+		}
+	})
 }
 
 func TestTerminalResultLimitIncludesFullSerializedEvent(t *testing.T) {

@@ -8,12 +8,12 @@ spec:
     name: claude-runtime-credentials
   runtime:
     type: claude
+    contractVersion: orka.harness.v2
     defaultMaxTurns: 50
     defaultAllowedTools:
       - Read
       - Glob
       - Grep
-      - LS
   systemPrompt:
     inline: |
       Research and plan GitHub issues for Orka RepositoryMonitor. Do not mutate GitHub.

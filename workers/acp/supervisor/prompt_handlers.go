@@ -1897,6 +1897,7 @@ func (s *Server) terminalEvent(
 		effective = promptResultFromSettlement(*prompt.settlement)
 	} else {
 		effective = providerTurnLimitResult(state, prompt, effective)
+		effective = providerUpstreamFailureResult(state, prompt, effective)
 	}
 	now := effective.SettledAt
 	if now.IsZero() {
@@ -1967,6 +1968,9 @@ func (s *Server) buildTerminalEventLocked(
 		if result.StopReason == acp.StopReasonMaxTurnRequests {
 			code = "turn_limit"
 			message = "ACP prompt exceeded maximum provider inference requests"
+		} else if upstreamFailure, ok := errors.AsType[*providerUpstreamFailureError](result.Err); ok {
+			code = "provider_upstream_error"
+			message = promptStreamErrorDetail(upstreamFailure)
 		}
 		event.Failed = &harnessv2.FailedEvent{
 			StopReason: harnessv2.ACPStopReason(result.StopReason),
@@ -2013,6 +2017,45 @@ func providerTurnLimitResult(state *sessionState, prompt *promptState, result ac
 	result.Outcome = acp.PromptOutcomeFailed
 	result.StopReason = acp.StopReasonMaxTurnRequests
 	result.Accepted = true
+	return result
+}
+
+// providerUpstreamFailureError records that every provider inference request
+// made during a prompt failed upstream, even though the ACP agent reported the
+// provider error as ordinary assistant text and ended its turn.
+type providerUpstreamFailureError struct {
+	Status int
+	Detail string
+}
+
+func (e providerUpstreamFailureError) Error() string {
+	message := fmt.Sprintf("provider upstream returned HTTP %d for every inference request", e.Status)
+	if detail := sanitizeProviderUpstreamDetail(e.Detail); detail != "" {
+		message += ": " + detail
+	}
+	return message
+}
+
+// providerUpstreamFailureResult converts a Completed prompt whose inference
+// requests all failed upstream into a Failed settlement so a provider quota or
+// outage never surfaces as a successful Task result.
+func providerUpstreamFailureResult(state *sessionState, prompt *promptState, result acp.PromptResult) acp.PromptResult {
+	if state == nil || prompt == nil || state.providerProxy == nil || result.Outcome != acp.PromptOutcomeCompleted {
+		return result
+	}
+	promptID := string(prompt.request.Metadata.PromptID)
+	failed, status, detail := state.providerProxy.upstreamFailureOnly(promptID)
+	if !failed {
+		return result
+	}
+	slog.Error(
+		"ACP prompt settled as failed: every provider inference request failed upstream",
+		"promptID", promptID, "upstreamStatus", status,
+	)
+	result.Outcome = acp.PromptOutcomeFailed
+	result.StopReason = acp.StopReasonRefusal
+	result.Accepted = true
+	result.Err = &providerUpstreamFailureError{Status: status, Detail: detail}
 	return result
 }
 

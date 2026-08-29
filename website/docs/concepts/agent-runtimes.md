@@ -141,6 +141,7 @@ metadata:
 spec:
   runtime:
     type: codex
+    contractVersion: orka.harness.v2
     defaultMaxTurns: 20
     defaultAllowBash: true
     defaultAllowedTools:

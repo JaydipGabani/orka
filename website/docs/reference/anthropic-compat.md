@@ -72,7 +72,7 @@ kubectl create serviceaccount orka-client
 
 # Bind it to the orka viewer role (or a custom role)
 kubectl create clusterrolebinding orka-client-binding \
-  --clusterrole=orka-task-viewer \
+  --clusterrole=orka-task-viewer-role \
   --serviceaccount=default:orka-client
 
 # Get a token

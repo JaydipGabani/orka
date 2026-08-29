@@ -4904,19 +4904,99 @@ func (d *ACPDispatcher) finishNonSuccessWithCancellationReason(
 		}
 		return d.failTask(ctx, task, corev1alpha1.TaskExecutionStateOutcomeUnknown, corev1alpha1.TaskExecutionOutcomeOutcomeUnknown, "RuntimeLost", "prompt outcome is unknown")
 	default:
-		if err := d.transitionAttemptToTerminal(ctx, attemptID, fence, store.PromptExecutionFailed, "failed"); err != nil {
+		message := acpPromptFailureMessage(terminal)
+		if err := d.transitionAttemptToFailed(ctx, attemptID, fence, "failed", acpPromptFailedReason, message); err != nil {
 			return err
 		}
 		execution := corev1alpha1.TaskExecutionStatus{
 			State: corev1alpha1.TaskExecutionStateFailed, Outcome: corev1alpha1.TaskExecutionOutcomeFailed,
 			Attempt: task.Status.Execution.Attempt, PromptID: task.Status.Execution.PromptID,
-			Reason: "PromptFailed", Message: "prompt failed",
+			Reason: acpPromptFailedReason, Message: message,
 		}
-		if err := d.finalizeTaskSessionMarker(ctx, task, fence, session, "Failed", "prompt failed", corev1alpha1.TaskPhaseFailed, execution); err != nil {
+		if err := d.finalizeTaskSessionMarker(ctx, task, fence, session, "Failed", message, corev1alpha1.TaskPhaseFailed, execution); err != nil {
 			return err
 		}
-		return d.failTask(ctx, task, corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed, "PromptFailed", "prompt failed")
+		return d.failTask(ctx, task, corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed, acpPromptFailedReason, message)
 	}
+}
+
+// acpPromptFailedReason classifies a prompt that the runtime settled as
+// failed; the message carries the runtime's bounded failure code and detail.
+const acpPromptFailedReason corev1alpha1.TaskExecutionReason = "PromptFailed"
+
+// acpPromptFailureMessageLimit bounds the projected Task failure message so a
+// runtime-supplied detail can never bloat Task status.
+const acpPromptFailureMessageLimit = 512
+
+// acpPromptFailureMessage projects the runtime's terminal Failed event into a
+// human-readable Task message. The generic "prompt failed" text is kept when
+// the runtime reported no code or detail; otherwise the runtime's bounded
+// failure code and message are appended so operators can distinguish provider
+// upstream errors, turn limits, and refusals without reading runtime logs.
+func acpPromptFailureMessage(terminal harnessv2.Event) string {
+	const generic = "prompt failed"
+	if terminal.Failed == nil {
+		return generic
+	}
+	detail := strings.TrimSpace(terminal.Failed.Message)
+	code := strings.TrimSpace(terminal.Failed.Code)
+	switch {
+	case detail == "" && code == "":
+		return generic
+	case detail == "":
+		detail = code
+	case code != "" && code != "acp_prompt_failed" && !strings.HasPrefix(detail, code):
+		detail = code + ": " + detail
+	}
+	message := generic + ": " + detail
+	if len(message) > acpPromptFailureMessageLimit {
+		message = message[:acpPromptFailureMessageLimit]
+	}
+	return message
+}
+
+// transitionAttemptToFailed mirrors transitionAttemptToCancelled for the
+// Failed terminal state so the durable PromptAttempt records the same reason
+// and message that the Task projection exposes; controller-restart recovery
+// then reproduces that classification instead of the generic default.
+func (d *ACPDispatcher) transitionAttemptToFailed(
+	ctx context.Context,
+	id string,
+	fence store.ControllerEpochFence,
+	operation string,
+	reason corev1alpha1.TaskExecutionReason,
+	message string,
+) error {
+	if strings.TrimSpace(string(reason)) == "" || strings.TrimSpace(message) == "" {
+		return errors.New("terminal attempt classification requires a reason and message")
+	}
+	attempt, err := d.Store.GetPromptAttempt(ctx, id)
+	if err != nil {
+		return err
+	}
+	target := store.PromptExecutionFailed
+	if attempt.ExecutionState == target {
+		if attempt.TerminalReason != string(reason) || attempt.OutcomeMarker != message {
+			return fmt.Errorf("%w: prompt attempt %s terminal classification does not match", store.ErrConflict, id)
+		}
+		return nil
+	}
+	if err := store.ValidatePromptExecutionTransition(attempt.ExecutionState, target); err != nil {
+		return err
+	}
+	digest, err := acpDomainDigest("attempt-transition", map[string]any{
+		"id": id, "from": attempt.ExecutionState, "to": target, "operation": operation,
+		"version": attempt.Version, "terminalReason": reason, "outcomeMarker": message,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.Store.TransitionPromptAttemptExecution(ctx, store.PromptAttemptExecutionTransition{
+		ID: id, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState, NewState: target,
+		OperationID: operation + "-" + strconv.FormatInt(attempt.Version, 10), OperationDigest: digest,
+		TerminalReason: string(reason), OutcomeMarker: message, UpdatedAt: time.Now().UTC(),
+	})
+	return err
 }
 
 func (d *ACPDispatcher) transitionAttemptToTerminal(ctx context.Context, id string, fence store.ControllerEpochFence, target store.PromptExecutionState, operation string) error {

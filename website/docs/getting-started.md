@@ -269,6 +269,7 @@ spec:
     name: claude-sonnet-4-20250514
   runtime:
     type: claude
+    contractVersion: orka.harness.v2
     defaultMaxTurns: 50
     defaultAllowBash: true
     defaultAllowedTools:

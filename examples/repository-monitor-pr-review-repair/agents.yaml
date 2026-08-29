@@ -8,12 +8,12 @@ spec:
     name: claude-runtime-credentials
   runtime:
     type: claude
+    contractVersion: orka.harness.v2
     defaultMaxTurns: 50
     defaultAllowedTools:
       - Read
       - Glob
       - Grep
-      - LS
   systemPrompt:
     inline: |
       Review exact pull request heads and return only Orka's structured review JSON.
@@ -28,6 +28,7 @@ spec:
     name: codex-runtime-credentials
   runtime:
     type: codex
+    contractVersion: orka.harness.v2
     defaultMaxTurns: 100
     defaultAllowedTools:
       - Read
