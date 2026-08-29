@@ -41,6 +41,8 @@ beforeEach(() => {
     messages: [],
     currentSessionId: null,
     isStreaming: false,
+    provider: '',
+    model: '',
   })
 })
 
@@ -446,6 +448,58 @@ describe('useSendMessage', () => {
     const assistantMsg = useChatStore.getState().messages.find((m) => m.role === 'assistant')
     expect(assistantMsg).toBeUndefined()
     expect(useChatStore.getState().isStreaming).toBe(false)
+  })
+
+  it('renders the API error envelope as a readable message, not raw JSON', async () => {
+    fetchSpy.mockImplementation((input, init) => {
+      const url = typeof input === 'string' ? input : (input as Request).url
+      if (url.endsWith('/chat') && init?.method === 'POST') {
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { code: 500, message: 'no provider "" found and no \'default\' Provider CRD exists' } }),
+          { status: 500 },
+        ))
+      }
+      return originalFetch(input as RequestInfo, init)
+    })
+
+    const { result } = renderHook(() => useSendMessage(), { wrapper: createWrapper() })
+    await act(async () => {
+      await result.current('test')
+    })
+
+    const errorMsg = useChatStore.getState().messages.find((m) => m.role === 'error')
+    expect(errorMsg!.content).toBe('Error 500: no provider "" found and no \'default\' Provider CRD exists')
+  })
+
+  it('sends provider and model from the chat store, omitting them when unset', async () => {
+    const bodies: any[] = []
+    fetchSpy.mockImplementation((input, init) => {
+      const url = typeof input === 'string' ? input : (input as Request).url
+      if (url.endsWith('/chat') && init?.method === 'POST') {
+        bodies.push(JSON.parse(init?.body as string))
+        return Promise.resolve(createSSEResponse([
+          { event: 'message', data: JSON.stringify({ content: 'reply' }) },
+        ]))
+      }
+      return originalFetch(input as RequestInfo, init)
+    })
+
+    const { result, rerender } = renderHook(() => useSendMessage(), { wrapper: createWrapper() })
+    await act(async () => {
+      await result.current('no picker')
+    })
+    expect(bodies[0].provider).toBeUndefined()
+    expect(bodies[0].model).toBeUndefined()
+
+    act(() => {
+      useChatStore.getState().setProvider('anthropic')
+      useChatStore.getState().setModel(' claude-sonnet-4-20250514 ')
+    })
+    rerender()
+    await act(async () => {
+      await result.current('with picker')
+    })
+    expect(bodies[1]).toMatchObject({ provider: 'anthropic', model: 'claude-sonnet-4-20250514' })
   })
 
   it('includes sessionId in request body when currentSessionId is set', async () => {

@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { useCallback } from 'react'
-import { api } from '@/lib/api-client'
+import { api, apiErrorMessage } from '@/lib/api-client'
 import { API_BASE_URL } from '@/lib/constants'
 import { useAuthStore } from '@/stores/auth'
 import { useUIStore } from '@/stores/ui'
@@ -51,6 +51,8 @@ export function useSendMessage() {
   const namespace = useUIStore((s) => s.namespace)
   const {
     currentSessionId,
+    provider,
+    model,
     addMessage,
     setSessionId,
     setStreaming,
@@ -176,6 +178,8 @@ export function useSendMessage() {
       if (currentSessionId) {
         body.sessionId = currentSessionId
       }
+      if (provider) body.provider = provider
+      if (model.trim()) body.model = model.trim()
 
       try {
         const response = await fetch(`${API_BASE_URL}/chat`, {
@@ -192,7 +196,7 @@ export function useSendMessage() {
           addMessage({
             id: generateMessageId(),
             role: 'error',
-            content: `Error ${response.status}: ${errText}`,
+            content: `Error ${response.status}: ${apiErrorMessage(errText)}`,
             timestamp: new Date().toISOString(),
           })
           setStreaming(false)
@@ -259,6 +263,6 @@ export function useSendMessage() {
         setStreaming(false)
       }
     },
-    [token, namespace, currentSessionId, addMessage, setSessionId, setStreaming, setUsageOnLastAssistant],
+    [token, namespace, currentSessionId, provider, model, addMessage, setSessionId, setStreaming, setUsageOnLastAssistant],
   )
 }

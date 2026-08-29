@@ -23,7 +23,7 @@ import { TaskExecutionRouteLedger } from '@/components/execution/execution-route
 import { useTask, useDeleteTask, useTaskEvents } from '@/hooks/use-tasks'
 import { useTaskTrace, useTaskApprovals } from '@/hooks/use-execution-events'
 import { useTaskArtifacts } from '@/hooks/use-task-artifacts'
-import { ApiError } from '@/lib/api-client'
+import { ApiError, isNotFoundError } from '@/lib/api-client'
 import { useNavigate, useSearch } from '@tanstack/react-router'
 import type { ExecutionEvent, PlanState } from '@/schemas/task'
 
@@ -61,11 +61,15 @@ function latestEventPlan(events: ExecutionEvent[]): PlanState | undefined {
 
 export function TaskDetail({ taskId }: { taskId: string }) {
   const [following, setFollowing] = useState(true)
-  const { data: task, isLoading } = useTask(taskId, following ? 5000 : false)
+  const { data: task, isLoading, error: taskError } = useTask(taskId, following ? 5000 : false)
+  // Once the primary task query 404s, every dependent query (events, trace,
+  // approvals, artifacts) is disabled so a missing task stops polling entirely.
+  const taskMissing = isNotFoundError(taskError)
   const { data: taskEventsResponse, error: taskEventsError, failureReason: taskEventsFailureReason } = useTaskEvents(
     taskId,
     following ? 5000 : false,
     task?.metadata.uid,
+    !taskMissing,
   )
   // Fork and the runtime timeline need execution-event storage; a 501 means it's off.
   // While retries are pending, failureReason carries the current fetch failure.
@@ -103,7 +107,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
   const deleteArmed = confirmDelete === deleteIdentity
   // Runtime-tab data: fetched only when that tab is active so other tabs don't
   // pay for trace/approvals/artifacts. Each hook is namespace+uid scoped.
-  const runtimeActive = activeTab === 'runtime'
+  const runtimeActive = activeTab === 'runtime' && !taskMissing
   const taskRunning = task?.status?.phase === 'Running'
   const taskTerminal = ['Succeeded', 'Failed', 'Cancelled'].includes(task?.status?.phase ?? '')
   const traceRefetchInterval = runtimeActive && taskRunning && following ? 5000 : false
@@ -161,8 +165,8 @@ export function TaskDetail({ taskId }: { taskId: string }) {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-4">
           <Link to="/tasks">
             <Button variant="ghost" size="icon" aria-label="Back to tasks">
               <ArrowLeft className="h-4 w-4" />
@@ -203,6 +207,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
       <TaskExecutionRouteLedger task={task} />
 
       <Tabs value={activeTab} onValueChange={setTab}>
+        <div className="overflow-x-auto">
         <TabsList>
           <TabsTrigger value="runtime">Runtime</TabsTrigger>
           <TabsTrigger value="overview">Overview</TabsTrigger>
@@ -219,6 +224,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
             <TabsTrigger value="children">Children</TabsTrigger>
           )}
         </TabsList>
+        </div>
 
         <TabsContent value="runtime" className="space-y-4">
           <TaskRuntimeView
@@ -245,7 +251,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
             <CardContent className="grid gap-2 text-sm md:grid-cols-2">
               <div>
                 <span className="text-muted-foreground">UID:</span>{' '}
-                <span className="font-mono text-xs">{task.metadata.uid}</span>
+                <span className="font-mono text-xs break-all">{task.metadata.uid}</span>
               </div>
               <div>
                 <span className="text-muted-foreground">Created:</span>{' '}
@@ -264,7 +270,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
               {task.status?.jobName && (
                 <div>
                   <span className="text-muted-foreground">Job:</span>{' '}
-                  <span className="font-mono text-xs">
+                  <span className="font-mono text-xs break-all">
                     {task.status.jobName}
                   </span>
                 </div>
@@ -286,7 +292,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
                 </div>
               )}
               {task.status?.message && (
-                <div className="md:col-span-2">
+                <div className="md:col-span-2 break-words">
                   <span className="text-muted-foreground">Message:</span>{' '}
                   {task.status.message}
                 </div>
@@ -352,7 +358,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
                 {task.spec.ai.prompt && (
                   <div>
                     <span className="text-muted-foreground">Prompt:</span>
-                    <pre className="mt-1 rounded-md bg-muted p-3 whitespace-pre-wrap">
+                    <pre className="mt-1 overflow-x-auto rounded-md bg-muted p-3 whitespace-pre-wrap break-words">
                       {task.spec.ai.prompt}
                     </pre>
                   </div>
@@ -374,7 +380,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
                 {task.spec.prompt && (
                   <div>
                     <span className="text-muted-foreground">Prompt:</span>
-                    <pre className="mt-1 rounded-md bg-muted p-3 whitespace-pre-wrap">
+                    <pre className="mt-1 overflow-x-auto rounded-md bg-muted p-3 whitespace-pre-wrap break-words">
                       {task.spec.prompt}
                     </pre>
                   </div>
@@ -454,7 +460,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
                       <p className="mb-1 text-xs font-medium text-muted-foreground">
                         Plan document
                       </p>
-                      <pre className="rounded-md bg-muted p-4 whitespace-pre-wrap max-h-[600px] overflow-y-auto text-xs">
+                      <pre className="rounded-md bg-muted p-4 whitespace-pre-wrap break-words max-h-[600px] overflow-auto text-xs">
                         {plan.planDocument}
                       </pre>
                     </div>

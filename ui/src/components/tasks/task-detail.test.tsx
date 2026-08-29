@@ -45,6 +45,51 @@ describe('TaskDetail', () => {
     expect(skeletons.length).toBeGreaterThan(0)
   })
 
+  it('stops polling the task and its dependent endpoints once the task 404s', async () => {
+    mockSearch.current = { tab: 'runtime' }
+    const hits: Record<string, number> = {}
+    const count = (key: string) => {
+      hits[key] = (hits[key] ?? 0) + 1
+    }
+    server.use(
+      http.get('/api/v1/tasks/:id', () => {
+        count('task')
+        return HttpResponse.json({ error: { code: 404, message: 'task not found' } }, { status: 404 })
+      }),
+      http.get('/api/v1/tasks/:id/events', () => {
+        count('events')
+        return HttpResponse.json({ error: { code: 404, message: 'task not found' } }, { status: 404 })
+      }),
+      http.get('/api/v1/tasks/:id/trace', () => {
+        count('trace')
+        return HttpResponse.json({ error: { code: 404, message: 'task not found' } }, { status: 404 })
+      }),
+      http.get('/api/v1/tasks/:id/approvals', () => {
+        count('approvals')
+        return HttpResponse.json({ error: { code: 404, message: 'task not found' } }, { status: 404 })
+      }),
+      http.get('/api/v1/tasks/:id/artifacts', () => {
+        count('artifacts')
+        return HttpResponse.json({ error: { code: 404, message: 'task not found' } }, { status: 404 })
+      }),
+    )
+    render(<TaskDetail taskId="nonexistent" />)
+    await waitFor(() => {
+      expect(screen.getByText('Task not found')).toBeInTheDocument()
+    })
+    // Let the trace hook's single 100ms retry settle, then confirm nothing
+    // else fires: no 5s polling, no dependent refetches.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const snapshot = { ...hits }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(hits).toEqual(snapshot)
+    expect(hits.task).toBe(1)
+    expect(hits.events ?? 0).toBeLessThanOrEqual(1)
+    expect(hits.trace ?? 0).toBeLessThanOrEqual(2)
+    expect(hits.approvals ?? 0).toBeLessThanOrEqual(1)
+    expect(hits.artifacts ?? 0).toBeLessThanOrEqual(1)
+  })
+
   it('shows not-found when task does not exist', async () => {
     server.use(
       http.get('/api/v1/tasks/:id', () => new HttpResponse(null, { status: 404 })),

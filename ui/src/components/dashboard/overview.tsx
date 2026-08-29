@@ -2,6 +2,7 @@ import { useTaskList } from '@/hooks/use-tasks'
 import { useSessionList } from '@/hooks/use-sessions'
 import { useAgentList } from '@/hooks/use-agents'
 import { useToolList } from '@/hooks/use-tools'
+import { isForbiddenError } from '@/lib/api-client'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { PageHeader } from '@/components/layout/page-header'
 import { Distribution } from '@/components/ui/distribution'
@@ -16,7 +17,7 @@ const PHASES = taskPhaseSchema.options
 
 export function Overview() {
   const { data: tasksData, isLoading: tasksLoading } = useTaskList('100')
-  const { data: sessionsData, isLoading: sessionsLoading } = useSessionList('100')
+  const { data: sessionsData, isLoading: sessionsLoading, error: sessionsError } = useSessionList('100')
   const { data: agentsData, isLoading: agentsLoading } = useAgentList()
   const { data: toolsData, isLoading: toolsLoading } = useToolList()
 
@@ -34,6 +35,7 @@ export function Overview() {
       <StatsCards
         tasks={tasksData?.items}
         sessionCount={sessionsData?.items?.length}
+        sessionsForbiddenMessage={isForbiddenError(sessionsError) ? sessionsError.message : undefined}
         agentCount={agentsData?.items?.length}
         toolCount={toolsData?.items?.length}
         isLoading={isLoading}

@@ -16,6 +16,17 @@ describe('useChatStore', () => {
     useChatStore.setState({ messages: [], currentSessionId: null, isStreaming: false })
   })
 
+  it('setProvider and setModel persist the picker choice', () => {
+    useChatStore.setState({ provider: '', model: '' })
+    useChatStore.getState().setProvider('anthropic')
+    useChatStore.getState().setModel('claude-sonnet-4-20250514')
+    expect(useChatStore.getState().provider).toBe('anthropic')
+    expect(useChatStore.getState().model).toBe('claude-sonnet-4-20250514')
+    // A new session keeps the picker choice.
+    useChatStore.getState().newSession()
+    expect(useChatStore.getState().provider).toBe('anthropic')
+  })
+
   it('has correct initial state', () => {
     const state = useChatStore.getState()
     expect(state.messages).toEqual([])

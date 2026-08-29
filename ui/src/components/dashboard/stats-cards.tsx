@@ -9,6 +9,8 @@ import { cn } from '@/lib/utils'
 interface StatsCardsProps {
   tasks?: Task[]
   sessionCount?: number
+  /** Set when the sessions list failed with 403; the card shows this instead of "0". */
+  sessionsForbiddenMessage?: string
   agentCount?: number
   toolCount?: number
   isLoading?: boolean
@@ -55,7 +57,7 @@ function taskWindow(tasks: Task[]): { min: number; max: number } | null {
   return { min: Math.min(...times), max: Math.max(...times) }
 }
 
-export function StatsCards({ tasks, sessionCount, agentCount, toolCount, isLoading }: StatsCardsProps) {
+export function StatsCards({ tasks, sessionCount, sessionsForbiddenMessage, agentCount, toolCount, isLoading }: StatsCardsProps) {
   if (isLoading) {
     return (
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
@@ -132,7 +134,16 @@ export function StatsCards({ tasks, sessionCount, agentCount, toolCount, isLoadi
           <MessageSquare className="h-4 w-4 text-muted-foreground" />
         </CardHeader>
         <CardContent>
-          <div className="text-2xl font-bold tabular-nums">{sessionCount ?? 0}</div>
+          {sessionsForbiddenMessage ? (
+            <div className="space-y-0.5" role="alert">
+              <div className="text-sm font-medium">Not authorized</div>
+              <div className="text-xs text-muted-foreground">
+                Your token lacks <code>sessions</code> read permission ({sessionsForbiddenMessage}).
+              </div>
+            </div>
+          ) : (
+            <div className="text-2xl font-bold tabular-nums">{sessionCount ?? 0}</div>
+          )}
         </CardContent>
       </Card>
       <Card>

@@ -47,6 +47,14 @@ describe('StatsCards', () => {
     expect(screen.getByText('4')).toBeInTheDocument()
   })
 
+  it('shows a not-authorized message on the Sessions card instead of 0', () => {
+    render(<StatsCards tasks={[]} sessionsForbiddenMessage="not authorized" agentCount={1} toolCount={2} />)
+    expect(screen.getByText('Not authorized')).toBeInTheDocument()
+    expect(screen.getByText(/read permission \(not authorized\)/)).toBeInTheDocument()
+    // total, running, succeeded, failed — the Sessions card no longer renders a 0
+    expect(screen.getAllByText('0').length).toBe(4)
+  })
+
   it('zero counts when no data', () => {
     render(<StatsCards />)
     expect(screen.getByText('Total Tasks')).toBeInTheDocument()

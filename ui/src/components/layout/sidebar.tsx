@@ -1,8 +1,10 @@
+import { useEffect } from 'react'
 import { Link, useLocation } from '@tanstack/react-router'
 import { LayoutDashboard, ListTodo, MessageSquare, Bot, Wrench, Sparkles, Columns3, Activity, Shield, Radar, Boxes, RadioTower, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import { useUIStore } from '@/stores/ui'
+import { useIsMobile } from '@/hooks/use-media-query'
 import { Button } from '@/components/ui/button'
 import { OrcaMark } from '@/components/ui/orca-mark'
 
@@ -23,12 +25,31 @@ const navItems = [
 
 export function Sidebar() {
   const location = useLocation()
-  const { sidebarCollapsed, toggleSidebar } = useUIStore()
+  const { sidebarCollapsed, toggleSidebar, setSidebarCollapsed } = useUIStore()
+  const isMobile = useIsMobile()
+
+  // Below the md breakpoint the expanded sidebar would leave ~135px for content,
+  // so collapse it to the icon rail on entry; expanding it there overlays the
+  // page (see the max-md: classes) instead of squeezing it.
+  useEffect(() => {
+    if (isMobile) setSidebarCollapsed(true)
+  }, [isMobile, setSidebarCollapsed])
+
+  const overlayOpen = isMobile && !sidebarCollapsed
 
   return (
+    <>
+    {overlayOpen && (
+      <div
+        className="fixed inset-0 z-30 bg-black/40 md:hidden"
+        aria-hidden="true"
+        data-testid="sidebar-backdrop"
+        onClick={() => setSidebarCollapsed(true)}
+      />
+    )}
     <aside className={cn(
-      'flex flex-col border-r border-border bg-card/80 backdrop-blur-md transition-all duration-200',
-      sidebarCollapsed ? 'w-16' : 'w-64'
+      'flex shrink-0 flex-col border-r border-border bg-card/80 backdrop-blur-md transition-all duration-200',
+      sidebarCollapsed ? 'w-16' : 'w-64 max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:bg-card max-md:shadow-xl',
     )}>
       <div className="flex h-14 items-center border-b border-border px-4">
         {!sidebarCollapsed && (
@@ -59,6 +80,7 @@ export function Sidebar() {
               key={to}
               to={to}
               aria-current={isActive ? 'page' : undefined}
+              onClick={() => { if (overlayOpen) setSidebarCollapsed(true) }}
               className={cn(
                 'relative flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
                 // Refined active state: left accent bar + subtle tint + colored
@@ -76,5 +98,6 @@ export function Sidebar() {
         })}
       </nav>
     </aside>
+    </>
   )
 }

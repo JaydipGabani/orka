@@ -7,6 +7,7 @@ import { PageHeader } from '@/components/layout/page-header'
 import { TaskStatusBadge } from './task-status-badge'
 import { useTaskList, useDeleteTask } from '@/hooks/use-tasks'
 import type { Task } from '@/schemas/task'
+import { taskTypeLabel } from '@/lib/task-status'
 
 function timeAgo(ts?: string): string {
   if (!ts) return '-'
@@ -70,7 +71,7 @@ export function TaskList() {
                       {task.metadata.name}
                     </Link>
                   </TableCell>
-                  <TableCell className="capitalize">{task.spec.type}</TableCell>
+                  <TableCell>{taskTypeLabel(task.spec.type)}</TableCell>
                   <TableCell><TaskStatusBadge phase={task.status?.phase} /></TableCell>
                   <TableCell>{task.metadata.namespace}</TableCell>
                   <TableCell>{timeAgo(task.metadata.creationTimestamp)}</TableCell>

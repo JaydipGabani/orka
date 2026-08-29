@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ApiError, api } from '@/lib/api-client'
+import { ApiError, api, isNotFoundError } from '@/lib/api-client'
 import { useUIStore } from '@/stores/ui'
 import type { ExecutionEvent, Task, TaskEventsResponse } from '@/schemas/task'
 
@@ -48,7 +48,9 @@ export function useTask(id: string, refetchInterval: number | false = 5000) {
   return useQuery({
     queryKey: ['task', id, namespace],
     queryFn: () => api.get<Task>(`/tasks/${id}`, { namespace }),
-    refetchInterval,
+    // A deleted task stays deleted; retrying or polling a 404 only spams the API.
+    retry: (failureCount, error) => !isNotFoundError(error) && failureCount < 3,
+    refetchInterval: (query) => (isNotFoundError(query.state.error) ? false : refetchInterval),
   })
 }
 
@@ -160,6 +162,7 @@ export function useTaskEvents(
   id: string,
   refetchInterval: number | false = 5000,
   taskUID?: string,
+  enabled = true,
 ) {
   const queryClient = useQueryClient()
   const namespace = useUIStore((s) => s.namespace)
@@ -172,7 +175,7 @@ export function useTaskEvents(
         namespace,
         queryClient.getQueryData<TaskEventsResponse>(queryKey),
       ),
-    enabled: Boolean(id),
+    enabled: enabled && Boolean(id),
     retry: (failureCount, error) =>
       !(error instanceof ApiError && error.status === 501) && failureCount < 3,
     refetchInterval: (query) =>

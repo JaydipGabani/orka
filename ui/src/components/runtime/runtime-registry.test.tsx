@@ -139,6 +139,19 @@ describe('RuntimeRegistry', () => {
     )
   })
 
+  it('renders a readable not-authorized state for a 403 instead of raw JSON', async () => {
+    server.use(
+      http.get('/api/v1/runtime-pools', () =>
+        HttpResponse.json({ error: { code: 403, message: 'not authorized' } }, { status: 403 }),
+      ),
+    )
+    render(<RuntimeRegistry />)
+    await waitFor(() => expect(screen.getByText('Not authorized to view RuntimePool resources')).toBeInTheDocument())
+    expect(screen.getByText(/lacks read permission for RuntimePool resources \(not authorized\)/)).toBeInTheDocument()
+    expect(screen.queryByText(/"code":403/)).not.toBeInTheDocument()
+    expect(screen.queryByText('Could not load runtimepool')).not.toBeInTheDocument()
+  })
+
   it('renders pool admission, capacity, and profile identity', async () => {
     render(<RuntimeRegistry />)
     await waitFor(() => expect(screen.getByText('codex-read')).toBeInTheDocument())

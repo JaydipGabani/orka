@@ -6,6 +6,7 @@ interface UIState {
   theme: 'light' | 'dark'
   namespace: string
   toggleSidebar: () => void
+  setSidebarCollapsed: (collapsed: boolean) => void
   toggleTheme: () => void
   setNamespace: (namespace: string) => void
 }
@@ -17,6 +18,7 @@ export const useUIStore = create<UIState>()(
       theme: 'light',
       namespace: 'orka-system',
       toggleSidebar: () => set({ sidebarCollapsed: !get().sidebarCollapsed }),
+      setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
       toggleTheme: () => {
         const newTheme = get().theme === 'light' ? 'dark' : 'light'
         document.documentElement.classList.toggle('dark', newTheme === 'dark')

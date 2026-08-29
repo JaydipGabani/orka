@@ -38,6 +38,19 @@ describe('Overview', () => {
     expect(screen.getByText('Overview of your Orka workspace')).toBeInTheDocument()
   })
 
+  it('passes a 403 on the sessions list through to the Sessions stat card', async () => {
+    server.use(
+      http.get('/api/v1/sessions', () =>
+        HttpResponse.json({ error: { code: 403, message: 'not authorized' } }, { status: 403 }),
+      ),
+    )
+    render(<Overview />)
+    await waitFor(() => {
+      expect(screen.getByText('Not authorized')).toBeInTheDocument()
+    })
+    expect(screen.getByText(/read permission \(not authorized\)/)).toBeInTheDocument()
+  })
+
   it('includes Scheduled and Cancelled tasks in the phase distribution', async () => {
     const mk = (name: string, phase: string) => ({
       metadata: { name, namespace: 'default', uid: name, creationTimestamp: new Date().toISOString() },

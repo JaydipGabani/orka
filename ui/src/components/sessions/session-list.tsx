@@ -4,7 +4,8 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Badge } from '@/components/ui/badge'
 import { PageHeader } from '@/components/layout/page-header'
-import { Trash2 } from 'lucide-react'
+import { ShieldAlert, Trash2 } from 'lucide-react'
+import { isForbiddenError } from '@/lib/api-client'
 import { useSessionList, useDeleteSession } from '@/hooks/use-sessions'
 
 function timeAgo(ts?: string): string {
@@ -17,8 +18,10 @@ function timeAgo(ts?: string): string {
 }
 
 export function SessionList() {
-  const { data, isLoading } = useSessionList()
+  const { data, isLoading, error } = useSessionList()
   const deleteSession = useDeleteSession()
+  const forbidden = isForbiddenError(error)
+  const errorMessage = error instanceof Error ? error.message : undefined
 
   return (
     <div className="space-y-4">
@@ -45,6 +48,24 @@ export function SessionList() {
                   ))}
                 </TableRow>
               ))
+            ) : forbidden ? (
+              <TableRow>
+                <TableCell colSpan={7} className="py-8">
+                  <div role="alert" className="flex flex-col items-center gap-1 text-center">
+                    <ShieldAlert className="h-5 w-5 text-muted-foreground" aria-hidden="true" />
+                    <p className="text-sm font-medium">Not authorized to view sessions</p>
+                    <p className="text-sm text-muted-foreground">
+                      Your token lacks <code>sessions</code> read permission ({errorMessage}).
+                    </p>
+                  </div>
+                </TableCell>
+              </TableRow>
+            ) : error ? (
+              <TableRow>
+                <TableCell colSpan={7} className="py-8 text-center text-destructive" role="alert">
+                  Could not load sessions: {errorMessage}
+                </TableCell>
+              </TableRow>
             ) : (data?.items ?? []).length === 0 ? (
               <TableRow>
                 <TableCell colSpan={7} className="text-center text-muted-foreground py-8">

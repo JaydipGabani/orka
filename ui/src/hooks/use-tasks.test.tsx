@@ -89,6 +89,23 @@ describe('useTask', () => {
   })
 })
 
+describe('useTask on 404', () => {
+  it('stops polling and does not retry once the task is gone', async () => {
+    let calls = 0
+    server.use(http.get('/api/v1/tasks/gone-task', () => {
+      calls += 1
+      return HttpResponse.json({ error: { code: 404, message: 'task not found' } }, { status: 404 })
+    }))
+
+    const { result } = renderHook(() => useTask('gone-task', 20), { wrapper: createWrapper() })
+    await waitFor(() => expect(result.current.isError).toBe(true))
+    const seen = calls
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    expect(calls).toBe(seen)
+    expect(calls).toBe(1)
+  })
+})
+
 describe('useTaskResult', () => {
   it('starts disabled and returns result on refetch', async () => {
     const { result } = renderHook(() => useTaskResult('my-task'), { wrapper: createWrapper() })

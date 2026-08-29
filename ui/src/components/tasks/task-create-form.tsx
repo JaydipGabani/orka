@@ -24,6 +24,7 @@ import {
   workspaceSourceRefError,
 } from '@/lib/workspace-source-ref'
 import { builtInAgentRuntimeLabel } from '@/lib/agent-runtime'
+import { splitShellWords } from '@/lib/shell-words'
 
 function optionalRepositoryIdentity(provider: string, id: string) {
   return provider.trim() && id.trim() ? { provider: provider.trim(), id: id.trim() } : undefined
@@ -50,6 +51,8 @@ export function TaskCreateForm() {
   const [model, setModel] = useState('')
   const [prompt, setPrompt] = useState('')
   const [agentRef, setAgentRef] = useState('')
+  const [aiAgentRef, setAIAgentRef] = useState('')
+  const [showAIModelOverrides, setShowAIModelOverrides] = useState(false)
 
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [priority, setPriority] = useState('')
@@ -83,6 +86,21 @@ export function TaskCreateForm() {
     [agentsData],
   )
   const externalRuntimeAgentCount = (agentsData?.items.length ?? 0) - dispatchableAgents.length
+  // The inverse of dispatchableAgents: native AI-worker Agents carry their own
+  // provider/model configuration and never set spec.runtime.
+  const inlineAgents = useMemo(
+    () => (agentsData?.items ?? []).filter((agent) => !agent.spec.runtime),
+    [agentsData],
+  )
+  const runtimeAgentCount = (agentsData?.items.length ?? 0) - inlineAgents.length
+  const selectedAIAgent = useMemo(
+    () => inlineAgents.find((agent) => agent.metadata.name === aiAgentRef),
+    [aiAgentRef, inlineAgents],
+  )
+  // Tokenized as the user types so a dangling quote is flagged inline instead of
+  // after the Task has been created and failed in the container.
+  const parsedCommand = useMemo(() => splitShellWords(command), [command])
+  const commandError = 'error' in parsedCommand ? parsedCommand.error : undefined
   const selectedAgent = useMemo(
     () => dispatchableAgents.find((agent) => agent.metadata.name === agentRef),
     [agentRef, dispatchableAgents],
@@ -101,9 +119,27 @@ export function TaskCreateForm() {
 
     if (type === 'container') {
       body.image = image
-      if (command) body.command = command.split(' ')
+      if ('error' in parsedCommand) {
+        toast.error(`Command is invalid: ${parsedCommand.error}`)
+        return
+      }
+      if (parsedCommand.words.length > 0) body.command = parsedCommand.words
     } else if (type === 'ai') {
-      body.ai = { provider, model, prompt }
+      if (aiAgentRef) {
+        // The Agent supplies provider/model (and providerRef credentials);
+        // only send explicit overrides so the controller merges the rest.
+        body.agentRef = { name: aiAgentRef }
+        const ai: Record<string, unknown> = { prompt }
+        if (provider) ai.provider = provider
+        if (model.trim()) ai.model = model.trim()
+        body.ai = ai
+      } else {
+        if (!provider) {
+          toast.error('Select an Agent or a Provider for the AI task')
+          return
+        }
+        body.ai = { provider, model, prompt }
+      }
     } else if (type === 'agent') {
       body.agentRef = { name: agentRef }
       body.prompt = prompt
@@ -324,29 +360,98 @@ export function TaskCreateForm() {
                 </div>
                 <div className="space-y-2">
                   <label htmlFor="task-command" className="text-sm font-medium">Command</label>
-                  <Input id="task-command" value={command} onChange={(e) => setCommand(e.target.value)} placeholder="echo hello" />
+                  <Input
+                    id="task-command"
+                    value={command}
+                    onChange={(e) => setCommand(e.target.value)}
+                    placeholder="echo hello"
+                    aria-invalid={commandError ? true : undefined}
+                    aria-describedby="task-command-help"
+                  />
+                  {commandError ? (
+                    <p id="task-command-help" className="text-xs text-destructive" role="alert">{commandError}</p>
+                  ) : (
+                    <p id="task-command-help" className="text-xs text-muted-foreground">
+                      Split like a shell: quote arguments that contain spaces, e.g. <code>sh -c "echo hello world"</code> runs <code>["sh", "-c", "echo hello world"]</code>. Backslashes escape the next character.
+                    </p>
+                  )}
                 </div>
               </div>
             )}
 
             {type === 'ai' && (
               <div className="space-y-4">
-                <div className="grid gap-4 md:grid-cols-2">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">Provider</label>
-                    <Select value={provider} onValueChange={setProvider}>
-                      <SelectTrigger><SelectValue placeholder="Select provider" /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="anthropic">Anthropic</SelectItem>
-                        <SelectItem value="openai">OpenAI</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="space-y-2">
-                    <label htmlFor="task-model" className="text-sm font-medium">Model</label>
-                    <Input id="task-model" value={model} onChange={(e) => setModel(e.target.value)} placeholder="claude-sonnet-4-20250514" />
-                  </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Agent</label>
+                  <Select
+                    value={aiAgentRef || '__none__'}
+                    onValueChange={(value) => setAIAgentRef(value === '__none__' ? '' : value)}
+                    disabled={inlineAgents.length === 0}
+                  >
+                    <SelectTrigger aria-label="AI agent"><SelectValue placeholder="Select an agent (optional)" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">No agent — configure provider inline</SelectItem>
+                      {inlineAgents.map((agent) => (
+                        <SelectItem key={agent.metadata.name} value={agent.metadata.name}>
+                          {agent.metadata.name}
+                          {agent.spec.model?.provider && ` (${agent.spec.model.provider}${agent.spec.model.name ? ` / ${agent.spec.model.name}` : ''})`}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    {inlineAgents.length === 0
+                      ? 'No native AI Agents found in this namespace; the provider must be configured inline.'
+                      : 'Agents supply the provider credentials, model, system prompt, and tools for native AI tasks.'}
+                    {runtimeAgentCount > 0 && ' Agents with a built-in CLI runtime are hidden because they run as Agent tasks.'}
+                  </p>
                 </div>
+
+                {selectedAIAgent && (
+                  <div className="rounded-md border bg-muted/50 p-3 text-sm" data-testid="ai-agent-info-card">
+                    <div className="font-medium">{selectedAIAgent.metadata.name}</div>
+                    <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground">
+                      {selectedAIAgent.spec.providerRef?.name && <span>Provider CRD {selectedAIAgent.spec.providerRef.name}</span>}
+                      {selectedAIAgent.spec.model?.provider && <span>{selectedAIAgent.spec.model.provider}</span>}
+                      {selectedAIAgent.spec.model?.name && <span>{selectedAIAgent.spec.model.name}</span>}
+                      {(selectedAIAgent.spec.tools?.length ?? 0) > 0 && <span>{selectedAIAgent.spec.tools!.length} tools</span>}
+                    </div>
+                  </div>
+                )}
+
+                {aiAgentRef ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowAIModelOverrides(!showAIModelOverrides)}
+                    className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+                  >
+                    {showAIModelOverrides ? '▼' : '▶'} Provider / model overrides (optional)
+                  </button>
+                ) : null}
+
+                {(!aiAgentRef || showAIModelOverrides) && (
+                  <div className={`grid gap-4 md:grid-cols-2 ${aiAgentRef ? 'border-l-2 border-border pl-4' : ''}`}>
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Provider</label>
+                      <Select value={provider} onValueChange={setProvider}>
+                        <SelectTrigger aria-label="AI provider"><SelectValue placeholder={aiAgentRef ? 'Agent default' : 'Select provider'} /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="anthropic">Anthropic</SelectItem>
+                          <SelectItem value="openai">OpenAI</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      {!aiAgentRef && (
+                        <p className="text-xs text-muted-foreground">
+                          Inline providers read their API key from the Task namespace; pick an Agent to use a Provider CRD instead.
+                        </p>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <label htmlFor="task-model" className="text-sm font-medium">Model</label>
+                      <Input id="task-model" value={model} onChange={(e) => setModel(e.target.value)} placeholder={aiAgentRef ? 'Agent default' : 'claude-sonnet-4-20250514'} />
+                    </div>
+                  </div>
+                )}
                 <div className="space-y-2">
                   <label htmlFor="ai-prompt" className="text-sm font-medium">Prompt</label>
                   <textarea
