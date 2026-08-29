@@ -151,6 +151,22 @@ describe('TaskDetail', () => {
     expect(screen.getByText('Summarize')).toBeInTheDocument()
   })
 
+  it('shows a cross-namespace agentRef qualified instead of linking into the wrong namespace', async () => {
+    server.use(
+      http.get('/api/v1/tasks/:id', () =>
+        HttpResponse.json({
+          metadata: { name: 'ai-xns-task', namespace: 'default', uid: 'uid-xns' },
+          spec: { type: 'ai', agentRef: { name: 'shared-agent', namespace: 'platform' }, ai: { prompt: 'Summarize' } },
+          status: { phase: 'Pending' },
+        }),
+      ),
+    )
+    render(<TaskDetail taskId="ai-xns-task" />)
+    await waitFor(() => expect(screen.getByText('AI Config')).toBeInTheDocument())
+    expect(screen.queryByRole('link', { name: 'shared-agent' })).not.toBeInTheDocument()
+    expect(screen.getByText('platform/shared-agent')).toBeInTheDocument()
+  })
+
   it('overview tab shows metadata', async () => {
     server.use(
       http.get('/api/v1/tasks/:id', () =>

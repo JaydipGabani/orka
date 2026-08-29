@@ -172,6 +172,10 @@ func paginatedListNames(t *testing.T, app *fiber.App, target string) ([]string, 
 	names := make([]string, 0, len(body.Items))
 	for _, item := range body.Items {
 		if builtin, _ := item["builtin"].(bool); builtin {
+			// Built-ins are collected like any other item so the caller can
+			// assert they appear exactly once across all pages.
+			name, _ := item["name"].(string)
+			names = append(names, "builtin:"+name)
 			continue
 		}
 		if name, ok := item["name"].(string); ok {
@@ -205,7 +209,7 @@ func TestPaginatedListsFollowContinueThroughAPIReader(t *testing.T) {
 			app := fiber.New()
 			app.Get(tc.route, tc.handler(handlers))
 
-			var got []string
+			var got, gotBuiltins []string
 			continueToken := ""
 			pages := 0
 			for {
@@ -214,8 +218,14 @@ func TestPaginatedListsFollowContinueThroughAPIReader(t *testing.T) {
 					target += "&continue=" + continueToken
 				}
 				names, next := paginatedListNames(t, app, target)
-				require.LessOrEqual(t, len(names), 2)
-				got = append(got, names...)
+				crdNames, builtins := splitBuiltinListNames(names)
+				require.LessOrEqual(t, len(crdNames), 2)
+				if pages == 0 {
+					gotBuiltins = builtins
+				} else {
+					require.Empty(t, builtins, "built-in tools must only be emitted on the first page")
+				}
+				got = append(got, crdNames...)
 				pages++
 				if next == "" {
 					break
@@ -226,6 +236,10 @@ func TestPaginatedListsFollowContinueThroughAPIReader(t *testing.T) {
 			require.Equal(t, 3, pages)
 			require.Equal(t, want, got, "every item must be listed exactly once")
 			require.Equal(t, pages, reader.lists)
+			if tc.route == listPaginationToolsRoute {
+				require.NotEmpty(t, gotBuiltins, "the first tools page must carry the built-in tools")
+				require.Len(t, gotBuiltins, len(builtinToolsList), "built-ins must be unique across pages")
+			}
 		})
 	}
 }
@@ -248,8 +262,12 @@ func TestPaginatedListsWithoutAPIReaderReturnCompleteUnlimitedPage(t *testing.T)
 			app.Get(tc.route, tc.handler(handlers))
 
 			names, next := paginatedListNames(t, app, tc.route+"?namespace="+listPaginationTestNamespace+"&limit=2")
+			names, builtins := splitBuiltinListNames(names)
 			sort.Strings(names)
 			require.Equal(t, want, names, "cache fallback must not truncate")
+			if tc.route == listPaginationToolsRoute {
+				require.Len(t, builtins, len(builtinToolsList), "the single page must carry every built-in tool once")
+			}
 			require.Empty(t, next)
 			require.Zero(t, cached.limitedLists, "cache must never be asked for a limited list")
 
@@ -271,4 +289,17 @@ func TestListPageReportsReaderFailures(t *testing.T) {
 	require.ErrorAs(t, err, &fiberErr)
 	require.Equal(t, http.StatusInternalServerError, fiberErr.Code)
 	require.Contains(t, fiberErr.Message, "failed to list tasks: API unavailable")
+}
+
+// splitBuiltinListNames separates the "builtin:" entries paginatedListNames
+// records for built-in tools from the CRD-backed item names.
+func splitBuiltinListNames(names []string) (crd, builtins []string) {
+	for _, name := range names {
+		if rest, ok := strings.CutPrefix(name, "builtin:"); ok {
+			builtins = append(builtins, rest)
+			continue
+		}
+		crd = append(crd, name)
+	}
+	return crd, builtins
 }

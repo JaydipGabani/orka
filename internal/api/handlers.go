@@ -1126,16 +1126,20 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 		return err
 	}
 
-	// Add built-in tools to the response
+	// Add built-in tools to the response. They are not part of the paginated
+	// Tool CRD collection, so they are emitted once, on the first page only;
+	// a client following metadata.continue must not receive them again.
 	toolItems := make([]fiber.Map, 0)
-	for _, tool := range builtinToolsList {
-		name, _ := tool["name"].(string)
-		allowed, err := contextTokenAllowsToolMetadata(c, h.contextTokenAuthorization, "listTools", name)
-		if err != nil {
-			return err
-		}
-		if allowed {
-			toolItems = append(toolItems, tool)
+	if pagination.Continue == "" {
+		for _, tool := range builtinToolsList {
+			name, _ := tool["name"].(string)
+			allowed, err := contextTokenAllowsToolMetadata(c, h.contextTokenAuthorization, "listTools", name)
+			if err != nil {
+				return err
+			}
+			if allowed {
+				toolItems = append(toolItems, tool)
+			}
 		}
 	}
 

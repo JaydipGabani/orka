@@ -353,13 +353,22 @@ export function TaskDetail({ taskId }: { taskId: string }) {
                 {task.spec.agentRef && (
                   <div>
                     <span className="text-muted-foreground">Agent:</span>{' '}
-                    <Link
-                      to="/agents/$agentId"
-                      params={{ agentId: task.spec.agentRef.name }}
-                      className="underline-offset-4 hover:underline"
-                    >
-                      {task.spec.agentRef.name}
-                    </Link>
+                    {!task.spec.agentRef.namespace || task.spec.agentRef.namespace === task.metadata.namespace ? (
+                      <Link
+                        to="/agents/$agentId"
+                        params={{ agentId: task.spec.agentRef.name }}
+                        className="underline-offset-4 hover:underline"
+                      >
+                        {task.spec.agentRef.name}
+                      </Link>
+                    ) : (
+                      // The agent detail route resolves in the dashboard's
+                      // current namespace, so a cross-namespace reference is
+                      // shown qualified instead of linking to the wrong Agent.
+                      <span className="font-mono">
+                        {task.spec.agentRef.namespace}/{task.spec.agentRef.name}
+                      </span>
+                    )}
                   </div>
                 )}
                 <div>

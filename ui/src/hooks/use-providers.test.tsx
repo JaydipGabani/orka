@@ -41,3 +41,34 @@ describe('useProviderList', () => {
     expect(result.current.data?.items[0]).toMatchObject({ name: 'anthropic', defaultModel: 'claude-sonnet-4-20250514' })
   })
 })
+
+describe('useProviderList pagination', () => {
+  beforeEach(() => {
+    useUIStore.setState({ namespace: 'team-a', sidebarCollapsed: false, theme: 'light' })
+    useAuthStore.setState({ token: 'test-token' })
+  })
+
+  it('follows metadata.continue so providers beyond the first page are listed once', async () => {
+    const cursors: Array<string | null> = []
+    server.use(
+      http.get('/api/v1/providers', ({ request }) => {
+        const cursor = new URL(request.url).searchParams.get('continue')
+        cursors.push(cursor)
+        if (!cursor) {
+          return HttpResponse.json({
+            items: [{ metadata: { name: 'p1', namespace: 'team-a' }, spec: { type: 'openai' } }],
+            metadata: { continue: 'page-2' },
+          })
+        }
+        return HttpResponse.json({
+          items: [{ metadata: { name: 'p2', namespace: 'team-a' }, spec: { type: 'anthropic' } }],
+          metadata: {},
+        })
+      }),
+    )
+    const { result } = renderHook(() => useProviderList(), { wrapper: createWrapper() })
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(cursors).toEqual([null, 'page-2'])
+    expect(result.current.data?.items.map((p) => p.name)).toEqual(['p1', 'p2'])
+  })
+})

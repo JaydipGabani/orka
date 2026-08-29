@@ -8,7 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/layout/page-header'
 import { useCreateTask } from '@/hooks/use-tasks'
-import { useAgentList } from '@/hooks/use-agents'
+import { useAgentListAll } from '@/hooks/use-agents'
 import { useUIStore } from '@/stores/ui'
 import { toast } from 'sonner'
 import { workspaceConfigSchema, type WorkspaceIntent } from '@/schemas/task'
@@ -40,7 +40,7 @@ function optionalCredentialReference(name: string, key: string) {
 export function TaskCreateForm() {
   const navigate = useNavigate()
   const createTask = useCreateTask()
-  const { data: agentsData } = useAgentList()
+  const { data: agentsData } = useAgentListAll()
   const namespace = useUIStore((s) => s.namespace)
 
   const [name, setName] = useState('')
