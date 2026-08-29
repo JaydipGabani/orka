@@ -838,10 +838,10 @@ func TestProviderProxyMaxTurnsMapsToTerminalFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer proxy.close()
-	if err := proxy.consumeInferenceRequest(promptID, providerRequestInference, now); err != nil {
+	if _, err := proxy.consumeInferenceRequest(promptID, providerRequestInference, now); err != nil {
 		t.Fatalf("first inference request: %v", err)
 	}
-	if err := proxy.consumeInferenceRequest(promptID, providerRequestInference, now); err != errProviderTurnLimitExceeded {
+	if _, err := proxy.consumeInferenceRequest(promptID, providerRequestInference, now); err != errProviderTurnLimitExceeded {
 		t.Fatalf("N+1 inference request error = %v, want %v", err, errProviderTurnLimitExceeded)
 	}
 	proxy.deactivate(promptID)
@@ -919,10 +919,11 @@ func newUpstreamFailureFixture(t *testing.T) upstreamFailureFixture {
 
 func (f upstreamFailureFixture) recordInference(t *testing.T, status int, detail string) {
 	t.Helper()
-	if err := f.proxy.consumeInferenceRequest(f.promptID, providerRequestInference, f.now); err != nil {
+	seq, err := f.proxy.consumeInferenceRequest(f.promptID, providerRequestInference, f.now)
+	if err != nil {
 		t.Fatal(err)
 	}
-	f.proxy.recordInferenceResponse(f.promptID, providerRequestInference, status, detail)
+	f.proxy.recordInferenceOutcome(f.promptID, providerRequestInference, seq, status, detail)
 }
 
 func (f upstreamFailureFixture) settleCompleted(t *testing.T) (harnessv2.Event, acp.PromptResult) {

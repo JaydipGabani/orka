@@ -140,6 +140,30 @@ describe('ChatPage', () => {
     expect(screen.queryByText('Choose a provider to override the model.')).not.toBeInTheDocument()
   })
 
+  it('clears a persisted provider that is no longer listed', async () => {
+    useChatStore.setState({ provider: 'retired-provider', model: 'old-model', selections: { default: { provider: 'retired-provider', model: 'old-model' } } })
+    render(<ChatPage />)
+    await waitFor(() => expect(useChatStore.getState().provider).toBe(''))
+    expect(useChatStore.getState().model).toBe('')
+    expect(useChatStore.getState().selections.default).toEqual({ provider: '', model: '' })
+    expect(screen.getByRole('combobox', { name: 'Chat provider' })).toHaveTextContent('Server default')
+  })
+
+  it('clears a persisted provider when listing Providers is forbidden', async () => {
+    providerList.current = { data: undefined, error: new ApiError(403, JSON.stringify({ error: { code: 403, message: 'not authorized' } })) }
+    useChatStore.setState({ provider: 'openai-proxy', model: 'gpt-5', selections: { default: { provider: 'openai-proxy', model: 'gpt-5' } } })
+    render(<ChatPage />)
+    await waitFor(() => expect(useChatStore.getState().provider).toBe(''))
+    expect(useChatStore.getState().model).toBe('')
+  })
+
+  it('keeps a persisted provider while the Provider list is still loading', () => {
+    providerList.current = { data: undefined, error: null }
+    useChatStore.setState({ provider: 'openai-proxy', model: 'gpt-5', selections: { default: { provider: 'openai-proxy', model: 'gpt-5' } } })
+    render(<ChatPage />)
+    expect(useChatStore.getState().provider).toBe('openai-proxy')
+  })
+
   it('scopes the persisted provider/model to the active namespace', async () => {
     useChatStore.setState({
       activeNamespace: '',

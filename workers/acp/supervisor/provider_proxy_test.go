@@ -873,6 +873,7 @@ func TestProviderProxyUpstreamFailureAccountingPassesErrorThrough(t *testing.T) 
 	if got := response.Header.Get("X-Upstream-Marker"); got != "quota" {
 		t.Fatalf("passed-through upstream header = %q", got)
 	}
+	waitProviderProxyIdle(t, session)
 	failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
 	if !failed || status != http.StatusPaymentRequired || detail != "You have exceeded your monthly quota" {
 		t.Fatalf("upstreamFailureUnrecovered = %v/%d/%q", failed, status, detail)
@@ -1135,6 +1136,7 @@ func TestProviderProxyUpstreamFailureDetailRedactsCredentials(t *testing.T) {
 	if response.StatusCode != http.StatusBadRequest || string(body) != credentialShapedUpstreamErrorBody {
 		t.Fatalf("passed-through upstream error = %d %s", response.StatusCode, body)
 	}
+	waitProviderProxyIdle(t, session)
 	failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
 	if !failed || status != http.StatusBadRequest {
 		t.Fatalf("upstreamFailureUnrecovered = %v/%d/%q", failed, status, detail)
@@ -1188,7 +1190,11 @@ func TestProviderProxyChildDisconnectOnStreamedSuccessCountsAsSuccess(t *testing
 				t.Fatalf("relay panic = %v, want http.ErrAbortHandler", recovered)
 			}
 		}()
-		proxy.relayUpstreamResponse(context.Background(), &childDisconnectedWriter{header: http.Header{}}, session, testPromptOneID, providerRequestInference, response)
+		seq, err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		proxy.relayUpstreamResponse(context.Background(), &childDisconnectedWriter{header: http.Header{}}, session, testPromptOneID, providerRequestInference, seq, response)
 	}()
 	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed || status != 0 || detail != "" {
 		t.Fatalf("upstreamFailureUnrecovered after child disconnect on 2xx = %v/%d/%q, want the earlier failure recovered", failed, status, detail)
@@ -1298,5 +1304,57 @@ func TestProviderProxyStreamedSuccessOverLimitCountsAsFailure(t *testing.T) {
 	session.mu.Unlock()
 	if successes != 0 || failures != 1 {
 		t.Fatalf("inference accounting after oversized 2xx stream = %d/%d, want 0/1", successes, failures)
+	}
+}
+
+// recordInferenceResponse is a test convenience that issues a fresh sequence
+// for one accounted response so fixtures can record outcomes in order.
+func (s *providerProxySession) recordInferenceResponse(promptID string, class providerRequestClass, statusCode int, detail string) {
+	s.mu.Lock()
+	s.issuedInference++
+	seq := s.issuedInference
+	s.mu.Unlock()
+	s.recordInferenceOutcome(promptID, class, seq, statusCode, detail)
+}
+
+func TestProviderProxyInferenceAccountingOrdersByIssuance(t *testing.T) {
+	_, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: "http://upstream.invalid", UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+	first, err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The later-issued request fails fast; the earlier one succeeds afterwards.
+	session.recordInferenceOutcome(testPromptOneID, providerRequestInference, second, http.StatusTooManyRequests, "rate limit exceeded")
+	session.recordInferenceOutcome(testPromptOneID, providerRequestInference, first, http.StatusOK, "")
+	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); !failed || status != http.StatusTooManyRequests || detail != "rate limit exceeded" {
+		t.Fatalf("upstreamFailureUnrecovered = %v/%d/%q, want the later-issued failure to decide", failed, status, detail)
+	}
+	// A failure issued before a success that completes later is recovered.
+	third, _ := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+	fourth, _ := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+	session.recordInferenceOutcome(testPromptOneID, providerRequestInference, fourth, http.StatusOK, "")
+	session.recordInferenceOutcome(testPromptOneID, providerRequestInference, third, http.StatusBadGateway, "late failure")
+	if failed, _, _ := session.upstreamFailureUnrecovered(testPromptOneID); failed {
+		t.Fatal("earlier-issued failure was not recovered by the later-issued success")
+	}
+}
+
+// waitProviderProxyIdle mirrors prompt settlement, which lets in-flight relays
+// drain before the accounting is read: the failure detail is attached once
+// the relayed error body has been observed, after the client may already
+// have read a Content-Length-delimited body to EOF.
+func waitProviderProxyIdle(t *testing.T, session *providerProxySession) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := session.wait(ctx); err != nil {
+		t.Fatalf("provider proxy did not drain: %v", err)
 	}
 }

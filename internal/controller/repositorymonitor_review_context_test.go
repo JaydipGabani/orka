@@ -277,13 +277,15 @@ func TestRepositoryMonitorReviewContextRedactsCredentialsFromPatchesAndPaths(t *
 	const signedURL = "https://files.example/blob?token=sig-0123456789&expires=1"
 	// Assembled at runtime so the fixture never appears as a literal credential URL.
 	credentialURL := "https://deploy:" + "hunter2secret" + "@git.example/repo.git"
+	// Azure SAS: the credential parameter carries no generic secret keyword.
+	sasURL := "https://acct.blob.core.windows.net/c/b?sv=2024-05-04&se=2026-01-01&sig=" + "sasSecretValue" + "&sr=b"
 	files := []repositoryMonitorPullRequestFileResponse{
-		{Filename: "config/" + apiKey + ".env", Status: repositoryMonitorReviewContextTestAdded, Additions: 3, Patch: "@@ -0,0 +1,3 @@\n+" + apiKey + "\n+Authorization: Bearer " + jwt + "\n+url = " + signedURL + "\n+remote = " + credentialURL + "\n"},
+		{Filename: "config/" + apiKey + ".env", Status: repositoryMonitorReviewContextTestAdded, Additions: 3, Patch: "@@ -0,0 +1,3 @@\n+" + apiKey + "\n+Authorization: Bearer " + jwt + "\n+url = " + signedURL + "\n+remote = " + credentialURL + "\n+blob = " + sasURL + "\n"},
 	}
 	pr := repositoryMonitorReviewContextTestPR()
 	reviewContext := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, pr, files)
 	prompt := buildRepositoryMonitorReviewPrompt(repositoryMonitorInventoryTestMonitor(), repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, pr, reviewContext)
-	for _, leaked := range []string{"ak-live-0123456789abcdef", jwt, "sig-0123456789", "hunter2secret"} {
+	for _, leaked := range []string{"ak-live-0123456789abcdef", jwt, "sig-0123456789", "hunter2secret", "sasSecretValue"} {
 		if strings.Contains(prompt, leaked) {
 			t.Fatalf("rendered prompt leaks %q:\n%s", leaked, renderRepositoryMonitorReviewContext(reviewContext))
 		}
@@ -700,7 +702,7 @@ func TestRepositoryMonitorReviewTaskAdoptionFailsClosedWhenContextCannotBeReprod
 	}
 }
 
-func TestRepositoryMonitorReviewContextClippedPathMarksChangeSetIncomplete(t *testing.T) {
+func TestRepositoryMonitorReviewContextAlteredPathMarksChangeSetIncomplete(t *testing.T) {
 	t.Parallel()
 	longPath := "dir/" + strings.Repeat("n", repositoryMonitorReviewContextMaxPathBytes) + ".go"
 	for _, tc := range []struct {
@@ -709,16 +711,18 @@ func TestRepositoryMonitorReviewContextClippedPathMarksChangeSetIncomplete(t *te
 	}{
 		{name: "deleted long path", file: repositoryMonitorPullRequestFileResponse{Filename: longPath, Status: "removed", Deletions: 1, Patch: "@@ -1 +0,0 @@\n-old\n"}},
 		{name: "renamed from long path", file: repositoryMonitorPullRequestFileResponse{Filename: "short.go", PreviousFilename: longPath, Status: "renamed"}},
+		{name: "deleted path with credential-shaped segment", file: repositoryMonitorPullRequestFileResponse{Filename: "config/api_key=ak-live-0123456789abcdef.env", Status: "removed", Deletions: 1}},
+		{name: "renamed from control-character path", file: repositoryMonitorPullRequestFileResponse{Filename: "short.go", PreviousFilename: "old\x00name.go", Status: "renamed"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{tc.file})
 			if !got.Truncated.Files {
-				t.Fatalf("truncated = %#v, want files=true when a path identity is clipped", got.Truncated)
+				t.Fatalf("truncated = %#v, want files=true when a path identity is altered", got.Truncated)
 			}
 			prompt := "review\n" + renderRepositoryMonitorReviewContext(got) + "\n"
 			if reason := repositoryMonitorReviewVerdictGateReason(prompt, repositoryMonitorReviewVerdictPassed); reason == "" {
-				t.Fatal("passed verdict was not gated for a clipped path identity")
+				t.Fatal("passed verdict was not gated for an altered path identity")
 			}
 		})
 	}

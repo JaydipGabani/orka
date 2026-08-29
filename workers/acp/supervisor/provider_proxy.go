@@ -129,13 +129,16 @@ type providerProxySession struct {
 	// Codex and Copilot report provider errors as ordinary assistant text and
 	// end their turn, so the supervisor needs its own evidence that the
 	// prompt's final inference call succeeded before it trusts an end_turn
-	// settlement. upstreamFailureLatest tracks whether the most recent
-	// accounted inference response failed without a later success.
-	inferenceSuccesses    int32
-	inferenceFailures     int32
-	upstreamFailureLatest bool
-	lastUpstreamStatus    int
-	lastUpstreamDetail    string
+	// settlement. Outcomes are ordered by issuance, not completion: with two
+	// concurrent slots a later-issued request can fail before an earlier one
+	// succeeds, and the prompt's final outcome is the highest-sequence one.
+	inferenceSuccesses int32
+	inferenceFailures  int32
+	issuedInference    uint64
+	lastSuccessSeq     uint64
+	lastFailureSeq     uint64
+	lastUpstreamStatus int
+	lastUpstreamDetail string
 	// admissionClosed rejects new requests for the active prompt once the
 	// ACP child has settled its turn, while in-flight relays keep their
 	// gate context and drain normally.
@@ -352,7 +355,9 @@ func (s *providerProxySession) activateWithMaxTurns(promptID string, maxTurns in
 	s.admissionClosed = false
 	s.inferenceSuccesses = 0
 	s.inferenceFailures = 0
-	s.upstreamFailureLatest = false
+	s.issuedInference = 0
+	s.lastSuccessSeq = 0
+	s.lastFailureSeq = 0
 	s.lastUpstreamStatus = 0
 	s.lastUpstreamDetail = ""
 	s.leaseVersion++
@@ -524,21 +529,25 @@ func (s *providerProxySession) releaseRequest() {
 	}
 }
 
-func (s *providerProxySession) consumeInferenceRequest(promptID string, class providerRequestClass, now time.Time) error {
+// consumeInferenceRequest admits one inference request against the prompt's
+// turn budget and returns its issuance sequence, which orders the response
+// accounting. Metadata requests consume nothing and carry sequence 0.
+func (s *providerProxySession) consumeInferenceRequest(promptID string, class providerRequestClass, now time.Time) (uint64, error) {
 	if class != providerRequestInference {
-		return nil
+		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.activePromptID != promptID || s.gateContext == nil || !now.Before(s.leaseExpiresAt) {
-		return context.Canceled
+		return 0, context.Canceled
 	}
 	if s.inferenceRequests >= s.maxTurns {
 		s.turnLimitExceeded = true
-		return errProviderTurnLimitExceeded
+		return 0, errProviderTurnLimitExceeded
 	}
 	s.inferenceRequests++
-	return nil
+	s.issuedInference++
+	return s.issuedInference, nil
 }
 
 func (s *providerProxySession) maxTurnsExceeded(promptID string) bool {
@@ -550,14 +559,15 @@ func (s *providerProxySession) maxTurnsExceeded(promptID string) bool {
 	return s.turnPromptID == strings.TrimSpace(promptID) && s.turnLimitExceeded
 }
 
-// recordInferenceResponse accounts one upstream inference response for the
-// prompt that owns the current turn. Status codes below 400 count as
-// successes and clear any earlier failure; everything else is a failure whose
-// bounded, sanitized detail is kept for the terminal failure message until a
-// later inference succeeds. Metadata requests and responses for other prompts
-// are ignored.
-func (s *providerProxySession) recordInferenceResponse(promptID string, class providerRequestClass, statusCode int, detail string) {
-	if s == nil || class != providerRequestInference {
+// recordInferenceOutcome accounts one upstream inference response, issued
+// with sequence seq, for the prompt that owns the current turn. Status codes
+// below 400 count as successes; everything else is a failure whose bounded,
+// sanitized detail is kept for the terminal failure message. The outcome
+// that decides the prompt is the one with the highest issuance sequence,
+// regardless of the order in which responses complete. Metadata requests and
+// responses for other prompts are ignored.
+func (s *providerProxySession) recordInferenceOutcome(promptID string, class providerRequestClass, seq uint64, statusCode int, detail string) {
+	if s == nil || class != providerRequestInference || seq == 0 {
 		return
 	}
 	promptID = strings.TrimSpace(promptID)
@@ -568,13 +578,14 @@ func (s *providerProxySession) recordInferenceResponse(promptID string, class pr
 	}
 	if statusCode < http.StatusBadRequest {
 		s.inferenceSuccesses++
-		s.upstreamFailureLatest = false
-		s.lastUpstreamStatus = 0
-		s.lastUpstreamDetail = ""
+		s.lastSuccessSeq = max(s.lastSuccessSeq, seq)
 		return
 	}
 	s.inferenceFailures++
-	s.upstreamFailureLatest = true
+	if seq < s.lastFailureSeq {
+		return
+	}
+	s.lastFailureSeq = seq
 	s.lastUpstreamStatus = statusCode
 	s.lastUpstreamDetail = sanitizeProviderUpstreamDetail(detail)
 }
@@ -583,33 +594,34 @@ func (s *providerProxySession) recordInferenceResponse(promptID string, class pr
 // recorded by recordInferenceResponse once the relayed error body prefix has
 // been observed. It is a no-op when a later inference already succeeded or a
 // different failure has been recorded since.
-func (s *providerProxySession) attachInferenceFailureDetail(promptID string, class providerRequestClass, statusCode int, detail string) {
-	if s == nil || class != providerRequestInference || detail == "" {
+func (s *providerProxySession) attachInferenceFailureDetail(promptID string, class providerRequestClass, seq uint64, detail string) {
+	if s == nil || class != providerRequestInference || seq == 0 || detail == "" {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.turnPromptID != strings.TrimSpace(promptID) || !s.upstreamFailureLatest ||
-		s.lastUpstreamStatus != statusCode || s.lastUpstreamDetail != "" {
+	if s.turnPromptID != strings.TrimSpace(promptID) || s.lastFailureSeq != seq || s.lastUpstreamDetail != "" {
 		return
 	}
 	s.lastUpstreamDetail = sanitizeProviderUpstreamDetail(detail)
 }
 
-// upstreamFailureUnrecovered reports whether the most recent accounted
-// inference response for promptID failed and no later inference succeeded.
-// It is false when the prompt made no inference requests or when the latest
-// response succeeded. An earlier success (for example the tool-call round
-// before a 429 on the follow-up request) does not mask a final failure: the
-// agent may render that error as assistant text and settle end_turn, which
-// must not become a successful Task.
+// upstreamFailureUnrecovered reports whether the latest-issued accounted
+// inference response for promptID failed and no later-issued inference
+// succeeded. It is false when the prompt made no inference requests or when
+// the latest-issued response succeeded. An earlier success (for example the
+// tool-call round before a 429 on the follow-up request) does not mask a
+// final failure: the agent may render that error as assistant text and settle
+// end_turn, which must not become a successful Task. Completion order is
+// irrelevant: a later-issued failure stays unrecovered even if an
+// earlier-issued request succeeds afterwards.
 func (s *providerProxySession) upstreamFailureUnrecovered(promptID string) (bool, int, string) {
 	if s == nil {
 		return false, 0, ""
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.turnPromptID != strings.TrimSpace(promptID) || !s.upstreamFailureLatest {
+	if s.turnPromptID != strings.TrimSpace(promptID) || s.lastFailureSeq == 0 || s.lastFailureSeq < s.lastSuccessSeq {
 		return false, 0, ""
 	}
 	return true, s.lastUpstreamStatus, s.lastUpstreamDetail
@@ -812,7 +824,8 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	default:
 	}
-	if err := session.consumeInferenceRequest(authorization.promptID, requestClass, time.Now().UTC()); err != nil {
+	inferenceSeq, err := session.consumeInferenceRequest(authorization.promptID, requestClass, time.Now().UTC())
+	if err != nil {
 		if errors.Is(err, errProviderTurnLimitExceeded) {
 			writeProviderTurnLimitError(w, p.providerKind)
 		} else {
@@ -841,12 +854,12 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	response, err := p.client.Do(upstreamRequest)
 	if err != nil {
-		session.recordInferenceResponse(authorization.promptID, requestClass, http.StatusBadGateway, providerUpstreamTransportFailure)
+		session.recordInferenceOutcome(authorization.promptID, requestClass, inferenceSeq, http.StatusBadGateway, providerUpstreamTransportFailure)
 		providerproxy.WriteError(w, http.StatusBadGateway, providerUpstreamTransportFailure)
 		return
 	}
 	defer response.Body.Close() //nolint:errcheck
-	p.relayUpstreamResponse(requestContext, w, session, authorization.promptID, requestClass, response)
+	p.relayUpstreamResponse(requestContext, w, session, authorization.promptID, requestClass, inferenceSeq, response)
 }
 
 // relayUpstreamResponse forwards an upstream response to the ACP child and
@@ -859,10 +872,11 @@ func (p *providerProxy) relayUpstreamResponse(
 	session *providerProxySession,
 	promptID string,
 	requestClass providerRequestClass,
+	seq uint64,
 	response *http.Response,
 ) {
 	rejectUpstream := func(message string) {
-		session.recordInferenceResponse(promptID, requestClass, http.StatusBadGateway, message)
+		session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, message)
 		providerproxy.WriteError(w, http.StatusBadGateway, message)
 	}
 	if response.StatusCode >= http.StatusMultipleChoices && response.StatusCode < http.StatusBadRequest {
@@ -886,7 +900,7 @@ func (p *providerProxy) relayUpstreamResponse(
 		// is captured from a bounded prefix as the body is relayed rather
 		// than read ahead: a chunked 4xx that stalls after a short payload
 		// must not hold the child's request until the lease expires.
-		session.recordInferenceResponse(promptID, requestClass, response.StatusCode, "")
+		session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
 		capture = &prefixCapture{limit: providerUpstreamDetailProbeBytes}
 		body = io.TeeReader(response.Body, capture)
 	}
@@ -897,7 +911,7 @@ func (p *providerProxy) relayUpstreamResponse(
 	flusher, _ := w.(http.Flusher)
 	err := providerproxy.StreamBoundedResponse(w, body, p.maxResponseBytes, flusher)
 	if upstreamFailed {
-		session.attachInferenceFailureDetail(promptID, requestClass, response.StatusCode, providerUpstreamErrorDetail(capture.buffer))
+		session.attachInferenceFailureDetail(promptID, requestClass, seq, providerUpstreamErrorDetail(capture.buffer))
 	}
 	if err != nil {
 		if !upstreamFailed {
@@ -910,14 +924,14 @@ func (p *providerProxy) relayUpstreamResponse(
 				// cancelled upstream read. Neither is upstream evidence of
 				// failure, so account the success and let the child's own
 				// settlement decide the prompt outcome.
-				session.recordInferenceResponse(promptID, requestClass, response.StatusCode, "")
+				session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
 			} else {
 				// A 2xx whose body overran the response limit or broke
 				// mid-stream on the upstream side never delivered a usable
 				// inference result; count it as a failure so
 				// upstreamFailureUnrecovered does not mistake it for a
 				// success.
-				session.recordInferenceResponse(promptID, requestClass, http.StatusBadGateway, "provider upstream stream failed")
+				session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider upstream stream failed")
 			}
 		}
 		panic(http.ErrAbortHandler)
@@ -925,7 +939,7 @@ func (p *providerProxy) relayUpstreamResponse(
 	if !upstreamFailed {
 		// A success is only accounted once the whole body reached the
 		// child; a chunked response is not known to be usable earlier.
-		session.recordInferenceResponse(promptID, requestClass, response.StatusCode, "")
+		session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
 	}
 }
 

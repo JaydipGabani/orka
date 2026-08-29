@@ -36,6 +36,16 @@ export function ChatPage() {
   }, [namespace, selectNamespace])
   const providers = providersData?.items ?? []
   const providersForbidden = isForbiddenError(providersError)
+  // A persisted pick can outlive its Provider (deleted, or listing now
+  // forbidden). Sending that stale name would fail provider resolution on
+  // every turn, so fall back to the server default once the list has
+  // answered and does not contain it.
+  const providerGone = provider !== '' && (providersForbidden || (providersData !== undefined && !providers.some((p) => p.name === provider)))
+  useEffect(() => {
+    if (!providerGone) return
+    setProvider('')
+    setModel('')
+  }, [providerGone, setProvider, setModel])
   const providersErrorMessage = providersError
     ? providersForbidden
       ? `Not authorized to list Providers in ${namespace}; only the server default is available.`
