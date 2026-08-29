@@ -203,8 +203,13 @@ func (p *providerAuthProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	providerproxy.CopyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
-	// The nil flusher keeps this proxy's original buffered write behavior.
-	if err := providerproxy.StreamBoundedResponse(w, response.Body, p.maxResponseBytes, nil); err != nil {
+	flusher, _ := w.(http.Flusher)
+	// Flush headers before waiting for the first upstream body chunk, then flush
+	// every chunk so streamed responses reach the ACP runtime promptly.
+	if flusher != nil {
+		flusher.Flush()
+	}
+	if err := providerproxy.StreamBoundedResponse(w, response.Body, p.maxResponseBytes, flusher); err != nil {
 		panic(http.ErrAbortHandler)
 	}
 }

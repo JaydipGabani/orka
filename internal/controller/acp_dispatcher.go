@@ -1482,6 +1482,32 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		}
 	}
 
+	// Persist the high-water mark on the durable Session after the provider
+	// RuntimeSession is proven live. This survives controller restarts, physical
+	// runtime replacement, and deletion of prior Task objects.
+	if sessionExecution != nil {
+		if sessionExecution.Turn == nil {
+			return fmt.Errorf("session-bound RuntimeSession lacks an open SessionTurn")
+		}
+		committedLease, commitErr := d.Sessions.CommitRuntimeSessionGeneration(
+			ctx,
+			sessionExecution.Turn.Lease,
+			fence,
+			runtimeFence.RuntimeSessionGeneration,
+			time.Now().UTC(),
+		)
+		if commitErr != nil {
+			if requeueErr := d.requeuePreSubmissionTaskWithRuntimeBinding(
+				ctx, task, attemptID, fence, commitErr, &sessionExecution.Binding,
+			); requeueErr != nil {
+				return errors.Join(commitErr, requeueErr)
+			}
+			sessionExecution.requeued = true
+			return nil
+		}
+		sessionExecution.Turn.Lease = *committedLease
+	}
+
 	// A live RuntimeSession - freshly created here or reconciled as reused -
 	// commits (or committed) the supervisor's durable checkpoint
 	// synchronously during its creation; record that on the linked workspace
@@ -3589,7 +3615,9 @@ func (d *ACPDispatcher) settlePreSubmissionCancellation(
 	reason corev1alpha1.TaskExecutionReason,
 	message string,
 ) error {
-	if err := d.transitionAttemptToTerminal(ctx, attemptID, fence, store.PromptExecutionCancelled, operation); err != nil {
+	if err := d.transitionAttemptToCancelled(
+		ctx, attemptID, fence, operation, reason, message,
+	); err != nil {
 		return err
 	}
 	attempt, err := d.Store.GetPromptAttempt(ctx, attemptID)
@@ -4521,7 +4549,9 @@ func (d *ACPDispatcher) handlePromptStreamError(
 			if errors.Is(runtimeContextErr, context.DeadlineExceeded) {
 				operation, terminalReason, message = "timeout-before-acceptance", acpTaskTimeoutReason, "task deadline exceeded before prompt acceptance"
 			}
-			if transitionErr := d.transitionAttemptToTerminal(ctx, attemptID, fence, store.PromptExecutionCancelled, operation); transitionErr != nil {
+			if transitionErr := d.transitionAttemptToCancelled(
+				ctx, attemptID, fence, operation, terminalReason, message,
+			); transitionErr != nil {
 				return transitionErr
 			}
 			return recordACPPromptOutcomeIfSettled(
@@ -4565,7 +4595,9 @@ func (d *ACPDispatcher) handlePromptStreamError(
 					if terminalReason == corev1alpha1.TaskExecutionReason(acpTaskTimeoutReason) {
 						operation = "timeout-cancelled"
 					}
-					if transitionErr := d.transitionAttemptToTerminal(ctx, attemptID, fence, store.PromptExecutionCancelled, operation); transitionErr != nil {
+					if transitionErr := d.transitionAttemptToCancelled(
+						ctx, attemptID, fence, operation, terminalReason, terminalMessage,
+					); transitionErr != nil {
 						return transitionErr
 					}
 					return recordACPPromptOutcomeIfSettled(
@@ -4849,7 +4881,9 @@ func (d *ACPDispatcher) finishNonSuccessWithCancellationReason(
 			reason = acpTaskTimeoutReason
 			message = acpTaskTimeoutCancellationSettledMessage
 		}
-		if err := d.transitionAttemptToTerminal(ctx, attemptID, fence, store.PromptExecutionCancelled, operation); err != nil {
+		if err := d.transitionAttemptToCancelled(
+			ctx, attemptID, fence, operation, reason, message,
+		); err != nil {
 			return err
 		}
 		execution := corev1alpha1.TaskExecutionStatus{
@@ -4897,6 +4931,46 @@ func (d *ACPDispatcher) transitionAttemptToTerminal(ctx context.Context, id stri
 		return err
 	}
 	return d.transitionAttempt(ctx, id, fence, attempt.ExecutionState, target, operation, nil)
+}
+
+func (d *ACPDispatcher) transitionAttemptToCancelled(
+	ctx context.Context,
+	id string,
+	fence store.ControllerEpochFence,
+	operation string,
+	reason corev1alpha1.TaskExecutionReason,
+	message string,
+) error {
+	if strings.TrimSpace(string(reason)) == "" || strings.TrimSpace(message) == "" {
+		return errors.New("terminal attempt classification requires a reason and message")
+	}
+	attempt, err := d.Store.GetPromptAttempt(ctx, id)
+	if err != nil {
+		return err
+	}
+	target := store.PromptExecutionCancelled
+	if attempt.ExecutionState == target {
+		if attempt.TerminalReason != string(reason) || attempt.OutcomeMarker != message {
+			return fmt.Errorf("%w: prompt attempt %s terminal classification does not match", store.ErrConflict, id)
+		}
+		return nil
+	}
+	if err := store.ValidatePromptExecutionTransition(attempt.ExecutionState, target); err != nil {
+		return err
+	}
+	digest, err := acpDomainDigest("attempt-transition", map[string]any{
+		"id": id, "from": attempt.ExecutionState, "to": target, "operation": operation,
+		"version": attempt.Version, "terminalReason": reason, "outcomeMarker": message,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.Store.TransitionPromptAttemptExecution(ctx, store.PromptAttemptExecutionTransition{
+		ID: id, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState, NewState: target,
+		OperationID: operation + "-" + strconv.FormatInt(attempt.Version, 10), OperationDigest: digest,
+		TerminalReason: string(reason), OutcomeMarker: message, UpdatedAt: time.Now().UTC(),
+	})
+	return err
 }
 
 func (d *ACPDispatcher) failTask(ctx context.Context, task *corev1alpha1.Task, state corev1alpha1.TaskExecutionState, outcome corev1alpha1.TaskExecutionOutcome, reason corev1alpha1.TaskExecutionReason, message string) error {

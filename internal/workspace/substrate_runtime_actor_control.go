@@ -469,6 +469,15 @@ type SubstrateRuntimeActorDataResumeControl interface {
 	) (SubstrateCredentialBootstrapResult, error)
 }
 
+// SubstrateRuntimeActorCreateRecoveryControl is the provider attestation
+// required before retrying a CreateActor call whose outcome was ambiguous.
+// A GetActor miss alone is insufficient because the original call may still
+// materialize the deterministic actor later.
+type SubstrateRuntimeActorCreateRecoveryControl interface {
+	ActorCreateRecoveryAttestationSupported() bool
+	ConfirmActorCreationSettled(ctx context.Context, actorID string) (bool, error)
+}
+
 type substrateRuntimeActorControl struct {
 	control substrateControlClient
 }
@@ -535,6 +544,14 @@ func (c *substrateRuntimeActorControl) DeleteActor(ctx context.Context, actorID 
 		return err
 	}
 	return nil
+}
+
+func (c *substrateRuntimeActorControl) ActorCreateRecoveryAttestationSupported() bool {
+	return false
+}
+
+func (c *substrateRuntimeActorControl) ConfirmActorCreationSettled(context.Context, string) (bool, error) {
+	return false, fmt.Errorf("substrate provider does not expose operation-level actor creation settlement")
 }
 
 func (c *substrateRuntimeActorControl) Close() error {

@@ -260,7 +260,13 @@ func TestSubstrateSuspendCapablePoolFailsClosedWithoutAtomicDataCheckpoint(t *te
 
 func TestSubstrateExistingUnbootedActorRechecksAtomicDataCheckpointBeforeBoot(t *testing.T) {
 	r, pool, _, control := newSubstrateSuspendTestReconciler(t)
-	control.resumeErr = errors.New("injected initial boot failure")
+	control.resumeErr = workspace.NewError(
+		"resume actor",
+		workspace.ErrorKindInvalidArgument,
+		"injected definitive boot rejection",
+		false,
+		nil,
+	)
 
 	runtimePoolReconcile(t, r, pool)
 	if len(control.created) != 1 {
@@ -1028,7 +1034,7 @@ func TestSubstrateRuntimePoolRejectsUnprovenProviderResume(t *testing.T) {
 	actor.Status = substrateTestStatusRunning
 	actor.PodNamespace = substrateTestWorkerNamespace
 	actor.PodName = substrateTestWorkerPodName
-	actor.PodIP = "10.99.0.5"
+	actor.PodIP = substrateTestWorkerPodIP
 	substrateSuspendTestPoolIntent(t, r, pool, false)
 
 	_, _ = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(pool)})
@@ -2099,6 +2105,76 @@ func TestSubstrateRuntimePoolRecoversAcceptedCheckpointAfterResponseLoss(t *test
 	}
 }
 
+func TestSubstrateRuntimePoolRecoversResumedActorCheckpointAfterResponseLoss(t *testing.T) {
+	r, pool, supervisor, control := newSubstrateSuspendTestReconciler(t)
+	actorID := substrateTestActorID(pool)
+	probePod := substrateTestProbePod(pool)
+	substrateSuspendTestReachStopped(t, r, pool, supervisor)
+
+	substrateSuspendTestPoolIntent(t, r, pool, false)
+	current := runtimePoolTestGetPool(t, r, pool)
+	supervisor.probe = runtimePoolValidProbe(&current, &probePod, "first-resume", false)
+	for range 10 {
+		runtimePoolReconcile(t, r, pool)
+		current = runtimePoolTestGetPool(t, r, pool)
+		if current.Status.Lifecycle == corev1alpha1.RuntimePoolLifecycleServing {
+			break
+		}
+	}
+	if current.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleServing ||
+		current.Annotations[substrateActorResumingAnnotation] != actorID {
+		t.Fatalf("resumed pool = lifecycle %s annotations=%v, want Serving lineage for %q",
+			current.Status.Lifecycle, current.Annotations, actorID)
+	}
+
+	checkpointsBefore := len(control.dataSuspended)
+	r.ControllerEpoch++
+	runtimePoolReconcile(t, r, pool)
+	current = runtimePoolTestGetPool(t, r, pool)
+	supervisor.probe = runtimePoolValidProbe(&current, &probePod, "first-resume", true)
+	runtimePoolReconcile(t, r, pool)
+	control.dataCheckpointResponseErr = workspace.NewError(
+		"suspend actor", workspace.ErrorKindTimeout, "checkpoint response lost", true,
+		errors.New("injected resumed-actor checkpoint response loss"),
+	)
+	runtimePoolReconcile(t, r, pool)
+
+	current = runtimePoolTestGetPool(t, r, pool)
+	operationID := current.Annotations[substrateActorSuspendOperationAnnotation]
+	actor := control.actors[actorID]
+	if !validSubstrateDataCheckpointOperationID(operationID) || actor == nil ||
+		actor.DataCheckpointOperation == nil || actor.DataCheckpointOperation.OperationID != operationID ||
+		actor.LatestDataOperationID != operationID {
+		t.Fatalf("resumed-actor checkpoint proof = %+v operation=%q, want durable acceptance", actor, operationID)
+	}
+	if len(control.dataSuspended) != checkpointsBefore+1 ||
+		current.Annotations[substrateActorSuspendCallAcceptedAnnotation] != "" ||
+		current.Annotations[substrateActorResumingAnnotation] != actorID {
+		t.Fatalf("response-loss state = checkpoints:%d accepted:%q resuming:%q, want one unrecorded accepted checkpoint",
+			len(control.dataSuspended), current.Annotations[substrateActorSuspendCallAcceptedAnnotation],
+			current.Annotations[substrateActorResumingAnnotation])
+	}
+	if len(control.deleted) != 0 {
+		t.Fatalf("response loss deleted the resumed checkpoint-bearing actor: %v", control.deleted)
+	}
+
+	attempts := len(control.dataSuspended)
+	control.dataCheckpointResponseErr = nil
+	runtimePoolReconcile(t, r, pool)
+	current = runtimePoolTestGetPool(t, r, pool)
+	if len(control.dataSuspended) != attempts {
+		t.Fatalf("accepted resumed-actor checkpoint replayed after response loss: attempts %d -> %d", attempts, len(control.dataSuspended))
+	}
+	if current.Annotations[substrateActorSuspendAcceptedAnnotation] != substrateActorSuspendConsentValue(actorID) ||
+		current.Annotations[substrateActorResumingAnnotation] != "" {
+		t.Fatalf("recovered resumed-actor checkpoint = consent:%q resuming:%q, want settled checkpoint lineage",
+			current.Annotations[substrateActorSuspendAcceptedAnnotation], current.Annotations[substrateActorResumingAnnotation])
+	}
+	if len(control.deleted) != 0 || control.actors[actorID] == nil {
+		t.Fatalf("recovery destroyed the valid checkpoint-bearing actor: deleted=%v actor=%+v", control.deleted, control.actors[actorID])
+	}
+}
+
 func TestSubstrateRuntimePoolRecoversAcceptedCheckpointBeforeTemplateIntegrityRecycle(t *testing.T) {
 	r, pool, supervisor, control := newSubstrateSuspendTestReconciler(t)
 	actorID := substrateTestActorID(pool)
@@ -2540,28 +2616,70 @@ func TestLinkedWorkspaceSuspendIntentPendingUsesAPIReader(t *testing.T) {
 }
 
 func TestSubstrateRuntimePoolColdResumeErrorClassification(t *testing.T) {
+	providerDetail := "private-snapshot-name private-snapshot-uid private-atespace"
 	for _, tc := range []struct {
-		name      string
-		retryable bool
-		kind      workspace.ErrorKind
+		name           string
+		resumeErr      error
+		wantQuarantine bool
+		wantRecycle    bool
+		wantRetry      bool
 	}{
-		{name: "fence rejection", retryable: false, kind: workspace.ErrorKindFailedPrecondition},
-		{name: "invalid resume request", retryable: false, kind: workspace.ErrorKindInvalidArgument},
-		{name: "transient provider failure", retryable: true, kind: workspace.ErrorKindTimeout},
+		{
+			name: "production fence rejection preserves checkpoint",
+			resumeErr: workspace.NewError(
+				"resume actor",
+				workspace.ErrorKindFailedPrecondition,
+				providerDetail,
+				false,
+				errors.New("injected stale snapshot fence: "+providerDetail),
+			),
+			wantRetry: true,
+		},
+		{
+			name: "invalid resume request quarantines checkpoint",
+			resumeErr: workspace.NewError(
+				"resume actor",
+				workspace.ErrorKindInvalidArgument,
+				providerDetail,
+				false,
+				errors.New("injected invalid provider resume request: "+providerDetail),
+			),
+			wantQuarantine: true,
+		},
+		{
+			name: "retryable fence rejection preserves checkpoint",
+			resumeErr: workspace.NewError(
+				"resume actor",
+				workspace.ErrorKindFailedPrecondition,
+				providerDetail,
+				true,
+				errors.New("injected retryable snapshot fence: "+providerDetail),
+			),
+			wantRetry: true,
+		},
+		{
+			name:      "untyped ambiguous failure retries idempotently",
+			resumeErr: errors.New("injected untyped provider failure: " + providerDetail),
+			wantRetry: true,
+		},
+		{
+			name: "retryable ambiguous failure retries idempotently",
+			resumeErr: workspace.NewError(
+				"resume actor",
+				workspace.ErrorKindTimeout,
+				providerDetail,
+				true,
+				errors.New("injected retryable provider resume failure: "+providerDetail),
+			),
+			wantRetry: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, pool, supervisor, control := newSubstrateSuspendTestReconciler(t)
 			substrateSuspendTestReachStopped(t, r, pool, supervisor)
 			substrateSuspendTestPoolIntent(t, r, pool, false)
 			priorResumeAttempts := len(control.resumed)
-			providerDetail := "private-snapshot-name private-snapshot-uid private-atespace"
-			control.resumeErr = workspace.NewError(
-				"resume actor",
-				tc.kind,
-				providerDetail,
-				tc.retryable,
-				errors.New("injected provider resume failure: "+providerDetail),
-			)
+			control.resumeErr = tc.resumeErr
 
 			for range 8 {
 				runtimePoolReconcile(t, r, pool)
@@ -2573,33 +2691,95 @@ func TestSubstrateRuntimePoolColdResumeErrorClassification(t *testing.T) {
 				t.Fatal("cold resume was never attempted")
 			}
 			current := runtimePoolTestGetPool(t, r, pool)
-			if lost := strings.TrimSpace(current.Annotations[runtimePoolWorkspaceResumeLostAnnotation]); lost != "" {
-				t.Fatalf("resume rejection declared the preserved checkpoint lost: %q", lost)
+			lost := strings.TrimSpace(current.Annotations[runtimePoolWorkspaceResumeLostAnnotation]) != ""
+			if lost != tc.wantRecycle {
+				t.Fatalf("resume-lost=%v, want %v", lost, tc.wantRecycle)
 			}
 			if strings.Contains(current.Status.Message, providerDetail) {
 				t.Fatalf("status leaked provider snapshot identifiers: %q", current.Status.Message)
 			}
-			if current.Annotations[substrateActorSuspendAcceptedAnnotation] != substrateActorSuspendConsentValue(substrateTestActorID(pool)) ||
-				current.Annotations[substrateActorSnapshotDigestAnnotation] == "" {
-				t.Fatal("resume failure discarded the consensual checkpoint fence")
+			actorID := substrateTestActorID(pool)
+			operationID := strings.TrimSpace(current.Annotations[substrateActorResumeOperationAnnotation])
+			if tc.wantRetry && !validSubstrateDataResumeOperationID(operationID) {
+				t.Fatalf("retryable data resume operation = %q, want a persisted idempotency key", operationID)
 			}
-			if _, exists := control.actors[substrateTestActorID(pool)]; !exists {
-				t.Fatal("resume failure deleted the checkpoint-bearing actor")
-			}
-			if rejected := current.Annotations[substrateActorResumeRejectedAnnotation]; tc.retryable && rejected != "" {
-				t.Fatalf("retryable resume failure was quarantined as terminal: %q", rejected)
-			} else if !tc.retryable && rejected != substrateTestActorID(pool) {
-				t.Fatalf("non-retryable resume rejection = %q, want actor quarantine", rejected)
+			recycling := strings.TrimSpace(current.Annotations[substrateActorRecyclingAnnotation])
+			if tc.wantRecycle {
+				if current.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDegraded ||
+					!strings.Contains(current.Status.Message, "boot outcome was ambiguous") {
+					t.Fatalf("cold-resume status = %s/%q recycling=%q, want exact-actor recycle", current.Status.Lifecycle, current.Status.Message, recycling)
+				}
+				if recycling != "" && recycling != actorID {
+					t.Fatalf("cold-resume recycle fence = %q, want empty after completed teardown or exact actor %q", recycling, actorID)
+				}
+			} else {
+				if recycling != "" {
+					t.Fatalf("preserved cold-resume rejection entered recycle path for %q", recycling)
+				}
+				if current.Annotations[substrateActorSuspendAcceptedAnnotation] != substrateActorSuspendConsentValue(actorID) ||
+					current.Annotations[substrateActorSnapshotDigestAnnotation] == "" {
+					t.Fatal("resume rejection discarded the consensual checkpoint fence")
+				}
+				if _, exists := control.actors[actorID]; !exists {
+					t.Fatal("resume rejection deleted the checkpoint-bearing actor")
+				}
+				if rejected := current.Annotations[substrateActorResumeRejectedAnnotation]; tc.wantQuarantine && rejected != actorID {
+					t.Fatalf("non-retryable resume rejection = %q, want actor quarantine", rejected)
+				} else if tc.wantRetry && rejected != "" {
+					t.Fatalf("retryable fence rejection was quarantined as terminal: %q", rejected)
+				}
+				if tc.wantQuarantine && current.Annotations[substrateActorTemplateUpdateFenceAnnotation] != "" {
+					t.Fatalf("quarantined resume retained provider-call fence %q", current.Annotations[substrateActorTemplateUpdateFenceAnnotation])
+				}
 			}
 			attempts := len(control.resumed)
+			control.resumeErr = nil
+			if tc.wantRecycle {
+				for range 8 {
+					if len(control.deleted) != 0 {
+						break
+					}
+					runtimePoolReconcile(t, r, pool)
+				}
+				if len(control.resumed) != attempts {
+					t.Fatalf("resume calls after ambiguous outcome = %v, want no retry before recycle", control.resumed)
+				}
+				if len(control.deleted) != 1 || control.deleted[0] != actorID {
+					t.Fatalf("deleted actors = %v, want ambiguously resumed actor %q recycled", control.deleted, actorID)
+				}
+				return
+			}
+			if tc.wantRetry {
+				fenceAttempts := len(control.dataResumeFences)
+				for range 8 {
+					if len(control.resumed) > attempts {
+						break
+					}
+					runtimePoolReconcile(t, r, pool)
+				}
+				if len(control.resumed) <= attempts || len(control.dataResumeFences) <= fenceAttempts {
+					t.Fatal("retryable data resume was not retried")
+				}
+				for _, fence := range control.dataResumeFences {
+					if fence.OperationID != operationID {
+						t.Fatalf("data resume operation changed across retries: got %q, want %q", fence.OperationID, operationID)
+					}
+				}
+				current = runtimePoolTestGetPool(t, r, pool)
+				if strings.TrimSpace(current.Annotations[runtimePoolWorkspaceResumeLostAnnotation]) != "" || len(control.deleted) != 0 {
+					t.Fatalf("retryable data resume lost the checkpoint: annotations=%v deleted=%v", current.Annotations, control.deleted)
+				}
+				return
+			}
 			for range 3 {
 				runtimePoolReconcile(t, r, pool)
 			}
-			if tc.retryable && len(control.resumed) <= attempts {
-				t.Fatal("transient cold-resume failure was not retried")
-			}
-			if !tc.retryable && len(control.resumed) != attempts {
+			if len(control.resumed) != attempts {
 				t.Fatal("quarantined cold-resume rejection was retried")
+			}
+			current = runtimePoolTestGetPool(t, r, pool)
+			if strings.TrimSpace(current.Annotations[runtimePoolWorkspaceResumeLostAnnotation]) != "" || len(control.deleted) != 0 {
+				t.Fatalf("quarantined resume lost the checkpoint: annotations=%v deleted=%v", current.Annotations, control.deleted)
 			}
 		})
 	}

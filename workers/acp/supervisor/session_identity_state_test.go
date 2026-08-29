@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,6 +59,116 @@ func TestSessionIdentityHighWaterSurvivesSupervisorRestart(t *testing.T) {
 	if err != nil || !exists || state.Allocated != 2 {
 		t.Fatalf("identity state = %#v exists=%v err=%v, want allocated=2", state, exists, err)
 	}
+}
+
+func TestE2EPromptWriteAmbiguityLedgerSurvivesDurableSupervisorRestart(t *testing.T) {
+	cfg, _ := newSessionIdentityTestConfig(t)
+	cfg.DurableWorkspaceDir = t.TempDir()
+	cfg.E2EPromptWriteAmbiguityMarker = testE2EPromptWriteAmbiguityMarker
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := harnessv2.StartPromptRequest{
+		Metadata: harnessv2.MutationMetadata{OperationID: "operation-across-cold-boot"},
+		Input: harnessv2.PromptInput{Content: []harnessv2.ContentBlock{{
+			Type: harnessv2.ContentBlockText,
+			Text: "Reply exactly: " + testE2EPromptWriteAmbiguityMarker,
+		}}},
+	}
+	server.mu.Lock()
+	consumed, err := server.consumeE2EPromptWriteAmbiguityLocked(context.Background(), request, testE2EPromptWriteAmbiguityMarker)
+	server.mu.Unlock()
+	if err != nil || !consumed {
+		t.Fatalf("initial durable fault consumption = (%v, %v), want consumed", consumed, err)
+	}
+	expectedLedgerDir := filepath.Join(cfg.DurableWorkspaceDir, ".session-identity", e2ePromptWriteAmbiguityLedgerDir)
+	if server.e2ePromptWriteFaultDir != expectedLedgerDir {
+		t.Fatalf("durable ledger directory = %q, want %q", server.e2ePromptWriteFaultDir, expectedLedgerDir)
+	}
+	closeIdentityTestSupervisor(t, server)
+
+	restartedCfg, _ := newSessionIdentityTestConfig(t)
+	restartedCfg.DurableWorkspaceDir = cfg.DurableWorkspaceDir
+	restartedCfg.E2EPromptWriteAmbiguityMarker = testE2EPromptWriteAmbiguityMarker
+	restarted, err := New(restartedCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeIdentityTestSupervisor(t, restarted) })
+	restarted.mu.Lock()
+	consumed, err = restarted.consumeE2EPromptWriteAmbiguityLocked(context.Background(), request, testE2EPromptWriteAmbiguityMarker)
+	restarted.mu.Unlock()
+	if err != nil || consumed {
+		t.Fatalf("recreated durable fault consumption = (%v, %v), want already consumed", consumed, err)
+	}
+	entries, err := os.ReadDir(expectedLedgerDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || strings.Contains(entries[0].Name(), string(request.Metadata.OperationID)) {
+		t.Fatalf("durable operation records = %v, want one digest-keyed record", entries)
+	}
+}
+
+func TestE2EPromptWriteAmbiguityLedgerSurvivesDirectRuntimeReplacement(t *testing.T) {
+	recorder := &sharedE2EPromptWriteFaultRecorder{consumed: make(map[harnessv2.OperationID]struct{})}
+	cfg, _ := newSessionIdentityTestConfig(t)
+	cfg.E2EPromptWriteAmbiguityMarker = testE2EPromptWriteAmbiguityMarker
+	cfg.E2EPromptWriteFaultRecorder = recorder
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := harnessv2.StartPromptRequest{
+		Metadata: harnessv2.MutationMetadata{OperationID: "operation-across-runtime-replacement"},
+		Input: harnessv2.PromptInput{Content: []harnessv2.ContentBlock{{
+			Type: harnessv2.ContentBlockText,
+			Text: "Reply exactly: " + testE2EPromptWriteAmbiguityMarker,
+		}}},
+	}
+	server.mu.Lock()
+	consumed, err := server.consumeE2EPromptWriteAmbiguityLocked(context.Background(), request, testE2EPromptWriteAmbiguityMarker)
+	server.mu.Unlock()
+	if err != nil || !consumed {
+		t.Fatalf("initial direct-pool fault consumption = (%v, %v), want consumed", consumed, err)
+	}
+	if server.e2ePromptWriteFaultDir != "" || server.e2ePromptWriteRecorder != recorder {
+		t.Fatalf("direct-pool recorder = dir %q recorder %T, want external recorder", server.e2ePromptWriteFaultDir, server.e2ePromptWriteRecorder)
+	}
+	closeIdentityTestSupervisor(t, server)
+
+	// A physical replacement receives a fresh emptyDir-backed SessionBaseDir.
+	// Only the controller-owned recorder survives that boundary.
+	restartedCfg, _ := newSessionIdentityTestConfig(t)
+	restartedCfg.E2EPromptWriteAmbiguityMarker = testE2EPromptWriteAmbiguityMarker
+	restartedCfg.E2EPromptWriteFaultRecorder = recorder
+	restarted, err := New(restartedCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeIdentityTestSupervisor(t, restarted) })
+	restarted.mu.Lock()
+	consumed, err = restarted.consumeE2EPromptWriteAmbiguityLocked(context.Background(), request, testE2EPromptWriteAmbiguityMarker)
+	restarted.mu.Unlock()
+	if err != nil || consumed {
+		t.Fatalf("replacement direct-pool fault consumption = (%v, %v), want already consumed", consumed, err)
+	}
+}
+
+type sharedE2EPromptWriteFaultRecorder struct {
+	mu       sync.Mutex
+	consumed map[harnessv2.OperationID]struct{}
+}
+
+func (r *sharedE2EPromptWriteFaultRecorder) Consume(_ context.Context, metadata harnessv2.MutationMetadata) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.consumed[metadata.OperationID]; ok {
+		return false, nil
+	}
+	r.consumed[metadata.OperationID] = struct{}{}
+	return true, nil
 }
 
 func TestSessionIdentityStateMissingWithStaleEntriesFailsClosed(t *testing.T) {

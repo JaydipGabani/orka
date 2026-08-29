@@ -1211,12 +1211,14 @@ func TestPromptStreamFailureClosesLifecycleBeforeOutcomeUnknown(t *testing.T) {
 
 func TestPromptTimeoutPersistsProvenCancellationSettlement(t *testing.T) {
 	for _, test := range []struct {
-		name         string
-		settlement   harnessv2.PromptSettlement
-		wantState    corev1alpha1.TaskExecutionState
-		wantReason   corev1alpha1.TaskExecutionReason
-		wantAttempt  store.PromptExecutionState
-		wantTerminal harnessv2.EventType
+		name           string
+		settlement     harnessv2.PromptSettlement
+		wantState      corev1alpha1.TaskExecutionState
+		wantReason     corev1alpha1.TaskExecutionReason
+		wantAttempt    store.PromptExecutionState
+		attemptReason  string
+		attemptMessage string
+		wantTerminal   harnessv2.EventType
 	}{
 		{
 			name: acpCancelledOperation,
@@ -1225,7 +1227,8 @@ func TestPromptTimeoutPersistsProvenCancellationSettlement(t *testing.T) {
 				StopReason: harnessv2.ACPStopReasonCancelled, SettledAt: time.Now().UTC(),
 			},
 			wantState: corev1alpha1.TaskExecutionStateCancelled, wantReason: acpTaskTimeoutReason,
-			wantAttempt: store.PromptExecutionCancelled, wantTerminal: harnessv2.EventCancelled,
+			wantAttempt: store.PromptExecutionCancelled, attemptReason: string(acpTaskTimeoutReason),
+			attemptMessage: acpTaskTimeoutCancellationSettledMessage, wantTerminal: harnessv2.EventCancelled,
 		},
 		{
 			name: acpPromptOutcomeFailed,
@@ -1262,8 +1265,13 @@ func TestPromptTimeoutPersistsProvenCancellationSettlement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if attempt.ExecutionState != test.wantAttempt {
-				t.Fatalf("timeout settlement attempt = %s, want %s", attempt.ExecutionState, test.wantAttempt)
+			if attempt.ExecutionState != test.wantAttempt || attempt.TerminalReason != test.attemptReason ||
+				attempt.OutcomeMarker != test.attemptMessage {
+				t.Fatalf(
+					"timeout settlement attempt = state %s reason %q message %q, want %s/%q/%q",
+					attempt.ExecutionState, attempt.TerminalReason, attempt.OutcomeMarker,
+					test.wantAttempt, test.attemptReason, test.attemptMessage,
+				)
 			}
 			fixture.assertTerminalLifecycle(t, test.wantTerminal, true)
 		})

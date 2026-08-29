@@ -965,6 +965,14 @@ rules:
   - list
   - watch
 - apiGroups:
+  - core.orka.ai
+  resources:
+  - sessions
+  verbs:
+  - delete
+  - get
+  - list
+- apiGroups:
   - discovery.k8s.io
   resources:
   - endpointslices
@@ -1251,6 +1259,12 @@ rules:
   - tasks/status
   verbs:
   - get
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - sessions
+  verbs:
+  - '*'
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -1278,6 +1292,14 @@ rules:
   - tasks/status
   verbs:
   - get
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - sessions
+  verbs:
+  - delete
+  - get
+  - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -1301,6 +1323,13 @@ rules:
   - tasks/status
   verbs:
   - get
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - sessions
+  verbs:
+  - get
+  - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

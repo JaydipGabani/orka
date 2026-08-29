@@ -68,6 +68,7 @@ const (
 	EnvFirstSessionUID           = "ORKA_ACP_FIRST_SESSION_UID"
 	EnvLastSessionUID            = "ORKA_ACP_LAST_SESSION_UID"
 	EnvSessionGID                = "ORKA_ACP_SESSION_GID"
+	EnvE2EPromptWriteAmbiguity   = "ORKA_ACP_E2E_PROMPT_WRITE_AMBIGUITY_MARKER"
 
 	openCodeProviderID          = "orka"
 	openCodeProviderEnvName     = "ORKA_OPENCODE_PROVIDER_TOKEN"
@@ -162,7 +163,8 @@ func LoadConfigFromEnv() (Config, error) {
 	}
 	workspaceMaterializer := EmptyWorkspaceMaterializer()
 	var artifactUploader ArtifactUploader
-	if artifactAPIURL := strings.TrimSpace(os.Getenv(EnvArtifactAPIURL)); artifactAPIURL != "" {
+	artifactAPIURL := strings.TrimSpace(os.Getenv(EnvArtifactAPIURL))
+	if artifactAPIURL != "" {
 		authorizationProvider, providerErr := NewBrokerArtifactAuthorizationProvider(
 			artifactAPIURL, requiredEnv(EnvTrustNamespace), controllerToken, []byte(capabilitySecret),
 		)
@@ -201,6 +203,17 @@ func LoadConfigFromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	durableWorkspaceDir := strings.TrimSpace(os.Getenv(EnvDurableWorkspaceDir))
+	e2ePromptWriteAmbiguityMarker := strings.TrimSpace(os.Getenv(EnvE2EPromptWriteAmbiguity))
+	var e2ePromptWriteFaultRecorder E2EPromptWriteFaultRecorder
+	if e2ePromptWriteAmbiguityMarker != "" && durableWorkspaceDir == "" {
+		e2ePromptWriteFaultRecorder, err = NewControllerE2EPromptWriteFaultRecorder(
+			mcpBrokerURL, requiredEnv(EnvTrustNamespace), controllerToken, []byte(capabilitySecret),
+		)
+		if err != nil {
+			return Config{}, err
+		}
+	}
 	providerToken, err := readRequiredSecret(EnvProviderTokenFile, EnvProviderTokenBootstrap)
 	if err != nil {
 		return Config{}, err
@@ -237,15 +250,17 @@ func LoadConfigFromEnv() (Config, error) {
 		Capabilities: capabilities, Provider: provider,
 		ControllerBearerToken: controllerToken, CapabilitySecret: []byte(capabilitySecret), RequireCapabilities: true,
 		SessionBaseDir:      envDefault(EnvSessionBaseDir, "/sessions"),
-		DurableWorkspaceDir: strings.TrimSpace(os.Getenv(EnvDurableWorkspaceDir)),
+		DurableWorkspaceDir: durableWorkspaceDir,
 		UIDAllocator:        allocator,
 		ProviderProxy: ProviderProxyConfig{
 			UpstreamBaseURL: providerUpstreamBaseURL(providerKind, providerBaseURL), UpstreamBearerToken: providerToken,
 			ProviderKind: providerKind, Model: model,
 		},
-		MCPBroker:             mcpBroker,
-		WorkspaceMaterializer: workspaceMaterializer,
-		ArtifactUploader:      artifactUploader,
+		MCPBroker:                     mcpBroker,
+		WorkspaceMaterializer:         workspaceMaterializer,
+		ArtifactUploader:              artifactUploader,
+		E2EPromptWriteFaultRecorder:   e2ePromptWriteFaultRecorder,
+		E2EPromptWriteAmbiguityMarker: e2ePromptWriteAmbiguityMarker,
 	}
 	cfg.ProviderProxy.ModelOutputLimit = modelOutputLimit
 	if err := cfg.Validate(); err != nil {

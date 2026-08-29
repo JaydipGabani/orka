@@ -2550,6 +2550,19 @@ type metadataOnlySessionStore struct {
 	getCalls   int
 }
 
+type sessionAccessRecordingStore struct {
+	store.SessionStore
+	typeReader  transcriptSessionTypeReader
+	listCalls   int
+	readCalls   int
+	deleteCalls int
+}
+
+func (s *sessionAccessRecordingStore) ListSessions(ctx context.Context, namespace string) ([]store.SessionMetadata, error) {
+	s.listCalls++
+	return s.SessionStore.ListSessions(ctx, namespace)
+}
+
 func (s *metadataOnlySessionStore) GetSession(ctx context.Context, namespace, name string) (*store.SessionRecord, error) {
 	s.getCalls++
 	return s.SessionStore.GetSession(ctx, namespace, name)
@@ -2557,6 +2570,21 @@ func (s *metadataOnlySessionStore) GetSession(ctx context.Context, namespace, na
 
 func (s *metadataOnlySessionStore) GetSessionType(ctx context.Context, namespace, name string) (string, error) {
 	return s.typeReader.GetSessionType(ctx, namespace, name)
+}
+
+func (s *sessionAccessRecordingStore) GetSession(ctx context.Context, namespace, name string) (*store.SessionRecord, error) {
+	s.readCalls++
+	return s.SessionStore.GetSession(ctx, namespace, name)
+}
+
+func (s *sessionAccessRecordingStore) GetSessionType(ctx context.Context, namespace, name string) (string, error) {
+	s.readCalls++
+	return s.typeReader.GetSessionType(ctx, namespace, name)
+}
+
+func (s *sessionAccessRecordingStore) DeleteSession(ctx context.Context, namespace, name string) error {
+	s.deleteCalls++
+	return s.SessionStore.DeleteSession(ctx, namespace, name)
 }
 
 func setupTestHandlersWithSessionManager() (*Handlers, *fiber.App, *sqlite.Store) {
@@ -2696,6 +2724,91 @@ func TestHandlers_ListSessions_WatchNamespace(t *testing.T) {
 }
 
 // --- GetSession tests ---
+
+func TestHandlers_SessionEndpointsRequireKubernetesRBACForTokenReviewUser(t *testing.T) {
+	const (
+		protectedSessionName = "protected-session"
+		sessionsPath         = "/sessions"
+		protectedSessionPath = sessionsPath + "/" + protectedSessionName
+	)
+	tests := []struct {
+		name         string
+		method       string
+		path         string
+		verb         string
+		resourceName string
+		allowed      bool
+		wantStatus   int
+	}{
+		{name: "list denied", method: http.MethodGet, path: sessionsPath, verb: gatewayVerbList, wantStatus: http.StatusForbidden},
+		{name: "list allowed", method: http.MethodGet, path: sessionsPath, verb: gatewayVerbList, allowed: true, wantStatus: http.StatusOK},
+		{name: "get denied", method: http.MethodGet, path: protectedSessionPath, verb: gatewayVerbGet, resourceName: protectedSessionName, wantStatus: http.StatusForbidden},
+		{name: "get allowed", method: http.MethodGet, path: protectedSessionPath, verb: gatewayVerbGet, resourceName: protectedSessionName, allowed: true, wantStatus: http.StatusOK},
+		{name: "events denied", method: http.MethodGet, path: protectedSessionPath + "/events", verb: gatewayVerbGet, resourceName: protectedSessionName, wantStatus: http.StatusForbidden},
+		{name: "stream denied", method: http.MethodGet, path: protectedSessionPath + "/stream", verb: gatewayVerbGet, resourceName: protectedSessionName, wantStatus: http.StatusForbidden},
+		{name: "delete denied", method: http.MethodDelete, path: protectedSessionPath, verb: "delete", resourceName: protectedSessionName, wantStatus: http.StatusForbidden},
+		{name: "delete allowed", method: http.MethodDelete, path: protectedSessionPath, verb: "delete", resourceName: protectedSessionName, allowed: true, wantStatus: http.StatusNoContent},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, corev1alpha1.AddToScheme(scheme))
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+			db, err := sqlite.NewDB(":memory:")
+			require.NoError(t, err)
+			ss := sqlite.NewStore(db, ":memory:")
+			t.Cleanup(func() { require.NoError(t, db.Close()) })
+			require.NoError(t, ss.CreateSession(context.Background(), &store.SessionRecord{
+				Namespace: "default", Name: protectedSessionName, SessionType: "task",
+			}))
+			require.NoError(t, ss.AppendMessages(context.Background(), "default", protectedSessionName, []store.SessionMessage{{
+				Role: testRoleUser, Content: "private prompt",
+			}}))
+			recordingStore := &sessionAccessRecordingStore{SessionStore: ss, typeReader: ss}
+			kubeClient := kubefake.NewSimpleClientset()
+			kubeClient.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				createAction := action.(k8stesting.CreateAction)
+				review := createAction.GetObject().(*authorizationv1.SubjectAccessReview)
+				require.Equal(t, "system:serviceaccount:default:limited", review.Spec.User)
+				require.Equal(t, []string{"system:serviceaccounts", "system:serviceaccounts:default"}, review.Spec.Groups)
+				require.NotNil(t, review.Spec.ResourceAttributes)
+				require.Equal(t, "default", review.Spec.ResourceAttributes.Namespace)
+				require.Equal(t, test.verb, review.Spec.ResourceAttributes.Verb)
+				require.Equal(t, corev1alpha1.GroupVersion.Group, review.Spec.ResourceAttributes.Group)
+				require.Equal(t, "sessions", review.Spec.ResourceAttributes.Resource)
+				require.Equal(t, test.resourceName, review.Spec.ResourceAttributes.Name)
+				review.Status.Allowed = test.allowed
+				return true, review, nil
+			})
+
+			handlers := NewHandlers(HandlersConfig{
+				Client: fakeClient, KubeClient: kubeClient, SessionStore: recordingStore, ResultStore: ss,
+			})
+			app := fiber.New()
+			app.Use(tokenReviewUserMiddleware(limitedTokenReviewUser("default")))
+			app.Get("/sessions", handlers.ListSessions)
+			app.Get("/sessions/:id", handlers.GetSession)
+			app.Get("/sessions/:id/events", handlers.ListSessionEvents)
+			app.Get("/sessions/:id/stream", handlers.StreamSessionEvents)
+			app.Delete("/sessions/:id", handlers.DeleteSession)
+
+			resp, err := app.Test(httptest.NewRequest(test.method, test.path, nil))
+			require.NoError(t, err)
+			require.Equal(t, test.wantStatus, resp.StatusCode)
+			if !test.allowed {
+				require.Zero(t, recordingStore.listCalls, "denied request must not list Session state")
+				require.Zero(t, recordingStore.readCalls, "denied request must not read Session state")
+				require.Zero(t, recordingStore.deleteCalls, "denied request must not delete Session state")
+			}
+			_, getErr := ss.GetSession(context.Background(), "default", protectedSessionName)
+			if test.method == http.MethodDelete && test.allowed {
+				require.ErrorIs(t, getErr, store.ErrNotFound)
+			} else {
+				require.NoError(t, getErr)
+			}
+		})
+	}
+}
 
 func TestHandlers_GetSession_Success(t *testing.T) {
 	handlers, app, ss := setupTestHandlersWithSessionManager()

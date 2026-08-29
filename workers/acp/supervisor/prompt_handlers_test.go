@@ -19,6 +19,8 @@ import (
 	"github.com/orka-agents/orka/internal/workspacedelta"
 )
 
+const testE2EPromptWriteAmbiguityMarker = "ORKA_E2E_WS_LC_AMBIGUOUS_OK"
+
 func TestPromptStreamErrorDetailIsBoundedAndSingleLine(t *testing.T) {
 	if got := promptStreamErrorDetail(fmt.Errorf("first\nsecond\rthird")); got != "first second third" {
 		t.Fatalf("single-line detail = %q", got)
@@ -26,6 +28,60 @@ func TestPromptStreamErrorDetailIsBoundedAndSingleLine(t *testing.T) {
 	detail := promptStreamErrorDetail(fmt.Errorf("%s界", strings.Repeat("x", 512)))
 	if !strings.HasSuffix(detail, "...") || len(strings.TrimSuffix(detail, "...")) > 512 || !utf8.ValidString(detail) {
 		t.Fatalf("bounded detail = %q (len=%d)", detail, len(detail))
+	}
+}
+
+func TestPromptContainsE2EWriteAmbiguityMarker(t *testing.T) {
+	marker := testE2EPromptWriteAmbiguityMarker
+	input := harnessv2.PromptInput{Content: []harnessv2.ContentBlock{
+		{Type: harnessv2.ContentBlockResourceLink, URI: "https://example.com/" + testE2EPromptWriteAmbiguityMarker},
+		{Type: harnessv2.ContentBlockText, Text: "Reply exactly: " + marker},
+	}}
+	if !promptContainsE2EWriteAmbiguityMarker(input, marker) {
+		t.Fatal("configured text marker was not detected")
+	}
+	if promptContainsE2EWriteAmbiguityMarker(input, "") {
+		t.Fatal("empty fault marker enabled the injection")
+	}
+	if promptContainsE2EWriteAmbiguityMarker(input, "ORKA_E2E_OTHER_OK") {
+		t.Fatal("unrelated marker enabled the injection")
+	}
+}
+
+func TestE2EPromptWriteAmbiguityIsOneShotPerOperation(t *testing.T) {
+	request := harnessv2.StartPromptRequest{
+		Metadata: harnessv2.MutationMetadata{OperationID: "operation-1"},
+		Input: harnessv2.PromptInput{Content: []harnessv2.ContentBlock{{
+			Type: harnessv2.ContentBlockText,
+			Text: "Reply exactly: " + testE2EPromptWriteAmbiguityMarker,
+		}}},
+	}
+	recorder := &sharedE2EPromptWriteFaultRecorder{consumed: make(map[harnessv2.OperationID]struct{})}
+	server := &Server{e2ePromptWriteRecorder: recorder}
+	consumed, err := server.consumeE2EPromptWriteAmbiguityLocked(context.Background(), request, testE2EPromptWriteAmbiguityMarker)
+	if err != nil || !consumed {
+		t.Fatal("first request did not consume the ambiguity fault")
+	}
+	consumed, err = server.consumeE2EPromptWriteAmbiguityLocked(context.Background(), request, testE2EPromptWriteAmbiguityMarker)
+	if err != nil || consumed {
+		t.Fatal("retry of the same operation consumed the ambiguity fault again")
+	}
+	request.Metadata.OperationID = "operation-2"
+	consumed, err = server.consumeE2EPromptWriteAmbiguityLocked(context.Background(), request, testE2EPromptWriteAmbiguityMarker)
+	if err != nil || !consumed {
+		t.Fatal("distinct operation did not receive its own ambiguity fault")
+	}
+	// RuntimeSession state may be discarded and recreated inside the same
+	// supervisor. The one-shot decision belongs to the external recorder.
+	consumed, err = server.consumeE2EPromptWriteAmbiguityLocked(context.Background(), request, testE2EPromptWriteAmbiguityMarker)
+	if err != nil || consumed {
+		t.Fatal("runtime Session recreation reset the process-local ambiguity ledger")
+	}
+
+	restartedServer := &Server{e2ePromptWriteRecorder: recorder}
+	consumed, err = restartedServer.consumeE2EPromptWriteAmbiguityLocked(context.Background(), request, testE2EPromptWriteAmbiguityMarker)
+	if err != nil || consumed {
+		t.Fatal("supervisor restart re-armed the external ambiguity ledger")
 	}
 }
 

@@ -104,6 +104,21 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, harnessv2.ErrorCodeInvalidRequest, err.Error(), nil, false)
 		return
 	}
+	injectWriteAmbiguity, faultErr := s.consumeE2EPromptWriteAmbiguityLocked(r.Context(), request, s.cfg.E2EPromptWriteAmbiguityMarker)
+	if faultErr != nil {
+		s.mu.Unlock()
+		slog.Error("record E2E prompt write ambiguity failed", "promptID", request.Metadata.PromptID, "error", faultErr)
+		writeError(
+			w, http.StatusInternalServerError, harnessv2.ErrorCodeSessionPoisoned,
+			"E2E prompt write ambiguity state failed", nil, false,
+		)
+		return
+	}
+	if injectWriteAmbiguity {
+		s.mu.Unlock()
+		slog.Warn("injecting E2E prompt write ambiguity", "promptID", request.Metadata.PromptID)
+		panic(http.ErrAbortHandler)
+	}
 	select {
 	case s.promptSlots <- struct{}{}:
 		slotHeld = true
@@ -318,6 +333,33 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 	s.finishPrompt(state, prompt, settledResult, terminal.Identity.Timestamp)
 	slotHeld = false
 	<-s.promptSlots
+}
+
+func promptContainsE2EWriteAmbiguityMarker(input harnessv2.PromptInput, marker string) bool {
+	if marker == "" {
+		return false
+	}
+	for _, block := range input.Content {
+		if block.Type == harnessv2.ContentBlockText && strings.Contains(block.Text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// consumeE2EPromptWriteAmbiguityLocked injects the test fault once for each
+// operation. A retry of the same HTTP mutation must proceed to the provider so
+// live conformance detects it through the provider request count. The caller
+// must hold s.mu.
+func (s *Server) consumeE2EPromptWriteAmbiguityLocked(
+	ctx context.Context,
+	request harnessv2.StartPromptRequest,
+	marker string,
+) (bool, error) {
+	if !promptContainsE2EWriteAmbiguityMarker(request.Input, marker) {
+		return false, nil
+	}
+	return s.consumeE2EPromptWriteFaultLocked(ctx, request.Metadata)
 }
 
 func promptTerminalDiagnostic(result acp.PromptResult) (string, string) {

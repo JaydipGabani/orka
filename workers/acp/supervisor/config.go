@@ -78,10 +78,20 @@ type Config struct {
 	WorkspaceMaterializer WorkspaceMaterializer
 	ArtifactUploader      ArtifactUploader
 	DeltaOptions          workspacedelta.Options
+	// E2EPromptWriteFaultRecorder persists direct-pool fault consumption
+	// outside the runtime Pod so replacement cannot re-arm the test fault.
+	E2EPromptWriteFaultRecorder E2EPromptWriteFaultRecorder
 
 	InitializeTimeout time.Duration
 	PermissionTimeout time.Duration
 	CancelGrace       time.Duration
+
+	// E2EPromptWriteAmbiguityMarker enables a test-only transport fault for an
+	// exact prompt marker. The supervisor aborts the first authenticated request
+	// for each operation after fully decoding and validating it, but before
+	// recording the operation. The one-shot record survives runtime and
+	// supervisor recreation so live conformance exposes an accidental retry.
+	E2EPromptWriteAmbiguityMarker string
 }
 
 func (c Config) Validate() error {
@@ -158,6 +168,20 @@ func (c Config) Validate() error {
 	}
 	if c.InitializeTimeout < 0 || c.PermissionTimeout < 0 || c.CancelGrace < 0 {
 		return fmt.Errorf("runtime timeouts must be non-negative")
+	}
+	if marker := c.E2EPromptWriteAmbiguityMarker; marker != "" {
+		if strings.TrimSpace(marker) != marker || len(marker) > 128 ||
+			!strings.HasPrefix(marker, "ORKA_E2E_") || !strings.HasSuffix(marker, "_OK") {
+			return fmt.Errorf("E2E prompt write ambiguity marker must be an ORKA_E2E_*_OK token")
+		}
+		for _, value := range marker {
+			if (value < 'A' || value > 'Z') && (value < '0' || value > '9') && value != '_' {
+				return fmt.Errorf("E2E prompt write ambiguity marker must contain only uppercase ASCII letters, digits, and underscores")
+			}
+		}
+		if c.DurableWorkspaceDir == "" && c.E2EPromptWriteFaultRecorder == nil {
+			return fmt.Errorf("E2E prompt write fault recorder is required without a durable workspace")
+		}
 	}
 	return nil
 }

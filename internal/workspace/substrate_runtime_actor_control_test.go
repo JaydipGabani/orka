@@ -7,6 +7,7 @@ MIT License - see LICENSE file for details.
 package workspace
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -82,6 +83,21 @@ func TestSubstrateRuntimeActorVerifiedDataSnapshotFence(t *testing.T) {
 	actor.DataSnapshot.ContentScope = SubstrateSnapshotContentScopeFull
 	if _, _, err := actor.VerifiedDataSnapshotFence(actorID); err == nil || !strings.Contains(err.Error(), "not Data") {
 		t.Fatalf("Full snapshot verification error = %v, want Data-scope refusal", err)
+	}
+}
+
+func TestSubstrateRuntimeActorControlDoesNotAdvertiseCreateRecoverySettlement(t *testing.T) {
+	provider := &recordingSubstrateControlClient{}
+	control := &substrateRuntimeActorControl{control: provider}
+	if control.ActorCreateRecoveryAttestationSupported() {
+		t.Fatal("production actor control advertised unsupported create recovery attestation")
+	}
+	settled, err := control.ConfirmActorCreationSettled(context.Background(), "actor-1")
+	if settled || err == nil || !strings.Contains(err.Error(), "operation-level") {
+		t.Fatalf("ConfirmActorCreationSettled() = (%v, %v), want fail-closed unsupported error", settled, err)
+	}
+	if provider.listActorsCalls != 0 || provider.getCalls != 0 {
+		t.Fatalf("unsupported settlement performed provider reads: list=%d get=%d", provider.listActorsCalls, provider.getCalls)
 	}
 }
 

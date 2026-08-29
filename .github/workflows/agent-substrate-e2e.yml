@@ -23,6 +23,7 @@ on:
       - "internal/**"
       - "pkg/**"
       - "scripts/agent-substrate-e2e.sh"
+      - "scripts/fixtures/openai-responses/**"
       - "scripts/lib/e2e-admission-tls.sh"
       - "scripts/lib/ensure-static-mode-namespace.sh"
       - "workers/**"
@@ -41,6 +42,7 @@ on:
       - "internal/**"
       - "pkg/**"
       - "scripts/agent-substrate-e2e.sh"
+      - "scripts/fixtures/openai-responses/**"
       - "scripts/lib/e2e-admission-tls.sh"
       - "scripts/lib/ensure-static-mode-namespace.sh"
       - "workers/**"
@@ -55,7 +57,7 @@ concurrency:
 jobs:
   agent-substrate-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 140
+    timeout-minutes: 170
     env:
       KIND_CLUSTER: orka-agent-substrate-e2e
       KO_VERSION: v0.18.1

@@ -20,6 +20,8 @@ expected_router_paths="$(printf '%s\n' \
   cmd/servers/atenet/app/router/envoyrunner.go \
   cmd/servers/atenet/app/router/extproc_in.go \
   cmd/servers/atenet/app/router/extproc_in_test.go \
+  cmd/servers/atenet/app/router/xds.go \
+  cmd/servers/atenet/app/router/xds_test.go \
   manifests/ate-install/atenet-router.yaml | LC_ALL=C sort)"
 [[ "${router_paths}" == "${expected_router_paths}" ]] || {
   echo "router patch paths differ from the reviewed scope" >&2
@@ -38,6 +40,8 @@ expected_ateom_paths="$(printf '%s\n' \
 grep -F 'SUBSTRATE_ATENET_EXTPROC_IN_BLOB="317511845fef40b7602861383f7664e915215a69"' "${e2e}" >/dev/null
 grep -F 'SUBSTRATE_ATENET_ENVOY_RUNNER_BLOB="8d38be29f09a7ce23886b71a051586354c8413e5"' "${e2e}" >/dev/null
 grep -F 'SUBSTRATE_ATENET_MANIFEST_BLOB="e309cad0a2e8435d1ed8dfd51ce347ab4f5a7521"' "${e2e}" >/dev/null
+grep -F 'SUBSTRATE_ATENET_XDS_BLOB="20ce920de816c885e4614c4f723e75a6c2b74d8d"' "${e2e}" >/dev/null
+grep -F 'SUBSTRATE_ATENET_XDS_TEST_BLOB="189914c245d13eeec19293d08258fcd8c27676e7"' "${e2e}" >/dev/null
 grep -F 'SUBSTRATE_ATEOM_RUNSC_BLOB="6db499a549f2b6987a867b144e8d6b3828cad9ff"' "${e2e}" >/dev/null
 grep -F 'apply_substrate_atenet_authorization_redaction_patch' "${e2e}" >/dev/null
 grep -F 'apply_substrate_ateom_delete_recovery_patch' "${e2e}" >/dev/null
@@ -48,6 +52,10 @@ grep -F 'if !isSafeRequestMetadataHeader(k) {' "${router_patch}" >/dev/null
 grep -F 'url.ParseRequestURI(value)' "${router_patch}" >/dev/null
 grep -F 'credential headers and query values are omitted' "${router_patch}" >/dev/null
 grep -F 'TestRequestMetadataStringOnlyIncludesSafeRoutingMetadata' "${router_patch}" >/dev/null
+grep -F 'func digestRequestID(value string) string {' "${router_patch}" >/dev/null
+grep -F 'TestRequestIDDigestSupportsBothHeaderRepresentations' "${router_patch}" >/dev/null
+grep -F 'headerFreeAccessLog  = ' "${router_patch}" >/dev/null
+grep -F 'assertHeaderFreeAccessLogs(t, listenersMap)' "${router_patch}" >/dev/null
 for covered_value in Authorization Proxy-Authorization Txn-Token Cookie X-API-Key RawValue test-token-placeholder; do
   grep -F "${covered_value}" "${router_patch}" >/dev/null || {
     echo "router patch lacks ${covered_value} coverage" >&2
@@ -59,6 +67,11 @@ if grep -Eq '^\+.*(redactedHeaderValue|sanitizeRequestHeaderValue)' "${router_pa
   exit 1
 fi
 grep -F 'upstream:info,router:info,ext_proc:info' "${router_patch}" >/dev/null
+grep -F 'request_id_digest="sha256:$(printf' "${e2e}" >/dev/null
+grep -F 'atenet-router leaked a raw request ID in its logs' "${e2e}" >/dev/null
+grep -F 'request audit digest while omitting raw request metadata and credentials' "${e2e}" >/dev/null
+grep -F 'Timeout: durationpb.New(0), // Disable route timeout for streaming responses.' "${router_patch}" >/dev/null
+grep -F 'Expected streaming route timeout to be disabled' "${router_patch}" >/dev/null
 if grep -Fq 'upstream:debug,router:debug,ext_proc:debug' <(grep '^+' "${router_patch}" || true); then
   echo 'router patch adds credential-bearing Envoy debug logging' >&2
   exit 1
@@ -87,7 +100,7 @@ cluster_health_line="$(grep -nF 'health_summary="$(cluster_health)"' "${installe
 }
 
 # Exercise retained-cluster marker matching with command stubs. A marker written
-# before the Envoy info-level fix carried only the old pinned-hardening string;
+# before the current router hardening carried only the old pinned-hardening string;
 # it must fail closed rather than silently accepting stale router logging.
 marker_fixture="$(mktemp -d "${TMPDIR:-/tmp}/agent-substrate-marker-test.XXXXXX")"
 fake_bin="${marker_fixture}/bin"
