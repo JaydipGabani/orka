@@ -185,6 +185,26 @@ func acpRuntimePoolWorkspaceMatchesPlan(pool *corev1alpha1.RuntimePool, plan ACP
 	}
 	switch plan.Workspace.Provider {
 	case corev1alpha1.WorkspaceProviderAgentSandbox:
+		planSuspendMode := ""
+		var planVolume *ACPSandboxDurableVolume
+		if plan.Workspace.Class != nil {
+			planSuspendMode = plan.Workspace.Class.SuspendMode
+			planVolume = plan.Workspace.Class.SandboxVolume
+		}
+		if planVolume == nil {
+			if workspace.AgentSandbox != nil {
+				return false
+			}
+		} else {
+			sandbox := workspace.AgentSandbox
+			if sandbox == nil || sandbox.SuspendMode != planSuspendMode || sandbox.SuspendVolume == nil ||
+				sandbox.SuspendVolume.StorageClassName != planVolume.StorageClassName ||
+				sandbox.SuspendVolume.StorageClassUID != planVolume.StorageClassUID ||
+				sandbox.SuspendVolume.Capacity != planVolume.Capacity ||
+				!slices.Equal(sandbox.SuspendVolume.AccessModes, planVolume.AccessModes) {
+				return false
+			}
+		}
 		return workspace.Substrate == nil &&
 			plan.Workspace.TemplateNamespace == "" && plan.Workspace.TemplateName == ""
 	case corev1alpha1.WorkspaceProviderSubstrate:
@@ -192,7 +212,10 @@ func acpRuntimePoolWorkspaceMatchesPlan(pool *corev1alpha1.RuntimePool, plan ACP
 		if plan.Workspace.Class != nil {
 			planSuspendMode = plan.Workspace.Class.SuspendMode
 		}
-		return workspace.Substrate != nil &&
+		// A stray agentSandbox block on a substrate pool is drift the CRD
+		// cannot express away; reject it so cross-provider suspend settings
+		// can never be smuggled onto a mismatched backend.
+		return workspace.AgentSandbox == nil && workspace.Substrate != nil &&
 			workspace.Substrate.BaseTemplateNamespace == plan.Workspace.TemplateNamespace &&
 			workspace.Substrate.BaseTemplateName == plan.Workspace.TemplateName &&
 			workspace.Substrate.SuspendMode == planSuspendMode

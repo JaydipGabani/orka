@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -40,6 +41,11 @@ const acpWorkspaceAdapterRequeue = 2 * time.Second
 type ACPExecutionWorkspaceAdapterReconciler struct {
 	client.Client
 	APIReader client.Reader
+	// RuntimeNamespace is the controller-configured ACP runtime namespace
+	// where workspace-backed pools place their provider children (the
+	// SandboxClaim and its realized durable PVC); empty means the workspace
+	// namespace.
+	RuntimeNamespace string
 }
 
 //nolint:gocyclo // The adapter state machine keeps every desired-state branch auditable in one place.
@@ -80,6 +86,77 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) Reconcile(ctx context.Context, 
 		// enforce even while the provider object is unavailable.
 		return r.reconcileExpiredACPWorkspace(ctx, workspace)
 	}
+	// A detach can race the linked pool becoming unavailable. For resumed
+	// lineages, inspect the sole data-bearing pool before the revocation
+	// bypass publishes Ready; otherwise a coalesced pool and detach event can
+	// leave a degraded workspace reusable with no follow-up reconcile.
+	if exact && workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredReady &&
+		workspaceNeedsAttachmentRevocation(workspace) &&
+		workspace.Annotations[acpWorkspaceResumedLineageAnnotation] == booleanTrueValue {
+		pool, foreign, poolErr := r.linkedRuntimePool(ctx, workspace)
+		if poolErr != nil {
+			return ctrl.Result{}, poolErr
+		}
+		if pool == nil || foreign {
+			return ctrl.Result{}, r.patchWorkspaceStatus(ctx, workspace, func(status *workspacev1alpha1.ExecutionWorkspaceStatus) {
+				status.ObservedGeneration = workspace.Generation
+				status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
+				status.AttachedEpoch = 0
+				workspaceprovider.SetCondition(&status.Conditions, metav1.Condition{
+					Type: string(workspacev1alpha1.ConditionWorkspaceAttached), Status: metav1.ConditionFalse,
+					Reason:             string(workspacev1alpha1.ReasonAttachmentRevoked),
+					Message:            "attachment intent was revoked; the linked resumed workspace pool is gone",
+					ObservedGeneration: workspace.Generation,
+				})
+				workspaceprovider.SetCondition(&status.Conditions, metav1.Condition{
+					Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: metav1.ConditionFalse,
+					Reason:             string(workspacev1alpha1.ReasonCleanupFailed),
+					Message:            "the suspended workspace's linked pool is gone; the data checkpoint is unrecoverable and cold resume fails closed",
+					ObservedGeneration: workspace.Generation,
+				})
+			})
+		}
+		if strings.TrimSpace(pool.Annotations[runtimePoolWorkspaceResumeLostAnnotation]) != "" {
+			return ctrl.Result{}, r.patchWorkspaceStatus(ctx, workspace, func(status *workspacev1alpha1.ExecutionWorkspaceStatus) {
+				status.ObservedGeneration = workspace.Generation
+				status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
+				status.AttachedEpoch = 0
+				workspaceprovider.SetCondition(&status.Conditions, metav1.Condition{
+					Type: string(workspacev1alpha1.ConditionWorkspaceAttached), Status: metav1.ConditionFalse,
+					Reason:             string(workspacev1alpha1.ReasonAttachmentRevoked),
+					Message:            "attachment intent was revoked; the resumed workspace data is unrecoverable",
+					ObservedGeneration: workspace.Generation,
+				})
+				workspaceprovider.SetCondition(&status.Conditions, metav1.Condition{
+					Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: metav1.ConditionFalse,
+					Reason:             string(workspacev1alpha1.ReasonCleanupFailed),
+					Message:            "the suspended workspace's durable data is unrecoverable; cold resume fails closed",
+					ObservedGeneration: workspace.Generation,
+				})
+			})
+		}
+		if !runtimePoolWorkspaceResumeSettled(pool, foreign) {
+			message := "the resumed workspace pool is not Serving and Accepting; workspace admission remains withdrawn until the exact durable lineage recovers"
+			return ctrl.Result{RequeueAfter: acpWorkspaceAdapterRequeue}, r.patchWorkspaceStatus(ctx, workspace,
+				func(status *workspacev1alpha1.ExecutionWorkspaceStatus) {
+					status.ObservedGeneration = workspace.Generation
+					status.State = workspacev1alpha1.ExecutionWorkspaceStateProvisioning
+					status.AttachedEpoch = 0
+					workspaceprovider.SetCondition(&status.Conditions, metav1.Condition{
+						Type: string(workspacev1alpha1.ConditionWorkspaceAttached), Status: metav1.ConditionFalse,
+						Reason:             string(workspacev1alpha1.ReasonProgressing),
+						Message:            message,
+						ObservedGeneration: workspace.Generation,
+					})
+					workspaceprovider.SetCondition(&status.Conditions, metav1.Condition{
+						Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: metav1.ConditionFalse,
+						Reason:             string(workspacev1alpha1.ReasonProgressing),
+						Message:            message,
+						ObservedGeneration: workspace.Generation,
+					})
+				})
+		}
+	}
 	// Attachment revocation must converge even while re-admission for the
 	// bumped generation is still pending, mirroring the core controller's
 	// revocation bypass; otherwise detach and re-admission deadlock.
@@ -114,6 +191,7 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) Reconcile(ctx context.Context, 
 
 	switch workspace.Spec.DesiredState {
 	case workspacev1alpha1.ExecutionWorkspaceDesiredReady:
+		resumedLineage := workspace.Annotations[acpWorkspaceResumedLineageAnnotation] == booleanTrueValue
 		if workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateFailed {
 			// A failed cold resume is terminal while DesiredState stays
 			// Ready: overwriting it with Ready would let a continuation
@@ -125,9 +203,9 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) Reconcile(ctx context.Context, 
 			return ctrl.Result{}, poolErr
 		} else if pool != nil && !foreign &&
 			strings.TrimSpace(pool.Annotations[runtimePoolWorkspaceResumeLostAnnotation]) != "" {
-			// The pool proved the durable data unrecoverable; the workspace
-			// fails closed instead of resuming against a silently
-			// re-materialized volume.
+			// The pool proved the durable data unrecoverable during cold
+			// resume; the workspace fails closed instead of resuming against
+			// a silently re-materialized volume.
 			return ctrl.Result{}, r.patchWorkspaceStatus(ctx, workspace, func(status *workspacev1alpha1.ExecutionWorkspaceStatus) {
 				status.ObservedGeneration = workspace.Generation
 				status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
@@ -142,7 +220,7 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) Reconcile(ctx context.Context, 
 		}
 		if workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateSuspended ||
 			workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateSuspending ||
-			workspace.Annotations[acpWorkspaceResumedLineageAnnotation] == booleanTrueValue {
+			resumedLineage {
 			if pool, foreign, poolErr := r.linkedRuntimePool(ctx, workspace); poolErr != nil {
 				return ctrl.Result{}, poolErr
 			} else if pool == nil || foreign {
@@ -166,6 +244,54 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) Reconcile(ctx context.Context, 
 		}
 		if requeue, err := r.driveLinkedRuntimePoolResume(ctx, workspace); err != nil || requeue {
 			return ctrl.Result{RequeueAfter: acpWorkspaceAdapterRequeue}, err
+		}
+		resumingState := workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateSuspended ||
+			workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateSuspending
+		if resumingState || resumedLineage {
+			// The suspend intent was just lifted, but the cold resume is not
+			// done: the pool may still be Stopped or Starting, the provider
+			// checkpoint record may still stand, and the resumed Pod has not
+			// passed materialization, credential bootstrap, or the
+			// authenticated Serving fence. Publishing Ready here would let a
+			// Task attach and dispatch before the preserved data is actually
+			// being served; hold the workspace in Provisioning until the
+			// linked pool is observed Serving and Accepting with its
+			// checkpoint consent retired.
+			pool, foreign, poolErr := r.linkedRuntimePool(ctx, workspace)
+			if poolErr != nil {
+				return ctrl.Result{}, poolErr
+			}
+			resumeSettled := runtimePoolWorkspaceResumeSettled(pool, foreign)
+			if !resumeSettled {
+				heldState := workspace.Status.State
+				message := "cold resume is in progress; the workspace becomes Ready once the resumed pool serves the preserved data"
+				if !resumingState {
+					// A previously Ready or Attached resumed lineage must withdraw
+					// admission whenever its sole data-bearing pool stops serving.
+					// Provisioning is reversible if the exact pool recovers; a
+					// definitive lineage-loss annotation above makes it Failed.
+					heldState = workspacev1alpha1.ExecutionWorkspaceStateProvisioning
+					message = "the resumed workspace pool is not Serving and Accepting; workspace admission remains withdrawn until the exact durable lineage recovers"
+				}
+				return ctrl.Result{RequeueAfter: acpWorkspaceAdapterRequeue}, r.patchWorkspaceStatus(ctx, workspace,
+					func(status *workspacev1alpha1.ExecutionWorkspaceStatus) {
+						status.ObservedGeneration = workspace.Generation
+						status.State = heldState
+						status.AttachedEpoch = 0
+						workspaceprovider.SetCondition(&status.Conditions, metav1.Condition{
+							Type: string(workspacev1alpha1.ConditionWorkspaceAttached), Status: metav1.ConditionFalse,
+							Reason:             string(workspacev1alpha1.ReasonProgressing),
+							Message:            message,
+							ObservedGeneration: workspace.Generation,
+						})
+						workspaceprovider.SetCondition(&status.Conditions, metav1.Condition{
+							Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: metav1.ConditionFalse,
+							Reason:             string(workspacev1alpha1.ReasonProgressing),
+							Message:            message,
+							ObservedGeneration: workspace.Generation,
+						})
+					})
+			}
 		}
 		result := ctrl.Result{}
 		if lifetimeBounded {
@@ -208,6 +334,15 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) Reconcile(ctx context.Context, 
 	}
 }
 
+func runtimePoolWorkspaceResumeSettled(pool *corev1alpha1.RuntimePool, foreign bool) bool {
+	return pool != nil && !foreign &&
+		pool.Status.Lifecycle == corev1alpha1.RuntimePoolLifecycleServing &&
+		pool.Status.AdmissionState == corev1alpha1.RuntimePoolAdmissionAccepting &&
+		pool.Status.ObservedGeneration == pool.Generation &&
+		strings.TrimSpace(pool.Annotations[sandboxSuspendedAnnotation]) == "" &&
+		strings.TrimSpace(pool.Annotations[substrateActorSuspendedAnnotation]) == ""
+}
+
 // reconcileSuspension drives a requested data-only suspension through the
 // linked RuntimePool and reports sanitized progress. The pool backend owns
 // every provider call; this adapter only records the intent and observes the
@@ -220,9 +355,7 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) reconcileSuspension(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if foreign || pool == nil ||
-		pool.Spec.ExecutionWorkspace == nil || pool.Spec.ExecutionWorkspace.Substrate == nil ||
-		pool.Spec.ExecutionWorkspace.Substrate.SuspendMode == "" {
+	if foreign || pool == nil || !runtimePoolWorkspaceSuspendCapable(pool) {
 		// No suspend-capable physical runtime backs this workspace; nothing
 		// durable exists to resume into, so the suspension fails closed.
 		return ctrl.Result{}, r.patchWorkspaceStatus(ctx, workspace, func(status *workspacev1alpha1.ExecutionWorkspaceStatus) {
@@ -233,6 +366,24 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) reconcileSuspension(
 				Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: metav1.ConditionFalse,
 				Reason:             string(workspacev1alpha1.ReasonCleanupFailed),
 				Message:            "no suspend-capable linked RuntimePool backs this workspace; the requested suspension cannot preserve data",
+				ObservedGeneration: workspace.Generation,
+			})
+		})
+	}
+	if strings.TrimSpace(pool.Annotations[runtimePoolWorkspaceResumeLostAnnotation]) != "" {
+		// The backend declared the checkpoint unsettleable (for example the
+		// provider accepted the suspension but never settled it within the
+		// bounded window): the workspace fails closed instead of holding
+		// Suspending forever while continuations queue behind it. The
+		// durable claim stays preserved by the standing consent record.
+		return ctrl.Result{}, r.patchWorkspaceStatus(ctx, workspace, func(status *workspacev1alpha1.ExecutionWorkspaceStatus) {
+			status.ObservedGeneration = workspace.Generation
+			status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
+			status.AttachedEpoch = 0
+			workspaceprovider.SetCondition(&status.Conditions, metav1.Condition{
+				Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: metav1.ConditionFalse,
+				Reason:             string(workspacev1alpha1.ReasonCleanupFailed),
+				Message:            "the data-only checkpoint could not settle; the suspension fails closed with any durable volume preserved",
 				ObservedGeneration: workspace.Generation,
 			})
 		})
@@ -259,7 +410,7 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) reconcileSuspension(
 	}
 	settled := pool.Status.Lifecycle == corev1alpha1.RuntimePoolLifecycleStopped &&
 		pool.Status.ObservedGeneration == pool.Generation
-	consent := substrateActorHasAcceptedSuspension(pool)
+	consent := runtimePoolWorkspaceSuspendConsentRecorded(pool)
 	switch {
 	case settled && consent:
 		// The stopped pool produces no further status events, so the settled
@@ -316,7 +467,7 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) driveLinkedRuntimePoolResume(
 	if err != nil || foreign || pool == nil {
 		return false, err
 	}
-	if strings.TrimSpace(pool.Annotations[substrateWorkspaceSuspendAnnotation]) == "" {
+	if !runtimePoolWorkspaceSuspendIntentSet(pool) {
 		return false, nil
 	}
 	return r.patchLinkedPoolSuspendIntent(ctx, pool, false)
@@ -363,18 +514,22 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) patchLinkedPoolSuspendIntent(
 	if suspend {
 		desiredReplicas = 0
 	}
-	intentSet := strings.TrimSpace(pool.Annotations[substrateWorkspaceSuspendAnnotation]) != ""
-	if intentSet == suspend && pool.Spec.DesiredReplicas == desiredReplicas {
+	intentSet := runtimePoolWorkspaceSuspendIntentSet(pool)
+	legacySet := strings.TrimSpace(pool.Annotations[runtimePoolLegacySubstrateSuspendAnnotation]) != ""
+	if intentSet == suspend && !legacySet && pool.Spec.DesiredReplicas == desiredReplicas {
 		return false, nil
 	}
 	base := pool.DeepCopy()
 	if pool.Annotations == nil {
 		pool.Annotations = map[string]string{}
 	}
+	// Every intent write migrates the legacy substrate spelling to the shared
+	// key so recognition of the old key can eventually retire.
+	delete(pool.Annotations, runtimePoolLegacySubstrateSuspendAnnotation)
 	if suspend {
-		pool.Annotations[substrateWorkspaceSuspendAnnotation] = booleanTrueValue
+		pool.Annotations[runtimePoolWorkspaceSuspendAnnotation] = booleanTrueValue
 	} else {
-		delete(pool.Annotations, substrateWorkspaceSuspendAnnotation)
+		delete(pool.Annotations, runtimePoolWorkspaceSuspendAnnotation)
 	}
 	pool.Spec.DesiredReplicas = desiredReplicas
 	if err := r.Patch(ctx, pool, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
@@ -523,6 +678,19 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) reconcileMaintenance(
 				status.State = workspacev1alpha1.ExecutionWorkspaceStateDeleting
 			})
 	}
+	if gone, pvcErr := r.durableWorkspacePVCGone(ctx, workspace); pvcErr != nil {
+		return ctrl.Result{}, pvcErr
+	} else if !gone {
+		// The pool is gone but background garbage collection has not removed
+		// the realized durable PVC yet (a protection finalizer or CSI delay
+		// can hold it). The deletion guarantee must not be published while
+		// repository data can still exist; hold the finalizer instead.
+		return ctrl.Result{RequeueAfter: acpWorkspaceAdapterRequeue}, r.patchWorkspaceStatus(ctx, workspace,
+			func(status *workspacev1alpha1.ExecutionWorkspaceStatus) {
+				status.ObservedGeneration = workspace.Generation
+				status.State = workspacev1alpha1.ExecutionWorkspaceStateDeleting
+			})
+	}
 	credentialsGone, err := r.ensureACPWorkspaceAttachmentCredentialsDeleted(ctx, workspace)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -543,16 +711,28 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) reconcileMaintenance(
 			})
 		})
 	}
-	// A pool rendered from a frozen DataOnly profile has a provider-owned
-	// DurableDir even when the class allows only Delete. Once teardown
-	// succeeds the terminal audit record affirms both deletions instead of
-	// reporting NotApplicable.
-	persistentVolumes := workspacev1alpha1.DispositionNotApplicable
+	// A suspend-capable class produced real durable artifacts; once teardown
+	// succeeds the terminal audit record affirms their deletion instead of
+	// reporting NotApplicable. Substrate preserves data in a provider
+	// checkpoint backed by a DurableDir; agent-sandbox preserves it in a
+	// durable workspace PVC.
 	checkpoints := workspacev1alpha1.DispositionNotApplicable
-	if workspace.Annotations[acpWorkspaceBackendAnnotation] == string(corev1alpha1.WorkspaceProviderSubstrate) &&
-		workspace.Annotations[acpWorkspaceSuspendModeAnnotation] == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) {
-		persistentVolumes = workspacev1alpha1.DispositionDeleted
-		checkpoints = workspacev1alpha1.DispositionDeleted
+	persistentVolumes := workspacev1alpha1.DispositionNotApplicable
+	// The frozen durable-capability record, not the allowed detach actions,
+	// decides the disposition: a profile can provision the durable PVC while
+	// the class allows only Delete, and allowing Suspend without a suspension
+	// profile provisions nothing.
+	switch workspace.Annotations[acpWorkspaceBackendAnnotation] {
+	case string(acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox):
+		if workspace.Annotations[acpWorkspaceDurableAnnotation] == booleanTrueValue {
+			persistentVolumes = workspacev1alpha1.DispositionDeleted
+		}
+	case string(acpworkspacev1alpha1.RuntimeProviderBackendSubstrate):
+		if workspace.Annotations[acpWorkspaceDurableAnnotation] == booleanTrueValue ||
+			workspace.Annotations[acpWorkspaceSuspendModeAnnotation] == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) {
+			persistentVolumes = workspacev1alpha1.DispositionDeleted
+			checkpoints = workspacev1alpha1.DispositionDeleted
+		}
 	}
 	return ctrl.Result{}, r.patchWorkspaceStatus(ctx, workspace, func(status *workspacev1alpha1.ExecutionWorkspaceStatus) {
 		status.ObservedGeneration = workspace.Generation
@@ -574,6 +754,107 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) reconcileMaintenance(
 			ObservedGeneration: workspace.Generation,
 		})
 	})
+}
+
+// durableWorkspacePVCGone proves through the uncached reader that the
+// realized durable workspace PVC of a durable agent-sandbox workspace no
+// longer exists. Non-durable and substrate workspaces have no realized PVC
+// and report gone immediately.
+func (r *ACPExecutionWorkspaceAdapterReconciler) durableWorkspacePVCGone(
+	ctx context.Context,
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+) (bool, error) {
+	// The controller-owned durable metadata is admission-protected (the
+	// workspace ValidatingAdmissionPolicy denies unauthorized changes to the
+	// acp.workspace.orka.ai/ annotations), but deletion proof still fails
+	// closed on inconsistency.
+	suspendPermitted := slices.Contains(workspace.Spec.Lifecycle.AllowedOnDetach, workspacev1alpha1.WorkspaceOnDetachSuspend)
+	backend := workspace.Annotations[acpWorkspaceBackendAnnotation]
+	durableValue, durablePresent := workspace.Annotations[acpWorkspaceDurableAnnotation]
+	if durablePresent && durableValue != booleanTrueValue {
+		return false, fmt.Errorf(
+			"workspace %s has invalid controller-owned durable-workspace metadata %q; refusing to prove durable cleanup",
+			workspace.Name,
+			durableValue,
+		)
+	}
+	durable := durablePresent
+	if backend == "" && (suspendPermitted || durable) {
+		return false, fmt.Errorf(
+			"durable workspace %s lost its controller-owned backend metadata; refusing to prove durable cleanup",
+			workspace.Name,
+		)
+	}
+	if !durable {
+		if suspendPermitted && backend == string(acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox) {
+			// An agent-sandbox class permitting Suspend always materializes a
+			// durable volume; a missing durable marker cannot prove absence.
+			return false, fmt.Errorf(
+				"suspend-capable agent-sandbox workspace %s lost its durable-workspace metadata; refusing to prove durable cleanup",
+				workspace.Name,
+			)
+		}
+		return true, nil
+	}
+	if backend != string(acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox) {
+		if backend == string(acpworkspacev1alpha1.RuntimeProviderBackendSubstrate) {
+			return true, nil
+		}
+		return false, fmt.Errorf(
+			"durable workspace %s has invalid controller-owned backend metadata %q; refusing to prove durable cleanup",
+			workspace.Name,
+			backend,
+		)
+	}
+	poolName := strings.TrimSpace(workspace.Annotations[acpExecutionWorkspacePoolAnnotation])
+	if poolName == "" {
+		return false, fmt.Errorf(
+			"durable workspace %s lost its RuntimePool link metadata; refusing to prove durable cleanup",
+			workspace.Name,
+		)
+	}
+	// The namespace frozen at creation wins: the controller's current
+	// --acp-runtime-namespace may have changed since, and probing the wrong
+	// namespace would prove a false NotFound while the original PVC lives on.
+	// An absent frozen annotation means the workspace was created when the
+	// runtime-namespace flag was empty - provider children lived in the
+	// workspace namespace. Probing the controller's CURRENT flag value
+	// instead could observe a false NotFound in a namespace the original
+	// PVC never lived in and finalize while the repository data remains.
+	pvcNamespace := strings.TrimSpace(workspace.Annotations[acpWorkspaceRuntimeNamespaceAnnotation])
+	if pvcNamespace == "" {
+		pvcNamespace = workspace.Namespace
+	}
+	claimName := runtimePoolSandboxClaimName(runtimePoolResourceName(workspace.Namespace, poolName))
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	pvcName := durableWorkspacePVCName(claimName)
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := reader.Get(ctx, types.NamespacedName{Namespace: pvcNamespace, Name: pvcName}, pvc)
+	if apierrors.IsNotFound(err) {
+		// PVC removal only initiates asynchronous PV/CSI cleanup under Delete
+		// reclaim semantics: a delayed or failed volume deletion leaves
+		// repository data on the backing PersistentVolume after the claim is
+		// gone. Deletion is proven only once no PV still references the
+		// claim.
+		pvs := &corev1.PersistentVolumeList{}
+		if listErr := reader.List(ctx, pvs); listErr != nil {
+			return false, fmt.Errorf("prove durable workspace PersistentVolume deletion: %w", listErr)
+		}
+		for i := range pvs.Items {
+			claimRef := pvs.Items[i].Spec.ClaimRef
+			if claimRef != nil && claimRef.Namespace == pvcNamespace && claimRef.Name == pvcName {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("prove durable workspace PVC deletion: %w", err)
+	}
+	return false, nil
 }
 
 // ensureACPWorkspaceAttachmentCredentialsDeleted removes and then proves the

@@ -73,9 +73,6 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 	if err := validateACPWorkspacePreflight(frozenTask); err != nil {
 		return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), err.Error())
 	}
-	if err := validateACPRuntimeWorkspaceNamespace(plan, task.Namespace, r.ACPRuntimeNamespace); err != nil {
-		return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), err.Error())
-	}
 	workspaceName, workspaceReady, err := r.ensureACPClassWorkspace(ctx, task, plan)
 	if err != nil {
 		if errors.Is(err, errACPWorkspaceBindingConflict) {
@@ -98,6 +95,9 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 	pool, poolPreexisting, err := r.ensureACPRuntimePool(ctx, task.Namespace, plan, workspaceName,
 		task.Annotations[acpExecutionWorkspaceUIDAnnotation], string(task.UID))
 	if err != nil {
+		if errors.Is(err, errACPRuntimeWorkspaceNamespace) {
+			return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), err.Error())
+		}
 		if errors.Is(err, store.ErrValidation) {
 			return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidRuntimeProfile"), err.Error())
 		}
@@ -1093,6 +1093,8 @@ func validateACPWorkspacePreflight(task *corev1alpha1.Task) error {
 	return nil
 }
 
+var errACPRuntimeWorkspaceNamespace = errors.New("invalid ACP runtime workspace namespace")
+
 func validateACPRuntimeWorkspaceNamespace(
 	plan ACPRuntimePlan,
 	taskNamespace, configuredRuntimeNamespace string,
@@ -1104,7 +1106,10 @@ func validateACPRuntimeWorkspaceNamespace(
 	if runtimeNamespace == "" {
 		runtimeNamespace = strings.TrimSpace(taskNamespace)
 	}
-	return validateSubstrateTemplateRuntimeNamespace(plan.Workspace.TemplateNamespace, runtimeNamespace)
+	if err := validateSubstrateTemplateRuntimeNamespace(plan.Workspace.TemplateNamespace, runtimeNamespace); err != nil {
+		return fmt.Errorf("%w: %v", errACPRuntimeWorkspaceNamespace, err)
+	}
+	return nil
 }
 
 func (r *TaskReconciler) ensureACPRuntimePool(
@@ -1115,13 +1120,36 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 	workspaceUID string,
 	workspaceTaskUID string,
 ) (*corev1alpha1.RuntimePool, bool, error) {
-	if err := validateACPRuntimeWorkspaceNamespace(plan, namespace, r.ACPRuntimeNamespace); err != nil {
-		return nil, false, err
-	}
 	pool := &corev1alpha1.RuntimePool{}
 	key := types.NamespacedName{Namespace: namespace, Name: plan.PoolName}
 	err := r.Get(ctx, key, pool)
 	if apierrors.IsNotFound(err) {
+		// The pool's runtime namespace is FROZEN from the linked workspace's
+		// creation-time annotation, not re-read from the mutable controller
+		// flag: workspace creation and pool creation happen on different
+		// reconciles, and a flag change between them would realize the
+		// SandboxClaim and durable PVC in a namespace the workspace's
+		// deletion proofs never probe (a false NotFound would then report
+		// the volume deleted while repository data remains). An explicit
+		// frozen namespace the current controller no longer permits fails
+		// the pool visibly instead of silently splitting the two.
+		poolRuntimeNamespace := strings.TrimSpace(r.ACPRuntimeNamespace)
+		if plan.Workspace != nil && workspaceName != "" {
+			reader := client.Reader(r.Client)
+			if r.APIReader != nil {
+				reader = r.APIReader
+			}
+			workspace := &workspacev1alpha1.ExecutionWorkspace{}
+			if getErr := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: workspaceName}, workspace); getErr != nil {
+				return nil, false, fmt.Errorf("resolve the linked workspace's frozen runtime namespace: %w", getErr)
+			}
+			if frozen := strings.TrimSpace(workspace.Annotations[acpWorkspaceRuntimeNamespaceAnnotation]); frozen != "" {
+				poolRuntimeNamespace = frozen
+			}
+		}
+		if namespaceErr := validateACPRuntimeWorkspaceNamespace(plan, namespace, poolRuntimeNamespace); namespaceErr != nil {
+			return nil, false, namespaceErr
+		}
 		capacity := &corev1alpha1.RuntimePoolCapacitySpec{
 			MaxResidentSessions: corev1alpha1.DefaultRuntimePoolMaxResidentSessions,
 			MaxRunningPrompts:   corev1alpha1.DefaultRuntimePoolMaxRunningPrompts,
@@ -1161,6 +1189,18 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 					executionWorkspace.Substrate.SuspendMode = plan.Workspace.Class.SuspendMode
 				}
 			}
+			if plan.Workspace.Provider == corev1alpha1.WorkspaceProviderAgentSandbox &&
+				plan.Workspace.Class != nil && plan.Workspace.Class.SandboxVolume != nil {
+				executionWorkspace.AgentSandbox = &corev1alpha1.RuntimePoolAgentSandboxWorkspaceSpec{
+					SuspendMode: plan.Workspace.Class.SuspendMode,
+					SuspendVolume: &corev1alpha1.RuntimePoolSandboxDurableVolumeSpec{
+						StorageClassName: plan.Workspace.Class.SandboxVolume.StorageClassName,
+						StorageClassUID:  plan.Workspace.Class.SandboxVolume.StorageClassUID,
+						AccessModes:      append([]string(nil), plan.Workspace.Class.SandboxVolume.AccessModes...),
+						Capacity:         plan.Workspace.Class.SandboxVolume.Capacity,
+					},
+				}
+			}
 		}
 		pool = &corev1alpha1.RuntimePool{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1170,7 +1210,7 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 			},
 			Spec: corev1alpha1.RuntimePoolSpec{
 				TrustDomain:             corev1alpha1.RuntimePoolTrustDomain{Namespace: namespace, Identity: "namespace:" + namespace},
-				RuntimeNamespace:        strings.TrimSpace(r.ACPRuntimeNamespace),
+				RuntimeNamespace:        poolRuntimeNamespace,
 				Runtime:                 corev1alpha1.RuntimePoolRuntimeSpec{Image: plan.Image, Profile: RuntimePoolProfileFromPlan(plan)},
 				ExecutionWorkspace:      executionWorkspace,
 				DesiredReplicas:         1,
@@ -1202,6 +1242,13 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 	}
 	if err != nil {
 		return nil, false, err
+	}
+	poolRuntimeNamespace := strings.TrimSpace(pool.Spec.RuntimeNamespace)
+	if poolRuntimeNamespace == "" {
+		poolRuntimeNamespace = strings.TrimSpace(r.ACPRuntimeNamespace)
+	}
+	if namespaceErr := validateACPRuntimeWorkspaceNamespace(plan, namespace, poolRuntimeNamespace); namespaceErr != nil {
+		return nil, false, namespaceErr
 	}
 	if !acpRuntimePoolWorkspaceMatchesPlan(pool, plan) {
 		if plan.Workspace != nil && plan.Workspace.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession {

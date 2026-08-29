@@ -17,6 +17,7 @@ import (
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -40,6 +41,8 @@ const (
 	acpTestInfraName    = "infra"
 
 	acpTestSubstrateNamespace = "substrate-system"
+	acpTestDurableCapacity    = "1Gi"
+	acpTestStorageProvisioner = "test.orka.ai/provisioner"
 )
 
 const acpTestSandboxPoolName = "acp-ws-agent-sandbox-0123456789abcdef"
@@ -50,7 +53,53 @@ func testACPWorkspaceScheme(t *testing.T) *runtime.Scheme {
 	if err := acpworkspacev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add acp.workspace scheme: %v", err)
 	}
+	if err := storagev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add storage scheme: %v", err)
+	}
 	return scheme
+}
+
+// acpTestDefaultStorageClass is the cluster default StorageClass with Delete
+// reclaim semantics that durable-volume profiles resolve against.
+func acpTestDefaultStorageClass() *storagev1.StorageClass {
+	reclaim := corev1.PersistentVolumeReclaimDelete
+	return &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "acp-test-default",
+			Annotations: map[string]string{"storageclass.kubernetes.io/is-default-class": booleanTrueValue},
+		},
+		Provisioner:   acpTestStorageProvisioner,
+		ReclaimPolicy: &reclaim,
+	}
+}
+
+func TestValidateDurableStorageClassReclaimMatchesKubernetesDefaultNameTieBreak(t *testing.T) {
+	t.Parallel()
+	reclaim := corev1.PersistentVolumeReclaimDelete
+	created := metav1.NewTime(time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC))
+	defaultClass := func(name string) *storagev1.StorageClass {
+		return &storagev1.StorageClass{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				CreationTimestamp: created,
+				Annotations:       map[string]string{"storageclass.kubernetes.io/is-default-class": booleanTrueValue},
+			},
+			Provisioner:   acpTestStorageProvisioner,
+			ReclaimPolicy: &reclaim,
+		}
+	}
+	reader := fake.NewClientBuilder().WithScheme(testACPWorkspaceScheme(t)).WithObjects(
+		defaultClass("zeta-default"),
+		defaultClass("alpha-default"),
+	).Build()
+
+	class, err := validateDurableStorageClassReclaim(context.Background(), reader, "", "profile")
+	if err != nil {
+		t.Fatalf("resolve default StorageClass: %v", err)
+	}
+	if class.Name != "alpha-default" {
+		t.Fatalf("default StorageClass = %q, want Kubernetes tie-break winner %q", class.Name, "alpha-default")
+	}
 }
 
 type acpClassFixture struct {
@@ -61,7 +110,7 @@ type acpClassFixture struct {
 }
 
 func (f *acpClassFixture) objects() []client.Object {
-	return []client.Object{f.class, f.provider, f.config, f.profile}
+	return []client.Object{f.class, f.provider, f.config, f.profile, acpTestDefaultStorageClass()}
 }
 
 // pinProfileHash recomputes and pins the class profile hash exactly the way
@@ -466,6 +515,62 @@ func TestResolveACPWorkspaceClassRequiresProviderAPI(t *testing.T) {
 	_, err := r.resolveACPWorkspaceClass(context.Background(), acpClassTestTask())
 	if err == nil || !strings.Contains(err.Error(), "requires the workspace provider API") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestResolveAgentExecutionCandidatePreservesTransientStorageClassReadErrors(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name  string
+		named bool
+	}{
+		{name: "default StorageClass list"},
+		{name: "named StorageClass get", named: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := suspendableSandboxFixture(t)
+			if tt.named {
+				fixture.profile.Spec.AgentSandbox.Suspend.Volume.StorageClassName = acpTestDefaultStorageClass().Name
+				fixture.pinProfileHash(t)
+			}
+			task := acpClassTestTask()
+			objects := append(fixture.objects(), bindingTestNamespace())
+			r := acpClassTestReconciler(t, objects...)
+			bindingReconciler, _ := newBindingTestReconciler(t)
+			r.AgentExecutionSnapshots = bindingReconciler.AgentExecutionSnapshots
+			r.ACPRuntimeEnabled = bindingReconciler.ACPRuntimeEnabled
+			r.ACPRuntimeNamespace = bindingReconciler.ACPRuntimeNamespace
+			r.ACPRuntimeImages = bindingReconciler.ACPRuntimeImages
+
+			withWatch, ok := r.Client.(client.WithWatch)
+			if !ok {
+				t.Fatal("fake client does not support watch interception")
+			}
+			transient := errors.New("temporary StorageClass API outage")
+			functions := interceptor.Funcs{}
+			if tt.named {
+				functions.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if _, isStorageClass := obj.(*storagev1.StorageClass); isStorageClass {
+						return transient
+					}
+					return c.Get(ctx, key, obj, opts...)
+				}
+			} else {
+				functions.List = func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, isStorageClasses := list.(*storagev1.StorageClassList); isStorageClasses {
+						return transient
+					}
+					return c.List(ctx, list, opts...)
+				}
+			}
+			r.APIReader = interceptor.NewClient(withWatch, functions)
+
+			_, err := r.resolveAgentExecutionCandidate(context.Background(), task, bindingTestAgent())
+			if !errors.Is(err, transient) || isPermanentACPAgentConfigurationError(err) {
+				t.Fatalf("candidate error = %v, permanent=%t, want retryable StorageClass read failure", err, isPermanentACPAgentConfigurationError(err))
+			}
+		})
 	}
 }
 
@@ -1981,6 +2086,35 @@ func TestResolveACPWorkspaceClassRejectsReplacedProviderConfig(t *testing.T) {
 	if _, err := r.resolveACPWorkspaceClass(ctx, acpClassTestTask()); err == nil ||
 		!strings.Contains(err.Error(), "was replaced") {
 		t.Fatalf("error = %v, want a fail-closed replaced-config rejection", err)
+	}
+}
+
+// A durable-volume profile bound to a retaining StorageClass violates the
+// all-Delete lifecycle: finalization would report the volume deleted while
+// Kubernetes leaves the PV and repository data behind.
+func TestResolveACPWorkspaceClassRejectsRetainingStorageClass(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	retain := corev1.PersistentVolumeReclaimRetain
+	retaining := &storagev1.StorageClass{
+		ObjectMeta:    metav1.ObjectMeta{Name: "retaining-class"},
+		Provisioner:   acpTestStorageProvisioner,
+		ReclaimPolicy: &retain,
+	}
+	fixture := newACPClassFixture(t, acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox, func(f *acpClassFixture) {
+		f.profile.Spec.AgentSandbox = &acpworkspacev1alpha1.AgentSandboxProfileSpec{
+			Suspend: &acpworkspacev1alpha1.AgentSandboxSuspendPolicy{
+				Mode: acpworkspacev1alpha1.SubstrateSuspendModeDataOnly,
+				Volume: acpworkspacev1alpha1.AgentSandboxDurableVolume{
+					Capacity: acpTestDurableCapacity, StorageClassName: "retaining-class",
+				},
+			},
+		}
+	})
+	r := acpClassTestReconciler(t, append(fixture.objects(), retaining)...)
+	if _, err := r.resolveACPWorkspaceClass(ctx, acpClassTestTask()); err == nil ||
+		!strings.Contains(err.Error(), "only Delete reclaim is admitted") {
+		t.Fatalf("error = %v, want a retaining-class rejection", err)
 	}
 }
 

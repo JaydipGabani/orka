@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,6 +21,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	acpworkspacev1alpha1 "github.com/orka-agents/orka/api/acp.workspace/v1alpha1"
 	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
@@ -39,6 +43,7 @@ const (
 	reasonPoolNotReady               = "PoolNotReady"
 	reasonProviderNotReady           = "ProviderNotReady"
 	messageProviderDisabled          = "provider is disabled"
+	messageACPProfileInvalid         = "ACP RuntimeWorkspaceProfile is invalid for the selected provider backend"
 )
 
 var errInvalidProviderNamespaceSelector = errors.New("invalid provider namespace selector")
@@ -281,22 +286,23 @@ func (r *ExecutionWorkspaceClassReconciler) resolveClassProvider(
 		return providerName, reasonRequiredFeatures,
 			"provider does not support every explicit or implied class feature", nil
 	}
-	if provider.Spec.ControllerName == acpWorkspaceProviderControllerName &&
-		slices.Contains(requiredFeatures, workspacev1alpha1.WorkspaceFeatureSuspend) {
-		// The reserved in-tree ACP adapter advertises suspend per PROVIDER,
-		// but executing it requires Session reuse and a class profile that
-		// opts into a backend DataOnly suspend policy. A class missing either
-		// prerequisite would go Ready and then reject every Task that relies
-		// on the advertised lifecycle.
-		if !slices.Contains(class.Spec.AllowedReuseScopes, workspacev1alpha1.WorkspaceReuseScopeSession) {
-			return providerName, reasonRequiredFeatures,
-				"class permits Suspend, but ACP RuntimeSessions require the Session reuse scope to resume it", nil
-		}
-		permits, err := r.acpClassProfilePermitsSuspend(ctx, class)
+	if provider.Spec.ControllerName == acpWorkspaceProviderControllerName {
+		// ACP Tasks always resolve the backend-specific profile, even when the
+		// class permits only Delete. Validate it before publishing Ready so
+		// invalid profile inputs cannot fail later when a Task selects the class.
+		profileValid, permitsSuspend, err := r.validateACPClassProfile(ctx, class, provider)
 		if err != nil {
 			return "", "", "", err
 		}
-		if !permits {
+		if !profileValid {
+			return providerName, reasonRequiredFeatures, messageACPProfileInvalid, nil
+		}
+		if slices.Contains(requiredFeatures, workspacev1alpha1.WorkspaceFeatureSuspend) &&
+			!slices.Contains(class.Spec.AllowedReuseScopes, workspacev1alpha1.WorkspaceReuseScopeSession) {
+			return providerName, reasonRequiredFeatures,
+				"class permits Suspend, but ACP RuntimeSessions require the Session reuse scope to resume it", nil
+		}
+		if slices.Contains(requiredFeatures, workspacev1alpha1.WorkspaceFeatureSuspend) && !permitsSuspend {
 			return providerName, reasonRequiredFeatures,
 				"class permits Suspend, but its ACP RuntimeWorkspaceProfile does not opt into a DataOnly suspend policy", nil
 		}
@@ -314,31 +320,96 @@ func (r *ExecutionWorkspaceClassReconciler) resolveClassProvider(
 	return providerName, string(workspacev1alpha1.ReasonReady), "class references are ready", nil
 }
 
-// acpClassProfilePermitsSuspend reports whether the class's ACP
-// RuntimeWorkspaceProfile opts into a backend DataOnly suspend policy - the
-// per-class prerequisite for actually executing the provider-advertised
-// suspend capability.
-func (r *ExecutionWorkspaceClassReconciler) acpClassProfilePermitsSuspend(
+// validateACPClassProfile mirrors the backend-specific profile validation run
+// by Task resolution. It reports whether the profile is valid and whether it
+// opts into an executable DataOnly suspend policy.
+func (r *ExecutionWorkspaceClassReconciler) validateACPClassProfile(
 	ctx context.Context,
 	class *workspacev1alpha1.ExecutionWorkspaceClass,
-) (bool, error) {
+	provider *workspacev1alpha1.ExecutionWorkspaceProvider,
+) (valid, permitsSuspend bool, err error) {
 	ref := class.Spec.ParametersRef
 	if ref == nil || ref.Group != acpworkspacev1alpha1.GroupVersion.Group ||
 		ref.Kind != acpWorkspaceProviderProfileKind {
-		return false, nil
+		return false, false, nil
 	}
+	reader := r.classPolicyReader()
 	profile := &acpworkspacev1alpha1.RuntimeWorkspaceProfile{}
-	if err := r.classPolicyReader().Get(ctx, types.NamespacedName{Namespace: class.Namespace, Name: ref.Name}, profile); err != nil {
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: class.Namespace, Name: ref.Name}, profile); err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, nil
+			return false, false, nil
 		}
-		return false, err
+		return false, false, err
 	}
-	if substrate := profile.Spec.Substrate; substrate != nil && substrate.Suspend != nil &&
-		substrate.Suspend.Mode == acpworkspacev1alpha1.SubstrateSuspendModeDataOnly {
-		return true, nil
+	if !profile.DeletionTimestamp.IsZero() {
+		return false, false, nil
 	}
-	return false, nil
+	if provider.Spec.ParametersRef.Group != acpworkspacev1alpha1.GroupVersion.Group ||
+		provider.Spec.ParametersRef.Kind != acpWorkspaceProviderConfigKind {
+		return false, false, nil
+	}
+	config := &acpworkspacev1alpha1.RuntimeProviderConfig{}
+	if err := reader.Get(ctx, types.NamespacedName{Name: provider.Spec.ParametersRef.Name}, config); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+	if !config.DeletionTimestamp.IsZero() {
+		return false, false, nil
+	}
+	switch config.Spec.Backend {
+	case acpworkspacev1alpha1.RuntimeProviderBackendSubstrate:
+		substrate := profile.Spec.Substrate
+		if substrate == nil || profile.Spec.AgentSandbox != nil {
+			return false, false, nil
+		}
+		templateName := strings.TrimSpace(substrate.TemplateRef.Name)
+		templateNamespace := strings.TrimSpace(substrate.TemplateRef.Namespace)
+		if templateNamespace == "" {
+			templateNamespace = class.Namespace
+		}
+		if err := validateSubstrateWorkspaceTemplateReference(templateNamespace, templateName); err != nil {
+			return false, false, nil
+		}
+		if substrate.Suspend == nil {
+			return true, false, nil
+		}
+		if substrate.Suspend.Mode != acpworkspacev1alpha1.SubstrateSuspendModeDataOnly {
+			return false, false, nil
+		}
+		return true, true, nil
+	case acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox:
+		sandbox := profile.Spec.AgentSandbox
+		if profile.Spec.Substrate != nil {
+			return false, false, nil
+		}
+		if sandbox == nil || sandbox.Suspend == nil {
+			return true, false, nil
+		}
+		// The SAME validators resolution runs decide readiness: the frozen
+		// volume shape (mode, positive capacity, writable access modes) and
+		// the pinned storage class (existing, Delete reclaim,
+		// non-terminating, or a resolvable cluster default).
+		volume, volumeErr := frozenACPSandboxDurableVolume(sandbox.Suspend, class.Spec.ParametersRef.Name)
+		if volumeErr != nil {
+			return false, false, nil
+		}
+		if _, classErr := validateDurableStorageClassReclaim(
+			ctx, reader, volume.StorageClassName, class.Spec.ParametersRef.Name,
+		); classErr != nil {
+			if isRetryableACPWorkspaceClassResolutionError(classErr) {
+				// A live reader failure is transient: surface it so the
+				// reconcile retries instead of latching a false not-ready
+				// verdict.
+				return false, false, classErr
+			}
+			return false, false, nil
+		}
+		return true, true, nil
+	default:
+		return false, false, nil
+	}
 }
 
 func (r *ExecutionWorkspaceClassReconciler) resolveDirectParameters(
@@ -540,7 +611,28 @@ func (r *ExecutionWorkspaceClassReconciler) SetupWithManager(mgr ctrl.Manager) e
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workspacev1alpha1.ExecutionWorkspaceClass{}).
 		Named("execution-workspace-class-core").
+		Watches(&storagev1.StorageClass{}, handler.EnqueueRequestsFromMapFunc(r.classesForStorageChange)).
 		Complete(r)
+}
+
+// classesForStorageChange re-evaluates every class on a StorageClass change:
+// sandbox suspend readiness pins a named or default storage class, and
+// creating or correcting one must lift a stale NotReady without waiting for
+// an unrelated class edit or controller restart. Class populations are small,
+// so the full sweep is cheaper than tracking which class resolved which
+// storage class.
+func (r *ExecutionWorkspaceClassReconciler) classesForStorageChange(ctx context.Context, _ client.Object) []reconcile.Request {
+	classes := &workspacev1alpha1.ExecutionWorkspaceClassList{}
+	if err := r.List(ctx, classes); err != nil {
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(classes.Items))
+	for i := range classes.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+			Namespace: classes.Items[i].Namespace, Name: classes.Items[i].Name,
+		}})
+	}
+	return requests
 }
 
 func featureSetContainsAll(have, required []workspacev1alpha1.ExecutionWorkspaceFeature) bool {

@@ -507,6 +507,14 @@ func acpWorkspaceBindingDigestWithClassOnDetach(
 		if binding.Class.SuspendMode != "" {
 			fields["classSuspendMode"] = binding.Class.SuspendMode
 		}
+		if binding.Class.SandboxVolume != nil {
+			fields["classSandboxVolume"] = strings.Join([]string{
+				binding.Class.SandboxVolume.StorageClassName,
+				binding.Class.SandboxVolume.StorageClassUID,
+				strings.Join(binding.Class.SandboxVolume.AccessModes, ","),
+				binding.Class.SandboxVolume.Capacity,
+			}, "|")
+		}
 	}
 	return acpDomainDigest("execution-workspace-binding", fields)
 }
@@ -680,6 +688,8 @@ func (r *TaskReconciler) projectACPClassAttachmentIdentity(
 
 // validateACPWorkspaceBindingValues re-verifies a frozen snapshot workspace
 // binding without consulting live cluster state.
+//
+//nolint:gocyclo // Frozen binding validation keeps all fail-closed identity checks in one auditable boundary.
 func validateACPWorkspaceBindingValues(binding *ACPRuntimeWorkspaceBinding) error {
 	if binding == nil {
 		return nil
@@ -728,8 +738,17 @@ func validateACPWorkspaceBindingValues(binding *ACPRuntimeWorkspaceBinding) erro
 		return err
 	}
 	if binding.Class != nil && binding.Class.EffectiveOnDetach == string(workspacev1alpha1.WorkspaceOnDetachSuspend) {
-		if binding.Provider != corev1alpha1.WorkspaceProviderSubstrate {
-			return fmt.Errorf("frozen execution workspace binding permits Suspend for provider %q; only substrate supports data-only suspension", binding.Provider)
+		switch binding.Provider {
+		case corev1alpha1.WorkspaceProviderSubstrate:
+			if binding.Class.SandboxVolume != nil {
+				return fmt.Errorf("frozen substrate execution workspace binding must not carry an agent-sandbox durable volume")
+			}
+		case corev1alpha1.WorkspaceProviderAgentSandbox:
+			if binding.Class.SandboxVolume == nil {
+				return fmt.Errorf("frozen agent-sandbox execution workspace binding permits Suspend without a frozen durable volume")
+			}
+		default:
+			return fmt.Errorf("frozen execution workspace binding permits Suspend for provider %q", binding.Provider)
 		}
 		if binding.ReusePolicy != corev1alpha1.WorkspaceReusePolicySession {
 			return fmt.Errorf("frozen execution workspace binding permits Suspend without session reuse")

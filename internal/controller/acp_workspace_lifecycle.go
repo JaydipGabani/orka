@@ -58,6 +58,12 @@ const (
 	// recreated same-name provider config can never silently re-serve an
 	// existing workspace through a different backend.
 	acpWorkspaceBackendAnnotation = "acp.workspace.orka.ai/backend"
+	// acpWorkspaceDurableAnnotation records at materialization that the
+	// frozen class profile provisions durable workspace artifacts (a data-only
+	// suspension checkpoint or durable PVC), so terminal dispositions report
+	// what actually existed instead of inferring it from allowed detach
+	// actions.
+	acpWorkspaceDurableAnnotation = "acp.workspace.orka.ai/durable-workspace"
 	// acpWorkspaceSuspendModeAnnotation records the profile-frozen Substrate
 	// suspend mode. The terminal adapter still needs this after the linked
 	// RuntimePool and its rendered DurableDir policy have been deleted.
@@ -68,6 +74,11 @@ const (
 	// workspace's remaining lifetime, so a missing or foreign pool is
 	// terminal data loss even after the adapter projected Ready or Attached.
 	acpWorkspaceResumedLineageAnnotation = "acp.workspace.orka.ai/resumed-lineage"
+	// acpWorkspaceRuntimeNamespaceAnnotation freezes the runtime namespace
+	// the linked pool realizes its provider children (SandboxClaim, durable
+	// PVC) in, so deletion proofs probe the ORIGINAL namespace even if the
+	// controller's --acp-runtime-namespace changed since creation.
+	acpWorkspaceRuntimeNamespaceAnnotation = "acp.workspace.orka.ai/runtime-namespace"
 
 	// acpWorkspaceDurableSessionCommittedAnnotation records that a
 	// RuntimeSession creation completed on this workspace - and with it the
@@ -78,13 +89,6 @@ const (
 	// attempt so settlement can enforce the frozen detachTimeout instead of
 	// requeueing forever behind an adapter that never releases the epoch.
 	acpWorkspaceRevocationStartedAnnotation = "acp.workspace.orka.ai/revocation-started-at"
-	// runtimePoolWorkspaceResumeLostAnnotation records on a RuntimePool that
-	// a consensually suspended workspace's durable data became unrecoverable
-	// (the checkpointed actor or its snapshot is gone). It is terminal: the
-	// backend never reprovisions, and the workspace adapter propagates the
-	// linked workspace to Failed instead of silently resuming against a
-	// re-materialized baseline.
-	runtimePoolWorkspaceResumeLostAnnotation = "orka.ai/workspace-resume-lost"
 	// acpWorkspaceAttachmentTTL bounds one ACP Task attachment. The attachment
 	// Secret is not the RuntimePool data-plane credential; the epoch enforces
 	// the one-writer rule, and class maxLifetime still clamps the expiry.
@@ -549,6 +553,33 @@ func (r *TaskReconciler) createACPClassWorkspace(
 	if err != nil {
 		return nil, err
 	}
+	creationAnnotations := map[string]string{
+		acpExecutionWorkspacePoolAnnotation:     poolName,
+		acpWorkspaceProviderConfigUIDAnnotation: binding.Class.ProviderConfigUID,
+		acpWorkspaceBackendAnnotation:           string(binding.Provider),
+		// The creator's frozen effective detach action is bound
+		// atomically with the workspace's existence: a crash between
+		// Attach and the later refresh patch can never leave a
+		// Suspend-frozen workspace defaulting to Delete.
+		acpWorkspaceDetachActionAnnotation: binding.Class.EffectiveOnDetach,
+	}
+	// Freeze the realized runtime namespace so deletion proofs probe the
+	// ORIGINAL provider-children namespace even if the controller flag
+	// changes later. An empty flag means provider children live in the
+	// workspace namespace, and that resolution is frozen too: leaving the
+	// annotation absent would let a later non-empty flag redirect deletion
+	// proofs to a namespace the original PVC never lived in.
+	runtimeNamespace := strings.TrimSpace(r.ACPRuntimeNamespace)
+	if runtimeNamespace == "" {
+		runtimeNamespace = task.Namespace
+	}
+	creationAnnotations[acpWorkspaceRuntimeNamespaceAnnotation] = runtimeNamespace
+	if binding.Class.SuspendMode == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) {
+		// The frozen profile provisions durable artifacts (a checkpoint or a
+		// durable PVC); the terminal disposition reports what actually
+		// existed instead of inferring it from allowed detach actions.
+		creationAnnotations[acpWorkspaceDurableAnnotation] = booleanTrueValue
+	}
 	workspace := &workspacev1alpha1.ExecutionWorkspace{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: task.Namespace,
@@ -556,16 +587,7 @@ func (r *TaskReconciler) createACPClassWorkspace(
 			Labels: map[string]string{
 				workspacev1alpha1.ProviderControllerLabel: acpWorkspaceProviderControllerName,
 			},
-			Annotations: map[string]string{
-				acpExecutionWorkspacePoolAnnotation:     poolName,
-				acpWorkspaceProviderConfigUIDAnnotation: binding.Class.ProviderConfigUID,
-				acpWorkspaceBackendAnnotation:           string(binding.Provider),
-				// The creator's frozen effective detach action is bound
-				// atomically with the workspace's existence: a crash between
-				// Attach and the later refresh patch can never leave a
-				// Suspend-frozen workspace defaulting to Delete.
-				acpWorkspaceDetachActionAnnotation: binding.Class.EffectiveOnDetach,
-			},
+			Annotations: creationAnnotations,
 		},
 		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
 			Mode: workspacev1alpha1.ExecutionWorkspaceModeInteractive,
@@ -691,9 +713,11 @@ func verifyACPClassWorkspace(
 			return fmt.Errorf("%w: workspace %s is not owned by this Task", errACPWorkspaceBindingConflict, workspace.Name)
 		}
 	}
+	resumeProviderSupported := binding.Provider == corev1alpha1.WorkspaceProviderSubstrate ||
+		binding.Provider == corev1alpha1.WorkspaceProviderAgentSandbox
 	resumeFromSuspended := workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended &&
 		workspace.Spec.Attachment == nil &&
-		binding.Provider == corev1alpha1.WorkspaceProviderSubstrate &&
+		resumeProviderSupported &&
 		binding.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession &&
 		binding.Class.SuspendMode == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly)
 	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady && !resumeFromSuspended {

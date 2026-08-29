@@ -13,7 +13,6 @@ import (
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
-
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -57,7 +56,7 @@ func acpAdapterProvider() *workspacev1alpha1.ExecutionWorkspaceProvider {
 	}
 }
 
-func TestACPWorkspaceProviderAdapterAdvertisesWithoutSuspend(t *testing.T) {
+func TestACPWorkspaceProviderAdapterAdvertisesSuspend(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	provider := acpAdapterProvider()
@@ -82,10 +81,14 @@ func TestACPWorkspaceProviderAdapterAdvertisesWithoutSuspend(t *testing.T) {
 	if len(current.Status.SupportedContracts) != 1 || current.Status.SupportedContracts[0] != workspacev1alpha1.ContractVersionV1 {
 		t.Fatalf("contracts = %v", current.Status.SupportedContracts)
 	}
+	foundSuspend := false
 	for _, feature := range current.Status.SupportedFeatures {
 		if feature == workspacev1alpha1.WorkspaceFeatureSuspend {
-			t.Fatalf("suspend must not be advertised before data-only cold resume exists")
+			foundSuspend = true
 		}
+	}
+	if !foundSuspend {
+		t.Fatal("data-only cold suspension must be advertised; class profiles gate whether it is requestable")
 	}
 	// The core provider controller owns Compatible/Heartbeat/Ready; the
 	// adapter must never write those conditions from its heartbeat snapshot.
@@ -915,6 +918,49 @@ func TestACPExecutionWorkspaceAdapterSchedulesMaxLifetimeEnforcement(t *testing.
 	}
 }
 
+// PVC removal only starts asynchronous PV/CSI cleanup under Delete reclaim:
+// deletion of a durable workspace is proven only once no PersistentVolume
+// still references the claim, or repository data could survive finalization.
+func TestDurableWorkspacePVCGoneRequiresBackingPVAbsence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	workspace := acpAdapterWorkspace(t, "acp-ws-pool")
+	workspace.Annotations[acpWorkspaceDurableAnnotation] = booleanTrueValue
+	workspace.Annotations[acpWorkspaceBackendAnnotation] = string(acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox)
+	workspace.Annotations[acpWorkspaceRuntimeNamespaceAnnotation] = acpTestRuntimeNamespace
+	claimName := runtimePoolSandboxClaimName(runtimePoolResourceName(workspace.Namespace, "acp-ws-pool"))
+	pvcName := durableWorkspacePVCName(claimName)
+	lingering := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-lingering", UID: types.UID("pv-lingering-uid")},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{Namespace: acpTestRuntimeNamespace, Name: pvcName},
+		},
+	}
+	c := acpAdapterTestClient(t, workspace, lingering)
+	reconciler := &ACPExecutionWorkspaceAdapterReconciler{Client: c, APIReader: c}
+
+	// The PVC is gone but its backing PV still references the claim: deletion
+	// is not yet proven.
+	gone, err := reconciler.durableWorkspacePVCGone(ctx, workspace)
+	if err != nil {
+		t.Fatalf("prove deletion with lingering PV: %v", err)
+	}
+	if gone {
+		t.Fatal("deletion must not be proven while the backing PersistentVolume still references the claim")
+	}
+
+	if err := c.Delete(ctx, lingering); err != nil {
+		t.Fatalf("delete lingering PV: %v", err)
+	}
+	gone, err = reconciler.durableWorkspacePVCGone(ctx, workspace)
+	if err != nil {
+		t.Fatalf("prove deletion after PV cleanup: %v", err)
+	}
+	if !gone {
+		t.Fatal("deletion must be proven once both the PVC and its backing PV are absent")
+	}
+}
+
 // Lifetime expiry is enforced BEFORE the admission gate: a workspace that
 // lost current core admission (for example a Disabled provider) must not keep
 // its linked RuntimePool executing past the frozen deadline.
@@ -972,6 +1018,82 @@ func TestACPExecutionWorkspaceAdapterEnforcesMaxLifetimeWithoutAdmission(t *test
 	}
 	if result.RequeueAfter <= 0 || result.RequeueAfter > time.Hour {
 		t.Fatalf("unadmitted bounded workspace must requeue before expiry, got %v", result.RequeueAfter)
+	}
+}
+
+// A suspend-capable workspace was materialized WITH its controller-owned
+// durable metadata: losing that metadata is corruption, not proof that no
+// durable data exists, so deletion proof fails closed instead of finalizing
+// while provider cleanup may still leave repository data behind.
+func TestDurableWorkspacePVCGoneFailsClosedOnStrippedMetadata(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for name, mutate := range map[string]func(*workspacev1alpha1.ExecutionWorkspace){
+		"missing backend": func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+			delete(workspace.Annotations, acpWorkspaceBackendAnnotation)
+		},
+		"missing durable marker": func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+			delete(workspace.Annotations, acpWorkspaceDurableAnnotation)
+		},
+		"missing pool link": func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+			delete(workspace.Annotations, acpExecutionWorkspacePoolAnnotation)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			workspace := acpAdapterWorkspace(t, "acp-ws-pool")
+			workspace.Annotations[acpWorkspaceDurableAnnotation] = booleanTrueValue
+			workspace.Annotations[acpWorkspaceBackendAnnotation] = string(acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox)
+			workspace.Spec.Lifecycle.AllowedOnDetach = append(workspace.Spec.Lifecycle.AllowedOnDetach,
+				workspacev1alpha1.WorkspaceOnDetachSuspend)
+			mutate(workspace)
+			c := acpAdapterTestClient(t, workspace)
+			reconciler := &ACPExecutionWorkspaceAdapterReconciler{Client: c, APIReader: c}
+			gone, err := reconciler.durableWorkspacePVCGone(ctx, workspace)
+			if err == nil || gone {
+				t.Fatalf("stripped metadata on a suspend-capable workspace must fail closed, got (%v, %v)", gone, err)
+			}
+		})
+	}
+
+	// A Delete-only class may still provision the same durable PVC. The
+	// durable marker, not permission to Suspend, makes missing backend or pool
+	// metadata unsafe as cleanup proof.
+	for name, mutate := range map[string]func(*workspacev1alpha1.ExecutionWorkspace){
+		"missing backend": func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+			delete(workspace.Annotations, acpWorkspaceBackendAnnotation)
+		},
+		"malformed durable marker": func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+			workspace.Annotations[acpWorkspaceDurableAnnotation] = testFalseValue
+		},
+		"invalid backend": func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+			workspace.Annotations[acpWorkspaceBackendAnnotation] = "damaged"
+		},
+		"missing pool link": func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+			delete(workspace.Annotations, acpExecutionWorkspacePoolAnnotation)
+		},
+	} {
+		t.Run("delete-only "+name, func(t *testing.T) {
+			workspace := acpAdapterWorkspace(t, "acp-ws-pool")
+			workspace.Annotations[acpWorkspaceDurableAnnotation] = booleanTrueValue
+			workspace.Annotations[acpWorkspaceBackendAnnotation] = string(acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox)
+			mutate(workspace)
+			c := acpAdapterTestClient(t, workspace)
+			reconciler := &ACPExecutionWorkspaceAdapterReconciler{Client: c, APIReader: c}
+			gone, err := reconciler.durableWorkspacePVCGone(ctx, workspace)
+			if err == nil || gone {
+				t.Fatalf("damaged metadata on a Delete-only durable workspace must fail closed, got (%v, %v)", gone, err)
+			}
+		})
+	}
+
+	// A workspace whose immutable spec never permitted Suspend keeps the
+	// fast non-durable path.
+	plain := acpAdapterWorkspace(t, "acp-ws-pool")
+	gone, err := (&ACPExecutionWorkspaceAdapterReconciler{
+		Client: acpAdapterTestClient(t, plain), APIReader: acpAdapterTestClient(t, plain),
+	}).durableWorkspacePVCGone(ctx, plain)
+	if err != nil || !gone {
+		t.Fatalf("a never-suspendable workspace has no durable PVC to prove, got (%v, %v)", gone, err)
 	}
 }
 
@@ -1041,6 +1163,33 @@ func TestACPExecutionWorkspaceAdapterExpiryHoldsEpochUntilPoolGone(t *testing.T)
 	}
 	if current.Status.AttachedEpoch != 0 {
 		t.Fatalf("the epoch must be revoked once the pool is gone, got %d", current.Status.AttachedEpoch)
+	}
+}
+
+// An absent frozen runtime-namespace annotation means the workspace was
+// created when the flag was empty: deletion proof must probe the ORIGINAL
+// workspace namespace, never the controller's current flag value, or a false
+// NotFound could finalize while the repository data remains.
+func TestDurableWorkspacePVCGoneHonorsOriginalNamespaceWhenUnfrozen(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	workspace := acpAdapterWorkspace(t, "acp-ws-pool")
+	workspace.Annotations[acpWorkspaceDurableAnnotation] = booleanTrueValue
+	workspace.Annotations[acpWorkspaceBackendAnnotation] = string(acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox)
+	// No runtime-namespace annotation: the flag was empty at creation.
+	claimName := runtimePoolSandboxClaimName(runtimePoolResourceName(workspace.Namespace, "acp-ws-pool"))
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Namespace: workspace.Namespace, Name: durableWorkspacePVCName(claimName), UID: types.UID("orig-ns-pvc-uid"),
+	}}
+	c := acpAdapterTestClient(t, workspace, pvc)
+	// The controller has since been restarted with a non-empty flag.
+	reconciler := &ACPExecutionWorkspaceAdapterReconciler{Client: c, APIReader: c, RuntimeNamespace: acpTestRuntimeNamespace}
+	gone, err := reconciler.durableWorkspacePVCGone(ctx, workspace)
+	if err != nil {
+		t.Fatalf("prove deletion: %v", err)
+	}
+	if gone {
+		t.Fatal("the PVC in the original workspace namespace must block deletion proof despite the new flag value")
 	}
 }
 

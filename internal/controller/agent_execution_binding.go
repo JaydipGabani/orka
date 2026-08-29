@@ -96,26 +96,36 @@ type agentExecutionSnapshotWorkspaceBinding struct {
 // binding for class-selected execution workspaces. It carries only Orka-owned
 // identity and policy: no provider-native identifiers and no secrets.
 type agentExecutionSnapshotWorkspaceClass struct {
-	Name               string   `json:"name"`
-	UID                string   `json:"uid"`
-	Generation         int64    `json:"generation"`
-	ProfileHash        string   `json:"profileHash"`
-	ProviderName       string   `json:"providerName"`
-	ProviderUID        string   `json:"providerUID"`
-	ProviderGeneration int64    `json:"providerGeneration"`
-	ProviderConfigUID  string   `json:"providerConfigUID,omitempty"`
-	EffectiveOnDetach  string   `json:"effectiveOnDetach"`
-	SuspendMode        string   `json:"suspendMode,omitempty"`
-	DefaultOnDetach    string   `json:"defaultOnDetach"`
-	AllowedOnDetach    []string `json:"allowedOnDetach"`
-	DetachTimeout      string   `json:"detachTimeout"`
-	IdleTimeout        string   `json:"idleTimeout,omitempty"`
-	MaxLifetime        string   `json:"maxLifetime,omitempty"`
+	Name               string                               `json:"name"`
+	UID                string                               `json:"uid"`
+	Generation         int64                                `json:"generation"`
+	ProfileHash        string                               `json:"profileHash"`
+	ProviderName       string                               `json:"providerName"`
+	ProviderUID        string                               `json:"providerUID"`
+	ProviderGeneration int64                                `json:"providerGeneration"`
+	ProviderConfigUID  string                               `json:"providerConfigUID,omitempty"`
+	EffectiveOnDetach  string                               `json:"effectiveOnDetach"`
+	SuspendMode        string                               `json:"suspendMode,omitempty"`
+	SandboxVolume      *agentExecutionSnapshotSandboxVolume `json:"sandboxVolume,omitempty"`
+	DefaultOnDetach    string                               `json:"defaultOnDetach"`
+	AllowedOnDetach    []string                             `json:"allowedOnDetach"`
+	DetachTimeout      string                               `json:"detachTimeout"`
+	IdleTimeout        string                               `json:"idleTimeout,omitempty"`
+	MaxLifetime        string                               `json:"maxLifetime,omitempty"`
 	DeletionPolicy     struct {
 		ProviderResources string `json:"providerResources"`
 		PersistentVolumes string `json:"persistentVolumes"`
 		Checkpoints       string `json:"checkpoints"`
 	} `json:"deletionPolicy"`
+}
+
+// agentExecutionSnapshotSandboxVolume freezes the durable workspace PVC shape
+// for suspend-capable agent-sandbox class bindings.
+type agentExecutionSnapshotSandboxVolume struct {
+	StorageClassName string   `json:"storageClassName,omitempty"`
+	StorageClassUID  string   `json:"storageClassUID,omitempty"`
+	AccessModes      []string `json:"accessModes"`
+	Capacity         string   `json:"capacity"`
 }
 
 type agentExecutionSnapshotAgent struct {
@@ -238,16 +248,38 @@ func (r *TaskReconciler) resolveAgentExecutionCandidateWithWorkspaceSessionUID(
 	if err != nil {
 		return nil, permanentACPAgentConfiguration(err)
 	}
-	resolvedClass, err := r.resolveACPWorkspaceClass(ctx, task)
+	workspaceSessionUID = strings.TrimSpace(workspaceSessionUID)
+	if workspaceSessionUID == "" && taskRequestsWorkspaceClass(task) &&
+		task.Spec.Execution.Workspace.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession {
+		// A class-backed continuation must resolve its immutable Session UID
+		// before the class resolver considers live storage. The linked
+		// RuntimePool carries the frozen durable-volume identity, so requiring
+		// the original StorageClass or a current cluster default first would
+		// reject a valid continuation after that class was retired.
+		plannedUID, sessionErr := r.planACPWorkspaceSessionUID(ctx, task)
+		if sessionErr != nil {
+			wrapped := fmt.Errorf("plan immutable execution-workspace Session identity: %w", sessionErr)
+			if permanentACPWorkspaceSessionPlanningError(sessionErr) {
+				return nil, permanentACPAgentConfiguration(wrapped)
+			}
+			return nil, wrapped
+		}
+		workspaceSessionUID = plannedUID
+	}
+	var resolvedClass *acpResolvedWorkspaceClass
+	if workspaceSessionUID == "" {
+		resolvedClass, err = r.resolveACPWorkspaceClass(ctx, task)
+	} else {
+		resolvedClass, err = r.resolveACPWorkspaceClassWithSessionUID(ctx, task, workspaceSessionUID)
+	}
 	if err != nil {
-		return nil, permanentACPAgentConfiguration(err)
+		return nil, classifyACPWorkspaceClassResolutionError(err)
 	}
 	workspaceBinding, err := validateACPWorkspaceBindingRequestWithClass(task, r.ExecutionWorkspaceDefaultProvider, r.EnforceNamespaceIsolation, resolvedClass)
 	if err != nil {
 		return nil, permanentACPAgentConfiguration(err)
 	}
 	if workspaceBinding != nil && workspaceBinding.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession {
-		workspaceSessionUID = strings.TrimSpace(workspaceSessionUID)
 		if workspaceSessionUID == "" {
 			plannedUID, sessionErr := r.planACPWorkspaceSessionUID(ctx, task)
 			if sessionErr != nil {
@@ -258,6 +290,12 @@ func (r *TaskReconciler) resolveAgentExecutionCandidateWithWorkspaceSessionUID(
 				return nil, wrapped
 			}
 			workspaceSessionUID = plannedUID
+		}
+		if taskRequestsWorkspaceClass(task) {
+			resolvedClass, err = r.resolveACPWorkspaceClassWithSessionUID(ctx, task, workspaceSessionUID)
+			if err != nil {
+				return nil, classifyACPWorkspaceClassResolutionError(err)
+			}
 		}
 		workspaceBinding, err = resolveACPWorkspaceBindingWithClass(
 			task, r.ExecutionWorkspaceDefaultProvider, r.EnforceNamespaceIsolation, workspaceSessionUID, resolvedClass,
@@ -390,6 +428,13 @@ func (r *TaskReconciler) resolveAgentExecutionCandidateWithWorkspaceSessionUID(
 
 func permanentACPWorkspaceSessionPlanningError(err error) bool {
 	return errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrValidation)
+}
+
+func classifyACPWorkspaceClassResolutionError(err error) error {
+	if isRetryableACPWorkspaceClassResolutionError(err) {
+		return err
+	}
+	return permanentACPAgentConfiguration(err)
 }
 
 // canonicalAgentExecutionBindingDigest computes the canonical binding digest
@@ -641,6 +686,14 @@ func snapshotWorkspaceClassFromBinding(class *ACPWorkspaceClassBinding) *agentEx
 		IdleTimeout:        class.IdleTimeout,
 		MaxLifetime:        class.MaxLifetime,
 	}
+	if class.SandboxVolume != nil {
+		frozen.SandboxVolume = &agentExecutionSnapshotSandboxVolume{
+			StorageClassName: class.SandboxVolume.StorageClassName,
+			StorageClassUID:  class.SandboxVolume.StorageClassUID,
+			AccessModes:      append([]string(nil), class.SandboxVolume.AccessModes...),
+			Capacity:         class.SandboxVolume.Capacity,
+		}
+	}
 	frozen.DeletionPolicy.ProviderResources = class.DeletionPolicy.ProviderResources
 	frozen.DeletionPolicy.PersistentVolumes = class.DeletionPolicy.PersistentVolumes
 	frozen.DeletionPolicy.Checkpoints = class.DeletionPolicy.Checkpoints
@@ -669,11 +722,24 @@ func workspaceClassBindingFromSnapshot(class *agentExecutionSnapshotWorkspaceCla
 		DetachTimeout:      class.DetachTimeout,
 		IdleTimeout:        class.IdleTimeout,
 		MaxLifetime:        class.MaxLifetime,
+		SandboxVolume:      sandboxVolumeFromSnapshot(class.SandboxVolume),
 		DeletionPolicy: ACPWorkspaceClassDeletionPolicy{
 			ProviderResources: class.DeletionPolicy.ProviderResources,
 			PersistentVolumes: class.DeletionPolicy.PersistentVolumes,
 			Checkpoints:       class.DeletionPolicy.Checkpoints,
 		},
+	}
+}
+
+func sandboxVolumeFromSnapshot(volume *agentExecutionSnapshotSandboxVolume) *ACPSandboxDurableVolume {
+	if volume == nil {
+		return nil
+	}
+	return &ACPSandboxDurableVolume{
+		StorageClassName: volume.StorageClassName,
+		StorageClassUID:  volume.StorageClassUID,
+		AccessModes:      append([]string(nil), volume.AccessModes...),
+		Capacity:         volume.Capacity,
 	}
 }
 

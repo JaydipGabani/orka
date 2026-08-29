@@ -56,16 +56,62 @@ type SubstrateProfileSpec struct {
 	Suspend *SubstrateSuspendPolicy `json:"suspend,omitempty"`
 }
 
+// AgentSandboxDurableVolume freezes the durable workspace
+// PersistentVolumeClaim shape for PVC-backed cold suspension. The mount path
+// stays controller-owned; the volume holds only repository/workspace data.
+type AgentSandboxDurableVolume struct {
+	// StorageClassName optionally selects the storage class. Empty uses the
+	// cluster default.
+	// +optional
+	StorageClassName string `json:"storageClassName,omitempty"`
+
+	// AccessModes defaults to ReadWriteOnce when empty.
+	// +listType=set
+	// +optional
+	AccessModes []string `json:"accessModes,omitempty"`
+
+	// Capacity is the requested storage quantity, for example 1Gi.
+	// +kubebuilder:validation:MinLength=1
+	Capacity string `json:"capacity"`
+}
+
+// AgentSandboxSuspendPolicy permits operator-governed PVC-backed cold
+// suspension for Agent Sandbox classes. When set, the pool's SandboxClaim
+// requests one dedicated durable workspace PVC (which forces a cold start
+// instead of warm-pool adoption), and a requested suspension terminates the
+// Sandbox Pod through operatingMode: Suspended while the PVC persists. The
+// supervisor session tree, home, temporary files, identity bookkeeping, and
+// every credential stay on ephemeral storage; process memory is never
+// preserved.
+type AgentSandboxSuspendPolicy struct {
+	// Mode selects the suspension scope. Only DataOnly is supported.
+	Mode SubstrateSuspendMode `json:"mode"`
+
+	// Volume freezes the durable workspace PVC shape.
+	Volume AgentSandboxDurableVolume `json:"volume"`
+}
+
+// AgentSandboxProfileSpec carries operator-owned Agent Sandbox inputs.
+type AgentSandboxProfileSpec struct {
+	// Suspend permits PVC-backed cold suspension for this profile.
+	// +optional
+	Suspend *AgentSandboxSuspendPolicy `json:"suspend,omitempty"`
+}
+
 // RuntimeWorkspaceProfileSpec is the namespaced class-parameters contract for
-// the in-tree ACP RuntimePool execution-workspace adapter. A class whose
-// provider backend is substrate must reference a profile that sets substrate;
-// an agent-sandbox class profile must leave it empty because agent-sandbox
-// RuntimeSessions run only controller-rendered sandbox templates.
+// the in-tree ACP RuntimePool execution-workspace adapter. A profile sets only
+// the inputs for its provider backend: substrate for Substrate, or
+// agentSandbox.suspend for Agent Sandbox when PVC-backed DataOnly suspension
+// is enabled.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="RuntimeWorkspaceProfile spec is immutable; create a new profile"
 type RuntimeWorkspaceProfileSpec struct {
 	// Substrate carries the operator-owned Substrate infrastructure inputs.
 	// +optional
 	Substrate *SubstrateProfileSpec `json:"substrate,omitempty"`
+
+	// AgentSandbox carries the operator-owned Agent Sandbox inputs.
+	// +optional
+	AgentSandbox *AgentSandboxProfileSpec `json:"agentSandbox,omitempty"`
 }
 
 // +kubebuilder:object:root=true

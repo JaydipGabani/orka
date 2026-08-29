@@ -932,6 +932,98 @@ func TestACPRuntimePoolWorkspaceMatchesPlanRequiresExactProviderFields(t *testin
 	}
 }
 
+// The queue path must use the linked workspace's creation-time runtime
+// namespace after mutable controller configuration drifts. Validating the
+// current flag before loading the workspace would reject this continuation
+// before the frozen namespace can govern pool creation or reuse.
+func TestQueueACPRuntimeTaskUsesFrozenWorkspaceRuntimeNamespace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fixture := suspendableSubstrateFixture(t)
+	task := suspendableSessionTask()
+	reconciler := acpClassTestReconciler(t, append(fixture.objects(), task)...)
+	db, err := sqlite.NewDB(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	controlStore := sqlite.NewStore(db, "test")
+	reconciler.DurableControlStore = controlStore
+	reconciler.ControllerEpochManager = NewControllerEpochManager(controlStore, "controller-test")
+	reconciler.ACPWorkspaceDispatchEnabled = true
+	reconciler.SubstrateEnabled = true
+	epochCtx, cancelEpoch := context.WithCancel(context.Background())
+	epochDone := make(chan error, 1)
+	go func() { epochDone <- reconciler.ControllerEpochManager.Start(epochCtx) }()
+	t.Cleanup(func() {
+		cancelEpoch()
+		if err := <-epochDone; err != nil {
+			t.Errorf("controller epoch manager shutdown: %v", err)
+		}
+	})
+	if _, err := reconciler.ControllerEpochManager.CurrentFence(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	bound := bindSuspendableSessionTaskForSettlement(t, reconciler, task)
+	if _, err := reconciler.queueACPRuntimeTask(ctx, bound, bindingTestAgent()); err != nil {
+		t.Fatalf("materialize workspace through queue: %v", err)
+	}
+	current := &corev1alpha1.Task{}
+	if err := reconciler.Get(ctx, client.ObjectKeyFromObject(task), current); err != nil {
+		t.Fatal(err)
+	}
+	workspaceName := current.Labels[acpExecutionWorkspaceLinkLabel]
+	if workspaceName == "" {
+		t.Fatal("queue did not link the class workspace")
+	}
+	workspace := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := reconciler.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: workspaceName}, workspace); err != nil {
+		t.Fatal(err)
+	}
+	if got := workspace.Annotations[acpWorkspaceRuntimeNamespaceAnnotation]; got != acpTestRuntimeNamespace {
+		t.Fatalf("frozen workspace runtime namespace = %q, want %q", got, acpTestRuntimeNamespace)
+	}
+	admitTestACPWorkspace(t, reconciler, workspace)
+	if err := reconciler.Get(ctx, client.ObjectKeyFromObject(task), current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.queueACPRuntimeTask(ctx, current, bindingTestAgent()); err != nil {
+		t.Fatalf("attach workspace through queue: %v", err)
+	}
+	if err := reconciler.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: workspaceName}, workspace); err != nil {
+		t.Fatal(err)
+	}
+	acknowledgeTestACPWorkspaceAttachment(t, reconciler, workspace)
+
+	// The current flag now aliases the Substrate template namespace and is
+	// invalid for new workspaces. This existing workspace remains valid
+	// because its provider-child namespace was frozen before the drift.
+	reconciler.ACPRuntimeNamespace = acpTestSubstrateNamespace
+	if err := reconciler.Get(ctx, client.ObjectKeyFromObject(task), current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.queueACPRuntimeTask(ctx, current, bindingTestAgent()); err != nil {
+		t.Fatalf("queue with frozen workspace namespace: %v", err)
+	}
+	var pools corev1alpha1.RuntimePoolList
+	if err := reconciler.List(ctx, &pools); err != nil {
+		t.Fatal(err)
+	}
+	if len(pools.Items) != 1 || pools.Items[0].Spec.RuntimeNamespace != acpTestRuntimeNamespace {
+		t.Fatalf("workspace pools = %#v, want one pool in frozen runtime namespace %q", pools.Items, acpTestRuntimeNamespace)
+	}
+	if err := reconciler.Get(ctx, client.ObjectKeyFromObject(task), current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Execution == nil || current.Status.Execution.State != corev1alpha1.TaskExecutionStateQueued {
+		t.Fatalf("queue status = %#v, want Queued", current.Status.Execution)
+	}
+	if _, err := reconciler.queueACPRuntimeTask(ctx, current, bindingTestAgent()); err != nil {
+		t.Fatalf("reuse pool with frozen workspace namespace: %v", err)
+	}
+}
+
 // The post-materialization handshake repeats every admission and attachment
 // gate through the uncached reader. A lifecycle transition between workspace
 // readiness and pool creation must abort the pool before prompt dispatch.

@@ -120,11 +120,6 @@ const (
 	// remain namespace-scoped under the operator-provided RoleBindings even if
 	// the derived ActorTemplate is later removed.
 	substrateNetworkPolicyNamespacesAnnotation = "orka.ai/substrate-network-policy-namespaces"
-	// substrateWorkspaceSuspendAnnotation records the ACP workspace adapter's
-	// data-only suspension intent for this pool. It is honored only when the
-	// pool's immutable spec carries the DataOnly suspend mode; the scale-down
-	// drain then ends in a consensual data checkpoint instead of teardown.
-	substrateWorkspaceSuspendAnnotation = "orka.ai/substrate-workspace-suspend"
 	// substrateWorkspaceSuspendFailedAnnotation records the exact actor whose
 	// data-only checkpoint was permanently rejected. The failure is terminal:
 	// the actor is torn down without replaying the rejected provider call, and
@@ -368,14 +363,14 @@ func (r *RuntimePoolReconciler) reconcileSubstrateBackedRuntimePool(
 	// the controller-owned runtime namespace and are seeded into the booted
 	// supervisor through the nonce-bound, controller-signed credential bootstrap.
 	if err := r.ensureRuntimePoolNamespace(ctx, cfg); err != nil {
-		return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, err)
+		return r.finishWorkspacePoolPrerequisiteFailure(ctx, pool, cfg, "runtime namespace prerequisite failed", err)
 	}
 	authSecret, providerSecret, err := r.ensureRuntimePoolSecrets(ctx, pool, cfg)
 	if err != nil {
 		if errors.Is(err, errWorkspaceRuntimePoolAuthBindingLost) {
 			return r.reconcileSubstrateRuntimePoolMissingAuthSecret(ctx, pool, cfg)
 		}
-		return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, err)
+		return r.finishWorkspacePoolPrerequisiteFailure(ctx, pool, cfg, "runtime credential prerequisite failed", err)
 	}
 	actorID := runtimePoolSubstrateActorID(cfg.baseName)
 	routeHost := substrateActorRouteHost(actorID, r.SubstrateConfig.ActorDNSSuffix)
@@ -3185,19 +3180,18 @@ func (r *RuntimePoolReconciler) linkedWorkspaceSuspendIntentPending(
 	ctx context.Context,
 	pool *corev1alpha1.RuntimePool,
 ) (bool, error) {
-	if !substrateRuntimePoolSuspendCapable(pool) || substrateWorkspaceSuspendRequested(pool) {
+	if !runtimePoolWorkspaceSuspendCapable(pool) || runtimePoolWorkspaceSuspendIntentSet(pool) {
 		return false, nil
 	}
 	name := strings.TrimSpace(pool.Labels[acpExecutionWorkspaceLinkLabel])
 	if name == "" {
 		return false, nil
 	}
-	reader := r.APIReader
-	if reader == nil {
-		reader = r.Client
-	}
 	linked := &workspacev1alpha1.ExecutionWorkspace{}
-	if err := reader.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: name}, linked); err != nil {
+	// This fence guards a destructive scale-down: a DesiredState=Suspended
+	// write that reached the API server but not this controller's cache must
+	// still hold teardown, so the read is uncached.
+	if err := r.sandboxReader().Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: name}, linked); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -3222,7 +3216,10 @@ func (r *RuntimePoolReconciler) linkedWorkspaceSuspendIntentPending(
 // substrateRuntimePoolSuspendCapable reports whether the pool's immutable
 // binding permits data-only cold suspension.
 func substrateRuntimePoolSuspendCapable(pool *corev1alpha1.RuntimePool) bool {
+	// The provider gate keeps a stale or tampered pool carrying a foreign
+	// backend block from being classified as substrate-suspendable.
 	return pool != nil && pool.Spec.ExecutionWorkspace != nil &&
+		pool.Spec.ExecutionWorkspace.Provider == corev1alpha1.WorkspaceProviderSubstrate &&
 		pool.Spec.ExecutionWorkspace.Substrate != nil &&
 		pool.Spec.ExecutionWorkspace.Substrate.SuspendMode == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly)
 }
@@ -3230,8 +3227,20 @@ func substrateRuntimePoolSuspendCapable(pool *corev1alpha1.RuntimePool) bool {
 // substrateWorkspaceSuspendRequested reports the workspace adapter's
 // suspension intent. It is honored only on suspend-capable pools.
 func substrateWorkspaceSuspendRequested(pool *corev1alpha1.RuntimePool) bool {
-	return pool != nil && strings.TrimSpace(pool.Annotations[substrateWorkspaceSuspendAnnotation]) != "" &&
-		substrateRuntimePoolSuspendCapable(pool)
+	return runtimePoolWorkspaceSuspendIntentSet(pool) && substrateRuntimePoolSuspendCapable(pool)
+}
+
+// substrateWorkspaceDurableStateProtectionPresent reports any controller
+// marker that means a Substrate actor may hold the only durable copy of a
+// workspace. Presence is sufficient: malformed or partially persisted
+// transitions must preserve the admitted identity until the state machine can
+// validate them fail-closed.
+func substrateWorkspaceDurableStateProtectionPresent(pool *corev1alpha1.RuntimePool) bool {
+	return runtimePoolIsSubstrateBacked(pool) &&
+		(runtimePoolWorkspaceSuspendIntentSet(pool) ||
+			strings.TrimSpace(pool.Annotations[substrateActorSuspendedAnnotation]) != "" ||
+			strings.TrimSpace(pool.Annotations[substrateActorSuspendAcceptedAnnotation]) != "" ||
+			strings.TrimSpace(pool.Annotations[substrateActorResumingAnnotation]) != "")
 }
 
 // substrateActorSuspendRequested reports whether this controller durably
