@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/store/sqlite"
@@ -197,12 +198,12 @@ func TestResolveACPWorkspaceBinding(t *testing.T) {
 			wantErr: "reusePolicy none cannot be used with spec.sessionRef",
 		},
 		{
-			name: "classRef fails closed",
+			name: "classRef fails closed without a resolved class",
 			task: workspaceBindingTestTask(func(ws *corev1alpha1.ExecutionWorkspaceSpec) {
 				ws.Enabled = false
 				ws.ClassRef = &corev1alpha1.WorkspaceClassReference{Name: "class"}
 			}),
-			wantErr: "controller-first Task workspace integration",
+			wantErr: "requires a resolved workspace class",
 		},
 	}
 	for _, tt := range tests {
@@ -332,10 +333,10 @@ func TestSessionWorkspacePoolIdentityRejectsRuntimeProfileRotation(t *testing.T)
 	if rotatedPlan.PoolName != firstPlan.PoolName {
 		t.Fatalf("session workspace pool rotated with the runtime profile: first=%q rotated=%q", firstPlan.PoolName, rotatedPlan.PoolName)
 	}
-	if _, _, err := reconciler.ensureACPRuntimePool(ctx, task.Namespace, firstPlan); err != nil {
+	if _, _, err := reconciler.ensureACPRuntimePool(ctx, task.Namespace, firstPlan, "", "", ""); err != nil {
 		t.Fatalf("create session workspace RuntimePool: %v", err)
 	}
-	if _, _, err := reconciler.ensureACPRuntimePool(ctx, task.Namespace, rotatedPlan); !errors.Is(err, store.ErrValidation) ||
+	if _, _, err := reconciler.ensureACPRuntimePool(ctx, task.Namespace, rotatedPlan, "", "", ""); !errors.Is(err, store.ErrValidation) ||
 		!strings.Contains(err.Error(), "cannot rotate the runtime image or profile") {
 		t.Fatalf("rotated profile error = %v, want permanent session-workspace rejection", err)
 	}
@@ -395,10 +396,10 @@ func TestSessionWorkspacePoolIdentityRejectsWorkspaceSelectionRotation(t *testin
 	if rotatedPlan.PoolName != firstPlan.PoolName {
 		t.Fatalf("session workspace pool rotated with workspace selection: first=%q rotated=%q", firstPlan.PoolName, rotatedPlan.PoolName)
 	}
-	if _, _, err := reconciler.ensureACPRuntimePool(ctx, firstTask.Namespace, firstPlan); err != nil {
+	if _, _, err := reconciler.ensureACPRuntimePool(ctx, firstTask.Namespace, firstPlan, "", "", ""); err != nil {
 		t.Fatalf("create session workspace RuntimePool: %v", err)
 	}
-	if _, _, err := reconciler.ensureACPRuntimePool(ctx, firstTask.Namespace, rotatedPlan); !errors.Is(err, store.ErrValidation) ||
+	if _, _, err := reconciler.ensureACPRuntimePool(ctx, firstTask.Namespace, rotatedPlan, "", "", ""); !errors.Is(err, store.ErrValidation) ||
 		!strings.Contains(err.Error(), "cannot change the workspace provider") {
 		t.Fatalf("rotated workspace selection error = %v, want permanent session-workspace rejection", err)
 	}
@@ -727,7 +728,7 @@ func TestEnsureACPRuntimePoolCreatesWorkspaceBackedPool(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pool, preexisting, err := reconciler.ensureACPRuntimePool(ctx, task.Namespace, plan)
+	pool, preexisting, err := reconciler.ensureACPRuntimePool(ctx, task.Namespace, plan, "", "", "")
 	if err != nil {
 		t.Fatalf("ensureACPRuntimePool() error = %v", err)
 	}
@@ -745,7 +746,7 @@ func TestEnsureACPRuntimePoolCreatesWorkspaceBackedPool(t *testing.T) {
 	if pool.Labels[acpRuntimeWorkspaceProviderLabel] != string(corev1alpha1.WorkspaceProviderAgentSandbox) {
 		t.Fatalf("pool labels = %#v, want workspace provider label", pool.Labels)
 	}
-	reattached, preexisting, err := reconciler.ensureACPRuntimePool(ctx, task.Namespace, plan)
+	reattached, preexisting, err := reconciler.ensureACPRuntimePool(ctx, task.Namespace, plan, "", "", "")
 	if err != nil {
 		t.Fatalf("reattach workspace RuntimePool: %v", err)
 	}
@@ -756,7 +757,7 @@ func TestEnsureACPRuntimePoolCreatesWorkspaceBackedPool(t *testing.T) {
 	// A frozen plain plan must never bind to a workspace-backed pool.
 	plainPlan := plan
 	plainPlan.Workspace = nil
-	if _, _, err := reconciler.ensureACPRuntimePool(ctx, task.Namespace, plainPlan); err == nil ||
+	if _, _, err := reconciler.ensureACPRuntimePool(ctx, task.Namespace, plainPlan, "", "", ""); err == nil ||
 		!strings.Contains(err.Error(), "execution workspace binding does not match") {
 		t.Fatalf("mismatched pool binding error = %v, want exact-binding rejection", err)
 	}
@@ -810,7 +811,7 @@ func TestEnsureACPRuntimePoolValidatesCreateRaceWinner(t *testing.T) {
 			},
 		})
 
-		if _, _, err := reconciler.ensureACPRuntimePool(context.Background(), task.Namespace, plan); err == nil ||
+		if _, _, err := reconciler.ensureACPRuntimePool(context.Background(), task.Namespace, plan, "", "", ""); err == nil ||
 			!strings.Contains(err.Error(), "execution workspace binding does not match") {
 			t.Fatalf("create-race winner error = %v, want exact workspace-binding rejection", err)
 		}
@@ -839,7 +840,7 @@ func TestEnsureACPRuntimePoolValidatesCreateRaceWinner(t *testing.T) {
 			},
 		})
 
-		pool, preexisting, err := reconciler.ensureACPRuntimePool(context.Background(), task.Namespace, plan)
+		pool, preexisting, err := reconciler.ensureACPRuntimePool(context.Background(), task.Namespace, plan, "", "", "")
 		if err != nil {
 			t.Fatalf("activate matching create-race winner: %v", err)
 		}
@@ -875,6 +876,189 @@ func TestACPRuntimePoolWorkspaceMatchesPlanRequiresExactProviderFields(t *testin
 	pool.Spec.ExecutionWorkspace.Substrate.BaseTemplateNamespace = acpWorkspaceTestOtherNamespace
 	if acpRuntimePoolWorkspaceMatchesPlan(pool, plan) {
 		t.Fatal("Substrate workspace binding ignored the infrastructure template namespace")
+	}
+}
+
+// The post-materialization handshake repeats every admission and attachment
+// gate through the uncached reader. A lifecycle transition between workspace
+// readiness and pool creation must abort the pool before prompt dispatch.
+func TestVerifyACPWorkspaceReadyForPool(t *testing.T) {
+	t.Parallel()
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	const taskUID = "attached-task-uid"
+	readyObjects := func() (*workspacev1alpha1.ExecutionWorkspace, *corev1alpha1.RuntimePool) {
+		now := time.Now().UTC()
+		workspace := &workspacev1alpha1.ExecutionWorkspace{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: corev1.NamespaceDefault, Name: "acp-ws-alive", UID: types.UID("alive-ws-uid"),
+				Generation: 1, CreationTimestamp: metav1.NewTime(now.Add(-time.Minute)),
+				Annotations: map[string]string{acpExecutionWorkspacePoolAnnotation: "acp-ws-session-handshake"},
+			},
+			Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
+				DesiredState:    workspacev1alpha1.ExecutionWorkspaceDesiredReady,
+				AttachmentEpoch: 3,
+				Attachment: &workspacev1alpha1.ExecutionWorkspaceAttachment{
+					TaskRef:   workspacev1alpha1.ObjectIdentityReference{UID: types.UID(taskUID)},
+					Epoch:     3,
+					ExpiresAt: metav1.NewTime(now.Add(time.Hour)),
+				},
+				Lifecycle: workspacev1alpha1.ExecutionWorkspaceLifecycle{
+					MaxLifetime: &metav1.Duration{Duration: 2 * time.Hour},
+				},
+			},
+			Status: workspacev1alpha1.ExecutionWorkspaceStatus{
+				State: workspacev1alpha1.ExecutionWorkspaceStateAttached, AttachedEpoch: 3,
+			},
+		}
+		markWorkspaceAdmittedForPolicyReview(workspace, workspace.Generation)
+		workspace.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
+		workspace.Status.AttachedEpoch = 3
+		workspace.Status.Conditions = append(workspace.Status.Conditions, metav1.Condition{
+			Type: string(workspacev1alpha1.ConditionWorkspaceAttached), Status: metav1.ConditionTrue,
+			Reason: string(workspacev1alpha1.ReasonReady), ObservedGeneration: workspace.Generation,
+		})
+		pool := &corev1alpha1.RuntimePool{ObjectMeta: metav1.ObjectMeta{
+			Namespace: corev1.NamespaceDefault, Name: "acp-ws-session-handshake", UID: types.UID("handshake-pool-uid"),
+			Labels:      map[string]string{acpExecutionWorkspaceLinkLabel: workspace.Name},
+			Annotations: map[string]string{acpExecutionWorkspaceUIDAnnotation: string(workspace.UID)},
+		}}
+		return workspace, pool
+	}
+	workspace, pool := readyObjects()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workspace, pool).Build()
+	r := &TaskReconciler{Client: c, APIReader: c, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := r.verifyACPWorkspaceReadyForPool(ctx, pool, workspace.Name, string(workspace.UID), taskUID); err != nil {
+		t.Fatalf("ready workspace must pass the handshake: %v", err)
+	}
+
+	// Finalization between readiness and pool creation is one form of the
+	// same withdrawn-handshake race.
+	if err := c.Delete(ctx, workspace); err != nil {
+		t.Fatalf("delete workspace: %v", err)
+	}
+	if err := r.verifyACPWorkspaceReadyForPool(ctx, pool, workspace.Name, string(workspace.UID), taskUID); err == nil {
+		t.Fatal("a finalized workspace must abort the handshake")
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}, &corev1alpha1.RuntimePool{}); err == nil {
+		t.Fatal("the aborted pool must be deleted so no prompt can dispatch through the orphan")
+	}
+
+	t.Run("retries pool deletion after a resource version conflict", func(t *testing.T) {
+		workspace, pool := readyObjects()
+		workspace.Spec.CoreAdmission.AdmittedGeneration = 0
+		withWatch := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workspace, pool).Build()
+		deleteCalls := 0
+		kubeClient := interceptor.NewClient(withWatch, interceptor.Funcs{
+			Delete: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.DeleteOption) error {
+				if _, isPool := object.(*corev1alpha1.RuntimePool); !isPool {
+					return delegate.Delete(ctx, object, options...)
+				}
+				deleteCalls++
+				if deleteCalls == 1 {
+					current := &corev1alpha1.RuntimePool{}
+					key := client.ObjectKeyFromObject(object)
+					if err := delegate.Get(ctx, key, current); err != nil {
+						return err
+					}
+					current.Status.ObservedGeneration++
+					if err := delegate.Update(ctx, current); err != nil {
+						return err
+					}
+					return apierrors.NewConflict(
+						schema.GroupResource{Group: corev1alpha1.GroupVersion.Group, Resource: "runtimepools"},
+						object.GetName(), errors.New("simulated RuntimePool controller update"),
+					)
+				}
+				return delegate.Delete(ctx, object, options...)
+			},
+		})
+		reconciler := &TaskReconciler{Client: kubeClient, APIReader: kubeClient, Scheme: scheme}
+		if err := reconciler.verifyACPWorkspaceReadyForPool(
+			context.Background(), pool, workspace.Name, string(workspace.UID), taskUID,
+		); err == nil || !strings.Contains(err.Error(), "the pool was aborted") {
+			t.Fatalf("handshake error = %v, want proven pool abortion", err)
+		}
+		if deleteCalls != 2 {
+			t.Fatalf("RuntimePool delete calls = %d, want 2", deleteCalls)
+		}
+		if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(pool), &corev1alpha1.RuntimePool{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("RuntimePool survived retried deletion: %v", err)
+		}
+	})
+
+	tests := []struct {
+		name   string
+		mutate func(*workspacev1alpha1.ExecutionWorkspace)
+	}{
+		{
+			name: "quarantined intent",
+			mutate: func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+				workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredQuarantined
+			},
+		},
+		{
+			name: "terminal failure",
+			mutate: func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+				workspace.Status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
+			},
+		},
+		{
+			name: "core admission withdrawn",
+			mutate: func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+				workspace.Spec.CoreAdmission.AdmittedGeneration = 0
+			},
+		},
+		{
+			name: "attachment revocation started",
+			mutate: func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+				workspace.Annotations[acpWorkspaceRevocationStartedAnnotation] = "3 2026-08-23T00:00:00Z"
+			},
+		},
+		{
+			name: "attachment epoch not enforced",
+			mutate: func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+				workspace.Status.AttachedEpoch = 0
+			},
+		},
+		{
+			name: "attached to another Task",
+			mutate: func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+				workspace.Spec.Attachment.TaskRef.UID = types.UID("other-task-uid")
+			},
+		},
+		{
+			name: "maximum lifetime elapsed",
+			mutate: func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+				workspace.CreationTimestamp = metav1.NewTime(time.Now().Add(-3 * time.Hour))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			workspace, pool := readyObjects()
+			tt.mutate(workspace)
+			kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workspace, pool).Build()
+			reconciler := &TaskReconciler{Client: kubeClient, APIReader: kubeClient, Scheme: scheme}
+			if err := reconciler.verifyACPWorkspaceReadyForPool(
+				context.Background(), pool, workspace.Name, string(workspace.UID), taskUID,
+			); err == nil {
+				t.Fatal("withdrawn workspace readiness must abort the handshake")
+			}
+			if err := kubeClient.Get(context.Background(), types.NamespacedName{
+				Namespace: pool.Namespace, Name: pool.Name,
+			}, &corev1alpha1.RuntimePool{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("aborted RuntimePool must be deleted, got %v", err)
+			}
+		})
 	}
 }
 
@@ -944,6 +1128,330 @@ func TestReapIdlePoolsDeletesStoppedWorkspacePools(t *testing.T) {
 	}
 }
 
+func TestReapIdlePoolsUsesFrozenWorkspaceIdleTimeoutForScaleDown(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		globalTTL     time.Duration
+		idleTimeout   time.Duration
+		lastDemandAgo time.Duration
+		wantReplicas  int32
+	}{
+		{
+			name:          "longer class timeout retains physical workspace",
+			globalTTL:     time.Minute,
+			idleTimeout:   4 * time.Hour,
+			lastDemandAgo: 3 * time.Hour,
+			wantReplicas:  1,
+		},
+		{
+			name:          "shorter class timeout retires physical workspace",
+			globalTTL:     4 * time.Hour,
+			idleTimeout:   time.Minute,
+			lastDemandAgo: 3 * time.Minute,
+			wantReplicas:  0,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			workspace := &workspacev1alpha1.ExecutionWorkspace{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: corev1.NamespaceDefault,
+					Name:      "acp-ws-scale-timeout",
+					UID:       types.UID("scale-timeout-workspace-uid"),
+					Annotations: map[string]string{
+						acpExecutionWorkspacePoolAnnotation: acpWorkspaceTestRuntimePoolName,
+					},
+				},
+				Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
+					Lifecycle: workspacev1alpha1.ExecutionWorkspaceLifecycle{
+						IdleTimeout: &metav1.Duration{Duration: testCase.idleTimeout},
+					},
+				},
+			}
+			pool := &corev1alpha1.RuntimePool{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:  corev1.NamespaceDefault,
+					Name:       acpWorkspaceTestRuntimePoolName,
+					UID:        types.UID("scale-timeout-pool-uid"),
+					Generation: 1,
+					Labels: map[string]string{
+						acpExecutionWorkspaceLinkLabel: workspace.Name,
+					},
+					Annotations: map[string]string{
+						acpRuntimeLastDemandAnnotation:     now.Add(-testCase.lastDemandAgo).Format(time.RFC3339Nano),
+						acpExecutionWorkspaceUIDAnnotation: string(workspace.UID),
+					},
+				},
+				Spec: corev1alpha1.RuntimePoolSpec{
+					DesiredReplicas: 1,
+					ExecutionWorkspace: &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
+						Provider:      corev1alpha1.WorkspaceProviderAgentSandbox,
+						BindingDigest: "sha256:" + strings.Repeat("5", 64),
+					},
+				},
+			}
+			kubeClient := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&corev1alpha1.RuntimePool{}).
+				WithObjects(workspace, pool).
+				Build()
+			db, err := sqlite.NewDB(filepath.Join(t.TempDir(), "workspace-idle-timeout.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close() //nolint:errcheck
+			epochs := NewControllerEpochManager(sqlite.NewStore(db, "test"), "workspace-idle-timeout-controller")
+			epochCtx, cancelEpoch := context.WithCancel(context.Background())
+			epochDone := make(chan error, 1)
+			go func() { epochDone <- epochs.Start(epochCtx) }()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if _, err := epochs.CurrentFence(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			dispatcher := &ACPDispatcher{
+				Client: kubeClient, APIReader: kubeClient, Epochs: epochs, IdlePoolTTL: testCase.globalTTL,
+			}
+			if err := dispatcher.reapIdlePools(ctx, nil); err != nil {
+				t.Fatal(err)
+			}
+			current := &corev1alpha1.RuntimePool{}
+			if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(pool), current); err != nil {
+				t.Fatal(err)
+			}
+			if current.Spec.DesiredReplicas != testCase.wantReplicas {
+				t.Fatalf("DesiredReplicas = %d, want %d", current.Spec.DesiredReplicas, testCase.wantReplicas)
+			}
+
+			cancelEpoch()
+			if err := <-epochDone; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// The idle reaper must never destroy quarantine evidence: a workspace the
+// detach-timeout settlement deliberately preserved stays even when its
+// linked pool idles at Stopped past the TTL.
+func TestReapIdlePoolsPreservesQuarantinedWorkspaces(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	workspace := &workspacev1alpha1.ExecutionWorkspace{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: corev1.NamespaceDefault, Name: "acp-ws-quarantined", UID: types.UID("quarantined-ws-uid"),
+			Annotations: map[string]string{acpExecutionWorkspacePoolAnnotation: acpWorkspaceTestRuntimePoolName},
+		},
+		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
+			DesiredState: workspacev1alpha1.ExecutionWorkspaceDesiredQuarantined,
+		},
+	}
+	stopped := &corev1alpha1.RuntimePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: corev1.NamespaceDefault, Name: acpWorkspaceTestRuntimePoolName, UID: types.UID("ws-pool-uid"), Generation: 1,
+			Labels: map[string]string{acpExecutionWorkspaceLinkLabel: workspace.Name},
+			Annotations: map[string]string{
+				acpRuntimeLastDemandAnnotation:     now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+				acpExecutionWorkspaceUIDAnnotation: string(workspace.UID),
+			},
+		},
+		Spec: corev1alpha1.RuntimePoolSpec{
+			DesiredReplicas: 0,
+			ExecutionWorkspace: &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
+				Provider:      corev1alpha1.WorkspaceProviderAgentSandbox,
+				BindingDigest: "sha256:" + strings.Repeat("8", 64),
+			},
+		},
+		Status: corev1alpha1.RuntimePoolStatus{Lifecycle: corev1alpha1.RuntimePoolLifecycleStopped, ObservedGeneration: 1},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.RuntimePool{}).
+		WithObjects(stopped, workspace).Build()
+	dispatcher := &ACPDispatcher{Client: kubeClient, IdlePoolTTL: time.Minute}
+	ctx := context.Background()
+	if err := dispatcher.reapStoppedWorkspacePool(ctx, stopped, 0, time.Now().UTC()); err != nil {
+		t.Fatalf("reap stopped workspace pool: %v", err)
+	}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: corev1.NamespaceDefault, Name: workspace.Name}, &workspacev1alpha1.ExecutionWorkspace{}); err != nil {
+		t.Fatalf("the quarantined workspace must survive the idle reaper: %v", err)
+	}
+}
+
+func TestReapStoppedWorkspacePoolHonorsFrozenIdleTimeout(t *testing.T) {
+	t.Parallel()
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	workspace := &workspacev1alpha1.ExecutionWorkspace{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: corev1.NamespaceDefault,
+			Name:      "acp-ws-idle-timeout",
+			UID:       types.UID("idle-timeout-workspace-uid"),
+			Annotations: map[string]string{
+				acpExecutionWorkspacePoolAnnotation: acpWorkspaceTestRuntimePoolName,
+			},
+		},
+		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
+			DesiredState: workspacev1alpha1.ExecutionWorkspaceDesiredReady,
+			Lifecycle: workspacev1alpha1.ExecutionWorkspaceLifecycle{
+				IdleTimeout: &metav1.Duration{Duration: 4 * time.Hour},
+			},
+		},
+	}
+	pool := &corev1alpha1.RuntimePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  corev1.NamespaceDefault,
+			Name:       acpWorkspaceTestRuntimePoolName,
+			UID:        types.UID("idle-timeout-pool-uid"),
+			Generation: 1,
+			Labels: map[string]string{
+				acpExecutionWorkspaceLinkLabel: workspace.Name,
+			},
+			Annotations: map[string]string{
+				acpRuntimeLastDemandAnnotation:     now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+				acpExecutionWorkspaceUIDAnnotation: string(workspace.UID),
+			},
+		},
+		Spec: corev1alpha1.RuntimePoolSpec{
+			DesiredReplicas: 0,
+			ExecutionWorkspace: &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
+				Provider:      corev1alpha1.WorkspaceProviderAgentSandbox,
+				BindingDigest: "sha256:" + strings.Repeat("6", 64),
+			},
+		},
+		Status: corev1alpha1.RuntimePoolStatus{
+			Lifecycle:          corev1alpha1.RuntimePoolLifecycleStopped,
+			ObservedGeneration: 1,
+		},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.RuntimePool{}).
+		WithObjects(workspace, pool).
+		Build()
+	dispatcher := &ACPDispatcher{Client: kubeClient, APIReader: kubeClient, IdlePoolTTL: time.Minute}
+	ctx := context.Background()
+
+	if err := dispatcher.reapStoppedWorkspacePool(ctx, pool, 0, now); err != nil {
+		t.Fatalf("reap before frozen idle timeout: %v", err)
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(workspace), &workspacev1alpha1.ExecutionWorkspace{}); err != nil {
+		t.Fatalf("workspace was deleted before frozen idle timeout: %v", err)
+	}
+
+	if err := dispatcher.reapStoppedWorkspacePool(ctx, pool, 0, now.Add(2*time.Hour)); err != nil {
+		t.Fatalf("reap after frozen idle timeout: %v", err)
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(workspace), &workspacev1alpha1.ExecutionWorkspace{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("workspace survived past frozen idle timeout: %v", err)
+	}
+}
+
+func TestReapStoppedWorkspacePoolUsesAPIReaderForWorkspaceAbsence(t *testing.T) {
+	t.Parallel()
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	workspace := &workspacev1alpha1.ExecutionWorkspace{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: corev1.NamespaceDefault,
+			Name:      "acp-ws-api-reader",
+			UID:       types.UID("api-reader-workspace-uid"),
+			Finalizers: []string{
+				"workspace.orka.ai/test-finalizer",
+			},
+			Annotations: map[string]string{acpExecutionWorkspacePoolAnnotation: acpWorkspaceTestRuntimePoolName},
+		},
+		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{DesiredState: workspacev1alpha1.ExecutionWorkspaceDesiredReady},
+	}
+	pool := &corev1alpha1.RuntimePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  corev1.NamespaceDefault,
+			Name:       acpWorkspaceTestRuntimePoolName,
+			UID:        types.UID("api-reader-pool-uid"),
+			Generation: 1,
+			Labels:     map[string]string{acpExecutionWorkspaceLinkLabel: workspace.Name},
+			Annotations: map[string]string{
+				acpRuntimeLastDemandAnnotation:     now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+				acpExecutionWorkspaceUIDAnnotation: string(workspace.UID),
+			},
+		},
+		Spec: corev1alpha1.RuntimePoolSpec{
+			DesiredReplicas: 0,
+			ExecutionWorkspace: &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
+				Provider:      corev1alpha1.WorkspaceProviderAgentSandbox,
+				BindingDigest: "sha256:" + strings.Repeat("7", 64),
+			},
+		},
+		Status: corev1alpha1.RuntimePoolStatus{
+			Lifecycle:          corev1alpha1.RuntimePoolLifecycleStopped,
+			ObservedGeneration: 1,
+		},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.RuntimePool{}).
+		WithObjects(workspace, pool).
+		Build()
+	cachedClient := &missingExecutionWorkspaceGetClient{Client: baseClient, key: client.ObjectKeyFromObject(workspace)}
+	dispatcher := &ACPDispatcher{Client: cachedClient, APIReader: baseClient, IdlePoolTTL: time.Minute}
+	ctx := context.Background()
+	if err := dispatcher.reapStoppedWorkspacePool(ctx, pool, 0, now); err != nil {
+		t.Fatalf("reap stopped workspace pool: %v", err)
+	}
+
+	currentWorkspace := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := baseClient.Get(ctx, client.ObjectKeyFromObject(workspace), currentWorkspace); err != nil {
+		t.Fatalf("workspace finalization was bypassed: %v", err)
+	}
+	if currentWorkspace.DeletionTimestamp.IsZero() {
+		t.Fatal("workspace was not sent through controller-first finalization")
+	}
+	if err := baseClient.Get(ctx, client.ObjectKeyFromObject(pool), &corev1alpha1.RuntimePool{}); err != nil {
+		t.Fatalf("RuntimePool was deleted before workspace finalization: %v", err)
+	}
+}
+
+type missingExecutionWorkspaceGetClient struct {
+	client.Client
+	key client.ObjectKey
+}
+
+func (c *missingExecutionWorkspaceGetClient) Get(
+	ctx context.Context,
+	key client.ObjectKey,
+	object client.Object,
+	opts ...client.GetOption,
+) error {
+	if _, ok := object.(*workspacev1alpha1.ExecutionWorkspace); ok && key == c.key {
+		return apierrors.NewNotFound(schema.GroupResource{
+			Group: workspacev1alpha1.GroupVersion.Group, Resource: "executionworkspaces",
+		}, key.Name)
+	}
+	return c.Client.Get(ctx, key, object, opts...)
+}
+
 func TestProjectACPExecutionWorkspaceStatusTransitions(t *testing.T) {
 	scheme := bindingTestScheme(t)
 	task := workspaceBindingTestTask(nil)
@@ -1001,5 +1509,204 @@ func TestProjectACPExecutionWorkspaceStatusTransitions(t *testing.T) {
 	}
 	if task.Status.ExecutionWorkspace.Phase != corev1alpha1.ExecutionWorkspacePhaseFailed {
 		t.Fatal("Failed workspace projection was overridden")
+	}
+}
+
+// A transient workspace read failure during the class-identity projection
+// must fail the phase transition instead of persisting a projection stripped
+// of ClassRef/WorkspaceRef/State/AttachedEpoch: the advanced phase would
+// never retry the dropped identity.
+func TestProjectACPExecutionWorkspaceStatusRetriesOnIdentityReadFailure(t *testing.T) {
+	scheme := bindingTestScheme(t)
+	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("register workspace scheme: %v", err)
+	}
+	workspace := &workspacev1alpha1.ExecutionWorkspace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: acpTestNamespace, Name: "acp-ws-read-fail", UID: types.UID("ws-read-fail-uid")},
+	}
+	task := workspaceBindingTestTask(nil)
+	task.Labels = map[string]string{acpExecutionWorkspaceLinkLabel: workspace.Name}
+	task.Status = corev1alpha1.TaskStatus{
+		Phase: corev1alpha1.TaskPhaseRunning,
+		Execution: &corev1alpha1.TaskExecutionStatus{
+			State:           corev1alpha1.TaskExecutionStateRunning,
+			RuntimePoolName: acpWorkspaceTestRuntimePoolName,
+		},
+		ExecutionWorkspace: &corev1alpha1.ExecutionWorkspaceStatus{
+			Provider: corev1alpha1.WorkspaceProviderAgentSandbox,
+			Phase:    corev1alpha1.ExecutionWorkspacePhasePending,
+			Reason:   corev1alpha1.ExecutionWorkspaceReasonPending,
+		},
+	}
+	readErr := errors.New("injected workspace read failure")
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.Task{}).
+		WithObjects(task, workspace).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, isWorkspace := obj.(*workspacev1alpha1.ExecutionWorkspace); isWorkspace {
+					return readErr
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+	reconciler := &TaskReconciler{Client: kubeClient, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := reconciler.projectACPExecutionWorkspaceStatus(ctx, task); !errors.Is(err, readErr) {
+		t.Fatalf("projection error = %v, want the surfaced read failure", err)
+	}
+	current := &corev1alpha1.Task{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, current); err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if current.Status.ExecutionWorkspace.Phase != corev1alpha1.ExecutionWorkspacePhasePending {
+		t.Fatalf("phase advanced to %q over a failed identity read; the transition must retry instead", current.Status.ExecutionWorkspace.Phase)
+	}
+}
+
+// The attachment-epoch projection must claim only an epoch the adapter is
+// actually enforcing: the requested spec epoch and the enforced status epoch
+// deliberately diverge while attachment is pending and after max-lifetime
+// enforcement clears the enforced epoch.
+func TestProjectACPClassAttachmentIdentityRequiresAcknowledgedEpoch(t *testing.T) {
+	scheme := bindingTestScheme(t)
+	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("register workspace scheme: %v", err)
+	}
+	workspace := &workspacev1alpha1.ExecutionWorkspace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: acpTestNamespace, Name: "acp-ws-epoch", UID: types.UID("ws-epoch-uid")},
+		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
+			Attachment: &workspacev1alpha1.ExecutionWorkspaceAttachment{
+				TaskRef: workspacev1alpha1.ObjectIdentityReference{Name: "epoch-task", UID: types.UID("epoch-task-uid")},
+				Epoch:   3,
+			},
+		},
+		Status: workspacev1alpha1.ExecutionWorkspaceStatus{
+			State: workspacev1alpha1.ExecutionWorkspaceStateAttached,
+		},
+	}
+	task := workspaceBindingTestTask(nil)
+	task.UID = types.UID("epoch-task-uid")
+	task.Labels = map[string]string{acpExecutionWorkspaceLinkLabel: workspace.Name}
+	task.Annotations = map[string]string{acpExecutionWorkspaceUIDAnnotation: string(workspace.UID)}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(task, workspace).Build()
+	reconciler := &TaskReconciler{Client: kubeClient, Scheme: scheme}
+	ctx := context.Background()
+
+	// Pending attachment: the adapter has not acknowledged the epoch yet.
+	next := &corev1alpha1.ExecutionWorkspaceStatus{}
+	if err := reconciler.projectACPClassAttachmentIdentity(ctx, task, next); err != nil {
+		t.Fatalf("project pending attachment identity: %v", err)
+	}
+	if next.AttachedEpoch != 0 {
+		t.Fatalf("unacknowledged attachment projected epoch %d; the Task may only claim an enforced epoch", next.AttachedEpoch)
+	}
+
+	// The adapter acknowledged exactly this epoch.
+	current := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, current); err != nil {
+		t.Fatalf("read workspace: %v", err)
+	}
+	current.Status.AttachedEpoch = 3
+	if err := kubeClient.Update(ctx, current); err != nil {
+		t.Fatalf("acknowledge epoch: %v", err)
+	}
+	next = &corev1alpha1.ExecutionWorkspaceStatus{}
+	if err := reconciler.projectACPClassAttachmentIdentity(ctx, task, next); err != nil {
+		t.Fatalf("project acknowledged attachment identity: %v", err)
+	}
+	if next.AttachedEpoch != 3 {
+		t.Fatalf("acknowledged attachment projected epoch %d, want 3", next.AttachedEpoch)
+	}
+}
+
+// Settlement completion refreshes the Released projection: the terminal
+// transition runs before revocation, so without the refresh the status would
+// permanently claim state Attached and the pre-revocation epoch.
+func TestRefreshACPReleasedWorkspaceProjectionClearsAttachment(t *testing.T) {
+	scheme := bindingTestScheme(t)
+	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("register workspace scheme: %v", err)
+	}
+	workspace := &workspacev1alpha1.ExecutionWorkspace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: acpTestNamespace, Name: "acp-ws-refresh", UID: types.UID("ws-refresh-uid")},
+		Status:     workspacev1alpha1.ExecutionWorkspaceStatus{State: workspacev1alpha1.ExecutionWorkspaceStateSuspended},
+	}
+	task := workspaceBindingTestTask(nil)
+	task.Labels = map[string]string{acpExecutionWorkspaceLinkLabel: workspace.Name}
+	task.Annotations = map[string]string{acpExecutionWorkspaceUIDAnnotation: string(workspace.UID)}
+	task.Status = corev1alpha1.TaskStatus{
+		ExecutionWorkspace: &corev1alpha1.ExecutionWorkspaceStatus{
+			Phase:         corev1alpha1.ExecutionWorkspacePhaseReleased,
+			State:         string(workspacev1alpha1.ExecutionWorkspaceStateAttached),
+			AttachedEpoch: 3,
+		},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.Task{}).WithObjects(task, workspace).Build()
+	reconciler := &TaskReconciler{Client: kubeClient, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := reconciler.refreshACPReleasedWorkspaceProjection(ctx, task); err != nil {
+		t.Fatalf("refresh released projection: %v", err)
+	}
+	if task.Status.ExecutionWorkspace.AttachedEpoch != 0 ||
+		task.Status.ExecutionWorkspace.State != string(workspacev1alpha1.ExecutionWorkspaceStateSuspended) {
+		t.Fatalf("refreshed projection = %+v, want the revoked epoch cleared and the live workspace state", task.Status.ExecutionWorkspace)
+	}
+
+	// A workspace held only by its cleanup finalizer still serves cached
+	// pre-delete status; the refresh must not freeze that stale state into
+	// the released Task.
+	deleting := workspace.DeepCopy()
+	deleting.Name = "acp-ws-refresh-deleting"
+	deleting.UID = types.UID("ws-refresh-deleting-uid")
+	deleting.ResourceVersion = ""
+	deleting.Finalizers = []string{"workspace.orka.ai/cleanup"}
+	if err := kubeClient.Create(ctx, deleting); err != nil {
+		t.Fatalf("create deleting workspace: %v", err)
+	}
+	if err := kubeClient.Delete(ctx, deleting); err != nil {
+		t.Fatalf("start deleting workspace: %v", err)
+	}
+	task.Labels[acpExecutionWorkspaceLinkLabel] = deleting.Name
+	task.Annotations[acpExecutionWorkspaceUIDAnnotation] = string(deleting.UID)
+	task.Status.ExecutionWorkspace.State = string(workspacev1alpha1.ExecutionWorkspaceStateAttached)
+	task.Status.ExecutionWorkspace.AttachedEpoch = 4
+	if err := reconciler.refreshACPReleasedWorkspaceProjection(ctx, task); err != nil {
+		t.Fatalf("refresh over a deleting workspace: %v", err)
+	}
+	if task.Status.ExecutionWorkspace.AttachedEpoch != 0 || task.Status.ExecutionWorkspace.State != "" {
+		t.Fatalf("deleting-workspace projection = %+v, want no copied state", task.Status.ExecutionWorkspace)
+	}
+
+	// A deleted workspace leaves no state claim even while the informer cache
+	// still serves the pre-delete Ready object.
+	staleWorkspace := workspace.DeepCopy()
+	staleWorkspace.Status.State = workspacev1alpha1.ExecutionWorkspaceStateReady
+	task.Labels[acpExecutionWorkspaceLinkLabel] = workspace.Name
+	task.Annotations[acpExecutionWorkspaceUIDAnnotation] = string(workspace.UID)
+	task.Status.ExecutionWorkspace.State = string(workspacev1alpha1.ExecutionWorkspaceStateAttached)
+	task.Status.ExecutionWorkspace.AttachedEpoch = 5
+	if err := kubeClient.Delete(ctx, workspace); err != nil {
+		t.Fatalf("delete workspace: %v", err)
+	}
+	staleCache := interceptor.NewClient(kubeClient, interceptor.Funcs{
+		Get: func(ctx context.Context, delegate client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+			if current, ok := object.(*workspacev1alpha1.ExecutionWorkspace); ok && key == client.ObjectKeyFromObject(staleWorkspace) {
+				staleWorkspace.DeepCopyInto(current)
+				return nil
+			}
+			return delegate.Get(ctx, key, object, options...)
+		},
+	})
+	reconciler.Client = staleCache
+	reconciler.APIReader = kubeClient
+	if err := reconciler.refreshACPReleasedWorkspaceProjection(ctx, task); err != nil {
+		t.Fatalf("refresh after workspace deletion: %v", err)
+	}
+	if task.Status.ExecutionWorkspace.AttachedEpoch != 0 || task.Status.ExecutionWorkspace.State != "" {
+		t.Fatalf("post-deletion projection = %+v, want cleared attachment identity", task.Status.ExecutionWorkspace)
 	}
 }

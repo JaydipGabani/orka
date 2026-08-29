@@ -139,6 +139,13 @@ type TaskReconciler struct {
 	MaxTasksPerNamespace              int32
 	ExecutionWorkspaceDefaultProvider corev1alpha1.WorkspaceProvider
 	WorkspaceProviderAPIEnabled       bool
+	// WorkspaceSettlementProtected reports that Task provenance admission
+	// guards the reserved acp.workspace.orka.ai/ metadata settlement reads
+	// from. When false (a cleanup-only installation without the webhook),
+	// class settlement runs non-destructively: it never revokes or deletes a
+	// workspace from forgeable Task metadata, and existing workspaces are
+	// cleaned through explicit workspace deletion instead.
+	WorkspaceSettlementProtected bool
 	// ACPWorkspaceDispatchEnabled admits workspace-provider-backed ACP
 	// RuntimeSession dispatch. When false, workspace-backed agent Tasks fail
 	// closed before any workspace or RuntimePool demand exists.
@@ -371,6 +378,11 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.projectACPExecutionWorkspaceStatus(ctx, task); err != nil {
 		return ctrl.Result{}, err
 	}
+	if settled, err := r.reconcileACPClassWorkspaceSettlement(ctx, task); err != nil {
+		return ctrl.Result{}, err
+	} else if !settled {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 
 	// Handle based on current phase
 	switch task.Status.Phase {
@@ -552,6 +564,13 @@ func (r *TaskReconciler) handleDeletion(ctx context.Context, task *corev1alpha1.
 				return ctrl.Result{}, err
 			}
 			if !retired {
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			settled, err := r.settleACPClassWorkspace(ctx, task)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !settled {
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 		}
@@ -1784,6 +1803,9 @@ func (r *TaskReconciler) handleRunning(ctx context.Context, task *corev1alpha1.T
 	log := logf.FromContext(ctx)
 
 	if taskManagedByACP(task) {
+		if err := r.reconcileRunningACPClassWorkspaceAttachment(ctx, task); err != nil {
+			return ctrl.Result{}, err
+		}
 		// The leader-elected ACPDispatcher owns the non-reconnectable prompt stream,
 		// lease renewal, cancellation barrier, and terminal status projection.
 		return ctrl.Result{RequeueAfter: time.Second}, nil
@@ -2273,7 +2295,7 @@ func (r *TaskReconciler) handleFinalizing(
 		if workspaceStatus.WorkspaceRef.UID != "" && string(workspaceObject.UID) != workspaceStatus.WorkspaceRef.UID {
 			return ctrl.Result{}, fmt.Errorf("execution workspace UID changed during finalization")
 		}
-		attachmentManager := WorkspaceAttachmentManager{Client: r.Client}
+		attachmentManager := WorkspaceAttachmentManager{Client: r.Client, APIReader: r.APIReader}
 		if err := attachmentManager.BeginRevocation(ctx, workspaceObject, workspaceStatus.AttachedEpoch); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -2287,7 +2309,7 @@ func (r *TaskReconciler) handleFinalizing(
 			if workspaceStatus.WorkspaceRef.UID != "" && string(workspaceObject.UID) != workspaceStatus.WorkspaceRef.UID {
 				return ctrl.Result{}, fmt.Errorf("execution workspace UID changed during finalization")
 			}
-			attachmentManager := WorkspaceAttachmentManager{Client: r.Client}
+			attachmentManager := WorkspaceAttachmentManager{Client: r.Client, APIReader: r.APIReader}
 			if err := attachmentManager.FinalizeRevocation(ctx, workspaceObject, workspaceStatus.AttachedEpoch, attachmentSecretName(workspaceObject.Name, workspaceStatus.AttachedEpoch)); err != nil {
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
@@ -3035,7 +3057,12 @@ func (r *TaskReconciler) validateExecutionWorkspace(task *corev1alpha1.Task) err
 		if !r.WorkspaceProviderAPIEnabled {
 			return fmt.Errorf("execution workspace classRef requires the workspace provider API")
 		}
-		return fmt.Errorf("execution workspace classRef requires controller-first Task workspace integration")
+		if task.Spec.Type != corev1alpha1.TaskTypeAgent {
+			return fmt.Errorf("execution workspace classRef is only supported for type: agent tasks")
+		}
+		// Class resolution, policy validation, and provider gating run on the
+		// ACP execution plan path, which owns every class-shaped rejection.
+		return validateExecutionWorkspacePolicyShape(task, ws)
 	}
 	if !ws.Enabled {
 		return nil
@@ -3185,7 +3212,8 @@ func validateExecutionWorkspacePolicyShape(task *corev1alpha1.Task, ws *corev1al
 }
 
 func (r *TaskReconciler) markExecutionWorkspaceValidationFailed(ctx context.Context, task *corev1alpha1.Task, validationErr error) error {
-	if task == nil || task.Spec.Execution == nil || task.Spec.Execution.Workspace == nil || !task.Spec.Execution.Workspace.Enabled {
+	if task == nil || task.Spec.Execution == nil || task.Spec.Execution.Workspace == nil ||
+		(!task.Spec.Execution.Workspace.Enabled && task.Spec.Execution.Workspace.ClassRef == nil) {
 		return nil
 	}
 
@@ -3195,14 +3223,20 @@ func (r *TaskReconciler) markExecutionWorkspaceValidationFailed(ctx context.Cont
 		message = validationErr.Error()
 	}
 	ws := task.Spec.Execution.Workspace
-	provider := resolveWorkspaceProvider(ws, r.ExecutionWorkspaceDefaultProvider)
 	failure := statusrules.ValidationFailure{
 		Message:    message,
 		ObservedAt: &now,
 	}
-	if supportedWorkspaceProvider(provider) {
-		failure.Provider = provider
-		failure.TemplateRef = r.executionWorkspaceStatusTemplateRef(task, provider)
+	// A class-shaped request has no author-selected provider or template; the
+	// backend is resolved through the class and stays out of a failed
+	// projection so a wrong default is never displayed.
+	provider := corev1alpha1.WorkspaceProvider("")
+	if ws.ClassRef == nil {
+		provider = resolveWorkspaceProvider(ws, r.ExecutionWorkspaceDefaultProvider)
+		if supportedWorkspaceProvider(provider) {
+			failure.Provider = provider
+			failure.TemplateRef = r.executionWorkspaceStatusTemplateRef(task, provider)
+		}
 	}
 	if reusePolicy, ok := executionWorkspaceStatusReusePolicy(ws); ok {
 		failure.ReusePolicy = reusePolicy

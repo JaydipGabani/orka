@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/workspace/statusrules"
@@ -54,6 +55,12 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 	}
 	frozenTask := bound.frozenTask
 	plan := bound.plan
+	if reason := r.frozenWorkspaceDispatchDisabledReason(plan.Workspace); reason != "" {
+		// The single configuration gate for bound Tasks: ordinary planning
+		// AND bound-task recovery both flow through this chokepoint before
+		// any workspace or RuntimePool demand exists.
+		return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("WorkspaceUnsupported"), reason)
+	}
 	if err := r.ACPAdmissionGate.Check(); err != nil {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
@@ -69,11 +76,27 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 	if err := validateACPRuntimeWorkspaceNamespace(plan, task.Namespace, r.ACPRuntimeNamespace); err != nil {
 		return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), err.Error())
 	}
+	workspaceName, workspaceReady, err := r.ensureACPClassWorkspace(ctx, task, plan)
+	if err != nil {
+		if errors.Is(err, errACPWorkspaceBindingConflict) {
+			return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), err.Error())
+		}
+		if errors.Is(err, errACPWorkspaceTerminalFailure) {
+			return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("WorkspaceFailed"), err.Error())
+		}
+		return ctrl.Result{}, err
+	}
+	if !workspaceReady {
+		// The controller-first workspace is not yet admitted, attachable, or
+		// exclusively held by this Task; no RuntimePool demand exists yet.
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 	reader := r.APIReader
 	if reader == nil {
 		reader = r.Client
 	}
-	pool, poolPreexisting, err := r.ensureACPRuntimePool(ctx, task.Namespace, plan)
+	pool, poolPreexisting, err := r.ensureACPRuntimePool(ctx, task.Namespace, plan, workspaceName,
+		task.Annotations[acpExecutionWorkspaceUIDAnnotation], string(task.UID))
 	if err != nil {
 		if errors.Is(err, store.ErrValidation) {
 			return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidRuntimeProfile"), err.Error())
@@ -1088,6 +1111,9 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 	ctx context.Context,
 	namespace string,
 	plan ACPRuntimePlan,
+	workspaceName string,
+	workspaceUID string,
+	workspaceTaskUID string,
 ) (*corev1alpha1.RuntimePool, bool, error) {
 	if err := validateACPRuntimeWorkspaceNamespace(plan, namespace, r.ACPRuntimeNamespace); err != nil {
 		return nil, false, err
@@ -1104,12 +1130,24 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 			acpRuntimePoolLabel: booleanTrueValue, acpRuntimeTrustLabel: namespace,
 			acpRuntimeProfileLabel: strings.TrimPrefix(string(plan.Digest), "sha256:")[:16],
 		}
+		annotations := map[string]string{acpRuntimeLastDemandAnnotation: time.Now().UTC().Format(time.RFC3339Nano)}
 		var executionWorkspace *corev1alpha1.RuntimePoolExecutionWorkspaceSpec
 		if plan.Workspace != nil {
 			// A workspace-backed pool hosts exactly one logical RuntimeSession
 			// inside one provider-owned physical workspace.
 			capacity = &corev1alpha1.RuntimePoolCapacitySpec{MaxResidentSessions: 1, MaxRunningPrompts: 1}
 			labels[acpRuntimeWorkspaceProviderLabel] = string(plan.Workspace.Provider)
+			if workspaceName != "" {
+				// Links the pool to its controller-first ExecutionWorkspace so
+				// the ACP workspace adapter can prove exact ownership before
+				// tearing the pool down. The name link is paired with the
+				// workspace-incarnation UID pin: the adapter deletes only a
+				// pool carrying both.
+				labels[acpExecutionWorkspaceLinkLabel] = workspaceName
+				if workspaceUID != "" {
+					annotations[acpExecutionWorkspaceUIDAnnotation] = workspaceUID
+				}
+			}
 			executionWorkspace = &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
 				Provider:      plan.Workspace.Provider,
 				BindingDigest: plan.Workspace.BindingDigest,
@@ -1124,7 +1162,7 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 		pool = &corev1alpha1.RuntimePool{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: namespace, Name: plan.PoolName,
-				Annotations: map[string]string{acpRuntimeLastDemandAnnotation: time.Now().UTC().Format(time.RFC3339Nano)},
+				Annotations: annotations,
 				Labels:      labels,
 			},
 			Spec: corev1alpha1.RuntimePoolSpec{
@@ -1151,6 +1189,11 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 			// same-name winner.
 			err = nil
 		} else {
+			if handshakeErr := r.verifyACPWorkspaceReadyForPool(
+				ctx, pool, workspaceName, workspaceUID, workspaceTaskUID,
+			); handshakeErr != nil {
+				return nil, false, handshakeErr
+			}
 			return pool, false, nil
 		}
 	}
@@ -1164,6 +1207,17 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 			)
 		}
 		return nil, false, fmt.Errorf("RuntimePool %s execution workspace binding does not match queued Task", pool.Name)
+	}
+	if workspaceName != "" && pool.Labels[acpExecutionWorkspaceLinkLabel] != workspaceName {
+		return nil, false, fmt.Errorf(
+			"RuntimePool %s is not linked to controller-first execution workspace %s", pool.Name, workspaceName,
+		)
+	}
+	if workspaceName != "" && workspaceUID != "" &&
+		pool.Annotations[acpExecutionWorkspaceUIDAnnotation] != workspaceUID {
+		return nil, false, fmt.Errorf(
+			"RuntimePool %s is not pinned to the exact execution workspace incarnation", pool.Name,
+		)
 	}
 	if pool.Spec.Runtime.Image != plan.Image || pool.Spec.Runtime.Profile.Digest != string(plan.Digest) {
 		if plan.Workspace != nil && plan.Workspace.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession {
@@ -1192,7 +1246,149 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 			return nil, false, err
 		}
 	}
+	if handshakeErr := r.verifyACPWorkspaceReadyForPool(
+		ctx, pool, workspaceName, workspaceUID, workspaceTaskUID,
+	); handshakeErr != nil {
+		return nil, false, handshakeErr
+	}
 	return pool, true, nil
+}
+
+// verifyACPWorkspaceReadyForPool repeats the complete workspace admission and
+// attachment handshake through the uncached reader after a RuntimePool has
+// materialized. Any withdrawn lifecycle gate deletes the pool before prompt
+// demand can survive against an orphaned, quarantined, expired, or revoked
+// workspace.
+func (r *TaskReconciler) verifyACPWorkspaceReadyForPool(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+	workspaceName, workspaceUID, workspaceTaskUID string,
+) error {
+	if workspaceName == "" && workspaceUID == "" {
+		return nil
+	}
+	abortReason := ""
+	if pool == nil {
+		return errors.New("RuntimePool is required for the post-materialization workspace handshake")
+	} else if workspaceName == "" || workspaceUID == "" || workspaceTaskUID == "" {
+		abortReason = "the workspace identity or attached Task UID is incomplete"
+	} else if pool.Labels[acpExecutionWorkspaceLinkLabel] != workspaceName ||
+		pool.Annotations[acpExecutionWorkspaceUIDAnnotation] != workspaceUID {
+		abortReason = "the RuntimePool does not carry the exact workspace link"
+	}
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	if abortReason == "" {
+		workspace := &workspacev1alpha1.ExecutionWorkspace{}
+		err := reader.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: workspaceName}, workspace)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("revalidate linked execution workspace: %w", err)
+		}
+		if apierrors.IsNotFound(err) {
+			abortReason = "the linked workspace no longer exists"
+		} else {
+			abortReason = acpWorkspacePoolReadinessFailure(
+				workspace, pool, workspaceUID, workspaceTaskUID, time.Now(),
+			)
+			if abortReason == "" {
+				return nil
+			}
+		}
+	}
+	if deleteErr := r.deleteExactACPRuntimePool(ctx, reader, pool); deleteErr != nil {
+		return fmt.Errorf(
+			"linked execution workspace %s is not ready after RuntimePool materialization: %s; abort RuntimePool %s: %w",
+			workspaceName, abortReason, pool.Name, deleteErr,
+		)
+	}
+	return fmt.Errorf(
+		"linked execution workspace %s is not ready after RuntimePool materialization: %s; the pool was aborted before any prompt",
+		workspaceName, abortReason,
+	)
+}
+
+func (r *TaskReconciler) deleteExactACPRuntimePool(
+	ctx context.Context,
+	reader client.Reader,
+	expected *corev1alpha1.RuntimePool,
+) error {
+	if expected == nil || expected.UID == "" {
+		return errors.New("exact RuntimePool identity is required for deletion")
+	}
+	key := client.ObjectKeyFromObject(expected)
+	expectedWorkspaceName := expected.Labels[acpExecutionWorkspaceLinkLabel]
+	expectedWorkspaceUID := expected.Annotations[acpExecutionWorkspaceUIDAnnotation]
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &corev1alpha1.RuntimePool{}
+		if err := reader.Get(ctx, key, current); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if current.UID != expected.UID {
+			return fmt.Errorf("RuntimePool %s was replaced before deletion", key)
+		}
+		if current.Labels[acpExecutionWorkspaceLinkLabel] != expectedWorkspaceName ||
+			current.Annotations[acpExecutionWorkspaceUIDAnnotation] != expectedWorkspaceUID {
+			return fmt.Errorf("RuntimePool %s workspace link changed before deletion", key)
+		}
+		if err := r.Delete(ctx, current, deleteCurrentObjectPreconditions(current)...); err != nil &&
+			!apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+}
+
+func acpWorkspacePoolReadinessFailure(
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+	pool *corev1alpha1.RuntimePool,
+	workspaceUID, workspaceTaskUID string,
+	now time.Time,
+) string {
+	attached := meta.FindStatusCondition(
+		workspace.Status.Conditions,
+		string(workspacev1alpha1.ConditionWorkspaceAttached),
+	)
+	switch {
+	case string(workspace.UID) != workspaceUID:
+		return "the linked workspace was replaced"
+	case !workspace.DeletionTimestamp.IsZero():
+		return "the linked workspace is deleting"
+	case workspace.Annotations[acpExecutionWorkspacePoolAnnotation] != pool.Name:
+		return "the linked workspace does not name this RuntimePool"
+	case workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady:
+		return fmt.Sprintf("the linked workspace desired state is %q", workspace.Spec.DesiredState)
+	case !workspaceCurrentlyAdmittedByCore(workspace):
+		return "core admission is no longer current"
+	case workspace.Status.ObservedGeneration != workspace.Generation:
+		return "provider status has not observed the current workspace generation"
+	case workspace.Status.State != workspacev1alpha1.ExecutionWorkspaceStateAttached:
+		return fmt.Sprintf("the linked workspace state is %q", workspace.Status.State)
+	case workspace.Spec.Attachment == nil:
+		return "the linked workspace attachment is being revoked"
+	case string(workspace.Spec.Attachment.TaskRef.UID) != workspaceTaskUID:
+		return "the linked workspace is attached to a different Task"
+	case workspace.Spec.Attachment.Epoch <= 0 ||
+		workspace.Spec.AttachmentEpoch != workspace.Spec.Attachment.Epoch ||
+		workspace.Status.AttachedEpoch != workspace.Spec.Attachment.Epoch:
+		return "the linked workspace attachment epoch is not fully enforced"
+	case attached == nil || attached.Status != metav1.ConditionTrue ||
+		attached.ObservedGeneration != workspace.Generation:
+		return "the linked workspace attachment condition is not current"
+	case !workspace.Spec.Attachment.ExpiresAt.After(now):
+		return "the linked workspace attachment has expired"
+	case strings.TrimSpace(workspace.Annotations[acpWorkspaceRevocationStartedAnnotation]) != "":
+		return "attachment revocation has started for the linked workspace"
+	default:
+		if remaining, bounded := acpWorkspaceMaxLifetimeRemaining(workspace, now); bounded && remaining <= 0 {
+			return "the linked workspace maximum lifetime has elapsed"
+		}
+		return ""
+	}
 }
 
 func acpBoundTaskRequestDigest(bound *verifiedAgentExecution, attempt int32, promptID string) (string, error) {

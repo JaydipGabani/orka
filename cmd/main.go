@@ -52,6 +52,7 @@ import (
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	sandboxextv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 
+	acpworkspacev1alpha1 "github.com/orka-agents/orka/api/acp.workspace/v1alpha1"
 	fakeworkspacev1alpha1 "github.com/orka-agents/orka/api/fake.workspace/v1alpha1"
 	gatewayv1alpha1 "github.com/orka-agents/orka/api/gateway/v1alpha1"
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
@@ -103,6 +104,7 @@ func init() {
 	utilruntime.Must(sandboxv1beta1.AddToScheme(scheme))
 	utilruntime.Must(sandboxextv1beta1.AddToScheme(scheme))
 	utilruntime.Must(workspacev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(acpworkspacev1alpha1.AddToScheme(scheme))
 	utilruntime.Must(fakeworkspacev1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
@@ -122,9 +124,17 @@ func splitCommaList(raw string) []string {
 	return out
 }
 
-func validateWorkspaceProviderSecurityConfig(apiEnabled, classUseAdmissionEnabled bool) error {
+func validateWorkspaceProviderSecurityConfig(apiEnabled, classUseAdmissionEnabled, provenanceAdmissionEnabled bool) error {
 	if apiEnabled && !classUseAdmissionEnabled {
 		return fmt.Errorf("workspace provider API requires workspace class use admission")
+	}
+	if apiEnabled && !provenanceAdmissionEnabled {
+		// Settlement authorizes controller-privileged revocation and deletion
+		// through the reserved acp.workspace.orka.ai/ Task metadata; without
+		// the provenance webhook those keys are forgeable by any direct
+		// Kubernetes Task writer, so class-backed workspaces must never be
+		// served without it.
+		return fmt.Errorf("workspace provider API requires Task provenance admission (--task-provenance-admission-enabled) to protect the reserved workspace settlement metadata")
 	}
 	return nil
 }
@@ -360,7 +370,7 @@ func main() {
 		"Required controller mode: harness-v1 or harness-v2. An installation never serves both modes.")
 	flag.StringVar(&executionModeControllerUsernames, "execution-mode-controller-usernames",
 		os.Getenv("ORKA_EXECUTION_MODE_CONTROLLER_USERNAMES"),
-		"Comma-separated exact Kubernetes usernames authorized to write controller-owned Task execution authority.")
+		"Comma-separated exact Kubernetes usernames authorized for controller-owned admission writes.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
@@ -935,6 +945,7 @@ func main() {
 	if err := validateWorkspaceProviderSecurityConfig(
 		workspaceProviderAPIEnabled,
 		workspaceClassUseAdmissionEnabled,
+		taskProvenanceAdmissionEnabled,
 	); err != nil {
 		setupLog.Error(err, "invalid workspace provider security configuration")
 		os.Exit(1)
@@ -1098,6 +1109,7 @@ func main() {
 	if taskProvenanceAdmissionEnabled {
 		admissionConfig := orkaadmission.NewTaskProvenanceConfig(
 			true,
+			executionModeControllerUsernames,
 			taskProvenanceAdmissionTrustedUsers,
 			taskProvenanceAdmissionTrustedServiceAccounts,
 			currentPodNamespace(),
@@ -1462,6 +1474,7 @@ func main() {
 		MaxTasksPerNamespace:              maxTasksPerNamespaceValue,
 		ExecutionWorkspaceDefaultProvider: executionWorkspaceDefaultProvider,
 		WorkspaceProviderAPIEnabled:       workspaceProviderAPIEnabled,
+		WorkspaceSettlementProtected:      taskProvenanceAdmissionEnabled,
 		ACPWorkspaceDispatchEnabled:       acpWorkspaceDispatchEnabled,
 		AgentSandboxEnabled:               agentSandboxEnabled,
 		AgentSandboxConfig:                agentSandboxConfig,
@@ -1633,6 +1646,16 @@ func main() {
 		if !workspaceAPIsInstalled {
 			setupLog.Info("workspace CRDs are not installed; skipping cleanup-only workspace controllers")
 		}
+		if workspaceAPIsInstalled && !taskProvenanceAdmissionEnabled {
+			// Class-backed settlement performs controller-privileged deletion
+			// from the reserved Task metadata; without the provenance webhook
+			// those keys are forgeable. Cleanup-only installations (the stock
+			// installer with CRDs bundled) keep starting, but the Task
+			// reconciler disables the privileged settlement actions below and
+			// existing workspaces are cleaned through explicit workspace
+			// deletion instead.
+			setupLog.Info("Task provenance admission is disabled; class-backed Task settlement runs non-destructively and workspaces require explicit deletion")
+		}
 	}
 	if registerWorkspaceCoreControllers {
 		if err := (&controller.ExecutionWorkspaceProviderReconciler{
@@ -1661,6 +1684,29 @@ func main() {
 			CleanupOnly: !workspaceProviderAPIEnabled,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "ExecutionWorkspaceClassCore")
+			os.Exit(1)
+		}
+	}
+	if registerWorkspaceCoreControllers && acpRuntimeEnabled {
+		// The in-tree ACP RuntimePool workspace adapter serves class-backed
+		// execution workspaces. It registers even when dispatch or provider
+		// flags are off so existing workspaces keep converging toward cleanup;
+		// provider advertisement itself fails closed on the flags.
+		if err := (&controller.ACPWorkspaceProviderAdapterReconciler{
+			Client:                      mgr.GetClient(),
+			AgentSandboxEnabled:         agentSandboxEnabled,
+			SubstrateEnabled:            substrateEnabled,
+			ACPWorkspaceDispatchEnabled: acpWorkspaceDispatchEnabled,
+			WorkspaceProviderAPIEnabled: workspaceProviderAPIEnabled,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "ACPWorkspaceProviderAdapter")
+			os.Exit(1)
+		}
+		if err := (&controller.ACPExecutionWorkspaceAdapterReconciler{
+			Client:    mgr.GetClient(),
+			APIReader: mgr.GetAPIReader(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "ACPExecutionWorkspaceAdapter")
 			os.Exit(1)
 		}
 	}

@@ -120,7 +120,7 @@ func (r *TaskReconciler) planAgentExecution(
 			return rejectAgentExecutionPlan("ACP core runtime is disabled; built-in v2 agent runtimes have no fallback execution path")
 		}
 		if workspaceRequested {
-			if plan, rejected := r.rejectUnsupportedACPWorkspacePlan(task); rejected {
+			if plan, rejected := r.rejectUnsupportedACPWorkspacePlan(ctx, task); rejected {
 				return plan
 			}
 		}
@@ -153,18 +153,33 @@ func (r *TaskReconciler) planAgentExecution(
 const harnessV1ExecutionWorkspaceUnsupportedReason = "Task.spec.execution.workspace is not supported on the harness v1 execution path; workspace-provider-backed RuntimeSessions require the ACP v2 RuntimePool path, and repository access uses Task.spec.workspace"
 
 // taskRequestsExecutionWorkspace reports whether the Task carries an enabled
-// legacy-shaped execution-workspace request. classRef-shaped requests are
-// rejected earlier by validateExecutionWorkspace.
+// legacy-shaped or class-shaped execution-workspace request.
 func taskRequestsExecutionWorkspace(task *corev1alpha1.Task) bool {
 	return task != nil && task.Spec.Execution != nil && task.Spec.Execution.Workspace != nil &&
-		task.Spec.Execution.Workspace.Enabled
+		(task.Spec.Execution.Workspace.Enabled || task.Spec.Execution.Workspace.ClassRef != nil)
 }
 
 // rejectUnsupportedACPWorkspacePlan fails closed on every workspace request the
 // ACP RuntimePool path cannot host, before any workspace or RuntimePool demand
 // exists. A nil plan with rejected=false admits the workspace-backed ACP path.
-func (r *TaskReconciler) rejectUnsupportedACPWorkspacePlan(task *corev1alpha1.Task) (agentExecutionPlan, bool) {
-	binding, err := validateACPWorkspaceBindingRequest(task, r.ExecutionWorkspaceDefaultProvider, r.EnforceNamespaceIsolation)
+func (r *TaskReconciler) rejectUnsupportedACPWorkspacePlan(ctx context.Context, task *corev1alpha1.Task) (agentExecutionPlan, bool) {
+	if task.Status.AgentExecutionBinding != nil {
+		// The execution binding is frozen: new-allocation readiness (live
+		// class resolution, provider Active lifecycle) no longer applies -
+		// core deliberately admits Draining providers for already-admitted
+		// workspaces, and ensureAgentExecutionBinding re-verifies the frozen
+		// snapshot on every pass. The configuration-level dispatch gates are
+		// enforced against the VERIFIED frozen plan at the queue chokepoint
+		// (queueACPRuntimeTask), which both this path and bound-task
+		// recovery flow through - the public status projection may still be
+		// nil here and is never the gate's authority.
+		return agentExecutionPlan{}, false
+	}
+	resolvedClass, err := r.resolveACPWorkspaceClass(ctx, task)
+	if err != nil {
+		return rejectAgentExecutionPlanWithWorkspaceStatus(err.Error(), err), true
+	}
+	binding, err := validateACPWorkspaceBindingRequestWithClass(task, r.ExecutionWorkspaceDefaultProvider, r.EnforceNamespaceIsolation, resolvedClass)
 	if err != nil {
 		return rejectAgentExecutionPlanWithWorkspaceStatus(err.Error(), err), true
 	}
@@ -270,4 +285,35 @@ func agentHarnessV1InheritedAuthorityUnsupportedReason(agent *corev1alpha1.Agent
 	default:
 		return ""
 	}
+}
+
+// frozenWorkspaceDispatchDisabledReason enforces the configuration-level
+// workspace dispatch gates against the VERIFIED frozen execution plan. It is
+// the single authority for bound Tasks: both ordinary planning and bound-task
+// recovery reach it through the queue chokepoint, so a flag disabled after
+// the binding froze can never create new RuntimePool demand.
+func (r *TaskReconciler) frozenWorkspaceDispatchDisabledReason(binding *ACPRuntimeWorkspaceBinding) string {
+	if binding == nil {
+		return ""
+	}
+	switch binding.Provider {
+	case corev1alpha1.WorkspaceProviderAgentSandbox:
+		if !r.AgentSandboxEnabled {
+			return "execution workspace provider agent-sandbox is disabled; enable --agent-sandbox-enabled"
+		}
+	case corev1alpha1.WorkspaceProviderSubstrate:
+		if !r.SubstrateEnabled {
+			return "execution workspace provider substrate is disabled; enable --substrate-enabled"
+		}
+	}
+	if !r.ACPWorkspaceDispatchEnabled {
+		return "workspace-provider-backed RuntimeSession dispatch is disabled; enable --acp-workspace-dispatch-enabled"
+	}
+	if binding.Class != nil && !r.WorkspaceProviderAPIEnabled {
+		// The class-backed lifecycle needs the core workspace reconciler; in
+		// cleanup-only mode a newly materialized workspace would never be
+		// admitted and the Task would stay Pending forever.
+		return "class-backed execution workspaces require --enable-workspace-provider-api"
+	}
+	return ""
 }

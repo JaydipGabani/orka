@@ -29,6 +29,8 @@ const (
 	classReadinessRequeue            = 30 * time.Second
 	reasonParametersScopeInvalid     = "ParametersScopeInvalid"
 	reasonProfileDrift               = "ProfileDrift"
+	reasonProviderDeleting           = "ProviderDeleting"
+	reasonProviderNotFound           = "ProviderNotFound"
 	reasonRequiredFeatures           = "RequiredFeaturesUnavailable"
 	reasonProviderBindingMismatch    = "ProviderBindingMismatch"
 	reasonNamespacePolicyInvalid     = "NamespacePolicyInvalid"
@@ -226,12 +228,12 @@ func (r *ExecutionWorkspaceClassReconciler) resolveClassProvider(
 	provider := &workspacev1alpha1.ExecutionWorkspaceProvider{}
 	if err := r.classPolicyReader().Get(ctx, types.NamespacedName{Name: providerName}, provider); err != nil {
 		if client.IgnoreNotFound(err) == nil {
-			return providerName, "ProviderNotFound", "referenced workspace provider does not exist", nil
+			return providerName, reasonProviderNotFound, "referenced workspace provider does not exist", nil
 		}
 		return "", "", "", fmt.Errorf("get workspace provider: %w", err)
 	}
 	if !provider.DeletionTimestamp.IsZero() {
-		return providerName, "ProviderDeleting", "referenced workspace provider is deleting", nil
+		return providerName, reasonProviderDeleting, "referenced workspace provider is deleting", nil
 	}
 	if provider.Spec.LifecycleState != workspacev1alpha1.ExecutionWorkspaceProviderActive {
 		reason := string(workspacev1alpha1.ReasonProviderDraining)

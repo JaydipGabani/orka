@@ -17,6 +17,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -79,15 +80,41 @@ type agentExecutionSnapshotBody struct {
 // execution-workspace binding. It never carries provider-native identifiers,
 // physical workspace names, or secrets.
 type agentExecutionSnapshotWorkspaceBinding struct {
-	Provider          string `json:"provider"`
-	ReusePolicy       string `json:"reusePolicy"`
-	CleanupPolicy     string `json:"cleanupPolicy"`
-	WorkspaceSlot     string `json:"workspaceSlot"`
-	SessionUID        string `json:"sessionUID,omitempty"`
-	SessionKey        string `json:"sessionKey"`
-	TemplateNamespace string `json:"templateNamespace,omitempty"`
-	TemplateName      string `json:"templateName,omitempty"`
-	BindingDigest     string `json:"bindingDigest"`
+	Provider          string                                `json:"provider"`
+	ReusePolicy       string                                `json:"reusePolicy"`
+	CleanupPolicy     string                                `json:"cleanupPolicy"`
+	WorkspaceSlot     string                                `json:"workspaceSlot"`
+	SessionUID        string                                `json:"sessionUID,omitempty"`
+	SessionKey        string                                `json:"sessionKey"`
+	TemplateNamespace string                                `json:"templateNamespace,omitempty"`
+	TemplateName      string                                `json:"templateName,omitempty"`
+	Class             *agentExecutionSnapshotWorkspaceClass `json:"class,omitempty"`
+	BindingDigest     string                                `json:"bindingDigest"`
+}
+
+// agentExecutionSnapshotWorkspaceClass freezes the controller-first class
+// binding for class-selected execution workspaces. It carries only Orka-owned
+// identity and policy: no provider-native identifiers and no secrets.
+type agentExecutionSnapshotWorkspaceClass struct {
+	Name               string   `json:"name"`
+	UID                string   `json:"uid"`
+	Generation         int64    `json:"generation"`
+	ProfileHash        string   `json:"profileHash"`
+	ProviderName       string   `json:"providerName"`
+	ProviderUID        string   `json:"providerUID"`
+	ProviderGeneration int64    `json:"providerGeneration"`
+	ProviderConfigUID  string   `json:"providerConfigUID,omitempty"`
+	EffectiveOnDetach  string   `json:"effectiveOnDetach"`
+	DefaultOnDetach    string   `json:"defaultOnDetach"`
+	AllowedOnDetach    []string `json:"allowedOnDetach"`
+	DetachTimeout      string   `json:"detachTimeout"`
+	IdleTimeout        string   `json:"idleTimeout,omitempty"`
+	MaxLifetime        string   `json:"maxLifetime,omitempty"`
+	DeletionPolicy     struct {
+		ProviderResources string `json:"providerResources"`
+		PersistentVolumes string `json:"persistentVolumes"`
+		Checkpoints       string `json:"checkpoints"`
+	} `json:"deletionPolicy"`
 }
 
 type agentExecutionSnapshotAgent struct {
@@ -210,7 +237,11 @@ func (r *TaskReconciler) resolveAgentExecutionCandidateWithWorkspaceSessionUID(
 	if err != nil {
 		return nil, permanentACPAgentConfiguration(err)
 	}
-	workspaceBinding, err := validateACPWorkspaceBindingRequest(task, r.ExecutionWorkspaceDefaultProvider, r.EnforceNamespaceIsolation)
+	resolvedClass, err := r.resolveACPWorkspaceClass(ctx, task)
+	if err != nil {
+		return nil, permanentACPAgentConfiguration(err)
+	}
+	workspaceBinding, err := validateACPWorkspaceBindingRequestWithClass(task, r.ExecutionWorkspaceDefaultProvider, r.EnforceNamespaceIsolation, resolvedClass)
 	if err != nil {
 		return nil, permanentACPAgentConfiguration(err)
 	}
@@ -227,8 +258,8 @@ func (r *TaskReconciler) resolveAgentExecutionCandidateWithWorkspaceSessionUID(
 			}
 			workspaceSessionUID = plannedUID
 		}
-		workspaceBinding, err = resolveACPWorkspaceBinding(
-			task, r.ExecutionWorkspaceDefaultProvider, r.EnforceNamespaceIsolation, workspaceSessionUID,
+		workspaceBinding, err = resolveACPWorkspaceBindingWithClass(
+			task, r.ExecutionWorkspaceDefaultProvider, r.EnforceNamespaceIsolation, workspaceSessionUID, resolvedClass,
 		)
 		if err != nil {
 			return nil, permanentACPAgentConfiguration(err)
@@ -301,6 +332,7 @@ func (r *TaskReconciler) resolveAgentExecutionCandidateWithWorkspaceSessionUID(
 			SessionKey:        workspaceBinding.SessionKey,
 			TemplateNamespace: workspaceBinding.TemplateNamespace,
 			TemplateName:      workspaceBinding.TemplateName,
+			Class:             snapshotWorkspaceClassFromBinding(workspaceBinding.Class),
 			BindingDigest:     workspaceBinding.BindingDigest,
 		}
 	}
@@ -585,6 +617,63 @@ func validateAgentExecutionSnapshot(
 	}, configuration, mcpConfiguration, nil
 }
 
+// snapshotWorkspaceClassFromBinding freezes the class binding into its
+// snapshot encoding.
+func snapshotWorkspaceClassFromBinding(class *ACPWorkspaceClassBinding) *agentExecutionSnapshotWorkspaceClass {
+	if class == nil {
+		return nil
+	}
+	frozen := &agentExecutionSnapshotWorkspaceClass{
+		Name:               class.Name,
+		UID:                class.UID,
+		Generation:         class.Generation,
+		ProfileHash:        class.ProfileHash,
+		ProviderName:       class.ProviderName,
+		ProviderUID:        class.ProviderUID,
+		ProviderGeneration: class.ProviderGeneration,
+		ProviderConfigUID:  class.ProviderConfigUID,
+		EffectiveOnDetach:  class.EffectiveOnDetach,
+		DefaultOnDetach:    class.DefaultOnDetach,
+		AllowedOnDetach:    append([]string(nil), class.AllowedOnDetach...),
+		DetachTimeout:      class.DetachTimeout,
+		IdleTimeout:        class.IdleTimeout,
+		MaxLifetime:        class.MaxLifetime,
+	}
+	frozen.DeletionPolicy.ProviderResources = class.DeletionPolicy.ProviderResources
+	frozen.DeletionPolicy.PersistentVolumes = class.DeletionPolicy.PersistentVolumes
+	frozen.DeletionPolicy.Checkpoints = class.DeletionPolicy.Checkpoints
+	return frozen
+}
+
+// workspaceClassBindingFromSnapshot rebuilds the frozen class binding from its
+// snapshot encoding.
+func workspaceClassBindingFromSnapshot(class *agentExecutionSnapshotWorkspaceClass) *ACPWorkspaceClassBinding {
+	if class == nil {
+		return nil
+	}
+	return &ACPWorkspaceClassBinding{
+		Name:               class.Name,
+		UID:                class.UID,
+		Generation:         class.Generation,
+		ProfileHash:        class.ProfileHash,
+		ProviderName:       class.ProviderName,
+		ProviderUID:        class.ProviderUID,
+		ProviderGeneration: class.ProviderGeneration,
+		ProviderConfigUID:  class.ProviderConfigUID,
+		EffectiveOnDetach:  class.EffectiveOnDetach,
+		DefaultOnDetach:    class.DefaultOnDetach,
+		AllowedOnDetach:    append([]string(nil), class.AllowedOnDetach...),
+		DetachTimeout:      class.DetachTimeout,
+		IdleTimeout:        class.IdleTimeout,
+		MaxLifetime:        class.MaxLifetime,
+		DeletionPolicy: ACPWorkspaceClassDeletionPolicy{
+			ProviderResources: class.DeletionPolicy.ProviderResources,
+			PersistentVolumes: class.DeletionPolicy.PersistentVolumes,
+			Checkpoints:       class.DeletionPolicy.Checkpoints,
+		},
+	}
+}
+
 // verifiedSnapshotWorkspaceBinding re-verifies the frozen execution-workspace
 // binding against its canonical digest and the immutable Task/session identity.
 func verifiedSnapshotWorkspaceBinding(
@@ -603,6 +692,7 @@ func verifiedSnapshotWorkspaceBinding(
 		SessionKey:        body.ExecutionWorkspace.SessionKey,
 		TemplateNamespace: body.ExecutionWorkspace.TemplateNamespace,
 		TemplateName:      body.ExecutionWorkspace.TemplateName,
+		Class:             workspaceClassBindingFromSnapshot(body.ExecutionWorkspace.Class),
 		BindingDigest:     body.ExecutionWorkspace.BindingDigest,
 	}
 	if err := validateACPWorkspaceBindingValues(frozen); err != nil {
@@ -619,6 +709,63 @@ func verifiedSnapshotWorkspaceBinding(
 		return nil, errors.New("frozen execution workspace session key does not match the immutable Task and session identity")
 	}
 	return frozen, nil
+}
+
+// loadVerifiedACPWorkspaceBindingForSettlement reads the encrypted execution
+// snapshot without applying dispatch-only deletion or generation gates. The
+// immutable binding remains the settlement authority after a Task terminates or
+// begins deleting.
+func (r *TaskReconciler) loadVerifiedACPWorkspaceBindingForSettlement(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+) (*ACPRuntimeWorkspaceBinding, error) {
+	if task == nil {
+		return nil, nil
+	}
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	current := &corev1alpha1.Task{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("uncached Task read before execution workspace settlement: %w", err)
+	}
+	if current.UID != task.UID {
+		return nil, nil
+	}
+	binding := current.Status.AgentExecutionBinding
+	if binding == nil || binding.ContractVersion != corev1alpha1.AgentRuntimeContractHarnessV2 ||
+		binding.Backend != corev1alpha1.AgentExecutionBackendRuntimePool {
+		return nil, nil
+	}
+	if binding.Task.UID != current.UID {
+		return nil, errors.New("execution workspace settlement binding does not belong to the current Task UID")
+	}
+	canonicalDigest, err := canonicalAgentExecutionBindingDigest(*binding)
+	if err != nil || canonicalDigest != binding.BindingDigest {
+		return nil, errors.New("execution workspace settlement binding failed canonical integrity verification")
+	}
+	if r.AgentExecutionSnapshots == nil {
+		return nil, errors.New("encrypted agent execution snapshot store is required for execution workspace settlement")
+	}
+	snapshot, err := r.AgentExecutionSnapshots.GetAgentExecutionSnapshot(ctx, store.AgentExecutionSnapshotKey{
+		TaskUID: string(binding.Task.UID), Digest: binding.Snapshot.Digest,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("load immutable execution snapshot for workspace settlement: %w", err)
+	}
+	body, err := decodeAgentExecutionSnapshot(snapshot.Body)
+	if err != nil {
+		return nil, err
+	}
+	plan, _, _, err := validateAgentExecutionSnapshot(binding, snapshot, body)
+	if err != nil {
+		return nil, err
+	}
+	return plan.Workspace, nil
 }
 
 func frozenTaskFromAgentExecutionSnapshot(task *corev1alpha1.Task, binding *corev1alpha1.AgentExecutionBinding, body agentExecutionSnapshotBody) *corev1alpha1.Task {

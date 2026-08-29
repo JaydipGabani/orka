@@ -24,6 +24,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
 	"github.com/orka-agents/orka/internal/artifactcap"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	v2conformance "github.com/orka-agents/orka/internal/harness/v2/conformance"
@@ -512,7 +513,14 @@ func (d *ACPDispatcher) reapIdlePools(ctx context.Context, tasks []corev1alpha1.
 			}
 		}
 		lastDemand, err := time.Parse(time.RFC3339Nano, pool.Annotations[acpRuntimeLastDemandAnnotation])
-		if err != nil || now.Sub(lastDemand) < d.IdlePoolTTL {
+		if err != nil {
+			continue
+		}
+		idleTTL, workspaceAttached, err := d.runtimePoolIdlePolicy(ctx, pool)
+		if err != nil {
+			return err
+		}
+		if workspaceAttached || now.Sub(lastDemand) < idleTTL {
 			continue
 		}
 		base := pool.DeepCopy()
@@ -523,6 +531,46 @@ func (d *ACPDispatcher) reapIdlePools(ctx context.Context, tasks []corev1alpha1.
 		}
 	}
 	return nil
+}
+
+// runtimePoolIdlePolicy returns the retirement threshold for a warm pool and
+// whether its reciprocally linked class workspace has an active attachment.
+// Other pools retain the controller-wide default and have no attachment fence.
+func (d *ACPDispatcher) runtimePoolIdlePolicy(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+) (time.Duration, bool, error) {
+	if pool == nil || pool.Spec.ExecutionWorkspace == nil {
+		return d.IdlePoolTTL, false, nil
+	}
+	workspaceName := strings.TrimSpace(pool.Labels[acpExecutionWorkspaceLinkLabel])
+	if workspaceName == "" {
+		return d.IdlePoolTTL, false, nil
+	}
+	reader := d.APIReader
+	if reader == nil {
+		reader = d.Client
+	}
+	workspace := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: workspaceName}, workspace); err != nil {
+		if apierrors.IsNotFound(err) {
+			return d.IdlePoolTTL, false, nil
+		}
+		return 0, false, err
+	}
+	if workspace.Annotations[acpExecutionWorkspacePoolAnnotation] != pool.Name ||
+		pool.Annotations[acpExecutionWorkspaceUIDAnnotation] != string(workspace.UID) {
+		return d.IdlePoolTTL, false, nil
+	}
+	attached := workspace.Spec.Attachment != nil
+	idleTimeout := workspace.Spec.Lifecycle.IdleTimeout
+	if idleTimeout == nil {
+		return d.IdlePoolTTL, attached, nil
+	}
+	if idleTimeout.Duration <= 0 {
+		return 0, false, fmt.Errorf("workspace %s/%s has a non-positive frozen idle timeout", workspace.Namespace, workspace.Name)
+	}
+	return idleTimeout.Duration, attached, nil
 }
 
 // reapStoppedWorkspacePool retires a scaled-to-zero workspace-backed pool
@@ -546,6 +594,66 @@ func (d *ACPDispatcher) reapStoppedWorkspacePool(
 	lastDemand, err := time.Parse(time.RFC3339Nano, pool.Annotations[acpRuntimeLastDemandAnnotation])
 	if err != nil || now.Sub(lastDemand) < 2*d.IdlePoolTTL {
 		return nil
+	}
+	// A class-backed pool is torn down through its controller-first
+	// ExecutionWorkspace so the workspace lifecycle records the terminal
+	// disposition; the ACP workspace adapter then deletes this pool. Only a
+	// pool with no linked workspace left is deleted directly.
+	if workspaceName := strings.TrimSpace(pool.Labels[acpExecutionWorkspaceLinkLabel]); workspaceName != "" {
+		workspace := &workspacev1alpha1.ExecutionWorkspace{}
+		reader := d.APIReader
+		if reader == nil {
+			reader = d.Client
+		}
+		getErr := reader.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: workspaceName}, workspace)
+		if getErr == nil {
+			if workspace.Annotations[acpExecutionWorkspacePoolAnnotation] != pool.Name {
+				return nil
+			}
+			if pool.Annotations[acpExecutionWorkspaceUIDAnnotation] != string(workspace.UID) {
+				// The name link is reciprocal but the pool is pinned to a
+				// DIFFERENT workspace incarnation (a Session recreated under
+				// the same name); a stale pool must never delete the new
+				// incarnation's workspace.
+				return nil
+			}
+			if idleTimeout := workspace.Spec.Lifecycle.IdleTimeout; idleTimeout != nil &&
+				(idleTimeout.Duration <= 0 || now.Sub(lastDemand) < idleTimeout.Duration) {
+				// The frozen class timeout is the earliest allowed idle
+				// transition. The global pool reaper may run later, but it
+				// must never delete the workspace before class policy allows.
+				return nil
+			}
+			if workspace.Spec.Attachment != nil {
+				// An attachment can exist before its Task acquires the pool
+				// label (a crash between attachment and pool demand), so a
+				// zero active count is not proof of idleness; the attached
+				// Task's own settlement owns this workspace's retirement.
+				return nil
+			}
+			if workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredQuarantined ||
+				workspace.Labels[workspacev1alpha1.QuarantinedLabel] == booleanTrueValue {
+				// Detach-timeout settlement deliberately preserved this
+				// workspace as fail-closed evidence; idleness must never
+				// destroy what quarantine explicitly retained. Pool
+				// teardown stays with quarantine settlement itself.
+				return nil
+			}
+			if workspace.DeletionTimestamp.IsZero() {
+				// UID+resourceVersion preconditions: a Task attaching between
+				// the idle check and this delete bumps the resource version,
+				// so the race settles as a retried conflict instead of
+				// deleting a newly attached workspace.
+				if deleteErr := d.Client.Delete(ctx, workspace, deleteCurrentObjectPreconditions(workspace)...); deleteErr != nil &&
+					!apierrors.IsNotFound(deleteErr) && !apierrors.IsConflict(deleteErr) {
+					return deleteErr
+				}
+			}
+			return nil
+		}
+		if !apierrors.IsNotFound(getErr) {
+			return getErr
+		}
 	}
 	if err := d.Client.Delete(ctx, pool, deleteCurrentObjectPreconditions(pool)...); err != nil &&
 		!apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
