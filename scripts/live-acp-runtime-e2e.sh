@@ -2173,21 +2173,26 @@ assert_task_succeeded_read() {
   mark_task_validated "${task}"
 }
 
+# assert_cancelled_task requires a controller-owned Cancelled settlement. The
+# execution reason distinguishes why: an explicit cancellation request settles
+# with reason "Cancelled", while a Task deadline settles with reason
+# "TaskTimeout" (message "task deadline cancellation settled").
 assert_cancelled_task() {
   local task="$1"
   local snapshot="$2"
+  local expected_reason="${3:-Cancelled}"
   wait_task_terminal "${task}"
   local payload
   payload="$(task_json "${task}")"
-  if ! jq -e '
+  if ! jq -e --arg reason "${expected_reason}" '
     .status.phase == "Cancelled"
     and .status.execution.state == "Cancelled"
     and .status.execution.outcome == "Cancelled"
-    and .status.execution.reason == "Cancelled"
+    and .status.execution.reason == $reason
     and ((.status.jobName // "") == "")
   ' <<<"${payload}" >/dev/null; then
     safe_task_summary "${task}"
-    die "Task/${task} cancellation did not settle as controller-owned Cancelled"
+    die "Task/${task} cancellation did not settle as controller-owned Cancelled with reason ${expected_reason}"
   fi
   assert_task_fence "${task}" "${snapshot}"
   mark_task_validated "${task}"
@@ -2556,7 +2561,7 @@ run_timeout_check() {
   wait_until "Task/${task} active Running prompt" "${state_wait_seconds}" pool_running_for_task "${task}" "${pool}"
   snapshot="${temp_root}/${task}-running-pool.json"
   capture_pool_snapshot "${pool}" "${provider}" "${model}" read "${snapshot}"
-  assert_cancelled_task "${task}" "${snapshot}"
+  assert_cancelled_task "${task}" "${snapshot}" "TaskTimeout"
   elapsed_seconds=$((SECONDS - start_seconds))
   (( elapsed_seconds >= timeout_duration_seconds )) || \
     die "timeout Task/${task} cancelled before its configured ${timeout_duration} deadline"
