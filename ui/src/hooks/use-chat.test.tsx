@@ -533,6 +533,33 @@ describe('useSendMessage', () => {
     expect(bodies[0]).toMatchObject({ provider: 'anthropic', model: 'claude-opus-4-1' })
   })
 
+  it('pins a model-only override even when the chat config has not loaded yet', async () => {
+    const bodies: any[] = []
+    fetchSpy.mockImplementation((input, init) => {
+      const url = typeof input === 'string' ? input : (input as Request).url
+      if (url.endsWith('/chat') && init?.method === 'POST') {
+        bodies.push(JSON.parse(init?.body as string))
+        return Promise.resolve(createSSEResponse([
+          { event: 'message', data: JSON.stringify({ content: 'reply' }) },
+        ]))
+      }
+      if (url.endsWith('/chat/config')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          enabled: true, provider: 'anthropic', model: 'claude-sonnet-4-20250514', maxIterations: 1, maxDuration: '1m', maxTasksPerTurn: 1, maxConcurrent: 1, availableTools: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      }
+      return originalFetch(input as RequestInfo, init)
+    })
+    useChatStore.setState({ provider: '', model: 'claude-opus-4-1' })
+
+    // No useChatConfig subscriber: the config is not cached when the send starts.
+    const { result } = renderHook(() => useSendMessage(), { wrapper: createWrapper() })
+    await act(async () => {
+      await result.current('model only, config cold')
+    })
+    expect(bodies[0]).toMatchObject({ provider: 'anthropic', model: 'claude-opus-4-1' })
+  })
+
   it('drops a model-only override when the server has no default provider to pin it to', async () => {
     const bodies: any[] = []
     fetchSpy.mockImplementation((input, init) => {

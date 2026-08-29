@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback } from 'react'
 import { api, apiErrorMessage } from '@/lib/api-client'
 import { API_BASE_URL } from '@/lib/constants'
@@ -49,8 +49,7 @@ function parseSSELines(text: string): Array<{ event: string; data: string }> {
 export function useSendMessage() {
   const token = useAuthStore((s) => s.token)
   const namespace = useUIStore((s) => s.namespace)
-  const { data: config } = useChatConfig()
-  const serverDefaultProvider = config?.provider ?? ''
+  const queryClient = useQueryClient()
   const {
     currentSessionId,
     provider,
@@ -180,16 +179,27 @@ export function useSendMessage() {
       if (currentSessionId) {
         body.sessionId = currentSessionId
       }
-      // The server resolves `model` only alongside an explicit provider; a
-      // model-only override would be silently ignored. Pin it to the server's
-      // configured default provider, or drop it when there is none to pin to.
-      const effectiveProvider = provider || (model.trim() ? serverDefaultProvider : '')
-      if (effectiveProvider) {
-        body.provider = effectiveProvider
-        if (model.trim()) body.model = model.trim()
-      }
-
       try {
+        // The server resolves `model` only alongside an explicit provider; a
+        // model-only override would be silently ignored. Pin it to the
+        // server's configured default provider, or drop it when there is
+        // none to pin to. The config is resolved here (cached by the query
+        // client) so a send racing the initial /chat/config load does not
+        // silently drop a restored model-only override.
+        let effectiveProvider = provider
+        if (!effectiveProvider && model.trim()) {
+          const config = await queryClient.ensureQueryData({
+            queryKey: ['chatConfig'],
+            queryFn: () => api.get<ChatConfig>('/chat/config'),
+            staleTime: 60 * 1000,
+          })
+          effectiveProvider = config.provider ?? ''
+        }
+        if (effectiveProvider) {
+          body.provider = effectiveProvider
+          if (model.trim()) body.model = model.trim()
+        }
+
         const response = await fetch(`${API_BASE_URL}/chat`, {
           method: 'POST',
           headers: {
@@ -271,6 +281,6 @@ export function useSendMessage() {
         setStreaming(false)
       }
     },
-    [token, namespace, currentSessionId, provider, model, serverDefaultProvider, addMessage, setSessionId, setStreaming, setUsageOnLastAssistant],
+    [token, namespace, currentSessionId, provider, model, queryClient, addMessage, setSessionId, setStreaming, setUsageOnLastAssistant],
   )
 }

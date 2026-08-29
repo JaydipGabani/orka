@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -4828,4 +4829,127 @@ func TestRecoveredTaskSessionPreservesLegacyNonAppendTurnPolicy(t *testing.T) {
 	if recovered.Turn.SkipTranscriptAppend {
 		t.Fatal("legacy non-append turn was migrated to transcript suppression instead of preserving its durable digest")
 	}
+}
+
+func TestPromptLeaseRenewalRetryable(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "cancelled", err: context.Canceled, want: false},
+		{name: "transport", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorTransport}, want: true},
+		{name: "protocol", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorProtocol, StatusCode: 502}, want: true},
+		{name: "http 503 retryable", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorHTTP, StatusCode: 503, Retryable: true}, want: true},
+		{name: "http 500", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorHTTP, StatusCode: 500}, want: true},
+		{name: "http 410 settled", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorHTTP, StatusCode: 410, Code: harnessv2.ErrorCodeSettled}, want: false},
+		{name: "http 409 digest conflict", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorHTTP, StatusCode: 409, Code: harnessv2.ErrorCodeDigestConflict}, want: false},
+		{name: "validation", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorValidation}, want: false},
+		{name: "plain error", err: errors.New("boom"), want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := promptLeaseRenewalRetryable(tc.err); got != tc.want {
+				t.Fatalf("promptLeaseRenewalRetryable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRenewPromptLeaseLoopRetriesTransientFailures(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		var request harnessv2.RenewPromptLeaseRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode renew: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if n == 1 {
+			// A busy supervisor answering through a proxy: a non-v2 502 body.
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, "<html>bad gateway</html>")
+			return
+		}
+		writeDispatcherJSONStatus(w, http.StatusOK, harnessv2.PromptLeaseResponse{
+			Protocol: harnessv2.ProtocolVersion, Classification: harnessv2.Classification{Class: harnessv2.RequestClassificationFresh},
+			Lease: request.Lease,
+		})
+	}))
+	defer server.Close()
+	runtimeClient, err := harnessv2.NewClient(
+		server.URL, harnessv2.WithControllerBearerToken(strings.Repeat("t", 32)),
+		harnessv2.WithOperationCapabilitySecret([]byte(strings.Repeat("s", 32))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "renew", UID: types.UID("99999999-9999-9999-9999-999999999999")},
+		Status:     corev1alpha1.TaskStatus{Execution: &corev1alpha1.TaskExecutionStatus{Attempt: 1, PromptID: "prompt-renew"}},
+	}
+	fence := harnessv2.Fence{
+		RuntimeInstanceID: "runtime-instance", SupervisorBootID: "boot-id", ControllerEpoch: 1,
+		RuntimePoolUID: "pool-uid", RuntimePoolGeneration: 1, RuntimeProfileDigest: harnessv2.ProfileDigest(testControlDigestForDispatcher("renew-profile")),
+		ProfileDigestSchemaVersion: harnessv2.ProfileDigestSchemaVersion, RuntimeSessionUID: "session-renew", RuntimeSessionGeneration: 1,
+	}
+	now := time.Now().UTC()
+	lease := harnessv2.PromptLease{Generation: 1, IssuedAt: now, ExpiresAt: now.Add(12 * time.Second)}
+	descriptor := harnessv2.MCPToolDescriptor{
+		Name: acpMCPTestToolName, Description: "renew test tool", InputSchema: json.RawMessage(`{"type":"object"}`),
+		Source: harnessv2.MCPToolSourceBrokeredBuiltin, Effect: harnessv2.MCPToolEffectReadOnly,
+	}
+	descriptorDigest, err := harnessv2.CanonicalMCPToolDescriptorDigest([]harnessv2.MCPToolDescriptor{descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolPolicy := harnessv2.MCPToolPolicy{
+		AllowedToolNames: []string{acpMCPTestToolName}, Tools: []harnessv2.MCPToolDescriptor{descriptor}, DescriptorDigest: descriptorDigest,
+	}
+	approvalPolicy := harnessv2.MCPApprovalPolicy{}
+	toolDigest, _ := harnessv2.CanonicalRuntimeToolPolicyDigest(toolPolicy.AllowedToolNames, toolPolicy.DisallowedToolNames, toolPolicy.AllowBash)
+	approvalDigest, _ := harnessv2.CanonicalMCPApprovalPolicyDigest(approvalPolicy)
+	mcpDigest, _ := harnessv2.CanonicalMCPConfigurationDigest(toolPolicy.AllowedToolNames)
+	authorization := harnessv2.PromptMCPAuthorization{
+		RuntimeSessionUID: fence.RuntimeSessionUID, SessionGeneration: fence.RuntimeSessionGeneration,
+		TaskUID: harnessv2.TaskUID(task.UID), TaskAttempt: 1, PromptID: "prompt-renew",
+		LeaseGeneration: lease.Generation, ToolPolicyDigest: toolDigest, ApprovalPolicyDigest: approvalDigest,
+		MCPConfigurationDigest: mcpDigest, ToolPolicy: toolPolicy, ApprovalPolicy: approvalPolicy, ExpiresAt: lease.ExpiresAt,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelled := make(chan struct{}, 1)
+	cancelRuntime := func() {
+		select {
+		case cancelled <- struct{}{}:
+		default:
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&ACPDispatcher{}).renewPromptLeaseLoop(ctx, cancelRuntime, runtimeClient, "runtime-session-renew-g1", task, fence, lease, authorization)
+	}()
+	deadline := time.After(20 * time.Second)
+	for calls.Load() < 2 {
+		select {
+		case <-cancelled:
+			t.Fatal("runtime context was cancelled after a transient renewal failure while the lease was still valid")
+		case <-deadline:
+			t.Fatalf("renewal was not retried in time (calls=%d)", calls.Load())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	select {
+	case <-cancelled:
+		t.Fatal("runtime context was cancelled although the retried renewal succeeded")
+	case <-time.After(500 * time.Millisecond):
+	}
+	cancel()
+	<-done
 }

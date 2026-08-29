@@ -996,14 +996,19 @@ func (d *ACPDispatcher) removeRuntimeSessionBinding(sessionUID string) {
 }
 
 // retireRecoveredRuntimeSessionBinding drops the in-memory RuntimeSession
-// binding after recovered terminal settlement only when the RuntimeSession
-// itself is retired with the Task (task-scoped: no durable Session, or a
-// write workspace). A session-bound read RuntimeSession stays live on the
-// supervisor after its turn finalizes, and its binding must survive so the
-// next continuation Task plans a reuse instead of a controller-restart style
-// recreation at a new generation with a full transcript bootstrap.
-func (d *ACPDispatcher) retireRecoveredRuntimeSessionBinding(task *corev1alpha1.Task, sessionUID string) {
-	if task != nil && task.Spec.SessionRef != nil &&
+// binding after recovered terminal settlement unless the RuntimeSession is
+// known to stay live: a session-bound read RuntimeSession whose prompt
+// succeeded remains resident on the supervisor after its turn finalizes, and
+// its binding must survive so the next continuation Task plans a reuse
+// instead of a controller-restart style recreation at a new generation with
+// a full transcript bootstrap. Task-scoped sessions (no durable Session, or a
+// write workspace) are retired with the Task, and any non-successful
+// settlement (failed, cancelled, outcome unknown) schedules supervisor
+// cleanup of the RuntimeSession, so those bindings are dropped exactly as the
+// normal failure path does.
+func (d *ACPDispatcher) retireRecoveredRuntimeSessionBinding(task *corev1alpha1.Task, attempt *store.PromptAttempt, sessionUID string) {
+	if task != nil && attempt != nil && attempt.ExecutionState == store.PromptExecutionSucceeded &&
+		task.Spec.SessionRef != nil &&
 		(task.Spec.Workspace == nil || task.Spec.Workspace.Intent != corev1alpha1.WorkspaceIntentWrite) {
 		return
 	}

@@ -952,6 +952,7 @@ func TestProviderProxyUpstreamFailureAccountingFailsWhenFinalInferenceFails(t *t
 		t.Fatal("successful inference response was accounted as a failure")
 	}
 	assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusTooManyRequests)
+	waitProviderProxyIdle(t, session)
 	failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
 	if !failed || status != http.StatusTooManyRequests || detail != "rate limit exceeded" {
 		t.Fatalf("upstreamFailureUnrecovered after success then failure = %v/%d/%q, want the final failure", failed, status, detail)
@@ -1341,6 +1342,7 @@ func TestProviderProxyStreamedSuccessOverLimitCountsAsFailure(t *testing.T) {
 		}
 	}
 
+	waitProviderProxyIdle(t, session)
 	failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
 	if !failed || status != http.StatusBadGateway || detail != "provider upstream stream failed" {
 		t.Fatalf("upstreamFailureUnrecovered after oversized 2xx stream = %v/%d/%q, want failure", failed, status, detail)

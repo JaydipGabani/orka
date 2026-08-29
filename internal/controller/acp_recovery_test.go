@@ -3534,25 +3534,31 @@ func TestRetireRecoveredRuntimeSessionBindingKeepsSessionBoundReadBindings(t *te
 		return d
 	}
 	sessionRef := &corev1alpha1.SessionReference{Name: "durable"}
+	succeeded := &store.PromptAttempt{ExecutionState: store.PromptExecutionSucceeded}
+	readTask := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+		SessionRef: sessionRef, Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead},
+	}}
 	cases := []struct {
-		name string
-		task *corev1alpha1.Task
-		keep bool
+		name    string
+		task    *corev1alpha1.Task
+		attempt *store.PromptAttempt
+		keep    bool
 	}{
-		{name: "session-bound prompt-only task keeps the live binding", keep: true, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{SessionRef: sessionRef}}},
-		{name: "session-bound read workspace keeps the live binding", keep: true, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
-			SessionRef: sessionRef, Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead},
-		}}},
-		{name: "session-bound write workspace retires the task-scoped binding", keep: false, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+		{name: "session-bound prompt-only success keeps the live binding", keep: true, attempt: succeeded, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{SessionRef: sessionRef}}},
+		{name: "session-bound read success keeps the live binding", keep: true, attempt: succeeded, task: readTask},
+		{name: "session-bound write success retires the task-scoped binding", keep: false, attempt: succeeded, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
 			SessionRef: sessionRef, Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
 		}}},
-		{name: "task without a durable session retires the binding", keep: false, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{}}},
+		{name: "task without a durable session retires the binding", keep: false, attempt: succeeded, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{}}},
+		{name: "failed session-bound read retires the binding (supervisor cleans the session)", keep: false, attempt: &store.PromptAttempt{ExecutionState: store.PromptExecutionFailed}, task: readTask},
+		{name: "cancelled session-bound read retires the binding", keep: false, attempt: &store.PromptAttempt{ExecutionState: store.PromptExecutionCancelled}, task: readTask},
+		{name: "outcome-unknown session-bound read retires the binding", keep: false, attempt: &store.PromptAttempt{ExecutionState: store.PromptExecutionOutcomeUnknown}, task: readTask},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			d := newDispatcher()
-			d.retireRecoveredRuntimeSessionBinding(tc.task, sessionUID)
+			d.retireRecoveredRuntimeSessionBinding(tc.task, tc.attempt, sessionUID)
 			if got := d.currentRuntimeSessionBinding(sessionUID) != nil; got != tc.keep {
 				t.Fatalf("binding retained = %v, want %v", got, tc.keep)
 			}

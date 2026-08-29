@@ -4168,8 +4168,14 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 	lease harnessv2.PromptLease,
 	authorization harnessv2.PromptMCPAuthorization,
 ) {
+	log := logf.FromContext(ctx).WithValues("namespace", task.Namespace, "task", task.Name)
+	retryDelay := time.Duration(0)
 	for {
 		wait := max(time.Until(lease.ExpiresAt)/2, 5*time.Second)
+		if retryDelay > 0 {
+			wait = retryDelay
+			retryDelay = 0
+		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
@@ -4201,12 +4207,84 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 			return
 		}
 		response, err := runtimeClient.RenewPromptLease(ctx, sessionID, request)
-		if err != nil || response.Lease.Generation != proposed.Generation {
-			cancelRuntime()
-			return
+		if err == nil && response.Lease.Generation == proposed.Generation {
+			lease = response.Lease
+			continue
 		}
-		lease = response.Lease
+		// One slow or dropped renewal under load must not cancel a healthy
+		// prompt: a transient failure is retried while the current lease is
+		// still valid. Only a definitive supervisor rejection, a generation
+		// mismatch, or an expired lease ends the prompt.
+		if remaining := time.Until(lease.ExpiresAt); err != nil && promptLeaseRenewalRetryable(err) && remaining > promptLeaseRenewalRetryMargin {
+			retryDelay = min(promptLeaseRenewalRetryDelay, remaining/4)
+			log.Info("ACP prompt lease renewal failed; retrying while the lease is valid",
+				"errorClass", promptLeaseRenewalErrorClass(err), "leaseGeneration", lease.Generation,
+				"leaseRemaining", remaining.Round(time.Second).String(), "retryIn", retryDelay.Round(time.Millisecond).String())
+			continue
+		}
+		if err != nil {
+			log.Error(err, "ACP prompt lease renewal failed; cancelling the prompt",
+				"errorClass", promptLeaseRenewalErrorClass(err), "leaseGeneration", lease.Generation)
+		} else {
+			log.Info("ACP prompt lease renewal returned an unexpected generation; cancelling the prompt",
+				"leaseGeneration", lease.Generation, "proposedGeneration", proposed.Generation, "returnedGeneration", response.Lease.Generation)
+		}
+		cancelRuntime()
+		return
 	}
+}
+
+const (
+	// promptLeaseRenewalRetryDelay bounds how soon a transiently failed lease
+	// renewal is retried; promptLeaseRenewalRetryMargin is the remaining lease
+	// time below which a retry is no longer attempted.
+	promptLeaseRenewalRetryDelay  = 3 * time.Second
+	promptLeaseRenewalRetryMargin = 5 * time.Second
+)
+
+// promptLeaseRenewalErrorClass renders a low-cardinality, credential-free
+// class for a failed lease renewal (client error kind, HTTP status, and v2
+// error code) suitable for structured logs.
+func promptLeaseRenewalErrorClass(err error) string {
+	if clientErr, ok := errors.AsType[*harnessv2.ClientError](err); ok {
+		class := string(clientErr.Kind)
+		if clientErr.StatusCode != 0 {
+			class += "/" + strconv.Itoa(clientErr.StatusCode)
+		}
+		if clientErr.Code != "" {
+			class += "/" + string(clientErr.Code)
+		}
+		return class
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	return "unclassified"
+}
+
+// promptLeaseRenewalRetryable reports whether a failed lease renewal may be
+// retried while the current lease is still valid. Definitive rejections from
+// the supervisor (settled prompt, stale fence, identity or digest conflict,
+// poisoned session) end the prompt; transport, protocol, stream, and
+// retryable or server-side HTTP failures are transient.
+func promptLeaseRenewalRetryable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if clientErr, ok := errors.AsType[*harnessv2.ClientError](err); ok {
+		switch clientErr.Kind {
+		case harnessv2.ClientErrorHTTP:
+			return clientErr.Retryable || clientErr.StatusCode >= http.StatusInternalServerError
+		case harnessv2.ClientErrorTransport, harnessv2.ClientErrorProtocol, harnessv2.ClientErrorStream:
+			return true
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (d *ACPDispatcher) resolvePromptPermission(ctx context.Context, runtimeClient *harnessv2.Client, sessionID harnessv2.RuntimeSessionID, task *corev1alpha1.Task, fence harnessv2.Fence, event harnessv2.Event) error {
