@@ -15,6 +15,11 @@ var (
 	wellKnownTokenRe        = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{30,}|xox[baprs]-[A-Za-z0-9-]{20,})\b`)
 	jwtRe                   = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
 	urlCredentialRe         = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+@`)
+	// Signed/pre-signed URL query credentials whose parameter names do not
+	// contain a generic secret keyword: Azure SAS (sig), AWS SigV4
+	// (X-Amz-Signature, X-Amz-Security-Token), GCS (X-Goog-Signature), and
+	// generic signature/sas parameters.
+	signedURLQueryRe = regexp.MustCompile(`(?i)([?&](?:sig|signature|sas|x-amz-signature|x-amz-security-token|x-amz-credential|x-goog-signature|x-goog-credential)=)[^&#\s"'<>,;()\[\]]+`)
 )
 
 // SensitiveText replaces common credential and token shapes with a stable
@@ -30,6 +35,7 @@ func SensitiveText(s string) string {
 	s = sensitiveAssignmentRe.ReplaceAllString(s, `${1}${2}${3}${4}`+redactedValue)
 	s = naturalLanguageSecretRe.ReplaceAllString(s, `${1}`+redactedValue)
 	s = urlCredentialRe.ReplaceAllString(s, `${1}`+redactedValue+`@`)
+	s = signedURLQueryRe.ReplaceAllString(s, `${1}`+redactedValue)
 	s = wellKnownTokenRe.ReplaceAllString(s, redactedValue)
 	s = jwtRe.ReplaceAllString(s, redactedValue)
 	return s

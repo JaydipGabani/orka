@@ -148,15 +148,19 @@ make deploy \
 
 The Kustomize install does not create an API client identity. The Helm chart
 creates the `orka-client` ServiceAccount used by the examples below; for a
-Kustomize install create it yourself with the same read/create scope:
+Kustomize install create it yourself with the same scope as the Helm client
+Role — Task create/delete, RepositoryMonitor management, read-only catalog
+resources, session and gateway reads:
 
 ```bash
 kubectl -n orka-system create serviceaccount orka-client
 kubectl -n orka-system create role orka-client \
   --verb=get,list,watch,create,delete --resource=tasks.core.orka.ai
+kubectl -n orka-system create role orka-client-monitors \
+  --verb=get,list,watch,create,update,patch,delete --resource=repositorymonitors.core.orka.ai
 kubectl -n orka-system create role orka-client-read \
   --verb=get,list,watch \
-  --resource=agents.core.orka.ai,tools.core.orka.ai,skills.core.orka.ai,providers.core.orka.ai,runtimepools.core.orka.ai,agentruntimes.core.orka.ai,repositorymonitors.core.orka.ai
+  --resource=agents.core.orka.ai,tools.core.orka.ai,skills.core.orka.ai,providers.core.orka.ai,runtimepools.core.orka.ai,agentruntimes.core.orka.ai
 kubectl -n orka-system create role orka-client-sessions \
   --verb=get,list,delete --resource=sessions.core.orka.ai
 kubectl -n orka-system create role orka-client-gateway \
@@ -165,6 +169,8 @@ kubectl create clusterrole orka-client-gatewayclass-viewer \
   --verb=get,list,watch --resource=gatewayclasses.gateway.orka.ai
 kubectl -n orka-system create rolebinding orka-client \
   --role=orka-client --serviceaccount=orka-system:orka-client
+kubectl -n orka-system create rolebinding orka-client-monitors \
+  --role=orka-client-monitors --serviceaccount=orka-system:orka-client
 kubectl -n orka-system create rolebinding orka-client-read \
   --role=orka-client-read --serviceaccount=orka-system:orka-client
 kubectl -n orka-system create rolebinding orka-client-sessions \

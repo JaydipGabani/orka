@@ -136,10 +136,14 @@ type providerProxySession struct {
 	upstreamFailureLatest bool
 	lastUpstreamStatus    int
 	lastUpstreamDetail    string
-	inflight              int
-	drained               chan struct{}
-	closed                bool
-	requestSlots          chan struct{}
+	// admissionClosed rejects new requests for the active prompt once the
+	// ACP child has settled its turn, while in-flight relays keep their
+	// gate context and drain normally.
+	admissionClosed bool
+	inflight        int
+	drained         chan struct{}
+	closed          bool
+	requestSlots    chan struct{}
 }
 
 type providerProxyAuthorization struct {
@@ -345,6 +349,7 @@ func (s *providerProxySession) activateWithMaxTurns(promptID string, maxTurns in
 	s.maxTurns = maxTurns
 	s.inferenceRequests = 0
 	s.turnLimitExceeded = false
+	s.admissionClosed = false
 	s.inferenceSuccesses = 0
 	s.inferenceFailures = 0
 	s.upstreamFailureLatest = false
@@ -378,6 +383,20 @@ func (s *providerProxySession) renew(promptID string, expiresAt, now time.Time) 
 		s.expire(promptID, version)
 	})
 	return nil
+}
+
+// closeAdmission stops admitting new provider requests for promptID once the
+// ACP child has settled its turn. Requests already authorized keep relaying
+// under the prompt's gate context so the bounded drain before deactivate can
+// finish accounting them; a child cannot launch further inference calls
+// against the settled prompt's quota during that window.
+func (s *providerProxySession) closeAdmission(promptID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activePromptID != strings.TrimSpace(promptID) {
+		return
+	}
+	s.admissionClosed = true
 }
 
 func (s *providerProxySession) deactivate(promptID string) {
@@ -471,6 +490,9 @@ func (s *providerProxySession) authorize(r *http.Request, now time.Time) (provid
 		}
 		return providerProxyAuthorization{}, false
 	}
+	if s.admissionClosed {
+		return providerProxyAuthorization{}, false
+	}
 	if !requestHasCredential(r, s.credential) {
 		return providerProxyAuthorization{}, false
 	}
@@ -557,6 +579,23 @@ func (s *providerProxySession) recordInferenceResponse(promptID string, class pr
 	s.lastUpstreamDetail = sanitizeProviderUpstreamDetail(detail)
 }
 
+// attachInferenceFailureDetail fills in the sanitized detail for the failure
+// recorded by recordInferenceResponse once the relayed error body prefix has
+// been observed. It is a no-op when a later inference already succeeded or a
+// different failure has been recorded since.
+func (s *providerProxySession) attachInferenceFailureDetail(promptID string, class providerRequestClass, statusCode int, detail string) {
+	if s == nil || class != providerRequestInference || detail == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnPromptID != strings.TrimSpace(promptID) || !s.upstreamFailureLatest ||
+		s.lastUpstreamStatus != statusCode || s.lastUpstreamDetail != "" {
+		return
+	}
+	s.lastUpstreamDetail = sanitizeProviderUpstreamDetail(detail)
+}
+
 // upstreamFailureUnrecovered reports whether the most recent accounted
 // inference response for promptID failed and no later inference succeeded.
 // It is false when the prompt made no inference requests or when the latest
@@ -638,11 +677,20 @@ func providerUpstreamErrorDetail(prefix []byte) string {
 	return raw
 }
 
-// errorTailReader replays the read error observed while probing an upstream
-// error body so the relayed stream terminates exactly as the upstream did.
-type errorTailReader struct{ err error }
+// prefixCapture retains the first limit bytes written through it so an
+// upstream error body can be relayed to the ACP child as it arrives while a
+// bounded prefix is kept for the failure detail.
+type prefixCapture struct {
+	limit  int
+	buffer []byte
+}
 
-func (r errorTailReader) Read([]byte) (int, error) { return 0, r.err }
+func (c *prefixCapture) Write(p []byte) (int, error) {
+	if room := c.limit - len(c.buffer); room > 0 {
+		c.buffer = append(c.buffer, p[:min(room, len(p))]...)
+	}
+	return len(p), nil
+}
 
 func requestHasCredential(r *http.Request, expected []byte) bool {
 	for _, value := range r.Header.Values(providerAuthorizationHeader) {
@@ -798,7 +846,7 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer response.Body.Close() //nolint:errcheck
-	p.relayUpstreamResponse(w, session, authorization.promptID, requestClass, response)
+	p.relayUpstreamResponse(requestContext, w, session, authorization.promptID, requestClass, response)
 }
 
 // relayUpstreamResponse forwards an upstream response to the ACP child and
@@ -806,6 +854,7 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // stream through untouched; error responses have a bounded prefix probed for
 // a detail message before the identical bytes are relayed.
 func (p *providerProxy) relayUpstreamResponse(
+	ctx context.Context,
 	w http.ResponseWriter,
 	session *providerProxySession,
 	promptID string,
@@ -829,33 +878,36 @@ func (p *providerProxy) relayUpstreamResponse(
 		return
 	}
 	var body io.Reader = response.Body
-	detail := ""
-	if response.StatusCode >= http.StatusBadRequest {
-		prefix, readErr := io.ReadAll(io.LimitReader(response.Body, providerUpstreamDetailProbeBytes))
-		detail = providerUpstreamErrorDetail(prefix)
-		if readErr != nil {
-			body = io.MultiReader(bytes.NewReader(prefix), errorTailReader{err: readErr})
-		} else {
-			body = io.MultiReader(bytes.NewReader(prefix), response.Body)
-		}
-	}
 	upstreamFailed := response.StatusCode >= http.StatusBadRequest
+	var capture *prefixCapture
 	if upstreamFailed {
-		// Upstream errors are accounted before the relay so the bounded
-		// detail survives even when the child abandons the error body.
-		session.recordInferenceResponse(promptID, requestClass, response.StatusCode, detail)
+		// Upstream errors are accounted before the relay so the failure
+		// survives even when the child abandons the error body. The detail
+		// is captured from a bounded prefix as the body is relayed rather
+		// than read ahead: a chunked 4xx that stalls after a short payload
+		// must not hold the child's request until the lease expires.
+		session.recordInferenceResponse(promptID, requestClass, response.StatusCode, "")
+		capture = &prefixCapture{limit: providerUpstreamDetailProbeBytes}
+		body = io.TeeReader(response.Body, capture)
 	}
 	providerproxy.CopyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
 	// Flushing after every chunk keeps streamed provider responses (SSE)
 	// flowing to the ACP child without buffering delays.
 	flusher, _ := w.(http.Flusher)
-	if err := providerproxy.StreamBoundedResponse(w, body, p.maxResponseBytes, flusher); err != nil {
+	err := providerproxy.StreamBoundedResponse(w, body, p.maxResponseBytes, flusher)
+	if upstreamFailed {
+		session.attachInferenceFailureDetail(promptID, requestClass, response.StatusCode, providerUpstreamErrorDetail(capture.buffer))
+	}
+	if err != nil {
 		if !upstreamFailed {
-			if errors.Is(err, providerproxy.ErrDestinationWrite) {
+			if errors.Is(err, providerproxy.ErrDestinationWrite) || ctx.Err() != nil {
 				// The upstream delivered a healthy 2xx; the ACP child closed
 				// its side of the relay (Codex drops an SSE stream once it
-				// has read what it needs). That is not upstream evidence of
+				// has read what it needs), which surfaces either as a
+				// destination write error or, because the upstream request
+				// context is derived from the child's request, as a
+				// cancelled upstream read. Neither is upstream evidence of
 				// failure, so account the success and let the child's own
 				// settlement decide the prompt outcome.
 				session.recordInferenceResponse(promptID, requestClass, response.StatusCode, "")

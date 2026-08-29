@@ -960,6 +960,63 @@ func TestProviderProxyUpstreamFailureAccountingFailsWhenFinalInferenceFails(t *t
 	}
 }
 
+func TestProviderProxyCloseAdmissionRejectsNewRequestsButDrainsInFlight(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_1","output":[]}`)
+	}))
+	defer upstream.Close()
+	// Runs before upstream.Close so a failed assertion cannot leave the
+	// upstream handler blocked.
+	defer releaseUpstream()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+
+	inflightDone := make(chan int, 1)
+	go func() {
+		response := doProviderProxyRequest(t, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, []byte(`{"model":"test-model"}`), nil)
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		inflightDone <- response.StatusCode
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		session.mu.Lock()
+		inflight := session.inflight
+		session.mu.Unlock()
+		if inflight == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("in-flight request was never admitted")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	session.closeAdmission(testPromptOneID)
+	assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusForbidden)
+
+	releaseUpstream()
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := session.wait(waitCtx); err != nil {
+		t.Fatalf("in-flight request did not drain after admission closed: %v", err)
+	}
+	if status := <-inflightDone; status != http.StatusOK {
+		t.Fatalf("in-flight request status = %d, want 200 relayed after admission closed", status)
+	}
+	if failed, _, _ := session.upstreamFailureUnrecovered(testPromptOneID); failed {
+		t.Fatal("drained in-flight success was not accounted")
+	}
+}
+
 func TestProviderProxyUpstreamFailureAccountingResetsOnActivation(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
@@ -1131,13 +1188,69 @@ func TestProviderProxyChildDisconnectOnStreamedSuccessCountsAsSuccess(t *testing
 				t.Fatalf("relay panic = %v, want http.ErrAbortHandler", recovered)
 			}
 		}()
-		proxy.relayUpstreamResponse(&childDisconnectedWriter{header: http.Header{}}, session, testPromptOneID, providerRequestInference, response)
+		proxy.relayUpstreamResponse(context.Background(), &childDisconnectedWriter{header: http.Header{}}, session, testPromptOneID, providerRequestInference, response)
 	}()
 	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed || status != 0 || detail != "" {
 		t.Fatalf("upstreamFailureUnrecovered after child disconnect on 2xx = %v/%d/%q, want the earlier failure recovered", failed, status, detail)
 	}
 	if successes, failures := session.inferenceSuccesses, session.inferenceFailures; successes != 1 || failures != 1 {
 		t.Fatalf("inference accounting = %d successes / %d failures, want 1/1", successes, failures)
+	}
+}
+
+func TestProviderProxyChildCancelDuringStreamedSuccessCountsAsSuccess(t *testing.T) {
+	firstChunkSent := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Drain the request body so the server's background read can
+		// observe the proxy closing the upstream connection.
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {}\n\n")
+		flusher.Flush()
+		close(firstChunkSent)
+		// Keep the upstream stream open until the proxy's upstream request
+		// is cancelled by the child's disconnect.
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, strings.NewReader(`{"model":"test-model","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(providerAuthorizationHeader, "Bearer "+binding.Credential)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-firstChunkSent
+	chunk := make([]byte, 64)
+	if _, err := response.Body.Read(chunk); err != nil {
+		t.Fatalf("read first chunk: %v", err)
+	}
+	// The child got what it needed and drops the stream.
+	cancel()
+	_ = response.Body.Close()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+	if err := session.wait(waitCtx); err != nil {
+		t.Fatalf("relay did not finish after child cancel: %v", err)
+	}
+	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed {
+		t.Fatalf("child cancel of a healthy 2xx stream accounted as failure: %d %q", status, detail)
+	}
+	if successes, failures := session.inferenceSuccesses, session.inferenceFailures; successes != 1 || failures != 0 {
+		t.Fatalf("inference accounting = %d successes / %d failures, want 1/0", successes, failures)
 	}
 }
 
