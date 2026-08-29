@@ -200,7 +200,7 @@ func TestRepositoryMonitorReviewContextSanitizesUntrustedText(t *testing.T) {
 }
 
 func TestRepositoryMonitorReviewContextErrorClassNeverLeaksDetails(t *testing.T) {
-	secretURL := "https://x-access-token:ghp_secret@github.example/repos"
+	secretURL := "upstream detail placeholder-credential github.example must not leak"
 	cases := map[string]struct {
 		err  error
 		want string
@@ -218,7 +218,7 @@ func TestRepositoryMonitorReviewContextErrorClassNeverLeaksDetails(t *testing.T)
 			if got != tc.want {
 				t.Fatalf("errorClass = %q, want %q", got, tc.want)
 			}
-			if strings.Contains(got, "secret") || strings.Contains(got, "github.example") {
+			if strings.Contains(got, "placeholder-credential") || strings.Contains(got, "github.example") {
 				t.Fatalf("errorClass %q leaks error details", got)
 			}
 		})
