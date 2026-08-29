@@ -591,7 +591,7 @@ func TestResolveACPWorkspaceClassAllowsDeleteContinuationAfterSuspendWithdrawal(
 			Name:      workspaceName,
 			UID:       types.UID("existing-delete-continuation-workspace-uid"),
 			Labels: map[string]string{
-				workspacev1alpha1.ProviderControllerLabel: acpWorkspaceProviderControllerName,
+				workspacev1alpha1.ProviderControllerLabel: acpWorkspaceControllerLabelValue,
 			},
 			Annotations: map[string]string{
 				acpExecutionWorkspacePoolAnnotation: poolName,
@@ -1524,7 +1524,7 @@ func TestEnsureACPClassWorkspaceRejectsForeignAdoption(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: task.Namespace, Name: name, UID: types.UID("foreign-uid"),
 			Labels: map[string]string{
-				workspacev1alpha1.ProviderControllerLabel: acpWorkspaceProviderControllerName,
+				workspacev1alpha1.ProviderControllerLabel: acpWorkspaceControllerLabelValue,
 			},
 			Annotations: map[string]string{
 				acpExecutionWorkspacePoolAnnotation:     plan.PoolName,
@@ -1715,7 +1715,7 @@ func TestSettleACPClassWorkspaceSkipsForeignLinkTarget(t *testing.T) {
 	foreign := &workspacev1alpha1.ExecutionWorkspace{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: acpTestNamespace, Name: "acp-ws-foreign", UID: types.UID("foreign-ws-uid"),
-			Labels: map[string]string{workspacev1alpha1.ProviderControllerLabel: acpWorkspaceProviderControllerName},
+			Labels: map[string]string{workspacev1alpha1.ProviderControllerLabel: acpWorkspaceControllerLabelValue},
 		},
 		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
 			Mode:         workspacev1alpha1.ExecutionWorkspaceModeInteractive,

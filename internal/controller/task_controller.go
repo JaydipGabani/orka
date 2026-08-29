@@ -380,11 +380,6 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.projectACPExecutionWorkspaceStatus(ctx, task); err != nil {
 		return ctrl.Result{}, err
 	}
-	if settled, err := r.reconcileACPClassWorkspaceSettlement(ctx, task); err != nil {
-		return ctrl.Result{}, err
-	} else if !settled {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
 
 	// Handle based on current phase
 	switch task.Status.Phase {
@@ -2275,15 +2270,17 @@ func (r *TaskReconciler) handleFinalizing(
 	if outcome == nil {
 		return r.completeTask(ctx, task, corev1alpha1.TaskPhaseFailed, "finalizing task is missing execution outcome")
 	}
-	if !outcome.RecordedAt.IsZero() && time.Since(outcome.RecordedAt.Time) >= workspaceFinalizationTimeout {
-		if err := r.quarantineFinalizingWorkspace(ctx, task); err != nil {
-			return ctrl.Result{}, err
-		}
-		return r.completeTask(ctx, task, corev1alpha1.TaskPhaseFailed, "workspace authority revocation timed out; workspace quarantined")
-	}
+	genericFinalizationTimedOut := !outcome.RecordedAt.IsZero() &&
+		time.Since(outcome.RecordedAt.Time) >= workspaceFinalizationTimeout
 	if taskExecutionWorkspaceNeedsFinalization(task) {
 		workspaceStatus := task.Status.ExecutionWorkspace
 		if workspaceStatus == nil || workspaceStatus.WorkspaceRef == nil || workspaceStatus.AttachedEpoch <= 0 {
+			if genericFinalizationTimedOut {
+				if err := r.quarantineFinalizingWorkspace(ctx, task); err != nil {
+					return ctrl.Result{}, err
+				}
+				return r.completeTask(ctx, task, corev1alpha1.TaskPhaseFailed, "workspace authority revocation timed out; workspace quarantined")
+			}
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 		workspaceObject := &workspacev1alpha1.ExecutionWorkspace{}
@@ -2297,9 +2294,37 @@ func (r *TaskReconciler) handleFinalizing(
 		if workspaceStatus.WorkspaceRef.UID != "" && string(workspaceObject.UID) != workspaceStatus.WorkspaceRef.UID {
 			return ctrl.Result{}, fmt.Errorf("execution workspace UID changed during finalization")
 		}
+		revocationEpoch := workspaceStatus.AttachedEpoch
+		acpWorkspace := workspaceObject.Labels[workspacev1alpha1.ProviderControllerLabel] == acpWorkspaceControllerLabelValue
+		if acpWorkspace {
+			revocationEpoch = acpWorkspaceRevocationEpochForTask(task, workspaceObject, revocationEpoch)
+			// Attach and the Task epoch annotation are separate API writes.
+			// Persist the enforced epoch and pending-detach barrier BEFORE
+			// generic revocation clears the attachment: the Finalizing gate
+			// defers class settlement, so without both stamps a continuation
+			// could attach in this window and the later terminal settle could
+			// reapply or skip this Task's frozen Suspend/Delete action.
+			if err := r.markACPTaskAttachmentEpoch(ctx, task, revocationEpoch); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.markACPWorkspaceRevocationStarted(ctx, workspaceObject, revocationEpoch); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		attachmentManager := WorkspaceAttachmentManager{Client: r.Client, APIReader: r.APIReader}
-		if err := attachmentManager.BeginRevocation(ctx, workspaceObject, workspaceStatus.AttachedEpoch); err != nil {
+		if err := attachmentManager.BeginRevocation(ctx, workspaceObject, revocationEpoch); err != nil {
 			return ctrl.Result{}, err
+		}
+		if acpWorkspace {
+			result, expired, err := r.failFinalizingTaskPastACPDetachTimeout(ctx, task, workspaceObject)
+			if err != nil || expired {
+				return result, err
+			}
+		} else if genericFinalizationTimedOut {
+			if err := r.quarantineFinalizingWorkspace(ctx, task); err != nil {
+				return ctrl.Result{}, err
+			}
+			return r.completeTask(ctx, task, corev1alpha1.TaskPhaseFailed, "workspace authority revocation timed out; workspace quarantined")
 		}
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
@@ -2311,8 +2336,27 @@ func (r *TaskReconciler) handleFinalizing(
 			if workspaceStatus.WorkspaceRef.UID != "" && string(workspaceObject.UID) != workspaceStatus.WorkspaceRef.UID {
 				return ctrl.Result{}, fmt.Errorf("execution workspace UID changed during finalization")
 			}
+			revocationEpoch := workspaceStatus.AttachedEpoch
+			acpWorkspace := workspaceObject.Labels[workspacev1alpha1.ProviderControllerLabel] == acpWorkspaceControllerLabelValue
+			if acpWorkspace {
+				revocationEpoch = acpWorkspaceRevocationEpochForTask(task, workspaceObject, revocationEpoch)
+				if err := r.markACPWorkspaceRevocationStarted(ctx, workspaceObject, revocationEpoch); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
 			attachmentManager := WorkspaceAttachmentManager{Client: r.Client, APIReader: r.APIReader}
-			if err := attachmentManager.FinalizeRevocation(ctx, workspaceObject, workspaceStatus.AttachedEpoch, attachmentSecretName(workspaceObject.Name, workspaceStatus.AttachedEpoch)); err != nil {
+			if err := attachmentManager.FinalizeRevocation(ctx, workspaceObject, revocationEpoch, attachmentSecretName(workspaceObject.Name, revocationEpoch)); err != nil {
+				if acpWorkspace {
+					result, expired, timeoutErr := r.failFinalizingTaskPastACPDetachTimeout(ctx, task, workspaceObject)
+					if timeoutErr != nil || expired {
+						return result, timeoutErr
+					}
+				} else if genericFinalizationTimedOut {
+					if quarantineErr := r.quarantineFinalizingWorkspace(ctx, task); quarantineErr != nil {
+						return ctrl.Result{}, quarantineErr
+					}
+					return r.completeTask(ctx, task, corev1alpha1.TaskPhaseFailed, "workspace authority revocation timed out; workspace quarantined")
+				}
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 		} else if !apierrors.IsNotFound(err) {
@@ -2320,6 +2364,42 @@ func (r *TaskReconciler) handleFinalizing(
 		}
 	}
 	return r.completeTask(ctx, task, outcome.Phase, outcome.Message)
+}
+
+func acpWorkspaceRevocationEpochForTask(
+	task *corev1alpha1.Task,
+	workspaceObject *workspacev1alpha1.ExecutionWorkspace,
+	projectedEpoch int64,
+) int64 {
+	if task == nil {
+		return projectedEpoch
+	}
+	if workspaceObject != nil && task.UID != "" && workspaceObject.Spec.Attachment != nil &&
+		workspaceObject.Spec.Attachment.TaskRef.UID == task.UID && workspaceObject.Spec.Attachment.Epoch > 0 {
+		return workspaceObject.Spec.Attachment.Epoch
+	}
+	if recordedEpoch := acpTaskRecordedAttachmentEpoch(task); recordedEpoch > projectedEpoch {
+		return recordedEpoch
+	}
+	return projectedEpoch
+}
+
+func (r *TaskReconciler) failFinalizingTaskPastACPDetachTimeout(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	workspaceObject *workspacev1alpha1.ExecutionWorkspace,
+) (ctrl.Result, bool, error) {
+	expired, err := r.quarantineACPWorkspacePastDetachTimeout(ctx, workspaceObject)
+	if err != nil || !expired {
+		return ctrl.Result{}, false, err
+	}
+	result, err := r.completeTask(
+		ctx,
+		task,
+		corev1alpha1.TaskPhaseFailed,
+		"workspace authority revocation exceeded the class detach timeout; workspace quarantined",
+	)
+	return result, true, err
 }
 
 func (r *TaskReconciler) quarantineFinalizingWorkspace(ctx context.Context, task *corev1alpha1.Task) error {
@@ -2420,6 +2500,18 @@ func (r *TaskReconciler) handleCompleted(ctx context.Context, task *corev1alpha1
 		if !retired {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
+	}
+
+	// Detach can suspend or delete the RuntimePool that terminal recovery still
+	// needs. Apply it only after Job and lease cleanup plus durable ACP artifact
+	// retirement have settled.
+	settled, settleErr := r.reconcileACPClassWorkspaceSettlement(ctx, task)
+	if settleErr != nil {
+		log.Error(settleErr, "failed to settle terminal ACP workspace")
+		return ctrl.Result{}, settleErr
+	}
+	if !settled {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	// Send optional webhooks only after durable ACP artifact identities have

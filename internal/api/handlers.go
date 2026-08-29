@@ -450,8 +450,8 @@ func rejectRequestedByTampering(body []byte) error {
 // reservedTaskMetadataPrefixes are controller-owned metadata namespaces:
 // "orka.ai/" carries provenance and runtime bookkeeping, and
 // "acp.workspace.orka.ai/" carries workspace settlement state (the link label
-// and the incarnation pin) whose forgery would let settlement act on a
-// foreign workspace.
+// and the settled marker) whose forgery would skip controller-owned
+// revocation and detach actions.
 var reservedTaskMetadataPrefixes = []string{"orka.ai/", "acp.workspace.orka.ai/"}
 
 func rejectReservedTaskAnnotations(annotations map[string]string) error {

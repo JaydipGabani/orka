@@ -176,9 +176,20 @@ func TestRenderSubstrateRuntimeTemplateRejectsReservedVolumeCollision(t *testing
 	}
 }
 
+// The API server requires provider infrastructure fields (such as
+// snapshotsConfig.location) that fake clients never validate; the data-only
+// policy override must merge into the operator template's snapshotsConfig
+// rather than replace it.
+//
+// A provider whose ActorTemplate CRD predates the snapshot-policy fields
+// prunes them on write. The pool must fail closed with the capability gap
+// before booting any actor instead of looping through the revision fence.
+//
+//nolint:gocyclo // The suspension and cold-resume lifecycle is one auditable end-to-end scenario.
 func TestSubstrateSuspendCapablePoolFailsClosedWhenProviderPrunesPolicy(t *testing.T) {
 	r, pool, _, control := newSubstrateSuspendTestReconciler(t)
-	r.Client = &substratePolicyPruningClient{Client: r.Client}
+	base := r.Client
+	r.Client = &substratePolicyPruningClient{Client: base}
 
 	runtimePoolReconcile(t, r, pool)
 	if len(control.created) != 0 {
@@ -350,6 +361,9 @@ func TestSubstrateExistingActorFailsClosedWithoutAtomicDataCheckpoint(t *testing
 	}
 }
 
+// substratePolicyPruningClient mimics a provider API server whose
+// ActorTemplate schema lacks the snapshot-policy fields: every template write
+// silently drops onPause/onCommit/onResume, exactly like CRD pruning.
 type substratePolicyPruningClient struct {
 	client.Client
 }
@@ -399,7 +413,26 @@ func pruneSubstrateSnapshotPolicy(obj client.Object) {
 	_ = unstructured.SetNestedMap(template.Object, snapshots, "spec", "snapshotsConfig")
 }
 
-//nolint:gocyclo // The suspension and cold-resume lifecycle is one auditable end-to-end scenario.
+func TestSubstrateDataOnlyRenderKeepsOperatorSnapshotInfrastructure(t *testing.T) {
+	r, pool, _, _ := newSubstrateSuspendTestReconciler(t)
+	runtimePoolReconcile(t, r, pool)
+	template := substrateTestDerivedTemplate(t, r, pool)
+	if template == nil {
+		t.Fatal("derived template is required")
+	}
+	location, _, _ := unstructured.NestedString(template.Object, "spec", "snapshotsConfig", "location")
+	if location != substrateTestSnapshotLocation {
+		t.Fatalf("data-only render dropped the operator snapshot location (got %q)", location)
+	}
+	onPause, _, _ := unstructured.NestedString(template.Object, "spec", "snapshotsConfig", "onPause")
+	onCommit, _, _ := unstructured.NestedString(template.Object, "spec", "snapshotsConfig", "onCommit")
+	fromData, _, _ := unstructured.NestedString(template.Object, "spec", "snapshotsConfig", "onResume", "fromData")
+	if onPause != substrateSnapshotScopeData || onCommit != substrateSnapshotScopeData ||
+		fromData != substrateSnapshotResumeColdBoot {
+		t.Fatalf("data-only render policy = %s/%s/%s, want Data/Data/ColdBoot", onPause, onCommit, fromData)
+	}
+}
+
 func TestSubstrateRuntimePoolSuspendsAndColdResumesDataOnlyWorkspace(t *testing.T) {
 	r, pool, supervisor, control := newSubstrateSuspendTestReconciler(t)
 	actorID := substrateTestActorID(pool)
@@ -2933,6 +2966,43 @@ func TestSubstrateRuntimePoolHoldsSuspensionWhileActorResuming(t *testing.T) {
 	}
 	if len(control.deleted) != 0 || len(control.settled) != 0 {
 		t.Fatalf("deleted=%v settled=%v; a Running-without-route actor must be preserved", control.deleted, control.settled)
+	}
+}
+
+// A provider that prunes the data-only snapshot policy from the derived
+// template of a consensually suspended actor makes the template readback
+// revision-mismatched; that capability failure must degrade the pool with the
+// checkpoint preserved, never recycle the suspended actor.
+func TestSubstrateRuntimePoolPreservesSuspendedActorOnPolicyPruning(t *testing.T) {
+	r, pool, supervisor, control := newSubstrateSuspendTestReconciler(t)
+	actorID := substrateTestActorID(pool)
+	substrateSuspendTestReachStopped(t, r, pool, supervisor)
+
+	// The provider prunes the snapshot policy from the deployed template.
+	template := substrateTestDerivedTemplate(t, r, pool)
+	if template == nil {
+		t.Fatal("derived template missing")
+	}
+	unstructured.RemoveNestedField(template.Object, "spec", "snapshotsConfig", "policies")
+	unstructured.RemoveNestedField(template.Object, "spec", "snapshotsConfig", "onPause")
+	unstructured.RemoveNestedField(template.Object, "spec", "snapshotsConfig", "onCommit")
+	unstructured.RemoveNestedField(template.Object, "spec", "snapshotsConfig", "onResume")
+	if err := r.Update(context.Background(), template); err != nil {
+		t.Fatalf("prune snapshot policy: %v", err)
+	}
+
+	for range 3 {
+		runtimePoolReconcile(t, r, pool)
+	}
+	current := runtimePoolTestGetPool(t, r, pool)
+	if len(control.deleted) != 0 || len(control.settled) != 0 {
+		t.Fatalf("deleted=%v settled=%v; a suspended actor must survive provider policy pruning", control.deleted, control.settled)
+	}
+	if current.Annotations[substrateActorSuspendedAnnotation] != actorID {
+		t.Fatalf("consent = %q, want the suspended checkpoint preserved", current.Annotations[substrateActorSuspendedAnnotation])
+	}
+	if current.Annotations[runtimePoolWorkspaceResumeLostAnnotation] != "" {
+		t.Fatalf("resume-lost = %q; policy pruning must degrade, not destroy", current.Annotations[runtimePoolWorkspaceResumeLostAnnotation])
 	}
 }
 

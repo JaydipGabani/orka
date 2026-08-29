@@ -40,6 +40,8 @@ import (
 )
 
 const (
+	// substrateTestSnapshotLocation is the operator infrastructure snapshot
+	// location every derived template render must preserve.
 	substrateTestSnapshotLocation  = "gs://ate-snapshots/orka"
 	substrateTestSnapshotAtespace  = "orka-test"
 	substrateTestStatusSuspended   = "STATUS_SUSPENDED"

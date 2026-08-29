@@ -26,7 +26,68 @@ import (
 	acpworkspacev1alpha1 "github.com/orka-agents/orka/api/acp.workspace/v1alpha1"
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
+	"github.com/orka-agents/orka/internal/store"
 )
+
+// releaseTestACPEnforcedEpoch simulates the adapter observing a revocation
+// and releasing the enforced epoch, so settlement finalization can proceed.
+func releaseTestACPEnforcedEpoch(t *testing.T, r *TaskReconciler, namespace, name string) {
+	t.Helper()
+	ctx := context.Background()
+	released := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, released); err != nil ||
+		released.Spec.Attachment != nil || released.Status.AttachedEpoch == 0 {
+		return
+	}
+	base := released.DeepCopy()
+	released.Status.AttachedEpoch = 0
+	if err := r.Status().Patch(ctx, released, client.MergeFrom(base)); err != nil {
+		t.Fatalf("release enforced epoch: %v", err)
+	}
+}
+
+func settleTestACPClassWorkspace(t *testing.T, r *TaskReconciler, task *corev1alpha1.Task, workspaceName string) {
+	t.Helper()
+	ctx := context.Background()
+	for attempt := range 8 {
+		done, err := r.settleACPClassWorkspace(ctx, task)
+		if err != nil {
+			t.Fatalf("settle attempt %d: %v", attempt, err)
+		}
+		releaseTestACPEnforcedEpoch(t, r, task.Namespace, workspaceName)
+		if done {
+			return
+		}
+	}
+	t.Fatal("settle never completed")
+}
+
+func TestParseACPWorkspaceSettlementReceipt(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		raw       string
+		wantUID   string
+		wantEpoch int64
+		wantOK    bool
+	}{
+		{name: "legacy", raw: acpDispatcherTaskUID, wantUID: acpDispatcherTaskUID, wantOK: true},
+		{name: "epoch-bound", raw: acpDispatcherTaskUID + " 7", wantUID: acpDispatcherTaskUID, wantEpoch: 7, wantOK: true},
+		{name: "invalid epoch", raw: acpDispatcherTaskUID + " invalid"},
+		{name: "negative epoch", raw: acpDispatcherTaskUID + " -1"},
+		{name: "empty", raw: ""},
+		{name: "extra field", raw: acpDispatcherTaskUID + " 7 extra"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uid, epoch, ok := parseACPWorkspaceSettlementReceipt(tt.raw)
+			if uid != tt.wantUID || epoch != tt.wantEpoch || ok != tt.wantOK {
+				t.Fatalf("parse %q = (%q, %d, %v), want (%q, %d, %v)",
+					tt.raw, uid, epoch, ok, tt.wantUID, tt.wantEpoch, tt.wantOK)
+			}
+		})
+	}
+}
 
 const (
 	suspendTestRuntimePoolName = "acp-ws-session-0123456789abcdef"
@@ -586,31 +647,51 @@ func TestSettleACPClassWorkspaceAppliesSuspendAction(t *testing.T) {
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, task); err != nil {
 		t.Fatalf("reload task: %v", err)
 	}
+	attachmentEpoch := workspace.Spec.Attachment.Epoch
+	workspaceBase := workspace.DeepCopy()
+	workspace.Annotations[acpWorkspaceLastSettledTaskAnnotation] =
+		formatACPWorkspaceSettlementReceipt("prior-task-uid", attachmentEpoch+1)
+	if err := r.Patch(ctx, workspace, client.MergeFrom(workspaceBase)); err != nil {
+		t.Fatalf("record prior settlement receipt: %v", err)
+	}
+	taskBase := task.DeepCopy()
+	delete(task.Annotations, acpTaskAttachmentEpochAnnotation)
+	if err := r.Patch(ctx, task, client.MergeFrom(taskBase)); err != nil {
+		t.Fatalf("clear recorded attachment epoch: %v", err)
+	}
+
+	// Simulate Attach succeeding while its separate Task annotation patch was
+	// lost and a stale positive settlement receipt remains on the workspace. The live
+	// attachment wins: settlement must persist its epoch before revocation
+	// clears the only attachment copy.
+	if done, err := r.settleACPClassWorkspace(ctx, task); err != nil || done {
+		t.Fatalf("first settle pass = (%v, %v), want revocation pending", done, err)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, task); err != nil {
+		t.Fatalf("reload task after revocation start: %v", err)
+	}
+	if got := acpTaskRecordedAttachmentEpoch(task); got != attachmentEpoch {
+		t.Fatalf("recorded attachment epoch = %d, want %d before revocation", got, attachmentEpoch)
+	}
+	if task.Annotations[acpTaskWorkspaceSettledAnnotation] != "" {
+		t.Fatal("a stale receipt must not settle a Task that still owns the live attachment")
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read workspace after revocation start: %v", err)
+	}
+	if workspace.Spec.Attachment != nil {
+		t.Fatal("live attachment must be revoked before a stale receipt can settle the Task")
+	}
+	workspaceBase = workspace.DeepCopy()
+	delete(workspace.Annotations, acpWorkspaceLastSettledTaskAnnotation)
+	if err := r.Patch(ctx, workspace, client.MergeFrom(workspaceBase)); err != nil {
+		t.Fatalf("clear synthetic prior settlement receipt: %v", err)
+	}
 
 	// Settlement is a multi-reconcile flow: revocation start intentionally
 	// returns not-done so the next reconcile re-reads uncached state, and
 	// finalization waits for the adapter to release the enforced epoch.
-	done := false
-	for attempt := 0; attempt < 8 && !done; attempt++ {
-		var err error
-		if done, err = r.settleACPClassWorkspace(ctx, task); err != nil {
-			t.Fatalf("settle attempt %d: %v", attempt, err)
-		}
-		released := &workspacev1alpha1.ExecutionWorkspace{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, released); err == nil &&
-			released.Spec.Attachment == nil && released.Status.AttachedEpoch != 0 {
-			// Simulate the adapter observing the revocation and releasing
-			// the enforced epoch.
-			base := released.DeepCopy()
-			released.Status.AttachedEpoch = 0
-			if err := r.Status().Patch(ctx, released, client.MergeFrom(base)); err != nil {
-				t.Fatalf("release enforced epoch: %v", err)
-			}
-		}
-	}
-	if !done {
-		t.Fatal("settle never completed")
-	}
+	settleTestACPClassWorkspace(t, r, task, name)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
 		t.Fatalf("workspace must survive a Suspend detach: %v", err)
 	}
@@ -730,17 +811,30 @@ func TestSettleACPClassWorkspaceDeletesUncommittedWorkspaceWithExistingPool(t *t
 	}
 }
 
-// A terminally Failed workspace (for example after maxLifetime expiry tore
-// its pool down) must settle destructively even under a frozen Suspend
-// action: no checkpoint remains, and a Suspended/Failed incarnation would
-// wedge every later Session Task instead of recreating a clean workspace.
-func TestSettleACPClassWorkspaceDeletesTerminallyFailedInsteadOfSuspending(t *testing.T) {
+// Detach settlement must wait for the whole Task to settle: SessionTurn
+// finalization and artifact retirement still need the live runtime, so a
+// Suspend fired at terminal prompt delivery (while the Task is still
+// Finalizing) would kill the supervisor mid-finalization.
+func TestACPClassWorkspaceSettlementWaitsForTerminalTaskPhase(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	fixture := suspendableSubstrateFixture(t)
 	task := suspendableSessionTask()
+	task.Status.Phase = corev1alpha1.TaskPhaseFinalizing
+	task.Status.Execution = &corev1alpha1.TaskExecutionStatus{
+		State:           corev1alpha1.TaskExecutionStateSucceeded,
+		Outcome:         corev1alpha1.TaskExecutionOutcomeSucceeded,
+		RuntimePoolName: acpTestSessionPoolName,
+	}
+	task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{State: corev1alpha1.TaskDeliveryState(store.PromptDeliveryVerifiedExact)}
 	r := acpClassTestReconciler(t, append(fixture.objects(), task)...)
 	task = bindSuspendableSessionTaskForSettlement(t, r, task)
+
+	done, err := r.reconcileACPClassWorkspaceSettlement(ctx, task)
+	if err != nil || !done {
+		t.Fatalf("finalizing-phase settlement = (%v, %v), want a clean no-op", done, err)
+	}
+
 	resolved, err := r.resolveACPWorkspaceClass(ctx, task)
 	if err != nil {
 		t.Fatalf("resolve class: %v", err)
@@ -765,172 +859,260 @@ func TestSettleACPClassWorkspaceDeletesTerminallyFailedInsteadOfSuspending(t *te
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
 		t.Fatalf("read attached workspace: %v", err)
 	}
-	// The adapter marked the incarnation terminally Failed and released the
-	// enforced epoch (maxLifetime expiry destroyed the pool).
 	base := workspace.DeepCopy()
-	workspace.Status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
-	workspace.Status.AttachedEpoch = 0
-	if err := r.Status().Patch(ctx, workspace, client.MergeFrom(base)); err != nil {
-		t.Fatalf("mark workspace failed: %v", err)
+	workspace.Annotations[acpWorkspaceDurableSessionCommittedAnnotation] = "1"
+	if err := r.Patch(ctx, workspace, client.MergeFrom(base)); err != nil {
+		t.Fatalf("record durable session commit: %v", err)
+	}
+
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, task); err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	task.Status.Phase = corev1alpha1.TaskPhaseFinalizing
+	task.Status.Execution = &corev1alpha1.TaskExecutionStatus{
+		State:           corev1alpha1.TaskExecutionStateSucceeded,
+		Outcome:         corev1alpha1.TaskExecutionOutcomeSucceeded,
+		RuntimePoolName: acpTestSessionPoolName,
+	}
+	task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{State: corev1alpha1.TaskDeliveryState(store.PromptDeliveryVerifiedExact)}
+
+	// Still Finalizing: settlement must leave the attachment and state alone.
+	if done, err := r.reconcileACPClassWorkspaceSettlement(ctx, task); err != nil || !done {
+		t.Fatalf("finalizing-phase settlement after attach = (%v, %v)", done, err)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read attached workspace: %v", err)
+	}
+	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady || workspace.Spec.Attachment == nil {
+		t.Fatalf("finalizing Task must keep the workspace attached (state=%s attachment=%v)",
+			workspace.Spec.DesiredState, workspace.Spec.Attachment)
+	}
+
+	// Terminal phase: the deferred Suspend detach now proceeds. Settlement is
+	// a multi-reconcile flow: revocation start intentionally returns not-done
+	// so the next reconcile re-reads uncached state.
+	task.Status.Phase = corev1alpha1.TaskPhaseSucceeded
+	settled := false
+	for attempt := 0; attempt < 8 && !settled; attempt++ {
+		var settleErr error
+		if settled, settleErr = r.reconcileACPClassWorkspaceSettlement(ctx, task); settleErr != nil {
+			t.Fatalf("terminal-phase settlement attempt %d: %v", attempt, settleErr)
+		}
+		releaseTestACPEnforcedEpoch(t, r, task.Namespace, name)
+	}
+	if !settled {
+		t.Fatal("terminal-phase settlement never completed")
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read settled workspace: %v", err)
+	}
+	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredSuspended {
+		t.Fatalf("desired state = %s, want Suspended after the Task settles", workspace.Spec.DesiredState)
+	}
+}
+
+// A terminal projection can race attachment credential rotation: the Task may
+// project Released with no enforced epoch while the workspace still carries
+// the next attachment intent. Finalizing does not wait on an unprojected
+// epoch; once the Task becomes terminal, settlement must recover and revoke
+// the live attachment epoch instead of stranding the workspace.
+func TestACPClassWorkspaceSettlementRecoversUnprojectedRotatedAttachment(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := suspendableSubstrateFixture(t)
+	task := suspendableSessionTask()
+	r := acpClassTestReconciler(t, append(fixture.objects(), task)...)
+	task = bindSuspendableSessionTaskForSettlement(t, r, task)
+
+	resolved, err := r.resolveACPWorkspaceClass(ctx, task)
+	if err != nil {
+		t.Fatalf("resolve class: %v", err)
+	}
+	binding, err := resolveACPWorkspaceBindingWithClass(task, "", false, suspendTestSessionUID, resolved)
+	if err != nil {
+		t.Fatalf("resolve binding: %v", err)
+	}
+	plan := ACPRuntimePlan{PoolName: suspendTestRuntimePoolName, Workspace: binding}
+	if _, _, err := r.ensureACPClassWorkspace(ctx, task, plan); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	workspaceName := acpClassWorkspaceName(task, binding)
+	workspace := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: workspaceName}, workspace); err != nil {
+		t.Fatalf("read workspace: %v", err)
+	}
+	admitTestACPWorkspace(t, r, workspace)
+	if _, ready := attachTestACPWorkspace(t, r, task, plan, workspace.Name); !ready {
+		t.Fatal("initial attachment was not ready")
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: workspaceName}, workspace); err != nil {
+		t.Fatalf("read attached workspace: %v", err)
+	}
+	oldEpoch := workspace.Spec.Attachment.Epoch
+	rotatedEpoch := oldEpoch + 1
+	base := workspace.DeepCopy()
+	workspace.Spec.AttachmentEpoch = rotatedEpoch
+	workspace.Spec.Attachment.Epoch = rotatedEpoch
+	workspace.Spec.Attachment.TokenSecretRef.Name = attachmentSecretName(workspace.Name, rotatedEpoch)
+	if err := r.Patch(ctx, workspace, client.MergeFrom(base)); err != nil {
+		t.Fatalf("rotate attachment intent: %v", err)
+	}
+
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, task); err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	task.Status.Phase = corev1alpha1.TaskPhaseFinalizing
+	task.Status.Execution = &corev1alpha1.TaskExecutionStatus{
+		State:           corev1alpha1.TaskExecutionStateSucceeded,
+		Outcome:         corev1alpha1.TaskExecutionOutcomeSucceeded,
+		RuntimePoolName: acpTestSessionPoolName,
+	}
+	task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{State: corev1alpha1.TaskDeliveryState(store.PromptDeliveryVerifiedExact)}
+	task.Status.ExecutionWorkspace = &corev1alpha1.ExecutionWorkspaceStatus{
+		Phase:         corev1alpha1.ExecutionWorkspacePhaseReleased,
+		WorkspaceRef:  &corev1alpha1.WorkspaceObjectReference{Name: workspace.Name, UID: string(workspace.UID)},
+		AttachedEpoch: 0,
+	}
+	if taskExecutionWorkspaceNeedsFinalization(task) {
+		t.Fatal("an unprojected rotation epoch must not hold the Task in Finalizing")
+	}
+	if done, err := r.reconcileACPClassWorkspaceSettlement(ctx, task); err != nil || !done {
+		t.Fatalf("finalizing settlement gate = (%v, %v), want a clean defer", done, err)
+	}
+
+	task.Status.Phase = corev1alpha1.TaskPhaseSucceeded
+	if done, err := r.reconcileACPClassWorkspaceSettlement(ctx, task); err != nil || done {
+		t.Fatalf("terminal settlement = (%v, %v), want live-epoch revocation pending", done, err)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, task); err != nil {
+		t.Fatalf("reload task after revocation: %v", err)
+	}
+	if got := acpTaskRecordedAttachmentEpoch(task); got != rotatedEpoch {
+		t.Fatalf("recorded attachment epoch = %d, want rotated live epoch %d", got, rotatedEpoch)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: workspaceName}, workspace); err != nil {
+		t.Fatalf("read revoked workspace: %v", err)
+	}
+	if workspace.Spec.Attachment != nil || workspace.Spec.AttachmentEpoch != rotatedEpoch {
+		t.Fatalf("workspace attachment = %+v high-water=%d, want revoked epoch %d", workspace.Spec.Attachment, workspace.Spec.AttachmentEpoch, rotatedEpoch)
+	}
+}
+
+// A terminal Task keeps reconciling (artifact retirement, cleanup), and its
+// settlement hook runs on every pass. Once its detach action settled the
+// workspace, later passes must never re-suspend a workspace a continuation
+// Task has already asked to resume.
+func TestACPClassWorkspaceSettlementDoesNotResuspendAfterResumeRequest(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := suspendableSubstrateFixture(t)
+	task := suspendableSessionTask()
+	task.Status.Phase = corev1alpha1.TaskPhaseSucceeded
+	r := acpClassTestReconciler(t, append(fixture.objects(), task)...)
+	task = bindSuspendableSessionTaskForSettlement(t, r, task)
+	resolved, err := r.resolveACPWorkspaceClass(ctx, task)
+	if err != nil {
+		t.Fatalf("resolve class: %v", err)
+	}
+	binding, err := resolveACPWorkspaceBindingWithClass(task, "", false, "session-uid-1", resolved)
+	if err != nil {
+		t.Fatalf("resolve binding: %v", err)
+	}
+	plan := ACPRuntimePlan{PoolName: acpTestSessionPoolName, Workspace: binding}
+	if _, _, err := r.ensureACPClassWorkspace(ctx, task, plan); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	name := acpClassWorkspaceName(task, binding)
+	workspace := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read workspace: %v", err)
+	}
+	admitTestACPWorkspace(t, r, workspace)
+	if _, ready := attachTestACPWorkspace(t, r, task, plan, workspace.Name); !ready {
+		t.Fatalf("attach = (%v)", ready)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read attached workspace: %v", err)
+	}
+	base := workspace.DeepCopy()
+	workspace.Annotations[acpWorkspaceDurableSessionCommittedAnnotation] = "1"
+	if err := r.Patch(ctx, workspace, client.MergeFrom(base)); err != nil {
+		t.Fatalf("record durable session commit: %v", err)
 	}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, task); err != nil {
 		t.Fatalf("reload task: %v", err)
 	}
-
-	done := false
-	for attempt := 0; attempt < 8 && !done; attempt++ {
-		if done, err = r.settleACPClassWorkspace(ctx, task); err != nil {
-			t.Fatalf("settle attempt %d: %v", attempt, err)
-		}
-	}
-	if !done {
-		t.Fatal("settle never completed")
-	}
-	current := &workspacev1alpha1.ExecutionWorkspace{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, current); err == nil {
-		if current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended {
-			t.Fatal("a terminally Failed workspace must never be suspended; no checkpoint exists to preserve")
-		}
-		if current.DeletionTimestamp.IsZero() {
-			t.Fatalf("terminal failure must settle destructively, workspace still standing: desired=%s", current.Spec.DesiredState)
-		}
-	}
-}
-
-// A resuming workspace must not publish Ready while the linked pool is still
-// cold-booting: the checkpoint record may stand and the resumed Pod has not
-// passed the authenticated Serving fence, so an early Ready would let a Task
-// attach before the preserved data is actually being served.
-func TestACPExecutionWorkspaceAdapterHoldsReadyUntilResumeSettles(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	provider := acpAdapterProvider()
-	workspace := acpAdapterWorkspace(t, "acp-ws-pool")
-	workspace.CreationTimestamp = metav1.Now()
-	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredReady
-	workspace.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspended
-	pool := acpAdapterLinkedPool(workspace.Namespace, workspace.Name)
-	pool.Spec.ExecutionWorkspace.Provider = corev1alpha1.WorkspaceProviderSubstrate
-	pool.Spec.ExecutionWorkspace.Substrate = &corev1alpha1.RuntimePoolSubstrateWorkspaceSpec{
-		BaseTemplateNamespace: acpTestSubstrateNamespace, BaseTemplateName: acpTestInfraName,
-		SuspendMode: string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly),
-	}
-	pool.Spec.DesiredReplicas = 1
-	c := acpAdapterTestClient(t, provider, workspace, pool)
-	seed := &workspacev1alpha1.ExecutionWorkspace{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, seed); err != nil {
-		t.Fatalf("read workspace: %v", err)
-	}
-	base := seed.DeepCopy()
-	seed.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspended
-	if err := c.Status().Patch(ctx, seed, client.MergeFrom(base)); err != nil {
-		t.Fatalf("seed suspended state: %v", err)
-	}
-
-	// The pool is still Stopped: the resume has not passed the Serving fence.
-	currentPool := &corev1alpha1.RuntimePool{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}, currentPool); err != nil {
-		t.Fatalf("read pool: %v", err)
-	}
-	poolBase := currentPool.DeepCopy()
-	currentPool.Status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopped
-	currentPool.Status.ObservedGeneration = currentPool.Generation
-	if err := c.Status().Patch(ctx, currentPool, client.MergeFrom(poolBase)); err != nil {
-		t.Fatalf("mark pool stopped: %v", err)
-	}
-	reconcileACPWorkspaceAdapter(t, c, workspace)
-	held := &workspacev1alpha1.ExecutionWorkspace{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, held); err != nil {
-		t.Fatalf("read held workspace: %v", err)
-	}
-	if held.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended {
-		t.Fatalf("state = %s; the hold must preserve the pre-resume state so the gate re-arms every reconcile", held.Status.State)
-	}
-	// The hold re-arms: a second reconcile against the still-stopped pool
-	// must not publish Ready either.
-	reconcileACPWorkspaceAdapter(t, c, workspace)
-	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, held); err != nil {
-		t.Fatalf("re-read held workspace: %v", err)
-	}
-	if held.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended {
-		t.Fatalf("state = %s after a repeat reconcile; Ready must wait for the resumed pool's Serving fence", held.Status.State)
-	}
-
-	// The resumed pool passes the authenticated Serving fence with its
-	// checkpoint consent retired: Ready may now publish.
-	if err := c.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}, currentPool); err != nil {
-		t.Fatalf("re-read pool: %v", err)
-	}
-	poolBase = currentPool.DeepCopy()
-	currentPool.Status.Lifecycle = corev1alpha1.RuntimePoolLifecycleServing
-	currentPool.Status.AdmissionState = corev1alpha1.RuntimePoolAdmissionAccepting
-	currentPool.Status.ObservedGeneration = currentPool.Generation
-	if err := c.Status().Patch(ctx, currentPool, client.MergeFrom(poolBase)); err != nil {
-		t.Fatalf("mark pool serving: %v", err)
-	}
-	reconcileACPWorkspaceAdapter(t, c, workspace)
-	settled := &workspacev1alpha1.ExecutionWorkspace{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, settled); err != nil {
+	settleTestACPClassWorkspace(t, r, task, name)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
 		t.Fatalf("read settled workspace: %v", err)
 	}
-	if settled.Status.State != workspacev1alpha1.ExecutionWorkspaceStateReady {
-		t.Fatalf("state = %s, want Ready once the resumed pool serves", settled.Status.State)
-	}
-}
-
-// A settled suspension must self-schedule its frozen maxLifetime deadline:
-// the stopped pool produces no further events, so without the requeue the
-// retained checkpoint could outlive the bound until an unrelated mutation.
-func TestACPExecutionWorkspaceAdapterRequeuesSettledSuspensionForLifetime(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	provider := acpAdapterProvider()
-	workspace := acpAdapterWorkspace(t, "acp-ws-pool")
-	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredSuspended
-	workspace.CreationTimestamp = metav1.Now()
-	workspace.Spec.Lifecycle.MaxLifetime = &metav1.Duration{Duration: 24 * time.Hour}
-	pool := acpAdapterLinkedPool(workspace.Namespace, workspace.Name)
-	pool.Spec.ExecutionWorkspace.Provider = corev1alpha1.WorkspaceProviderSubstrate
-	pool.Spec.ExecutionWorkspace.Substrate = &corev1alpha1.RuntimePoolSubstrateWorkspaceSpec{
-		BaseTemplateNamespace: acpTestSubstrateNamespace, BaseTemplateName: acpTestInfraName,
-		SuspendMode: string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly),
-	}
-	pool.Spec.DesiredReplicas = 0
-	pool.Annotations[runtimePoolWorkspaceSuspendAnnotation] = booleanTrueValue
-	pool.Annotations[substrateActorSuspendedAnnotation] = runtimePoolSubstrateActorSuffix
-	pool.Annotations[substrateActorSuspendAcceptedAnnotation] = substrateActorSuspendConsentValue(runtimePoolSubstrateActorSuffix)
-	pool.Annotations[substrateActorSnapshotDigestAnnotation] = "sha256:" + strings.Repeat("a", 64)
-	pool.Annotations[substrateActorSnapshotOperationDigestAnnotation] = "sha256:" + strings.Repeat("c", 64)
-	pool.Annotations[substrateActorLastSnapshotDigestAnnotation] = pool.Annotations[substrateActorSnapshotDigestAnnotation]
-	pool.Annotations[substrateActorLastSnapshotIdentityDigestAnnotation] = "sha256:" + strings.Repeat("b", 64)
-	c := acpAdapterTestClient(t, provider, workspace, pool)
-	current := &corev1alpha1.RuntimePool{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}, current); err != nil {
-		t.Fatalf("read pool: %v", err)
-	}
-	base := current.DeepCopy()
-	current.Status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopped
-	current.Status.ObservedGeneration = current.Generation
-	if err := c.Status().Patch(ctx, current, client.MergeFrom(base)); err != nil {
-		t.Fatalf("mark pool stopped: %v", err)
+	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredSuspended {
+		t.Fatalf("desired state = %s, want Suspended after settle", workspace.Spec.DesiredState)
 	}
 
-	reconciler := &ACPExecutionWorkspaceAdapterReconciler{Client: c, APIReader: c}
-	result, err := reconciler.Reconcile(ctx, ctrl.Request{
-		NamespacedName: types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name},
-	})
+	// A continuation Task requests cold resume.
+	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredReady
+	if err := r.Update(ctx, workspace); err != nil {
+		t.Fatalf("request resume: %v", err)
+	}
+
+	// The terminal first Task keeps reconciling; its settlement must be a
+	// no-op now.
+	settleTestACPClassWorkspace(t, r, task, name)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read resumed workspace: %v", err)
+	}
+	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady {
+		t.Fatalf("terminal Task re-suspended a workspace whose resume was already requested (desiredState=%s)", workspace.Spec.DesiredState)
+	}
+
+	// A second session Task attaches, settles (re-suspending), and a third
+	// continuation resumes again. The FIRST Task's marker must survive the
+	// second settlement: per-Task markers are monotonic, so the old terminal
+	// Task still never re-applies its detach action.
+	second := suspendableSessionTask()
+	second.Name = "second-session-task"
+	second.UID = types.UID("second-session-task-uid")
+	second.Status.Phase = corev1alpha1.TaskPhaseSucceeded
+	if err := r.Create(ctx, second); err != nil {
+		t.Fatalf("create second task: %v", err)
+	}
+	second = bindSuspendableSessionTaskForSettlement(t, r, second)
+	secondBinding, err := resolveACPWorkspaceBindingWithClass(second, "", false, "session-uid-1", resolved)
 	if err != nil {
-		t.Fatalf("settle suspension: %v", err)
+		t.Fatalf("resolve second binding: %v", err)
 	}
-	updated := &workspacev1alpha1.ExecutionWorkspace{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, updated); err != nil {
-		t.Fatalf("read workspace: %v", err)
+	secondPlan := ACPRuntimePlan{PoolName: acpTestSessionPoolName, Workspace: secondBinding}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read workspace before second attach: %v", err)
 	}
-	if updated.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended {
-		t.Fatalf("state = %s, want Suspended", updated.Status.State)
+	admitTestACPWorkspace(t, r, workspace)
+	if _, ready := attachTestACPWorkspace(t, r, second, secondPlan, workspace.Name); !ready {
+		t.Fatalf("second attach = (%v)", ready)
 	}
-	if result.RequeueAfter <= 0 || result.RequeueAfter > 24*time.Hour {
-		t.Fatalf("settled suspension requeue = %v, want a bounded maxLifetime wake-up", result.RequeueAfter)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: second.Namespace, Name: second.Name}, second); err != nil {
+		t.Fatalf("reload second task: %v", err)
+	}
+	settleTestACPClassWorkspace(t, r, second, name)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read twice-settled workspace: %v", err)
+	}
+	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredSuspended {
+		t.Fatalf("second settle desired state = %s, want Suspended", workspace.Spec.DesiredState)
+	}
+	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredReady
+	if err := r.Update(ctx, workspace); err != nil {
+		t.Fatalf("request second resume: %v", err)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, task); err != nil {
+		t.Fatalf("reload first task: %v", err)
+	}
+	settleTestACPClassWorkspace(t, r, task, name)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read final workspace: %v", err)
+	}
+	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady {
+		t.Fatalf("an older settled Task re-suspended the workspace after a later settlement (desiredState=%s)", workspace.Spec.DesiredState)
 	}
 }
 
@@ -1854,5 +2036,209 @@ func TestACPExecutionWorkspaceAdapterWithdrawsUnavailableResumedLineage(t *testi
 				t.Fatalf("state = %s, want Failed after definitive resumed-lineage loss", failed.Status.State)
 			}
 		})
+	}
+}
+
+// A terminally Failed workspace (for example after maxLifetime expiry tore
+// its pool down) must settle destructively even under a frozen Suspend
+// action: no checkpoint remains, and a Suspended/Failed incarnation would
+// wedge every later Session Task instead of recreating a clean workspace.
+func TestSettleACPClassWorkspaceDeletesTerminallyFailedInsteadOfSuspending(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := suspendableSubstrateFixture(t)
+	task := suspendableSessionTask()
+	r := acpClassTestReconciler(t, append(fixture.objects(), task)...)
+	task = bindSuspendableSessionTaskForSettlement(t, r, task)
+	resolved, err := r.resolveACPWorkspaceClass(ctx, task)
+	if err != nil {
+		t.Fatalf("resolve class: %v", err)
+	}
+	binding, err := resolveACPWorkspaceBindingWithClass(task, "", false, "session-uid-1", resolved)
+	if err != nil {
+		t.Fatalf("resolve binding: %v", err)
+	}
+	plan := ACPRuntimePlan{PoolName: acpTestSessionPoolName, Workspace: binding}
+	if _, _, err := r.ensureACPClassWorkspace(ctx, task, plan); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	name := acpClassWorkspaceName(task, binding)
+	workspace := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read workspace: %v", err)
+	}
+	admitTestACPWorkspace(t, r, workspace)
+	if _, ready := attachTestACPWorkspace(t, r, task, plan, workspace.Name); !ready {
+		t.Fatalf("attach = (%v)", ready)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
+		t.Fatalf("read attached workspace: %v", err)
+	}
+	// The adapter marked the incarnation terminally Failed and released the
+	// enforced epoch (maxLifetime expiry destroyed the pool).
+	base := workspace.DeepCopy()
+	workspace.Status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
+	workspace.Status.AttachedEpoch = 0
+	if err := r.Status().Patch(ctx, workspace, client.MergeFrom(base)); err != nil {
+		t.Fatalf("mark workspace failed: %v", err)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, task); err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+
+	done := false
+	for attempt := 0; attempt < 8 && !done; attempt++ {
+		if done, err = r.settleACPClassWorkspace(ctx, task); err != nil {
+			t.Fatalf("settle attempt %d: %v", attempt, err)
+		}
+	}
+	if !done {
+		t.Fatal("settle never completed")
+	}
+	current := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, current); err == nil {
+		if current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended {
+			t.Fatal("a terminally Failed workspace must never be suspended; no checkpoint exists to preserve")
+		}
+		if current.DeletionTimestamp.IsZero() {
+			t.Fatalf("terminal failure must settle destructively, workspace still standing: desired=%s", current.Spec.DesiredState)
+		}
+	}
+}
+
+// A resuming workspace must not publish Ready while the linked pool is still
+// cold-booting: the checkpoint record may stand and the resumed Pod has not
+// passed the authenticated Serving fence, so an early Ready would let a Task
+// attach before the preserved data is actually being served.
+func TestACPExecutionWorkspaceAdapterHoldsReadyUntilResumeSettles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := acpAdapterProvider()
+	workspace := acpAdapterWorkspace(t, "acp-ws-pool")
+	workspace.CreationTimestamp = metav1.Now()
+	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredReady
+	workspace.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspended
+	pool := acpAdapterLinkedPool(workspace.Namespace, workspace.Name)
+	pool.Spec.ExecutionWorkspace.Provider = corev1alpha1.WorkspaceProviderSubstrate
+	pool.Spec.ExecutionWorkspace.Substrate = &corev1alpha1.RuntimePoolSubstrateWorkspaceSpec{
+		BaseTemplateNamespace: acpTestSubstrateNamespace, BaseTemplateName: acpTestInfraName,
+		SuspendMode: string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly),
+	}
+	pool.Spec.DesiredReplicas = 1
+	c := acpAdapterTestClient(t, provider, workspace, pool)
+	seed := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, seed); err != nil {
+		t.Fatalf("read workspace: %v", err)
+	}
+	base := seed.DeepCopy()
+	seed.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspended
+	if err := c.Status().Patch(ctx, seed, client.MergeFrom(base)); err != nil {
+		t.Fatalf("seed suspended state: %v", err)
+	}
+
+	// The pool is still Stopped: the resume has not passed the Serving fence.
+	currentPool := &corev1alpha1.RuntimePool{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}, currentPool); err != nil {
+		t.Fatalf("read pool: %v", err)
+	}
+	poolBase := currentPool.DeepCopy()
+	currentPool.Status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopped
+	currentPool.Status.ObservedGeneration = currentPool.Generation
+	if err := c.Status().Patch(ctx, currentPool, client.MergeFrom(poolBase)); err != nil {
+		t.Fatalf("mark pool stopped: %v", err)
+	}
+	reconcileACPWorkspaceAdapter(t, c, workspace)
+	held := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, held); err != nil {
+		t.Fatalf("read held workspace: %v", err)
+	}
+	if held.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended {
+		t.Fatalf("state = %s; the hold must preserve the pre-resume state so the gate re-arms every reconcile", held.Status.State)
+	}
+	// The hold re-arms: a second reconcile against the still-stopped pool
+	// must not publish Ready either.
+	reconcileACPWorkspaceAdapter(t, c, workspace)
+	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, held); err != nil {
+		t.Fatalf("re-read held workspace: %v", err)
+	}
+	if held.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended {
+		t.Fatalf("state = %s after a repeat reconcile; Ready must wait for the resumed pool's Serving fence", held.Status.State)
+	}
+
+	// The resumed pool passes the authenticated Serving fence with its
+	// checkpoint consent retired: Ready may now publish.
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}, currentPool); err != nil {
+		t.Fatalf("re-read pool: %v", err)
+	}
+	poolBase = currentPool.DeepCopy()
+	currentPool.Status.Lifecycle = corev1alpha1.RuntimePoolLifecycleServing
+	currentPool.Status.AdmissionState = corev1alpha1.RuntimePoolAdmissionAccepting
+	currentPool.Status.ObservedGeneration = currentPool.Generation
+	if err := c.Status().Patch(ctx, currentPool, client.MergeFrom(poolBase)); err != nil {
+		t.Fatalf("mark pool serving: %v", err)
+	}
+	reconcileACPWorkspaceAdapter(t, c, workspace)
+	settled := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, settled); err != nil {
+		t.Fatalf("read settled workspace: %v", err)
+	}
+	if settled.Status.State != workspacev1alpha1.ExecutionWorkspaceStateReady {
+		t.Fatalf("state = %s, want Ready once the resumed pool serves", settled.Status.State)
+	}
+}
+
+// A settled suspension must self-schedule its frozen maxLifetime deadline:
+// the stopped pool produces no further events, so without the requeue the
+// retained checkpoint could outlive the bound until an unrelated mutation.
+func TestACPExecutionWorkspaceAdapterRequeuesSettledSuspensionForLifetime(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := acpAdapterProvider()
+	workspace := acpAdapterWorkspace(t, "acp-ws-pool")
+	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredSuspended
+	workspace.CreationTimestamp = metav1.Now()
+	workspace.Spec.Lifecycle.MaxLifetime = &metav1.Duration{Duration: 24 * time.Hour}
+	pool := acpAdapterLinkedPool(workspace.Namespace, workspace.Name)
+	pool.Spec.ExecutionWorkspace.Provider = corev1alpha1.WorkspaceProviderSubstrate
+	pool.Spec.ExecutionWorkspace.Substrate = &corev1alpha1.RuntimePoolSubstrateWorkspaceSpec{
+		BaseTemplateNamespace: acpTestSubstrateNamespace, BaseTemplateName: acpTestInfraName,
+		SuspendMode: string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly),
+	}
+	pool.Spec.DesiredReplicas = 0
+	pool.Annotations[runtimePoolWorkspaceSuspendAnnotation] = booleanTrueValue
+	pool.Annotations[substrateActorSuspendedAnnotation] = runtimePoolSubstrateActorSuffix
+	pool.Annotations[substrateActorSuspendAcceptedAnnotation] = substrateActorSuspendConsentValue(runtimePoolSubstrateActorSuffix)
+	pool.Annotations[substrateActorSnapshotDigestAnnotation] = "sha256:" + strings.Repeat("a", 64)
+	pool.Annotations[substrateActorSnapshotOperationDigestAnnotation] = "sha256:" + strings.Repeat("c", 64)
+	pool.Annotations[substrateActorLastSnapshotDigestAnnotation] = pool.Annotations[substrateActorSnapshotDigestAnnotation]
+	pool.Annotations[substrateActorLastSnapshotIdentityDigestAnnotation] = "sha256:" + strings.Repeat("b", 64)
+	c := acpAdapterTestClient(t, provider, workspace, pool)
+	current := &corev1alpha1.RuntimePool{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}, current); err != nil {
+		t.Fatalf("read pool: %v", err)
+	}
+	base := current.DeepCopy()
+	current.Status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopped
+	current.Status.ObservedGeneration = current.Generation
+	if err := c.Status().Patch(ctx, current, client.MergeFrom(base)); err != nil {
+		t.Fatalf("mark pool stopped: %v", err)
+	}
+
+	reconciler := &ACPExecutionWorkspaceAdapterReconciler{Client: c, APIReader: c}
+	result, err := reconciler.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name},
+	})
+	if err != nil {
+		t.Fatalf("settle suspension: %v", err)
+	}
+	updated := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, updated); err != nil {
+		t.Fatalf("read workspace: %v", err)
+	}
+	if updated.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended {
+		t.Fatalf("state = %s, want Suspended", updated.Status.State)
+	}
+	if result.RequeueAfter <= 0 || result.RequeueAfter > 24*time.Hour {
+		t.Fatalf("settled suspension requeue = %v, want a bounded maxLifetime wake-up", result.RequeueAfter)
 	}
 }

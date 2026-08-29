@@ -113,7 +113,7 @@ func (r *ACPWorkspaceRetentionReconciler) Reconcile(ctx context.Context, req ctr
 	if err := r.Get(ctx, req.NamespacedName, workspace); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if workspace.Labels[workspacev1alpha1.ProviderControllerLabel] != acpWorkspaceProviderControllerName {
+	if workspace.Labels[workspacev1alpha1.ProviderControllerLabel] != acpWorkspaceControllerLabelValue {
 		return ctrl.Result{}, nil
 	}
 	if !workspace.DeletionTimestamp.IsZero() ||
@@ -331,7 +331,7 @@ func (r *ACPWorkspaceRetentionReconciler) Reconcile(ctx context.Context, req ctr
 			preserveLastDetached := resumeUnfulfilled &&
 				workspace.Annotations[acpWorkspaceResumedLineageAnnotation] == booleanTrueValue
 			err := suspendACPWorkspaceWithinQuota(
-				ctx, r.Client, r.quotaReader(), workspace, now, preserveLastDetached,
+				ctx, r.Client, r.quotaReader(), workspace, now, preserveLastDetached, "", 0,
 			)
 			switch {
 			case errors.Is(err, errACPSuspendQuotaExhausted):
@@ -1082,7 +1082,7 @@ func listACPSuspendQuotaWorkspaces(
 	workspaces := make(map[string]*workspacev1alpha1.ExecutionWorkspace, len(list.Items))
 	for i := range list.Items {
 		workspace := &list.Items[i]
-		if workspace.Labels[workspacev1alpha1.ProviderControllerLabel] != acpWorkspaceProviderControllerName ||
+		if workspace.Labels[workspacev1alpha1.ProviderControllerLabel] != acpWorkspaceControllerLabelValue ||
 			workspace.Spec.ClassBinding.UID != classUID || workspace.UID == "" {
 			continue
 		}
@@ -1324,7 +1324,19 @@ func suspendACPWorkspaceWithinQuota(
 	workspace *workspacev1alpha1.ExecutionWorkspace,
 	now time.Time,
 	preserveLastDetached bool,
+	settledTaskUID string,
+	settledTaskEpoch int64,
 ) error {
+	if settledTaskUID != "" &&
+		!acpWorkspaceResumeDemandBelongsToTask(
+			workspace.Annotations[acpWorkspaceResumeRequestedAnnotation], settledTaskUID,
+		) && acpWorkspaceSettlementReceiptCoversTask(
+		workspace.Annotations[acpWorkspaceLastSettledTaskAnnotation], settledTaskUID, settledTaskEpoch,
+	) {
+		// This settlement already landed or a later attachment displaced it.
+		// Do not reserve quota or suspend newer Ready state.
+		return nil
+	}
 	unlock := lockACPSuspendQuota(workspace.Namespace, workspace.Spec.ClassBinding.UID)
 	defer unlock()
 	limit := acpWorkspaceSuspendedCapFromAnnotation(workspace)
@@ -1341,6 +1353,15 @@ func suspendACPWorkspaceWithinQuota(
 		workspace.Annotations[acpWorkspaceLastDetachedAnnotation] = now.UTC().Format(time.RFC3339Nano)
 	}
 	delete(workspace.Annotations, acpWorkspaceRevocationStartedAnnotation)
+	if settledTaskUID != "" {
+		// The settlement receipt lands in the SAME patch as the suspension:
+		// if the controller dies before the separate Task-side marker patch,
+		// a restarted reconcile of that Task finds its receipt here and
+		// completes the marker instead of re-applying Suspend to newer
+		// session state.
+		workspace.Annotations[acpWorkspaceLastSettledTaskAnnotation] =
+			formatACPWorkspaceSettlementReceipt(settledTaskUID, settledTaskEpoch)
+	}
 	// Suspension settles any pending provisioning or resume demand; a later
 	// continuation stamps fresh demand when it flips the workspace back.
 	delete(workspace.Annotations, acpWorkspaceResumeRequestedAnnotation)
@@ -1397,7 +1418,7 @@ func countSuspendedClassWorkspaces(
 	count := 0
 	for i := range list.Items {
 		workspace := &list.Items[i]
-		if workspace.Labels[workspacev1alpha1.ProviderControllerLabel] != acpWorkspaceProviderControllerName ||
+		if workspace.Labels[workspacev1alpha1.ProviderControllerLabel] != acpWorkspaceControllerLabelValue ||
 			workspace.Spec.ClassBinding.UID != classUID || (exclude != nil && exclude(workspace)) {
 			continue
 		}
@@ -1683,7 +1704,7 @@ func acpWorkspaceSuspendedCapFromAnnotation(workspace *workspacev1alpha1.Executi
 // SetupWithManager registers retention enforcement for ACP class workspaces.
 func (r *ACPWorkspaceRetentionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	ours := predicate.NewPredicateFuncs(func(object client.Object) bool {
-		return object.GetLabels()[workspacev1alpha1.ProviderControllerLabel] == acpWorkspaceProviderControllerName
+		return object.GetLabels()[workspacev1alpha1.ProviderControllerLabel] == acpWorkspaceControllerLabelValue
 	})
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workspacev1alpha1.ExecutionWorkspace{}).

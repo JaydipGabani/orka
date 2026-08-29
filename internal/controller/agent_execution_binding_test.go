@@ -237,7 +237,7 @@ func TestSettleACPClassWorkspaceRequiresFrozenSessionUID(t *testing.T) {
 					Name:      workspaceName,
 					UID:       types.UID(workspaceUID),
 					Labels: map[string]string{
-						workspacev1alpha1.ProviderControllerLabel: acpWorkspaceProviderControllerName,
+						workspacev1alpha1.ProviderControllerLabel: acpWorkspaceControllerLabelValue,
 					},
 				},
 				Spec: workspacev1alpha1.ExecutionWorkspaceSpec{

@@ -18,6 +18,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -28,6 +29,15 @@ import (
 	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
 	"github.com/orka-agents/orka/pkg/workspaceprovider"
 )
+
+// The fake client never validates label values, so pin the API-server rule
+// (RFC 1123-ish label value: no '/') for the ACP owner label directly.
+func TestACPWorkspaceControllerLabelValueIsValid(t *testing.T) {
+	t.Parallel()
+	if errs := validation.IsValidLabelValue(acpWorkspaceControllerLabelValue); len(errs) != 0 {
+		t.Fatalf("ACP workspace controller label value is invalid: %v", errs)
+	}
+}
 
 const acpAdapterOriginalConfigUID = "config-uid-original"
 
@@ -426,7 +436,7 @@ func acpAdapterWorkspace(t *testing.T, poolName string) *workspacev1alpha1.Execu
 	workspace := &workspacev1alpha1.ExecutionWorkspace{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: acpTestNamespace, Name: "acp-ws-test", UID: types.UID("acp-ws-test-uid"), Generation: 1,
-			Labels:      map[string]string{workspacev1alpha1.ProviderControllerLabel: acpWorkspaceProviderControllerName},
+			Labels:      map[string]string{workspacev1alpha1.ProviderControllerLabel: acpWorkspaceControllerLabelValue},
 			Annotations: map[string]string{acpExecutionWorkspacePoolAnnotation: poolName},
 		},
 		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
@@ -906,6 +916,43 @@ func TestACPExecutionWorkspaceAdapterIgnoresForeignWorkspaces(t *testing.T) {
 	}
 	if current.Status.State != "" || len(current.Status.Conditions) != len(workspace.Status.Conditions) {
 		t.Fatalf("foreign workspace status must stay untouched: %+v", current.Status)
+	}
+}
+
+// Only actual resume admissions poll: a brand-new Ready workspace waiting on
+// initial core admission must not enter the two-second adapter retry loop,
+// while a previously admitted workspace with outstanding resume demand must.
+func TestACPExecutionWorkspaceAdapterPollsOnlyResumeAdmissions(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := acpAdapterProvider()
+
+	fresh := acpAdapterWorkspace(t, "acp-ws-pool")
+	fresh.Name = "acp-ws-fresh-alloc"
+	fresh.Spec.CoreAdmission = nil
+	fresh.Status.Conditions = nil
+	c := acpAdapterTestClient(t, provider, fresh)
+	reconciler := &ACPExecutionWorkspaceAdapterReconciler{Client: c, APIReader: c}
+	result, err := reconciler.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: fresh.Namespace, Name: fresh.Name},
+	})
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("fresh unadmitted allocation reconcile = (%+v, %v), want no adapter polling", result, err)
+	}
+
+	resuming := acpAdapterWorkspace(t, "acp-ws-pool")
+	resuming.Name = "acp-ws-resuming"
+	resuming.Annotations[acpWorkspaceResumeRequestedAnnotation] = "2026-08-23T00:00:00Z"
+	// Admission evidence exists for the prior generation; re-admission for
+	// the resume flip is still pending.
+	resuming.Generation = 2
+	c = acpAdapterTestClient(t, provider, resuming)
+	reconciler = &ACPExecutionWorkspaceAdapterReconciler{Client: c, APIReader: c}
+	result, err = reconciler.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: resuming.Namespace, Name: resuming.Name},
+	})
+	if err != nil || result.RequeueAfter == 0 {
+		t.Fatalf("outstanding resume reconcile = (%+v, %v), want the bounded admission retry", result, err)
 	}
 }
 

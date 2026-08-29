@@ -1133,6 +1133,27 @@ func (r *RuntimePoolReconciler) reconcileSubstrateBackedRuntimePool(
 			)
 		}
 	}
+	if actor != nil && templateIntegrityErr != nil && substrateRuntimePoolSuspendCapable(pool) &&
+		(substrateActorConsensuallySuspended(pool, actorID) ||
+			pool.Annotations[substrateActorResumingAnnotation] == actorID) {
+		if policyErr := verifySubstrateDeployedDataSnapshotPolicy(derivedTemplate); policyErr != nil {
+			// The provider pruned the data-only snapshot policy (for example
+			// during the bootstrap-only template refresh for a cold resume):
+			// the revision mismatch is a provider capability failure, not a
+			// compromised workload. Recycling would destroy the suspended
+			// actor's sole data checkpoint without recording resume loss, so
+			// the pool stays degraded with the checkpoint preserved and this
+			// provider version fails the DataOnly contract visibly instead.
+			status.ActiveInstance = nil
+			status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDegraded
+			status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
+			status.Message = sanitizeRuntimePoolMessage(
+				"the Substrate provider pruned the data-only snapshot policy; the suspended checkpoint is preserved and the pool fails closed: " + policyErr.Error())
+			r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionAdmissionReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonAdmissionClosed, status.Message)
+			r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonRolloutFailed, status.Message)
+			return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
+		}
+	}
 	if actor != nil && templateIntegrityErr != nil {
 		// A same-name template with valid ownership labels is still not trusted
 		// when its declared revision does not match its observed contents. Never
@@ -1296,6 +1317,20 @@ func (r *RuntimePoolReconciler) reconcileSubstrateBackedRuntimePool(
 	if err := loadDesired(); err != nil {
 		return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, err)
 	}
+	if derivedTemplate != nil && substrateRuntimePoolSuspendCapable(pool) {
+		// A provider that prunes the snapshot-policy fields makes every
+		// readback revision-mismatched. Entering rollout would rewrite the
+		// template, get pruned again, and loop Starting forever, losing the
+		// capability failure after the creation reconcile; verify the
+		// deployed policy on every pass so an unsupported DataOnly pool stays
+		// clearly failed instead of continuously writing and requeueing.
+		if policyErr := verifySubstrateDeployedDataSnapshotPolicy(derivedTemplate); policyErr != nil {
+			return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, fmt.Errorf(
+				"the Substrate provider pruned the data-only snapshot policy from the derived ActorTemplate; this provider version cannot express DataOnly suspension, so the suspend-capable pool fails closed: %w",
+				policyErr,
+			))
+		}
+	}
 	rolloutPending := derivedTemplate != nil && (templateIntegrityErr != nil || templateRevision != desired.revision)
 	if rolloutPending {
 		if actor != nil && substrateRuntimePoolSuspendCapable(pool) &&
@@ -1326,6 +1361,10 @@ func (r *RuntimePoolReconciler) reconcileSubstrateBackedRuntimePool(
 		if !substrateRuntimeTemplateOwnedByPool(derivedTemplate, desired.object) {
 			return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, fmt.Errorf("created RuntimePool substrate ActorTemplate does not carry the exact RuntimePool ownership identity"))
 		}
+		// A provider whose ActorTemplate schema predates the snapshot-policy
+		// fields silently prunes them on write; without this check the pruned
+		// readback fails the revision fence forever and the pool loops through
+		// actor recycles instead of reporting the real capability gap.
 		if substrateRuntimePoolSuspendCapable(pool) {
 			if policyErr := verifySubstrateDeployedDataSnapshotPolicy(derivedTemplate); policyErr != nil {
 				return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, fmt.Errorf(
@@ -4450,7 +4489,8 @@ func (r *RuntimePoolReconciler) renderSubstrateRuntimeTemplate(
 		// Override only the policy keys: the operator's base snapshotsConfig
 		// carries required provider fields such as the storage location, and
 		// dropping them would leave the provider unable to build or persist
-		// the data checkpoint.
+		// the data checkpoint. The resume policy is replaced wholesale so no
+		// memory-resume path can survive the override.
 		snapshots := map[string]any{}
 		if base, ok := infrastructure["snapshotsConfig"].(map[string]any); ok {
 			maps.Copy(snapshots, base)

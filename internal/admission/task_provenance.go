@@ -36,10 +36,9 @@ const (
 	fieldMetadataAnnotations = "metadata.annotations"
 
 	// managedWorkspaceMetadataPrefix protects the controller-owned ACP
-	// workspace settlement metadata (the workspace link label and the
-	// incarnation pin): forging them through direct Kubernetes writes would
-	// let an untrusted Task writer point settlement at a foreign workspace
-	// and delete it with controller privileges.
+	// workspace settlement metadata (the settled marker, the workspace link
+	// label, and the incarnation pin): forging them through direct Kubernetes
+	// writes would skip controller-owned revocation and detach actions.
 	managedWorkspaceMetadataPrefix = "acp.workspace.orka.ai/"
 )
 
@@ -189,8 +188,9 @@ func (v *TaskProvenanceValidator) Handle(_ context.Context, req ctrladmission.Re
 // presentTaskProvenanceFields lists Orka-managed fields present on a created
 // Task. A trusted worker keeps its provenance-field allowance, but workspace
 // settlement metadata stays reserved to controller identities: a compromised
-// worker with Task write access must never forge the workspace link or the
-// incarnation pin and point settlement at a foreign workspace.
+// worker with Task write access must never forge the settled marker, the
+// workspace link, or the incarnation pin and skip controller-owned revocation
+// and detach actions.
 func presentTaskProvenanceFields(task *corev1alpha1.Task, workerTrusted bool) []string {
 	fields := []string{}
 	if !workerTrusted {
@@ -222,16 +222,6 @@ func changedTaskProvenanceFields(oldTask, newTask *corev1alpha1.Task, workerTrus
 	}
 	fields = append(fields, changedManagedPrefixFields(fieldMetadataLabels, oldTask.Labels, newTask.Labels)...)
 	fields = append(fields, changedManagedPrefixFields(fieldMetadataAnnotations, oldTask.Annotations, newTask.Annotations)...)
-	return fields
-}
-
-func presentManagedMapFields(prefix string, values map[string]string, keys []string) []string {
-	fields := []string{}
-	for _, key := range keys {
-		if _, ok := values[key]; ok {
-			fields = append(fields, prefix+"["+key+"]")
-		}
-	}
 	return fields
 }
 
@@ -267,6 +257,16 @@ func changedManagedPrefixFields(prefix string, oldValues, newValues map[string]s
 		}
 	}
 	slices.Sort(fields)
+	return fields
+}
+
+func presentManagedMapFields(prefix string, values map[string]string, keys []string) []string {
+	fields := []string{}
+	for _, key := range keys {
+		if _, ok := values[key]; ok {
+			fields = append(fields, prefix+"["+key+"]")
+		}
+	}
 	return fields
 }
 

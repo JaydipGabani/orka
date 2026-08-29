@@ -15,7 +15,7 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 # shellcheck source=scripts/lib/e2e-admission-tls.sh
 . "${script_dir}/lib/e2e-admission-tls.sh"
 
-agent_sandbox_version="${AGENT_SANDBOX_VERSION:-v0.5.4}"
+agent_sandbox_version="${AGENT_SANDBOX_VERSION:-v0.5.5}"
 kind_cluster="${KIND_CLUSTER:-orka-live-agent-sandbox-e2e}"
 orka_namespace="${ORKA_NAMESPACE:-orka-system}"
 orka_controller_deployment="${ORKA_CONTROLLER_DEPLOYMENT:-orka-controller-manager}"
@@ -39,6 +39,14 @@ smoke_claim_name="${ORKA_AGENT_SANDBOX_SMOKE_CLAIM:-orka-agent-sandbox-e2e-retai
 # proxy and the local Responses-compatible fixture. Set to 0 to skip the
 # runtime image build and smoke.
 acp_task_smoke_enabled="${ORKA_AGENT_SANDBOX_ACP_TASK_SMOKE:-1}"
+# The class-backed suspend/cold-resume conformance (issue #425) enables the
+# workspace provider API, provisions a suspendable ExecutionWorkspaceClass, and
+# proves PVC-backed data-only suspension plus exact-Sandbox cold resume live.
+# It reuses the Codex runtime image and Responses fixture from the smoke.
+suspend_resume_enabled="${ORKA_AGENT_SANDBOX_SUSPEND_RESUME:-1}"
+acp_suspend_agent_name="orka-ws-suspend-agent"
+acp_suspend_class_name="acp-sandbox-suspend"
+acp_suspend_session_name="orka-ws-suspend-session"
 acp_codex_runtime_image="${ORKA_ACP_CODEX_RUNTIME_IMAGE:-orka-acp-codex-runtime:live-agent-sandbox-e2e-${e2e_run_id}}"
 acp_runtime_namespace="${ORKA_ACP_RUNTIME_NAMESPACE:-orka-runtimes}"
 acp_task_namespace="${ORKA_AGENT_SANDBOX_ACP_TASK_NAMESPACE:-${orka_namespace}}"
@@ -58,8 +66,8 @@ smoke_go_dir="${repo_root}/.tmp-live-agent-sandbox-smoke-${e2e_run_id}"
 manager_kustomization="${repo_root}/config/manager/kustomization.yaml"
 manager_kustomization_backup="${work_dir}/manager-kustomization.yaml.bak"
 
-if [[ "${agent_sandbox_version}" != "v0.5.4" ]]; then
-  die "this e2e is pinned to agent-sandbox v0.5.4 to match go.mod"
+if [[ "${agent_sandbox_version}" != "v0.5.5" ]]; then
+  die "this e2e is pinned to agent-sandbox v0.5.5 to match go.mod"
 fi
 
 cleanup_one_port_forward() {
@@ -106,6 +114,21 @@ dump_diagnostics() {
     kubectl get pods,secrets,sandboxclaims,sandboxes,sandboxtemplates,sandboxwarmpools -n "${acp_runtime_namespace}" -o wide 2>/dev/null || true
     echo
     echo "=== Responses Fixture ==="
+    # Diagnostics are limited to the fixture's own fixed-name Tasks, with the
+    # prompt and result bodies stripped: a reused cluster or customized task
+    # namespace can hold unrelated Tasks whose prompts and results may carry
+    # credentials or other sensitive user input that must never land in logs.
+    kubectl -n "${acp_task_namespace}" get tasks -o wide 2>/dev/null || true
+    local diag_task
+    for diag_task in "${acp_task_name}" orka-ws-suspend-first orka-ws-suspend-second; do
+      echo "--- task/${diag_task} (prompt and result redacted) ---"
+      kubectl -n "${acp_task_namespace}" get task "${diag_task}" -o json 2>/dev/null |
+        jq 'del(.spec.prompt) | del(.status.result) | del(.status.execution.result)' 2>/dev/null || true
+    done
+    kubectl -n "${acp_task_namespace}" get events --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -80 || true
+    kubectl -n "${acp_runtime_namespace}" get events --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -40 || true
+    kubectl get executionworkspaceproviders,runtimeproviderconfigs -o yaml 2>/dev/null || true
+    kubectl -n "${acp_task_namespace}" get executionworkspaceclasses,executionworkspaces,runtimeworkspaceprofiles,runtimepools -o yaml 2>/dev/null || true
     kubectl get pods,svc,deploy -n vekil-system -o wide 2>/dev/null || true
     kubectl logs deployment/vekil -n vekil-system --tail=300 2>/dev/null || true
     echo
@@ -172,6 +195,98 @@ run() {
   printf '%q ' "$@" >&2
   printf '\n' >&2
   "$@"
+}
+
+write_pod_file_as_directory_owner() {
+  local pod_name="$1"
+  local directory="$2"
+  local file_path="$3"
+  local contents="$4"
+
+  run kubectl -n "${acp_runtime_namespace}" exec "${pod_name}" -- node -e '
+const fs = require("node:fs");
+const directory = process.argv[1];
+const filePath = process.argv[2];
+const contents = process.argv[3];
+const owner = fs.statSync(directory);
+
+process.setgroups([]);
+process.setgid(owner.gid);
+process.setuid(owner.uid);
+
+const fd = fs.openSync(filePath, "w");
+try {
+  fs.writeFileSync(fd, contents);
+  fs.fsyncSync(fd);
+} finally {
+  fs.closeSync(fd);
+}
+' "${directory}" "${file_path}" "${contents}"
+}
+
+wait_for_pod_directory() {
+  local pod_name="$1"
+  local directory="$2"
+  local attempts_remaining="${3:-120}"
+
+  while (( attempts_remaining > 0 )); do
+    if kubectl -n "${acp_runtime_namespace}" exec "${pod_name}" -- node -e '
+const fs = require("node:fs");
+const stat = fs.statSync(process.argv[1]);
+if (!stat.isDirectory()) {
+  process.exit(1);
+}
+' "${directory}" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempts_remaining=$((attempts_remaining - 1))
+    sleep 1
+  done
+
+  die "runtime Pod ${pod_name} never created session directory ${directory}"
+}
+
+read_pod_file_as_directory_owner() {
+  local pod_name="$1"
+  local directory="$2"
+  local file_path="$3"
+
+  kubectl -n "${acp_runtime_namespace}" exec "${pod_name}" -- node -e '
+const fs = require("node:fs");
+const directory = process.argv[1];
+const filePath = process.argv[2];
+const owner = fs.statSync(directory);
+
+process.setgroups([]);
+process.setgid(owner.gid);
+process.setuid(owner.uid);
+process.stdout.write(fs.readFileSync(filePath, "utf8"));
+' "${directory}" "${file_path}"
+}
+
+remove_pod_file_as_directory_owner() {
+  local pod_name="$1"
+  local directory="$2"
+  local file_path="$3"
+
+  run kubectl -n "${acp_runtime_namespace}" exec "${pod_name}" -- node -e '
+const fs = require("node:fs");
+const directory = process.argv[1];
+const filePath = process.argv[2];
+const owner = fs.statSync(directory);
+
+process.setgroups([]);
+process.setgid(owner.gid);
+process.setuid(owner.uid);
+fs.unlinkSync(filePath);
+
+const directoryFd = fs.openSync(directory, "r");
+try {
+  fs.fsyncSync(directoryFd);
+} finally {
+  fs.closeSync(directoryFd);
+}
+' "${directory}" "${file_path}"
 }
 
 kind_cluster_exists() {
@@ -264,6 +379,57 @@ assert_task_result_contains() {
   die "Task/${task_name} result did not contain the expected marker ${expected_marker} (last HTTP status: ${status:-none})"
 }
 
+assert_fixture_marker_count() {
+  local marker="$1"
+  local expected_count="$2"
+  local marker_digest counts_payload observed_count
+
+  marker_digest="$(printf '%s' "${marker}" | openssl dgst -sha256 | awk '{print substr($NF, 1, 16)}')"
+  [[ "${#marker_digest}" == "16" ]] || die "could not digest fixture marker ${marker}"
+  counts_payload="$(kubectl get --raw \
+    '/api/v1/namespaces/vekil-system/services/http:vekil:1337/proxy/fixture/marker-counts')" ||
+    die "could not read Responses fixture marker counts"
+  observed_count="$(jq -er --arg digest "${marker_digest}" '.[$digest] // 0' <<<"${counts_payload}")" ||
+    die "Responses fixture returned invalid marker counts"
+  [[ "${observed_count}" == "${expected_count}" ]] ||
+    die "Responses fixture observed marker ${marker} ${observed_count} times, want ${expected_count}"
+  log "Responses fixture observed marker ${marker} exactly ${expected_count} time(s)"
+}
+
+delete_session_if_present() {
+  local namespace_arg="$1"
+  local session_name="$2"
+  local api_base="http://127.0.0.1:${orka_api_local_port}"
+  local api_token status attempts_remaining
+
+  wait_for_http "${api_base}/readyz" "Orka API /readyz"
+  api_token="$(kubectl -n "${namespace_arg}" create token "${orka_api_client_service_account}")"
+  attempts_remaining=30
+  while (( attempts_remaining > 0 )); do
+    status="$(curl --silent --show-error --connect-timeout 5 --max-time 30 \
+      --request DELETE \
+      --header "Authorization: Bearer ${api_token}" \
+      --output /dev/null --write-out '%{http_code}' \
+      "${api_base}/api/v1/sessions/${session_name}?namespace=${namespace_arg}" \
+      2>>"${api_pf_log}" || true)"
+    case "${status}" in
+    204 | 404)
+      log "Session/${session_name} is absent"
+      return 0
+      ;;
+    409 | "")
+      attempts_remaining=$((attempts_remaining - 1))
+      sleep 2
+      ;;
+    *)
+      die "delete Session/${session_name} returned HTTP ${status}"
+      ;;
+    esac
+  done
+
+  die "Session/${session_name} remained active or unsettled during cleanup"
+}
+
 deploy_responses_fixture() {
   log "Deploying local Responses-compatible provider fixture"
   kubectl -n vekil-system apply -f - <<YAML
@@ -329,6 +495,9 @@ spec:
       port: 1337
       targetPort: http
 YAML
+  # The fixture stores request counts in memory. Force a new Pod even when a
+  # reused cluster receives the same fixed image and Pod template.
+  run kubectl -n vekil-system rollout restart deployment/vekil
   run kubectl -n vekil-system rollout status deployment/vekil --timeout=2m
 }
 
@@ -656,11 +825,29 @@ patch_controller_for_agent_sandbox() {
   router_url="http://sandbox-router-svc.${router_namespace}.svc.cluster.local:8080"
   rollout_id="${e2e_run_id}"
 
+  local workspace_api="false"
+  if [[ "${suspend_resume_enabled}" == "1" ]]; then
+    workspace_api="true"
+    # The dedicated admission runtime below is the API server boundary. These
+    # controller flags also register equivalent local handlers, so give the
+    # manager webhook server a certificate even though no Service routes to it.
+    local webhook_cert_dir
+    webhook_cert_dir="$(mktemp -d "${work_dir}/webhook-certs.XXXXXX")"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+      -keyout "${webhook_cert_dir}/tls.key" -out "${webhook_cert_dir}/tls.crt" \
+      -subj "/CN=${orka_controller_deployment}.${orka_namespace}.svc" >/dev/null 2>&1
+    kubectl -n "${orka_namespace}" create secret tls orka-webhook-serving-certs \
+      --cert="${webhook_cert_dir}/tls.crt" --key="${webhook_cert_dir}/tls.key" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    rm -rf "${webhook_cert_dir}"
+  fi
+
   log "Configuring Orka controller for agent-sandbox"
   kubectl -n "${orka_namespace}" get deployment "${orka_controller_deployment}" -o json |
     jq \
       --arg routerURL "${router_url}" \
       --arg rolloutID "${rollout_id}" \
+      --arg workspaceAPI "${workspace_api}" \
       --arg template "${sandbox_template_name}" '
       def upsert_arg($name; $value):
         . as $args
@@ -685,8 +872,25 @@ patch_controller_for_agent_sandbox() {
           | .args = ((.args // []) | upsert_arg("--agent-sandbox-command-timeout"; "5m"))
           | .args = ((.args // []) | upsert_arg("--agent-sandbox-cleanup-policy"; "delete"))
           | .args = ((.args // []) | upsert_arg("--acp-workspace-dispatch-enabled"; "true"))
+          | (if $workspaceAPI == "true" then
+              .args = ((.args // [])
+                | upsert_arg("--enable-workspace-provider-api"; "true")
+                | upsert_arg("--workspace-class-use-admission-enabled"; "true")
+                | upsert_arg("--task-provenance-admission-enabled"; "true"))
+              | .volumeMounts = (((.volumeMounts // []) | map(select(.name != "webhook-serving-certs"))) + [{
+                  "name": "webhook-serving-certs",
+                  "mountPath": "/tmp/k8s-webhook-server/serving-certs",
+                  "readOnly": true
+                }])
+            else . end)
         else . end
       )
+      | (if $workspaceAPI == "true" then
+          .spec.template.spec.volumes = (((.spec.template.spec.volumes // []) | map(select(.name != "webhook-serving-certs"))) + [{
+            "name": "webhook-serving-certs",
+            "secret": { "secretName": "orka-webhook-serving-certs" }
+          }])
+        else . end)
     ' | kubectl apply -f -
 
   run kubectl -n "${orka_namespace}" rollout status deployment/"${orka_controller_deployment}" --timeout=5m
@@ -957,6 +1161,31 @@ reset_e2e_resources() {
   log "Resetting fixed-name agent-sandbox e2e resources"
   run kubectl -n "${acp_task_namespace}" delete task "${acp_task_name}"     --ignore-not-found=true --wait=true --timeout=2m
   run kubectl -n "${acp_task_namespace}" delete agent "${acp_agent_name}"     --ignore-not-found=true --wait=true --timeout=1m
+  # Suspend/cold-resume conformance leftovers from a failed prior run: a
+  # terminal fixed-name Task is never restarted by kubectl apply, and a stale
+  # suspended workspace, class, or provider registration would bind the rerun
+  # to old state or fail admission instead of exercising a fresh cycle.
+  run kubectl -n "${acp_task_namespace}" delete task orka-ws-suspend-first orka-ws-suspend-second \
+    --ignore-not-found=true --wait=true --timeout=4m
+  run kubectl -n "${acp_task_namespace}" delete agent "${acp_suspend_agent_name}" --ignore-not-found=true --wait=true --timeout=1m
+  run kubectl -n "${acp_runtime_namespace}" delete pod orka-ws-durability-writer orka-ws-durability-reader \
+    --ignore-not-found=true --wait=true --timeout=2m
+  # Delete only this scenario's ACP workspaces: an ACP-wide selector on a
+  # reused cluster could destroy unrelated experiments' active workspaces and
+  # their retained data. The suspend scenario binds the fixed session name;
+  # per-Task workspaces die with the fixed-name Tasks deleted above.
+  local reset_workspace
+  for reset_workspace in $(kubectl -n "${acp_task_namespace}" get executionworkspaces -o json 2>/dev/null |
+    jq -r --arg session_name "${acp_suspend_session_name}" \
+      '.items[] | select((.spec.sessionRef.name // "") == $session_name) | .metadata.name'); do
+    run kubectl -n "${acp_task_namespace}" delete executionworkspace "${reset_workspace}" \
+      --ignore-not-found=true --wait=true --timeout=6m
+  done
+  delete_session_if_present "${acp_task_namespace}" "${acp_suspend_session_name}"
+  run kubectl -n "${acp_task_namespace}" delete executionworkspaceclass "${acp_suspend_class_name}" --ignore-not-found=true --wait=true --timeout=2m
+  run kubectl -n "${acp_task_namespace}" delete runtimeworkspaceprofile "${acp_suspend_class_name}" --ignore-not-found=true --wait=true --timeout=1m
+  run kubectl delete executionworkspaceprovider acp-sandbox-e2e --ignore-not-found=true --wait=true --timeout=1m
+  run kubectl delete runtimeproviderconfig acp-sandbox-e2e --ignore-not-found=true --wait=true --timeout=1m
   run kubectl -n "${orka_namespace}" delete sandboxclaim "${smoke_claim_name}" \
     --ignore-not-found=true \
     --wait=true \
@@ -1138,6 +1367,439 @@ YAML
   log "Workspace-backed ACP Task infrastructure smoke passed"
 }
 
+
+# run_workspace_suspend_resume_acp_task proves class-backed PVC-backed
+# suspension and cold resume live against upstream agent-sandbox (issue #425):
+# a session-scoped classRef Task suspends its workspace on detach (the pool
+# drains to Stopped, the exact Sandbox is consensually suspended through
+# operatingMode: Suspended, its Pod disappears, and the injected durable
+# workspace PVC stays Bound), a continuation Task cold-resumes the same
+# Sandbox, and explicit deletion removes the workspace, pool, claim, Sandbox,
+# and PVC.
+run_workspace_suspend_resume_acp_task() {
+  log "Running class-backed suspend/cold-resume conformance (agent-sandbox)"
+
+  bash "${repo_root}/scripts/lib/ensure-static-mode-namespace.sh" \
+    kubectl "${acp_task_namespace}" harness-v2
+
+  kubectl apply -f - <<YAML
+apiVersion: acp.workspace.orka.ai/v1alpha1
+kind: RuntimeProviderConfig
+metadata:
+  name: acp-sandbox-e2e
+spec:
+  backend: agent-sandbox
+---
+apiVersion: workspace.orka.ai/v1alpha1
+kind: ExecutionWorkspaceProvider
+metadata:
+  name: acp-sandbox-e2e
+spec:
+  controllerName: acp.workspace.orka.ai/runtime-pool
+  parametersRef:
+    group: acp.workspace.orka.ai
+    kind: RuntimeProviderConfig
+    name: acp-sandbox-e2e
+  lifecycleState: Active
+  requiredContracts:
+    - workspace.orka.ai/v1
+---
+apiVersion: acp.workspace.orka.ai/v1alpha1
+kind: RuntimeWorkspaceProfile
+metadata:
+  name: ${acp_suspend_class_name}
+  namespace: ${acp_task_namespace}
+spec:
+  agentSandbox:
+    suspend:
+      mode: DataOnly
+      volume:
+        capacity: 1Gi
+---
+apiVersion: workspace.orka.ai/v1alpha1
+kind: ExecutionWorkspaceClass
+metadata:
+  name: ${acp_suspend_class_name}
+  namespace: ${acp_task_namespace}
+spec:
+  providerRef:
+    name: acp-sandbox-e2e
+  parametersRef:
+    group: acp.workspace.orka.ai
+    kind: RuntimeWorkspaceProfile
+    name: ${acp_suspend_class_name}
+  mode: Interactive
+  allowedReuseScopes:
+    - Session
+  lifecycle:
+    defaultOnDetach: Suspend
+    allowedOnDetach:
+      - Suspend
+      - Delete
+    detachTimeout: 2m
+    maxLifetime: 2h
+    deletionPolicy:
+      providerResources: Delete
+      persistentVolumes: Delete
+      checkpoints: Delete
+YAML
+
+  wait_for_jsonpath executionworkspaceclass "${acp_task_namespace}" "${acp_suspend_class_name}" \
+    '{.status.conditions[?(@.type=="Ready")].status}' "True" 180
+
+  kubectl apply -f - <<YAML
+apiVersion: core.orka.ai/v1alpha1
+kind: Agent
+metadata:
+  name: ${acp_suspend_agent_name}
+  namespace: ${acp_task_namespace}
+spec:
+  runtime:
+    type: codex
+    contractVersion: orka.harness.v2
+    defaultMaxTurns: 1
+  model:
+    name: gpt-5.5
+---
+apiVersion: core.orka.ai/v1alpha1
+kind: Task
+metadata:
+  name: orka-ws-suspend-first
+  namespace: ${acp_task_namespace}
+spec:
+  type: agent
+  agentRef:
+    name: ${acp_suspend_agent_name}
+  agentRuntime:
+    maxTurns: 1
+  timeout: 15m0s
+  sessionRef:
+    name: ${acp_suspend_session_name}
+    create: true
+  execution:
+    workspace:
+      classRef:
+        name: ${acp_suspend_class_name}
+      reusePolicy: session
+  prompt: "ORKA_HOLD_60S then reply ORKA_WS_SUSPEND_FIRST_OK"
+YAML
+
+  local workspace_name pool_name first_runtime_instance first_pod_uid
+  local claim_payload claim_count claim_name claim_uid warm_pool_name sandbox_template_name
+  local durability_marker durable_session_uid durable_volume_directory
+  local durable_session_relative_path durable_session_directory durable_marker_relative_path durable_marker_path
+  workspace_name="$(wait_for_nonempty_jsonpath task "${acp_task_namespace}" orka-ws-suspend-first \
+    '{.metadata.labels.acp\.workspace\.orka\.ai/execution-workspace}' 240)"
+  pool_name="$(wait_for_nonempty_jsonpath task "${acp_task_namespace}" orka-ws-suspend-first \
+    '{.status.execution.runtimePoolName}' 240)"
+  if [[ -z "${workspace_name}" || "${pool_name}" != acp-ws-session-* ]]; then
+    kubectl -n "${acp_task_namespace}" get task orka-ws-suspend-first -o yaml >&2 || true
+    die "class-backed Task did not bind a session workspace (workspace=${workspace_name:-<empty>} pool=${pool_name:-<empty>})"
+  fi
+  first_runtime_instance="$(wait_for_nonempty_jsonpath task "${acp_task_namespace}" orka-ws-suspend-first \
+    '{.status.execution.runtimeInstanceID}' 240)"
+  first_pod_uid="${first_runtime_instance%%.*}"
+  if [[ -z "${first_runtime_instance}" || "${first_runtime_instance}" == "${first_pod_uid}" ]]; then
+    die "first suspend Task carries no Pod-scoped runtime instance (got ${first_runtime_instance:-<empty>})"
+  fi
+  durable_session_uid="$(wait_for_nonempty_jsonpath task "${acp_task_namespace}" orka-ws-suspend-first \
+    '{.status.execution.runtimeSessionUID}' 240)"
+  durable_volume_directory="/durable/orka-workspace"
+  durable_session_relative_path="ws-${durable_session_uid}"
+  durable_session_directory="${durable_volume_directory}/${durable_session_relative_path}"
+  durable_marker_relative_path="${durable_session_relative_path}/e2e-durability-marker-${durable_session_uid}"
+  durable_marker_path="${durable_volume_directory}/${durable_marker_relative_path}"
+  durability_marker="ORKA_E2E_DURABLE_MARKER_${e2e_run_id}"
+  claim_payload="$(kubectl -n "${acp_runtime_namespace}" get sandboxclaims \
+    -l "orka.ai/runtime-pool-name=${pool_name}" -o json)"
+  claim_count="$(jq -r '.items | length' <<<"${claim_payload}")"
+  [[ "${claim_count}" == "1" ]] ||
+    die "expected exactly one SandboxClaim for ${pool_name}, found ${claim_count}"
+  claim_name="$(jq -r '.items[0].metadata.name // empty' <<<"${claim_payload}")"
+  claim_uid="$(jq -r '.items[0].metadata.uid // empty' <<<"${claim_payload}")"
+  [[ -n "${claim_name}" && -n "${claim_uid}" ]] ||
+    die "SandboxClaim for ${pool_name} has no exact name/UID identity"
+  warm_pool_name="$(jq -r '.items[0].spec.warmPoolRef.name // empty' <<<"${claim_payload}")"
+  [[ -n "${warm_pool_name}" ]] ||
+    die "SandboxClaim ${claim_name} has no SandboxWarmPool reference"
+  sandbox_template_name="$(kubectl -n "${acp_runtime_namespace}" get sandboxwarmpools.extensions.agents.x-k8s.io "${warm_pool_name}" \
+    -o jsonpath='{.spec.sandboxTemplateRef.name}')"
+  [[ -n "${sandbox_template_name}" ]] ||
+    die "SandboxWarmPool ${warm_pool_name} has no SandboxTemplate reference"
+  wait_for_jsonpath task "${acp_task_namespace}" orka-ws-suspend-first '{.status.phase}' "Succeeded" 900
+  assert_task_result_contains "${acp_task_namespace}" orka-ws-suspend-first "ORKA_WS_SUSPEND_FIRST_OK"
+  log "Class-backed Task bound workspace ${workspace_name} on pool ${pool_name} through SandboxClaim ${claim_name}"
+
+  log "Waiting for the detach-time PVC-backed suspension to settle"
+  wait_for_jsonpath executionworkspace "${acp_task_namespace}" "${workspace_name}" \
+    '{.spec.desiredState}' "Suspended" 240
+  wait_for_jsonpath executionworkspace "${acp_task_namespace}" "${workspace_name}" \
+    '{.status.state}' "Suspended" 600
+  wait_for_jsonpath runtimepool "${acp_task_namespace}" "${pool_name}" \
+    '{.status.lifecycle}' "Stopped" 240
+
+  local suspend_record sandbox_name sandbox_uid
+  suspend_record="$(kubectl -n "${acp_task_namespace}" get runtimepool "${pool_name}" -o json |
+    jq -r '.metadata.annotations["orka.ai/sandbox-suspended"] // empty')"
+  [[ -n "${suspend_record}" ]] || die "suspended pool carries no consensual Sandbox checkpoint record"
+  sandbox_name="$(jq -r '.name // empty' <<<"${suspend_record}")"
+  sandbox_uid="$(jq -r '.uid // empty' <<<"${suspend_record}")"
+  [[ -n "${sandbox_name}" && -n "${sandbox_uid}" ]] ||
+    die "consensual checkpoint record does not pin an exact Sandbox: ${suspend_record}"
+
+  wait_for_jsonpath sandboxes.agents.x-k8s.io "${acp_runtime_namespace}" "${sandbox_name}" \
+    '{.spec.operatingMode}' "Suspended" 120
+  wait_for_jsonpath sandboxes.agents.x-k8s.io "${acp_runtime_namespace}" "${sandbox_name}" \
+    '{.status.conditions[?(@.type=="Suspended")].status}' "True" 300
+  local observed_uid observed_claim_uid claim_sandbox_name
+  observed_uid="$(kubectl -n "${acp_runtime_namespace}" get sandboxes.agents.x-k8s.io "${sandbox_name}" \
+    -o jsonpath='{.metadata.uid}')"
+  [[ "${observed_uid}" == "${sandbox_uid}" ]] ||
+    die "suspended Sandbox UID ${observed_uid} does not match the consensual record ${sandbox_uid}"
+  observed_claim_uid="$(kubectl -n "${acp_runtime_namespace}" get sandboxclaims "${claim_name}" \
+    -o jsonpath='{.metadata.uid}')"
+  [[ "${observed_claim_uid}" == "${claim_uid}" ]] ||
+    die "SandboxClaim ${claim_name} UID changed from ${claim_uid} to ${observed_claim_uid}"
+  claim_sandbox_name="$(kubectl -n "${acp_runtime_namespace}" get sandboxclaims "${claim_name}" \
+    -o jsonpath='{.status.sandbox.name}')"
+  [[ "${claim_sandbox_name}" == "${sandbox_name}" ]] ||
+    die "SandboxClaim ${claim_name} selected Sandbox ${claim_sandbox_name:-<empty>}, want ${sandbox_name}"
+
+  local durable_pvc pvc_phase pod_count
+  durable_pvc="orka-workspace-${sandbox_name}"
+  pvc_phase="$(kubectl -n "${acp_runtime_namespace}" get pvc "${durable_pvc}" \
+    -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  [[ "${pvc_phase}" == "Bound" ]] ||
+    die "durable workspace PVC ${durable_pvc} is not Bound during suspension (phase=${pvc_phase:-<absent>})"
+  local pod_started pod_now
+  pod_started="$(date +%s)"
+  while true; do
+    pod_count="$(kubectl -n "${acp_runtime_namespace}" get pods -o json 2>/dev/null |
+      jq -r --arg sandbox_name "${sandbox_name}" --arg sandbox_uid "${sandbox_uid}" '
+        [.items[]? |
+          select(any(.metadata.ownerReferences[]?;
+            .controller == true and .kind == "Sandbox" and
+            .name == $sandbox_name and .uid == $sandbox_uid))] |
+        length
+      ')"
+    [[ "${pod_count}" == "0" ]] && break
+    pod_now="$(date +%s)"
+    (( pod_now - pod_started >= 180 )) &&
+      die "suspension left ${pod_count} runtime Pod(s) for ${pool_name}"
+    sleep 3
+  done
+  log "Sandbox ${sandbox_name} is consensually suspended; PVC ${durable_pvc} is retained and no runtime Pod remains"
+
+  # Seed known bytes only after the first turn's read-only validation and
+  # suspension have completed. The helper mounts the retained PVC while no
+  # runtime Pod owns it and writes inside the exact session tree. The
+  # continuation removes the probe before its own read-only validation.
+  log "Writing a durability marker into ${durable_session_relative_path} on retained PVC ${durable_pvc}"
+  kubectl -n "${acp_runtime_namespace}" delete pod orka-ws-durability-writer \
+    --ignore-not-found=true --wait=true >/dev/null 2>&1 || true
+  kubectl -n "${acp_runtime_namespace}" apply -f - <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: orka-ws-durability-writer
+spec:
+  restartPolicy: Never
+  # The private session tree is owned by the ACP child's distinct UID. The
+  # local-path volume receives no useful fsGroup, so this proof pod runs as
+  # root with only DAC_OVERRIDE to cross that ownership boundary.
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+  containers:
+    - name: writer
+      image: busybox:1.36
+      command:
+        - /bin/sh
+        - -c
+        - "test -d '/data/${durable_session_relative_path}' && printf '%s' '${durability_marker}' > '/data/${durable_marker_relative_path}' && sync"
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+          add:
+            - DAC_OVERRIDE
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: ${durable_pvc}
+YAML
+  wait_for_jsonpath pod "${acp_runtime_namespace}" orka-ws-durability-writer '{.status.phase}' "Succeeded" 240
+  run kubectl -n "${acp_runtime_namespace}" delete pod orka-ws-durability-writer --wait=true --timeout=2m
+
+  log "Continuing the session to cold-resume the suspended workspace"
+  kubectl apply -f - <<YAML
+apiVersion: core.orka.ai/v1alpha1
+kind: Task
+metadata:
+  name: orka-ws-suspend-second
+  namespace: ${acp_task_namespace}
+spec:
+  type: agent
+  agentRef:
+    name: ${acp_suspend_agent_name}
+  agentRuntime:
+    maxTurns: 1
+  timeout: 15m0s
+  sessionRef:
+    name: ${acp_suspend_session_name}
+    create: false
+  execution:
+    workspace:
+      classRef:
+        name: ${acp_suspend_class_name}
+      reusePolicy: session
+  prompt: "ORKA_HOLD_60S then reply ORKA_WS_SUSPEND_SECOND_OK"
+YAML
+
+  local second_pool_name resumed_uid resumed_pod_json resumed_pod resumed_pod_uid
+  second_pool_name="$(wait_for_nonempty_jsonpath task "${acp_task_namespace}" orka-ws-suspend-second \
+    '{.status.execution.runtimePoolName}' 240)"
+  [[ "${second_pool_name}" == "${pool_name}" ]] ||
+    die "continuation selected RuntimePool ${second_pool_name:-<empty>}, want the original ${pool_name}"
+
+  resumed_uid="$(kubectl -n "${acp_runtime_namespace}" get sandboxes.agents.x-k8s.io "${sandbox_name}" \
+    -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+  [[ "${resumed_uid}" == "${sandbox_uid}" ]] ||
+    die "resume did not preserve the exact Sandbox ${sandbox_name} (uid ${resumed_uid:-<absent>}, want ${sandbox_uid})"
+  wait_for_jsonpath sandboxes.agents.x-k8s.io "${acp_runtime_namespace}" "${sandbox_name}" \
+    '{.spec.operatingMode}' "Running" 300
+  wait_for_jsonpath sandboxes.agents.x-k8s.io "${acp_runtime_namespace}" "${sandbox_name}" \
+    '{.status.conditions[?(@.type=="Ready")].status}' "True" 600
+
+  local resume_started resume_now
+  resume_started="$(date +%s)"
+  while true; do
+    resumed_pod_json="$(kubectl -n "${acp_runtime_namespace}" get pods \
+      -l "orka.ai/runtime-pool-name=${pool_name}" -o json 2>/dev/null |
+      jq -c --arg sandbox_name "${sandbox_name}" --arg sandbox_uid "${sandbox_uid}" '
+        [.items[]? |
+          select(.status.phase == "Running") |
+          select(any(.metadata.ownerReferences[]?;
+            .controller == true and .kind == "Sandbox" and
+            .name == $sandbox_name and .uid == $sandbox_uid))] |
+        if length == 1 then .[0] else empty end
+      ' || true)"
+    if [[ -n "${resumed_pod_json}" ]]; then
+      resumed_pod="$(jq -r '.metadata.name' <<<"${resumed_pod_json}")"
+      resumed_pod_uid="$(jq -r '.metadata.uid' <<<"${resumed_pod_json}")"
+      break
+    fi
+    resume_now="$(date +%s)"
+    (( resume_now - resume_started >= 300 )) &&
+      die "exact Sandbox ${sandbox_name} did not produce one Running controller-owned Pod for ${pool_name}"
+    sleep 3
+  done
+  [[ "${resumed_pod_uid}" != "${first_pod_uid}" ]] ||
+    die "cold resume reused the first runtime Pod UID ${first_pod_uid} instead of replacing the process"
+  log "Exact Sandbox ${sandbox_name} returned Ready on replacement Pod ${resumed_pod}"
+
+  log "Verifying the replacement runtime Pod mounted the preserved workspace"
+  local marker_content
+  marker_content="$(read_pod_file_as_directory_owner \
+    "${resumed_pod}" \
+    "${durable_session_directory}" \
+    "${durable_marker_path}")"
+  [[ "${marker_content}" == "${durability_marker}" ]] ||
+    die "replacement runtime Pod ${resumed_pod} did not read the pre-resume durability marker"
+  log "Replacement runtime Pod ${resumed_pod} reads the pre-resume durability marker from the preserved PVC"
+  remove_pod_file_as_directory_owner \
+    "${resumed_pod}" \
+    "${durable_session_directory}" \
+    "${durable_marker_path}"
+  log "Removed the durability probe before read-only workspace validation"
+
+  wait_for_jsonpath task "${acp_task_namespace}" orka-ws-suspend-second '{.status.phase}' "Succeeded" 900
+  assert_task_result_contains "${acp_task_namespace}" orka-ws-suspend-second "ORKA_WS_SUSPEND_SECOND_OK"
+  assert_fixture_marker_count "ORKA_WS_SUSPEND_FIRST_OK" 1
+  assert_fixture_marker_count "ORKA_WS_SUSPEND_SECOND_OK" 1
+
+  local second_workspace second_runtime_instance
+  second_workspace="$(kubectl -n "${acp_task_namespace}" get task orka-ws-suspend-second \
+    -o jsonpath='{.metadata.labels.acp\.workspace\.orka\.ai/execution-workspace}')"
+  [[ "${second_workspace}" == "${workspace_name}" ]] ||
+    die "continuation bound workspace ${second_workspace:-<empty>}, want the resumed ${workspace_name}"
+  second_runtime_instance="$(kubectl -n "${acp_task_namespace}" get task orka-ws-suspend-second \
+    -o jsonpath='{.status.execution.runtimeInstanceID}')"
+  [[ "${second_runtime_instance}" == "${resumed_pod_uid}."* ]] ||
+    die "continuation runtime instance ${second_runtime_instance:-<empty>} does not belong to resumed Pod UID ${resumed_pod_uid}"
+  log "Continuation cold-resumed the same Sandbox ${sandbox_name} on its replacement runtime Pod"
+
+  log "Deleting the suspended workspace and asserting exact cleanup"
+  wait_for_jsonpath executionworkspace "${acp_task_namespace}" "${workspace_name}" \
+    '{.spec.desiredState}' "Suspended" 240
+  wait_for_jsonpath executionworkspace "${acp_task_namespace}" "${workspace_name}" \
+    '{.status.state}' "Suspended" 600
+  wait_for_jsonpath runtimepool "${acp_task_namespace}" "${pool_name}" \
+    '{.status.lifecycle}' "Stopped" 240
+  wait_for_jsonpath sandboxes.agents.x-k8s.io "${acp_runtime_namespace}" "${sandbox_name}" \
+    '{.spec.operatingMode}' "Suspended" 120
+  wait_for_jsonpath sandboxes.agents.x-k8s.io "${acp_runtime_namespace}" "${sandbox_name}" \
+    '{.status.conditions[?(@.type=="Suspended")].status}' "True" 300
+  pod_started="$(date +%s)"
+  while true; do
+    pod_count="$(kubectl -n "${acp_runtime_namespace}" get pods -o json 2>/dev/null |
+      jq -r --arg sandbox_name "${sandbox_name}" --arg sandbox_uid "${sandbox_uid}" '
+        [.items[]? |
+          select(any(.metadata.ownerReferences[]?;
+            .controller == true and .kind == "Sandbox" and
+            .name == $sandbox_name and .uid == $sandbox_uid))] |
+        length
+      ')"
+    [[ "${pod_count}" == "0" ]] && break
+    pod_now="$(date +%s)"
+    (( pod_now - pod_started >= 180 )) &&
+      die "continuation re-suspension left ${pod_count} runtime Pod(s) for ${pool_name}"
+    sleep 3
+  done
+  run kubectl -n "${acp_task_namespace}" delete task orka-ws-suspend-first orka-ws-suspend-second --wait=true --timeout=4m
+  run kubectl -n "${acp_task_namespace}" delete executionworkspace "${workspace_name}" --wait=true --timeout=6m
+
+  local cleanup_started cleanup_now remaining current_claim_uid
+  cleanup_started="$(date +%s)"
+  while true; do
+    remaining=0
+    kubectl -n "${acp_task_namespace}" get runtimepool "${pool_name}" >/dev/null 2>&1 && remaining=$((remaining + 1))
+    kubectl -n "${acp_runtime_namespace}" get sandboxes.agents.x-k8s.io "${sandbox_name}" >/dev/null 2>&1 && remaining=$((remaining + 1))
+    kubectl -n "${acp_runtime_namespace}" get sandboxwarmpools.extensions.agents.x-k8s.io "${warm_pool_name}" >/dev/null 2>&1 && remaining=$((remaining + 1))
+    kubectl -n "${acp_runtime_namespace}" get sandboxtemplates.extensions.agents.x-k8s.io "${sandbox_template_name}" >/dev/null 2>&1 && remaining=$((remaining + 1))
+    kubectl -n "${acp_runtime_namespace}" get pvc "${durable_pvc}" >/dev/null 2>&1 && remaining=$((remaining + 1))
+    current_claim_uid="$(kubectl -n "${acp_runtime_namespace}" get sandboxclaims "${claim_name}" \
+      -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+    if [[ -n "${current_claim_uid}" ]]; then
+      [[ "${current_claim_uid}" == "${claim_uid}" ]] ||
+        die "SandboxClaim ${claim_name} was replaced during cleanup (uid ${current_claim_uid}, want ${claim_uid})"
+      remaining=$((remaining + 1))
+    fi
+    [[ "${remaining}" == "0" ]] && break
+    cleanup_now="$(date +%s)"
+    (( cleanup_now - cleanup_started >= 300 )) &&
+      die "workspace deletion left ${remaining} provider object(s) for ${pool_name}/${sandbox_name}"
+    sleep 5
+  done
+
+  run kubectl -n "${acp_task_namespace}" delete agent "${acp_suspend_agent_name}" \
+    --ignore-not-found=true --wait=true --timeout=1m
+  run kubectl -n "${acp_task_namespace}" delete executionworkspaceclass "${acp_suspend_class_name}" \
+    --ignore-not-found=true --wait=true --timeout=2m
+  run kubectl -n "${acp_task_namespace}" delete runtimeworkspaceprofile "${acp_suspend_class_name}" \
+    --ignore-not-found=true --wait=true --timeout=1m
+  run kubectl delete executionworkspaceprovider acp-sandbox-e2e \
+    --ignore-not-found=true --wait=true --timeout=1m
+  run kubectl delete runtimeproviderconfig acp-sandbox-e2e \
+    --ignore-not-found=true --wait=true --timeout=1m
+  delete_session_if_present "${acp_task_namespace}" "${acp_suspend_session_name}"
+  log "Class-backed suspend/cold-resume conformance (agent-sandbox) passed"
+}
+
 main() {
   require_cmd make
   require_cmd go
@@ -1168,7 +1830,7 @@ main() {
   run make docker-build IMG="${manager_image}"
   log "Building workspace publisher image ${publisher_image}"
   run make docker-build-workspace-publisher WORKSPACE_PUBLISHER_IMG="${publisher_image}"
-  if [[ "${acp_task_smoke_enabled}" == "1" ]]; then
+  if [[ "${acp_task_smoke_enabled}" == "1" || "${suspend_resume_enabled}" == "1" ]]; then
     log "Building immutable Codex ACP runtime image ${acp_codex_runtime_image} for the workspace-backed Task smoke"
     run make docker-build-acp-codex-runtime ACP_CODEX_RUNTIME_IMG="${acp_codex_runtime_image}"
     log "Building local Responses-compatible provider fixture image ${responses_fixture_image}"
@@ -1184,7 +1846,7 @@ main() {
   run kind load docker-image "${manager_image}" --name "${kind_cluster}"
   run kind load docker-image "${sandbox_fixture_image}" --name "${kind_cluster}"
   run kind load docker-image "${sandbox_router_image}" --name "${kind_cluster}"
-  if [[ "${acp_task_smoke_enabled}" == "1" ]]; then
+  if [[ "${acp_task_smoke_enabled}" == "1" || "${suspend_resume_enabled}" == "1" ]]; then
     run kind load docker-image "${responses_fixture_image}" --name "${kind_cluster}"
   fi
 
@@ -1194,14 +1856,15 @@ main() {
   local placeholder_digest codex_runtime_ref
   placeholder_digest="sha256:$(printf '0%.0s' {1..64})"
   codex_runtime_ref="example.invalid/orka/acp-codex@${placeholder_digest}"
-  if [[ "${acp_task_smoke_enabled}" == "1" ]]; then
+  if [[ "${acp_task_smoke_enabled}" == "1" || "${suspend_resume_enabled}" == "1" ]]; then
     codex_runtime_ref="$(orka_kind_registry_push "${acp_codex_runtime_image}" "orka/acp-codex-runtime")"
   fi
 
   log "Bootstrapping test-only admission TLS"
-  orka_e2e_bootstrap_admission_tls
+  orka_e2e_remove_admission_webhooks
+  orka_e2e_bootstrap_admission_tls kubectl "${orka_namespace}"
 
-  if [[ "${acp_task_smoke_enabled}" == "1" ]]; then
+  if [[ "${acp_task_smoke_enabled}" == "1" || "${suspend_resume_enabled}" == "1" ]]; then
     deploy_responses_fixture
   fi
 
@@ -1214,18 +1877,20 @@ main() {
     ACP_COPILOT_RUNTIME_IMG="example.invalid/orka/acp-copilot@${placeholder_digest}" \
     ACP_OPENCODE_RUNTIME_IMG="example.invalid/orka/acp-opencode@${placeholder_digest}"
   run kubectl wait --for=condition=Established crd/tasks.core.orka.ai --timeout=60s
+  log "Deploying fail-closed Orka admission with the controller image under test"
+  orka_e2e_deploy_admission "${manager_ref}" kubectl "${orka_namespace}"
   ensure_api_client_identity
   deploy_sandbox_router
   patch_controller_for_agent_sandbox
-
-  reset_e2e_resources
-  apply_sandbox_template
 
   log "Port-forwarding Orka API service"
   api_pf_pid="$(start_port_forward "${orka_namespace}" "svc/${orka_api_service}" "${orka_api_local_port}" "${orka_api_service_port}" "${api_pf_log}")"
   local api_base
   api_base="http://127.0.0.1:${orka_api_local_port}"
   wait_for_http "${api_base}/readyz" "Orka API /readyz"
+
+  reset_e2e_resources
+  apply_sandbox_template
 
   log "Port-forwarding sandbox router service"
   router_pf_pid="$(start_port_forward "${router_namespace}" "svc/sandbox-router-svc" "${router_api_local_port}" "8080" "${router_pf_log}")"
@@ -1239,6 +1904,11 @@ main() {
     run_workspace_backed_acp_task_smoke
   else
     log "Skipping workspace-backed ACP Task smoke (ORKA_AGENT_SANDBOX_ACP_TASK_SMOKE=0)"
+  fi
+  if [[ "${suspend_resume_enabled}" == "1" ]]; then
+    run_workspace_suspend_resume_acp_task
+  else
+    log "Skipping class-backed suspend/cold-resume conformance (ORKA_AGENT_SANDBOX_SUSPEND_RESUME=0)"
   fi
   log "Live agent-sandbox installation/configuration/workspace-adapter e2e passed"
 }

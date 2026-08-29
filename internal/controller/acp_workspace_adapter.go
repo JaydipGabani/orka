@@ -22,6 +22,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	acpworkspacev1alpha1 "github.com/orka-agents/orka/api/acp.workspace/v1alpha1"
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
@@ -183,12 +184,36 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) Reconcile(ctx context.Context, 
 	// and must never be advertised as a usable physical environment.
 	if !exact || !workspaceCurrentlyAdmittedByCore(workspace) ||
 		!workspaceCarriesACPMaterializationMarkers(workspace) {
+		// Only an actual resume admission is polled: the workspace was
+		// admitted before (its core-admission evidence exists for an older
+		// generation) and a resume is outstanding (the demand annotation or
+		// the suspended/suspending transition). A brand-new allocation
+		// waiting on initial admission — class readiness, pool capacity —
+		// relies on the core controller's own retry instead of a sustained
+		// two-second adapter poll and log stream.
+		resumeOutstanding := strings.TrimSpace(workspace.Annotations[acpWorkspaceResumeRequestedAnnotation]) != "" ||
+			workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateSuspended ||
+			workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateSuspending
+		if exact && workspaceCarriesACPMaterializationMarkers(workspace) &&
+			workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredReady &&
+			resumeOutstanding && workspaceHasCoreAdmissionEvidence(workspace) {
+			logf.FromContext(ctx).V(1).Info("ACP workspace adapter holding a resume request",
+				"workspace", workspace.Name, "generation", workspace.Generation,
+				"coreAdmitted", workspaceCurrentlyAdmittedByCore(workspace))
+			// Core admission is normally observed through a workspace event,
+			// but a resume must never strand on a missed one.
+			return ctrl.Result{RequeueAfter: acpWorkspaceAdapterRequeue}, nil
+		}
 		if workspaceCarriesACPMaterializationMarkers(workspace) && lifetimeBounded {
 			// An unadmitted (or provider-unbound) bounded workspace still
 			// schedules its own expiry wake-up: admission-denied reconciles
 			// must not strand the enforcement deadline.
 			return ctrl.Result{RequeueAfter: remainingLifetime}, nil
 		}
+		// A non-exact provider binding is permanent: spec.providerBinding is
+		// immutable and provider UIDs are never reused, so no amount of
+		// polling repairs it. The workspace stays dormant - no requeue, no
+		// per-pass log - until deletion or another real watch event.
 		return ctrl.Result{}, nil
 	}
 
@@ -246,6 +271,16 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) Reconcile(ctx context.Context, 
 						ObservedGeneration: workspace.Generation,
 					})
 				})
+			} else {
+				// Transitional observability for the conformance lanes: a
+				// Ready workspace still bound to a suspended or scaled-down
+				// pool is about to drive resume below.
+				suspended := strings.TrimSpace(pool.Annotations[runtimePoolWorkspaceSuspendAnnotation]) != ""
+				if suspended || pool.Spec.DesiredReplicas == 0 {
+					logf.FromContext(ctx).Info("ACP workspace adapter serving a Ready workspace",
+						"workspace", workspace.Name, "generation", workspace.Generation,
+						"poolSuspendIntent", suspended, "poolReplicas", pool.Spec.DesiredReplicas)
+				}
 			}
 		}
 		if requeue, err := r.driveLinkedRuntimePoolResume(ctx, workspace); err != nil || requeue {
@@ -487,6 +522,8 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) driveLinkedRuntimePoolResume(
 	if !runtimePoolWorkspaceSuspendIntentSet(pool) {
 		return false, nil
 	}
+	logf.FromContext(ctx).Info("ACP workspace adapter lifting the pool suspension intent for resume",
+		"workspace", workspace.Name, "pool", pool.Name)
 	return r.patchLinkedPoolSuspendIntent(ctx, pool, false)
 }
 
@@ -600,7 +637,7 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) workspaceOwnership(
 	// UID) - the maintenance path would report a terminal Deleted
 	// disposition for resources this adapter never managed. The live
 	// provider decides only whether the binding is exact.
-	labeled := workspace.Labels[workspacev1alpha1.ProviderControllerLabel] == acpWorkspaceProviderControllerName
+	labeled := workspace.Labels[workspacev1alpha1.ProviderControllerLabel] == acpWorkspaceControllerLabelValue
 	if !labeled {
 		return false, false, nil
 	}
@@ -622,7 +659,7 @@ func (r *ACPExecutionWorkspaceAdapterReconciler) workspaceOwnership(
 // RuntimePool link annotation stamped at creation. A foreign workspace bound
 // to the ACP provider UID without them has no physical backing here.
 func workspaceCarriesACPMaterializationMarkers(workspace *workspacev1alpha1.ExecutionWorkspace) bool {
-	return workspace.Labels[workspacev1alpha1.ProviderControllerLabel] == acpWorkspaceProviderControllerName &&
+	return workspace.Labels[workspacev1alpha1.ProviderControllerLabel] == acpWorkspaceControllerLabelValue &&
 		strings.TrimSpace(workspace.Annotations[acpExecutionWorkspacePoolAnnotation]) != ""
 }
 

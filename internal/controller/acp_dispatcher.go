@@ -106,6 +106,7 @@ type ACPDispatcher struct {
 	active          map[types.UID]struct{}
 	sem             chan struct{}
 	runtimeSessions map[string]ACPRuntimeSessionBinding
+	finalizedTurns  map[types.UID]string
 
 	substrateRouteOnce  sync.Once
 	substrateRouteHTTP  *http.Client
@@ -198,6 +199,7 @@ func (d *ACPDispatcher) dispatchOnce(ctx context.Context) error {
 	if err := d.Client.List(ctx, &tasks); err != nil {
 		return err
 	}
+	d.pruneFinalizedSessionTurns(tasks.Items)
 	if err := d.scheduleACPDeliveryRecoveries(ctx, tasks.Items); err != nil {
 		return err
 	}
@@ -378,6 +380,15 @@ func (d *ACPDispatcher) scheduleACPDeliveryRecoveries(ctx context.Context, tasks
 			}
 		case store.PromptExecutionFailed, store.PromptExecutionCancelled, store.PromptExecutionOutcomeUnknown:
 			if corev1alpha1.TaskExecutionState(attempt.ExecutionState) != task.Status.Execution.State || task.Status.Execution.Outcome == "" {
+				recoveryKind = "terminal"
+			}
+		}
+		if recoveryKind == "" {
+			needsTurnRecovery, turnErr := d.sessionTurnRequiresTerminalRecovery(ctx, task, attempt)
+			if turnErr != nil {
+				return turnErr
+			}
+			if needsTurnRecovery {
 				recoveryKind = "terminal"
 			}
 		}
@@ -3926,17 +3937,23 @@ func runtimeProfileFromPool(profile corev1alpha1.RuntimePoolProfileSpec) harness
 	}
 }
 
-func emptyRuntimeWorkspace(task *corev1alpha1.Task) (harnessv2.WorkspaceBaseline, harnessv2.WorkspaceSpec, error) {
+// emptyRuntimeWorkspace derives the repo-less protocol baseline from scope:
+// the Session UID for session-bound Tasks (every turn must present the exact
+// baseline the session was created with) and the Task UID otherwise.
+func emptyRuntimeWorkspace(task *corev1alpha1.Task, scope string) (harnessv2.WorkspaceBaseline, harnessv2.WorkspaceSpec, error) {
 	workspace := task.Spec.Workspace
 	if workspace != nil && strings.TrimSpace(workspace.GitRepo) != "" {
 		return harnessv2.WorkspaceBaseline{}, harnessv2.WorkspaceSpec{}, fmt.Errorf("clean-room Git workspace preparation is not implemented")
 	}
-	digest, err := acpDomainDigest("empty-workspace", map[string]any{"taskUID": string(task.UID)})
+	if strings.TrimSpace(scope) == "" {
+		scope = string(task.UID)
+	}
+	digest, err := acpDomainDigest("empty-workspace", map[string]any{"taskUID": scope})
 	if err != nil {
 		return harnessv2.WorkspaceBaseline{}, harnessv2.WorkspaceSpec{}, err
 	}
 	baseline := harnessv2.WorkspaceBaseline{
-		RepositoryIdentity: acpNoWorkspaceRevision + ":" + string(task.UID),
+		RepositoryIdentity: acpNoWorkspaceRevision + ":" + scope,
 		Revision:           acpNoWorkspaceRevision,
 		TreeDigest:         digest,
 	}

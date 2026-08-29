@@ -1,14 +1,19 @@
 package main
 
 import (
-	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -28,6 +33,108 @@ const (
 
 var responseSequence atomic.Uint64
 
+// markerCounts records how many /responses requests resolved to each marker so
+// lifecycle E2E scenarios can prove a prompt was sent exactly once (no replay
+// across cancellation or controller restart). Keys are marker DIGESTS
+// (markerKey), never the raw prompt-derived marker: the counts endpoint is
+// unauthenticated, and a customized prompt could embed sensitive material in
+// its marker.
+var markerCounts sync.Map
+
+// markerKey reduces a prompt-derived marker to a fixed-length digest key so
+// the unauthenticated counts endpoint never discloses raw prompt material.
+func markerKey(marker string) string {
+	digest := sha256.Sum256([]byte(marker))
+	return hex.EncodeToString(digest[:8])
+}
+
+// responseHoldMarker requests a bounded server-side hold before the response
+// completes ("ORKA_HOLD_120S"), keeping the prompt observably Running for
+// cancellation and restart scenarios. The hold is capped defensively.
+var responseHoldMarker = regexp.MustCompile(`ORKA_HOLD_([0-9]{1,3})S`)
+
+const maxHoldSeconds = 240
+
+func requestHold(body []byte) time.Duration {
+	// A continuation can concatenate replayed history and the active prompt in
+	// one user message. Bind a structured hold to the final response marker and
+	// ignore hold markers that precede the prior response marker.
+	target := body
+	if encoded, ok := newestUserMessage(body); ok {
+		responseMarkers := responseTextMarker.FindAllIndex(encoded, -1)
+		if len(responseMarkers) == 0 {
+			return 0
+		}
+		start := 0
+		if len(responseMarkers) > 1 {
+			start = responseMarkers[len(responseMarkers)-2][1]
+		}
+		target = encoded[start:responseMarkers[len(responseMarkers)-1][1]]
+	}
+	matches := responseHoldMarker.FindAllSubmatch(target, -1)
+	if len(matches) == 0 {
+		return 0
+	}
+	seconds, err := strconv.Atoi(string(matches[len(matches)-1][1]))
+	if err != nil || seconds <= 0 {
+		return 0
+	}
+	if seconds > maxHoldSeconds {
+		seconds = maxHoldSeconds
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func recordMarker(marker string) uint64 {
+	value, _ := markerCounts.LoadOrStore(markerKey(marker), &atomic.Uint64{})
+	counter, ok := value.(*atomic.Uint64)
+	if !ok {
+		return 0
+	}
+	return counter.Add(1)
+}
+
+func handleMarkerCounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	counts := map[string]uint64{}
+	markerCounts.Range(func(key, value any) bool {
+		marker, markerOK := key.(string)
+		counter, counterOK := value.(*atomic.Uint64)
+		if markerOK && counterOK {
+			counts[marker] = counter.Load()
+		}
+		return true
+	})
+	writeJSON(w, http.StatusOK, counts)
+}
+
+// holdBeforeCompletion keeps the connection demonstrably alive for the
+// requested hold using SSE comments, so intermediaries do not sever the
+// stream while the prompt stays Running.
+func holdBeforeCompletion(w http.ResponseWriter, hold time.Duration, streaming bool) {
+	if hold <= 0 {
+		return
+	}
+	deadline := time.Now().Add(hold)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		step := min(remaining, 5*time.Second)
+		time.Sleep(step)
+		if streaming {
+			_, _ = fmt.Fprint(w, ": keepalive\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+	}
+}
+
 type responsesRequest struct {
 	Model  string `json:"model"`
 	Stream bool   `json:"stream"`
@@ -43,6 +150,7 @@ func main() {
 	mux.HandleFunc("/healthz", handleHealth)
 	mux.HandleFunc("/models", handleModels)
 	mux.HandleFunc("/v1/models", handleModels)
+	mux.HandleFunc("/fixture/marker-counts", handleMarkerCounts)
 	mux.HandleFunc("/responses", handleResponses)
 	mux.HandleFunc("/v1/responses", handleResponses)
 
@@ -51,8 +159,11 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       30 * time.Second,
+		// Held responses (ORKA_HOLD_<n>S) stream keepalives while the prompt
+		// intentionally stays Running; the write deadline must outlast the
+		// maximum hold.
+		WriteTimeout: 10 * time.Minute,
+		IdleTimeout:  30 * time.Second,
 	}
 	log.Printf("OpenAI Responses fixture listening on %s", addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -101,6 +212,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	text := responseText(body)
+	hold := requestHold(body)
+	recordMarker(text)
+	// The resolved marker is user-controlled prompt material: log only a
+	// digest and length so fixture diagnostics can correlate requests
+	// without disclosing prompt content.
+	markerDigest := sha256.Sum256([]byte(text))
+	log.Printf("responses request resolved marker_sha=%x marker_len=%d hold=%s roles=%s",
+		markerDigest[:8], len(text), hold, inputRoles(body))
 	responseID := fmt.Sprintf("resp_orka_fixture_%d", responseSequence.Add(1))
 	itemID := "msg_" + responseID
 	item := map[string]any{
@@ -128,6 +247,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !request.Stream {
+		holdBeforeCompletion(w, hold, false)
 		writeJSON(w, http.StatusOK, completed)
 		return
 	}
@@ -159,6 +279,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			responseTypeField: responseOutputTextType, responseTextField: "", responseAnnotationsField: []any{},
 		},
 	})
+	holdBeforeCompletion(w, hold, true)
 	writeSSE(w, "response.output_text.delta", map[string]any{
 		responseTypeField:           "response.output_text.delta",
 		responseSequenceNumberField: 3,
@@ -198,13 +319,92 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// responseTextMarker matches deterministic scenario markers embedded in the
+// request ("Reply exactly: ORKA_..._OK") so each Task in a multi-Task scenario
+// gets an independently verifiable result.
+var responseTextMarker = regexp.MustCompile(`ORKA_[A-Z0-9_]+_OK`)
+
 func responseText(body []byte) string {
-	for _, marker := range []string{"ORKA_WS_SANDBOX_OK", "ORKA_WS_SUBSTRATE_OK"} {
-		if bytes.Contains(body, []byte(marker)) {
-			return marker
+	// Continuation requests carry the full session history. Resolve structured
+	// input only from the newest user message so replayed markers cannot answer
+	// the active turn.
+	if encoded, ok := newestUserMessage(body); ok {
+		matches := responseTextMarker.FindAll(encoded, -1)
+		if len(matches) == 0 {
+			return "ORKA_RESPONSES_FIXTURE_OK"
 		}
+		return string(matches[len(matches)-1])
 	}
-	return "ORKA_RESPONSES_FIXTURE_OK"
+	matches := responseTextMarker.FindAll(body, -1)
+	if len(matches) == 0 {
+		return "ORKA_RESPONSES_FIXTURE_OK"
+	}
+	return string(matches[len(matches)-1])
+}
+
+// newestUserMessage walks a structured Responses input array from the end
+// and returns the encoded newest user message.
+func newestUserMessage(body []byte) ([]byte, bool) {
+	var request struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(body, &request); err != nil || len(request.Input) == 0 {
+		return nil, false
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(request.Input, &items); err != nil {
+		return nil, false
+	}
+	for _, item := range slices.Backward(items) {
+		role, _ := item["role"].(string)
+		if role != "user" {
+			continue
+		}
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			continue
+		}
+		return encoded, true
+	}
+	return nil, false
+}
+
+// inputRoles renders the structured input's role sequence (never content) so
+// fixture logs explain marker resolution for replayed sessions.
+func inputRoles(body []byte) string {
+	var request struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(body, &request); err != nil || len(request.Input) == 0 {
+		return "unstructured"
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(request.Input, &items); err != nil {
+		return "unstructured"
+	}
+	// Roles are client-controlled: only whitelisted values are logged
+	// verbatim so a crafted role/type field can never smuggle request
+	// material into fixture diagnostics.
+	known := map[string]bool{
+		"user": true, "assistant": true, "system": true, "developer": true,
+		"tool": true, "message": true, "function_call": true,
+		"function_call_output": true, "reasoning": true,
+	}
+	roles := make([]string, 0, len(items))
+	for _, item := range items {
+		role, _ := item["role"].(string)
+		if role == "" {
+			role, _ = item["type"].(string)
+		}
+		switch {
+		case role == "":
+			role = "?"
+		case !known[role]:
+			role = "other"
+		}
+		roles = append(roles, role)
+	}
+	return strings.Join(roles, ",")
 }
 
 func writeSSE(w http.ResponseWriter, event string, value any) {

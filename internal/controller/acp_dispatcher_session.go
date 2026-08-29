@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/store"
@@ -40,6 +43,117 @@ func promptAttemptSessionBound(attempt *store.PromptAttempt) (bool, error) {
 	default:
 		return true, nil
 	}
+}
+
+func (d *ACPDispatcher) finalizedSessionTurnKnown(taskUID types.UID, turnID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	knownTurnID, known := d.finalizedTurns[taskUID]
+	return known && knownTurnID == turnID
+}
+
+func (d *ACPDispatcher) rememberFinalizedSessionTurn(taskUID types.UID, turnID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.finalizedTurns == nil {
+		d.finalizedTurns = map[types.UID]string{}
+	}
+	d.finalizedTurns[taskUID] = turnID
+}
+
+// pruneFinalizedSessionTurns bounds the lookup cache to Tasks returned by the
+// current cluster-wide scan. A Task deleted during the scan can leave one
+// entry until the next pass, but cumulative historical throughput cannot grow
+// the map indefinitely.
+func (d *ACPDispatcher) pruneFinalizedSessionTurns(tasks []corev1alpha1.Task) {
+	live := make(map[types.UID]struct{}, len(tasks))
+	for i := range tasks {
+		if tasks[i].UID != "" {
+			live[tasks[i].UID] = struct{}{}
+		}
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for taskUID := range d.finalizedTurns {
+		if _, ok := live[taskUID]; !ok {
+			delete(d.finalizedTurns, taskUID)
+		}
+	}
+}
+
+// sessionTurnRequiresTerminalRecovery reports a session-bound Task whose
+// attempt settled in any terminal state while its SessionTurn is still open.
+// Inline settle finalization silently skips when its in-memory turn is
+// missing, and the recovery sweep otherwise assumes a complete projection
+// implies a finalized turn - leaving artifact retirement blocked on
+// "SessionTurn is not finalized" until the Task deadline fails it. Succeeded
+// additionally waits for terminal delivery because publication recovery owns
+// the open turn until then; Failed, Cancelled, and OutcomeUnknown attempts
+// have no delivery to wait for. The check runs for Finalizing AND settled
+// terminal phases: a finalizer that silently skipped its missing in-memory
+// turn still terminalizes the Task, so a terminal phase alone is never proof
+// of a finalized turn.
+func (d *ACPDispatcher) sessionTurnRequiresTerminalRecovery(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	attempt *store.PromptAttempt,
+) (bool, error) {
+	if task == nil || attempt == nil ||
+		!store.IsTerminalPromptExecutionState(attempt.ExecutionState) ||
+		(attempt.ExecutionState == store.PromptExecutionSucceeded &&
+			!store.IsTerminalPromptDeliveryState(attempt.DeliveryState)) {
+		return false, nil
+	}
+	// A settled Task phase is NOT proof of a finalized turn: a finalizer that
+	// silently skipped its missing in-memory turn still terminalizes the Task
+	// (for example deletion-driven cancellation), so every terminal phase is
+	// inspected alongside Finalizing.
+	switch task.Status.Phase {
+	case corev1alpha1.TaskPhaseFinalizing, corev1alpha1.TaskPhaseSucceeded,
+		corev1alpha1.TaskPhaseFailed, corev1alpha1.TaskPhaseCancelled:
+	default:
+		return false, nil
+	}
+	bound, err := promptAttemptSessionBound(attempt)
+	if err != nil {
+		return false, err
+	}
+	if !bound {
+		return false, nil
+	}
+	key := store.SessionTurnKey{
+		SessionUID: attempt.SessionUID, LeaseGeneration: attempt.SessionLeaseGeneration,
+		TaskUID: attempt.Key.TaskUID, Attempt: attempt.Key.Attempt, PromptID: attempt.Key.PromptID,
+	}
+	turnID, err := key.CanonicalID()
+	if err != nil {
+		return false, err
+	}
+	settled := task.Status.Phase != corev1alpha1.TaskPhaseFinalizing
+	if d.finalizedSessionTurnKnown(task.UID, turnID) {
+		return false, nil
+	}
+	turn, err := d.Store.GetSessionTurn(ctx, turnID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			if settled {
+				d.rememberFinalizedSessionTurn(task.UID, turnID)
+			}
+			return false, nil
+		}
+		return false, err
+	}
+	if turn.State != store.SessionTurnFinalized {
+		return true, nil
+	}
+	// SessionTurnFinalized proves only the durable turn commit, not the
+	// cross-store activation tail (lease release, status projection, outbox
+	// activation). The Task controller can terminalize independently after
+	// that commit, so Task phase is never durable tail-completion proof.
+	// ResumeSessionTurnFinalization is idempotent, and its successful recovery
+	// records the immutable turn ID in the cache above.
+	return true, nil
 }
 
 func (d *ACPDispatcher) reconcileUnfinalizedTaskSession(
@@ -135,6 +249,10 @@ func acpSessionLineageConfigDigest(plan ACPRuntimePlan) (string, error) {
 	if err := store.ValidateCanonicalDigest("session lineage workspace binding digest", workspaceBindingDigest); err != nil {
 		return "", err
 	}
+	// This is the provider-backed execution-workspace binding frozen into the
+	// RuntimePool plan. It is deliberately distinct from the harness
+	// RuntimeSession WorkspaceDigest, whose repo-less baseline may rotate after
+	// the Session lease is acquired without changing protocol lineage.
 	return acpDomainDigest("runtime-session-lineage-configuration/v1", struct {
 		RuntimeProfileDigest   string `json:"runtimeProfileDigest"`
 		RuntimeImage           string `json:"runtimeImage"`
@@ -690,6 +808,10 @@ func (d *ACPDispatcher) finalizeTaskSessionResult(
 	delivery corev1alpha1.TaskDeliveryStatus,
 ) error {
 	if session == nil || session.Turn == nil {
+		// The turn-aware recovery sweep converges the still-open SessionTurn;
+		// log so the skip is attributable when it happens.
+		logf.FromContext(ctx).Info("skipping inline ACP session finalization without an open in-memory turn",
+			"namespace", task.Namespace, "task", task.Name)
 		return nil
 	}
 	execution, err := taskSessionProjectionExecution(task, corev1alpha1.TaskExecutionStatus{

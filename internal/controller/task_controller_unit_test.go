@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -8161,7 +8162,10 @@ func TestHandleFinalizingBeginsWorkspaceAttachmentRevocation(t *testing.T) {
 	scheme := newTestScheme()
 	epoch := int64(2)
 	workspaceObject := &workspacev1alpha1.ExecutionWorkspace{
-		ObjectMeta: metav1.ObjectMeta{Name: "workspace-finalize", Namespace: "default", UID: types.UID("workspace-uid")},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "workspace-finalize", Namespace: "default", UID: types.UID("workspace-uid"),
+			Labels: map[string]string{workspacev1alpha1.ProviderControllerLabel: acpWorkspaceControllerLabelValue},
+		},
 		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
 			AttachmentEpoch: epoch,
 			Attachment:      &workspacev1alpha1.ExecutionWorkspaceAttachment{Epoch: epoch},
@@ -8195,6 +8199,82 @@ func TestHandleFinalizingBeginsWorkspaceAttachmentRevocation(t *testing.T) {
 	}
 	if current.Spec.Attachment != nil || current.Spec.AttachmentEpoch != epoch {
 		t.Fatalf("workspace attachment intent = %#v epoch=%d, want revoked at epoch %d", current.Spec.Attachment, current.Spec.AttachmentEpoch, epoch)
+	}
+	updatedTask := &corev1alpha1.Task{}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(task), updatedTask); err != nil {
+		t.Fatal(err)
+	}
+	if got := acpTaskRecordedAttachmentEpoch(updatedTask); got != epoch {
+		t.Fatalf("recorded attachment epoch = %d, want %d before revocation", got, epoch)
+	}
+}
+
+func TestHandleFinalizingRecoversRotatedACPAttachmentEpoch(t *testing.T) {
+	scheme := newTestScheme()
+	projectedEpoch := int64(2)
+	liveEpoch := projectedEpoch + 1
+	taskUID := types.UID("rotated-finalizing-task-uid")
+	workspaceObject := &workspacev1alpha1.ExecutionWorkspace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "workspace-finalize-rotated", Namespace: "default", UID: types.UID("workspace-rotated-uid"),
+			Labels: map[string]string{workspacev1alpha1.ProviderControllerLabel: acpWorkspaceControllerLabelValue},
+		},
+		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
+			AttachmentEpoch: liveEpoch,
+			Attachment: &workspacev1alpha1.ExecutionWorkspaceAttachment{
+				TaskRef: workspacev1alpha1.ObjectIdentityReference{UID: taskUID},
+				Epoch:   liveEpoch,
+			},
+		},
+		Status: workspacev1alpha1.ExecutionWorkspaceStatus{AttachedEpoch: liveEpoch},
+	}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "finalize-revoke-rotated", Namespace: "default", UID: taskUID,
+			Annotations: map[string]string{acpTaskAttachmentEpochAnnotation: strconv.FormatInt(projectedEpoch, 10)},
+		},
+		Spec: corev1alpha1.TaskSpec{Execution: &corev1alpha1.ExecutionSpec{Workspace: &corev1alpha1.ExecutionWorkspaceSpec{Enabled: true}}},
+		Status: corev1alpha1.TaskStatus{
+			Phase:            corev1alpha1.TaskPhaseFinalizing,
+			ExecutionOutcome: &corev1alpha1.TaskWorkloadExecutionOutcome{Phase: corev1alpha1.TaskPhaseSucceeded, Attempt: 1},
+			ExecutionWorkspace: &corev1alpha1.ExecutionWorkspaceStatus{
+				WorkspaceRef:  &corev1alpha1.WorkspaceObjectReference{Name: workspaceObject.Name, UID: string(workspaceObject.UID)},
+				AttachedEpoch: projectedEpoch,
+				Conditions:    []metav1.Condition{{Type: "Attached", Status: metav1.ConditionTrue}},
+			},
+		},
+	}
+	reconciler := newUnitReconciler(scheme, task, workspaceObject)
+
+	for attempt := range 2 {
+		result, err := reconciler.handleFinalizing(context.Background(), task)
+		if err != nil {
+			t.Fatalf("handleFinalizing() attempt %d error = %v", attempt, err)
+		}
+		if result.RequeueAfter <= 0 {
+			t.Fatalf("handleFinalizing() attempt %d result = %#v, want requeue", attempt, result)
+		}
+	}
+
+	current := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(workspaceObject), current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Spec.Attachment != nil || current.Spec.AttachmentEpoch != liveEpoch {
+		t.Fatalf("workspace attachment intent = %#v epoch=%d, want revoked rotated epoch %d",
+			current.Spec.Attachment, current.Spec.AttachmentEpoch, liveEpoch)
+	}
+	stampedEpoch, _, ok := parseACPWorkspaceRevocationStamp(current.Annotations[acpWorkspaceRevocationStartedAnnotation])
+	if !ok || stampedEpoch != liveEpoch {
+		t.Fatalf("revocation stamp = %q, want rotated epoch %d",
+			current.Annotations[acpWorkspaceRevocationStartedAnnotation], liveEpoch)
+	}
+	updatedTask := &corev1alpha1.Task{}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(task), updatedTask); err != nil {
+		t.Fatal(err)
+	}
+	if got := acpTaskRecordedAttachmentEpoch(updatedTask); got != liveEpoch {
+		t.Fatalf("recorded attachment epoch = %d, want rotated live epoch %d", got, liveEpoch)
 	}
 }
 
@@ -8967,6 +9047,103 @@ func TestEnsureWorkerRBACPrunesRemovedTrustedServiceReadBindingAfterRestart(t *t
 	}
 	if err := restarted.Get(context.Background(), types.NamespacedName{Name: unrelatedName, Namespace: "infra"}, unrelatedBinding); err != nil {
 		t.Fatalf("unrelated prefixed RoleBinding was removed: %v", err)
+	}
+}
+
+func TestHandleFinalizingUsesACPWorkspaceDetachTimeout(t *testing.T) {
+	t.Parallel()
+	const epoch int64 = 4
+	tests := []struct {
+		name          string
+		detachTimeout time.Duration
+		revocationAge time.Duration
+		outcomeAge    time.Duration
+		wantPhase     corev1alpha1.TaskPhase
+		wantState     workspacev1alpha1.ExecutionWorkspaceDesiredState
+	}{
+		{
+			name: "short-class-timeout", detachTimeout: time.Minute, revocationAge: 2 * time.Minute,
+			outcomeAge: 30 * time.Second, wantPhase: corev1alpha1.TaskPhaseFailed,
+			wantState: workspacev1alpha1.ExecutionWorkspaceDesiredQuarantined,
+		},
+		{
+			name: "long-class-timeout", detachTimeout: 10 * time.Minute, revocationAge: 6 * time.Minute,
+			outcomeAge: 6 * time.Minute, wantPhase: corev1alpha1.TaskPhaseFinalizing,
+			wantState: workspacev1alpha1.ExecutionWorkspaceDesiredReady,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			now := time.Now().UTC()
+			workspaceName := "workspace-" + test.name
+			workspaceObject := &workspacev1alpha1.ExecutionWorkspace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: workspaceName, Namespace: defaultNS, UID: types.UID(workspaceName + "-uid"),
+					Labels: map[string]string{workspacev1alpha1.ProviderControllerLabel: acpWorkspaceControllerLabelValue},
+					Annotations: map[string]string{
+						acpWorkspaceRevocationStartedAnnotation: fmt.Sprintf(
+							"%d %s", epoch, now.Add(-test.revocationAge).Format(time.RFC3339Nano),
+						),
+					},
+				},
+				Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
+					DesiredState:    workspacev1alpha1.ExecutionWorkspaceDesiredReady,
+					AttachmentEpoch: epoch,
+					Lifecycle: workspacev1alpha1.ExecutionWorkspaceLifecycle{
+						DetachTimeout: metav1.Duration{Duration: test.detachTimeout},
+					},
+				},
+				Status: workspacev1alpha1.ExecutionWorkspaceStatus{AttachedEpoch: epoch},
+			}
+			task := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "finalize-" + test.name, Namespace: defaultNS, UID: types.UID("task-" + test.name + "-uid"),
+				},
+				Spec: corev1alpha1.TaskSpec{
+					Type: corev1alpha1.TaskTypeAgent,
+					Execution: &corev1alpha1.ExecutionSpec{
+						Workspace: &corev1alpha1.ExecutionWorkspaceSpec{Enabled: true},
+					},
+				},
+				Status: corev1alpha1.TaskStatus{
+					Phase: corev1alpha1.TaskPhaseFinalizing,
+					ExecutionOutcome: &corev1alpha1.TaskWorkloadExecutionOutcome{
+						Phase: corev1alpha1.TaskPhaseSucceeded, Attempt: 1,
+						RecordedAt: metav1.NewTime(now.Add(-test.outcomeAge)),
+					},
+					ExecutionWorkspace: &corev1alpha1.ExecutionWorkspaceStatus{
+						WorkspaceRef: &corev1alpha1.WorkspaceObjectReference{
+							Name: workspaceObject.Name, UID: string(workspaceObject.UID),
+						},
+						AttachedEpoch: epoch,
+						Conditions:    []metav1.Condition{{Type: "Attached", Status: metav1.ConditionTrue}},
+					},
+				},
+			}
+			reconciler := newUnitReconciler(newTestScheme(), task, workspaceObject)
+			result, err := reconciler.handleFinalizing(context.Background(), task)
+			if err != nil {
+				t.Fatalf("handleFinalizing() error = %v", err)
+			}
+			if test.wantPhase == corev1alpha1.TaskPhaseFinalizing && result.RequeueAfter <= 0 {
+				t.Fatalf("handleFinalizing() result = %#v, want a pending-finalization requeue", result)
+			}
+			updatedTask := &corev1alpha1.Task{}
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(task), updatedTask); err != nil {
+				t.Fatal(err)
+			}
+			if updatedTask.Status.Phase != test.wantPhase {
+				t.Fatalf("phase = %s, want %s", updatedTask.Status.Phase, test.wantPhase)
+			}
+			updatedWorkspace := &workspacev1alpha1.ExecutionWorkspace{}
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(workspaceObject), updatedWorkspace); err != nil {
+				t.Fatal(err)
+			}
+			if updatedWorkspace.Spec.DesiredState != test.wantState {
+				t.Fatalf("desired state = %s, want %s", updatedWorkspace.Spec.DesiredState, test.wantState)
+			}
+		})
 	}
 }
 

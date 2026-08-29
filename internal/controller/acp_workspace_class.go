@@ -38,6 +38,11 @@ import (
 // class-selected ACP RuntimeSessions.
 const acpWorkspaceProviderControllerName = "acp.workspace.orka.ai/runtime-pool"
 
+// acpWorkspaceControllerLabelValue is the label-safe encoding of the reserved
+// controllerName (label values cannot contain '/'); it marks ACP-owned
+// ExecutionWorkspaces for the adapter and the retention reconciler.
+const acpWorkspaceControllerLabelValue = "runtime-pool.acp.workspace.orka.ai"
+
 // ACPWorkspaceClassDeletionPolicy freezes the class deletion dispositions that
 // finalization must honor independently for each retained-data category.
 type ACPWorkspaceClassDeletionPolicy struct {
@@ -324,7 +329,7 @@ func frozenACPContinuationWorkspaceMatches(
 	sessionUID, slot string,
 ) bool {
 	return workspace != nil && workspace.UID != "" && workspace.DeletionTimestamp.IsZero() &&
-		workspace.Labels[workspacev1alpha1.ProviderControllerLabel] == acpWorkspaceProviderControllerName &&
+		workspace.Labels[workspacev1alpha1.ProviderControllerLabel] == acpWorkspaceControllerLabelValue &&
 		workspace.Spec.Mode == workspacev1alpha1.ExecutionWorkspaceModeInteractive &&
 		workspace.Spec.ClassBinding.Name == class.Name && workspace.Spec.ClassBinding.UID == class.UID &&
 		workspace.Spec.ClassBinding.Generation == class.Generation &&

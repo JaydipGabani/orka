@@ -17,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,6 +53,7 @@ const (
 	runtimePoolPrerequisiteStageAncillary   = "ancillary"
 	runtimePoolSuspendTestStorageClassUID   = "acp-test-default-storage-class-uid"
 	malformedSandboxMetadata                = "not-json"
+	sandboxNotReadyReason                   = "SandboxNotReady"
 )
 
 func (c *runtimePoolSuspendPrerequisiteFailureClient) Get(
@@ -536,6 +538,20 @@ func TestWorkspaceRuntimePoolSuspendsAndColdResumesPVCWorkspace(t *testing.T) {
 		t.Fatalf("suspended message = %q", current.Status.Message)
 	}
 
+	// The provider reports the suspended Sandbox's claim as not ready - the
+	// live claim controller does exactly this while the Sandbox is suspended,
+	// and the resume must not be preempted by that expected state.
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(claim), currentClaim); err != nil {
+		t.Fatalf("re-read claim before resume: %v", err)
+	}
+	currentClaim.Status.Conditions = []metav1.Condition{{
+		Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionFalse,
+		Reason: sandboxNotReadyReason, Message: "sandbox is suspended", LastTransitionTime: metav1.Now(),
+	}}
+	if err := r.Update(context.Background(), currentClaim); err != nil {
+		t.Fatalf("record suspended claim readiness: %v", err)
+	}
+
 	// Cold resume: the intent lifts, bootstrap material rotates, the Sandbox
 	// blueprint refreshes with the rotated material, and the same Sandbox
 	// returns to Running against the preserved PVC.
@@ -589,6 +605,41 @@ func TestWorkspaceRuntimePoolSuspendsAndColdResumesPVCWorkspace(t *testing.T) {
 		// The consent record retires only once a resumed Pod is observed; with
 		// no fresh Pod yet in this fixture the record legitimately remains.
 		t.Logf("consent record still pending a resumed Pod: %s", encoded)
+	}
+}
+
+// The upstream claim controller injects the claim's volumeClaimTemplates
+// into the materialized Sandbox while the controller-rendered blueprint
+// template carries none; attestation must accept exactly the claim's volume
+// claims or every suspend-capable pool loops through rollouts at bring-up.
+func TestWorkspaceMaterializationAttestationAcceptsClaimInjectedVolumes(t *testing.T) {
+	scheme := runtimePoolWorkspaceTestScheme(t)
+	pool := runtimePoolSandboxSuspendTestObject()
+	supervisor := &fakeRuntimePoolSupervisorClient{}
+	r := runtimePoolSandboxSuspendTestReconciler(t, scheme, supervisor, pool)
+
+	runtimePoolReconcile(t, r, pool)
+	template, _, claim := runtimePoolWorkspaceTestChildren(t, r, pool)
+	if template == nil || claim == nil {
+		t.Fatal("suspend-capable pool must render a template and claim")
+	}
+	pod := runtimePoolWorkspaceTestMaterialization(t, r, pool, template, "10.0.0.9")
+	// The realized PVC is part of attestation for suspend-capable pools.
+	attSandbox := &sandboxv1beta1.Sandbox{}
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name}, attSandbox); err != nil {
+		t.Fatalf("read materialized Sandbox: %v", err)
+	}
+	sandboxSuspendTestDurablePVC(t, r, pool, attSandbox, "claim-injected-pvc-uid")
+	current := &sandboxextv1beta1.SandboxClaim{}
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name}, current); err != nil {
+		t.Fatalf("get claim: %v", err)
+	}
+	materialized, err := r.attestWorkspaceRuntimePoolMaterialization(context.Background(), pool, current, template, &pod)
+	if err != nil {
+		t.Fatalf("attestation rejected the claim-injected durable volume: %v", err)
+	}
+	if !materialized {
+		t.Fatal("attestation did not accept the materialized suspend-capable Sandbox")
 	}
 }
 
@@ -785,6 +836,161 @@ func TestStripInjectedDurableWorkspaceVolumeVerifiesClaimIdentity(t *testing.T) 
 	// A template that declares the reserved volume compares untouched.
 	if got := stripInjectedDurableWorkspaceVolume([]corev1.Volume{{Name: substrateDurableWorkspaceVolume}}, []corev1.Volume{injected}, claimName); len(got) != 1 {
 		t.Fatal("expected-declared reserved volumes must compare untouched")
+	}
+}
+
+// A real claim failure during a resume must not be hidden behind the suspend
+// record: only the expected suspended-claim readiness states are bypassed.
+func TestWorkspaceRuntimePoolResumeSurfacesUnrelatedClaimFailures(t *testing.T) {
+	pool := runtimePoolSandboxSuspendTestObject()
+	r := &RuntimePoolReconciler{}
+	apply := func(claim *sandboxextv1beta1.SandboxClaim, status *corev1alpha1.RuntimePoolStatus, expectSuspended bool) bool {
+		t.Helper()
+		failed, err := r.applySandboxClaimFailureConditions(
+			context.Background(), pool, claim, status, expectSuspended,
+		)
+		if err != nil {
+			t.Fatalf("apply claim failure conditions: %v", err)
+		}
+		return failed
+	}
+	status := corev1alpha1.RuntimePoolStatus{}
+	claim := &sandboxextv1beta1.SandboxClaim{}
+	claim.Status.Conditions = []metav1.Condition{{
+		Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionFalse,
+		Reason: "TemplateNotFound", Message: "SandboxTemplate was deleted", LastTransitionTime: metav1.Now(),
+	}}
+	if !apply(claim, &status, true) {
+		t.Fatal("an unrelated claim failure must degrade the pool even while a suspend record exists")
+	}
+	for _, reason := range []string{sandboxv1beta1.SandboxReasonSuspended, sandboxNotReadyReason} {
+		expected := &sandboxextv1beta1.SandboxClaim{}
+		expected.Status.Conditions = []metav1.Condition{{
+			Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionFalse,
+			Reason: reason, Message: "sandbox is suspended", LastTransitionTime: metav1.Now(),
+		}}
+		fresh := corev1alpha1.RuntimePoolStatus{}
+		if apply(expected, &fresh, true) {
+			t.Fatalf("the expected suspended-claim reason %q must not preempt the resume", reason)
+		}
+		if apply(expected, &fresh, false) {
+			// Without a suspend record SandboxNotReady/SandboxSuspended still
+			// degrade: only a recorded consensual suspension expects them.
+			continue
+		}
+		t.Fatalf("without a suspend record the reason %q must degrade the pool", reason)
+	}
+}
+
+// The generic SandboxNotReady reason is expected while a suspended Sandbox
+// republishes conditions, but it must not hide a failed cold resume forever.
+// The ordinary provider cold-start deadline still degrades the pool while the
+// checkpoint record and its durable claim remain protected.
+func TestWorkspaceRuntimePoolBoundsSandboxNotReadyDuringColdResume(t *testing.T) {
+	scheme := runtimePoolWorkspaceTestScheme(t)
+	pool := runtimePoolSandboxSuspendTestObject()
+	pool.Spec.ColdStartTimeoutSeconds = 5
+	now := runtimePoolTestNow
+	supervisor := &fakeRuntimePoolSupervisorClient{}
+	r := runtimePoolSandboxSuspendTestReconciler(t, scheme, supervisor, pool)
+	r.Now = func() time.Time { return now }
+	sandbox, claim, _ := sandboxSuspendTestReachStopped(t, r, pool, supervisor)
+
+	currentClaim := &sandboxextv1beta1.SandboxClaim{}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(claim), currentClaim); err != nil {
+		t.Fatalf("read suspended claim: %v", err)
+	}
+	currentClaim.Status.Conditions = []metav1.Condition{{
+		Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionFalse,
+		Reason: sandboxNotReadyReason, Message: "sandbox has not become ready", LastTransitionTime: metav1.NewTime(now),
+	}}
+	if err := r.Update(context.Background(), currentClaim); err != nil {
+		t.Fatalf("record generic claim failure: %v", err)
+	}
+
+	sandboxSuspendTestSetIntent(t, r, pool, false)
+	started := false
+	for range 12 {
+		runtimePoolReconcile(t, r, pool)
+		current := runtimePoolTestGetPool(t, r, pool)
+		condition := meta.FindStatusCondition(current.Status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+		resumed := &sandboxv1beta1.Sandbox{}
+		if err := r.Get(context.Background(), client.ObjectKeyFromObject(sandbox), resumed); err != nil {
+			t.Fatalf("read resuming Sandbox: %v", err)
+		}
+		if resumed.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
+			condition != nil && condition.Reason == runtimePoolRolloutReasonStarting {
+			started = true
+			break
+		}
+	}
+	if !started {
+		current := runtimePoolTestGetPool(t, r, pool)
+		t.Fatalf("cold resume never entered the bounded Starting state: %s %q", current.Status.Lifecycle, current.Status.Message)
+	}
+
+	now = now.Add(6 * time.Second)
+	runtimePoolReconcile(t, r, pool)
+	current := runtimePoolTestGetPool(t, r, pool)
+	condition := meta.FindStatusCondition(current.Status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+	if current.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDegraded ||
+		condition == nil || condition.Reason != runtimePoolRolloutReasonTimedOut {
+		t.Fatalf("cold-resume status/condition = %s/%#v, want Degraded/RolloutTimedOut", current.Status.Lifecycle, condition)
+	}
+	if sandboxConsensualSuspendRecord(&current) == nil {
+		t.Fatal("cold-start timeout retired the checkpoint record")
+	}
+	preserved := &sandboxextv1beta1.SandboxClaim{}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(claim), preserved); err != nil {
+		t.Fatalf("cold-start timeout removed the durable claim: %v", err)
+	}
+}
+
+// A mutated SandboxClaim adding PVC fields the frozen binding never declared
+// must fail the template match, or bootstrap would trust storage outside the
+// binding (for example an attacker-bound volumeName or dataSource).
+func TestDurableVolumeClaimTemplatesMatchRejectsTamperedFields(t *testing.T) {
+	scheme := runtimePoolWorkspaceTestScheme(t)
+	pool := runtimePoolSandboxSuspendTestObject()
+	supervisor := &fakeRuntimePoolSupervisorClient{}
+	r := runtimePoolSandboxSuspendTestReconciler(t, scheme, supervisor, pool)
+	runtimePoolReconcile(t, r, pool)
+	_, _, claim := runtimePoolWorkspaceTestChildren(t, r, pool)
+	if claim == nil {
+		t.Fatal("suspend-capable pool must render a claim")
+	}
+	if !runtimePoolDurableVolumeClaimTemplatesMatch(claim, pool) {
+		t.Fatal("the controller-rendered claim must match its own frozen template")
+	}
+	tamper := func(mutate func(*sandboxv1beta1.PersistentVolumeClaimTemplate)) *sandboxextv1beta1.SandboxClaim {
+		mutated := claim.DeepCopy()
+		mutate(&mutated.Spec.VolumeClaimTemplates[0])
+		return mutated
+	}
+	volumeName := "attacker-pv"
+	if runtimePoolDurableVolumeClaimTemplatesMatch(tamper(func(template *sandboxv1beta1.PersistentVolumeClaimTemplate) {
+		template.Spec.VolumeName = volumeName
+	}), pool) {
+		t.Fatal("a bound volumeName outside the frozen binding must fail the match")
+	}
+	if runtimePoolDurableVolumeClaimTemplatesMatch(tamper(func(template *sandboxv1beta1.PersistentVolumeClaimTemplate) {
+		apiGroup := "snapshot.storage.k8s.io"
+		template.Spec.DataSource = &corev1.TypedLocalObjectReference{
+			APIGroup: &apiGroup, Kind: "VolumeSnapshot", Name: "foreign-snapshot",
+		}
+	}), pool) {
+		t.Fatal("a dataSource outside the frozen binding must fail the match")
+	}
+	if runtimePoolDurableVolumeClaimTemplatesMatch(tamper(func(template *sandboxv1beta1.PersistentVolumeClaimTemplate) {
+		mode := corev1.PersistentVolumeBlock
+		template.Spec.VolumeMode = &mode
+	}), pool) {
+		t.Fatal("a volumeMode outside the frozen binding must fail the match")
+	}
+	if runtimePoolDurableVolumeClaimTemplatesMatch(tamper(func(template *sandboxv1beta1.PersistentVolumeClaimTemplate) {
+		template.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"steal": "other-workspace-data"}}
+	}), pool) {
+		t.Fatal("a selector outside the frozen binding must fail the match")
 	}
 }
 
