@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	acpworkspacev1alpha1 "github.com/orka-agents/orka/api/acp.workspace/v1alpha1"
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
 	"github.com/orka-agents/orka/internal/store"
@@ -37,6 +38,10 @@ const (
 	// acpExecutionWorkspacePoolAnnotation records the deterministic RuntimePool
 	// name bound to a class-backed ExecutionWorkspace.
 	acpExecutionWorkspacePoolAnnotation = "acp.workspace.orka.ai/runtime-pool"
+	// acpWorkspaceDetachActionAnnotation records the frozen effective detach
+	// action of the currently attached Task so settlement applies exactly the
+	// validated choice without reloading the execution snapshot.
+	acpWorkspaceDetachActionAnnotation = "acp.workspace.orka.ai/detach-action"
 	// acpExecutionWorkspaceUIDAnnotation pins the exact ExecutionWorkspace
 	// incarnation a Task attached, alongside the name-bearing link label.
 	// Settlement acts only on that incarnation: a Session deleted and
@@ -53,10 +58,33 @@ const (
 	// recreated same-name provider config can never silently re-serve an
 	// existing workspace through a different backend.
 	acpWorkspaceBackendAnnotation = "acp.workspace.orka.ai/backend"
+	// acpWorkspaceSuspendModeAnnotation records the profile-frozen Substrate
+	// suspend mode. The terminal adapter still needs this after the linked
+	// RuntimePool and its rendered DurableDir policy have been deleted.
+	acpWorkspaceSuspendModeAnnotation = "acp.workspace.orka.ai/substrate-suspend-mode"
+	// acpWorkspaceResumedLineageAnnotation marks a workspace whose current
+	// physical runtime was cold-resumed from a preserved data checkpoint. The
+	// linked pool then holds the ONLY copy of the session data for the
+	// workspace's remaining lifetime, so a missing or foreign pool is
+	// terminal data loss even after the adapter projected Ready or Attached.
+	acpWorkspaceResumedLineageAnnotation = "acp.workspace.orka.ai/resumed-lineage"
+
+	// acpWorkspaceDurableSessionCommittedAnnotation records that a
+	// RuntimeSession creation completed on this workspace - and with it the
+	// supervisor's synchronous durable checkpoint commit - so a resumed
+	// lineage may assert the committed checkpoint's existence fail-closed.
+	acpWorkspaceDurableSessionCommittedAnnotation = "acp.workspace.orka.ai/durable-session-committed"
 	// acpWorkspaceRevocationStartedAnnotation stamps the first revocation
 	// attempt so settlement can enforce the frozen detachTimeout instead of
 	// requeueing forever behind an adapter that never releases the epoch.
 	acpWorkspaceRevocationStartedAnnotation = "acp.workspace.orka.ai/revocation-started-at"
+	// runtimePoolWorkspaceResumeLostAnnotation records on a RuntimePool that
+	// a consensually suspended workspace's durable data became unrecoverable
+	// (the checkpointed actor or its snapshot is gone). It is terminal: the
+	// backend never reprovisions, and the workspace adapter propagates the
+	// linked workspace to Failed instead of silently resuming against a
+	// re-materialized baseline.
+	runtimePoolWorkspaceResumeLostAnnotation = "orka.ai/workspace-resume-lost"
 	// acpWorkspaceAttachmentTTL bounds one ACP Task attachment. The attachment
 	// Secret is not the RuntimePool data-plane credential; the epoch enforces
 	// the one-writer rule, and class maxLifetime still clamps the expiry.
@@ -129,10 +157,48 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 	}
 	// The settlement link is persisted as soon as the deterministic workspace
 	// exists: a Task deleted while core admission is still pending must be
-	// able to settle (and apply its frozen Delete action to) the session
+	// able to settle (and apply its frozen detach action to) the session
 	// workspace it materialized, which carries no Task owner reference.
 	if err := r.linkTaskToACPWorkspace(ctx, task, workspace); err != nil {
 		return "", false, err
+	}
+	if workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended {
+		// A continuation Task requests cold resume: the same concrete
+		// workspace returns to Ready, and the adapter replaces the physical
+		// runtime with a fresh boot and credential bootstrap before this
+		// Task can attach. The flip waits for the suspension to actually
+		// settle: resuming while the backend still drains or checkpoints
+		// would lift the pool's suspend intent mid-flight and strand the
+		// generic serving path in Draining with no undrain transition.
+		switch workspace.Status.State {
+		case workspacev1alpha1.ExecutionWorkspaceStateSuspended:
+			base := workspace.DeepCopy()
+			workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredReady
+			if workspace.Annotations == nil {
+				workspace.Annotations = map[string]string{}
+			}
+			// The continuation's frozen effective detach action replaces the
+			// suspender's in the SAME optimistic update that starts the
+			// resume: a continuation that selected Delete and dies before
+			// attaching must settle with Delete, not resuspend under the
+			// predecessor's stale action. The resumed-lineage marker makes
+			// later pool loss terminal even after Ready is projected.
+			workspace.Annotations[acpWorkspaceDetachActionAnnotation] = binding.Class.EffectiveOnDetach
+			workspace.Annotations[acpWorkspaceResumedLineageAnnotation] = booleanTrueValue
+			if err := r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+				return "", false, client.IgnoreNotFound(err)
+			}
+			return "", false, nil
+		case workspacev1alpha1.ExecutionWorkspaceStateFailed:
+			// The suspension failed closed and preserved no data checkpoint;
+			// resuming would fabricate a workspace the contract cannot back.
+			return "", false, fmt.Errorf(
+				"%w: workspace %s suspension failed without a preserved data checkpoint; cold resume is impossible",
+				errACPWorkspaceBindingConflict, workspace.Name,
+			)
+		default:
+			return "", false, nil
+		}
 	}
 	if workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateFailed {
 		if attachment := workspace.Spec.Attachment; attachment != nil && attachment.TaskRef.UID != task.UID {
@@ -144,9 +210,9 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 			// failing permanently.
 			return "", false, nil
 		}
-		// The adapter's Failed state is terminal for this incarnation (for
-		// example the frozen maximum lifetime elapsed and the RuntimePool was
-		// torn down); waiting can never recover it.
+		// The adapter's Failed state is terminal for this incarnation (a
+		// lost cold resume, a torn-down pool of a resumed lineage, or an
+		// enforced maximum-lifetime expiry); waiting can never recover it.
 		return "", false, fmt.Errorf(
 			"%w: workspace %s reported a terminal Failed state", errACPWorkspaceTerminalFailure, workspace.Name)
 	}
@@ -177,8 +243,13 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 	}
 	if workspace.Spec.Attachment != nil {
 		if workspace.Spec.Attachment.TaskRef.UID == task.UID {
-			ready, err := r.ensureACPWorkspaceAttachmentFresh(ctx, workspace, task)
+			ready, err := r.ensureACPWorkspaceAttachmentFresh(
+				ctx, workspace, task, binding.Class.EffectiveOnDetach,
+			)
 			if err != nil || !ready {
+				return "", false, err
+			}
+			if err := r.recordACPWorkspaceDetachAction(ctx, workspace, binding); err != nil {
 				return "", false, err
 			}
 			return name, true, r.linkTaskToACPWorkspace(ctx, task, workspace)
@@ -189,11 +260,16 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 		return "", false, nil
 	}
 	if acpWorkspaceRevocationStampMatchesCurrentEpoch(workspace) {
-		// A Delete settlement is pending on this workspace incarnation: the
-		// prior Task's frozen detach action must destroy this filesystem
-		// before any continuation runs. The deterministic name is recreated
-		// fresh once the deletion lands; attaching now would execute in state
-		// the class policy required to destroy.
+		// A settlement is pending on this workspace incarnation: the prior
+		// Task's frozen detach action must complete before any continuation
+		// runs. For Delete, this filesystem is destroyed and the
+		// deterministic name is recreated fresh once the deletion lands. For
+		// Suspend, the settlement retires this stamp in the same optimistic
+		// patch that lands DesiredState=Suspended, and the continuation then
+		// takes the cold-resume flip; attaching while the stamp stands would
+		// reuse the workspace warm and let the old settlement observe a
+		// foreign attachment as completion, so the requested checkpoint
+		// would silently never be taken.
 		return "", false, nil
 	}
 	// Persist the settlement link before attaching: if the controller dies
@@ -204,7 +280,9 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 		return "", false, err
 	}
 	manager := WorkspaceAttachmentManager{Client: r.Client, APIReader: r.APIReader, LeaseTTL: acpWorkspaceAttachmentTTL}
-	if _, err := manager.Attach(ctx, workspace, task); err != nil {
+	if _, err := manager.Attach(ctx, workspace, task, map[string]string{
+		acpWorkspaceDetachActionAnnotation: binding.Class.EffectiveOnDetach,
+	}); err != nil {
 		if errors.Is(err, ErrWorkspaceAttachmentLocked) {
 			return "", false, nil
 		}
@@ -221,10 +299,30 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 	return "", false, nil
 }
 
+// recordACPWorkspaceDetachAction records the attached Task's frozen effective
+// detach action on the workspace so settlement applies exactly that choice.
+func (r *TaskReconciler) recordACPWorkspaceDetachAction(
+	ctx context.Context,
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+	binding *ACPRuntimeWorkspaceBinding,
+) error {
+	action := binding.Class.EffectiveOnDetach
+	if workspace.Annotations[acpWorkspaceDetachActionAnnotation] == action {
+		return nil
+	}
+	base := workspace.DeepCopy()
+	if workspace.Annotations == nil {
+		workspace.Annotations = map[string]string{}
+	}
+	workspace.Annotations[acpWorkspaceDetachActionAnnotation] = action
+	return r.Patch(ctx, workspace, client.MergeFrom(base))
+}
+
 // queueACPClassWorkspaceBehindPredecessor recognizes an older class/provider
 // revision of the same session workspace while its creating Task still holds
-// the attachment or its epoch-matched Delete settlement is pending. Identity
-// conflicts outside the revision fields remain terminal.
+// the attachment or its epoch-matched detach settlement is pending. The
+// predecessor's frozen action must finish first; identity conflicts outside
+// the revision fields remain terminal.
 func queueACPClassWorkspaceBehindPredecessor(
 	workspace *workspacev1alpha1.ExecutionWorkspace,
 	task *corev1alpha1.Task,
@@ -271,6 +369,7 @@ func (r *TaskReconciler) ensureACPWorkspaceAttachmentFresh(
 	ctx context.Context,
 	workspace *workspacev1alpha1.ExecutionWorkspace,
 	task *corev1alpha1.Task,
+	detachAction string,
 ) (bool, error) {
 	if workspace == nil || task == nil || workspace.Spec.Attachment == nil ||
 		workspace.Spec.Attachment.TaskRef.UID != task.UID {
@@ -299,7 +398,11 @@ func (r *TaskReconciler) ensureACPWorkspaceAttachmentFresh(
 
 	expiredSecretName := attachment.TokenSecretRef.Name
 	manager := WorkspaceAttachmentManager{Client: r.Client, APIReader: r.APIReader, LeaseTTL: acpWorkspaceAttachmentTTL}
-	if _, err := manager.Attach(ctx, workspace, task); err != nil {
+	annotations := map[string]string(nil)
+	if detachAction = strings.TrimSpace(detachAction); detachAction != "" {
+		annotations = map[string]string{acpWorkspaceDetachActionAnnotation: detachAction}
+	}
+	if _, err := manager.Attach(ctx, workspace, task, annotations); err != nil {
 		if errors.Is(err, ErrWorkspaceAttachmentLocked) ||
 			errors.Is(err, errWorkspaceAttachmentRotationNotReady) ||
 			strings.Contains(err.Error(), "revalidate workspace") {
@@ -355,7 +458,9 @@ func (r *TaskReconciler) reconcileRunningACPClassWorkspaceAttachment(
 	if workspace.Spec.Attachment.ExpiresAt.After(time.Now()) {
 		return nil
 	}
-	_, err := r.ensureACPWorkspaceAttachmentFresh(ctx, workspace, task)
+	_, err := r.ensureACPWorkspaceAttachmentFresh(
+		ctx, workspace, task, workspace.Annotations[acpWorkspaceDetachActionAnnotation],
+	)
 	return err
 }
 
@@ -455,6 +560,11 @@ func (r *TaskReconciler) createACPClassWorkspace(
 				acpExecutionWorkspacePoolAnnotation:     poolName,
 				acpWorkspaceProviderConfigUIDAnnotation: binding.Class.ProviderConfigUID,
 				acpWorkspaceBackendAnnotation:           string(binding.Provider),
+				// The creator's frozen effective detach action is bound
+				// atomically with the workspace's existence: a crash between
+				// Attach and the later refresh patch can never leave a
+				// Suspend-frozen workspace defaulting to Delete.
+				acpWorkspaceDetachActionAnnotation: binding.Class.EffectiveOnDetach,
 			},
 		},
 		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
@@ -474,6 +584,9 @@ func (r *TaskReconciler) createACPClassWorkspace(
 			DesiredState: workspacev1alpha1.ExecutionWorkspaceDesiredReady,
 			Lifecycle:    lifecycle,
 		},
+	}
+	if binding.Class.SuspendMode != "" {
+		workspace.Annotations[acpWorkspaceSuspendModeAnnotation] = binding.Class.SuspendMode
 	}
 	if binding.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession {
 		if task.Spec.SessionRef == nil || strings.TrimSpace(task.Spec.SessionRef.Name) == "" {
@@ -555,8 +668,9 @@ func verifyACPClassWorkspace(
 		return fmt.Errorf("%w: workspace %s provider binding does not match the frozen provider identity", errACPWorkspaceBindingConflict, workspace.Name)
 	}
 	if workspace.Annotations[acpWorkspaceProviderConfigUIDAnnotation] != binding.Class.ProviderConfigUID ||
-		workspace.Annotations[acpWorkspaceBackendAnnotation] != string(binding.Provider) {
-		return fmt.Errorf("%w: workspace %s provider config or backend does not match the frozen binding", errACPWorkspaceBindingConflict, workspace.Name)
+		workspace.Annotations[acpWorkspaceBackendAnnotation] != string(binding.Provider) ||
+		workspace.Annotations[acpWorkspaceSuspendModeAnnotation] != binding.Class.SuspendMode {
+		return fmt.Errorf("%w: workspace %s provider config, backend, or suspend mode does not match the frozen binding", errACPWorkspaceBindingConflict, workspace.Name)
 	}
 	if workspace.Spec.Slot != binding.WorkspaceSlot {
 		return fmt.Errorf("%w: workspace %s slot does not match the frozen binding", errACPWorkspaceBindingConflict, workspace.Name)
@@ -577,7 +691,12 @@ func verifyACPClassWorkspace(
 			return fmt.Errorf("%w: workspace %s is not owned by this Task", errACPWorkspaceBindingConflict, workspace.Name)
 		}
 	}
-	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady {
+	resumeFromSuspended := workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended &&
+		workspace.Spec.Attachment == nil &&
+		binding.Provider == corev1alpha1.WorkspaceProviderSubstrate &&
+		binding.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession &&
+		binding.Class.SuspendMode == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly)
+	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady && !resumeFromSuspended {
 		return fmt.Errorf("%w: workspace %s desired state %q cannot admit new work", errACPWorkspaceBindingConflict, workspace.Name, workspace.Spec.DesiredState)
 	}
 	return nil
@@ -713,37 +832,78 @@ func (r *TaskReconciler) settleACPClassWorkspace(ctx context.Context, task *core
 			return expired, nil
 		}
 	}
-	// Only Delete is executable as a detach action, for per-Task and
-	// session-reused workspaces alike. The UID+resourceVersion preconditions
-	// keep a concurrent re-attachment from losing its workspace, and a
-	// conflict retries settlement against the fresh object: reporting the
-	// detach action applied on a swallowed conflict would let this Task
-	// release while the workspace it was frozen to delete lives on.
 	if workspace.Spec.Attachment != nil {
 		return true, nil
 	}
 	if workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredQuarantined {
 		// Quarantine is terminal: a retry after the adapter released the
 		// epoch must complete the credential cleanup idempotently and never
-		// execute the Delete detach action on the preserved evidence.
+		// execute any detach action on the preserved evidence.
 		if err := r.deleteACPWorkspaceAttachmentCredentials(ctx, workspace); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
+	// Apply the attached Task's frozen effective detach action. Suspend
+	// quiesced above: the attachment is revoked and the adapter released the
+	// enforced epoch, so no prompt or workspace writer remains. The
+	// UID+resourceVersion preconditions keep a concurrent re-attachment from
+	// losing its workspace: the API server rejects the write if the object
+	// changed after this read, and a Task that attached in between settles at
+	// its own settle time anyway.
+	terminallyFailed := workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateFailed
+	if workspace.Annotations[acpWorkspaceDetachActionAnnotation] == string(workspacev1alpha1.WorkspaceOnDetachSuspend) &&
+		!terminallyFailed {
+		if workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended {
+			return true, nil
+		}
+		if strings.TrimSpace(workspace.Annotations[acpWorkspaceDurableSessionCommittedAnnotation]) == "" {
+			// RuntimePool creation alone does not prove that a durable session
+			// exists. Only the synchronous durable-commit stamp permits
+			// retention; without it, delete the empty incarnation and let the
+			// adapter tear down any linked but checkpoint-free pool.
+			if err := r.Delete(ctx, workspace, deleteCurrentObjectPreconditions(workspace)...); err != nil &&
+				!apierrors.IsNotFound(err) {
+				if apierrors.IsConflict(err) {
+					return false, nil
+				}
+				return false, err
+			}
+			return true, nil
+		}
+		base := workspace.DeepCopy()
+		// The suspension retires the revocation stamp: the detach settled
+		// with a preserved workspace, and a continuation's cold resume must
+		// not be blocked by a stale pending-detach record.
+		delete(workspace.Annotations, acpWorkspaceRevocationStartedAnnotation)
+		workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredSuspended
+		if err := r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	}
 	// The destructive path revalidates the frozen policy it is about to
-	// execute: a workspace created by a newer controller with a Suspend
-	// action or retained deletion categories must fail closed after a
+	// execute: an action this controller cannot execute (written by a newer
+	// controller) or retained deletion categories must fail closed after a
 	// rollback instead of being deleted under a contract this version cannot
 	// honor.
-	// The detach-action key is written by newer controllers; this version
-	// freezes only Delete, so any other recorded action is a rollback marker.
-	if action := workspace.Annotations["acp.workspace.orka.ai/detach-action"]; action != "" &&
+	if action := workspace.Annotations[acpWorkspaceDetachActionAnnotation]; action != "" &&
 		action != string(workspacev1alpha1.WorkspaceOnDetachDelete) {
-		return false, fmt.Errorf(
-			"workspace %s froze detach action %q, which this controller cannot execute; refusing destructive settlement",
-			workspace.Name, action,
-		)
+		if action != string(workspacev1alpha1.WorkspaceOnDetachSuspend) || !terminallyFailed {
+			return false, fmt.Errorf(
+				"workspace %s froze detach action %q, which this controller cannot execute; refusing destructive settlement",
+				workspace.Name, action,
+			)
+		}
+		// The adapter marked this incarnation terminally Failed (for example
+		// maxLifetime expiry destroyed the pool): no checkpoint remains, so
+		// executing the frozen Suspend would preserve nothing and wedge
+		// every later Session Task against a Suspended/Failed incarnation.
+		// The terminal failure is settled destructively so the Session can
+		// recreate a clean workspace.
 	}
 	for _, deletionAction := range []workspacev1alpha1.WorkspaceDeletionAction{
 		workspace.Spec.Lifecycle.DeletionPolicy.ProviderResources,

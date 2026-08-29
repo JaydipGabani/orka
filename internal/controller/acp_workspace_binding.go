@@ -258,6 +258,12 @@ func resolveACPClassWorkspaceBinding(
 	if err != nil {
 		return nil, err
 	}
+	if effectiveOnDetach == workspacev1alpha1.WorkspaceOnDetachSuspend &&
+		reuse != corev1alpha1.WorkspaceReusePolicySession {
+		return nil, fmt.Errorf(
+			"execution workspace onDetach Suspend requires reusePolicy session; a per-Task workspace has no continuation to resume into",
+		)
+	}
 	templateNamespace := ""
 	templateName := ""
 	switch resolvedClass.Backend {
@@ -456,6 +462,19 @@ func (r *TaskReconciler) ensureACPWorkspaceSessionUID(
 // Class-path keys are added only for class-backed bindings so every legacy
 // binding digest remains byte-identical to its pre-class encoding.
 func acpWorkspaceBindingDigest(binding *ACPRuntimeWorkspaceBinding) (string, error) {
+	return acpWorkspaceBindingDigestWithClassOnDetach(binding, false)
+}
+
+// legacyACPWorkspaceBindingDigest reproduces schema-v1 class binding digests
+// written before the effective detach action became attachment-scoped.
+func legacyACPWorkspaceBindingDigest(binding *ACPRuntimeWorkspaceBinding) (string, error) {
+	return acpWorkspaceBindingDigestWithClassOnDetach(binding, true)
+}
+
+func acpWorkspaceBindingDigestWithClassOnDetach(
+	binding *ACPRuntimeWorkspaceBinding,
+	includeClassOnDetach bool,
+) (string, error) {
 	if binding == nil {
 		return "", fmt.Errorf("execution workspace binding is required")
 	}
@@ -477,7 +496,17 @@ func acpWorkspaceBindingDigest(binding *ACPRuntimeWorkspaceBinding) (string, err
 		fields["classProviderName"] = binding.Class.ProviderName
 		fields["classProviderUID"] = binding.Class.ProviderUID
 		fields["classProviderConfigUID"] = binding.Class.ProviderConfigUID
-		fields["classOnDetach"] = binding.Class.EffectiveOnDetach
+		if includeClassOnDetach {
+			fields["classOnDetach"] = binding.Class.EffectiveOnDetach
+		}
+		// The effective detach action is deliberately NOT part of the pool
+		// binding: it is attachment-scoped (a session suspended by one Task
+		// can be continued by a Task selecting Delete), and folding it into
+		// the immutable physical-pool identity would fail pool validation for
+		// every continuation that chooses a different allowed action.
+		if binding.Class.SuspendMode != "" {
+			fields["classSuspendMode"] = binding.Class.SuspendMode
+		}
 	}
 	return acpDomainDigest("execution-workspace-binding", fields)
 }
@@ -698,6 +727,14 @@ func validateACPWorkspaceBindingValues(binding *ACPRuntimeWorkspaceBinding) erro
 	if err := validateACPWorkspaceClassBindingValues(binding.Class); err != nil {
 		return err
 	}
+	if binding.Class != nil && binding.Class.EffectiveOnDetach == string(workspacev1alpha1.WorkspaceOnDetachSuspend) {
+		if binding.Provider != corev1alpha1.WorkspaceProviderSubstrate {
+			return fmt.Errorf("frozen execution workspace binding permits Suspend for provider %q; only substrate supports data-only suspension", binding.Provider)
+		}
+		if binding.ReusePolicy != corev1alpha1.WorkspaceReusePolicySession {
+			return fmt.Errorf("frozen execution workspace binding permits Suspend without session reuse")
+		}
+	}
 	digest, err := acpWorkspaceBindingDigest(binding)
 	if err != nil {
 		return err
@@ -706,4 +743,35 @@ func validateACPWorkspaceBindingValues(binding *ACPRuntimeWorkspaceBinding) erro
 		return fmt.Errorf("frozen execution workspace binding digest does not match its canonical identity")
 	}
 	return nil
+}
+
+// validateSnapshotACPWorkspaceBindingValues accepts the prior schema-v1 class
+// digest while re-verifying an immutable snapshot. New bindings never use this
+// compatibility path.
+func validateSnapshotACPWorkspaceBindingValues(binding *ACPRuntimeWorkspaceBinding) error {
+	if binding == nil {
+		return nil
+	}
+	currentDigest, err := acpWorkspaceBindingDigest(binding)
+	if err != nil {
+		return err
+	}
+	canonical := *binding
+	canonical.BindingDigest = currentDigest
+	if err := validateACPWorkspaceBindingValues(&canonical); err != nil {
+		return err
+	}
+	if binding.BindingDigest == currentDigest {
+		return nil
+	}
+	if binding.Class != nil {
+		legacyDigest, err := legacyACPWorkspaceBindingDigest(binding)
+		if err != nil {
+			return err
+		}
+		if binding.BindingDigest == legacyDigest {
+			return nil
+		}
+	}
+	return fmt.Errorf("frozen execution workspace binding digest does not match its canonical identity")
 }

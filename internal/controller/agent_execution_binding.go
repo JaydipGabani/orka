@@ -105,6 +105,7 @@ type agentExecutionSnapshotWorkspaceClass struct {
 	ProviderGeneration int64    `json:"providerGeneration"`
 	ProviderConfigUID  string   `json:"providerConfigUID,omitempty"`
 	EffectiveOnDetach  string   `json:"effectiveOnDetach"`
+	SuspendMode        string   `json:"suspendMode,omitempty"`
 	DefaultOnDetach    string   `json:"defaultOnDetach"`
 	AllowedOnDetach    []string `json:"allowedOnDetach"`
 	DetachTimeout      string   `json:"detachTimeout"`
@@ -633,6 +634,7 @@ func snapshotWorkspaceClassFromBinding(class *ACPWorkspaceClassBinding) *agentEx
 		ProviderGeneration: class.ProviderGeneration,
 		ProviderConfigUID:  class.ProviderConfigUID,
 		EffectiveOnDetach:  class.EffectiveOnDetach,
+		SuspendMode:        class.SuspendMode,
 		DefaultOnDetach:    class.DefaultOnDetach,
 		AllowedOnDetach:    append([]string(nil), class.AllowedOnDetach...),
 		DetachTimeout:      class.DetachTimeout,
@@ -661,6 +663,7 @@ func workspaceClassBindingFromSnapshot(class *agentExecutionSnapshotWorkspaceCla
 		ProviderGeneration: class.ProviderGeneration,
 		ProviderConfigUID:  class.ProviderConfigUID,
 		EffectiveOnDetach:  class.EffectiveOnDetach,
+		SuspendMode:        class.SuspendMode,
 		DefaultOnDetach:    class.DefaultOnDetach,
 		AllowedOnDetach:    append([]string(nil), class.AllowedOnDetach...),
 		DetachTimeout:      class.DetachTimeout,
@@ -695,7 +698,7 @@ func verifiedSnapshotWorkspaceBinding(
 		Class:             workspaceClassBindingFromSnapshot(body.ExecutionWorkspace.Class),
 		BindingDigest:     body.ExecutionWorkspace.BindingDigest,
 	}
-	if err := validateACPWorkspaceBindingValues(frozen); err != nil {
+	if err := validateSnapshotACPWorkspaceBindingValues(frozen); err != nil {
 		return nil, err
 	}
 	wantSessionKey := "task:" + string(binding.Task.UID)

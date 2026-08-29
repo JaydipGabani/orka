@@ -1157,6 +1157,9 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 					BaseTemplateNamespace: plan.Workspace.TemplateNamespace,
 					BaseTemplateName:      plan.Workspace.TemplateName,
 				}
+				if plan.Workspace.Class != nil {
+					executionWorkspace.Substrate.SuspendMode = plan.Workspace.Class.SuspendMode
+				}
 			}
 		}
 		pool = &corev1alpha1.RuntimePool{

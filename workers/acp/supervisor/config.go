@@ -62,7 +62,16 @@ type Config struct {
 	CapabilitySecret      []byte
 	RequireCapabilities   bool
 
-	SessionBaseDir        string
+	SessionBaseDir string
+	// DurableWorkspaceDir, when set, hosts each logical session's repository
+	// workspace on the provider's durable data volume so a data-only cold
+	// suspension preserves exactly that directory. The session root, home,
+	// temporary files, XDG state, and every credential stay under the
+	// ephemeral SessionBaseDir tree - EXCEPT the non-secret session identity
+	// allocator state (high-water mark, range, lock), which moves to
+	// <DurableWorkspaceDir>/.session-identity so a cold boot can never reuse
+	// a pre-suspension child UID/GID; snapshots must preserve it.
+	DurableWorkspaceDir   string
 	UIDAllocator          *acp.UIDAllocator
 	ProviderProxy         ProviderProxyConfig
 	MCPBroker             MCPBroker
@@ -117,6 +126,19 @@ func (c Config) Validate() error {
 	}
 	if c.SessionBaseDir == "" || !filepath.IsAbs(c.SessionBaseDir) {
 		return fmt.Errorf("session base directory must be absolute")
+	}
+	if c.DurableWorkspaceDir != "" && !filepath.IsAbs(c.DurableWorkspaceDir) {
+		return fmt.Errorf("durable workspace directory must be absolute when set")
+	}
+	if c.DurableWorkspaceDir != "" {
+		relative, err := filepath.Rel(filepath.Clean(c.DurableWorkspaceDir), filepath.Clean(c.SessionBaseDir))
+		if err != nil {
+			return fmt.Errorf("compare session and durable workspace directories: %w", err)
+		}
+		if relative == "." || (relative != ".." &&
+			!strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)) {
+			return fmt.Errorf("session base directory must not equal or be beneath the durable workspace directory")
+		}
 	}
 	if c.UIDAllocator == nil {
 		return fmt.Errorf("UID allocator is required")

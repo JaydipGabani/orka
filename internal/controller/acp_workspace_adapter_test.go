@@ -519,6 +519,34 @@ func TestACPExecutionWorkspaceAdapterDeletionTearsDownLinkedPool(t *testing.T) {
 	}
 }
 
+func TestACPExecutionWorkspaceAdapterDeletionReportsDataOnlyStorageDeleted(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := acpAdapterProvider()
+	workspace := acpAdapterWorkspace(t, "acp-ws-pool")
+	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredDeleted
+	workspace.Annotations[acpWorkspaceBackendAnnotation] = string(corev1alpha1.WorkspaceProviderSubstrate)
+	workspace.Annotations[acpWorkspaceSuspendModeAnnotation] = string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly)
+	pool := acpAdapterLinkedPool(workspace.Namespace, workspace.Name)
+	pool.Spec.ExecutionWorkspace.Provider = corev1alpha1.WorkspaceProviderSubstrate
+	pool.Spec.ExecutionWorkspace.Substrate = &corev1alpha1.RuntimePoolSubstrateWorkspaceSpec{
+		SuspendMode: string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly),
+	}
+	c := acpAdapterTestClient(t, provider, workspace, pool)
+
+	reconcileACPWorkspaceAdapter(t, c, workspace)
+	reconcileACPWorkspaceAdapter(t, c, workspace)
+	current := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, current); err != nil {
+		t.Fatalf("get workspace: %v", err)
+	}
+	if current.Status.Disposition == nil ||
+		current.Status.Disposition.PersistentVolumes != workspacev1alpha1.DispositionDeleted ||
+		current.Status.Disposition.Checkpoints != workspacev1alpha1.DispositionDeleted {
+		t.Fatalf("DataOnly deletion disposition = %+v, want deleted persistent volume and checkpoint", current.Status.Disposition)
+	}
+}
+
 // A directly deleted ATTACHED workspace must remove its bearer attachment
 // Secret and Lease and prove their absence before publishing the Deleted
 // disposition: Task settlement never ran, and asynchronous owner-reference GC

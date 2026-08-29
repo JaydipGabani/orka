@@ -41,7 +41,7 @@ func TestWorkspaceAttachmentManagerPersistsEpochAcrossReattach(t *testing.T) {
 		Build()
 	manager := attachmentReviewManager(c)
 
-	first, err := manager.Attach(ctx, workspace.DeepCopy(), firstTask)
+	first, err := manager.Attach(ctx, workspace.DeepCopy(), firstTask, nil)
 	if err != nil {
 		t.Fatalf("first Attach: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestWorkspaceAttachmentManagerPersistsEpochAcrossReattach(t *testing.T) {
 	if err := c.Get(ctx, key, detached); err != nil {
 		t.Fatalf("get detached workspace: %v", err)
 	}
-	second, err := manager.Attach(ctx, detached, secondTask)
+	second, err := manager.Attach(ctx, detached, secondTask, nil)
 	if err != nil {
 		t.Fatalf("second Attach: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestWorkspaceAttachmentManagerRejectsForeignLease(t *testing.T) {
 		Build()
 	manager := attachmentReviewManager(c)
 
-	result, err := manager.Attach(ctx, workspace.DeepCopy(), task)
+	result, err := manager.Attach(ctx, workspace.DeepCopy(), task, nil)
 	if result != nil || err == nil || !strings.Contains(err.Error(), "not controlled by workspace") {
 		t.Fatalf("Attach = (%#v, %v), want foreign Lease ownership rejection", result, err)
 	}
@@ -195,7 +195,7 @@ func TestWorkspaceAttachmentManagerFinalizeRevocationUsesAPIReader(t *testing.T)
 		Build()
 	setupManager := attachmentReviewManager(baseClient)
 
-	result, err := setupManager.Attach(ctx, workspace.DeepCopy(), task)
+	result, err := setupManager.Attach(ctx, workspace.DeepCopy(), task, nil)
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestWorkspaceAttachmentManagerFinalizeRevocationPreservesNewerLease(t *test
 		Build()
 	setupManager := attachmentReviewManager(baseClient)
 
-	result, err := setupManager.Attach(ctx, workspace.DeepCopy(), firstTask)
+	result, err := setupManager.Attach(ctx, workspace.DeepCopy(), firstTask, nil)
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -399,7 +399,7 @@ func TestWorkspaceAttachmentManagerBootstrapsLegacyActiveEpochOnRevocation(t *te
 		t.Fatalf("mark legacy attachment revoked: %v", err)
 	}
 
-	result, err := manager.Attach(ctx, current, newTask)
+	result, err := manager.Attach(ctx, current, newTask, nil)
 	if err != nil {
 		t.Fatalf("Attach after legacy revocation: %v", err)
 	}
@@ -421,7 +421,7 @@ func TestWorkspaceAttachmentManagerStoresHeaderSafeBearerText(t *testing.T) {
 		Build()
 	manager := attachmentReviewManager(c)
 
-	result, err := manager.Attach(ctx, workspace.DeepCopy(), task)
+	result, err := manager.Attach(ctx, workspace.DeepCopy(), task, nil)
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -522,7 +522,7 @@ func TestWorkspaceAttachmentManagerRecoversOwnedOrphanAfterLeaseHandoff(t *testi
 		Build()
 	manager := attachmentReviewManager(c)
 
-	result, err := manager.Attach(ctx, workspace.DeepCopy(), task)
+	result, err := manager.Attach(ctx, workspace.DeepCopy(), task, nil)
 	if err != nil {
 		t.Fatalf("Attach with owned orphan: %v", err)
 	}
@@ -615,7 +615,7 @@ func TestWorkspaceAttachmentManagerFencesPausedHolderAfterLeaseHandoff(t *testin
 		Now:      now,
 	}
 	go func() {
-		result, err := originalManager.Attach(ctx, workspace.DeepCopy(), originalTask)
+		result, err := originalManager.Attach(ctx, workspace.DeepCopy(), originalTask, nil)
 		originalOutcomes <- attachOutcome{result: result, err: err}
 	}()
 	waitForAttachmentBarrier(t, ctx, originalReached, "original Lease fence")
@@ -634,7 +634,7 @@ func TestWorkspaceAttachmentManagerFencesPausedHolderAfterLeaseHandoff(t *testin
 		Now:      now,
 	}
 	go func() {
-		result, err := successorManager.Attach(ctx, workspace.DeepCopy(), successorTask)
+		result, err := successorManager.Attach(ctx, workspace.DeepCopy(), successorTask, nil)
 		successorOutcomes <- attachOutcome{result: result, err: err}
 	}()
 	waitForAttachmentBarrier(t, ctx, successorReached, "successor Lease fence")
@@ -711,7 +711,7 @@ func TestWorkspaceAttachmentManagerRefusesForeignOrphanedSecret(t *testing.T) {
 		Build()
 	manager := attachmentReviewManager(c)
 
-	if result, err := manager.Attach(ctx, workspace.DeepCopy(), task); err == nil ||
+	if result, err := manager.Attach(ctx, workspace.DeepCopy(), task, nil); err == nil ||
 		!strings.Contains(err.Error(), "not the exact recoverable workspace attachment") {
 		t.Fatalf("Attach with foreign orphan = (%#v, %v), want ownership rejection", result, err)
 	}
@@ -838,7 +838,7 @@ func TestWorkspaceAttachmentManagerRevalidatesReusableStateBeforeIntentPatch(t *
 			}
 			manager := attachmentReviewManager(mutatingClient)
 
-			if result, err := manager.Attach(ctx, workspace.DeepCopy(), task); err == nil {
+			if result, err := manager.Attach(ctx, workspace.DeepCopy(), task, nil); err == nil {
 				t.Fatalf("Attach = %#v, want revalidation error", result)
 			}
 			if mutatingClient.mutationErr != nil {
@@ -891,7 +891,7 @@ func TestWorkspaceAttachmentManagerUsesOptimisticLockForIntentRevalidation(t *te
 	}
 	manager := attachmentReviewManager(mutatingClient)
 
-	if result, err := manager.Attach(ctx, workspace.DeepCopy(), task); err == nil {
+	if result, err := manager.Attach(ctx, workspace.DeepCopy(), task, nil); err == nil {
 		t.Fatalf("Attach = %#v, want concurrent desired-state revalidation error", result)
 	}
 	if mutatingClient.mutationErr != nil {

@@ -38,6 +38,8 @@ const (
 	acpTestNamespace    = "default"
 	acpTestSessionName  = "session-a"
 	acpTestInfraName    = "infra"
+
+	acpTestSubstrateNamespace = "substrate-system"
 )
 
 const acpTestSandboxPoolName = "acp-ws-agent-sandbox-0123456789abcdef"
@@ -111,7 +113,7 @@ func newACPClassFixture(t *testing.T, backend acpworkspacev1alpha1.RuntimeProvid
 	}
 	if backend == acpworkspacev1alpha1.RuntimeProviderBackendSubstrate {
 		fixture.profile.Spec.Substrate = &acpworkspacev1alpha1.SubstrateProfileSpec{
-			TemplateRef: acpworkspacev1alpha1.SubstrateTemplateReference{Name: "infra-template", Namespace: "substrate-system"},
+			TemplateRef: acpworkspacev1alpha1.SubstrateTemplateReference{Name: "infra-template", Namespace: acpTestSubstrateNamespace},
 		}
 	}
 	fixture.class = &workspacev1alpha1.ExecutionWorkspaceClass{
@@ -312,7 +314,7 @@ func TestResolveACPWorkspaceClassMatrix(t *testing.T) {
 				if resolved.Backend != corev1alpha1.WorkspaceProviderSubstrate {
 					t.Fatalf("backend = %s", resolved.Backend)
 				}
-				if resolved.SubstrateTemplateNamespace != "substrate-system" || resolved.SubstrateTemplateName != "infra-template" {
+				if resolved.SubstrateTemplateNamespace != acpTestSubstrateNamespace || resolved.SubstrateTemplateName != "infra-template" {
 					t.Fatalf("substrate template = %s/%s", resolved.SubstrateTemplateNamespace, resolved.SubstrateTemplateName)
 				}
 			},
@@ -527,7 +529,7 @@ func TestResolveACPClassWorkspaceBindingPolicy(t *testing.T) {
 			t.Fatalf("resolve class: %v", err)
 		}
 		if _, err := resolveACPWorkspaceBindingWithClass(acpClassTestTask(), "", false, "", suspendResolved); err == nil ||
-			!strings.Contains(err.Error(), "not yet executable") {
+			!strings.Contains(err.Error(), "permits DataOnly suspension") {
 			t.Fatalf("error = %v", err)
 		}
 		// The Task may still pick the executable Delete action explicitly.
@@ -649,8 +651,8 @@ func TestACPWorkspaceClassBindingSnapshotRoundTrip(t *testing.T) {
 	suspendedClass.EffectiveOnDetach = string(workspacev1alpha1.WorkspaceOnDetachSuspend)
 	suspended.Class = &suspendedClass
 	if err := validateACPWorkspaceBindingValues(&suspended); err == nil ||
-		!strings.Contains(err.Error(), "not executable") {
-		t.Fatalf("suspend detach action must stay rejected, got %v", err)
+		!strings.Contains(err.Error(), "DataOnly suspension policy") {
+		t.Fatalf("a tampered Suspend action without its policy must stay rejected, got %v", err)
 	}
 }
 
@@ -958,6 +960,63 @@ func TestEnsureACPClassWorkspaceFailedStateIsTerminal(t *testing.T) {
 	}
 }
 
+// A continuation must never attach while a revocation stamp stands — even for
+// a Suspend detach action. The suspend settlement retires the stamp in the
+// same optimistic patch that lands DesiredState=Suspended; attaching earlier
+// would reuse the workspace warm and let the old settlement observe a foreign
+// attachment as completion, silently skipping the requested checkpoint.
+func TestEnsureACPClassWorkspaceBlocksContinuationDuringPendingSuspend(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newACPClassFixture(t, acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox)
+	task := acpClassTestTask()
+	r := acpClassTestReconciler(t, append(fixture.objects(), task)...)
+	resolved, err := r.resolveACPWorkspaceClass(ctx, task)
+	if err != nil {
+		t.Fatalf("resolve class: %v", err)
+	}
+	binding, err := resolveACPWorkspaceBindingWithClass(task, "", false, "", resolved)
+	if err != nil {
+		t.Fatalf("resolve binding: %v", err)
+	}
+	plan := ACPRuntimePlan{PoolName: acpTestSandboxPoolName, Workspace: binding}
+	if _, _, err := r.ensureACPClassWorkspace(ctx, task, plan); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	workspaceName := acpClassWorkspaceName(task, binding)
+	workspace := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: workspaceName}, workspace); err != nil {
+		t.Fatalf("read workspace: %v", err)
+	}
+	workspace.Spec.AttachmentEpoch = 1
+	admitTestACPWorkspace(t, r, workspace)
+	// The predecessor's Suspend settlement is mid-flight: the attachment was
+	// revoked and the revocation stamp stands, but the suspension patch has
+	// not landed DesiredState=Suspended yet.
+	base := workspace.DeepCopy()
+	if workspace.Annotations == nil {
+		workspace.Annotations = map[string]string{}
+	}
+	workspace.Annotations[acpWorkspaceRevocationStartedAnnotation] = fmt.Sprintf(
+		"%d %s", workspace.Spec.AttachmentEpoch, time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	workspace.Annotations[acpWorkspaceDetachActionAnnotation] = string(workspacev1alpha1.WorkspaceOnDetachSuspend)
+	if err := r.Patch(ctx, workspace, client.MergeFrom(base)); err != nil {
+		t.Fatalf("stamp pending suspend settlement: %v", err)
+	}
+
+	name, ready, err := r.ensureACPClassWorkspace(ctx, task, plan)
+	if err != nil || ready || name != "" {
+		t.Fatalf("ensure during pending Suspend settlement = (%q, %v, %v), want blocked", name, ready, err)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: workspaceName}, workspace); err != nil {
+		t.Fatalf("re-read workspace: %v", err)
+	}
+	if workspace.Spec.Attachment != nil {
+		t.Fatalf("attachment = %+v, want none while the revocation stamp stands", workspace.Spec.Attachment)
+	}
+}
+
 // TestEnsureACPClassWorkspaceSessionContention proves attachment exclusivity
 // on a genuinely shared workspace: two session-reused Tasks with the same
 // immutable Session UID derive the same workspace name, so the competitor
@@ -1238,7 +1297,10 @@ func TestEnsureACPClassWorkspaceRejectsForeignAdoption(t *testing.T) {
 // longer match the frozen binding is rejected instead of reused.
 func TestEnsureACPClassWorkspaceRejectsProviderIdentityDrift(t *testing.T) {
 	t.Parallel()
-	const materializationMarkersError = "materialization markers do not match"
+	const (
+		materializationMarkersError = "materialization markers do not match"
+		frozenProviderError         = "provider config, backend, or suspend mode does not match"
+	)
 	tests := []struct {
 		name    string
 		mutate  func(*workspacev1alpha1.ExecutionWorkspace)
@@ -1256,14 +1318,21 @@ func TestEnsureACPClassWorkspaceRejectsProviderIdentityDrift(t *testing.T) {
 			mutate: func(workspace *workspacev1alpha1.ExecutionWorkspace) {
 				workspace.Annotations[acpWorkspaceProviderConfigUIDAnnotation] = "recreated-config-uid"
 			},
-			wantErr: "provider config or backend does not match",
+			wantErr: frozenProviderError,
 		},
 		{
 			name: "backend drift",
 			mutate: func(workspace *workspacev1alpha1.ExecutionWorkspace) {
 				workspace.Annotations[acpWorkspaceBackendAnnotation] = string(acpworkspacev1alpha1.RuntimeProviderBackendSubstrate)
 			},
-			wantErr: "provider config or backend does not match",
+			wantErr: frozenProviderError,
+		},
+		{
+			name: "suspend mode drift",
+			mutate: func(workspace *workspacev1alpha1.ExecutionWorkspace) {
+				workspace.Annotations[acpWorkspaceSuspendModeAnnotation] = string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly)
+			},
+			wantErr: frozenProviderError,
 		},
 		{
 			name: "controller label missing",
@@ -2069,6 +2138,9 @@ func TestEnsureACPClassWorkspaceRotatesExpiredAttachmentBeforeReady(t *testing.T
 	firstDigest := workspace.Spec.Attachment.TokenSHA256
 	base := workspace.DeepCopy()
 	workspace.Spec.Attachment.ExpiresAt = metav1.NewTime(time.Now().Add(-time.Minute))
+	// Simulate stale metadata from a predecessor. Credential rotation must bind
+	// this Task's frozen action atomically with the replacement attachment.
+	workspace.Annotations[acpWorkspaceDetachActionAnnotation] = string(workspacev1alpha1.WorkspaceOnDetachSuspend)
 	if err := r.Patch(ctx, workspace, client.MergeFrom(base)); err != nil {
 		t.Fatalf("expire attachment: %v", err)
 	}
@@ -2087,6 +2159,9 @@ func TestEnsureACPClassWorkspaceRotatesExpiredAttachmentBeforeReady(t *testing.T
 	}
 	if rotated.TokenSecretRef.Name == firstSecret || rotated.TokenSHA256 == firstDigest || !rotated.ExpiresAt.After(time.Now()) {
 		t.Fatalf("rotation did not replace and renew the expired credential: %#v", rotated)
+	}
+	if got := workspace.Annotations[acpWorkspaceDetachActionAnnotation]; got != binding.Class.EffectiveOnDetach {
+		t.Fatalf("rotated detach action = %q, want %q", got, binding.Class.EffectiveOnDetach)
 	}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: firstSecret}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expired attachment Secret still exists after rotation: %v", err)

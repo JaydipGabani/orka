@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	acpworkspacev1alpha1 "github.com/orka-agents/orka/api/acp.workspace/v1alpha1"
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
@@ -703,6 +704,58 @@ func TestVerifiedSnapshotWorkspaceBindingRejectsTamperedIdentity(t *testing.T) {
 	tamperedDigest.CleanupPolicy = string(corev1alpha1.WorkspaceCleanupPolicyRetain)
 	if _, err := verifiedSnapshotWorkspaceBinding(binding, agentExecutionSnapshotBody{ExecutionWorkspace: &tamperedDigest}); err == nil {
 		t.Fatal("tampered cleanup policy passed verification")
+	}
+}
+
+func TestVerifiedSnapshotWorkspaceBindingAcceptsLegacyClassOnDetachDigest(t *testing.T) {
+	task := acpClassTestTask()
+	fixture := newACPClassFixture(t, acpworkspacev1alpha1.RuntimeProviderBackendAgentSandbox)
+	reconciler := acpClassTestReconciler(t, fixture.objects()...)
+	resolved, err := reconciler.resolveACPWorkspaceClass(context.Background(), task)
+	if err != nil {
+		t.Fatalf("resolve class: %v", err)
+	}
+	frozen, err := resolveACPWorkspaceBindingWithClass(task, "", false, "", resolved)
+	if err != nil {
+		t.Fatalf("resolve class binding: %v", err)
+	}
+	legacyDigest, err := legacyACPWorkspaceBindingDigest(frozen)
+	if err != nil {
+		t.Fatalf("legacy binding digest: %v", err)
+	}
+	if legacyDigest == frozen.BindingDigest {
+		t.Fatal("legacy classOnDetach digest unexpectedly matches the current digest")
+	}
+	legacy := *frozen
+	legacy.BindingDigest = legacyDigest
+	if err := validateACPWorkspaceBindingValues(&legacy); err == nil {
+		t.Fatal("new binding validation unexpectedly accepted the legacy digest")
+	}
+
+	snapshot := agentExecutionSnapshotWorkspaceBinding{
+		Provider:          string(frozen.Provider),
+		ReusePolicy:       string(frozen.ReusePolicy),
+		CleanupPolicy:     string(frozen.CleanupPolicy),
+		WorkspaceSlot:     frozen.WorkspaceSlot,
+		SessionUID:        frozen.SessionUID,
+		SessionKey:        frozen.SessionKey,
+		TemplateNamespace: frozen.TemplateNamespace,
+		TemplateName:      frozen.TemplateName,
+		Class:             snapshotWorkspaceClassFromBinding(frozen.Class),
+		BindingDigest:     legacyDigest,
+	}
+	binding := &corev1alpha1.AgentExecutionBinding{
+		Task: corev1alpha1.AgentExecutionBindingTaskRef{UID: task.UID},
+	}
+	restored, err := verifiedSnapshotWorkspaceBinding(
+		binding,
+		agentExecutionSnapshotBody{ExecutionWorkspace: &snapshot},
+	)
+	if err != nil {
+		t.Fatalf("pre-upgrade class snapshot rejected: %v", err)
+	}
+	if restored.BindingDigest != legacyDigest {
+		t.Fatalf("restored digest = %q, want legacy digest %q", restored.BindingDigest, legacyDigest)
 	}
 }
 
@@ -1512,56 +1565,80 @@ func TestProjectACPExecutionWorkspaceStatusTransitions(t *testing.T) {
 	}
 }
 
-// A transient workspace read failure during the class-identity projection
-// must fail the phase transition instead of persisting a projection stripped
-// of ClassRef/WorkspaceRef/State/AttachedEpoch: the advanced phase would
-// never retry the dropped identity.
-func TestProjectACPExecutionWorkspaceStatusRetriesOnIdentityReadFailure(t *testing.T) {
+// A resumed lineage asserts a committed durable checkpoint only when a
+// RuntimeSession actually committed one before the suspension: a first Task
+// cancelled before session creation validly suspends a volume that never held
+// a checkpoint, and its continuation must materialize fresh instead of
+// failing closed forever over data that never existed.
+func TestTaskExpectsDurableResumeRequiresCommittedSession(t *testing.T) {
 	scheme := bindingTestScheme(t)
 	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("register workspace scheme: %v", err)
 	}
 	workspace := &workspacev1alpha1.ExecutionWorkspace{
-		ObjectMeta: metav1.ObjectMeta{Namespace: acpTestNamespace, Name: "acp-ws-read-fail", UID: types.UID("ws-read-fail-uid")},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: acpTestNamespace, Name: "acp-ws-lineage", UID: types.UID("ws-lineage-uid"),
+			Annotations: map[string]string{acpWorkspaceResumedLineageAnnotation: booleanTrueValue},
+		},
 	}
 	task := workspaceBindingTestTask(nil)
 	task.Labels = map[string]string{acpExecutionWorkspaceLinkLabel: workspace.Name}
-	task.Status = corev1alpha1.TaskStatus{
-		Phase: corev1alpha1.TaskPhaseRunning,
-		Execution: &corev1alpha1.TaskExecutionStatus{
-			State:           corev1alpha1.TaskExecutionStateRunning,
-			RuntimePoolName: acpWorkspaceTestRuntimePoolName,
-		},
-		ExecutionWorkspace: &corev1alpha1.ExecutionWorkspaceStatus{
-			Provider: corev1alpha1.WorkspaceProviderAgentSandbox,
-			Phase:    corev1alpha1.ExecutionWorkspacePhasePending,
-			Reason:   corev1alpha1.ExecutionWorkspaceReasonPending,
-		},
-	}
-	readErr := errors.New("injected workspace read failure")
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme).
-		WithStatusSubresource(&corev1alpha1.Task{}).
-		WithObjects(task, workspace).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if _, isWorkspace := obj.(*workspacev1alpha1.ExecutionWorkspace); isWorkspace {
-					return readErr
-				}
-				return cl.Get(ctx, key, obj, opts...)
-			},
-		}).Build()
-	reconciler := &TaskReconciler{Client: kubeClient, Scheme: scheme}
+	task.Annotations = map[string]string{acpExecutionWorkspaceUIDAnnotation: string(workspace.UID)}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(task, workspace).Build()
+	dispatcher := &ACPDispatcher{Client: kubeClient, APIReader: kubeClient}
 	ctx := context.Background()
 
-	if err := reconciler.projectACPExecutionWorkspaceStatus(ctx, task); !errors.Is(err, readErr) {
-		t.Fatalf("projection error = %v, want the surfaced read failure", err)
+	expects, _, err := dispatcher.taskExpectsDurableResume(ctx, task)
+	if err != nil {
+		t.Fatalf("resume expectation: %v", err)
 	}
-	current := &corev1alpha1.Task{}
-	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, current); err != nil {
-		t.Fatalf("reload task: %v", err)
+	if expects {
+		t.Fatal("a lineage with no committed durable session must not assert a checkpoint")
 	}
-	if current.Status.ExecutionWorkspace.Phase != corev1alpha1.ExecutionWorkspacePhasePending {
-		t.Fatalf("phase advanced to %q over a failed identity read; the transition must retry instead", current.Status.ExecutionWorkspace.Phase)
+
+	// Session creation records the synchronous durable commit with its
+	// generation; the floor only ever advances.
+	if err := dispatcher.markLinkedWorkspaceDurableSessionCommitted(ctx, task, 3); err != nil {
+		t.Fatalf("record durable session commit: %v", err)
+	}
+	expects, floor, err := dispatcher.taskExpectsDurableResume(ctx, task)
+	if err != nil {
+		t.Fatalf("resume expectation after commit: %v", err)
+	}
+	if !expects || floor != 3 {
+		t.Fatalf("expects=%v floor=%d, want an asserted checkpoint at generation 3", expects, floor)
+	}
+
+	// The stamp is monotonic and pinned to the workspace incarnation: an
+	// older generation never regresses the floor.
+	if err := dispatcher.markLinkedWorkspaceDurableSessionCommitted(ctx, task, 2); err != nil {
+		t.Fatalf("repeat commit record: %v", err)
+	}
+	if _, floor, _ = dispatcher.taskExpectsDurableResume(ctx, task); floor != 3 {
+		t.Fatalf("floor = %d after an older stamp, want the monotonic 3", floor)
+	}
+	task.Annotations[acpExecutionWorkspaceUIDAnnotation] = "different-incarnation"
+	expects, _, err = dispatcher.taskExpectsDurableResume(ctx, task)
+	if err != nil || expects {
+		t.Fatalf("a different incarnation must not inherit the lineage assertion (expects=%v err=%v)", expects, err)
+	}
+
+	// Corrupt or zero generation records must fail dispatch instead of
+	// disabling the stale-snapshot floor.
+	task.Annotations[acpExecutionWorkspaceUIDAnnotation] = string(workspace.UID)
+	for _, recorded := range []string{"not-a-generation", "0"} {
+		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, workspace); err != nil {
+			t.Fatalf("read workspace before corrupting generation: %v", err)
+		}
+		base := workspace.DeepCopy()
+		workspace.Annotations[acpWorkspaceDurableSessionCommittedAnnotation] = recorded
+		if err := kubeClient.Patch(ctx, workspace, client.MergeFrom(base)); err != nil {
+			t.Fatalf("write invalid durable generation %q: %v", recorded, err)
+		}
+		if _, _, err := dispatcher.taskExpectsDurableResume(ctx, task); err == nil ||
+			!strings.Contains(err.Error(), "invalid durable checkpoint generation") {
+			t.Fatalf("invalid generation %q error = %v", recorded, err)
+		}
 	}
 }
 
@@ -1708,5 +1785,143 @@ func TestRefreshACPReleasedWorkspaceProjectionClearsAttachment(t *testing.T) {
 	}
 	if task.Status.ExecutionWorkspace.AttachedEpoch != 0 || task.Status.ExecutionWorkspace.State != "" {
 		t.Fatalf("post-deletion projection = %+v, want cleared attachment identity", task.Status.ExecutionWorkspace)
+	}
+}
+
+// A failed suspension preserves no checkpoint: the idle reaper must be able
+// to reclaim the stopped pool while a genuinely suspended (or suspending)
+// workspace stays deliberately retained.
+func TestReapIdlePoolsReclaimsFailedSuspensions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	makePool := func(name, workspaceName string) *corev1alpha1.RuntimePool {
+		return &corev1alpha1.RuntimePool{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: defaultNS, Name: name, UID: types.UID(name + "-uid"), Generation: 1,
+				Annotations: map[string]string{
+					acpRuntimeLastDemandAnnotation:     now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+					acpExecutionWorkspaceUIDAnnotation: workspaceName + "-uid",
+				},
+				Labels: map[string]string{acpExecutionWorkspaceLinkLabel: workspaceName},
+			},
+			Spec: corev1alpha1.RuntimePoolSpec{
+				DesiredReplicas: 0,
+				ExecutionWorkspace: &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
+					Provider:      corev1alpha1.WorkspaceProviderAgentSandbox,
+					BindingDigest: "sha256:" + strings.Repeat("9", 64),
+				},
+			},
+			Status: corev1alpha1.RuntimePoolStatus{Lifecycle: corev1alpha1.RuntimePoolLifecycleStopped, ObservedGeneration: 1},
+		}
+	}
+	makeWorkspace := func(name, poolName string, state workspacev1alpha1.ExecutionWorkspaceState) *workspacev1alpha1.ExecutionWorkspace {
+		return &workspacev1alpha1.ExecutionWorkspace{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: defaultNS, Name: name, UID: types.UID(name + "-uid"),
+				Annotations: map[string]string{acpExecutionWorkspacePoolAnnotation: poolName},
+			},
+			Spec:   workspacev1alpha1.ExecutionWorkspaceSpec{DesiredState: workspacev1alpha1.ExecutionWorkspaceDesiredSuspended},
+			Status: workspacev1alpha1.ExecutionWorkspaceStatus{State: state},
+		}
+	}
+	suspendedPool := makePool("acp-ws-suspended-fedcba9876543210", "acp-ws-suspended")
+	failedPool := makePool("acp-ws-failed-fedcba9876543210", "acp-ws-failed")
+	suspended := makeWorkspace("acp-ws-suspended", suspendedPool.Name, workspacev1alpha1.ExecutionWorkspaceStateSuspended)
+	failed := makeWorkspace("acp-ws-failed", failedPool.Name, workspacev1alpha1.ExecutionWorkspaceStateFailed)
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.RuntimePool{}, &workspacev1alpha1.ExecutionWorkspace{}).
+		WithObjects(suspendedPool, failedPool, suspended, failed).Build()
+	db, err := sqlite.NewDB(filepath.Join(t.TempDir(), "ws-failed-gc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() //nolint:errcheck
+	controlStore := sqlite.NewStore(db, "test")
+	epochs := NewControllerEpochManager(controlStore, "ws-failed-gc-controller")
+	epochCtx, cancelEpoch := context.WithCancel(context.Background())
+	epochDone := make(chan error, 1)
+	go func() { epochDone <- epochs.Start(epochCtx) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := epochs.CurrentFence(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	dispatcher := &ACPDispatcher{Client: kubeClient, Epochs: epochs, IdlePoolTTL: time.Minute}
+	if err := dispatcher.reapIdlePools(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: defaultNS, Name: suspended.Name},
+		&workspacev1alpha1.ExecutionWorkspace{}); err != nil {
+		t.Fatalf("a genuinely suspended workspace must be retained for cold resume: %v", err)
+	}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: defaultNS, Name: failed.Name},
+		&workspacev1alpha1.ExecutionWorkspace{}); err == nil {
+		t.Fatal("a failed suspension preserves no checkpoint and must be reclaimed")
+	}
+
+	cancelEpoch()
+	if err := <-epochDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A transient workspace read failure during the class-identity projection
+// must fail the phase transition instead of persisting a projection stripped
+// of ClassRef/WorkspaceRef/State/AttachedEpoch: the advanced phase would
+// never retry the dropped identity.
+func TestProjectACPExecutionWorkspaceStatusRetriesOnIdentityReadFailure(t *testing.T) {
+	scheme := bindingTestScheme(t)
+	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("register workspace scheme: %v", err)
+	}
+	workspace := &workspacev1alpha1.ExecutionWorkspace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: acpTestNamespace, Name: "acp-ws-read-fail", UID: types.UID("ws-read-fail-uid")},
+	}
+	task := workspaceBindingTestTask(nil)
+	task.Labels = map[string]string{acpExecutionWorkspaceLinkLabel: workspace.Name}
+	task.Status = corev1alpha1.TaskStatus{
+		Phase: corev1alpha1.TaskPhaseRunning,
+		Execution: &corev1alpha1.TaskExecutionStatus{
+			State:           corev1alpha1.TaskExecutionStateRunning,
+			RuntimePoolName: acpWorkspaceTestRuntimePoolName,
+		},
+		ExecutionWorkspace: &corev1alpha1.ExecutionWorkspaceStatus{
+			Provider: corev1alpha1.WorkspaceProviderAgentSandbox,
+			Phase:    corev1alpha1.ExecutionWorkspacePhasePending,
+			Reason:   corev1alpha1.ExecutionWorkspaceReasonPending,
+		},
+	}
+	readErr := errors.New("injected workspace read failure")
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.Task{}).
+		WithObjects(task, workspace).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, isWorkspace := obj.(*workspacev1alpha1.ExecutionWorkspace); isWorkspace {
+					return readErr
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+	reconciler := &TaskReconciler{Client: kubeClient, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := reconciler.projectACPExecutionWorkspaceStatus(ctx, task); !errors.Is(err, readErr) {
+		t.Fatalf("projection error = %v, want the surfaced read failure", err)
+	}
+	current := &corev1alpha1.Task{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, current); err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if current.Status.ExecutionWorkspace.Phase != corev1alpha1.ExecutionWorkspacePhasePending {
+		t.Fatalf("phase advanced to %q over a failed identity read; the transition must retry instead", current.Status.ExecutionWorkspace.Phase)
 	}
 }

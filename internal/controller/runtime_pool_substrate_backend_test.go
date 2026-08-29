@@ -34,11 +34,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/workspace"
 )
 
 const (
+	substrateTestSnapshotLocation  = "gs://ate-snapshots/orka"
 	substrateTestStatusSuspended   = "STATUS_SUSPENDED"
 	substrateTestStatusSuspending  = "STATUS_SUSPENDING"
 	substrateTestStatusCrashed     = "STATUS_CRASHED"
@@ -55,16 +57,19 @@ const (
 )
 
 type fakeSubstrateActorControl struct {
-	actors      map[string]*workspace.SubstrateRuntimeActor
-	created     []string
-	resumed     []string
-	boots       []bool
-	settled     []string
-	deleted     []string
-	closed      int
-	afterCreate func()
-	afterResume func(*workspace.SubstrateRuntimeActor)
-	afterSettle func(*workspace.SubstrateRuntimeActor)
+	actors        map[string]*workspace.SubstrateRuntimeActor
+	created       []string
+	resumed       []string
+	boots         []bool
+	settled       []string
+	dataSuspended []string
+	deleted       []string
+	closed        int
+	resumeErr     error
+	suspendErr    error
+	afterCreate   func()
+	afterResume   func(*workspace.SubstrateRuntimeActor)
+	afterSettle   func(*workspace.SubstrateRuntimeActor)
 }
 
 type blockingSubstrateActorControl struct{}
@@ -94,6 +99,10 @@ func (c blockingSubstrateActorControl) ResumeActor(
 }
 
 func (c blockingSubstrateActorControl) SettleActor(ctx context.Context, _ string) (*workspace.SubstrateRuntimeActor, error) {
+	return nil, c.wait(ctx)
+}
+
+func (c blockingSubstrateActorControl) SuspendActorForDataCheckpoint(ctx context.Context, _ string) (*workspace.SubstrateRuntimeActor, error) {
 	return nil, c.wait(ctx)
 }
 
@@ -185,12 +194,15 @@ func (f *fakeSubstrateActorControl) CreateActor(_ context.Context, actorID, temp
 func (f *fakeSubstrateActorControl) ResumeActor(_ context.Context, actorID string, boot bool) (*workspace.SubstrateRuntimeActor, error) {
 	f.resumed = append(f.resumed, actorID)
 	f.boots = append(f.boots, boot)
+	if f.resumeErr != nil {
+		return nil, f.resumeErr
+	}
 	actor := f.actors[actorID]
 	if actor == nil {
 		actor = &workspace.SubstrateRuntimeActor{ActorID: actorID}
 		f.actors[actorID] = actor
 	}
-	actor.Status = "STATUS_RUNNING"
+	actor.Status = substrateTestStatusRunning
 	actor.PodNamespace = substrateTestWorkerNamespace
 	actor.PodName = substrateTestWorkerPodName
 	actor.PodIP = "10.99.0.5"
@@ -211,6 +223,24 @@ func (f *fakeSubstrateActorControl) SettleActor(_ context.Context, actorID strin
 	if f.afterSettle != nil {
 		f.afterSettle(actor)
 	}
+	view := *actor
+	return &view, nil
+}
+
+func (f *fakeSubstrateActorControl) SuspendActorForDataCheckpoint(_ context.Context, actorID string) (*workspace.SubstrateRuntimeActor, error) {
+	f.dataSuspended = append(f.dataSuspended, actorID)
+	if f.suspendErr != nil {
+		return nil, f.suspendErr
+	}
+	actor, ok := f.actors[actorID]
+	if !ok {
+		return nil, fmt.Errorf("suspend: actor %s not found", actorID)
+	}
+	actor.Status = substrateTestStatusSuspended
+	actor.PodNamespace = ""
+	actor.PodName = ""
+	actor.PodIP = ""
+	actor.SnapshotObserved = true
 	view := *actor
 	return &view, nil
 }
@@ -282,6 +312,9 @@ func (r *substrateNamespaceScopedNetworkPolicyReader) List(
 func runtimePoolSubstrateTestScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	scheme := runtimePoolTestScheme(t)
+	if err := workspacev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add workspace scheme: %v", err)
+	}
 	scheme.AddKnownTypeWithName(substrateActorTemplateGVK, &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(substrateActorTemplateGVK.GroupVersion().WithKind("ActorTemplateList"), &unstructured.UnstructuredList{})
 	metav1.AddToGroupVersion(scheme, substrateActorTemplateGVK.GroupVersion())
@@ -303,7 +336,7 @@ func substrateTestBaseTemplate() *unstructured.Unstructured {
 	template := &unstructured.Unstructured{Object: map[string]any{
 		substrateObjectSpecField: map[string]any{
 			"workerPoolRef":   map[string]any{"namespace": substrateTestWorkerNamespace, substrateTestObjectNameField: substrateTestWorkerPoolName},
-			"snapshotsConfig": map[string]any{"location": "gs://ate-snapshots/orka"},
+			"snapshotsConfig": map[string]any{"location": substrateTestSnapshotLocation},
 			"runsc":           map[string]any{"amd64": map[string]any{"url": "https://example.invalid/runsc"}},
 			"containers": []any{map[string]any{
 				substrateTestObjectNameField: "operator-base", substrateTestObjectImageField: "example.com/operator@sha256:" + strings.Repeat("1", 64),
@@ -1027,7 +1060,7 @@ func TestSubstrateRuntimePoolRefusesActorWithUnexpectedTemplateBeforeBootstrap(t
 		ActorID:           actorID,
 		TemplateNamespace: "attacker-owned",
 		TemplateName:      "credential-capture",
-		Status:            "STATUS_RUNNING",
+		Status:            substrateTestStatusRunning,
 		PodNamespace:      substrateTestWorkerNamespace,
 		PodName:           substrateTestWorkerPodName,
 	}
@@ -1068,6 +1101,66 @@ func TestSubstrateRuntimePoolRefusesActorWithUnexpectedTemplateBeforeBootstrap(t
 	}
 	if seedAttempts != 0 {
 		t.Fatalf("credential seed attempts after deletion = %d, want none", seedAttempts)
+	}
+}
+
+func TestSubstrateRuntimePoolMarksForeignCheckpointReplacementAsResumeLoss(t *testing.T) {
+	for name, annotation := range map[string]string{
+		"suspended": substrateActorSuspendedAnnotation,
+		"resuming":  substrateActorResumingAnnotation,
+	} {
+		t.Run(name, func(t *testing.T) {
+			supervisor := &fakeRuntimePoolSupervisorClient{}
+			control := newFakeSubstrateActorControl()
+			r, pool := runtimePoolSubstrateTestReconciler(t, supervisor, control)
+			// First materialize the controller-owned template and actor. Then
+			// replace only the deterministic actor ID with a foreign workload.
+			runtimePoolReconcile(t, r, pool)
+			actorID := substrateTestActorID(pool)
+			control.actors[actorID] = &workspace.SubstrateRuntimeActor{
+				ActorID:           actorID,
+				TemplateNamespace: "attacker-owned",
+				TemplateName:      "credential-capture",
+				Status:            substrateTestStatusRunning,
+				PodNamespace:      substrateTestWorkerNamespace,
+				PodName:           substrateTestWorkerPodName,
+			}
+			control.resumed = nil
+			control.settled = nil
+			control.deleted = nil
+			current := runtimePoolTestGetPool(t, r, pool)
+			if current.Annotations == nil {
+				current.Annotations = map[string]string{}
+			}
+			current.Spec.ExecutionWorkspace.Substrate.SuspendMode = "DataOnly"
+			current.Annotations[annotation] = actorID
+			if annotation == substrateActorSuspendedAnnotation {
+				current.Annotations[substrateActorSuspendAcceptedAnnotation] = actorID
+			}
+			if err := r.Update(context.Background(), &current); err != nil {
+				t.Fatalf("record checkpoint state: %v", err)
+			}
+
+			runtimePoolReconcile(t, r, pool)
+
+			got := runtimePoolTestGetPool(t, r, pool)
+			if got.Annotations[runtimePoolWorkspaceResumeLostAnnotation] == "" {
+				t.Fatalf("foreign checkpoint replacement did not record resume loss: %v", got.Annotations)
+			}
+			if got.Annotations[substrateActorSuspendedAnnotation] != "" ||
+				got.Annotations[substrateActorSuspendAcceptedAnnotation] != "" ||
+				got.Annotations[substrateActorResumingAnnotation] != "" {
+				t.Fatalf("stale checkpoint annotations remained: %v", got.Annotations)
+			}
+			if len(control.resumed) != 0 || len(control.settled) != 0 || len(control.deleted) != 0 {
+				t.Fatalf("foreign actor was modified: resumed=%v settled=%v deleted=%v", control.resumed, control.settled, control.deleted)
+			}
+			if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDegraded ||
+				got.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
+				!strings.Contains(got.Status.Message, "durable workspace data is unrecoverable") {
+				t.Fatalf("status = %s/%s %q, want terminal checkpoint loss", got.Status.Lifecycle, got.Status.AdmissionState, got.Status.Message)
+			}
+		})
 	}
 }
 
@@ -1213,7 +1306,7 @@ func assertSubstrateDerivedTemplate(
 	if workerPool, _, _ := unstructured.NestedString(derived.Object, substrateObjectSpecField, "workerPoolRef", substrateTestObjectNameField); workerPool != substrateTestWorkerPoolName {
 		t.Fatalf("derived template workerPoolRef = %q, want operator infrastructure copied", workerPool)
 	}
-	if location, _, _ := unstructured.NestedString(derived.Object, "spec", "snapshotsConfig", "location"); location != "gs://ate-snapshots/orka" {
+	if location, _, _ := unstructured.NestedString(derived.Object, "spec", "snapshotsConfig", "location"); location != substrateTestSnapshotLocation {
 		t.Fatalf("derived template snapshotsConfig = %q, want operator infrastructure copied (safe: the golden-built instance boots credential-free)", location)
 	}
 }
@@ -2708,5 +2801,67 @@ func TestRuntimePoolInstanceEndpoint(t *testing.T) {
 	routed := substrateTestProbePod(substrate)
 	if got := runtimePoolInstanceEndpoint(substrate, &routed); got != "http://"+substrateTestRouteHost(substrate) {
 		t.Fatalf("substrate endpoint = %q, want route host", got)
+	}
+}
+
+// Recycling an actor whose cold resume consumed the suspension consent but
+// never completed admission is terminal: the DurableDir being destroyed is
+// the only copy of the preserved session data.
+func TestRecycleSubstrateActorDuringResumeRecordsTerminalLoss(t *testing.T) {
+	control := newFakeSubstrateActorControl()
+	r, pool := runtimePoolSubstrateTestReconciler(t, &fakeRuntimePoolSupervisorClient{}, control)
+	actorID := substrateTestActorID(pool)
+	derivedName := runtimePoolSubstrateTemplateName(runtimePoolResourceName(pool.Namespace, pool.Name))
+	if _, err := control.CreateActor(context.Background(), actorID, substrateTestTemplateNamespace, derivedName); err != nil {
+		t.Fatalf("create actor: %v", err)
+	}
+	current := runtimePoolTestGetPool(t, r, pool)
+	if current.Annotations == nil {
+		current.Annotations = map[string]string{}
+	}
+	current.Annotations[substrateActorResumingAnnotation] = actorID
+	if err := r.Update(context.Background(), &current); err != nil {
+		t.Fatalf("record resume in progress: %v", err)
+	}
+
+	// The teardown spans reconciles; the terminal loss must be recorded
+	// before any destruction stage runs.
+	if err := r.recycleSubstrateActor(context.Background(), &current, control, actorID); err != nil {
+		t.Fatalf("recycle: %v", err)
+	}
+	current = runtimePoolTestGetPool(t, r, pool)
+	if current.Annotations[runtimePoolWorkspaceResumeLostAnnotation] == "" {
+		t.Fatalf("recycling a resuming actor must record terminal loss, annotations=%v", current.Annotations)
+	}
+}
+
+// Recycling an actor whose consensual suspension consent still stands (for
+// example through the integrity-triggered recycle that runs before the resume
+// handler) is equally terminal.
+func TestRecycleSubstrateActorWithStandingConsentRecordsTerminalLoss(t *testing.T) {
+	control := newFakeSubstrateActorControl()
+	r, pool := runtimePoolSubstrateTestReconciler(t, &fakeRuntimePoolSupervisorClient{}, control)
+	actorID := substrateTestActorID(pool)
+	derivedName := runtimePoolSubstrateTemplateName(runtimePoolResourceName(pool.Namespace, pool.Name))
+	if _, err := control.CreateActor(context.Background(), actorID, substrateTestTemplateNamespace, derivedName); err != nil {
+		t.Fatalf("create actor: %v", err)
+	}
+	current := runtimePoolTestGetPool(t, r, pool)
+	if current.Annotations == nil {
+		current.Annotations = map[string]string{}
+	}
+	current.Annotations[substrateActorSuspendedAnnotation] = actorID
+	current.Annotations[substrateActorSuspendAcceptedAnnotation] = actorID
+	// Consent is honored only on a suspend-capable binding.
+	current.Spec.ExecutionWorkspace.Substrate.SuspendMode = "DataOnly"
+	if err := r.Update(context.Background(), &current); err != nil {
+		t.Fatalf("record suspension consent: %v", err)
+	}
+	if err := r.recycleSubstrateActor(context.Background(), &current, control, actorID); err != nil {
+		t.Fatalf("recycle: %v", err)
+	}
+	current = runtimePoolTestGetPool(t, r, pool)
+	if current.Annotations[runtimePoolWorkspaceResumeLostAnnotation] == "" {
+		t.Fatalf("recycling a consensually suspended actor must record terminal loss, annotations=%v", current.Annotations)
 	}
 }

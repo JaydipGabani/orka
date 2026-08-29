@@ -16,9 +16,12 @@ type SubstrateRuntimeActor struct {
 	PodName           string
 	PodIP             string
 	// SnapshotObserved reports that the provider recorded a completed or
-	// in-progress snapshot for this actor. ACP RuntimePool hosting never
-	// requests snapshots, so an observed snapshot is proof of a
-	// provider-initiated suspension and forces a fail-closed recycle.
+	// in-progress snapshot for this actor. Pools without an operator-permitted
+	// data-only suspension policy never request snapshots, so an observed
+	// snapshot there is proof of a provider-initiated suspension and forces a
+	// fail-closed recycle. Data-only pools expect snapshot records after a
+	// requested suspension; their derived template's explicit Data policy is
+	// what keeps process memory out of every checkpoint.
 	SnapshotObserved bool
 }
 
@@ -42,6 +45,20 @@ func (a *SubstrateRuntimeActor) Suspended() bool {
 // Suspending reports an in-flight provider suspension transition.
 func (a *SubstrateRuntimeActor) Suspending() bool {
 	return a != nil && a.Status == substrateStatusSuspending
+}
+
+// RunningStatus reports provider-side liveness (STATUS_RUNNING) regardless of
+// route readiness: a just-resumed actor can be Running before its Pod IP is
+// populated, which is a transitional state, never a crash.
+func (a *SubstrateRuntimeActor) RunningStatus() bool {
+	return a != nil && a.Status == substrateStatusRunning
+}
+
+// Resuming reports an in-flight provider cold resume: ResumeActor accepted
+// the request but the workload has not reached Running yet. The checkpoint is
+// being consumed, not crashed.
+func (a *SubstrateRuntimeActor) Resuming() bool {
+	return a != nil && a.Status == substrateStatusResuming
 }
 
 // Crashed reports a provider state whose worker workload is no longer
@@ -72,6 +89,15 @@ type SubstrateRuntimeActorControl interface {
 	// memory has been destroyed and its absence confirmed — settling a live
 	// supervisor would checkpoint credentials and is prohibited.
 	SettleActor(ctx context.Context, actorID string) (*SubstrateRuntimeActor, error)
+	// SuspendActorForDataCheckpoint suspends a live actor whose derived
+	// template renders the explicit data-only snapshot policy (onPause: Data,
+	// onCommit: Data, onResume.fromData: ColdBoot). Under that policy the
+	// checkpoint captures only the controller-owned DurableDir workspace
+	// volume and can never contain process memory or credentials. Callers must
+	// verify the deployed template's exact fence and rendered policy, and
+	// settle prompt and workspace activity, before invoking it; every other
+	// template policy keeps live suspension prohibited.
+	SuspendActorForDataCheckpoint(ctx context.Context, actorID string) (*SubstrateRuntimeActor, error)
 	// DeleteActor returns nil when the actor is already absent. The provider
 	// accepts deletion of suspended (settled) or crashed actors.
 	DeleteActor(ctx context.Context, actorID string) error
@@ -132,6 +158,14 @@ func (c *substrateRuntimeActorControl) ResumeActor(ctx context.Context, actorID 
 }
 
 func (c *substrateRuntimeActorControl) SettleActor(ctx context.Context, actorID string) (*SubstrateRuntimeActor, error) {
+	actor, err := c.control.SuspendActor(ctx, actorID)
+	if err != nil {
+		return nil, err
+	}
+	return substrateRuntimeActorView(actor), nil
+}
+
+func (c *substrateRuntimeActorControl) SuspendActorForDataCheckpoint(ctx context.Context, actorID string) (*SubstrateRuntimeActor, error) {
 	actor, err := c.control.SuspendActor(ctx, actorID)
 	if err != nil {
 		return nil, err
