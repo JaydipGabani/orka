@@ -78,7 +78,7 @@ export function useTaskTrace(
       api.get<TaskTrace>(executionEventApiPath.taskTrace(taskId), { namespace }),
     enabled: enabled && !!taskId,
     retry: (failureCount, error) =>
-      !(error instanceof ApiError && error.status === 501) && failureCount < 1,
+      !(error instanceof ApiError && (error.status === 501 || error.status === 404)) && failureCount < 1,
     retryDelay: 100,
     refetchInterval: (query) =>
       query.state.error instanceof ApiError && query.state.error.status === 501

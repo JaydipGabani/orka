@@ -54,8 +54,10 @@ export function useTaskArtifacts(
       return listArtifactsResponseSchema.parse(raw)
     },
     enabled: enabled && !!taskId,
+    // 501 means the feature is off and 404 means the task is gone; neither
+    // changes on retry, so only transient failures are retried.
     retry: (failureCount, error) =>
-      !(error instanceof ApiError && error.status === 501) && failureCount < 3,
+      !(error instanceof ApiError && (error.status === 501 || error.status === 404)) && failureCount < 3,
     refetchInterval: (query) =>
       query.state.error instanceof ApiError && query.state.error.status === 501
         ? false

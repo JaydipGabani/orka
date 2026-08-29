@@ -84,8 +84,11 @@ describe('TaskDetail', () => {
     await new Promise((resolve) => setTimeout(resolve, 200))
     expect(hits).toEqual(snapshot)
     expect(hits.task).toBe(1)
+    // A 404 is never retried: at most the single in-flight request that
+    // raced the task lookup.
     expect(hits.events ?? 0).toBeLessThanOrEqual(1)
-    expect(hits.trace ?? 0).toBeLessThanOrEqual(2)
+    expect(hits.trace ?? 0).toBeLessThanOrEqual(1)
+    expect(hits.artifacts ?? 0).toBeLessThanOrEqual(1)
     expect(hits.approvals ?? 0).toBeLessThanOrEqual(1)
     expect(hits.artifacts ?? 0).toBeLessThanOrEqual(1)
   })

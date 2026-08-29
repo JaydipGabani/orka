@@ -36,6 +36,7 @@ func (h *Handlers) ListRuntimePools(c fiber.Ctx) error {
 	}); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list runtime pools: %v", err))
 	}
+	list.Continue = NormalizeListContinue(list.Continue)
 	return c.JSON(list)
 }
 
@@ -182,6 +183,7 @@ func (h *Handlers) ListAgentRuntimes(c fiber.Ctx) error {
 	}); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list agent runtimes: %v", err))
 	}
+	list.Continue = NormalizeListContinue(list.Continue)
 	return c.JSON(list)
 }
 
