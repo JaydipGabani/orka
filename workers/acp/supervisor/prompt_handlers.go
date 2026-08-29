@@ -615,9 +615,26 @@ func (s *Server) handleRenewLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusGone, harnessv2.ErrorCodeSettled, safeError(err), nil, false)
 		return
 	}
-	if providerProxy == nil || mcpProxy == nil ||
-		providerProxy.renew(string(request.Metadata.PromptID), request.Lease.ExpiresAt, now) != nil ||
-		mcpProxy.renew(request.MCPAuthorization, request.Lease, now) != nil {
+	var providerRenewErr, mcpRenewErr error
+	if providerProxy != nil {
+		providerRenewErr = providerProxy.renew(string(request.Metadata.PromptID), request.Lease.ExpiresAt, now)
+	}
+	if mcpProxy != nil && providerRenewErr == nil {
+		mcpRenewErr = mcpProxy.renew(request.MCPAuthorization, request.Lease, now)
+	}
+	if providerProxy == nil || mcpProxy == nil || providerRenewErr != nil || mcpRenewErr != nil {
+		// The renewal is rejected fail-closed and the prompt is cancelled;
+		// record which capability refused so a cancelled prompt can be
+		// traced to its cause. Both messages are supervisor-generated.
+		slog.Error(
+			"ACP prompt lease renewal rejected; cancelling the prompt",
+			"promptID", request.Metadata.PromptID,
+			"leaseGeneration", request.Lease.Generation,
+			"providerProxyPresent", providerProxy != nil,
+			"mcpProxyPresent", mcpProxy != nil,
+			"providerRenewError", errorString(providerRenewErr),
+			"mcpRenewError", errorString(mcpRenewErr),
+		)
 		if providerProxy != nil {
 			providerProxy.revoke()
 		}
@@ -2292,4 +2309,11 @@ func pathMatchesPermission(r *http.Request, request harnessv2.ResolvePermissionR
 func sessionWorkspaceOutsideRoot(paths acp.SessionPaths) bool {
 	root := strings.TrimSuffix(paths.Root, "/")
 	return paths.Workspace != root && !strings.HasPrefix(paths.Workspace, root+"/")
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

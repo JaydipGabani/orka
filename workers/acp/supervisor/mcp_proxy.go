@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -278,6 +279,8 @@ func (s *mcpProxySession) expire(promptID harnessv2.PromptID, version uint64) {
 	if s.authorization == nil || s.authorization.PromptID != promptID || s.leaseVersion != version {
 		return
 	}
+	slog.Warn("ACP MCP proxy prompt authorization expired without renewal; revoking tool access",
+		"promptID", promptID, "leaseVersion", version)
 	s.revokeLocked(harnessv2.RuntimeSessionStateCancelling)
 }
 

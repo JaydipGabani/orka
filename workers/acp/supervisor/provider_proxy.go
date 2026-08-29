@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -444,6 +445,8 @@ func (s *providerProxySession) expire(promptID string, version uint64) {
 		s.leaseTimer = time.AfterFunc(remaining, func() { s.expire(promptID, version) })
 		return
 	}
+	slog.Warn("ACP provider proxy prompt lease expired without renewal; revoking provider access",
+		"promptID", promptID, "leaseVersion", version, "expiredAt", s.leaseExpiresAt.UTC().Format(time.RFC3339))
 	s.revokeLocked()
 }
 
