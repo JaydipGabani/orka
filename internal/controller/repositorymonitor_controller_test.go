@@ -1498,6 +1498,45 @@ func TestRepositoryMonitorReconcileKeepsSucceededBackingTaskPendingWithoutTypedR
 	}
 }
 
+func TestRepositoryMonitorIngestDowngradesPassedVerdictWithoutCompleteContext(t *testing.T) {
+	ctx := context.Background()
+	monitorStore := setupControllerSQLiteStore(t)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "gate-monitor", Namespace: "default", UID: types.UID("uid-gate-monitor")}, Spec: corev1alpha1.RepositoryMonitorSpec{RepoURL: repositoryMonitorTestRepoURL, Branch: "main", Agents: corev1alpha1.RepositoryMonitorAgents{Reviewer: &corev1alpha1.AgentReference{Name: "reviewer"}}}}
+	task := repositoryMonitorReviewIngestTestTask("gate-review-task", monitor.Name, 91, "head91")
+	task.Spec.Prompt = "review\n" + renderRepositoryMonitorReviewContext(repositoryMonitorReviewContext{
+		SchemaVersion: repositoryMonitorReviewContextSchemaVersion, Repo: "orka-agents/orka", PRNumber: 91, HeadSHA: "head91",
+		ContextUnavailable: repositoryMonitorReviewContextErrorTimeout,
+	}) + "\n"
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(monitor, task).Build()
+	reconciler := &RepositoryMonitorReconciler{Client: cl, Scheme: scheme, Store: monitorStore, ResultStore: monitorStore}
+	if err := monitorStore.SaveResult(ctx, "default", task.Name, repositoryMonitorReviewResultEnvelope(t, 91, "head91", repositoryMonitorReviewVerdictPassed)); err != nil {
+		t.Fatal(err)
+	}
+	item := &store.MonitorItem{MonitorNamespace: "default", MonitorName: monitor.Name, Kind: repositoryMonitorPullRequestKind, ItemKey: "91", Number: 91, State: repositoryMonitorItemStateOpen, HeadSHA: "head91", BaseBranch: "main", LastVerdict: repositoryMonitorRunPhaseQueued, LastReviewID: task.Name}
+	if err := monitorStore.UpsertMonitorItem(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	handled, err := reconciler.ingestCompletedRepositoryMonitorReviewTask(ctx, monitor, item, task)
+	if err != nil || !handled {
+		t.Fatalf("ingest = (%v, %v), want handled without error", handled, err)
+	}
+	updated, err := monitorStore.GetMonitorItem(ctx, "default", monitor.Name, repositoryMonitorPullRequestKind, "91")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.LastVerdict != repositoryMonitorReviewVerdictNeedsHuman || updated.AutomergeState != "" {
+		t.Fatalf("item after gated ingest = verdict %q automerge %q, want needs_human and no merge-ready state", updated.LastVerdict, updated.AutomergeState)
+	}
+	events, _, err := monitorStore.ListMonitorEvents(ctx, store.MonitorEventFilter{Namespace: "default", MonitorName: monitor.Name, EventType: "review_verdict_downgraded", Limit: 5})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("downgrade events = %d (err %v), want 1", len(events), err)
+	}
+}
+
 func TestRepositoryMonitorReconcileIngestsTypedReviewResult(t *testing.T) {
 	ctx := context.Background()
 	monitorStore := setupControllerSQLiteStore(t)
@@ -3658,7 +3697,15 @@ func repositoryMonitorReviewIngestTestTask(name, monitorName string, prNumber in
 				labels.AnnotationGitHubRepository:      "orka-agents/orka",
 			},
 		},
-		Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent},
+		Spec: corev1alpha1.TaskSpec{
+			Type: corev1alpha1.TaskTypeAgent,
+			// A complete (non-truncated, available) rendered context so passed
+			// verdicts from these fixtures pass the controller-side gate.
+			Prompt: "review\n" + renderRepositoryMonitorReviewContext(repositoryMonitorReviewContext{
+				SchemaVersion: repositoryMonitorReviewContextSchemaVersion, Repo: "orka-agents/orka",
+				PRNumber: prNumber, HeadSHA: headSHA,
+			}) + "\n",
+		},
 		Status: corev1alpha1.TaskStatus{
 			Phase:     corev1alpha1.TaskPhaseSucceeded,
 			ResultRef: &corev1alpha1.ResultReference{Available: true},

@@ -117,3 +117,17 @@ func TestACPStatusMessagesRedactCredentialShapedDetail(t *testing.T) {
 		StatusCode: 409, Code: harnessv2.ErrorCodeSessionPoisoned, Message: detail,
 	}))
 }
+
+func TestACPPromptFailureMessageRedactsCredentialShapedCode(t *testing.T) {
+	t.Parallel()
+	terminal := harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{
+		Code: "api_key=sk-live-0123456789abcdefghij", Message: "upstream rejected the request",
+	}}
+	got := acpPromptFailureMessage(terminal)
+	if strings.Contains(got, "sk-live-0123456789abcdefghij") {
+		t.Fatalf("acpPromptFailureMessage() leaked a credential-shaped code: %q", got)
+	}
+	if !strings.Contains(got, "upstream rejected the request") {
+		t.Fatalf("acpPromptFailureMessage() dropped the redacted detail: %q", got)
+	}
+}

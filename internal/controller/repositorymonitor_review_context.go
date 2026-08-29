@@ -463,3 +463,27 @@ func repositoryMonitorReviewContextErrorClassWellFormed(class string) bool {
 	}
 	return true
 }
+
+// repositoryMonitorReviewVerdictGateReason enforces, controller-side, the
+// rule the review prompt states: a "passed" verdict is only trustworthy when
+// the reviewer saw the complete change set. A review Task whose embedded
+// context is missing, unavailable, or file-truncated cannot have verified
+// every changed file against a checkout without Git history, so its passed
+// verdict must not become the automerge gate. The returned reason is empty
+// when the verdict may stand.
+func repositoryMonitorReviewVerdictGateReason(prompt, verdict string) string {
+	if strings.TrimSpace(verdict) != repositoryMonitorReviewVerdictPassed {
+		return ""
+	}
+	reviewContext, ok := repositoryMonitorReviewPromptContext(prompt)
+	switch {
+	case !ok:
+		return "the review task carried no embedded diff context"
+	case reviewContext.ContextUnavailable != "":
+		return "the diff context was unavailable (" + reviewContext.ContextUnavailable + ")"
+	case reviewContext.Truncated.Files:
+		return "the change set was not completely represented in the diff context"
+	default:
+		return ""
+	}
+}

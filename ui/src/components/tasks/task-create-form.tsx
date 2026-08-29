@@ -51,7 +51,12 @@ export function TaskCreateForm() {
   const [model, setModel] = useState('')
   const [prompt, setPrompt] = useState('')
   const [agentRef, setAgentRef] = useState('')
-  const [aiAgentRef, setAIAgentRef] = useState('')
+  // Agent names are namespace-scoped: the selection remembers the namespace it
+  // was made in and is treated as empty once the dashboard namespace changes,
+  // so an unqualified name is never submitted against a different namespace.
+  const [aiAgentSelection, setAIAgentSelection] = useState<{ namespace: string; name: string } | null>(null)
+  const aiAgentRef = aiAgentSelection && aiAgentSelection.namespace === namespace ? aiAgentSelection.name : ''
+  const setAIAgentRef = (name: string) => setAIAgentSelection(name ? { namespace, name } : null)
   const [showAIModelOverrides, setShowAIModelOverrides] = useState(false)
 
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -97,6 +102,9 @@ export function TaskCreateForm() {
     () => inlineAgents.find((agent) => agent.metadata.name === aiAgentRef),
     [aiAgentRef, inlineAgents],
   )
+  // The controller resolves a providerRef Agent's Provider CRD and makes its
+  // type authoritative, so an inline provider override would be discarded.
+  const agentProviderLocked = Boolean(selectedAIAgent?.spec.providerRef?.name)
   // Tokenized as the user types so a dangling quote is flagged inline instead of
   // after the Task has been created and failed in the container.
   const parsedCommand = useMemo(() => splitShellWords(command), [command])
@@ -127,10 +135,12 @@ export function TaskCreateForm() {
     } else if (type === 'ai') {
       if (aiAgentRef) {
         // The Agent supplies provider/model (and providerRef credentials);
-        // only send explicit overrides so the controller merges the rest.
+        // only send explicit overrides so the controller merges the rest. A
+        // Provider-CRD-backed Agent ignores ai.provider (the CRD type is
+        // authoritative), so that override is never submitted for it.
         body.agentRef = { name: aiAgentRef }
         const ai: Record<string, unknown> = { prompt }
-        if (provider) ai.provider = provider
+        if (provider && !agentProviderLocked) ai.provider = provider
         if (model.trim()) ai.model = model.trim()
         body.ai = ai
       } else {
@@ -447,21 +457,30 @@ export function TaskCreateForm() {
                     id={aiAgentRef ? 'ai-model-overrides' : undefined}
                     className={`grid gap-4 md:grid-cols-2 ${aiAgentRef ? 'border-l-2 border-border pl-4' : ''}`}
                   >
-                    <div className="space-y-2">
-                      <label className="text-sm font-medium">Provider</label>
-                      <Select value={provider} onValueChange={setProvider}>
-                        <SelectTrigger aria-label="AI provider"><SelectValue placeholder={aiAgentRef ? 'Agent default' : 'Select provider'} /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="anthropic">Anthropic</SelectItem>
-                          <SelectItem value="openai">OpenAI</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      {!aiAgentRef && (
-                        <p className="text-xs text-muted-foreground">
-                          Inline providers read their API key from the Task namespace; pick an Agent to use a Provider CRD instead.
+                    {agentProviderLocked ? (
+                      <div className="space-y-2">
+                        <label className="text-sm font-medium">Provider</label>
+                        <p className="text-xs text-muted-foreground" data-testid="ai-provider-locked">
+                          Fixed by the Agent&apos;s Provider CRD ({selectedAIAgent?.spec.providerRef?.name}); only the model can be overridden.
                         </p>
-                      )}
-                    </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <label className="text-sm font-medium">Provider</label>
+                        <Select value={provider} onValueChange={setProvider}>
+                          <SelectTrigger aria-label="AI provider"><SelectValue placeholder={aiAgentRef ? 'Agent default' : 'Select provider'} /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="anthropic">Anthropic</SelectItem>
+                            <SelectItem value="openai">OpenAI</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        {!aiAgentRef && (
+                          <p className="text-xs text-muted-foreground">
+                            Inline providers read their API key from the Task namespace; pick an Agent to use a Provider CRD instead.
+                          </p>
+                        )}
+                      </div>
+                    )}
                     <div className="space-y-2">
                       <label htmlFor="task-model" className="text-sm font-medium">Model</label>
                       <Input id="task-model" value={model} onChange={(e) => setModel(e.target.value)} placeholder={aiAgentRef ? 'Agent default' : 'claude-sonnet-4-20250514'} />

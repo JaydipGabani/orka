@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { render, screen, waitFor, fireEvent } from '@/test/test-utils'
+import { act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { server } from '@/test/mocks/server'
@@ -348,6 +349,41 @@ describe('TaskCreateForm', () => {
     await user.click(screen.getByRole('button', { name: 'Create Task' }))
     await waitFor(() => expect(submitted).toHaveLength(2))
     expect(submitted[1].ai).toEqual({ prompt: 'Summarize', model: 'claude-opus-4-1' })
+  })
+
+  it('hides the ignored provider override for Provider-backed Agents and resets the selection on namespace change', async () => {
+    useStateTypeOverride = 'ai'
+    server.use(
+      http.get('/api/v1/agents', ({ request }) => {
+        const ns = new URL(request.url).searchParams.get('namespace')
+        return HttpResponse.json({
+          items: ns === 'default'
+            ? [{ metadata: { name: 'native-agent', namespace: 'default' }, spec: { providerRef: { name: 'anthropic' }, model: { provider: 'anthropic', name: 'claude' } } }]
+            : [],
+        })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    const agentTrigger = await screen.findByRole('combobox', { name: 'AI agent' })
+    await waitFor(() => expect(agentTrigger).not.toBeDisabled())
+    fireEvent.pointerDown(agentTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: /native-agent/ }))
+    await waitFor(() => expect(screen.getByTestId('ai-agent-info-card')).toBeInTheDocument())
+
+    await user.click(screen.getByRole('button', { name: /Provider \/ model overrides/ }))
+    // A providerRef Agent's Provider CRD is authoritative: no provider picker, only the model.
+    expect(screen.queryByRole('combobox', { name: 'AI provider' })).not.toBeInTheDocument()
+    expect(screen.getByTestId('ai-provider-locked')).toHaveTextContent('anthropic')
+    expect(screen.getByPlaceholderText('Agent default')).toBeInTheDocument()
+
+    // Switching namespaces drops the (namespace-scoped) selection.
+    act(() => {
+      useUIStore.setState({ namespace: 'other' })
+    })
+    await waitFor(() => expect(screen.queryByTestId('ai-agent-info-card')).not.toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: /Provider \/ model overrides/ })).not.toBeInTheDocument()
   })
 
   it('flags a trailing backslash inline and blocks submission', async () => {

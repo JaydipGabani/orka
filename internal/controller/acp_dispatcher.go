@@ -4975,7 +4975,9 @@ func acpPromptFailureMessage(terminal harnessv2.Event) string {
 	// again here keeps a credential out of durable Task status even if a
 	// runtime does not.
 	detail := redact.SensitiveText(strings.TrimSpace(terminal.Failed.Message))
-	code := strings.TrimSpace(terminal.Failed.Code)
+	// The code is runtime-controlled too (only bounded by the harness), so
+	// it gets the same treatment before it becomes durable.
+	code := redact.SensitiveText(strings.TrimSpace(terminal.Failed.Code))
 	switch {
 	case detail == "" && code == "":
 		return generic

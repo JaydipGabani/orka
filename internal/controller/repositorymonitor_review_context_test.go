@@ -680,3 +680,38 @@ func TestRepositoryMonitorReviewTaskAdoptionFailsClosedWhenContextCannotBeReprod
 		t.Fatalf("createRepositoryMonitorReviewTask() created = %v err = %v, want adoption once the context is reproducible", created, err)
 	}
 }
+
+func TestRepositoryMonitorReviewVerdictGateReason(t *testing.T) {
+	t.Parallel()
+	complete := "review\n" + renderRepositoryMonitorReviewContext(repositoryMonitorReviewContext{
+		SchemaVersion: repositoryMonitorReviewContextSchemaVersion, Repo: repositoryMonitorReviewContextTestRepo, PRNumber: 7,
+		HeadSHA: repositoryMonitorReviewContextTestHead,
+	}) + "\n"
+	unavailable := "review\n" + renderRepositoryMonitorReviewContext(repositoryMonitorReviewContext{
+		SchemaVersion: repositoryMonitorReviewContextSchemaVersion, Repo: repositoryMonitorReviewContextTestRepo, PRNumber: 7,
+		HeadSHA: repositoryMonitorReviewContextTestHead, ContextUnavailable: repositoryMonitorReviewContextErrorTimeout,
+	}) + "\n"
+	truncated := "review\n" + renderRepositoryMonitorReviewContext(repositoryMonitorReviewContext{
+		SchemaVersion: repositoryMonitorReviewContextSchemaVersion, Repo: repositoryMonitorReviewContextTestRepo, PRNumber: 7,
+		HeadSHA: repositoryMonitorReviewContextTestHead, Truncated: repositoryMonitorReviewContextTruncation{Files: true},
+	}) + "\n"
+	cases := []struct {
+		name, prompt, verdict string
+		wantGate              bool
+	}{
+		{name: "passed with complete context", prompt: complete, verdict: repositoryMonitorReviewVerdictPassed},
+		{name: "passed without context", prompt: "review only", verdict: repositoryMonitorReviewVerdictPassed, wantGate: true},
+		{name: "passed with unavailable context", prompt: unavailable, verdict: repositoryMonitorReviewVerdictPassed, wantGate: true},
+		{name: "passed with truncated files", prompt: truncated, verdict: repositoryMonitorReviewVerdictPassed, wantGate: true},
+		{name: "needs_changes is never gated", prompt: unavailable, verdict: repositoryMonitorReviewVerdictNeedsChanges},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := repositoryMonitorReviewVerdictGateReason(tc.prompt, tc.verdict)
+			if (got != "") != tc.wantGate {
+				t.Fatalf("gate reason = %q, wantGate %v", got, tc.wantGate)
+			}
+		})
+	}
+}
