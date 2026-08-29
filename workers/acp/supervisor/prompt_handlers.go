@@ -2064,27 +2064,31 @@ func providerUpstreamFailureResult(state *sessionState, prompt *promptState, res
 	return result
 }
 
-// promptFailureErrorDetail renders a bounded, sanitized description of the
-// error that failed a prompt: the JSON-RPC error message plus any service and
-// errorName data the ACP agent attached. Private provider-proxy routes are
-// stripped, matching sanitizeProviderUpstreamDetail.
+// promptFailureErrorDetail renders a bounded, low-cardinality description of
+// the error that failed a prompt. Free-text error messages are never copied:
+// the ACP child (and the provider behind it) can echo credentials or private
+// routes into them, and the terminal event is persisted and projected onto
+// Task status. Only the validated JSON-RPC code plus the identifier-shaped
+// service/errorName data the agent attached, or the supervisor's own
+// classification stage, are exposed.
 func promptFailureErrorDetail(err error) string {
 	if err == nil {
 		return ""
 	}
-	detail := err.Error()
-	var rpcErr *acp.RPCError
-	if errors.As(err, &rpcErr) && rpcErr != nil {
-		detail = strings.TrimSpace(rpcErr.Message)
-		_, _, service, errorName := promptExecutionDiagnostic(err)
-		switch {
-		case service != "" && errorName != "":
-			detail = fmt.Sprintf("%s/%s: %s", service, errorName, detail)
-		case errorName != "":
-			detail = errorName + ": " + detail
-		}
+	stage, rpcCode, service, errorName := promptExecutionDiagnostic(err)
+	if stage != promptExecutionStageJSONRPCError {
+		return stage
 	}
-	return promptStreamErrorDetail(errors.New(sanitizeProviderUpstreamDetail(detail)))
+	detail := fmt.Sprintf("json-rpc error %d", rpcCode)
+	switch {
+	case service != "" && errorName != "":
+		detail += " " + service + "/" + errorName
+	case errorName != "":
+		detail += " " + errorName
+	case service != "":
+		detail += " " + service
+	}
+	return detail
 }
 
 // failedEventStopReason maps a failed prompt's ACP stop reason onto one the
