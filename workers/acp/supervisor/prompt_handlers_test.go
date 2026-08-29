@@ -951,7 +951,7 @@ func TestProviderUpstreamFailureOnlyMapsToTerminalFailure(t *testing.T) {
 	wantMessage := "provider upstream returned HTTP 402 for the final inference request: You have exceeded your monthly quota"
 	if terminal.Type != harnessv2.EventFailed || terminal.Failed == nil ||
 		terminal.Failed.StopReason != harnessv2.ACPStopReasonRefusal ||
-		terminal.Failed.Code != "provider_upstream_error" || terminal.Failed.Retryable ||
+		terminal.Failed.Code != providerUpstreamErrorCode || terminal.Failed.Retryable ||
 		terminal.Failed.Message != wantMessage {
 		t.Fatalf("upstream-failure terminal event = %#v", terminal.Failed)
 	}
@@ -981,7 +981,7 @@ func TestProviderUpstreamFinalFailureAfterSuccessMapsToTerminalFailure(t *testin
 	}
 	terminal, settledResult := fixture.settleCompleted(t)
 	if terminal.Type != harnessv2.EventFailed || terminal.Failed == nil ||
-		terminal.Failed.Code != "provider_upstream_error" ||
+		terminal.Failed.Code != providerUpstreamErrorCode ||
 		terminal.Failed.Message != "provider upstream returned HTTP 429 for the final inference request: rate limit exceeded" {
 		t.Fatalf("final-failure terminal event = %#v", terminal.Failed)
 	}
@@ -1291,7 +1291,7 @@ func TestProviderUpstreamFailureTerminalEventRedactsCredentials(t *testing.T) {
 	fixture.recordInference(t, http.StatusBadRequest, providerUpstreamErrorDetail([]byte(credentialShapedUpstreamErrorBody)))
 
 	terminal, settledResult := fixture.settleCompleted(t)
-	if terminal.Type != harnessv2.EventFailed || terminal.Failed == nil || terminal.Failed.Code != "provider_upstream_error" {
+	if terminal.Type != harnessv2.EventFailed || terminal.Failed == nil || terminal.Failed.Code != providerUpstreamErrorCode {
 		t.Fatalf("upstream-failure terminal event = %#v", terminal.Failed)
 	}
 	assertNoLeakedCredential(t, "terminal Failed event message", terminal.Failed.Message)

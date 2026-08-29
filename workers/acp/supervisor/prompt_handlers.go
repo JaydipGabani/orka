@@ -1977,7 +1977,7 @@ func (s *Server) buildTerminalEventLocked(
 			code = "turn_limit"
 			message = "ACP prompt exceeded maximum provider inference requests"
 		} else if upstreamFailure, ok := errors.AsType[*providerUpstreamFailureError](result.Err); ok {
-			code = "provider_upstream_error"
+			code = providerUpstreamErrorCode
 			message = promptStreamErrorDetail(upstreamFailure)
 		} else if detail := promptFailureErrorDetail(result.Err); detail != "" {
 			// Keep the generic code but carry the agent's own error text
@@ -2032,6 +2032,10 @@ func providerTurnLimitResult(state *sessionState, prompt *promptState, result ac
 	result.Accepted = true
 	return result
 }
+
+// providerUpstreamErrorCode is the terminal Failed event code for a prompt whose
+// final inference request failed upstream.
+const providerUpstreamErrorCode = "provider_upstream_error"
 
 // providerUpstreamFailureError records that the final provider inference request
 // made during a prompt failed upstream, even though the ACP agent reported the

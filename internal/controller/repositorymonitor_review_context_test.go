@@ -27,6 +27,7 @@ const (
 	repositoryMonitorReviewContextTestPath   = "main.go"
 	repositoryMonitorReviewContextTestPatch  = "@@ -1 +1,2 @@\n package main\n+// change"
 	repositoryMonitorReviewContextTestStatus = "modified"
+	repositoryMonitorReviewContextTestAdded  = "added"
 	repositoryMonitorReviewContextTestBase   = "base7"
 	repositoryMonitorReviewContextTestHead   = "head7"
 	repositoryMonitorReviewContextTestRepo   = "orka-agents/orka"
@@ -49,7 +50,7 @@ func TestRepositoryMonitorReviewContextFromFilesRendersBoundedPayload(t *testing
 	files := []repositoryMonitorPullRequestFileResponse{
 		{Filename: repositoryMonitorReviewContextTestPath, Status: repositoryMonitorReviewContextTestStatus, Additions: 1, Deletions: 0, Patch: repositoryMonitorReviewContextTestPatch},
 		{Filename: "docs/new.md", PreviousFilename: "docs/old.md", Status: "renamed", Additions: 0, Deletions: 0},
-		{Filename: "image.png", Status: "added", Additions: 0, Deletions: 0, Patch: ""},
+		{Filename: "image.png", Status: repositoryMonitorReviewContextTestAdded, Additions: 0, Deletions: 0, Patch: ""},
 	}
 	got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, pr, files)
 	if got.SchemaVersion != repositoryMonitorReviewContextSchemaVersion || got.Repo != repositoryMonitorReviewContextTestRepo || got.PRNumber != 7 || got.BaseSHA != repositoryMonitorReviewContextTestBase || got.HeadSHA != repositoryMonitorReviewContextTestHead {
@@ -258,7 +259,7 @@ func TestRepositoryMonitorReviewContextRedactsCredentialsSplitByControlCharacter
 	const secret = "ak-live-0123456789abcdef"
 	split := "api_key=" + secret[:10] + "\x00" + secret[10:]
 	files := []repositoryMonitorPullRequestFileResponse{
-		{Filename: "config/" + split + ".env", Status: "added", Additions: 1, Patch: "@@ -0,0 +1 @@\n+" + split + "\n"},
+		{Filename: "config/" + split + ".env", Status: repositoryMonitorReviewContextTestAdded, Additions: 1, Patch: "@@ -0,0 +1 @@\n+" + split + "\n"},
 	}
 	reviewContext := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), files)
 	entry := reviewContext.Files[0]
@@ -277,7 +278,7 @@ func TestRepositoryMonitorReviewContextRedactsCredentialsFromPatchesAndPaths(t *
 	// Assembled at runtime so the fixture never appears as a literal credential URL.
 	credentialURL := "https://deploy:" + "hunter2secret" + "@git.example/repo.git"
 	files := []repositoryMonitorPullRequestFileResponse{
-		{Filename: "config/" + apiKey + ".env", Status: "added", Additions: 3, Patch: "@@ -0,0 +1,3 @@\n+" + apiKey + "\n+Authorization: Bearer " + jwt + "\n+url = " + signedURL + "\n+remote = " + credentialURL + "\n"},
+		{Filename: "config/" + apiKey + ".env", Status: repositoryMonitorReviewContextTestAdded, Additions: 3, Patch: "@@ -0,0 +1,3 @@\n+" + apiKey + "\n+Authorization: Bearer " + jwt + "\n+url = " + signedURL + "\n+remote = " + credentialURL + "\n"},
 	}
 	pr := repositoryMonitorReviewContextTestPR()
 	reviewContext := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, pr, files)
