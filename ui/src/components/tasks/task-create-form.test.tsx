@@ -402,6 +402,25 @@ describe('TaskCreateForm', () => {
     expect(toast.success).not.toHaveBeenCalled()
   })
 
+  it('drops an AI Agent selection that disappears from the refreshed list', async () => {
+    useStateTypeOverride = 'ai'
+    let agents = [{ metadata: { name: 'native-agent', namespace: 'default' }, spec: { model: { provider: 'anthropic', name: 'claude' } } }]
+    server.use(http.get('/api/v1/agents', () => HttpResponse.json({ items: agents })))
+    render(<TaskCreateForm />)
+
+    const agentTrigger = await screen.findByRole('combobox', { name: 'AI agent' })
+    await waitFor(() => expect(agentTrigger).not.toBeDisabled())
+    fireEvent.pointerDown(agentTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: /native-agent/ }))
+    await waitFor(() => expect(screen.getByTestId('ai-agent-info-card')).toBeInTheDocument())
+
+    // The Agent is deleted; the next refetch no longer lists it.
+    agents = []
+    window.dispatchEvent(new Event('visibilitychange'))
+    await waitFor(() => expect(screen.queryByTestId('ai-agent-info-card')).not.toBeInTheDocument())
+    expect(screen.getByRole('combobox', { name: 'AI provider' })).toBeInTheDocument()
+  })
+
   it('AI type without an Agent still submits the inline provider path', async () => {
     useStateTypeOverride = 'ai'
     let submitted: Record<string, unknown> | undefined

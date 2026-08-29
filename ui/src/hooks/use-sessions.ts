@@ -1,9 +1,13 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ApiError, api, isForbiddenError } from '@/lib/api-client'
 
-// Client errors (403/404/400) do not clear on retry; only transient failures do.
-const retryUnlessClientError = (failureCount: number, error: unknown) =>
-  !(error instanceof ApiError && error.status >= 400 && error.status < 500) && failureCount < 3
+// Client errors (403/404/400) do not clear on retry; only transient failures
+// do. 408 (request timeout) and 429 (throttled) are client statuses that an
+// ingress or API throttle returns transiently, so they keep retrying.
+const transientClientStatuses = new Set([408, 429])
+export const retryUnlessClientError = (failureCount: number, error: unknown) =>
+  failureCount < 3 &&
+  !(error instanceof ApiError && error.status >= 400 && error.status < 500 && !transientClientStatuses.has(error.status))
 import { useUIStore } from '@/stores/ui'
 import type { Session, SessionListItem } from '@/schemas/session'
 

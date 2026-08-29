@@ -7,7 +7,8 @@ vi.mock('zustand/middleware', () => ({
 }))
 
 import { useUIStore } from '@/stores/ui'
-import { useSessionList, useSession, useDeleteSession } from './use-sessions'
+import { useSessionList, useSession, useDeleteSession, retryUnlessClientError } from './use-sessions'
+import { ApiError } from '@/lib/api-client'
 
 function createWrapper() {
   const queryClient = new QueryClient({
@@ -49,5 +50,17 @@ describe('useDeleteSession', () => {
       result.current.mutate('sess-1')
     })
     await waitFor(() => expect(result.current.isSuccess).toBe(true))
+  })
+})
+
+describe('retryUnlessClientError', () => {
+  it('retries transient failures and 408/429 but not other client errors', () => {
+    expect(retryUnlessClientError(0, new Error('network'))).toBe(true)
+    expect(retryUnlessClientError(0, new ApiError(500, 'boom'))).toBe(true)
+    expect(retryUnlessClientError(0, new ApiError(408, 'timeout'))).toBe(true)
+    expect(retryUnlessClientError(0, new ApiError(429, 'throttled'))).toBe(true)
+    expect(retryUnlessClientError(0, new ApiError(403, 'forbidden'))).toBe(false)
+    expect(retryUnlessClientError(0, new ApiError(404, 'missing'))).toBe(false)
+    expect(retryUnlessClientError(3, new ApiError(429, 'throttled'))).toBe(false)
   })
 })

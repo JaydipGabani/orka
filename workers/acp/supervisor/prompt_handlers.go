@@ -311,13 +311,20 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 	// otherwise the upstream-failure classification could read a snapshot
 	// with an earlier failure and no success yet, and turn a successfully
 	// retried prompt into provider_upstream_error.
-	// Admission closes first: a child that has settled must not launch
-	// further inference calls during the bounded drain.
+	// Capabilities close before the drain: a settled child must not start
+	// MCP/tool side effects or launch further inference calls while the
+	// last provider relay finishes. Only the provider proxy's deactivation
+	// waits, and only for responses that were already admitted.
+	if state.mcpProxy != nil {
+		state.mcpProxy.deactivate(request.Metadata.PromptID, harnessv2.RuntimeSessionStateCancelling)
+	}
 	if state.providerProxy != nil {
 		state.providerProxy.closeAdmission(string(request.Metadata.PromptID))
 	}
 	s.waitProviderProxyDrained(state)
-	deactivatePromptCapabilities(state, request.Metadata.PromptID, harnessv2.RuntimeSessionStateCancelling)
+	if state.providerProxy != nil {
+		state.providerProxy.deactivate(string(request.Metadata.PromptID))
+	}
 	terminal, settledResult, terminalErr := s.terminalEvent(state, prompt, result)
 	if settledResult.Outcome == acp.PromptOutcomeFailed {
 		outcome, stopReason := promptTerminalDiagnostic(settledResult)

@@ -854,7 +854,14 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	response, err := p.client.Do(upstreamRequest)
 	if err != nil {
-		session.recordInferenceOutcome(authorization.promptID, requestClass, inferenceSeq, http.StatusBadGateway, providerUpstreamTransportFailure)
+		// A transport failure is upstream evidence only while the child's
+		// request is still wanted. When the child (or the prompt gate)
+		// cancelled before headers arrived, nothing about the upstream was
+		// learned, so the sequence is left unaccounted rather than turning a
+		// speculative request the child abandoned into a prompt failure.
+		if requestContext.Err() == nil {
+			session.recordInferenceOutcome(authorization.promptID, requestClass, inferenceSeq, http.StatusBadGateway, providerUpstreamTransportFailure)
+		}
 		providerproxy.WriteError(w, http.StatusBadGateway, providerUpstreamTransportFailure)
 		return
 	}

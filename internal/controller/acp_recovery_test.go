@@ -3524,3 +3524,38 @@ func TestRecoveredTerminalDeliveryStatusUsesTaskReceiptWithoutPublication(t *tes
 		t.Fatalf("status = %#v", status)
 	}
 }
+
+func TestRetireRecoveredRuntimeSessionBindingKeepsSessionBoundReadBindings(t *testing.T) {
+	t.Parallel()
+	const sessionUID = "acp-session-retire-test"
+	newDispatcher := func() *ACPDispatcher {
+		d := &ACPDispatcher{}
+		d.setRuntimeSessionBinding(ACPRuntimeSessionBinding{SessionUID: sessionUID, Generation: 1})
+		return d
+	}
+	sessionRef := &corev1alpha1.SessionReference{Name: "durable"}
+	cases := []struct {
+		name string
+		task *corev1alpha1.Task
+		keep bool
+	}{
+		{name: "session-bound prompt-only task keeps the live binding", keep: true, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{SessionRef: sessionRef}}},
+		{name: "session-bound read workspace keeps the live binding", keep: true, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+			SessionRef: sessionRef, Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead},
+		}}},
+		{name: "session-bound write workspace retires the task-scoped binding", keep: false, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+			SessionRef: sessionRef, Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+		}}},
+		{name: "task without a durable session retires the binding", keep: false, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := newDispatcher()
+			d.retireRecoveredRuntimeSessionBinding(tc.task, sessionUID)
+			if got := d.currentRuntimeSessionBinding(sessionUID) != nil; got != tc.keep {
+				t.Fatalf("binding retained = %v, want %v", got, tc.keep)
+			}
+		})
+	}
+}

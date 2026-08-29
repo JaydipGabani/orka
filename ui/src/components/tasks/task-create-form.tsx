@@ -55,7 +55,6 @@ export function TaskCreateForm() {
   // was made in and is treated as empty once the dashboard namespace changes,
   // so an unqualified name is never submitted against a different namespace.
   const [aiAgentSelection, setAIAgentSelection] = useState<{ namespace: string; name: string } | null>(null)
-  const aiAgentRef = aiAgentSelection && aiAgentSelection.namespace === namespace ? aiAgentSelection.name : ''
   const setAIAgentRef = (name: string) => setAIAgentSelection(name ? { namespace, name } : null)
   const [showAIModelOverrides, setShowAIModelOverrides] = useState(false)
 
@@ -98,6 +97,16 @@ export function TaskCreateForm() {
     [agentsData],
   )
   const runtimeAgentCount = (agentsData?.items.length ?? 0) - inlineAgents.length
+  // The selection only counts while it names a native Agent in the current
+  // namespace's latest list: an Agent deleted (or turned into a runtime
+  // Agent) after being picked must not be submitted as a stale agentRef. The
+  // pick survives while the list is still loading.
+  const aiAgentRef =
+    aiAgentSelection &&
+    aiAgentSelection.namespace === namespace &&
+    (agentsData === undefined || inlineAgents.some((agent) => agent.metadata.name === aiAgentSelection.name))
+      ? aiAgentSelection.name
+      : ''
   const selectedAIAgent = useMemo(
     () => inlineAgents.find((agent) => agent.metadata.name === aiAgentRef),
     [aiAgentRef, inlineAgents],

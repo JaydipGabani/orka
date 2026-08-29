@@ -1260,6 +1260,52 @@ func TestProviderProxyChildCancelDuringStreamedSuccessCountsAsSuccess(t *testing
 	}
 }
 
+func TestProviderProxyChildCancelBeforeHeadersIsNotAnUpstreamFailure(t *testing.T) {
+	requestSeen := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(requestSeen)
+		// Never write headers: the child abandons the request first.
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+	// An earlier request already succeeded; the abandoned one is later-issued.
+	session.recordInferenceResponse(testPromptOneID, providerRequestInference, http.StatusOK, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, strings.NewReader(`{"model":"test-model"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(providerAuthorizationHeader, "Bearer "+binding.Credential)
+	done := make(chan error, 1)
+	go func() {
+		response, err := http.DefaultClient.Do(request)
+		if err == nil {
+			_ = response.Body.Close()
+		}
+		done <- err
+	}()
+	<-requestSeen
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("cancelled request unexpectedly completed")
+	}
+	waitProviderProxyIdle(t, session)
+	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed {
+		t.Fatalf("pre-header child cancel accounted as upstream failure: %d %q", status, detail)
+	}
+	if failures := session.inferenceFailures; failures != 0 {
+		t.Fatalf("inferenceFailures = %d, want 0", failures)
+	}
+}
+
 func TestProviderProxyStreamedSuccessOverLimitCountsAsFailure(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// No Content-Length: the body is chunked, so the size is unknown

@@ -328,6 +328,13 @@ func (d *ACPDispatcher) prepareTaskSession(
 			preparation.plan.Reason = "persisted-runtime-session-recreation"
 		}
 	}
+	logf.FromContext(ctx).Info("ACP runtime session planned",
+		"namespace", task.Namespace, "task", task.Name, "sessionUID", preparation.control.SessionUID,
+		"reason", preparation.plan.Reason, "generation", preparation.plan.Binding.Generation,
+		"recreate", preparation.plan.Recreate, "bootstrap", preparation.plan.BootstrapRequired,
+		"currentBindingKnown", preparation.current != nil, "leaseGeneration", lease.Session.LeaseGeneration,
+		"durableGeneration", preparation.control.RuntimeSessionGeneration,
+	)
 	return &acpTaskSession{
 		Turn: turn, Binding: preparation.plan.Binding, Bootstrap: preparation.bootstrap,
 		UserPrompt:       preparation.userPrompt,
@@ -986,6 +993,21 @@ func (d *ACPDispatcher) removeRuntimeSessionBinding(sessionUID string) {
 	d.mu.Lock()
 	delete(d.runtimeSessions, strings.TrimSpace(sessionUID))
 	d.mu.Unlock()
+}
+
+// retireRecoveredRuntimeSessionBinding drops the in-memory RuntimeSession
+// binding after recovered terminal settlement only when the RuntimeSession
+// itself is retired with the Task (task-scoped: no durable Session, or a
+// write workspace). A session-bound read RuntimeSession stays live on the
+// supervisor after its turn finalizes, and its binding must survive so the
+// next continuation Task plans a reuse instead of a controller-restart style
+// recreation at a new generation with a full transcript bootstrap.
+func (d *ACPDispatcher) retireRecoveredRuntimeSessionBinding(task *corev1alpha1.Task, sessionUID string) {
+	if task != nil && task.Spec.SessionRef != nil &&
+		(task.Spec.Workspace == nil || task.Spec.Workspace.Intent != corev1alpha1.WorkspaceIntentWrite) {
+		return
+	}
+	d.removeRuntimeSessionBinding(sessionUID)
 }
 
 func bootstrapPromptText(bootstrap *ACPBootstrapTranscript) string {

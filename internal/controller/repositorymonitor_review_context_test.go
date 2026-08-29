@@ -22,19 +22,21 @@ import (
 )
 
 const (
-	reviewContextTestPullPath                = "/repos/orka-agents/orka/pulls/7"
-	reviewContextTestFilesPath               = "/repos/orka-agents/orka/pulls/7/files"
-	repositoryMonitorReviewContextTestPath   = "main.go"
-	repositoryMonitorReviewContextTestPatch  = "@@ -1 +1,2 @@\n package main\n+// change"
-	repositoryMonitorReviewContextTestStatus = "modified"
-	repositoryMonitorReviewContextTestAdded  = "added"
-	repositoryMonitorReviewContextTestBase   = "base7"
-	repositoryMonitorReviewContextTestHead   = "head7"
-	repositoryMonitorReviewContextTestRepo   = "orka-agents/orka"
-	repositoryMonitorReviewContextTestOwner  = "orka-agents"
-	repositoryMonitorReviewContextTestName   = "orka"
-	repositoryMonitorReviewContextTestKind   = "RepositoryMonitor"
-	repositoryMonitorReviewContextReviewer   = "reviewer"
+	reviewContextTestPullPath                 = "/repos/orka-agents/orka/pulls/7"
+	reviewContextTestFilesPath                = "/repos/orka-agents/orka/pulls/7/files"
+	repositoryMonitorReviewContextTestPath    = "main.go"
+	repositoryMonitorReviewContextTestPatch   = "@@ -1 +1,2 @@\n package main\n+// change"
+	repositoryMonitorReviewContextTestStatus  = "modified"
+	repositoryMonitorReviewContextTestAdded   = "added"
+	repositoryMonitorReviewContextTestRenamed = "renamed"
+	repositoryMonitorReviewContextTestShort   = "short.go"
+	repositoryMonitorReviewContextTestBase    = "base7"
+	repositoryMonitorReviewContextTestHead    = "head7"
+	repositoryMonitorReviewContextTestRepo    = "orka-agents/orka"
+	repositoryMonitorReviewContextTestOwner   = "orka-agents"
+	repositoryMonitorReviewContextTestName    = "orka"
+	repositoryMonitorReviewContextTestKind    = "RepositoryMonitor"
+	repositoryMonitorReviewContextReviewer    = "reviewer"
 )
 
 func repositoryMonitorReviewContextTestPR() repositoryMonitorPullRequest {
@@ -49,7 +51,7 @@ func TestRepositoryMonitorReviewContextFromFilesRendersBoundedPayload(t *testing
 	pr := repositoryMonitorReviewContextTestPR()
 	files := []repositoryMonitorPullRequestFileResponse{
 		{Filename: repositoryMonitorReviewContextTestPath, Status: repositoryMonitorReviewContextTestStatus, Additions: 1, Deletions: 0, Patch: repositoryMonitorReviewContextTestPatch},
-		{Filename: "docs/new.md", PreviousFilename: "docs/old.md", Status: "renamed", Additions: 0, Deletions: 0},
+		{Filename: "docs/new.md", PreviousFilename: "docs/old.md", Status: repositoryMonitorReviewContextTestRenamed, Additions: 0, Deletions: 0},
 		{Filename: "image.png", Status: repositoryMonitorReviewContextTestAdded, Additions: 0, Deletions: 0, Patch: ""},
 	}
 	got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, pr, files)
@@ -710,9 +712,9 @@ func TestRepositoryMonitorReviewContextAlteredPathMarksChangeSetIncomplete(t *te
 		file repositoryMonitorPullRequestFileResponse
 	}{
 		{name: "deleted long path", file: repositoryMonitorPullRequestFileResponse{Filename: longPath, Status: "removed", Deletions: 1, Patch: "@@ -1 +0,0 @@\n-old\n"}},
-		{name: "renamed from long path", file: repositoryMonitorPullRequestFileResponse{Filename: "short.go", PreviousFilename: longPath, Status: "renamed"}},
+		{name: "renamed from long path", file: repositoryMonitorPullRequestFileResponse{Filename: repositoryMonitorReviewContextTestShort, PreviousFilename: longPath, Status: repositoryMonitorReviewContextTestRenamed}},
 		{name: "deleted path with credential-shaped segment", file: repositoryMonitorPullRequestFileResponse{Filename: "config/api_key=ak-live-0123456789abcdef.env", Status: "removed", Deletions: 1}},
-		{name: "renamed from control-character path", file: repositoryMonitorPullRequestFileResponse{Filename: "short.go", PreviousFilename: "old\x00name.go", Status: "renamed"}},
+		{name: "renamed from control-character path", file: repositoryMonitorPullRequestFileResponse{Filename: repositoryMonitorReviewContextTestShort, PreviousFilename: "old\x00name.go", Status: repositoryMonitorReviewContextTestRenamed}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -726,7 +728,7 @@ func TestRepositoryMonitorReviewContextAlteredPathMarksChangeSetIncomplete(t *te
 			}
 		})
 	}
-	short := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{{Filename: "short.go", Status: repositoryMonitorReviewContextTestStatus, Patch: repositoryMonitorReviewContextTestPatch}})
+	short := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{{Filename: repositoryMonitorReviewContextTestShort, Status: repositoryMonitorReviewContextTestStatus, Patch: repositoryMonitorReviewContextTestPatch}})
 	if short.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=false for an in-bound path", short.Truncated)
 	}

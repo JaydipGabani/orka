@@ -72,6 +72,10 @@ func TestACPWorkspaceValidationFailureMessageProjectsSupervisorReason(t *testing
 	if got := acpWorkspaceValidationFailureMessage(&harnessv2.ClientError{StatusCode: 409, Message: "   "}); got != generic {
 		t.Fatalf("blank client message = %q, want %q", got, generic)
 	}
+	long := &harnessv2.ClientError{StatusCode: 409, Code: harnessv2.ErrorCodeSessionPoisoned, Message: "workspace validation failed: " + strings.Repeat("x", 2*acpPromptFailureMessageLimit)}
+	if got := acpWorkspaceValidationFailureMessage(long); len(got) > acpPromptFailureMessageLimit || !strings.HasPrefix(got, generic+": ") {
+		t.Fatalf("len(long client message) = %d (limit %d), prefix ok=%v", len(got), acpPromptFailureMessageLimit, strings.HasPrefix(got, generic+": "))
+	}
 }
 
 func TestACPPromptFailureMessageTruncatesOnRuneBoundary(t *testing.T) {
@@ -88,8 +92,9 @@ func TestACPPromptFailureMessageTruncatesOnRuneBoundary(t *testing.T) {
 	clientErr := &harnessv2.ClientError{StatusCode: 409, Code: harnessv2.ErrorCodeSessionPoisoned, Message: multibyte}
 	got = acpWorkspaceValidationFailureMessage(clientErr)
 	const generic = "workspace validation failed before a trusted delta was established: "
-	detail := strings.TrimPrefix(got, generic)
-	if detail == got || !utf8.ValidString(detail) || len(detail) > acpPromptFailureMessageLimit || len(detail) < acpPromptFailureMessageLimit-utf8.UTFMax {
+	// The complete projected message (prefix included) is bounded, on a rune
+	// boundary, exactly like acpPromptFailureMessage.
+	if !strings.HasPrefix(got, generic) || !utf8.ValidString(got) || len(got) > acpPromptFailureMessageLimit || len(got) < acpPromptFailureMessageLimit-utf8.UTFMax {
 		t.Fatalf("acpWorkspaceValidationFailureMessage() = %q (%d bytes)", got, len(got))
 	}
 }

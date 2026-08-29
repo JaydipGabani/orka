@@ -4404,7 +4404,7 @@ func acpWorkspaceValidationFailureMessage(err error) string {
 		return generic
 	}
 	detail := redact.SensitiveText(boundedRuntimeSessionServerMessage(err))
-	return generic + ": " + boundACPStatusMessage(detail)
+	return boundACPStatusMessage(generic + ": " + detail)
 }
 
 func boundedRuntimeSessionServerMessage(err error) string {
