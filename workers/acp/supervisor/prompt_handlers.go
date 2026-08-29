@@ -1971,6 +1971,11 @@ func (s *Server) buildTerminalEventLocked(
 		} else if upstreamFailure, ok := errors.AsType[*providerUpstreamFailureError](result.Err); ok {
 			code = "provider_upstream_error"
 			message = promptStreamErrorDetail(upstreamFailure)
+		} else if detail := promptFailureErrorDetail(result.Err); detail != "" {
+			// Keep the generic code but carry the agent's own error text
+			// (JSON-RPC error message and service/errorName data) so a
+			// provider or session failure is diagnosable from Task status.
+			message = "ACP prompt failed: " + detail
 		}
 		event.Failed = &harnessv2.FailedEvent{
 			StopReason: harnessv2.ACPStopReason(result.StopReason),
@@ -2057,6 +2062,29 @@ func providerUpstreamFailureResult(state *sessionState, prompt *promptState, res
 	result.Accepted = true
 	result.Err = &providerUpstreamFailureError{Status: status, Detail: detail}
 	return result
+}
+
+// promptFailureErrorDetail renders a bounded, sanitized description of the
+// error that failed a prompt: the JSON-RPC error message plus any service and
+// errorName data the ACP agent attached. Private provider-proxy routes are
+// stripped, matching sanitizeProviderUpstreamDetail.
+func promptFailureErrorDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	detail := err.Error()
+	var rpcErr *acp.RPCError
+	if errors.As(err, &rpcErr) && rpcErr != nil {
+		detail = strings.TrimSpace(rpcErr.Message)
+		_, _, service, errorName := promptExecutionDiagnostic(err)
+		switch {
+		case service != "" && errorName != "":
+			detail = fmt.Sprintf("%s/%s: %s", service, errorName, detail)
+		case errorName != "":
+			detail = errorName + ": " + detail
+		}
+	}
+	return promptStreamErrorDetail(errors.New(sanitizeProviderUpstreamDetail(detail)))
 }
 
 func serializedEventWithinLimit(event harnessv2.Event, limit int) bool {
