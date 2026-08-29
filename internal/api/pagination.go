@@ -113,6 +113,11 @@ func (h *Handlers) listPage(ctx context.Context, list client.ObjectList, opts *c
 	// Defense in depth: the sentinel must never reach a client even if a
 	// cache-backed reader served the page.
 	list.SetContinue(NormalizeListContinue(list.GetContinue()))
+	// Every caller applies per-item authorization after paging, so the API
+	// server's collection-wide remaining count would reveal how many objects
+	// the caller is not allowed to see on later pages. Clients page with the
+	// continue token; the optional count is never forwarded.
+	list.SetRemainingItemCount(nil)
 	return nil
 }
 

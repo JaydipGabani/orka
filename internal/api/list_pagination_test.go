@@ -32,7 +32,8 @@ const (
 
 // paginatingReader emulates the API server's chunked list semantics on top of
 // the fake client, which ignores Limit/Continue: items are served in name
-// order, Continue is an opaque offset, and RemainingItemCount is populated.
+// order, Continue is an opaque offset, and RemainingItemCount is populated
+// (the handlers must strip it before responding).
 type paginatingReader struct {
 	client.Reader
 	lists int
@@ -165,10 +166,14 @@ func paginatedListNames(t *testing.T, app *fiber.App, target string) ([]string, 
 	var body struct {
 		Items    []map[string]any `json:"items"`
 		Metadata struct {
-			Continue string `json:"continue"`
+			Continue           string `json:"continue"`
+			RemainingItemCount *int64 `json:"remainingItemCount"`
 		} `json:"metadata"`
 	}
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&body))
+	// The API server's collection-wide count would reveal how many objects a
+	// scoped caller cannot see on later pages, so it is never forwarded.
+	require.Nil(t, body.Metadata.RemainingItemCount, "remainingItemCount must not be forwarded from paginated lists")
 	names := make([]string, 0, len(body.Items))
 	for _, item := range body.Items {
 		if builtin, _ := item["builtin"].(bool); builtin {
