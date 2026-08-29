@@ -107,6 +107,7 @@ type agentExecutionSnapshotWorkspaceClass struct {
 	EffectiveOnDetach  string                               `json:"effectiveOnDetach"`
 	SuspendMode        string                               `json:"suspendMode,omitempty"`
 	SandboxVolume      *agentExecutionSnapshotSandboxVolume `json:"sandboxVolume,omitempty"`
+	MaxSuspended       *int32                               `json:"maxSuspended,omitempty"`
 	DefaultOnDetach    string                               `json:"defaultOnDetach"`
 	AllowedOnDetach    []string                             `json:"allowedOnDetach"`
 	DetachTimeout      string                               `json:"detachTimeout"`
@@ -431,7 +432,7 @@ func permanentACPWorkspaceSessionPlanningError(err error) bool {
 }
 
 func classifyACPWorkspaceClassResolutionError(err error) error {
-	if isRetryableACPWorkspaceClassResolutionError(err) {
+	if isRetryableACPWorkspaceClassResolutionError(err) || errors.Is(err, errACPWorkspacePlanningTransient) {
 		return err
 	}
 	return permanentACPAgentConfiguration(err)
@@ -694,6 +695,10 @@ func snapshotWorkspaceClassFromBinding(class *ACPWorkspaceClassBinding) *agentEx
 			Capacity:         class.SandboxVolume.Capacity,
 		}
 	}
+	if class.MaxSuspendedWorkspaces != nil {
+		limit := *class.MaxSuspendedWorkspaces
+		frozen.MaxSuspended = &limit
+	}
 	frozen.DeletionPolicy.ProviderResources = class.DeletionPolicy.ProviderResources
 	frozen.DeletionPolicy.PersistentVolumes = class.DeletionPolicy.PersistentVolumes
 	frozen.DeletionPolicy.Checkpoints = class.DeletionPolicy.Checkpoints
@@ -723,6 +728,13 @@ func workspaceClassBindingFromSnapshot(class *agentExecutionSnapshotWorkspaceCla
 		IdleTimeout:        class.IdleTimeout,
 		MaxLifetime:        class.MaxLifetime,
 		SandboxVolume:      sandboxVolumeFromSnapshot(class.SandboxVolume),
+		MaxSuspendedWorkspaces: func() *int32 {
+			if class.MaxSuspended == nil {
+				return nil
+			}
+			limit := *class.MaxSuspended
+			return &limit
+		}(),
 		DeletionPolicy: ACPWorkspaceClassDeletionPolicy{
 			ProviderResources: class.DeletionPolicy.ProviderResources,
 			PersistentVolumes: class.DeletionPolicy.PersistentVolumes,

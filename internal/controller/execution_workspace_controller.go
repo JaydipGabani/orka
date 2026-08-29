@@ -45,6 +45,24 @@ func (r *ExecutionWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	if r.CleanupOnly && workspace.DeletionTimestamp.IsZero() {
+		// Cleanup-only mode admits nothing new, but the cleanup finalizer
+		// must still be installed: a workspace created just before the API
+		// was disabled would otherwise never gain it, retention would wait on
+		// it forever, and neither idleTimeout nor maxLifetime could ever
+		// reclaim the workspace and its pool. Only ACP-owned workspaces get
+		// this recovery: adapters registered solely under the enabled API
+		// (the development fake provider) are not running in cleanup-only
+		// mode, and a finalizer no adapter can ever settle with StateDeleted
+		// would make the object undeletable.
+		if workspace.Labels[workspacev1alpha1.ProviderControllerLabel] != acpWorkspaceProviderControllerName {
+			return ctrl.Result{}, nil
+		}
+		if !controllerutil.ContainsFinalizer(workspace, executionWorkspaceFinalizer) {
+			controllerutil.AddFinalizer(workspace, executionWorkspaceFinalizer)
+			if err := r.Update(ctx, workspace); err != nil {
+				return ctrl.Result{}, client.IgnoreNotFound(err)
+			}
+		}
 		return ctrl.Result{}, nil
 	}
 	if !workspace.DeletionTimestamp.IsZero() {

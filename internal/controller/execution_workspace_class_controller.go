@@ -358,6 +358,19 @@ func (r *ExecutionWorkspaceClassReconciler) validateACPClassProfile(
 	if !config.DeletionTimestamp.IsZero() {
 		return false, false, nil
 	}
+	retentionCapped := profile.Spec.Retention != nil &&
+		profile.Spec.Retention.MaxSuspendedWorkspaces != nil
+	expiryBounded := class.Spec.Lifecycle.MaxLifetime != nil ||
+		(class.Spec.Lifecycle.IdleTimeout != nil && !retentionCapped)
+	suspendAllowed := slices.Contains(
+		class.Spec.Lifecycle.AllowedOnDetach,
+		workspacev1alpha1.WorkspaceOnDetachSuspend,
+	)
+	if class.Spec.Lifecycle.DefaultOnDetach == workspacev1alpha1.WorkspaceOnDetachSuspend &&
+		profile.Spec.Retention != nil && profile.Spec.Retention.MaxSuspendedWorkspaces != nil &&
+		*profile.Spec.Retention.MaxSuspendedWorkspaces == 0 {
+		return false, false, nil
+	}
 	switch config.Spec.Backend {
 	case acpworkspacev1alpha1.RuntimeProviderBackendSubstrate:
 		substrate := profile.Spec.Substrate
@@ -376,6 +389,9 @@ func (r *ExecutionWorkspaceClassReconciler) validateACPClassProfile(
 			return true, false, nil
 		}
 		if substrate.Suspend.Mode != acpworkspacev1alpha1.SubstrateSuspendModeDataOnly {
+			return false, false, nil
+		}
+		if suspendAllowed && !expiryBounded {
 			return false, false, nil
 		}
 		return true, true, nil
@@ -404,6 +420,9 @@ func (r *ExecutionWorkspaceClassReconciler) validateACPClassProfile(
 				// verdict.
 				return false, false, classErr
 			}
+			return false, false, nil
+		}
+		if suspendAllowed && !expiryBounded {
 			return false, false, nil
 		}
 		return true, true, nil

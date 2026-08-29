@@ -782,6 +782,52 @@ func preparePooledClassProfileForTest(
 	return mapper, parameters
 }
 
+// Cleanup-only recovery installs the core finalizer only on ACP-owned
+// workspaces: adapters registered solely under the enabled provider API (the
+// development fake provider) are not running in cleanup-only mode, and a
+// finalizer no adapter can settle with StateDeleted would make the object
+// undeletable.
+func TestExecutionWorkspaceCleanupOnlyFinalizerIsACPScoped(t *testing.T) {
+	t.Parallel()
+	const cleanupTestNamespace = "cleanup-ns"
+	ctx := context.Background()
+	scheme := testWorkspaceScheme(t)
+	acpOwned := &workspacev1alpha1.ExecutionWorkspace{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cleanupTestNamespace, Name: "acp-owned", UID: types.UID("acp-owned-uid"),
+			Labels: map[string]string{workspacev1alpha1.ProviderControllerLabel: acpWorkspaceProviderControllerName},
+		},
+	}
+	foreign := &workspacev1alpha1.ExecutionWorkspace{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cleanupTestNamespace, Name: "fake-owned", UID: types.UID("fake-owned-uid"),
+			Labels: map[string]string{workspacev1alpha1.ProviderControllerLabel: FakeWorkspaceControllerName},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(acpOwned, foreign).Build()
+	reconciler := &ExecutionWorkspaceReconciler{Client: c, APIReader: c, CleanupOnly: true}
+	for _, name := range []string{acpOwned.Name, foreign.Name} {
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: cleanupTestNamespace, Name: name},
+		}); err != nil {
+			t.Fatalf("cleanup-only reconcile %s: %v", name, err)
+		}
+	}
+	got := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: cleanupTestNamespace, Name: acpOwned.Name}, got); err != nil {
+		t.Fatalf("read ACP workspace: %v", err)
+	}
+	if len(got.Finalizers) == 0 {
+		t.Fatal("an ACP-owned workspace must gain the cleanup finalizer so retention can reclaim it")
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: cleanupTestNamespace, Name: foreign.Name}, got); err != nil {
+		t.Fatalf("read fake workspace: %v", err)
+	}
+	if len(got.Finalizers) != 0 {
+		t.Fatal("a non-ACP workspace must not gain a finalizer no running adapter can ever settle")
+	}
+}
+
 // A substrate-backend Suspend class must not advertise readiness when its
 // profile also carries agent-sandbox inputs: resolution rejects that profile,
 // so every Task selecting the class would fail after admission.
@@ -873,7 +919,10 @@ func TestExecutionWorkspaceClassReconcilerRequiresACPSuspendPolicy(t *testing.T)
 	t.Parallel()
 	ctx := context.Background()
 	const acpProfileName = "acp-profile"
-	shape := func(nsName string, withPolicy, withSessionReuse bool) (bool, string) {
+	shape := func(
+		nsName string,
+		withPolicy, withSessionReuse, withIdleTimeout, withMaxLifetime, zeroCapSuspendDefault bool,
+	) (bool, string) {
 		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
 		provider := testGenericProvider("acp-provider-" + nsName)
 		provider.Spec.ControllerName = acpWorkspaceProviderControllerName
@@ -899,6 +948,15 @@ func TestExecutionWorkspaceClassReconcilerRequiresACPSuspendPolicy(t *testing.T)
 		}
 		class.Spec.Lifecycle.AllowedOnDetach = append(class.Spec.Lifecycle.AllowedOnDetach,
 			workspacev1alpha1.WorkspaceOnDetachSuspend)
+		if zeroCapSuspendDefault {
+			class.Spec.Lifecycle.DefaultOnDetach = workspacev1alpha1.WorkspaceOnDetachSuspend
+		}
+		if withIdleTimeout {
+			class.Spec.Lifecycle.IdleTimeout = &metav1.Duration{Duration: time.Hour}
+		}
+		if withMaxLifetime {
+			class.Spec.Lifecycle.MaxLifetime = &metav1.Duration{Duration: 24 * time.Hour}
+		}
 		if !withSessionReuse {
 			class.Spec.AllowedReuseScopes = []workspacev1alpha1.WorkspaceReuseScope{
 				workspacev1alpha1.WorkspaceReuseScopeNone,
@@ -916,6 +974,11 @@ func TestExecutionWorkspaceClassReconcilerRequiresACPSuspendPolicy(t *testing.T)
 		if withPolicy {
 			profile.Spec.Substrate.Suspend = &acpworkspacev1alpha1.SubstrateSuspendPolicy{Mode: acpworkspacev1alpha1.SubstrateSuspendModeDataOnly}
 		}
+		limit := int32(1)
+		if zeroCapSuspendDefault {
+			limit = 0
+		}
+		profile.Spec.Retention = &acpworkspacev1alpha1.RetentionPolicy{MaxSuspendedWorkspaces: &limit}
 		scheme := testWorkspaceScheme(t)
 		if err := acpworkspacev1alpha1.AddToScheme(scheme); err != nil {
 			t.Fatalf("add acp scheme: %v", err)
@@ -940,16 +1003,28 @@ func TestExecutionWorkspaceClassReconcilerRequiresACPSuspendPolicy(t *testing.T)
 		return condition.Status == metav1.ConditionTrue, condition.Message
 	}
 
-	ready, message := shape("acp-suspend-nopolicy", false, true)
+	ready, message := shape("acp-suspend-nopolicy", false, true, false, true, false)
 	if ready || !strings.Contains(message, "DataOnly suspend policy") {
 		t.Fatalf("a Suspend class without a profile policy must not be Ready (ready=%v message=%q)", ready, message)
 	}
-	ready, message = shape("acp-suspend-no-session-reuse", true, false)
+	ready, message = shape("acp-suspend-no-session-reuse", true, false, false, true, false)
 	if ready || !strings.Contains(message, "Session reuse scope") {
 		t.Fatalf("a Suspend class without Session reuse must not be Ready (ready=%v message=%q)", ready, message)
 	}
-	if ready, message = shape("acp-suspend-policy", true, true); !ready {
+	if ready, message = shape("acp-suspend-policy", true, true, false, true, false); !ready {
 		t.Fatalf("a Suspend class with a DataOnly profile policy must be Ready (message=%q)", message)
+	}
+	if ready, message = shape("acp-suspend-quota-only", true, true, false, false, false); ready ||
+		!strings.Contains(message, "RuntimeWorkspaceProfile is invalid") {
+		t.Fatalf("a quota-only Suspend class must not be Ready (ready=%v message=%q)", ready, message)
+	}
+	if ready, message = shape("acp-suspend-capped-idle-only", true, true, true, false, false); ready ||
+		!strings.Contains(message, "RuntimeWorkspaceProfile is invalid") {
+		t.Fatalf("a capped idle-only Suspend class must not be Ready (ready=%v message=%q)", ready, message)
+	}
+	if ready, message = shape("acp-suspend-zero-cap-default", true, true, false, true, true); ready ||
+		!strings.Contains(message, "RuntimeWorkspaceProfile is invalid") {
+		t.Fatalf("a zero-cap Suspend-default class must not be Ready even when Delete is allowed (ready=%v message=%q)", ready, message)
 	}
 }
 
@@ -995,10 +1070,14 @@ func TestExecutionWorkspaceClassReconcilerValidatesSandboxSuspendProfile(t *test
 		}
 		class.Spec.Lifecycle.AllowedOnDetach = append(class.Spec.Lifecycle.AllowedOnDetach,
 			workspacev1alpha1.WorkspaceOnDetachSuspend)
+		class.Spec.Lifecycle.MaxLifetime = &metav1.Duration{Duration: 24 * time.Hour}
 		mapper, parameters := testParameterMapping(ns.Name, class.Spec.ParametersRef)
 		profile := &acpworkspacev1alpha1.RuntimeWorkspaceProfile{
 			ObjectMeta: metav1.ObjectMeta{Namespace: ns.Name, Name: sandboxProfileName, UID: sandboxProfileName + "-uid", Generation: 1},
 			Spec: acpworkspacev1alpha1.RuntimeWorkspaceProfileSpec{
+				Retention: &acpworkspacev1alpha1.RetentionPolicy{
+					MaxSuspendedWorkspaces: func() *int32 { limit := int32(1); return &limit }(),
+				},
 				AgentSandbox: &acpworkspacev1alpha1.AgentSandboxProfileSpec{
 					Suspend: &acpworkspacev1alpha1.AgentSandboxSuspendPolicy{
 						Mode: acpworkspacev1alpha1.SubstrateSuspendModeDataOnly,
@@ -1043,6 +1122,17 @@ func TestExecutionWorkspaceClassReconcilerValidatesSandboxSuspendProfile(t *test
 
 	if ready, message := shape("acp-sandbox-valid", nil); !ready {
 		t.Fatalf("a valid sandbox suspend profile must be Ready (message=%q)", message)
+	}
+	if ready, message := shape("acp-sandbox-quota-only", func(_ *acpworkspacev1alpha1.RuntimeWorkspaceProfile, _ *storagev1.StorageClass, class *workspacev1alpha1.ExecutionWorkspaceClass) {
+		class.Spec.Lifecycle.MaxLifetime = nil
+	}); ready || !strings.Contains(message, "RuntimeWorkspaceProfile is invalid") {
+		t.Fatalf("a quota-only sandbox Suspend class must not be Ready (ready=%v message=%q)", ready, message)
+	}
+	if ready, message := shape("acp-sandbox-capped-idle-only", func(_ *acpworkspacev1alpha1.RuntimeWorkspaceProfile, _ *storagev1.StorageClass, class *workspacev1alpha1.ExecutionWorkspaceClass) {
+		class.Spec.Lifecycle.MaxLifetime = nil
+		class.Spec.Lifecycle.IdleTimeout = &metav1.Duration{Duration: time.Hour}
+	}); ready || !strings.Contains(message, "RuntimeWorkspaceProfile is invalid") {
+		t.Fatalf("a capped idle-only sandbox Suspend class must not be Ready (ready=%v message=%q)", ready, message)
 	}
 	if ready, message := shape("acp-sandbox-mode", func(profile *acpworkspacev1alpha1.RuntimeWorkspaceProfile, _ *storagev1.StorageClass, _ *workspacev1alpha1.ExecutionWorkspaceClass) {
 		profile.Spec.AgentSandbox.Suspend.Volume.AccessModes = []string{string(corev1.ReadOnlyMany)}
@@ -1150,6 +1240,7 @@ func TestExecutionWorkspaceClassReconcilerReadsACPSuspendPolicyFromAPIReader(t *
 				WithObjects(profile(test.authoritativePolicy), providerConfig.DeepCopy()).
 				Build()
 			class := testGenericClass(namespace, "class", "provider")
+			class.Spec.Lifecycle.MaxLifetime = &metav1.Duration{Duration: time.Hour}
 			class.Spec.ParametersRef = &workspacev1alpha1.TypedObjectReference{
 				Group: acpworkspacev1alpha1.GroupVersion.Group,
 				Kind:  acpWorkspaceProviderProfileKind,

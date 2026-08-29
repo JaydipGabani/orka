@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ import (
 	acpworkspacev1alpha1 "github.com/orka-agents/orka/api/acp.workspace/v1alpha1"
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
+	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/pkg/workspaceprovider"
 )
@@ -79,6 +81,13 @@ const (
 	// PVC) in, so deletion proofs probe the ORIGINAL namespace even if the
 	// controller's --acp-runtime-namespace changed since creation.
 	acpWorkspaceRuntimeNamespaceAnnotation = "acp.workspace.orka.ai/runtime-namespace"
+	// acpWorkspaceDurableDataAbsentAnnotation records, on a terminally failed
+	// workspace, that the failure PROVED no durable data exists (a missing,
+	// foreign, or non-suspend-capable linked pool, or a pool that settled
+	// without a consensual checkpoint). Retention frees the suspension-quota
+	// slot for such failures while resume-loss failures that preserve a
+	// claim stay charged until deletion proves cleanup.
+	acpWorkspaceDurableDataAbsentAnnotation = "acp.workspace.orka.ai/durable-data-absent"
 
 	// acpWorkspaceDurableSessionCommittedAnnotation records that a
 	// RuntimeSession creation completed on this workspace - and with it the
@@ -89,6 +98,12 @@ const (
 	// attempt so settlement can enforce the frozen detachTimeout instead of
 	// requeueing forever behind an adapter that never releases the epoch.
 	acpWorkspaceRevocationStartedAnnotation = "acp.workspace.orka.ai/revocation-started-at"
+	// acpWorkspaceResumeRequestedAnnotation records that a continuation
+	// requested cold resume and has not attached yet. Idle retention treats
+	// it as live demand (a cold boot can outlast idleTimeout), and the next
+	// successful attachment clears it; the frozen maxLifetime remains the
+	// hard bound if the requester dies before attaching.
+	acpWorkspaceResumeRequestedAnnotation = "acp.workspace.orka.ai/resume-requested-at"
 	// acpWorkspaceAttachmentTTL bounds one ACP Task attachment. The attachment
 	// Secret is not the RuntimePool data-plane credential; the epoch enforces
 	// the one-writer rule, and class maxLifetime still clamps the expiry.
@@ -138,6 +153,13 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 	workspace := &workspacev1alpha1.ExecutionWorkspace{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace)
 	if apierrors.IsNotFound(err) {
+		blocked, fenceErr := r.taskBlockedByACPWorkspaceRetentionFence(ctx, task, binding, name, nil)
+		if fenceErr != nil {
+			return "", false, fenceErr
+		}
+		if blocked {
+			return "", false, nil
+		}
 		workspace, err = r.createACPClassWorkspace(ctx, task, binding, plan.PoolName, name)
 		if err != nil {
 			if apierrors.IsAlreadyExists(err) {
@@ -148,6 +170,13 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 	} else if err != nil {
 		return "", false, err
 	}
+	blocked, fenceErr := r.taskBlockedByACPWorkspaceRetentionFence(ctx, task, binding, name, workspace)
+	if fenceErr != nil {
+		return "", false, fenceErr
+	}
+	if blocked {
+		return "", false, nil
+	}
 	if !workspace.DeletionTimestamp.IsZero() {
 		// The predecessor detach is still deleting the deterministic-name
 		// workspace; the replacement is created once deletion completes.
@@ -157,6 +186,9 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 		if queueACPClassWorkspaceBehindPredecessor(workspace, task, binding) {
 			return "", false, nil
 		}
+		return "", false, err
+	}
+	if err := r.backfillACPWorkspaceSuspendedCap(ctx, workspace, binding.Class.MaxSuspendedWorkspaces); err != nil {
 		return "", false, err
 	}
 	// The settlement link is persisted as soon as the deterministic workspace
@@ -181,12 +213,22 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 			if workspace.Annotations == nil {
 				workspace.Annotations = map[string]string{}
 			}
-			// The continuation's frozen effective detach action replaces the
-			// suspender's in the SAME optimistic update that starts the
-			// resume: a continuation that selected Delete and dies before
-			// attaching must settle with Delete, not resuspend under the
-			// predecessor's stale action. The resumed-lineage marker makes
-			// later pool loss terminal even after Ready is projected.
+			// The resume flip records pending demand without changing the last
+			// detach instant: a cold boot can outlast idleTimeout, so retention
+			// must treat the workspace as demanded until the continuation
+			// attaches. If that requester dies, idle retention resumes from the
+			// actual detach instead of granting another full retention interval. The
+			// continuation's frozen effective detach action replaces the
+			// suspender's in the same patch (a continuation that selects
+			// Delete and dies during cold boot must settle with Delete, not
+			// resuspend under the predecessor's stale action), and the
+			// resumed-lineage marker makes later pool loss terminal even
+			// after Ready is projected.
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			// The demand record carries the requesting Task's name so
+			// retention can retire demand whose requester died before
+			// attaching instead of holding the workspace forever.
+			workspace.Annotations[acpWorkspaceResumeRequestedAnnotation] = now + " " + task.Name + " " + string(task.UID)
 			workspace.Annotations[acpWorkspaceDetachActionAnnotation] = binding.Class.EffectiveOnDetach
 			workspace.Annotations[acpWorkspaceResumedLineageAnnotation] = booleanTrueValue
 			if err := r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
@@ -201,6 +243,23 @@ func (r *TaskReconciler) ensureACPClassWorkspace(
 				errACPWorkspaceBindingConflict, workspace.Name,
 			)
 		default:
+			// The suspension has not settled yet, but the continuation's
+			// demand must already be durable: if idleTimeout expires while
+			// the checkpoint drains, retention must see outstanding demand
+			// instead of deleting the retained workspace the continuation is
+			// about to resume.
+			if fields := strings.Fields(workspace.Annotations[acpWorkspaceResumeRequestedAnnotation]); len(fields) < 3 ||
+				fields[2] != string(task.UID) {
+				base := workspace.DeepCopy()
+				if workspace.Annotations == nil {
+					workspace.Annotations = map[string]string{}
+				}
+				workspace.Annotations[acpWorkspaceResumeRequestedAnnotation] =
+					time.Now().UTC().Format(time.RFC3339Nano) + " " + task.Name + " " + string(task.UID)
+				if err := r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+					return "", false, client.IgnoreNotFound(err)
+				}
+			}
 			return "", false, nil
 		}
 	}
@@ -311,7 +370,9 @@ func (r *TaskReconciler) recordACPWorkspaceDetachAction(
 	binding *ACPRuntimeWorkspaceBinding,
 ) error {
 	action := binding.Class.EffectiveOnDetach
-	if workspace.Annotations[acpWorkspaceDetachActionAnnotation] == action {
+	if workspace.Annotations[acpWorkspaceDetachActionAnnotation] == action &&
+		workspace.Annotations[acpWorkspaceRevocationStartedAnnotation] == "" &&
+		workspace.Annotations[acpWorkspaceResumeRequestedAnnotation] == "" {
 		return nil
 	}
 	base := workspace.DeepCopy()
@@ -319,7 +380,12 @@ func (r *TaskReconciler) recordACPWorkspaceDetachAction(
 		workspace.Annotations = map[string]string{}
 	}
 	workspace.Annotations[acpWorkspaceDetachActionAnnotation] = action
-	return r.Patch(ctx, workspace, client.MergeFrom(base))
+	// A fresh attachment invalidates any prior revocation stamp and fulfils
+	// pending resume demand: the next detach measures its detachTimeout from
+	// its own revocation, and retention resumes ordinary idle handling.
+	delete(workspace.Annotations, acpWorkspaceRevocationStartedAnnotation)
+	delete(workspace.Annotations, acpWorkspaceResumeRequestedAnnotation)
+	return r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }
 
 // queueACPClassWorkspaceBehindPredecessor recognizes an older class/provider
@@ -520,17 +586,21 @@ func (r *TaskReconciler) deleteACPWorkspaceAttachmentCredentials(
 
 // linkTaskToACPWorkspace records the workspace name on the Task so terminal
 // settlement and Task finalization find the workspace without reloading the
-// execution snapshot. The label value is an Orka-owned deterministic name.
+// execution snapshot. It installs the cleanup finalizer in the same metadata
+// patch, so a Task cannot disappear during deletion after it acquires
+// settlement ownership. The label value is an Orka-owned deterministic name.
 func (r *TaskReconciler) linkTaskToACPWorkspace(
 	ctx context.Context,
 	task *corev1alpha1.Task,
 	workspace *workspacev1alpha1.ExecutionWorkspace,
 ) error {
 	if task.Labels[acpExecutionWorkspaceLinkLabel] == workspace.Name &&
-		task.Annotations[acpExecutionWorkspaceUIDAnnotation] == string(workspace.UID) {
+		task.Annotations[acpExecutionWorkspaceUIDAnnotation] == string(workspace.UID) &&
+		controllerutil.ContainsFinalizer(task, labels.TaskFinalizer) {
 		return nil
 	}
 	base := task.DeepCopy()
+	controllerutil.AddFinalizer(task, labels.TaskFinalizer)
 	if task.Labels == nil {
 		task.Labels = make(map[string]string)
 	}
@@ -539,7 +609,11 @@ func (r *TaskReconciler) linkTaskToACPWorkspace(
 	}
 	task.Labels[acpExecutionWorkspaceLinkLabel] = workspace.Name
 	task.Annotations[acpExecutionWorkspaceUIDAnnotation] = string(workspace.UID)
-	return r.Patch(ctx, task, client.MergeFrom(base))
+	patch := client.MergeFrom(base)
+	if base.ResourceVersion != "" {
+		patch = client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})
+	}
+	return r.Patch(ctx, task, patch)
 }
 
 func (r *TaskReconciler) createACPClassWorkspace(
@@ -553,33 +627,6 @@ func (r *TaskReconciler) createACPClassWorkspace(
 	if err != nil {
 		return nil, err
 	}
-	creationAnnotations := map[string]string{
-		acpExecutionWorkspacePoolAnnotation:     poolName,
-		acpWorkspaceProviderConfigUIDAnnotation: binding.Class.ProviderConfigUID,
-		acpWorkspaceBackendAnnotation:           string(binding.Provider),
-		// The creator's frozen effective detach action is bound
-		// atomically with the workspace's existence: a crash between
-		// Attach and the later refresh patch can never leave a
-		// Suspend-frozen workspace defaulting to Delete.
-		acpWorkspaceDetachActionAnnotation: binding.Class.EffectiveOnDetach,
-	}
-	// Freeze the realized runtime namespace so deletion proofs probe the
-	// ORIGINAL provider-children namespace even if the controller flag
-	// changes later. An empty flag means provider children live in the
-	// workspace namespace, and that resolution is frozen too: leaving the
-	// annotation absent would let a later non-empty flag redirect deletion
-	// proofs to a namespace the original PVC never lived in.
-	runtimeNamespace := strings.TrimSpace(r.ACPRuntimeNamespace)
-	if runtimeNamespace == "" {
-		runtimeNamespace = task.Namespace
-	}
-	creationAnnotations[acpWorkspaceRuntimeNamespaceAnnotation] = runtimeNamespace
-	if binding.Class.SuspendMode == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) {
-		// The frozen profile provisions durable artifacts (a checkpoint or a
-		// durable PVC); the terminal disposition reports what actually
-		// existed instead of inferring it from allowed detach actions.
-		creationAnnotations[acpWorkspaceDurableAnnotation] = booleanTrueValue
-	}
 	workspace := &workspacev1alpha1.ExecutionWorkspace{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: task.Namespace,
@@ -587,7 +634,8 @@ func (r *TaskReconciler) createACPClassWorkspace(
 			Labels: map[string]string{
 				workspacev1alpha1.ProviderControllerLabel: acpWorkspaceProviderControllerName,
 			},
-			Annotations: creationAnnotations,
+			Annotations: workspaceCreationAnnotations(binding, poolName, task.Name, string(task.UID),
+				resolveACPWorkspaceRuntimeNamespace(r.ACPRuntimeNamespace, task.Namespace)),
 		},
 		Spec: workspacev1alpha1.ExecutionWorkspaceSpec{
 			Mode: workspacev1alpha1.ExecutionWorkspaceModeInteractive,
@@ -654,6 +702,57 @@ func (r *TaskReconciler) createACPClassWorkspace(
 	return workspace, nil
 }
 
+// workspaceCreationAnnotations renders the Orka-owned annotations for a fresh
+// class-backed workspace: the linked pool name and the frozen retention cap.
+// resolveACPWorkspaceRuntimeNamespace resolves the namespace provider
+// children realize in: the configured runtime namespace, or the workspace's
+// own namespace when the flag is empty.
+func resolveACPWorkspaceRuntimeNamespace(configured, workspaceNamespace string) string {
+	if resolved := strings.TrimSpace(configured); resolved != "" {
+		return resolved
+	}
+	return workspaceNamespace
+}
+
+func workspaceCreationAnnotations(binding *ACPRuntimeWorkspaceBinding, poolName, requesterName, requesterUID, runtimeNamespace string) map[string]string {
+	annotations := map[string]string{
+		acpExecutionWorkspacePoolAnnotation:     poolName,
+		acpWorkspaceProviderConfigUIDAnnotation: binding.Class.ProviderConfigUID,
+		acpWorkspaceBackendAnnotation:           string(binding.Provider),
+		// The creator's frozen effective detach action is recorded at
+		// materialization so retention honors the class default even for a
+		// workspace whose Task never reached attachment; the attach path
+		// refreshes it with the attached Task's frozen choice.
+		acpWorkspaceDetachActionAnnotation: binding.Class.EffectiveOnDetach,
+		// Initial materialization is pending demand exactly like a cold
+		// resume: a slow first provisioning can outlast idleTimeout, and
+		// retention must not suspend or delete the workspace out from under
+		// the Task still waiting to attach. The record clears on attachment
+		// (or when settlement suspends the workspace); the frozen maxLifetime
+		// stays the hard bound if the creator dies before attaching.
+		acpWorkspaceResumeRequestedAnnotation: time.Now().UTC().Format(time.RFC3339Nano) + " " + requesterName + " " + requesterUID,
+	}
+	if binding.Class.MaxSuspendedWorkspaces != nil {
+		annotations[acpWorkspaceMaxSuspendedAnnotation] = strconv.FormatInt(int64(*binding.Class.MaxSuspendedWorkspaces), 10)
+	}
+	if runtimeNamespace != "" {
+		// Freeze the realized runtime namespace so deletion proofs probe the
+		// ORIGINAL provider-children namespace even if the controller flag
+		// changes later. Callers resolve an empty flag to the workspace
+		// namespace BEFORE this call so that resolution is frozen too: an
+		// absent annotation would let a later non-empty flag redirect
+		// deletion proofs to a namespace the original PVC never lived in.
+		annotations[acpWorkspaceRuntimeNamespaceAnnotation] = runtimeNamespace
+	}
+	if binding.Class.SuspendMode == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) {
+		// The frozen profile provisions durable artifacts (a checkpoint or a
+		// durable PVC); the terminal disposition reports what actually
+		// existed instead of inferring it from allowed detach actions.
+		annotations[acpWorkspaceDurableAnnotation] = booleanTrueValue
+	}
+	return annotations
+}
+
 // verifyACPClassWorkspace fail-closes adoption: an existing workspace must
 // carry exactly the frozen class, provider, session, and slot bindings.
 func verifyACPClassWorkspace(
@@ -694,6 +793,9 @@ func verifyACPClassWorkspace(
 		workspace.Annotations[acpWorkspaceSuspendModeAnnotation] != binding.Class.SuspendMode {
 		return fmt.Errorf("%w: workspace %s provider config, backend, or suspend mode does not match the frozen binding", errACPWorkspaceBindingConflict, workspace.Name)
 	}
+	if err := validateACPWorkspaceSuspendedCap(workspace, binding.Class.MaxSuspendedWorkspaces); err != nil {
+		return err
+	}
 	if workspace.Spec.Slot != binding.WorkspaceSlot {
 		return fmt.Errorf("%w: workspace %s slot does not match the frozen binding", errACPWorkspaceBindingConflict, workspace.Name)
 	}
@@ -722,6 +824,48 @@ func verifyACPClassWorkspace(
 		binding.Class.SuspendMode == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly)
 	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady && !resumeFromSuspended {
 		return fmt.Errorf("%w: workspace %s desired state %q cannot admit new work", errACPWorkspaceBindingConflict, workspace.Name, workspace.Spec.DesiredState)
+	}
+	return nil
+}
+
+// validateACPWorkspaceSuspendedCap verifies a materialized cap when present.
+// An absent cap remains admissible here so a controller upgrade can backfill
+// workspaces created before the annotation existed.
+func validateACPWorkspaceSuspendedCap(
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+	expected *int32,
+) error {
+	raw, present := workspace.Annotations[acpWorkspaceMaxSuspendedAnnotation]
+	if !present {
+		return nil
+	}
+	if expected == nil || raw != strconv.FormatInt(int64(*expected), 10) {
+		return fmt.Errorf("%w: workspace %s suspended-workspace cap does not match the frozen binding", errACPWorkspaceBindingConflict, workspace.Name)
+	}
+	return nil
+}
+
+// backfillACPWorkspaceSuspendedCap migrates a legacy workspace only when the
+// protected cap annotation is absent. Present mismatches are rejected by
+// verifyACPClassWorkspace and never rewritten.
+func (r *TaskReconciler) backfillACPWorkspaceSuspendedCap(
+	ctx context.Context,
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+	expected *int32,
+) error {
+	if expected == nil {
+		return nil
+	}
+	if _, present := workspace.Annotations[acpWorkspaceMaxSuspendedAnnotation]; present {
+		return nil
+	}
+	base := workspace.DeepCopy()
+	if workspace.Annotations == nil {
+		workspace.Annotations = map[string]string{}
+	}
+	workspace.Annotations[acpWorkspaceMaxSuspendedAnnotation] = strconv.FormatInt(int64(*expected), 10)
+	if err := r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		return fmt.Errorf("backfill workspace %s suspended-workspace cap: %w", workspace.Name, err)
 	}
 	return nil
 }
@@ -868,6 +1012,32 @@ func (r *TaskReconciler) settleACPClassWorkspace(ctx context.Context, task *core
 		}
 		return true, nil
 	}
+	// A failed settlement-ownership transfer can leave the candidate's detach
+	// action on the workspace before its Task link commits. Before an
+	// unattached owner settles, reassert that Task's own effective policy so a
+	// vanished candidate cannot change Delete into Suspend, or vice versa.
+	if taskNeverHeldACPWorkspaceAttachment(task) {
+		taskAction, allowed := effectiveACPWorkspaceDetachAction(task, workspace)
+		if !allowed {
+			return false, fmt.Errorf(
+				"task %s requests a detach action outside workspace %s policy; refusing settlement",
+				task.Name, workspace.Name,
+			)
+		}
+		if workspace.Annotations[acpWorkspaceDetachActionAnnotation] != taskAction {
+			base := workspace.DeepCopy()
+			if workspace.Annotations == nil {
+				workspace.Annotations = map[string]string{}
+			}
+			workspace.Annotations[acpWorkspaceDetachActionAnnotation] = taskAction
+			if err := r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+				if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+					return false, nil
+				}
+				return false, err
+			}
+		}
+	}
 	// Apply the attached Task's frozen effective detach action. Suspend
 	// quiesced above: the attachment is revoked and the adapter released the
 	// enforced epoch, so no prompt or workspace writer remains. The
@@ -895,16 +1065,41 @@ func (r *TaskReconciler) settleACPClassWorkspace(ctx context.Context, task *core
 			}
 			return true, nil
 		}
-		base := workspace.DeepCopy()
-		// The suspension retires the revocation stamp: the detach settled
-		// with a preserved workspace, and a continuation's cold resume must
-		// not be blocked by a stale pending-detach record.
-		delete(workspace.Annotations, acpWorkspaceRevocationStartedAnnotation)
-		workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredSuspended
-		if err := r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
-			if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+		reader := client.Reader(r.Client)
+		if r.APIReader != nil {
+			reader = r.APIReader
+		}
+		err := suspendACPWorkspaceWithinQuota(
+			ctx,
+			r.Client,
+			reader,
+			workspace,
+			time.Now(),
+			taskNeverHeldACPWorkspaceAttachment(task),
+		)
+		switch {
+		case errors.Is(err, errACPSuspendQuotaExhausted):
+			// Quota exhaustion cannot replace the frozen Suspend action with
+			// Delete. A live queued continuation can take the still-Ready
+			// workspace directly; otherwise settlement remains pending until
+			// capacity opens or maxLifetime independently forces cleanup.
+			if deferred, retry, deferErr := r.deferACPSettlementToSuccessor(ctx, workspace, task); deferErr != nil {
+				return false, deferErr
+			} else if retry {
 				return false, nil
+			} else if deferred {
+				return true, nil
 			}
+			if r.Recorder != nil {
+				if limit := acpWorkspaceSuspendedCapFromAnnotation(workspace); limit != nil {
+					r.Recorder.Eventf(workspace, corev1.EventTypeWarning, "SuspendQuotaExhausted",
+						"class retention cap of %d suspended workspaces is exhausted; the frozen Suspend action remains pending", *limit)
+				}
+			}
+			return false, nil
+		case errors.Is(err, errACPSuspendQuotaBusy), apierrors.IsConflict(err), apierrors.IsNotFound(err):
+			return false, nil
+		case err != nil:
 			return false, err
 		}
 		return true, nil
@@ -941,6 +1136,22 @@ func (r *TaskReconciler) settleACPClassWorkspace(ctx context.Context, task *core
 			)
 		}
 	}
+	// A requester that terminated before it ever executed against this
+	// workspace (its cold-resume flip stored the Delete action, but no
+	// RuntimePool demand was ever stamped) must not destroy the retained
+	// repository out from under another live queued continuation: the
+	// successor attaches and stamps its own frozen action instead. A Task
+	// that actually executed keeps the normal contract - its frozen Delete
+	// destroys the filesystem before any continuation runs.
+	if taskNeverHeldACPWorkspaceAttachment(task) {
+		if deferred, retry, deferErr := r.deferACPSettlementToSuccessor(ctx, workspace, task); deferErr != nil {
+			return false, deferErr
+		} else if retry {
+			return false, nil
+		} else if deferred {
+			return true, nil
+		}
+	}
 	if err := r.Delete(ctx, workspace, deleteCurrentObjectPreconditions(workspace)...); err != nil &&
 		!apierrors.IsNotFound(err) {
 		if apierrors.IsConflict(err) {
@@ -949,6 +1160,189 @@ func (r *TaskReconciler) settleACPClassWorkspace(ctx context.Context, task *core
 		return false, err
 	}
 	return true, nil
+}
+
+// deferACPSettlementToSuccessor completes a requester's settlement without
+// destroying the workspace when another live continuation is queued for the
+// same incarnation, transferring the successor's effective detach policy.
+// Callers decide whether the requester must be pre-attachment: Delete requires
+// that restriction, while quota-exhausted Suspend can hand off after execution.
+// deferred reports completion; retry requests a settle requeue. An UNLINKED
+// successor's resolved Session UID must match the workspace's immutable Session
+// identity when the durable session stores are available - a recreated same-name
+// Session can never adopt the old incarnation's cleanup.
+//
+//nolint:gocyclo // Candidate validation and ordered ownership transfer form one fail-closed handoff.
+func (r *TaskReconciler) deferACPSettlementToSuccessor(
+	ctx context.Context,
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+	task *corev1alpha1.Task,
+) (bool, bool, error) {
+	if workspace.Spec.SessionRef == nil {
+		return false, false, nil
+	}
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	candidates, successorErr := liveACPSessionContinuations(ctx, reader, workspace, task.UID)
+	if successorErr != nil {
+		return false, false, successorErr
+	}
+	// Every candidate is examined: one ineligible waiter (an out-of-policy
+	// override, a recreated Session) must not conclude no successor exists
+	// while a later valid continuation is queued behind it.
+	var successor *corev1alpha1.Task
+	successorAction := ""
+	settlementBindingPending := false
+	for _, candidate := range candidates {
+		linked := strings.TrimSpace(candidate.Labels[acpExecutionWorkspaceLinkLabel]) == workspace.Name &&
+			strings.TrimSpace(candidate.Annotations[acpExecutionWorkspaceUIDAnnotation]) == string(workspace.UID)
+		if !linked && r.DurableControlStore != nil && r.SessionManager != nil && r.ControllerEpochManager != nil {
+			resolvedUID, resolveErr := r.planACPWorkspaceSessionUID(ctx, candidate)
+			if resolveErr != nil {
+				// The candidate's Session identity cannot be proven right
+				// now; retry rather than either destroying under a possibly
+				// valid waiter or transferring ownership to a recreated
+				// Session.
+				return false, true, nil //nolint:nilerr // fail closed into a settle retry
+			}
+			if strings.TrimSpace(resolvedUID) != string(workspace.Spec.SessionRef.UID) {
+				// A recreated same-name Session resolves a different
+				// immutable UID and can never attach this incarnation: it is
+				// not a successor. Later candidates may still be.
+				continue
+			}
+		}
+		// The deferral transfers the SUCCESSOR's policy onto the workspace:
+		// the surviving waiter stamps its own action only at attachment, and
+		// leaving the dead requester's Delete in place would destroy the
+		// retained workspace if the successor also terminates before
+		// attaching.
+		_, allowed := effectiveACPWorkspaceDetachAction(candidate, workspace)
+		if !allowed {
+			// The waiter's explicit override is outside the class policy, so
+			// its own attachment resolution will reject it. Later candidates
+			// may still be valid successors.
+			continue
+		}
+		binding, bindingErr := r.loadVerifiedACPWorkspaceBindingForSettlement(ctx, candidate)
+		if bindingErr != nil {
+			return false, false, bindingErr
+		}
+		if binding == nil {
+			// A live waiter may still be in its first planning pass. Keep the
+			// predecessor responsible until the waiter's immutable binding is
+			// durable; linking it sooner can orphan the workspace if it dies.
+			settlementBindingPending = true
+			continue
+		}
+		if binding.ReusePolicy != corev1alpha1.WorkspaceReusePolicySession ||
+			strings.TrimSpace(binding.SessionUID) != string(workspace.Spec.SessionRef.UID) {
+			continue
+		}
+		action := binding.Class.EffectiveOnDetach
+		if !slices.Contains(workspace.Spec.Lifecycle.AllowedOnDetach, workspacev1alpha1.WorkspaceOnDetach(action)) {
+			continue
+		}
+		successor = candidate
+		successorAction = action
+		break
+	}
+	if successor == nil {
+		if settlementBindingPending {
+			return false, true, nil
+		}
+		return false, false, nil
+	}
+	transferSuccessorAction := func() (bool, error) {
+		if workspace.Annotations[acpWorkspaceDetachActionAnnotation] == successorAction {
+			return false, nil
+		}
+		base := workspace.DeepCopy()
+		if workspace.Annotations == nil {
+			workspace.Annotations = map[string]string{}
+		}
+		workspace.Annotations[acpWorkspaceDetachActionAnnotation] = successorAction
+		if err := r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+				return true, nil
+			}
+			return false, err
+		}
+		return false, nil
+	}
+	// Suspend is safe to publish before the ownership link: if linking fails
+	// or the controller dies in between, the stale action preserves data. A
+	// successor's Delete is destructive, so publish it only AFTER its Task
+	// link is durable. Until then the predecessor's Suspend remains in force;
+	// once linked, the successor either stamps Delete during attachment or
+	// reasserts it if the Task terminates before attachment.
+	if successorAction == string(workspacev1alpha1.WorkspaceOnDetachSuspend) {
+		if retry, err := transferSuccessorAction(); err != nil {
+			return false, false, err
+		} else if retry {
+			return false, true, nil
+		}
+	}
+	// Settlement ownership is transferred DURABLY before the predecessor
+	// releases: an unlinked successor deleted between this scan and its
+	// first reconcile would otherwise leave a workspace nobody settles (with
+	// idleTimeout and maxLifetime unset, nothing would ever reclaim it).
+	// A conflict or a successor deleted in the window retries the settle and
+	// re-scans.
+	if err := r.linkTaskToACPWorkspace(ctx, successor, workspace); err != nil {
+		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+			return false, true, nil
+		}
+		return false, false, err
+	}
+	if successorAction == string(workspacev1alpha1.WorkspaceOnDetachDelete) {
+		if retry, err := transferSuccessorAction(); err != nil {
+			return false, false, err
+		} else if retry {
+			return false, true, nil
+		}
+	}
+	if _, stamped := workspace.Annotations[acpWorkspaceRevocationStartedAnnotation]; stamped {
+		base := workspace.DeepCopy()
+		delete(workspace.Annotations, acpWorkspaceRevocationStartedAnnotation)
+		if err := r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+				return false, true, nil
+			}
+			return false, false, err
+		}
+	}
+	return true, false, nil
+}
+
+func effectiveACPWorkspaceDetachAction(
+	task *corev1alpha1.Task,
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+) (string, bool) {
+	action := string(workspace.Spec.Lifecycle.DefaultOnDetach)
+	if task.Spec.Execution == nil || task.Spec.Execution.Workspace == nil {
+		return action, true
+	}
+	raw := strings.TrimSpace(string(task.Spec.Execution.Workspace.OnDetach))
+	if raw == "" {
+		return action, true
+	}
+	requested := workspacev1alpha1.WorkspaceOnDetach(raw)
+	if !slices.Contains(workspace.Spec.Lifecycle.AllowedOnDetach, requested) {
+		return "", false
+	}
+	return string(requested), true
+}
+
+// taskNeverHeldACPWorkspaceAttachment reports a Task that terminated before
+// any RuntimePool demand existed for it: ACP dispatch stamps the pool
+// identity into status.execution only after the workspace attachment is
+// admitted, so its absence proves the Task never executed against the
+// workspace it links.
+func taskNeverHeldACPWorkspaceAttachment(task *corev1alpha1.Task) bool {
+	return task.Status.Execution == nil || strings.TrimSpace(task.Status.Execution.RuntimePoolName) == ""
 }
 
 // settlementWorkspaceBelongsToTask revalidates a settlement target found
@@ -988,7 +1382,11 @@ func (r *TaskReconciler) markACPWorkspaceRevocationStarted(
 	if workspace.Annotations == nil {
 		workspace.Annotations = map[string]string{}
 	}
-	workspace.Annotations[acpWorkspaceRevocationStartedAnnotation] = fmt.Sprintf("%d %s", epoch, time.Now().UTC().Format(time.RFC3339Nano))
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	workspace.Annotations[acpWorkspaceRevocationStartedAnnotation] = fmt.Sprintf("%d %s", epoch, now)
+	// The detach instant is stamped as revocation begins so idle retention
+	// never falls back to the creation timestamp while the epoch settles.
+	workspace.Annotations[acpWorkspaceLastDetachedAnnotation] = now
 	if err := r.Patch(ctx, workspace, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		return err
 	}

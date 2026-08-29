@@ -87,6 +87,9 @@ type ACPWorkspaceClassBinding struct {
 	// SandboxVolume freezes the durable workspace PVC shape for
 	// suspend-capable agent-sandbox classes. It is nil for every other class.
 	SandboxVolume *ACPSandboxDurableVolume
+	// MaxSuspendedWorkspaces freezes the class retention cap. Nil means
+	// per-workspace age must be bounded by idleTimeout or maxLifetime.
+	MaxSuspendedWorkspaces *int32
 	// DefaultOnDetach and AllowedOnDetach freeze the class lifecycle policy in
 	// class order so the materialized ExecutionWorkspace carries the exact
 	// class lifecycle and never drifts from it.
@@ -410,6 +413,10 @@ func (r *TaskReconciler) resolveACPWorkspaceClassWithSessionUID(
 			)
 		}
 	}
+	if retention := profileSpec.Retention; retention != nil && retention.MaxSuspendedWorkspaces != nil {
+		limit := *retention.MaxSuspendedWorkspaces
+		resolved.Binding.MaxSuspendedWorkspaces = &limit
+	}
 
 	switch backend {
 	case corev1alpha1.WorkspaceProviderSubstrate:
@@ -480,7 +487,148 @@ func (r *TaskReconciler) resolveACPWorkspaceClassWithSessionUID(
 			class.Spec.ParametersRef.Name, provider.Name, backend,
 		)
 	}
+	if err := validateACPWorkspaceRetentionBound(&resolved.Binding); err != nil {
+		return nil, fmt.Errorf("execution workspace class %q: %w", class.Name, err)
+	}
+	if err := r.enforceACPWorkspaceSuspendQuota(ctx, reader, task, class, resolved); err != nil {
+		return nil, err
+	}
 	return resolved, nil
+}
+
+// errACPWorkspacePlanningTransient marks workspace-plan resolution failures
+// caused by transient reads (uncached quota lists, durable session-store
+// lookups): the Task must requeue instead of being permanently rejected by a
+// brief API-server or control-store outage.
+var errACPWorkspacePlanningTransient = errors.New("transient execution workspace planning failure")
+
+// enforceACPWorkspaceSuspendQuota rejects a Task whose prospective Suspend
+// detach action would exceed the class retention cap. Settlement re-checks
+// the live count so a race between admissions still cannot exceed the cap.
+func (r *TaskReconciler) enforceACPWorkspaceSuspendQuota(
+	ctx context.Context,
+	reader client.Reader,
+	task *corev1alpha1.Task,
+	class *workspacev1alpha1.ExecutionWorkspaceClass,
+	resolved *acpResolvedWorkspaceClass,
+) error {
+	if resolved.Binding.MaxSuspendedWorkspaces == nil {
+		return nil
+	}
+	prospective := resolved.DefaultOnDetach
+	if requested := task.Spec.Execution.Workspace.OnDetach; requested != "" {
+		prospective = workspacev1alpha1.WorkspaceOnDetach(requested)
+	}
+	if prospective != workspacev1alpha1.WorkspaceOnDetachSuspend {
+		return nil
+	}
+	// A continuation resuming its own suspended session workspace frees the
+	// slot it occupies: that workspace never counts against admission, or the
+	// Task that would resume it could never reach ensureACPClassWorkspace.
+	// The exclusion matches the immutable Session UID, never the reusable
+	// name: a Session recreated under the same name resolves a different UID
+	// and creates a different workspace, so the old incarnation's suspended
+	// workspace still consumes the cap. Session reuse currently admits only
+	// the default workspace slot in resolveACPWorkspaceSessionScope, so the UID
+	// identifies the only reusable workspace this Task can resume.
+	sessionUID := ""
+	if task.Spec.SessionRef != nil && strings.TrimSpace(task.Spec.SessionRef.Name) != "" &&
+		r.DurableControlStore != nil && r.SessionManager != nil && r.ControllerEpochManager != nil {
+		// Without the durable session stores (validation-only resolution) the
+		// exclusion is simply skipped: counting the own workspace is stricter,
+		// never looser.
+		resolvedUID, sessionErr := r.planACPWorkspaceSessionUID(ctx, task)
+		if sessionErr != nil {
+			if permanentACPWorkspaceSessionPlanningError(sessionErr) {
+				// A nonexistent create:false Session or failed stored-Session
+				// validation is terminal: the binding stage classifies these
+				// permanent, and marking them transient here would requeue
+				// the Task forever instead of surfacing the validation
+				// failure.
+				return sessionErr
+			}
+			// A store-read outage stays retryable: the primary binding
+			// resolution re-runs this lookup with full classification, and
+			// here it only shapes the quota exclusion.
+			return fmt.Errorf("%w: %v", errACPWorkspacePlanningTransient, sessionErr)
+		}
+		sessionUID = strings.TrimSpace(resolvedUID)
+	}
+	suspended, err := countSuspendedClassWorkspaces(ctx, reader, task.Namespace, class.UID,
+		func(candidate *workspacev1alpha1.ExecutionWorkspace) bool {
+			return sessionUID != "" && candidate.Spec.SessionRef != nil &&
+				string(candidate.Spec.SessionRef.UID) == sessionUID
+		})
+	if err != nil {
+		return fmt.Errorf("%w: %v", errACPWorkspacePlanningTransient, err)
+	}
+	if suspended >= int(*resolved.Binding.MaxSuspendedWorkspaces) {
+		continuationReady, continuationErr := r.readySessionWorkspaceAwaitingSuspendQuota(
+			ctx, reader, task, resolved, sessionUID,
+		)
+		if continuationErr != nil {
+			return continuationErr
+		}
+		if continuationReady {
+			return nil
+		}
+		remediation := "delete or resume a suspended workspace"
+		if slices.Contains(resolved.AllowedOnDetach, workspacev1alpha1.WorkspaceOnDetachDelete) {
+			remediation += ", or request onDetach Delete"
+		}
+		return fmt.Errorf(
+			"execution workspace class %q retention cap of %d suspended workspaces is exhausted; %s",
+			class.Name, *resolved.Binding.MaxSuspendedWorkspaces, remediation,
+		)
+	}
+	return nil
+}
+
+// readySessionWorkspaceAwaitingSuspendQuota reports whether this Task can
+// reuse its exact session workspace while the class cap is full. The existing
+// Ready workspace has already consumed the only materialization for this
+// session and cannot suspend until a slot opens, so admitting its continuation
+// creates no additional retained workspace.
+func (r *TaskReconciler) readySessionWorkspaceAwaitingSuspendQuota(
+	ctx context.Context,
+	reader client.Reader,
+	task *corev1alpha1.Task,
+	resolved *acpResolvedWorkspaceClass,
+	sessionUID string,
+) (bool, error) {
+	if strings.TrimSpace(sessionUID) == "" ||
+		task.Spec.Execution.Workspace.ReusePolicy != corev1alpha1.WorkspaceReusePolicySession {
+		return false, nil
+	}
+	binding, err := resolveACPWorkspaceBindingWithClass(task, "", false, sessionUID, resolved)
+	if err != nil {
+		return false, err
+	}
+	workspace := &workspacev1alpha1.ExecutionWorkspace{}
+	key := types.NamespacedName{
+		Namespace: task.Namespace,
+		Name:      acpClassWorkspaceName(task, binding),
+	}
+	if err := reader.Get(ctx, key, workspace); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("%w: read quota-blocked session workspace: %v", errACPWorkspacePlanningTransient, err)
+	}
+	if !workspace.DeletionTimestamp.IsZero() || workspace.Spec.Attachment != nil ||
+		workspace.Status.State != workspacev1alpha1.ExecutionWorkspaceStateReady ||
+		workspace.Spec.SessionRef == nil || string(workspace.Spec.SessionRef.UID) != sessionUID ||
+		workspace.Annotations[acpWorkspaceDetachActionAnnotation] != string(workspacev1alpha1.WorkspaceOnDetachSuspend) ||
+		strings.TrimSpace(workspace.Annotations[acpWorkspaceDurableSessionCommittedAnnotation]) == "" ||
+		!runtimePoolWorkspaceSuspendableAnnotationPresent(workspace) {
+		return false, nil
+	}
+	if err := verifyACPClassWorkspace(
+		workspace, task, binding, workspace.Annotations[acpExecutionWorkspacePoolAnnotation],
+	); err != nil {
+		return false, nil
+	}
+	return true, nil
 }
 
 // frozenACPContinuationSandboxVolume returns the durable-volume identity
@@ -890,6 +1038,12 @@ func validateACPWorkspaceClassLifecycleValues(class *ACPWorkspaceClassBinding) e
 	if class.SuspendMode != "" && class.SuspendMode != string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) {
 		return fmt.Errorf("frozen execution workspace class binding suspension mode %q is not supported", class.SuspendMode)
 	}
+	if class.MaxSuspendedWorkspaces != nil && *class.MaxSuspendedWorkspaces < 0 {
+		return fmt.Errorf("frozen execution workspace class binding retention cap is negative")
+	}
+	// Retention bounds gate new class resolution. Frozen snapshots admitted by
+	// older controllers remain executable so an upgrade cannot wedge a Task
+	// whose immutable binding predates that requirement.
 	if class.SandboxVolume != nil {
 		if class.SuspendMode != string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) {
 			return fmt.Errorf("frozen execution workspace class binding carries a durable volume without a DataOnly suspension policy")
@@ -937,6 +1091,20 @@ func validateACPWorkspaceClassLifecycleValues(class *ACPWorkspaceClassBinding) e
 		if action != string(workspacev1alpha1.WorkspaceDeletionActionDelete) {
 			return fmt.Errorf("frozen execution workspace class binding deletion policy action %q is not executable; only Delete is supported", action)
 		}
+	}
+	return nil
+}
+
+func validateACPWorkspaceRetentionBound(class *ACPWorkspaceClassBinding) error {
+	if class == nil || class.SuspendMode != string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) ||
+		!slices.Contains(class.AllowedOnDetach, string(workspacev1alpha1.WorkspaceOnDetachSuspend)) {
+		return nil
+	}
+	if class.IdleTimeout == "" && class.MaxLifetime == "" {
+		return errors.New("a suspend-capable class requires an expiry bound: idleTimeout or maxLifetime; maxSuspendedWorkspaces only caps suspended occupancy")
+	}
+	if class.MaxSuspendedWorkspaces != nil && class.MaxLifetime == "" {
+		return errors.New("a suspend-capable class with maxSuspendedWorkspaces requires maxLifetime because quota can defer suspension past idleTimeout")
 	}
 	return nil
 }

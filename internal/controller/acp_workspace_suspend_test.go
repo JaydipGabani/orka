@@ -207,6 +207,8 @@ func TestEnsureACPClassWorkspaceResumesSuspendedWorkspace(t *testing.T) {
 	}
 	base := workspace.DeepCopy()
 	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredSuspended
+	detachedAt := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	workspace.Annotations[acpWorkspaceLastDetachedAnnotation] = detachedAt
 	if err := r.Patch(ctx, workspace, client.MergeFrom(base)); err != nil {
 		t.Fatalf("suspend workspace: %v", err)
 	}
@@ -227,13 +229,22 @@ func TestEnsureACPClassWorkspaceResumesSuspendedWorkspace(t *testing.T) {
 		t.Fatalf("desired state = %s, want the suspension left to finish", workspace.Spec.DesiredState)
 	}
 
-	// Once the checkpoint settles, the continuation flips the workspace back
-	// to Ready for a cold resume.
+	// Once the checkpoint settles, a continuation that froze the Delete
+	// action flips the workspace back to Ready for a cold resume — and the
+	// flip must stamp the continuation's own detach action so a death during
+	// cold boot settles with Delete, not the suspender's stale Suspend.
 	workspace.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspended
 	if err := r.Status().Update(ctx, workspace); err != nil {
 		t.Fatalf("mark suspended: %v", err)
 	}
-	if _, ready, err := r.ensureACPClassWorkspace(ctx, task, plan); err != nil || ready {
+	continuation := suspendableSessionTask()
+	continuation.Spec.Execution.Workspace.OnDetach = corev1alpha1.WorkspaceOnDetachDelete
+	deleteBinding, err := resolveACPWorkspaceBindingWithClass(continuation, "", false, "session-uid-1", resolved)
+	if err != nil {
+		t.Fatalf("resolve continuation binding: %v", err)
+	}
+	deletePlan := ACPRuntimePlan{PoolName: plan.PoolName, Workspace: deleteBinding}
+	if _, ready, err := r.ensureACPClassWorkspace(ctx, continuation, deletePlan); err != nil || ready {
 		t.Fatalf("ensure over a suspended workspace = (%v, %v), want a resume request", ready, err)
 	}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, workspace); err != nil {
@@ -241,6 +252,104 @@ func TestEnsureACPClassWorkspaceResumesSuspendedWorkspace(t *testing.T) {
 	}
 	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady {
 		t.Fatalf("desired state = %s, want Ready", workspace.Spec.DesiredState)
+	}
+	if got := workspace.Annotations[acpWorkspaceDetachActionAnnotation]; got != string(workspacev1alpha1.WorkspaceOnDetachDelete) {
+		t.Fatalf("resumed detach action = %q, want the continuation's frozen Delete", got)
+	}
+	if workspace.Annotations[acpWorkspaceResumeRequestedAnnotation] == "" {
+		t.Fatal("the resume flip must record pending demand")
+	}
+	if got := workspace.Annotations[acpWorkspaceLastDetachedAnnotation]; got != detachedAt {
+		t.Fatalf("resume changed last detach timestamp to %q, want %q", got, detachedAt)
+	}
+}
+
+// Initial materialization records pending demand so a slow first provisioning
+// is never idle-expired before its Task can attach.
+func TestWorkspaceCreationAnnotationsRecordPendingDemand(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := suspendableSubstrateFixture(t)
+	r := acpClassTestReconciler(t, fixture.objects()...)
+	resolved, err := r.resolveACPWorkspaceClass(ctx, acpClassTestTask())
+	if err != nil {
+		t.Fatalf("resolve class: %v", err)
+	}
+	binding, err := resolveACPWorkspaceBindingWithClass(suspendableSessionTask(), "", false, "session-uid-1", resolved)
+	if err != nil {
+		t.Fatalf("resolve binding: %v", err)
+	}
+	annotations := workspaceCreationAnnotations(binding, "acp-ws-session-0123456789abcdef", "test-requester", "test-requester-uid", "orka-runtimes")
+	if annotations[acpWorkspaceResumeRequestedAnnotation] == "" {
+		t.Fatal("materialization must record pending provisioning demand")
+	}
+	if annotations[acpWorkspaceDetachActionAnnotation] != string(workspacev1alpha1.WorkspaceOnDetachSuspend) {
+		t.Fatalf("creation detach action = %q", annotations[acpWorkspaceDetachActionAnnotation])
+	}
+}
+
+func TestRecordACPWorkspaceDetachActionFencesReplacementIncarnation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	workspace := acpAdapterWorkspace(t, "")
+	workspace.Annotations[acpWorkspaceResumeRequestedAnnotation] = "original-demand"
+	baseClient := acpAdapterTestClient(t, workspace)
+	replaced := false
+	c := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Patch: func(
+			ctx context.Context,
+			delegate client.WithWatch,
+			object client.Object,
+			patch client.Patch,
+			options ...client.PatchOption,
+		) error {
+			candidate, isWorkspace := object.(*workspacev1alpha1.ExecutionWorkspace)
+			if isWorkspace && candidate.Annotations[acpWorkspaceDetachActionAnnotation] != "" && !replaced {
+				current := &workspacev1alpha1.ExecutionWorkspace{}
+				key := client.ObjectKeyFromObject(workspace)
+				if err := delegate.Get(ctx, key, current); err != nil {
+					return err
+				}
+				if err := delegate.Delete(ctx, current); err != nil {
+					return err
+				}
+				replacement := current.DeepCopy()
+				replacement.ObjectMeta = metav1.ObjectMeta{
+					Namespace: current.Namespace,
+					Name:      current.Name,
+					UID:       types.UID("replacement-workspace-uid"),
+					Labels:    current.Labels,
+					Annotations: map[string]string{
+						acpWorkspaceResumeRequestedAnnotation: "replacement-demand",
+					},
+				}
+				if err := delegate.Create(ctx, replacement); err != nil {
+					return err
+				}
+				replaced = true
+			}
+			return delegate.Patch(ctx, object, patch, options...)
+		},
+	})
+	original := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(workspace), original); err != nil {
+		t.Fatalf("read original workspace: %v", err)
+	}
+	r := &TaskReconciler{Client: c}
+	binding := &ACPRuntimeWorkspaceBinding{Class: &ACPWorkspaceClassBinding{
+		EffectiveOnDetach: string(workspacev1alpha1.WorkspaceOnDetachSuspend),
+	}}
+	if err := r.recordACPWorkspaceDetachAction(ctx, original, binding); err == nil {
+		t.Fatal("detach-action patch succeeded across workspace replacement")
+	}
+	current := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := baseClient.Get(ctx, client.ObjectKeyFromObject(workspace), current); err != nil {
+		t.Fatalf("read replacement workspace: %v", err)
+	}
+	if current.UID != "replacement-workspace-uid" ||
+		current.Annotations[acpWorkspaceDetachActionAnnotation] != "" ||
+		current.Annotations[acpWorkspaceResumeRequestedAnnotation] != "replacement-demand" {
+		t.Fatalf("replacement workspace was changed by stale attachment metadata: %#v", current)
 	}
 }
 
@@ -924,6 +1033,7 @@ func TestACPExecutionWorkspaceAdapterFailsPermanentCheckpointRejection(t *testin
 	provider := acpAdapterProvider()
 	workspace := acpAdapterWorkspace(t, "acp-ws-pool")
 	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredSuspended
+	workspace.Annotations[acpWorkspaceDurableAnnotation] = booleanTrueValue
 	pool := acpAdapterLinkedPool(workspace.Namespace, workspace.Name)
 	pool.Spec.ExecutionWorkspace.Provider = corev1alpha1.WorkspaceProviderSubstrate
 	pool.Spec.ExecutionWorkspace.Substrate = &corev1alpha1.RuntimePoolSubstrateWorkspaceSpec{
@@ -942,6 +1052,16 @@ func TestACPExecutionWorkspaceAdapterFailsPermanentCheckpointRejection(t *testin
 	}
 	if updated.Status.State != workspacev1alpha1.ExecutionWorkspaceStateFailed {
 		t.Fatalf("state = %s, want Failed after a permanent checkpoint rejection", updated.Status.State)
+	}
+	if updated.Annotations[acpWorkspaceDurableDataAbsentAnnotation] != booleanTrueValue {
+		t.Fatal("permanent checkpoint rejection must record that no durable data exists")
+	}
+	count, err := countSuspendedClassWorkspaces(ctx, c, workspace.Namespace, workspace.Spec.ClassBinding.UID, nil)
+	if err != nil {
+		t.Fatalf("count retained workspaces: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("count = %d, want the rejected checkpoint excluded from the retention quota", count)
 	}
 }
 
@@ -1023,6 +1143,9 @@ func TestResolveACPClassWorkspaceBindingAdmitsSandboxPVCSuspend(t *testing.T) {
 func TestResolveACPClassWorkspaceContinuationReusesFrozenSandboxVolume(t *testing.T) {
 	ctx := context.Background()
 	fixture := suspendableSandboxFixture(t)
+	limit := int32(2)
+	fixture.profile.Spec.Retention = &acpworkspacev1alpha1.RetentionPolicy{MaxSuspendedWorkspaces: &limit}
+	fixture.pinProfileHash(t)
 	holder := suspendableSessionTask()
 	objects := fixture.objects()
 	for _, object := range objects {
@@ -1035,6 +1158,9 @@ func TestResolveACPClassWorkspaceContinuationReusesFrozenSandboxVolume(t *testin
 	originalResolved, err := r.resolveACPWorkspaceClassWithSessionUID(ctx, holder, sessionUID)
 	if err != nil {
 		t.Fatalf("resolve original class: %v", err)
+	}
+	if originalResolved.Binding.MaxSuspendedWorkspaces == nil || *originalResolved.Binding.MaxSuspendedWorkspaces != limit {
+		t.Fatalf("resolved suspended-workspace cap = %v, want %d", originalResolved.Binding.MaxSuspendedWorkspaces, limit)
 	}
 	originalBinding, err := resolveACPWorkspaceBindingWithClass(holder, "", false, sessionUID, originalResolved)
 	if err != nil {
@@ -1454,6 +1580,7 @@ func TestACPExecutionWorkspaceAdapterFailsResumedLineageOnPoolLoss(t *testing.T)
 	provider := acpAdapterProvider()
 	workspace := acpAdapterWorkspace(t, "acp-ws-pool")
 	workspace.Annotations[acpWorkspaceResumedLineageAnnotation] = booleanTrueValue
+	workspace.Annotations[acpWorkspaceDurableAnnotation] = booleanTrueValue
 	// Ready already projected; no pool exists any more.
 	workspace.Status.State = workspacev1alpha1.ExecutionWorkspaceStateReady
 	c := acpAdapterTestClient(t, provider, workspace)
@@ -1465,6 +1592,16 @@ func TestACPExecutionWorkspaceAdapterFailsResumedLineageOnPoolLoss(t *testing.T)
 	}
 	if updated.Status.State != workspacev1alpha1.ExecutionWorkspaceStateFailed {
 		t.Fatalf("state = %s, want Failed after pool loss on a resumed lineage", updated.Status.State)
+	}
+	if updated.Annotations[acpWorkspaceDurableDataAbsentAnnotation] != booleanTrueValue {
+		t.Fatal("pool loss must record that the resumed workspace's durable data is absent")
+	}
+	count, err := countSuspendedClassWorkspaces(ctx, c, workspace.Namespace, workspace.Spec.ClassBinding.UID, nil)
+	if err != nil {
+		t.Fatalf("count retained workspaces: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("count = %d, want proven pool loss to free the retention slot", count)
 	}
 }
 
@@ -1523,6 +1660,51 @@ func TestACPExecutionWorkspaceAdapterRevocationChecksResumedPoolHealth(t *testin
 	}
 }
 
+func TestACPExecutionWorkspaceAdapterRevocationFreesQuotaAfterResumedPoolLoss(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := acpAdapterProvider()
+	workspace := acpAdapterWorkspace(t, "acp-ws-pool")
+	workspace.Annotations[acpWorkspaceResumedLineageAnnotation] = booleanTrueValue
+	workspace.Annotations[acpWorkspaceDurableAnnotation] = booleanTrueValue
+	workspace.Spec.AttachmentEpoch = 7
+	c := acpAdapterTestClient(t, provider, workspace)
+
+	current := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(workspace), current); err != nil {
+		t.Fatalf("read workspace: %v", err)
+	}
+	base := current.DeepCopy()
+	current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
+	current.Status.AttachedEpoch = 7
+	apimeta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
+		Type: string(workspacev1alpha1.ConditionWorkspaceAttached), Status: metav1.ConditionTrue,
+		Reason: string(workspacev1alpha1.ReasonReady), ObservedGeneration: current.Generation,
+	})
+	if err := c.Status().Patch(ctx, current, client.MergeFrom(base)); err != nil {
+		t.Fatalf("seed attached workspace: %v", err)
+	}
+
+	reconcileACPWorkspaceAdapter(t, c, workspace)
+	if err := c.Get(ctx, client.ObjectKeyFromObject(workspace), current); err != nil {
+		t.Fatalf("read failed workspace: %v", err)
+	}
+	if current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateFailed || current.Status.AttachedEpoch != 0 {
+		t.Fatalf("lost resumed pool = %s epoch=%d, want Failed with no enforced attachment",
+			current.Status.State, current.Status.AttachedEpoch)
+	}
+	if current.Annotations[acpWorkspaceDurableDataAbsentAnnotation] != booleanTrueValue {
+		t.Fatal("lost resumed pool during revocation must record that durable data is absent")
+	}
+	count, err := countSuspendedClassWorkspaces(ctx, c, current.Namespace, current.Spec.ClassBinding.UID, nil)
+	if err != nil {
+		t.Fatalf("count retained workspaces: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("count = %d, want proven resumed-pool loss to free the retention slot", count)
+	}
+}
+
 // A resumed lineage may recover from a transient pool outage, but it must not
 // remain Ready or Attached while the exact data-bearing pool is unavailable.
 // Once the pool records definitive lineage loss, the workspace becomes Failed.
@@ -1542,7 +1724,7 @@ func TestACPExecutionWorkspaceAdapterWithdrawsUnavailableResumedLineage(t *testi
 			if attached {
 				workspace.Spec.AttachmentEpoch = 7
 				workspace.Spec.Attachment = &workspacev1alpha1.ExecutionWorkspaceAttachment{
-					TaskRef:        workspacev1alpha1.ObjectIdentityReference{Name: "attached-task", UID: types.UID("attached-task-uid")},
+					TaskRef:        workspacev1alpha1.ObjectIdentityReference{Name: acpTestAttachedTask, UID: types.UID("attached-task-uid")},
 					Epoch:          7,
 					TokenSHA256:    "sha256:" + strings.Repeat("c", 64),
 					TokenSecretRef: workspacev1alpha1.SecretReference{Name: "attach-secret"},
