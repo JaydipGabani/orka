@@ -32,6 +32,13 @@ describe('splitShellWords', () => {
     expect(splitShellWords('echo "a \\"b\\" \\$c \\\\ \\n"')).toEqual({ words: ['echo', 'a "b" $c \\ \\n'] })
   })
 
+  it('rejects a trailing unquoted backslash instead of dropping it', () => {
+    expect(splitShellWords('echo foo\\')).toEqual({ error: 'Trailing backslash in command' })
+    expect(splitShellWords('\\')).toEqual({ error: 'Trailing backslash in command' })
+    // Inside quotes a trailing backslash is literal; the open quote is the error.
+    expect(splitShellWords('echo "foo\\')).toEqual({ error: 'Unterminated double quote in command' })
+  })
+
   it('rejects unterminated double and single quotes', () => {
     expect(splitShellWords('sh -c "echo hi')).toEqual({ error: 'Unterminated double quote in command' })
     expect(splitShellWords("sh -c 'echo hi")).toEqual({ error: 'Unterminated single quote in command' })

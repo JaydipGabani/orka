@@ -7,11 +7,17 @@ interface ChatState {
   currentSessionId: string | null
   isStreaming: boolean
   // Provider CRD name and model sent with each turn; empty means "server default".
+  // These mirror `selections[activeNamespace]`: Providers are namespace-scoped,
+  // so the persisted picker choice is keyed by namespace and swapped in with
+  // `selectNamespace` whenever the active namespace changes.
   provider: string
   model: string
+  activeNamespace: string
+  selections: Record<string, ChatSelection>
   // Actions
   setProvider: (provider: string) => void
   setModel: (model: string) => void
+  selectNamespace: (namespace: string) => void
   addMessage: (message: ChatMessage) => void
   updateLastAssistantMessage: (content: string) => void
   setSessionId: (id: string) => void
@@ -42,7 +48,12 @@ function rawStorage(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> {
   }
 }
 
-type PersistedChatState = Pick<ChatState, 'provider' | 'model'>
+export interface ChatSelection {
+  provider: string
+  model: string
+}
+
+type PersistedChatState = Pick<ChatState, 'selections'>
 
 // Hand-rolled JSON storage (instead of createJSONStorage) so test suites that
 // stub `zustand/middleware` with only `persist` keep working.
@@ -76,9 +87,28 @@ export const useChatStore = create<ChatState>()(
   isStreaming: false,
   provider: '',
   model: '',
+  activeNamespace: '',
+  selections: {},
 
-  setProvider: (provider) => set({ provider }),
-  setModel: (model) => set({ model }),
+  setProvider: (provider) =>
+    set((state) => ({
+      provider,
+      selections: { ...state.selections, [state.activeNamespace]: { provider, model: state.model } },
+    })),
+  setModel: (model) =>
+    set((state) => ({
+      model,
+      selections: { ...state.selections, [state.activeNamespace]: { provider: state.provider, model } },
+    })),
+  selectNamespace: (namespace) =>
+    set((state) => {
+      const selection = state.selections[namespace]
+      return {
+        activeNamespace: namespace,
+        provider: selection?.provider ?? '',
+        model: selection?.model ?? '',
+      }
+    }),
 
   addMessage: (message) =>
     set((state) => ({ messages: [...state.messages, message] })),
@@ -117,11 +147,18 @@ export const useChatStore = create<ChatState>()(
       return { messages: msgs }
     }),
     }),
-    // Only the picker choice survives reloads; transcripts stay per-page.
+    // Only the per-namespace picker choices survive reloads; transcripts stay
+    // per-page. Version 0 persisted one global {provider, model}; it is dropped
+    // on upgrade because it cannot be attributed to a namespace.
     {
       name: 'orka-chat',
+      version: 1,
       storage: chatStorage(),
-      partialize: (state) => ({ provider: state.provider, model: state.model }),
+      partialize: (state) => ({ selections: state.selections }),
+      migrate: (persisted, version) => {
+        const state = (persisted ?? {}) as Partial<PersistedChatState>
+        return { selections: version >= 1 && state.selections ? state.selections : {} }
+      },
     },
   ),
 )

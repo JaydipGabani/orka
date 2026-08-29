@@ -385,7 +385,18 @@ export function TaskCreateForm() {
                   <label className="text-sm font-medium">Agent</label>
                   <Select
                     value={aiAgentRef || '__none__'}
-                    onValueChange={(value) => setAIAgentRef(value === '__none__' ? '' : value)}
+                    onValueChange={(value) => {
+                      const next = value === '__none__' ? '' : value
+                      setAIAgentRef(next)
+                      // Inline provider/model become hidden overrides once an
+                      // Agent is chosen; drop them so only values the user
+                      // re-enters after opening the disclosure are submitted.
+                      if (next) {
+                        setProvider('')
+                        setModel('')
+                        setShowAIModelOverrides(false)
+                      }
+                    }}
                     disabled={inlineAgents.length === 0}
                   >
                     <SelectTrigger aria-label="AI agent"><SelectValue placeholder="Select an agent (optional)" /></SelectTrigger>
@@ -424,13 +435,18 @@ export function TaskCreateForm() {
                     type="button"
                     onClick={() => setShowAIModelOverrides(!showAIModelOverrides)}
                     className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+                    aria-expanded={showAIModelOverrides}
+                    aria-controls="ai-model-overrides"
                   >
                     {showAIModelOverrides ? '▼' : '▶'} Provider / model overrides (optional)
                   </button>
                 ) : null}
 
                 {(!aiAgentRef || showAIModelOverrides) && (
-                  <div className={`grid gap-4 md:grid-cols-2 ${aiAgentRef ? 'border-l-2 border-border pl-4' : ''}`}>
+                  <div
+                    id={aiAgentRef ? 'ai-model-overrides' : undefined}
+                    className={`grid gap-4 md:grid-cols-2 ${aiAgentRef ? 'border-l-2 border-border pl-4' : ''}`}
+                  >
                     <div className="space-y-2">
                       <label className="text-sm font-medium">Provider</label>
                       <Select value={provider} onValueChange={setProvider}>

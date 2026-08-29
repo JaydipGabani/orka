@@ -5,6 +5,8 @@ kind: Agent
 metadata:
   name: claude-coder
 spec:
+  model:
+    name: claude-sonnet-4.6
   runtime:
     type: claude
     contractVersion: orka.harness.v2

@@ -7,26 +7,35 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/orka-agents/orka/internal/redact"
 )
 
 // Review context bounds. The encoded orka.prReview.context.v1 payload is
 // embedded in Task.spec.prompt, so the total budget must stay well below the
 // etcd object size limit (~1.5 MiB) together with the rest of the prompt and
 // the Task object; 700 KiB leaves that margin while matching the documented
-// contract in website/docs/guides/repository-monitors.md.
+// contract in website/docs/guides/repository-monitors.md. Patches are carried
+// for at most MaxFiles files; identities (path, status, counts) are carried
+// for at most MaxFileEntries files so the reviewer can still discover every
+// changed file in the Git-metadata-free checkout. Identities take precedence
+// over patches inside the byte budget.
 const (
 	repositoryMonitorReviewContextSchemaVersion    = "orka.prReview.context.v1"
 	repositoryMonitorReviewContextMaxFiles         = 100
+	repositoryMonitorReviewContextMaxFileEntries   = 2000
 	repositoryMonitorReviewContextMaxBytes         = 700 << 10
 	repositoryMonitorReviewContextMaxPatchBytes    = 64 << 10
 	repositoryMonitorReviewContextMaxPathBytes     = 512
 	repositoryMonitorReviewContextMaxStatusBytes   = 32
 	repositoryMonitorReviewContextPatchTruncated   = "truncated"
 	repositoryMonitorReviewContextPatchUnavailable = "unavailable"
+	repositoryMonitorReviewContextPatchCapped      = "capped"
 	repositoryMonitorReviewContextBeginMarker      = "--- BEGIN orka.prReview.context.v1 ---"
 	repositoryMonitorReviewContextEndMarker        = "--- END orka.prReview.context.v1 ---"
 
@@ -96,18 +105,14 @@ func newRepositoryMonitorReviewContext(owner, repository string, pr repositoryMo
 
 // buildRepositoryMonitorReviewContext fetches the pull request file list with
 // patches, then refetches the pull request and fails closed when the base,
-// head, or head repository drifted. GitHub read failures do not fail the
-// review: the returned context is marked unavailable with a sanitized error
-// class only, so the reviewer inspects the checked-out tree instead.
+// head, or head repository drifted. The drift check runs even when the file
+// listing failed so a moved head is never reviewed against stale identity.
+// GitHub read failures do not fail the review: the returned context is
+// marked unavailable with a sanitized error class only, so the reviewer
+// inspects the checked-out tree instead.
 func (r *RepositoryMonitorReconciler) buildRepositoryMonitorReviewContext(ctx context.Context, owner, repository, token string, pr repositoryMonitorPullRequest) (repositoryMonitorReviewContext, error) {
 	logger := log.FromContext(ctx).WithName("repositorymonitor")
-	files, err := r.listRepositoryMonitorPullRequestFiles(ctx, owner, repository, token, pr.Number)
-	if err != nil {
-		reviewContext := newRepositoryMonitorReviewContext(owner, repository, pr)
-		reviewContext.ContextUnavailable = repositoryMonitorReviewContextErrorClass(err)
-		logger.Info("pull request review context unavailable", "pr", pr.Number, "operation", "list_files", "errorClass", reviewContext.ContextUnavailable)
-		return reviewContext, nil
-	}
+	files, filesErr := r.listRepositoryMonitorPullRequestFiles(ctx, owner, repository, token, pr.Number)
 	current, err := r.fetchRepositoryMonitorPullRequest(ctx, owner, repository, token, pr.Number)
 	if err != nil {
 		reviewContext := newRepositoryMonitorReviewContext(owner, repository, pr)
@@ -117,6 +122,12 @@ func (r *RepositoryMonitorReconciler) buildRepositoryMonitorReviewContext(ctx co
 	}
 	if driftErr := repositoryMonitorReviewContextDrift(pr, *current); driftErr != nil {
 		return repositoryMonitorReviewContext{}, driftErr
+	}
+	if filesErr != nil {
+		reviewContext := newRepositoryMonitorReviewContext(owner, repository, pr)
+		reviewContext.ContextUnavailable = repositoryMonitorReviewContextErrorClass(filesErr)
+		logger.Info("pull request review context unavailable", "pr", pr.Number, "operation", "list_files", "errorClass", reviewContext.ContextUnavailable)
+		return reviewContext, nil
 	}
 	return repositoryMonitorReviewContextFromFiles(owner, repository, pr, files), nil
 }
@@ -167,54 +178,89 @@ func repositoryMonitorReviewContextErrorClass(err error) string {
 }
 
 // repositoryMonitorReviewContextFromFiles renders the bounded context payload:
-// at most repositoryMonitorReviewContextMaxFiles files, at most
-// repositoryMonitorReviewContextMaxPatchBytes encoded patch per file, and at
-// most repositoryMonitorReviewContextMaxBytes encoded payload overall. When
-// the byte budget is exhausted, remaining patches are dropped first and then
-// remaining files, with the matching truncated flags set.
+// identities for at most repositoryMonitorReviewContextMaxFileEntries files,
+// patches (at most repositoryMonitorReviewContextMaxPatchBytes encoded each)
+// for the first repositoryMonitorReviewContextMaxFiles of them, and at most
+// repositoryMonitorReviewContextMaxBytes encoded payload overall. Identities
+// are placed first: patches are only added while the budget allows, and
+// identities are dropped only when the path list alone does not fit.
+// truncated.files therefore means the change set is not fully represented,
+// which the prompt turns into a mandatory non-passing verdict.
 func repositoryMonitorReviewContextFromFiles(owner, repository string, pr repositoryMonitorPullRequest, files []repositoryMonitorPullRequestFileResponse) repositoryMonitorReviewContext {
 	reviewContext := newRepositoryMonitorReviewContext(owner, repository, pr)
 	reviewContext.ChangedFileCount = len(files)
-	if len(files) > repositoryMonitorReviewContextMaxFiles {
-		files = files[:repositoryMonitorReviewContextMaxFiles]
+	if len(files) > repositoryMonitorReviewContextMaxFileEntries {
+		files = files[:repositoryMonitorReviewContextMaxFileEntries]
 		reviewContext.Truncated.Files = true
 	}
 
+	entries := make([]repositoryMonitorReviewContextFile, 0, len(files))
 	used := repositoryMonitorReviewContextEncodedSize(reviewContext)
-	patchesAllowed := true
-	for _, file := range files {
-		entry := repositoryMonitorReviewContextFileEntry(file)
-		if !patchesAllowed {
-			entry = repositoryMonitorReviewContextDropPatch(entry)
-		}
-		entrySize := repositoryMonitorReviewContextEntrySize(entry, len(reviewContext.Files))
-		if used+entrySize > repositoryMonitorReviewContextMaxBytes && entry.Patch != "" {
-			patchesAllowed = false
-			reviewContext.Truncated.Bytes = true
-			entry = repositoryMonitorReviewContextDropPatch(entry)
-			entrySize = repositoryMonitorReviewContextEntrySize(entry, len(reviewContext.Files))
-		}
+	for i, file := range files {
+		entry := repositoryMonitorReviewContextIdentityEntry(file, i >= repositoryMonitorReviewContextMaxFiles)
+		entrySize := repositoryMonitorReviewContextEntrySize(entry, len(entries))
 		if used+entrySize > repositoryMonitorReviewContextMaxBytes {
 			reviewContext.Truncated.Files = true
 			reviewContext.Truncated.Bytes = true
 			break
 		}
-		reviewContext.Files = append(reviewContext.Files, entry)
+		entries = append(entries, entry)
 		used += entrySize
 	}
-	// The truncated flags flip after entries were sized, and the envelope is an
-	// estimate; verify the final encoding and trim conservatively if needed.
-	for repositoryMonitorReviewContextEncodedSize(reviewContext) > repositoryMonitorReviewContextMaxBytes && len(reviewContext.Files) > 0 {
-		last := len(reviewContext.Files) - 1
-		reviewContext.Truncated.Bytes = true
-		if reviewContext.Files[last].Patch != "" {
-			reviewContext.Files[last] = repositoryMonitorReviewContextDropPatch(reviewContext.Files[last])
+	for i := range min(len(entries), repositoryMonitorReviewContextMaxFiles) {
+		withPatch := repositoryMonitorReviewContextFileEntry(files[i])
+		if withPatch.Patch == "" {
 			continue
 		}
-		reviewContext.Files = reviewContext.Files[:last]
+		delta := repositoryMonitorReviewContextEntrySize(withPatch, i) - repositoryMonitorReviewContextEntrySize(entries[i], i)
+		if used+delta > repositoryMonitorReviewContextMaxBytes {
+			reviewContext.Truncated.Bytes = true
+			break
+		}
+		entries[i] = withPatch
+		used += delta
+	}
+	reviewContext.Files = entries
+	return repositoryMonitorReviewContextTrimToBudget(reviewContext)
+}
+
+// repositoryMonitorReviewContextTrimToBudget verifies the final encoding,
+// because the per-entry accounting is an estimate, and trims conservatively:
+// the last remaining patch goes first, then the last identity entry.
+func repositoryMonitorReviewContextTrimToBudget(reviewContext repositoryMonitorReviewContext) repositoryMonitorReviewContext {
+	for repositoryMonitorReviewContextEncodedSize(reviewContext) > repositoryMonitorReviewContextMaxBytes && len(reviewContext.Files) > 0 {
+		reviewContext.Truncated.Bytes = true
+		if i := repositoryMonitorReviewContextLastPatchIndex(reviewContext.Files); i >= 0 {
+			reviewContext.Files[i] = repositoryMonitorReviewContextDropPatch(reviewContext.Files[i])
+			continue
+		}
+		reviewContext.Files = reviewContext.Files[:len(reviewContext.Files)-1]
 		reviewContext.Truncated.Files = true
 	}
 	return reviewContext
+}
+
+func repositoryMonitorReviewContextLastPatchIndex(files []repositoryMonitorReviewContextFile) int {
+	for i, file := range slices.Backward(files) {
+		if file.Patch != "" {
+			return i
+		}
+	}
+	return -1
+}
+
+// repositoryMonitorReviewContextIdentityEntry renders the patch-free entry
+// for a changed file. Files beyond the patch cap are marked capped; files
+// inside it are marked truncated until a patch is attached, or unavailable
+// when GitHub supplied none.
+func repositoryMonitorReviewContextIdentityEntry(file repositoryMonitorPullRequestFileResponse, capped bool) repositoryMonitorReviewContextFile {
+	entry := repositoryMonitorReviewContextFileEntry(file)
+	if capped {
+		entry.Patch = ""
+		entry.PatchOmitted = repositoryMonitorReviewContextPatchCapped
+		return entry
+	}
+	return repositoryMonitorReviewContextDropPatch(entry)
 }
 
 func repositoryMonitorReviewContextFileEntry(file repositoryMonitorPullRequestFileResponse) repositoryMonitorReviewContextFile {
@@ -281,9 +327,11 @@ func repositoryMonitorReviewContextBoundedField(value string, maxBytes int) stri
 
 // repositoryMonitorReviewContextSanitize drops invalid UTF-8 and control
 // characters other than newline and tab so GitHub-supplied text cannot carry
-// terminal escapes or NUL bytes into the prompt.
+// terminal escapes or NUL bytes into the prompt, then redacts credential
+// shapes: patches are untrusted pull request content that is persisted in
+// Task.spec.prompt and readable through the Tasks API.
 func repositoryMonitorReviewContextSanitize(value string) string {
-	value = strings.ToValidUTF8(value, "")
+	value = redact.SensitiveText(strings.ToValidUTF8(value, ""))
 	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\t' {
 			return r
@@ -327,6 +375,10 @@ func repositoryMonitorReviewContextEntrySize(entry repositoryMonitorReviewContex
 	return len(encoded) + overhead
 }
 
+// renderRepositoryMonitorReviewContext wraps the indented JSON payload in
+// line-anchored markers. JSON string values cannot contain a raw newline, so a
+// marker preceded by a newline can only come from the renderer, never from a
+// patch or path embedded in the payload.
 func renderRepositoryMonitorReviewContext(reviewContext repositoryMonitorReviewContext) string {
 	if reviewContext.Files == nil {
 		reviewContext.Files = []repositoryMonitorReviewContextFile{}
@@ -344,17 +396,70 @@ func renderRepositoryMonitorReviewContext(reviewContext repositoryMonitorReviewC
 	return repositoryMonitorReviewContextBeginMarker + "\n" + string(encoded) + "\n" + repositoryMonitorReviewContextEndMarker
 }
 
-// repositoryMonitorReviewPromptWithoutContext strips the embedded context
-// block so an existing review Task can be compared against a freshly built
-// one even when GitHub returned different (or no) diff context.
-func repositoryMonitorReviewPromptWithoutContext(prompt string) string {
-	start := strings.Index(prompt, repositoryMonitorReviewContextBeginMarker)
+// repositoryMonitorReviewPromptContextBounds locates the rendered context
+// block: the first line-anchored begin marker and the LAST line-anchored end
+// marker after it. Untrusted payload text is JSON-encoded, so it can never
+// place a marker at the start of a line; only the renderer's markers match.
+func repositoryMonitorReviewPromptContextBounds(prompt string) (int, int, bool) {
+	beginLine := "\n" + repositoryMonitorReviewContextBeginMarker + "\n"
+	endLine := "\n" + repositoryMonitorReviewContextEndMarker
+	start := strings.Index(prompt, beginLine)
 	if start < 0 {
-		return prompt
+		return 0, 0, false
 	}
-	_, after, found := strings.Cut(prompt[start:], repositoryMonitorReviewContextEndMarker)
+	start++ // keep the newline that precedes the block
+	end := strings.LastIndex(prompt, endLine)
+	if end < start {
+		return 0, 0, false
+	}
+	return start, end + len(endLine), true
+}
+
+// repositoryMonitorReviewPromptContext parses the embedded context block of a
+// rendered review prompt.
+func repositoryMonitorReviewPromptContext(prompt string) (repositoryMonitorReviewContext, bool) {
+	start, end, found := repositoryMonitorReviewPromptContextBounds(prompt)
 	if !found {
-		return prompt
+		return repositoryMonitorReviewContext{}, false
 	}
-	return prompt[:start] + after
+	block := prompt[start:end]
+	block = strings.TrimPrefix(block, repositoryMonitorReviewContextBeginMarker+"\n")
+	block = strings.TrimSuffix(block, "\n"+repositoryMonitorReviewContextEndMarker)
+	var parsed repositoryMonitorReviewContext
+	if err := json.Unmarshal([]byte(block), &parsed); err != nil {
+		return repositoryMonitorReviewContext{}, false
+	}
+	return parsed, true
+}
+
+// repositoryMonitorReviewContextIsUnavailableEnvelope reports whether the
+// context is exactly the controller-shaped "GitHub unavailable" envelope for
+// the expected pull request: no files, no truncation, and a well-formed error
+// class. Such an envelope carries no untrusted content.
+func repositoryMonitorReviewContextIsUnavailableEnvelope(candidate, expected repositoryMonitorReviewContext) bool {
+	if candidate.SchemaVersion != expected.SchemaVersion || candidate.Repo != expected.Repo || candidate.PRNumber != expected.PRNumber ||
+		candidate.BaseSHA != expected.BaseSHA || candidate.HeadSHA != expected.HeadSHA {
+		return false
+	}
+	if candidate.ChangedFileCount != 0 || len(candidate.Files) != 0 || candidate.Truncated.Files || candidate.Truncated.Bytes {
+		return false
+	}
+	return repositoryMonitorReviewContextErrorClassWellFormed(candidate.ContextUnavailable)
+}
+
+func repositoryMonitorReviewContextErrorClassWellFormed(class string) bool {
+	switch class {
+	case repositoryMonitorReviewContextErrorTimeout, repositoryMonitorReviewContextErrorNetwork, repositoryMonitorReviewContextErrorInvalidPayload, repositoryMonitorReviewContextErrorRequestFailed:
+		return true
+	}
+	status, ok := strings.CutPrefix(class, repositoryMonitorReviewContextErrorGitHubStatus)
+	if !ok || len(status) != 3 {
+		return false
+	}
+	for _, r := range status {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

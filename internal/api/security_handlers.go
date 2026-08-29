@@ -494,8 +494,8 @@ func (h *Handlers) ListRepositoryScans(c fiber.Ctx) error {
 	opts.Continue = pagination.Continue
 
 	list := &corev1alpha1.RepositoryScanList{}
-	if err := h.client.List(c.Context(), list, opts); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list repository scans: %v", err))
+	if err := h.listPage(c.Context(), list, opts, "repository scans"); err != nil {
+		return err
 	}
 
 	items := list.Items

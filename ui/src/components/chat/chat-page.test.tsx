@@ -5,35 +5,52 @@ vi.mock('zustand/middleware', async () => {
   return { ...actual, persist: (fn: any) => fn }
 })
 
-vi.mock('@/hooks/use-chat', () => ({
-  useSendMessage: () => vi.fn(),
-  useChatConfig: () => ({ data: { model: 'claude-sonnet-4-20250514', provider: 'anthropic', enabled: true } }),
-}))
-
-vi.mock('@/hooks/use-providers', () => ({
-  useProviderList: () => ({
+const chatConfig = { current: { model: 'claude-sonnet-4-20250514', provider: 'anthropic', enabled: true } as Record<string, unknown> }
+const providerList = {
+  current: {
     data: {
       items: [
         { name: 'anthropic', type: 'anthropic', defaultModel: 'claude-sonnet-4-20250514', ready: true },
         { name: 'openai-proxy', type: 'openai', defaultModel: 'gpt-5', ready: true },
       ],
     },
-  }),
+    error: null,
+  } as { data?: { items: Array<Record<string, unknown>> }; error: unknown },
+}
+
+vi.mock('@/hooks/use-chat', () => ({
+  useSendMessage: () => vi.fn(),
+  useChatConfig: () => ({ data: chatConfig.current }),
+}))
+
+vi.mock('@/hooks/use-providers', () => ({
+  useProviderList: () => providerList.current,
 }))
 
 import { fireEvent, waitFor } from '@testing-library/react'
 
 import { render, screen } from '@/test/test-utils'
 import { ChatPage } from './chat-page'
+import { ApiError } from '@/lib/api-client'
 import { useUIStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
 import { useChatStore } from '@/stores/chat'
 import type { ChatMessage } from '@/schemas/chat'
 
 beforeEach(() => {
+  chatConfig.current = { model: 'claude-sonnet-4-20250514', provider: 'anthropic', enabled: true }
+  providerList.current = {
+    data: {
+      items: [
+        { name: 'anthropic', type: 'anthropic', defaultModel: 'claude-sonnet-4-20250514', ready: true },
+        { name: 'openai-proxy', type: 'openai', defaultModel: 'gpt-5', ready: true },
+      ],
+    },
+    error: null,
+  }
   useUIStore.setState({ namespace: 'default', sidebarCollapsed: false, theme: 'light' })
   useAuthStore.setState({ token: 'test-token' })
-  useChatStore.setState({ messages: [], currentSessionId: null, isStreaming: false, provider: '', model: '' })
+  useChatStore.setState({ messages: [], currentSessionId: null, isStreaming: false, provider: '', model: '', activeNamespace: 'default', selections: {} })
   Element.prototype.scrollIntoView = vi.fn()
   if (!Element.prototype.hasPointerCapture) Element.prototype.hasPointerCapture = () => false
   if (!Element.prototype.setPointerCapture) Element.prototype.setPointerCapture = () => {}
@@ -78,6 +95,64 @@ describe('ChatPage', () => {
     render(<ChatPage />)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat model' }), { target: { value: 'claude-opus-4-1' } })
     expect(useChatStore.getState().model).toBe('claude-opus-4-1')
+  })
+
+  it('uses symmetric negative margins so the surface is not clipped on mobile', () => {
+    const { container } = render(<ChatPage />)
+    const surface = container.firstElementChild as HTMLElement
+    expect(surface.className).toContain('-m-4')
+    expect(surface.className).toContain('md:-m-6')
+    expect(surface.className).not.toMatch(/(^|\s)-m-6(\s|$)/)
+  })
+
+  it('surfaces a not-authorized state instead of an empty provider list on 403', async () => {
+    providerList.current = { data: undefined, error: new ApiError(403, JSON.stringify({ error: { code: 403, message: 'not authorized' } })) }
+    render(<ChatPage />)
+    expect(screen.getByRole('alert')).toHaveTextContent('Not authorized to list Providers in default')
+
+    fireEvent.pointerDown(screen.getByRole('combobox', { name: 'Chat provider' }), { button: 0, pointerId: 1, pointerType: 'mouse' })
+    expect(await screen.findByRole('option', { name: /Server default/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /anthropic \(/ })).not.toBeInTheDocument()
+  })
+
+  it('shows other provider list failures with their message', () => {
+    providerList.current = { data: undefined, error: new ApiError(500, 'boom') }
+    render(<ChatPage />)
+    expect(screen.getByRole('alert')).toHaveTextContent('Providers unavailable: boom')
+  })
+
+  it('disables the model override when neither a provider nor a server default provider exists', async () => {
+    chatConfig.current = { model: '', provider: '', enabled: true }
+    render(<ChatPage />)
+    const modelInput = screen.getByRole('textbox', { name: 'Chat model' })
+    expect(modelInput).toBeDisabled()
+    expect(modelInput).toHaveAccessibleDescription('Choose a provider to override the model.')
+
+    // Picking a Provider CRD re-enables it.
+    useChatStore.setState({ selections: { default: { provider: 'openai-proxy', model: 'gpt-5' } } })
+    render(<ChatPage />)
+    await waitFor(() => expect(screen.getAllByRole('textbox', { name: 'Chat model' })[1]).not.toBeDisabled())
+  })
+
+  it('keeps the model override editable when the server has a default provider to pin it to', () => {
+    render(<ChatPage />)
+    expect(screen.getByRole('textbox', { name: 'Chat model' })).not.toBeDisabled()
+    expect(screen.queryByText('Choose a provider to override the model.')).not.toBeInTheDocument()
+  })
+
+  it('scopes the persisted provider/model to the active namespace', async () => {
+    useChatStore.setState({
+      activeNamespace: '',
+      selections: { default: { provider: 'openai-proxy', model: 'gpt-5' }, team: { provider: '', model: '' } },
+    })
+    render(<ChatPage />)
+    await waitFor(() => expect(useChatStore.getState().provider).toBe('openai-proxy'))
+    expect(screen.getByRole('textbox', { name: 'Chat model' })).toHaveValue('gpt-5')
+
+    useUIStore.setState({ namespace: 'team' })
+    await waitFor(() => expect(useChatStore.getState().provider).toBe(''))
+    expect(screen.getByRole('textbox', { name: 'Chat model' })).toHaveValue('')
+    expect(useChatStore.getState().selections.default).toEqual({ provider: 'openai-proxy', model: 'gpt-5' })
   })
 
   it('session ID badge shown when currentSessionId is set', () => {

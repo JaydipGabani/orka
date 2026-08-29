@@ -471,7 +471,8 @@ spec:
   systemPrompt:
     inline: "You are a senior software engineer."
   runtime:
-    type: claude         # or "codex" / "copilot"
+    type: claude         # or "codex" / "copilot" / "opencode"
+    contractVersion: orka.harness.v2
     defaultMaxTurns: 50
     defaultAllowBash: true
     defaultAllowedTools:

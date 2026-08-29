@@ -13,7 +13,26 @@ function makeMessage(overrides: Partial<ChatMessage> & { role: ChatMessage['role
 
 describe('useChatStore', () => {
   beforeEach(() => {
-    useChatStore.setState({ messages: [], currentSessionId: null, isStreaming: false })
+    useChatStore.setState({ messages: [], currentSessionId: null, isStreaming: false, activeNamespace: 'default', selections: {} })
+  })
+
+  it('keeps a separate provider/model selection per namespace', () => {
+    useChatStore.getState().selectNamespace('alpha')
+    useChatStore.getState().setProvider('anthropic')
+    useChatStore.getState().setModel('claude-sonnet-4-20250514')
+
+    useChatStore.getState().selectNamespace('beta')
+    expect(useChatStore.getState().provider).toBe('')
+    expect(useChatStore.getState().model).toBe('')
+    useChatStore.getState().setProvider('openai-proxy')
+
+    useChatStore.getState().selectNamespace('alpha')
+    expect(useChatStore.getState().provider).toBe('anthropic')
+    expect(useChatStore.getState().model).toBe('claude-sonnet-4-20250514')
+    expect(useChatStore.getState().selections).toEqual({
+      alpha: { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+      beta: { provider: 'openai-proxy', model: '' },
+    })
   })
 
   it('setProvider and setModel persist the picker choice', () => {

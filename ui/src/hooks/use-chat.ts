@@ -49,6 +49,8 @@ function parseSSELines(text: string): Array<{ event: string; data: string }> {
 export function useSendMessage() {
   const token = useAuthStore((s) => s.token)
   const namespace = useUIStore((s) => s.namespace)
+  const { data: config } = useChatConfig()
+  const serverDefaultProvider = config?.provider ?? ''
   const {
     currentSessionId,
     provider,
@@ -178,8 +180,14 @@ export function useSendMessage() {
       if (currentSessionId) {
         body.sessionId = currentSessionId
       }
-      if (provider) body.provider = provider
-      if (model.trim()) body.model = model.trim()
+      // The server resolves `model` only alongside an explicit provider; a
+      // model-only override would be silently ignored. Pin it to the server's
+      // configured default provider, or drop it when there is none to pin to.
+      const effectiveProvider = provider || (model.trim() ? serverDefaultProvider : '')
+      if (effectiveProvider) {
+        body.provider = effectiveProvider
+        if (model.trim()) body.model = model.trim()
+      }
 
       try {
         const response = await fetch(`${API_BASE_URL}/chat`, {
@@ -263,6 +271,6 @@ export function useSendMessage() {
         setStreaming(false)
       }
     },
-    [token, namespace, currentSessionId, provider, model, addMessage, setSessionId, setStreaming, setUsageOnLastAssistant],
+    [token, namespace, currentSessionId, provider, model, serverDefaultProvider, addMessage, setSessionId, setStreaming, setUsageOnLastAssistant],
   )
 }

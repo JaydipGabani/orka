@@ -159,7 +159,10 @@ export function TaskDetail({ taskId }: { taskId: string }) {
     )
   }
 
-  if (!task) {
+  // A 404 wins over cached data: React Query keeps the last successful `data`
+  // when a refetch fails, so a task deleted after it loaded would otherwise
+  // keep rendering as if it still existed.
+  if (taskMissing || !task) {
     return <div className="text-muted-foreground">Task not found</div>
   }
 
@@ -341,21 +344,33 @@ export function TaskDetail({ taskId }: { taskId: string }) {
             </Card>
           )}
 
-          {task.spec.type === 'ai' && task.spec.ai && (
+          {task.spec.type === 'ai' && (task.spec.ai || task.spec.agentRef) && (
             <Card>
               <CardHeader>
                 <CardTitle>AI Config</CardTitle>
               </CardHeader>
               <CardContent className="space-y-2 text-sm">
+                {task.spec.agentRef && (
+                  <div>
+                    <span className="text-muted-foreground">Agent:</span>{' '}
+                    <Link
+                      to="/agents/$agentId"
+                      params={{ agentId: task.spec.agentRef.name }}
+                      className="underline-offset-4 hover:underline"
+                    >
+                      {task.spec.agentRef.name}
+                    </Link>
+                  </div>
+                )}
                 <div>
                   <span className="text-muted-foreground">Provider:</span>{' '}
-                  {task.spec.ai.provider}
+                  {task.spec.ai?.provider || (task.spec.agentRef ? <span className="text-muted-foreground">Agent default</span> : '-')}
                 </div>
                 <div>
                   <span className="text-muted-foreground">Model:</span>{' '}
-                  {task.spec.ai.model}
+                  {task.spec.ai?.model || (task.spec.agentRef ? <span className="text-muted-foreground">Agent default</span> : '-')}
                 </div>
-                {task.spec.ai.prompt && (
+                {task.spec.ai?.prompt && (
                   <div>
                     <span className="text-muted-foreground">Prompt:</span>
                     <pre className="mt-1 overflow-x-auto rounded-md bg-muted p-3 whitespace-pre-wrap break-words">

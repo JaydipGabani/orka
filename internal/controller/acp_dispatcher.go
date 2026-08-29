@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -30,6 +31,7 @@ import (
 	v2conformance "github.com/orka-agents/orka/internal/harness/v2/conformance"
 	v2eventjournal "github.com/orka-agents/orka/internal/harness/v2/eventjournal"
 	publisherservice "github.com/orka-agents/orka/internal/publisher/service"
+	"github.com/orka-agents/orka/internal/redact"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/tools"
 )
@@ -4401,11 +4403,8 @@ func acpWorkspaceValidationFailureMessage(err error) string {
 	if !errors.As(err, &clientErr) || strings.TrimSpace(clientErr.Message) == "" {
 		return generic
 	}
-	detail := boundedRuntimeSessionServerMessage(err)
-	if len(detail) > acpPromptFailureMessageLimit {
-		detail = detail[:acpPromptFailureMessageLimit]
-	}
-	return generic + ": " + detail
+	detail := redact.SensitiveText(boundedRuntimeSessionServerMessage(err))
+	return generic + ": " + boundACPStatusMessage(detail)
 }
 
 func boundedRuntimeSessionServerMessage(err error) string {
@@ -4972,7 +4971,10 @@ func acpPromptFailureMessage(terminal harnessv2.Event) string {
 	if terminal.Failed == nil {
 		return generic
 	}
-	detail := strings.TrimSpace(terminal.Failed.Message)
+	// The supervisor already bounds and redacts what it sends; redacting
+	// again here keeps a credential out of durable Task status even if a
+	// runtime does not.
+	detail := redact.SensitiveText(strings.TrimSpace(terminal.Failed.Message))
 	code := strings.TrimSpace(terminal.Failed.Code)
 	switch {
 	case detail == "" && code == "":
@@ -4982,11 +4984,21 @@ func acpPromptFailureMessage(terminal harnessv2.Event) string {
 	case code != "" && code != "acp_prompt_failed" && !strings.HasPrefix(detail, code):
 		detail = code + ": " + detail
 	}
-	message := generic + ": " + detail
-	if len(message) > acpPromptFailureMessageLimit {
-		message = message[:acpPromptFailureMessageLimit]
+	return boundACPStatusMessage(generic + ": " + detail)
+}
+
+// boundACPStatusMessage truncates a runtime-derived status message to
+// acpPromptFailureMessageLimit bytes on a rune boundary so the persisted
+// message stays valid UTF-8 for the control store.
+func boundACPStatusMessage(message string) string {
+	if len(message) <= acpPromptFailureMessageLimit {
+		return message
 	}
-	return message
+	limit := acpPromptFailureMessageLimit
+	for limit > 0 && !utf8.RuneStart(message[limit]) {
+		limit--
+	}
+	return message[:limit]
 }
 
 // transitionAttemptToFailed mirrors transitionAttemptToCancelled for the

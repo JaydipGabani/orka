@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 )
@@ -71,4 +72,48 @@ func TestACPWorkspaceValidationFailureMessageProjectsSupervisorReason(t *testing
 	if got := acpWorkspaceValidationFailureMessage(&harnessv2.ClientError{StatusCode: 409, Message: "   "}); got != generic {
 		t.Fatalf("blank client message = %q, want %q", got, generic)
 	}
+}
+
+func TestACPPromptFailureMessageTruncatesOnRuneBoundary(t *testing.T) {
+	t.Parallel()
+	// Three-byte runes guarantee the byte limit falls inside a rune for at
+	// least one of the two helpers' prefixes.
+	multibyte := strings.Repeat("界", acpPromptFailureMessageLimit)
+	got := acpPromptFailureMessage(harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{
+		Code: promptFailureTestGenericCode, Message: multibyte,
+	}})
+	if !utf8.ValidString(got) || len(got) > acpPromptFailureMessageLimit || len(got) < acpPromptFailureMessageLimit-utf8.UTFMax {
+		t.Fatalf("acpPromptFailureMessage() = %d bytes valid=%v", len(got), utf8.ValidString(got))
+	}
+	clientErr := &harnessv2.ClientError{StatusCode: 409, Code: harnessv2.ErrorCodeSessionPoisoned, Message: multibyte}
+	got = acpWorkspaceValidationFailureMessage(clientErr)
+	const generic = "workspace validation failed before a trusted delta was established: "
+	detail := strings.TrimPrefix(got, generic)
+	if detail == got || !utf8.ValidString(detail) || len(detail) > acpPromptFailureMessageLimit || len(detail) < acpPromptFailureMessageLimit-utf8.UTFMax {
+		t.Fatalf("acpWorkspaceValidationFailureMessage() = %q (%d bytes)", got, len(got))
+	}
+}
+
+func TestACPStatusMessagesRedactCredentialShapedDetail(t *testing.T) {
+	t.Parallel()
+	const (
+		leakedKey = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+		leakedJWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvcmthLXRlc3QifQ.c2lnbmF0dXJlLXRoYXQtbXVzdC1ub3QtbGVhaw"
+	)
+	detail := "upstream rejected api_key=" + leakedKey + " and Authorization: Bearer " + leakedJWT + " for the model"
+	assertRedacted := func(label, got string) {
+		t.Helper()
+		if strings.Contains(got, leakedKey) || strings.Contains(got, leakedJWT) {
+			t.Fatalf("%s leaked a credential: %q", label, got)
+		}
+		if !strings.Contains(got, "upstream rejected") || !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("%s lost its surrounding prose: %q", label, got)
+		}
+	}
+	assertRedacted("acpPromptFailureMessage", acpPromptFailureMessage(harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{
+		Code: "provider_upstream_error", Message: detail,
+	}}))
+	assertRedacted("acpWorkspaceValidationFailureMessage", acpWorkspaceValidationFailureMessage(&harnessv2.ClientError{
+		StatusCode: 409, Code: harnessv2.ErrorCodeSessionPoisoned, Message: detail,
+	}))
 }

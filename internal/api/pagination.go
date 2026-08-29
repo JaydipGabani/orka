@@ -7,8 +7,12 @@ MIT License - see LICENSE file for details.
 package api
 
 import (
+	"context"
 	"fmt"
 	"strconv"
+
+	"github.com/gofiber/fiber/v3"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -64,4 +68,54 @@ func NormalizeListContinue(token string) string {
 		return ""
 	}
 	return token
+}
+
+// listPage serves one page of a limited Kubernetes list.
+//
+// controller-runtime's cache reader truncates a limited List at opts.Limit and
+// stamps the "continue-not-supported" sentinel, so it can never resume: paging
+// through the cache silently drops every item past the first page. Limited
+// lists therefore go to the uncached API reader, whose continue tokens are
+// real. When no uncached reader is configured (unit tests build Handlers
+// without one) the cached client is asked for the complete, unlimited list and
+// the whole result is returned as a single page with no continue token; a
+// continue token supplied in that mode cannot have been issued by this server
+// and is rejected. Unlimited lists (Limit == 0) always use the cached client.
+//
+// The returned error is already a *fiber.Error carrying the client-facing
+// status; what names the listed resource in the failure message.
+func (h *Handlers) listPage(ctx context.Context, list client.ObjectList, opts *client.ListOptions, what string) error {
+	if opts == nil {
+		opts = &client.ListOptions{}
+	}
+	switch {
+	case opts.Limit <= 0:
+		if err := h.client.List(ctx, list, opts); err != nil {
+			return listPageError(what, err)
+		}
+	case h.apiReader != nil:
+		if err := h.apiReader.List(ctx, list, opts); err != nil {
+			return listPageError(what, err)
+		}
+	default:
+		if opts.Continue != "" {
+			return fiber.NewError(fiber.StatusBadRequest, "continue is not supported: list pagination requires an uncached API reader")
+		}
+		unlimited := *opts
+		unlimited.Limit = 0
+		unlimited.Continue = ""
+		if err := h.client.List(ctx, list, &unlimited); err != nil {
+			return listPageError(what, err)
+		}
+		list.SetContinue("")
+		list.SetRemainingItemCount(nil)
+	}
+	// Defense in depth: the sentinel must never reach a client even if a
+	// cache-backed reader served the page.
+	list.SetContinue(NormalizeListContinue(list.GetContinue()))
+	return nil
+}
+
+func listPageError(what string, err error) error {
+	return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list %s: %v", what, err))
 }

@@ -43,6 +43,8 @@ beforeEach(() => {
     isStreaming: false,
     provider: '',
     model: '',
+    activeNamespace: 'default',
+    selections: {},
   })
 })
 
@@ -500,6 +502,65 @@ describe('useSendMessage', () => {
       await result.current('with picker')
     })
     expect(bodies[1]).toMatchObject({ provider: 'anthropic', model: 'claude-sonnet-4-20250514' })
+  })
+
+  it('pins a model-only override to the server default provider so the server honors it', async () => {
+    const bodies: any[] = []
+    fetchSpy.mockImplementation((input, init) => {
+      const url = typeof input === 'string' ? input : (input as Request).url
+      if (url.endsWith('/chat') && init?.method === 'POST') {
+        bodies.push(JSON.parse(init?.body as string))
+        return Promise.resolve(createSSEResponse([
+          { event: 'message', data: JSON.stringify({ content: 'reply' }) },
+        ]))
+      }
+      if (url.endsWith('/chat/config')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          enabled: true, provider: 'anthropic', model: 'claude-sonnet-4-20250514', maxIterations: 1, maxDuration: '1m', maxTasksPerTurn: 1, maxConcurrent: 1, availableTools: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      }
+      return originalFetch(input as RequestInfo, init)
+    })
+    useChatStore.setState({ provider: '', model: 'claude-opus-4-1' })
+
+    const wrapper = createWrapper()
+    const { result: config } = renderHook(() => useChatConfig(), { wrapper })
+    await waitFor(() => expect(config.current.isSuccess).toBe(true))
+    const { result } = renderHook(() => useSendMessage(), { wrapper })
+    await act(async () => {
+      await result.current('model only')
+    })
+    expect(bodies[0]).toMatchObject({ provider: 'anthropic', model: 'claude-opus-4-1' })
+  })
+
+  it('drops a model-only override when the server has no default provider to pin it to', async () => {
+    const bodies: any[] = []
+    fetchSpy.mockImplementation((input, init) => {
+      const url = typeof input === 'string' ? input : (input as Request).url
+      if (url.endsWith('/chat') && init?.method === 'POST') {
+        bodies.push(JSON.parse(init?.body as string))
+        return Promise.resolve(createSSEResponse([
+          { event: 'message', data: JSON.stringify({ content: 'reply' }) },
+        ]))
+      }
+      if (url.endsWith('/chat/config')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          enabled: true, provider: '', model: '', maxIterations: 1, maxDuration: '1m', maxTasksPerTurn: 1, maxConcurrent: 1, availableTools: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      }
+      return originalFetch(input as RequestInfo, init)
+    })
+    useChatStore.setState({ provider: '', model: 'claude-opus-4-1' })
+
+    const wrapper = createWrapper()
+    const { result: config } = renderHook(() => useChatConfig(), { wrapper })
+    await waitFor(() => expect(config.current.isSuccess).toBe(true))
+    const { result } = renderHook(() => useSendMessage(), { wrapper })
+    await act(async () => {
+      await result.current('model only')
+    })
+    expect(bodies[0].provider).toBeUndefined()
+    expect(bodies[0].model).toBeUndefined()
   })
 
   it('includes sessionId in request body when currentSessionId is set', async () => {

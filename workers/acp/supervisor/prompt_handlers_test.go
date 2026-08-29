@@ -1265,3 +1265,20 @@ func TestWorkspaceDeltaRepositoryControlAndContentPolicies(t *testing.T) {
 		t.Fatalf("symlink secret policy = %q, %v", violation, err)
 	}
 }
+
+func TestProviderUpstreamFailureTerminalEventRedactsCredentials(t *testing.T) {
+	fixture := newUpstreamFailureFixture(t)
+	fixture.recordInference(t, http.StatusBadRequest, providerUpstreamErrorDetail([]byte(credentialShapedUpstreamErrorBody)))
+
+	terminal, settledResult := fixture.settleCompleted(t)
+	if terminal.Type != harnessv2.EventFailed || terminal.Failed == nil || terminal.Failed.Code != "provider_upstream_error" {
+		t.Fatalf("upstream-failure terminal event = %#v", terminal.Failed)
+	}
+	assertNoLeakedCredential(t, "terminal Failed event message", terminal.Failed.Message)
+	if !strings.HasPrefix(terminal.Failed.Message, "provider upstream returned HTTP 400 for every inference request: request rejected:") {
+		t.Fatalf("terminal Failed event message lost its prose: %q", terminal.Failed.Message)
+	}
+	if settledResult.Err != nil {
+		assertNoLeakedCredential(t, "settled result error", settledResult.Err.Error())
+	}
+}

@@ -606,8 +606,8 @@ func (h *Handlers) ListTasks(c fiber.Ctx) error {
 
 	taskList := &corev1alpha1.TaskList{}
 	ctx := c.Context()
-	if err := h.client.List(ctx, taskList, opts); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list tasks: %v", err))
+	if err := h.listPage(ctx, taskList, opts, "tasks"); err != nil {
+		return err
 	}
 	filtered := taskList.Items[:0]
 	gatewayAuthorizations := map[gatewayTaskAuthorizationKey]bool{}
@@ -1122,8 +1122,8 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 
 	toolList := &corev1alpha1.ToolList{}
 	ctx := c.Context()
-	if err := h.client.List(ctx, toolList, opts); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list tools: %v", err))
+	if err := h.listPage(ctx, toolList, opts, "tools"); err != nil {
+		return err
 	}
 
 	// Add built-in tools to the response
@@ -1227,8 +1227,8 @@ func (h *Handlers) ListAgents(c fiber.Ctx) error {
 
 	agentList := &corev1alpha1.AgentList{}
 	ctx := c.Context()
-	if err := h.client.List(ctx, agentList, opts); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list agents: %v", err))
+	if err := h.listPage(ctx, agentList, opts, "agents"); err != nil {
+		return err
 	}
 	if h.contextTokenAuthorization.Enabled() {
 		filtered := agentList.Items[:0]
@@ -1460,8 +1460,8 @@ func (h *Handlers) ListSkills(c fiber.Ctx) error {
 
 	skillList := &corev1alpha1.SkillList{}
 	ctx := c.Context()
-	if err := h.client.List(ctx, skillList, opts); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list skills: %v", err))
+	if err := h.listPage(ctx, skillList, opts, "skills"); err != nil {
+		return err
 	}
 
 	skills := make([]fiber.Map, 0, len(skillList.Items))

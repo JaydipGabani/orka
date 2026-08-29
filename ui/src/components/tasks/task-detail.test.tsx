@@ -24,6 +24,8 @@ vi.mock('@tanstack/react-router', async () => {
 import { useUIStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
 import { TaskDetail } from './task-detail'
+import { render as renderRaw } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 describe('TaskDetail', () => {
   beforeEach(() => {
@@ -101,6 +103,52 @@ describe('TaskDetail', () => {
     await waitFor(() => {
       expect(screen.getByText('Task not found')).toBeInTheDocument()
     })
+  })
+
+  it('renders not-found once a loaded task 404s on refetch, ignoring the cached copy', async () => {
+    let hits = 0
+    server.use(
+      http.get('/api/v1/tasks/:id', () => {
+        hits++
+        if (hits === 1) {
+          return HttpResponse.json({
+            metadata: { name: 'gone-task', namespace: 'default', uid: 'uid-gone' },
+            spec: { type: 'container', image: 'alpine' },
+            status: { phase: 'Succeeded' },
+          })
+        }
+        return HttpResponse.json({ error: { code: 404, message: 'task not found' } }, { status: 404 })
+      }),
+    )
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+    renderRaw(
+      <QueryClientProvider client={queryClient}>
+        <TaskDetail taskId="gone-task" />
+      </QueryClientProvider>,
+    )
+    await waitFor(() => expect(screen.getByText('gone-task')).toBeInTheDocument())
+
+    await queryClient.refetchQueries({ queryKey: ['task', 'gone-task'] })
+    await waitFor(() => expect(screen.getByText('Task not found')).toBeInTheDocument())
+    expect(screen.queryByText('gone-task')).not.toBeInTheDocument()
+  })
+
+  it('shows the Agent link for AI tasks created from an agentRef', async () => {
+    server.use(
+      http.get('/api/v1/tasks/:id', () =>
+        HttpResponse.json({
+          metadata: { name: 'ai-agent-task', namespace: 'default', uid: 'uid-ai' },
+          spec: { type: 'ai', agentRef: { name: 'native-agent' }, ai: { prompt: 'Summarize' } },
+          status: { phase: 'Pending' },
+        }),
+      ),
+    )
+    render(<TaskDetail taskId="ai-agent-task" />)
+    await waitFor(() => expect(screen.getByText('AI Config')).toBeInTheDocument())
+    const link = screen.getByRole('link', { name: 'native-agent' })
+    expect(link).toHaveAttribute('href', expect.stringContaining('/agents/'))
+    expect(screen.getAllByText('Agent default')).toHaveLength(2)
+    expect(screen.getByText('Summarize')).toBeInTheDocument()
   })
 
   it('overview tab shows metadata', async () => {

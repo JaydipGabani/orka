@@ -1,0 +1,274 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+)
+
+const (
+	listPaginationTestNamespace = "default"
+	listPaginationTasksRoute    = "/tasks"
+	listPaginationToolsRoute    = "/tools"
+	listPaginationAgentsRoute   = "/agents"
+)
+
+// paginatingReader emulates the API server's chunked list semantics on top of
+// the fake client, which ignores Limit/Continue: items are served in name
+// order, Continue is an opaque offset, and RemainingItemCount is populated.
+type paginatingReader struct {
+	client.Reader
+	lists int
+}
+
+func (r *paginatingReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	r.lists++
+	options := &client.ListOptions{}
+	for _, opt := range opts {
+		opt.ApplyToList(options)
+	}
+	if err := r.Reader.List(ctx, list, client.InNamespace(options.Namespace)); err != nil {
+		return err
+	}
+	items, err := meta.ExtractList(list)
+	if err != nil {
+		return err
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].(client.Object).GetName() < items[j].(client.Object).GetName()
+	})
+	offset := 0
+	if options.Continue != "" {
+		if offset, err = strconv.Atoi(options.Continue); err != nil {
+			return fmt.Errorf("invalid continue token %q", options.Continue)
+		}
+	}
+	if offset > len(items) {
+		offset = len(items)
+	}
+	end := len(items)
+	if options.Limit > 0 && offset+int(options.Limit) < end {
+		end = offset + int(options.Limit)
+	}
+	if err := meta.SetList(list, items[offset:end]); err != nil {
+		return err
+	}
+	list.SetContinue("")
+	list.SetRemainingItemCount(nil)
+	if end < len(items) {
+		list.SetContinue(strconv.Itoa(end))
+		remaining := int64(len(items) - end)
+		list.SetRemainingItemCount(&remaining)
+	}
+	return nil
+}
+
+// cacheEmulatingClient behaves like controller-runtime's cache reader for a
+// limited List: it truncates at Limit and stamps the unusable sentinel.
+type cacheEmulatingClient struct {
+	client.Client
+	limitedLists int
+}
+
+func (c *cacheEmulatingClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	options := &client.ListOptions{}
+	for _, opt := range opts {
+		opt.ApplyToList(options)
+	}
+	if err := c.Client.List(ctx, list, client.InNamespace(options.Namespace)); err != nil {
+		return err
+	}
+	if options.Limit <= 0 {
+		return nil
+	}
+	c.limitedLists++
+	items, err := meta.ExtractList(list)
+	if err != nil {
+		return err
+	}
+	if int64(len(items)) > options.Limit {
+		items = items[:options.Limit]
+	}
+	if err := meta.SetList(list, items); err != nil {
+		return err
+	}
+	list.SetContinue(cacheContinueUnsupported)
+	return nil
+}
+
+type paginatedListCase struct {
+	route   string
+	handler func(*Handlers) fiber.Handler
+	object  func(name string) client.Object
+}
+
+func paginatedListCases() []paginatedListCase {
+	objectMeta := func(name string) metav1.ObjectMeta {
+		return metav1.ObjectMeta{Name: name, Namespace: listPaginationTestNamespace}
+	}
+	return []paginatedListCase{
+		{route: listPaginationTasksRoute, handler: func(h *Handlers) fiber.Handler { return h.ListTasks },
+			object: func(name string) client.Object { return &corev1alpha1.Task{ObjectMeta: objectMeta(name)} }},
+		{route: listPaginationToolsRoute, handler: func(h *Handlers) fiber.Handler { return h.ListTools },
+			object: func(name string) client.Object { return &corev1alpha1.Tool{ObjectMeta: objectMeta(name)} }},
+		{route: listPaginationAgentsRoute, handler: func(h *Handlers) fiber.Handler { return h.ListAgents },
+			object: func(name string) client.Object { return &corev1alpha1.Agent{ObjectMeta: objectMeta(name)} }},
+		{route: "/skills", handler: func(h *Handlers) fiber.Handler { return h.ListSkills },
+			object: func(name string) client.Object { return &corev1alpha1.Skill{ObjectMeta: objectMeta(name)} }},
+		{route: "/monitors", handler: func(h *Handlers) fiber.Handler { return h.ListRepositoryMonitors },
+			object: func(name string) client.Object { return &corev1alpha1.RepositoryMonitor{ObjectMeta: objectMeta(name)} }},
+		{route: "/scans", handler: func(h *Handlers) fiber.Handler { return h.ListRepositoryScans },
+			object: func(name string) client.Object { return &corev1alpha1.RepositoryScan{ObjectMeta: objectMeta(name)} }},
+		{route: "/providers", handler: func(h *Handlers) fiber.Handler { return h.ListProviders },
+			object: func(name string) client.Object { return &corev1alpha1.Provider{ObjectMeta: objectMeta(name)} }},
+		{route: "/substrate-actor-pools", handler: func(h *Handlers) fiber.Handler { return h.ListSubstrateActorPools },
+			object: func(name string) client.Object { return &corev1alpha1.SubstrateActorPool{ObjectMeta: objectMeta(name)} }},
+		{route: "/runtime-pools", handler: func(h *Handlers) fiber.Handler { return h.ListRuntimePools },
+			object: func(name string) client.Object { return &corev1alpha1.RuntimePool{ObjectMeta: objectMeta(name)} }},
+		{route: "/agent-runtimes", handler: func(h *Handlers) fiber.Handler { return h.ListAgentRuntimes },
+			object: func(name string) client.Object { return &corev1alpha1.AgentRuntime{ObjectMeta: objectMeta(name)} }},
+	}
+}
+
+func paginatedListScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	return scheme
+}
+
+// paginatedListNames decodes one list page and returns the listed item names
+// plus the continue token. Handlers either return Kubernetes objects
+// (metadata.name) or flattened maps (name); built-in tools are skipped.
+func paginatedListNames(t *testing.T, app *fiber.App, target string) ([]string, string) {
+	t.Helper()
+	response, err := app.Test(httptest.NewRequest(http.MethodGet, target, nil))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode, "GET %s", target)
+	var body struct {
+		Items    []map[string]any `json:"items"`
+		Metadata struct {
+			Continue string `json:"continue"`
+		} `json:"metadata"`
+	}
+	require.NoError(t, json.NewDecoder(response.Body).Decode(&body))
+	names := make([]string, 0, len(body.Items))
+	for _, item := range body.Items {
+		if builtin, _ := item["builtin"].(bool); builtin {
+			continue
+		}
+		if name, ok := item["name"].(string); ok {
+			names = append(names, name)
+			continue
+		}
+		objectMeta, _ := item["metadata"].(map[string]any)
+		name, _ := objectMeta["name"].(string)
+		require.NotEmpty(t, name, "item without a name: %v", item)
+		names = append(names, name)
+	}
+	require.NotEqual(t, cacheContinueUnsupported, body.Metadata.Continue)
+	return names, body.Metadata.Continue
+}
+
+func TestPaginatedListsFollowContinueThroughAPIReader(t *testing.T) {
+	const total = 5
+	for _, tc := range paginatedListCases() {
+		t.Run(strings.TrimPrefix(tc.route, "/"), func(t *testing.T) {
+			scheme := paginatedListScheme(t)
+			objects := make([]client.Object, 0, total)
+			want := make([]string, 0, total)
+			for i := range total {
+				name := fmt.Sprintf("item-%d", i)
+				objects = append(objects, tc.object(name))
+				want = append(want, name)
+			}
+			reader := &paginatingReader{Reader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()}
+			cached := listFailingClient{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+			handlers := NewHandlers(HandlersConfig{Client: cached, APIReader: reader})
+			app := fiber.New()
+			app.Get(tc.route, tc.handler(handlers))
+
+			var got []string
+			continueToken := ""
+			pages := 0
+			for {
+				target := tc.route + "?namespace=" + listPaginationTestNamespace + "&limit=2"
+				if continueToken != "" {
+					target += "&continue=" + continueToken
+				}
+				names, next := paginatedListNames(t, app, target)
+				require.LessOrEqual(t, len(names), 2)
+				got = append(got, names...)
+				pages++
+				if next == "" {
+					break
+				}
+				require.Less(t, pages, total+1, "continue tokens did not terminate")
+				continueToken = next
+			}
+			require.Equal(t, 3, pages)
+			require.Equal(t, want, got, "every item must be listed exactly once")
+			require.Equal(t, pages, reader.lists)
+		})
+	}
+}
+
+func TestPaginatedListsWithoutAPIReaderReturnCompleteUnlimitedPage(t *testing.T) {
+	const total = 4
+	for _, tc := range paginatedListCases() {
+		t.Run(strings.TrimPrefix(tc.route, "/"), func(t *testing.T) {
+			scheme := paginatedListScheme(t)
+			objects := make([]client.Object, 0, total)
+			want := make([]string, 0, total)
+			for i := range total {
+				name := fmt.Sprintf("item-%d", i)
+				objects = append(objects, tc.object(name))
+				want = append(want, name)
+			}
+			cached := &cacheEmulatingClient{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()}
+			handlers := NewHandlers(HandlersConfig{Client: cached})
+			app := fiber.New()
+			app.Get(tc.route, tc.handler(handlers))
+
+			names, next := paginatedListNames(t, app, tc.route+"?namespace="+listPaginationTestNamespace+"&limit=2")
+			sort.Strings(names)
+			require.Equal(t, want, names, "cache fallback must not truncate")
+			require.Empty(t, next)
+			require.Zero(t, cached.limitedLists, "cache must never be asked for a limited list")
+
+			response, err := app.Test(httptest.NewRequest(http.MethodGet, tc.route+"?namespace="+listPaginationTestNamespace+"&limit=2&continue=2", nil))
+			require.NoError(t, err)
+			require.Equal(t, http.StatusBadRequest, response.StatusCode, "a continue token cannot have been issued without an API reader")
+		})
+	}
+}
+
+func TestListPageReportsReaderFailures(t *testing.T) {
+	scheme := paginatedListScheme(t)
+	handlers := NewHandlers(HandlersConfig{
+		Client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
+		APIReader: failingGatewayIdentityReader{err: errors.New("API unavailable")},
+	})
+	err := handlers.listPage(context.Background(), &corev1alpha1.TaskList{}, &client.ListOptions{Limit: 1}, "tasks")
+	var fiberErr *fiber.Error
+	require.ErrorAs(t, err, &fiberErr)
+	require.Equal(t, http.StatusInternalServerError, fiberErr.Code)
+	require.Contains(t, fiberErr.Message, "failed to list tasks: API unavailable")
+}

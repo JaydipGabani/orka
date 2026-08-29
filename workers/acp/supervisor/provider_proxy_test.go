@@ -992,3 +992,125 @@ func TestSanitizeProviderUpstreamDetailIsBounded(t *testing.T) {
 		t.Fatalf("raw error detail = %q", got)
 	}
 }
+
+// credentialShapedUpstreamErrorBody is an upstream error payload that echoes
+// several credential shapes back into error.message; none of them may reach
+// the persisted failure detail.
+const (
+	testLeakedAPIKey    = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	testLeakedJWT       = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvcmthLXRlc3QifQ.c2lnbmF0dXJlLXRoYXQtbXVzdC1ub3QtbGVhaw"
+	testLeakedSignature = "deadbeefcafef00d1234567890abcdef"
+	testLeakedSignedURL = "https://bucket.example.com/object?X-Amz-Credential=AKIAEXAMPLEKEYID&X-Amz-Signature=" + testLeakedSignature
+)
+
+var credentialShapedUpstreamErrorBody = `{"error":{"message":"request rejected: api_key=` + testLeakedAPIKey +
+	` Authorization: Bearer ` + testLeakedJWT + ` presigned ` + testLeakedSignedURL + ` denied","type":"invalid_request_error"}}`
+
+func assertNoLeakedCredential(t *testing.T, label, text string) {
+	t.Helper()
+	for _, leaked := range []string{testLeakedAPIKey, testLeakedJWT, testLeakedSignature, "AKIAEXAMPLEKEYID"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("%s leaked credential-shaped value %q: %q", label, leaked, text)
+		}
+	}
+	if len(text) > providerUpstreamDetailMaxBytes+64 {
+		t.Fatalf("%s is unbounded (%d bytes): %q", label, len(text), text)
+	}
+}
+
+func TestProviderProxyUpstreamFailureDetailRedactsCredentials(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, credentialShapedUpstreamErrorBody)
+	}))
+	defer upstream.Close()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+
+	response := doProviderProxyRequest(
+		t, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential,
+		[]byte(`{"model":"test-model"}`), nil,
+	)
+	defer func() { _ = response.Body.Close() }()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The child still receives the identical upstream bytes; only the
+	// persisted accounting detail is redacted.
+	if response.StatusCode != http.StatusBadRequest || string(body) != credentialShapedUpstreamErrorBody {
+		t.Fatalf("passed-through upstream error = %d %s", response.StatusCode, body)
+	}
+	failed, status, detail := session.upstreamFailureOnly(testPromptOneID)
+	if !failed || status != http.StatusBadRequest {
+		t.Fatalf("upstreamFailureOnly = %v/%d/%q", failed, status, detail)
+	}
+	assertNoLeakedCredential(t, "upstreamFailureOnly detail", detail)
+	if !strings.HasPrefix(detail, "request rejected:") || !strings.Contains(detail, "[REDACTED]") {
+		t.Fatalf("redacted detail lost its surrounding prose: %q", detail)
+	}
+	assertNoLeakedCredential(t, "providerUpstreamFailureError", (&providerUpstreamFailureError{Status: status, Detail: detail}).Error())
+}
+
+func TestSanitizeProviderUpstreamDetailRedactsSplitTokens(t *testing.T) {
+	// A control character inside a token must not let the token slip past
+	// the redactor once the control character is stripped.
+	split := "key sk-proj\x00-abcdefghijklmnopqrstuvwxyz0123456789 rejected"
+	if got := sanitizeProviderUpstreamDetail(split); strings.Contains(got, "abcdefghijklmnopqrstuvwxyz0123456789") {
+		t.Fatalf("control-split token survived sanitization: %q", got)
+	}
+	if got := sanitizeProviderUpstreamDetail("quota exceeded for model"); got != "quota exceeded for model" {
+		t.Fatalf("benign detail was altered: %q", got)
+	}
+}
+
+func TestProviderProxyStreamedSuccessOverLimitCountsAsFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// No Content-Length: the body is chunked, so the size is unknown
+		// until the relay reads past the limit.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for _, chunk := range []string{"data: {}\n\n", "data: {\"done\":true}\n\n"} {
+			_, _ = io.WriteString(w, chunk)
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken, MaxResponseBytes: 4,
+	})
+	defer session.close()
+
+	request, err := http.NewRequest(http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, strings.NewReader(`{"model":"test-model","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(providerAuthorizationHeader, "Bearer "+binding.Credential)
+	// The relay aborts the connection once the body overruns the limit; the
+	// client observes either a transport error or a truncated body.
+	response, err := http.DefaultClient.Do(request)
+	if err == nil {
+		body, readErr := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if readErr == nil && len(body) > 4 {
+			t.Fatalf("oversized streamed body was relayed in full: %q", body)
+		}
+	}
+
+	failed, status, detail := session.upstreamFailureOnly(testPromptOneID)
+	if !failed || status != http.StatusBadGateway || detail != "provider upstream stream failed" {
+		t.Fatalf("upstreamFailureOnly after oversized 2xx stream = %v/%d/%q, want failure", failed, status, detail)
+	}
+	session.mu.Lock()
+	successes, failures := session.inferenceSuccesses, session.inferenceFailures
+	session.mu.Unlock()
+	if successes != 0 || failures != 1 {
+		t.Fatalf("inference accounting after oversized 2xx stream = %d/%d, want 0/1", successes, failures)
+	}
+}

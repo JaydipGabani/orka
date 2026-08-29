@@ -29,12 +29,12 @@ func (h *Handlers) ListRuntimePools(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	list := &corev1alpha1.RuntimePoolList{}
-	if err := h.client.List(c.Context(), list, &client.ListOptions{
+	if err := h.listPage(c.Context(), list, &client.ListOptions{
 		Namespace: namespace,
 		Limit:     pagination.Limit,
 		Continue:  pagination.Continue,
-	}); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list runtime pools: %v", err))
+	}, "runtime pools"); err != nil {
+		return err
 	}
 	list.Continue = NormalizeListContinue(list.Continue)
 	return c.JSON(list)
@@ -176,12 +176,12 @@ func (h *Handlers) ListAgentRuntimes(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	list := &corev1alpha1.AgentRuntimeList{}
-	if err := h.client.List(c.Context(), list, &client.ListOptions{
+	if err := h.listPage(c.Context(), list, &client.ListOptions{
 		Namespace: namespace,
 		Limit:     pagination.Limit,
 		Continue:  pagination.Continue,
-	}); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list agent runtimes: %v", err))
+	}, "agent runtimes"); err != nil {
+		return err
 	}
 	list.Continue = NormalizeListContinue(list.Continue)
 	return c.JSON(list)

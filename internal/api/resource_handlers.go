@@ -209,12 +209,12 @@ func (h *Handlers) ListProviders(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	list := &corev1alpha1.ProviderList{}
-	if err := h.client.List(c.Context(), list, &client.ListOptions{
+	if err := h.listPage(c.Context(), list, &client.ListOptions{
 		Namespace: namespace,
 		Limit:     pagination.Limit,
 		Continue:  pagination.Continue,
-	}); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list providers: %v", err))
+	}, "providers"); err != nil {
+		return err
 	}
 	items := list.Items
 	filteredList := false
@@ -596,12 +596,12 @@ func (h *Handlers) ListSubstrateActorPools(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	list := &corev1alpha1.SubstrateActorPoolList{}
-	if err := h.client.List(c.Context(), list, &client.ListOptions{
+	if err := h.listPage(c.Context(), list, &client.ListOptions{
 		Namespace: namespace,
 		Limit:     pagination.Limit,
 		Continue:  pagination.Continue,
-	}); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list substrate actor pools: %v", err))
+	}, "substrate actor pools"); err != nil {
+		return err
 	}
 	return c.JSON(ListResponse{
 		Items: list.Items,

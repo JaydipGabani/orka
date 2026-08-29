@@ -6,6 +6,8 @@ metadata:
 spec:
   secretRef:
     name: claude-runtime-credentials
+  model:
+    name: claude-sonnet-4.6
   runtime:
     type: claude
     contractVersion: orka.harness.v2

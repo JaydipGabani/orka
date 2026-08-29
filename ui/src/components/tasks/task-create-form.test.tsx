@@ -295,6 +295,77 @@ describe('TaskCreateForm', () => {
     expect((submitted?.ai as Record<string, unknown>).provider).toBeUndefined()
   })
 
+  it('clears inline provider/model when an Agent is picked and only sends re-entered overrides', async () => {
+    useStateTypeOverride = 'ai'
+    const submitted: Array<Record<string, unknown>> = []
+    server.use(
+      http.get('/api/v1/agents', () =>
+        HttpResponse.json({
+          items: [
+            { metadata: { name: 'native-agent', namespace: 'default' }, spec: { providerRef: { name: 'anthropic' }, model: { provider: 'anthropic', name: 'claude' } } },
+          ],
+        }),
+      ),
+      http.post('/api/v1/tasks', async ({ request }) => {
+        submitted.push((await request.json()) as Record<string, unknown>)
+        return HttpResponse.json({ metadata: { name: 'ai-task', namespace: 'default' }, spec: { type: 'ai' } })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    // Configure the inline provider/model first, as if no Agent were going to be used.
+    fireEvent.pointerDown(screen.getByRole('combobox', { name: 'AI provider' }), { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: 'OpenAI' }))
+    await user.type(screen.getByPlaceholderText('claude-sonnet-4-20250514'), 'gpt-5')
+
+    const agentTrigger = await screen.findByRole('combobox', { name: 'AI agent' })
+    await waitFor(() => expect(agentTrigger).not.toBeDisabled())
+    fireEvent.pointerDown(agentTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: /native-agent/ }))
+    await waitFor(() => expect(screen.getByTestId('ai-agent-info-card')).toBeInTheDocument())
+
+    const disclosure = screen.getByRole('button', { name: /Provider \/ model overrides/ })
+    expect(disclosure).toHaveAttribute('aria-expanded', 'false')
+    expect(disclosure).toHaveAttribute('aria-controls', 'ai-model-overrides')
+    expect(document.getElementById('ai-model-overrides')).toBeNull()
+
+    await user.type(screen.getByPlaceholderText('my-task'), 'ai-task')
+    await user.type(screen.getByPlaceholderText('Enter your prompt...'), 'Summarize')
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+    await waitFor(() => expect(submitted).toHaveLength(1))
+    // The stale inline values must not travel as hidden overrides.
+    expect(submitted[0]).toMatchObject({ agentRef: { name: 'native-agent' }, ai: { prompt: 'Summarize' } })
+    expect(submitted[0].ai).not.toHaveProperty('provider')
+    expect(submitted[0].ai).not.toHaveProperty('model')
+
+    // Overrides re-entered after opening the disclosure are sent.
+    await user.click(disclosure)
+    expect(disclosure).toHaveAttribute('aria-expanded', 'true')
+    expect(document.getElementById('ai-model-overrides')).not.toBeNull()
+    expect(screen.getByPlaceholderText('Agent default')).toHaveValue('')
+    await user.type(screen.getByPlaceholderText('Agent default'), 'claude-opus-4-1')
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+    await waitFor(() => expect(submitted).toHaveLength(2))
+    expect(submitted[1].ai).toEqual({ prompt: 'Summarize', model: 'claude-opus-4-1' })
+  })
+
+  it('flags a trailing backslash inline and blocks submission', async () => {
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    await user.type(screen.getByPlaceholderText('my-task'), 'bad-escape')
+    await user.type(screen.getByPlaceholderText('alpine:latest'), 'alpine:latest')
+    await user.type(screen.getByPlaceholderText('echo hello'), 'echo foo\\')
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Trailing backslash in command')
+    expect(screen.getByPlaceholderText('echo hello')).toHaveAttribute('aria-invalid', 'true')
+
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+    expect(toast.error).toHaveBeenCalledWith('Command is invalid: Trailing backslash in command')
+    expect(toast.success).not.toHaveBeenCalled()
+  })
+
   it('AI type without an Agent still submits the inline provider path', async () => {
     useStateTypeOverride = 'ai'
     let submitted: Record<string, unknown> | undefined

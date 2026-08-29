@@ -22,7 +22,9 @@ export const providerListItemSchema = z
     namespace: item.namespace ?? item.metadata?.namespace,
     type: item.type ?? item.spec?.type ?? '',
     defaultModel: item.defaultModel ?? item.spec?.defaultModel ?? '',
-    ready: item.ready ?? item.status?.ready,
+    // Full CRDs serialize status.ready with omitempty, so a missing value on a
+    // CRD-shaped item means false; only the flat projection may leave it unknown.
+    ready: item.ready ?? (item.metadata ? item.status?.ready ?? false : undefined),
   }))
   .refine((item) => item.name.length > 0, { message: 'provider name is required' })
 

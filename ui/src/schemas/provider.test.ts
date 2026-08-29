@@ -14,6 +14,21 @@ describe('providerListResponseSchema', () => {
     ])
   })
 
+  it('treats a missing status.ready on a full CRD as not ready', () => {
+    const parsed = providerListResponseSchema.parse({
+      items: [
+        { metadata: { name: 'no-status' }, spec: { type: 'openai' } },
+        { metadata: { name: 'empty-status' }, spec: { type: 'openai' }, status: {} },
+      ],
+    })
+    expect(parsed.items.map((item) => item.ready)).toEqual([false, false])
+  })
+
+  it('leaves ready unknown when the flat projection omits it', () => {
+    const parsed = providerListResponseSchema.parse({ items: [{ name: 'flat', type: 'openai' }] })
+    expect(parsed.items[0].ready).toBeUndefined()
+  })
+
   it('normalizes the flat transaction-token projection', () => {
     const parsed = providerListResponseSchema.parse({
       items: [{ name: 'openai', namespace: 'default', type: 'openai', defaultModel: 'gpt-5', ready: false }],

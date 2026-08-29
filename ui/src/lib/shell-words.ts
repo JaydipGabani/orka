@@ -4,7 +4,8 @@
  * literally, double quotes preserve everything except backslash escapes of
  * `"` `\` and `$`, and an unquoted backslash escapes the next character.
  *
- * Returns `{ words }` on success or `{ error }` when a quote is left open, so
+ * Returns `{ words }` on success or `{ error }` when a quote or a trailing
+ * backslash escape is left open, so
  * `sh -c "echo hi"` becomes `["sh", "-c", "echo hi"]` instead of the naive
  * whitespace split that leaves the quote characters inside the words.
  */
@@ -43,10 +44,14 @@ export function splitShellWords(input: string): { words: string[] } | { error: s
       continue
     }
     if (ch === '\\') {
-      if (i + 1 < input.length) {
-        current += input[++i]
-        inWord = true
+      // A backslash with nothing after it is an unterminated escape, not a
+      // no-op: a shell would wait for more input, so reject it instead of
+      // silently dropping it.
+      if (i + 1 >= input.length) {
+        return { error: 'Trailing backslash in command' }
       }
+      current += input[++i]
+      inWord = true
       continue
     }
     if (/\s/.test(ch)) {

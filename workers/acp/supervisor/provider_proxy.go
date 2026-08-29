@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/orka-agents/orka/internal/providerproxy"
+	"github.com/orka-agents/orka/internal/redact"
 )
 
 const (
@@ -563,8 +564,14 @@ func (s *providerProxySession) upstreamFailureOnly(promptID string) (bool, int, 
 }
 
 // sanitizeProviderUpstreamDetail bounds an upstream error detail to printable
-// text of at most providerUpstreamDetailMaxBytes and strips any private
-// provider-proxy route path that an upstream might echo back.
+// text of at most providerUpstreamDetailMaxBytes, strips any private
+// provider-proxy route path that an upstream might echo back, and redacts
+// credential-shaped values (API keys, bearer/JWT tokens, signed or
+// credentialed URLs). The result is persisted in the terminal Failed event,
+// the PromptAttempt, and Task status, so it must never carry a secret the
+// upstream echoed into its error message. Non-printable runes are dropped
+// before redaction so a control character cannot split a token past the
+// redactor.
 func sanitizeProviderUpstreamDetail(detail string) string {
 	fields := strings.Fields(detail)
 	kept := fields[:0]
@@ -581,7 +588,7 @@ func sanitizeProviderUpstreamDetail(detail string) string {
 		}
 		builder.WriteRune(r)
 	}
-	sanitized := strings.TrimSpace(builder.String())
+	sanitized := strings.TrimSpace(redact.SensitiveText(builder.String()))
 	limit := providerUpstreamDetailMaxBytes
 	if len(sanitized) <= limit {
 		return sanitized
@@ -819,14 +826,31 @@ func (p *providerProxy) relayUpstreamResponse(
 			body = io.MultiReader(bytes.NewReader(prefix), response.Body)
 		}
 	}
-	session.recordInferenceResponse(promptID, requestClass, response.StatusCode, detail)
+	upstreamFailed := response.StatusCode >= http.StatusBadRequest
+	if upstreamFailed {
+		// Upstream errors are accounted before the relay so the bounded
+		// detail survives even when the child abandons the error body.
+		session.recordInferenceResponse(promptID, requestClass, response.StatusCode, detail)
+	}
 	providerproxy.CopyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
 	// Flushing after every chunk keeps streamed provider responses (SSE)
 	// flowing to the ACP child without buffering delays.
 	flusher, _ := w.(http.Flusher)
 	if err := providerproxy.StreamBoundedResponse(w, body, p.maxResponseBytes, flusher); err != nil {
+		if !upstreamFailed {
+			// A 2xx whose body overran the response limit or broke
+			// mid-stream never delivered a usable inference result; count
+			// it as a failure so upstreamFailureOnly does not mistake it
+			// for a success.
+			session.recordInferenceResponse(promptID, requestClass, http.StatusBadGateway, "provider upstream stream failed")
+		}
 		panic(http.ErrAbortHandler)
+	}
+	if !upstreamFailed {
+		// A success is only accounted once the whole body reached the
+		// child; a chunked response is not known to be usable earlier.
+		session.recordInferenceResponse(promptID, requestClass, response.StatusCode, "")
 	}
 }
 

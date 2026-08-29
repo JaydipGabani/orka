@@ -1,8 +1,11 @@
+import { useEffect } from 'react'
 import { ChatMessageList } from './chat-message-list'
 import { ChatInput } from './chat-input'
 import { useSendMessage, useChatConfig } from '@/hooks/use-chat'
 import { useProviderList } from '@/hooks/use-providers'
 import { useChatStore } from '@/stores/chat'
+import { useUIStore } from '@/stores/ui'
+import { isForbiddenError } from '@/lib/api-client'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -14,13 +17,38 @@ const SERVER_DEFAULT = '__default__'
 export function ChatPage() {
   const sendMessage = useSendMessage()
   const { data: config } = useChatConfig()
-  const { data: providersData } = useProviderList()
-  const { currentSessionId, newSession, messages, provider, model, setProvider, setModel, isStreaming } = useChatStore()
+  const { data: providersData, error: providersError } = useProviderList()
+  const namespace = useUIStore((s) => s.namespace)
+  const {
+    currentSessionId,
+    newSession,
+    messages,
+    provider,
+    model,
+    setProvider,
+    setModel,
+    selectNamespace,
+    isStreaming,
+  } = useChatStore()
+  // Providers are namespace-scoped, so the persisted picker choice is too.
+  useEffect(() => {
+    selectNamespace(namespace)
+  }, [namespace, selectNamespace])
   const providers = providersData?.items ?? []
+  const providersForbidden = isForbiddenError(providersError)
+  const providersErrorMessage = providersError
+    ? providersForbidden
+      ? `Not authorized to list Providers in ${namespace}; only the server default is available.`
+      : `Providers unavailable: ${providersError instanceof Error ? providersError.message : 'unknown error'}`
+    : undefined
   const serverDefaultLabel = config?.provider
     ? `Server default (${config.provider}${config.model ? ` / ${config.model}` : ''})`
     : 'Server default'
   const effectiveModel = model || (provider ? providers.find((p) => p.name === provider)?.defaultModel : config?.model)
+  // A model override only reaches the server alongside a provider; without a
+  // Provider CRD pick it is pinned to the server's configured default provider,
+  // and when there is none to pin to the input is disabled.
+  const modelNeedsProvider = !provider && !config?.provider
 
   const handleProviderChange = (value: string) => {
     const next = value === SERVER_DEFAULT ? '' : value
@@ -31,52 +59,69 @@ export function ChatPage() {
   }
 
   return (
-    <div className="flex h-full flex-col -m-6">
+    <div className="flex h-full flex-col -m-4 md:-m-6">
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-border bg-card px-4 py-2">
-        <div className="flex items-center gap-3">
-          <h1 className="text-sm font-semibold">Chat</h1>
-          {currentSessionId && (
-            <Badge variant="secondary" className="font-mono text-[10px]">
-              {currentSessionId}
-            </Badge>
-          )}
-          {effectiveModel && (
-            <Badge variant="outline" className="text-[10px]">
-              {effectiveModel}
-            </Badge>
-          )}
+      <div className="border-b border-border bg-card px-4 py-2">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <h1 className="text-sm font-semibold">Chat</h1>
+            {currentSessionId && (
+              <Badge variant="secondary" className="font-mono text-[10px]">
+                {currentSessionId}
+              </Badge>
+            )}
+            {effectiveModel && (
+              <Badge variant="outline" className="text-[10px]">
+                {effectiveModel}
+              </Badge>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Select value={provider || SERVER_DEFAULT} onValueChange={handleProviderChange} disabled={isStreaming}>
+              <SelectTrigger className="h-7 w-auto min-w-40 text-xs" aria-label="Chat provider">
+                <SelectValue placeholder="Provider" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={SERVER_DEFAULT}>{serverDefaultLabel}</SelectItem>
+                {providers.map((p) => (
+                  <SelectItem key={p.name} value={p.name}>
+                    {p.name}
+                    {p.type && ` (${p.type})`}
+                    {p.ready === false && ' — not ready'}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Input
+              aria-label="Chat model"
+              aria-describedby={modelNeedsProvider ? 'chat-model-hint' : undefined}
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder={provider ? providers.find((p) => p.name === provider)?.defaultModel || 'model' : config?.model || 'model (server default)'}
+              disabled={isStreaming || modelNeedsProvider}
+              className="h-7 w-48 text-xs"
+            />
+            {messages.length > 0 && (
+              <Button variant="ghost" size="sm" onClick={newSession} className="h-7 text-xs">
+                <Plus className="mr-1 h-3 w-3" /> New Chat
+              </Button>
+            )}
+          </div>
         </div>
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          <Select value={provider || SERVER_DEFAULT} onValueChange={handleProviderChange} disabled={isStreaming}>
-            <SelectTrigger className="h-7 w-auto min-w-40 text-xs" aria-label="Chat provider">
-              <SelectValue placeholder="Provider" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={SERVER_DEFAULT}>{serverDefaultLabel}</SelectItem>
-              {providers.map((p) => (
-                <SelectItem key={p.name} value={p.name}>
-                  {p.name}
-                  {p.type && ` (${p.type})`}
-                  {p.ready === false && ' — not ready'}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Input
-            aria-label="Chat model"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            placeholder={provider ? providers.find((p) => p.name === provider)?.defaultModel || 'model' : config?.model || 'model (server default)'}
-            disabled={isStreaming}
-            className="h-7 w-48 text-xs"
-          />
-          {messages.length > 0 && (
-            <Button variant="ghost" size="sm" onClick={newSession} className="h-7 text-xs">
-              <Plus className="mr-1 h-3 w-3" /> New Chat
-            </Button>
-          )}
-        </div>
+        {(providersErrorMessage || modelNeedsProvider) && (
+          <div className="mt-1 flex flex-wrap justify-end gap-x-4 text-[11px]">
+            {providersErrorMessage && (
+              <p role="alert" className={providersForbidden ? 'text-muted-foreground' : 'text-destructive'}>
+                {providersErrorMessage}
+              </p>
+            )}
+            {modelNeedsProvider && (
+              <p id="chat-model-hint" className="text-muted-foreground">
+                Choose a provider to override the model.
+              </p>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Messages */}
