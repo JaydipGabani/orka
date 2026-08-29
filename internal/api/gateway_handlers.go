@@ -121,7 +121,7 @@ func (h *Handlers) ListGatewayClasses(c fiber.Ctx) error {
 	if err := reader.List(c.Context(), list, &client.ListOptions{Limit: pagination.Limit, Continue: pagination.Continue}); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "failed to list gateway classes")
 	}
-	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: list.Continue, RemainingItemCount: list.RemainingItemCount}})
+	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: NormalizeListContinue(list.Continue), RemainingItemCount: list.RemainingItemCount}})
 }
 
 // GetGatewayClass gets one cluster-scoped adapter profile.
@@ -166,7 +166,7 @@ func (h *Handlers) ListGateways(c fiber.Ctx) error {
 	if err := reader.List(c.Context(), list, &client.ListOptions{Namespace: namespace, Limit: pagination.Limit, Continue: pagination.Continue}); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "failed to list gateways")
 	}
-	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: list.Continue, RemainingItemCount: list.RemainingItemCount}})
+	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: NormalizeListContinue(list.Continue), RemainingItemCount: list.RemainingItemCount}})
 }
 
 // GetGateway gets one namespaced adapter instance.
@@ -215,7 +215,7 @@ func (h *Handlers) ListGatewayBindings(c fiber.Ctx) error {
 	if err := reader.List(c.Context(), list, &client.ListOptions{Namespace: namespace, Limit: pagination.Limit, Continue: pagination.Continue}); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "failed to list gateway bindings")
 	}
-	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: list.Continue, RemainingItemCount: list.RemainingItemCount}})
+	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: NormalizeListContinue(list.Continue), RemainingItemCount: list.RemainingItemCount}})
 }
 
 // GetGatewayBinding gets one namespaced semantic binding.

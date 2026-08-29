@@ -519,7 +519,7 @@ func (h *Handlers) ListRepositoryScans(c fiber.Ctx) error {
 	return c.JSON(ListResponse{
 		Items: items,
 		Metadata: ListMeta{
-			Continue:           list.Continue,
+			Continue:           NormalizeListContinue(list.Continue),
 			RemainingItemCount: remainingItemCount,
 		},
 	})

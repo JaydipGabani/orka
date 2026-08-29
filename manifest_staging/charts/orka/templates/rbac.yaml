@@ -338,6 +338,13 @@ rules:
   - apiGroups: ["gateway.orka.ai"]
     resources: ["gateways", "gatewaybindings"]
     verbs: ["get", "list", "watch"]
+
+  # ACP runtime resource permissions (read-only; the dashboard Runtimes page
+  # and `orka runtime-pool` / `orka agent-runtime` reads pass a
+  # SubjectAccessReview for these resources).
+  - apiGroups: ["core.orka.ai"]
+    resources: ["runtimepools", "agentruntimes"]
+    verbs: ["get", "list", "watch"]
   {{- end }}
 
   # ConfigMap permissions (for results and sessions)

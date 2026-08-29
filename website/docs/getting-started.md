@@ -146,6 +146,26 @@ make deploy \
   ACP_OPENCODE_RUNTIME_IMG=docker.io/sozercan/orka-acp-opencode@sha256:<opencode-digest>
 ```
 
+The Kustomize install does not create an API client identity. The Helm chart
+creates the `orka-client` ServiceAccount used by the examples below; for a
+Kustomize install create it yourself with the same read/create scope:
+
+```bash
+kubectl -n orka-system create serviceaccount orka-client
+kubectl -n orka-system create role orka-client \
+  --verb=get,list,watch,create,delete --resource=tasks.core.orka.ai
+kubectl -n orka-system create role orka-client-read \
+  --verb=get,list,watch \
+  --resource=agents.core.orka.ai,tools.core.orka.ai,skills.core.orka.ai,sessions.core.orka.ai,runtimepools.core.orka.ai,agentruntimes.core.orka.ai,repositorymonitors.core.orka.ai
+kubectl -n orka-system create rolebinding orka-client \
+  --role=orka-client --serviceaccount=orka-system:orka-client
+kubectl -n orka-system create rolebinding orka-client-read \
+  --role=orka-client-read --serviceaccount=orka-system:orka-client
+```
+
+`sessions` is a virtual API resource: the REST API authorizes session reads
+with a SubjectAccessReview even though no CRD backs it.
+
 `make deploy` applies the same resources as the canonical
 `config/acp-production` Kustomize overlay. For direct Kustomize workflows, use
 that overlay rather than `config/default`; it includes the Vekil ingress policy

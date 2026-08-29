@@ -130,3 +130,19 @@ func TestParsePagination_Constants(t *testing.T) {
 		t.Errorf("MaxLimit = %d, want 500", MaxLimit)
 	}
 }
+
+func TestParsePaginationDropsCacheContinueSentinel(t *testing.T) {
+	p, err := ParsePagination("50", cacheContinueUnsupported)
+	if err != nil {
+		t.Fatalf("ParsePagination() error = %v", err)
+	}
+	if p.Continue != "" {
+		t.Fatalf("ParsePagination() Continue = %q, want empty", p.Continue)
+	}
+	if got := NormalizeListContinue(cacheContinueUnsupported); got != "" {
+		t.Fatalf("NormalizeListContinue(sentinel) = %q, want empty", got)
+	}
+	if got := NormalizeListContinue("eyJ2IjoibWV0YSJ9"); got != "eyJ2IjoibWV0YSJ9" {
+		t.Fatalf("NormalizeListContinue(real token) = %q, want unchanged", got)
+	}
+}

@@ -640,7 +640,7 @@ func (h *Handlers) ListTasks(c fiber.Ctx) error {
 	response := ListResponse{
 		Items: taskList.Items,
 		Metadata: ListMeta{
-			Continue:           taskList.Continue,
+			Continue:           NormalizeListContinue(taskList.Continue),
 			RemainingItemCount: remainingItemCount,
 		},
 	}
@@ -1160,7 +1160,7 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 	response := ListResponse{
 		Items: toolItems,
 		Metadata: ListMeta{
-			Continue:           toolList.Continue,
+			Continue:           NormalizeListContinue(toolList.Continue),
 			RemainingItemCount: toolList.RemainingItemCount,
 		},
 	}
@@ -1248,7 +1248,7 @@ func (h *Handlers) ListAgents(c fiber.Ctx) error {
 	response := ListResponse{
 		Items: agentList.Items,
 		Metadata: ListMeta{
-			Continue:           agentList.Continue,
+			Continue:           NormalizeListContinue(agentList.Continue),
 			RemainingItemCount: agentList.RemainingItemCount,
 		},
 	}
@@ -1481,7 +1481,7 @@ func (h *Handlers) ListSkills(c fiber.Ctx) error {
 	response := ListResponse{
 		Items: skills,
 		Metadata: ListMeta{
-			Continue:           skillList.Continue,
+			Continue:           NormalizeListContinue(skillList.Continue),
 			RemainingItemCount: skillList.RemainingItemCount,
 		},
 	}

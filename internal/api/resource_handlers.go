@@ -244,7 +244,7 @@ func (h *Handlers) ListProviders(c fiber.Ctx) error {
 	return c.JSON(ListResponse{
 		Items: providerReadItems(c, items),
 		Metadata: ListMeta{
-			Continue:           list.Continue,
+			Continue:           NormalizeListContinue(list.Continue),
 			RemainingItemCount: remainingItemCount,
 		},
 	})
@@ -606,7 +606,7 @@ func (h *Handlers) ListSubstrateActorPools(c fiber.Ctx) error {
 	return c.JSON(ListResponse{
 		Items: list.Items,
 		Metadata: ListMeta{
-			Continue:           list.Continue,
+			Continue:           NormalizeListContinue(list.Continue),
 			RemainingItemCount: list.RemainingItemCount,
 		},
 	})
