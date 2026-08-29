@@ -36,6 +36,10 @@ const (
 func suspendableSubstrateFixture(t *testing.T) *acpClassFixture {
 	t.Helper()
 	return newACPClassFixture(t, acpworkspacev1alpha1.RuntimeProviderBackendSubstrate, func(f *acpClassFixture) {
+		f.provider.Status.SupportedFeatures = append(
+			f.provider.Status.SupportedFeatures,
+			workspacev1alpha1.WorkspaceFeatureSuspend,
+		)
 		f.profile.Spec.Substrate.Suspend = &acpworkspacev1alpha1.SubstrateSuspendPolicy{
 			Mode: acpworkspacev1alpha1.SubstrateSuspendModeDataOnly,
 		}
@@ -97,20 +101,48 @@ func TestResolveACPClassWorkspaceBindingAdmitsDataOnlySuspend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve class: %v", err)
 	}
-	if resolved.SubstrateSuspendMode != string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) {
-		t.Fatalf("suspend mode = %q", resolved.SubstrateSuspendMode)
-	}
 
 	binding, err := resolveACPWorkspaceBindingWithClass(suspendableSessionTask(), "", false, suspendTestSessionUID, resolved)
 	if err != nil {
 		t.Fatalf("resolve suspendable binding: %v", err)
 	}
-	if binding.Class.EffectiveOnDetach != string(workspacev1alpha1.WorkspaceOnDetachSuspend) ||
+	if acpSubstratePoolSuspendMode(binding) != string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) ||
+		binding.Class.EffectiveOnDetach != string(workspacev1alpha1.WorkspaceOnDetachSuspend) ||
 		binding.Class.SuspendMode != string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) {
 		t.Fatalf("class binding = %+v", binding.Class)
 	}
 	if err := validateACPWorkspaceBindingValues(binding); err != nil {
 		t.Fatalf("frozen binding validation: %v", err)
+	}
+	deleteTask := suspendableSessionTask()
+	deleteTask.Spec.Execution.Workspace.OnDetach = corev1alpha1.WorkspaceOnDetachDelete
+	deleteBinding, err := resolveACPWorkspaceBindingWithClass(deleteTask, "", false, suspendTestSessionUID, resolved)
+	if err != nil {
+		t.Fatalf("resolve Delete-bound binding: %v", err)
+	}
+	if deleteBinding.Class.EffectiveOnDetach != string(workspacev1alpha1.WorkspaceOnDetachDelete) ||
+		acpSubstratePoolSuspendMode(deleteBinding) != string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) ||
+		deleteBinding.BindingDigest != binding.BindingDigest {
+		t.Fatalf("Delete-first binding = %+v digest %q, want a DataOnly-capable pool identity shared with Suspend digest %q",
+			deleteBinding.Class, deleteBinding.BindingDigest, binding.BindingDigest)
+	}
+	pool := &corev1alpha1.RuntimePool{Spec: corev1alpha1.RuntimePoolSpec{
+		ExecutionWorkspace: &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
+			Provider:      corev1alpha1.WorkspaceProviderSubstrate,
+			BindingDigest: deleteBinding.BindingDigest,
+			Substrate: &corev1alpha1.RuntimePoolSubstrateWorkspaceSpec{
+				BaseTemplateNamespace: deleteBinding.TemplateNamespace,
+				BaseTemplateName:      deleteBinding.TemplateName,
+				SuspendMode:           acpSubstratePoolSuspendMode(deleteBinding),
+			},
+		},
+	}}
+	if !acpRuntimePoolWorkspaceMatchesPlan(pool, ACPRuntimePlan{Workspace: binding}) {
+		t.Fatal("a Suspend-bound continuation must reuse the mixed class pool created by a Delete-bound Task")
+	}
+	pool.Spec.ExecutionWorkspace.Substrate.SuspendMode = ""
+	if acpRuntimePoolWorkspaceMatchesPlan(pool, ACPRuntimePlan{Workspace: binding}) {
+		t.Fatal("a mixed class pool without its DataOnly capability must not match a Suspend-bound continuation")
 	}
 
 	frozen := snapshotWorkspaceClassFromBinding(binding.Class)
@@ -141,6 +173,10 @@ func TestResolveACPClassWorkspaceBindingSuspendRejections(t *testing.T) {
 	t.Run("suspend without a data-only policy stays rejected", func(t *testing.T) {
 		t.Parallel()
 		fixture := newACPClassFixture(t, acpworkspacev1alpha1.RuntimeProviderBackendSubstrate, func(f *acpClassFixture) {
+			f.provider.Status.SupportedFeatures = append(
+				f.provider.Status.SupportedFeatures,
+				workspacev1alpha1.WorkspaceFeatureSuspend,
+			)
 			f.class.Spec.Lifecycle.DefaultOnDetach = workspacev1alpha1.WorkspaceOnDetachSuspend
 			f.class.Spec.Lifecycle.AllowedOnDetach = []workspacev1alpha1.WorkspaceOnDetach{
 				workspacev1alpha1.WorkspaceOnDetachSuspend, workspacev1alpha1.WorkspaceOnDetachDelete,
@@ -862,7 +898,11 @@ func TestACPExecutionWorkspaceAdapterRequeuesSettledSuspensionForLifetime(t *tes
 	pool.Spec.DesiredReplicas = 0
 	pool.Annotations[runtimePoolWorkspaceSuspendAnnotation] = booleanTrueValue
 	pool.Annotations[substrateActorSuspendedAnnotation] = runtimePoolSubstrateActorSuffix
-	pool.Annotations[substrateActorSuspendAcceptedAnnotation] = runtimePoolSubstrateActorSuffix
+	pool.Annotations[substrateActorSuspendAcceptedAnnotation] = substrateActorSuspendConsentValue(runtimePoolSubstrateActorSuffix)
+	pool.Annotations[substrateActorSnapshotDigestAnnotation] = "sha256:" + strings.Repeat("a", 64)
+	pool.Annotations[substrateActorSnapshotOperationDigestAnnotation] = "sha256:" + strings.Repeat("c", 64)
+	pool.Annotations[substrateActorLastSnapshotDigestAnnotation] = pool.Annotations[substrateActorSnapshotDigestAnnotation]
+	pool.Annotations[substrateActorLastSnapshotIdentityDigestAnnotation] = "sha256:" + strings.Repeat("b", 64)
 	c := acpAdapterTestClient(t, provider, workspace, pool)
 	current := &corev1alpha1.RuntimePool{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}, current); err != nil {
@@ -958,7 +998,11 @@ func TestACPExecutionWorkspaceAdapterDrivesSuspension(t *testing.T) {
 	// The backend completes the checkpoint: consent recorded, pool Stopped.
 	base := current.DeepCopy()
 	current.Annotations[substrateActorSuspendedAnnotation] = runtimePoolSubstrateActorSuffix
-	current.Annotations[substrateActorSuspendAcceptedAnnotation] = runtimePoolSubstrateActorSuffix
+	current.Annotations[substrateActorSuspendAcceptedAnnotation] = substrateActorSuspendConsentValue(runtimePoolSubstrateActorSuffix)
+	current.Annotations[substrateActorSnapshotDigestAnnotation] = "sha256:" + strings.Repeat("a", 64)
+	current.Annotations[substrateActorSnapshotOperationDigestAnnotation] = "sha256:" + strings.Repeat("c", 64)
+	current.Annotations[substrateActorLastSnapshotDigestAnnotation] = current.Annotations[substrateActorSnapshotDigestAnnotation]
+	current.Annotations[substrateActorLastSnapshotIdentityDigestAnnotation] = "sha256:" + strings.Repeat("b", 64)
 	if err := c.Patch(ctx, current, client.MergeFrom(base)); err != nil {
 		t.Fatalf("record consent: %v", err)
 	}
@@ -1186,10 +1230,12 @@ func TestResolveACPClassWorkspaceContinuationReusesFrozenSandboxVolume(t *testin
 	}
 	pool := &corev1alpha1.RuntimePool{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: holder.Namespace,
-			Name:      plan.PoolName,
+			Namespace:  holder.Namespace,
+			Name:       plan.PoolName,
+			Generation: 1,
 			Labels: map[string]string{
-				acpExecutionWorkspaceLinkLabel: workspace.Name,
+				acpExecutionWorkspaceLinkLabel:   workspace.Name,
+				acpRuntimeWorkspaceProviderLabel: string(corev1alpha1.WorkspaceProviderAgentSandbox),
 			},
 			Annotations: map[string]string{
 				acpExecutionWorkspaceUIDAnnotation: string(workspace.UID),
@@ -1208,6 +1254,11 @@ func TestResolveACPClassWorkspaceContinuationReusesFrozenSandboxVolume(t *testin
 				},
 			},
 		}},
+		Status: corev1alpha1.RuntimePoolStatus{
+			ObservedGeneration: 1,
+			Lifecycle:          corev1alpha1.RuntimePoolLifecycleServing,
+			AdmissionState:     corev1alpha1.RuntimePoolAdmissionAccepting,
+		},
 	}
 	if err := r.Create(ctx, pool); err != nil {
 		t.Fatalf("create linked RuntimePool: %v", err)

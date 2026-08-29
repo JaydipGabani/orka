@@ -208,9 +208,9 @@ func acpRuntimePoolWorkspaceMatchesPlan(pool *corev1alpha1.RuntimePool, plan ACP
 		return workspace.Substrate == nil &&
 			plan.Workspace.TemplateNamespace == "" && plan.Workspace.TemplateName == ""
 	case corev1alpha1.WorkspaceProviderSubstrate:
-		planSuspendMode := ""
-		if plan.Workspace.Class != nil {
-			planSuspendMode = plan.Workspace.Class.SuspendMode
+		poolSuspendMode := ""
+		if workspace.Substrate != nil {
+			poolSuspendMode = workspace.Substrate.SuspendMode
 		}
 		// A stray agentSandbox block on a substrate pool is drift the CRD
 		// cannot express away; reject it so cross-provider suspend settings
@@ -218,7 +218,7 @@ func acpRuntimePoolWorkspaceMatchesPlan(pool *corev1alpha1.RuntimePool, plan ACP
 		return workspace.AgentSandbox == nil && workspace.Substrate != nil &&
 			workspace.Substrate.BaseTemplateNamespace == plan.Workspace.TemplateNamespace &&
 			workspace.Substrate.BaseTemplateName == plan.Workspace.TemplateName &&
-			workspace.Substrate.SuspendMode == planSuspendMode
+			acpSubstratePoolSuspendModeMatches(plan.Workspace, poolSuspendMode)
 	default:
 		return false
 	}

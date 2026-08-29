@@ -41,6 +41,7 @@ import (
 
 const (
 	substrateTestSnapshotLocation  = "gs://ate-snapshots/orka"
+	substrateTestSnapshotAtespace  = "orka-test"
 	substrateTestStatusSuspended   = "STATUS_SUSPENDED"
 	substrateTestStatusSuspending  = "STATUS_SUSPENDING"
 	substrateTestStatusCrashed     = "STATUS_CRASHED"
@@ -57,19 +58,37 @@ const (
 )
 
 type fakeSubstrateActorControl struct {
-	actors        map[string]*workspace.SubstrateRuntimeActor
-	created       []string
-	resumed       []string
-	boots         []bool
-	settled       []string
-	dataSuspended []string
-	deleted       []string
-	closed        int
-	resumeErr     error
-	suspendErr    error
-	afterCreate   func()
-	afterResume   func(*workspace.SubstrateRuntimeActor)
-	afterSettle   func(*workspace.SubstrateRuntimeActor)
+	actors                                        map[string]*workspace.SubstrateRuntimeActor
+	created                                       []string
+	resumed                                       []string
+	boots                                         []bool
+	settled                                       []string
+	dataSuspended                                 []string
+	dataCheckpointFences                          []workspace.SubstrateDataCheckpointFence
+	dataResumeFences                              []workspace.SubstrateDataResumeFence
+	deleted                                       []string
+	closed                                        int
+	getErr                                        error
+	resumeErr                                     error
+	suspendErr                                    error
+	dataCheckpointFencingSupported                bool
+	dataResumeFencingSupported                    bool
+	dataResumeCredentialBootstrapFencingSupported bool
+	afterCreate                                   func()
+	beforeDataSuspend                             func(*workspace.SubstrateRuntimeActor)
+	onDataSuspend                                 func(*workspace.SubstrateRuntimeActor, int) *workspace.SubstrateRuntimeActor
+	dataCheckpointResponseErr                     error
+	validateDataCheckpointFence                   func(workspace.SubstrateDataCheckpointFence) error
+	beforeDataResume                              func(*workspace.SubstrateRuntimeActor)
+	validateDataResumeFence                       func(workspace.SubstrateDataResumeFence) error
+	beforeDataResumeCredentialBootstrap           func(*workspace.SubstrateRuntimeActor)
+	dataResumeCredentialBootstrapAttempts         []workspace.SubstrateDataResumeCredentialFence
+	dataResumeCredentialBootstraps                []workspace.SubstrateCredentialBootstrapEnvelope
+	dataResumeCredentialBootstrapWorkerPod        workspace.SubstrateWorkerPodFence
+	dataResumeCredentialBootstrapResult           workspace.SubstrateCredentialBootstrapResult
+	dataResumeCredentialBootstrapErr              error
+	afterResume                                   func(*workspace.SubstrateRuntimeActor)
+	afterSettle                                   func(*workspace.SubstrateRuntimeActor)
 }
 
 type blockingSubstrateActorControl struct{}
@@ -102,7 +121,15 @@ func (c blockingSubstrateActorControl) SettleActor(ctx context.Context, _ string
 	return nil, c.wait(ctx)
 }
 
-func (c blockingSubstrateActorControl) SuspendActorForDataCheckpoint(ctx context.Context, _ string) (*workspace.SubstrateRuntimeActor, error) {
+func (blockingSubstrateActorControl) DataSnapshotCheckpointFencingSupported() bool {
+	return true
+}
+
+func (c blockingSubstrateActorControl) SuspendActorForDataCheckpoint(
+	ctx context.Context,
+	_ string,
+	_ workspace.SubstrateDataCheckpointFence,
+) (*workspace.SubstrateRuntimeActor, error) {
 	return nil, c.wait(ctx)
 }
 
@@ -130,6 +157,10 @@ func TestSubstrateActorControlForCleanupAppliesClaimTimeout(t *testing.T) {
 		t.Fatalf("create actor control: %v", err)
 	}
 	defer control.Close() //nolint:errcheck // fake close cannot fail
+	checkpointControl, ok := control.(workspace.SubstrateRuntimeActorDataCheckpointControl)
+	if !ok {
+		t.Fatal("timeout wrapper does not expose atomic data-checkpoint control")
+	}
 
 	tests := []struct {
 		name string
@@ -151,6 +182,10 @@ func TestSubstrateActorControlForCleanupAppliesClaimTimeout(t *testing.T) {
 			_, callErr := control.SettleActor(ctx, "actor")
 			return callErr
 		}},
+		{name: "SuspendActorForDataCheckpoint", call: func(ctx context.Context) error {
+			_, callErr := checkpointControl.SuspendActorForDataCheckpoint(ctx, "actor", workspace.SubstrateDataCheckpointFence{})
+			return callErr
+		}},
 		{name: "DeleteActor", call: func(ctx context.Context) error {
 			return control.DeleteActor(ctx, "actor")
 		}},
@@ -165,23 +200,48 @@ func TestSubstrateActorControlForCleanupAppliesClaimTimeout(t *testing.T) {
 }
 
 func newFakeSubstrateActorControl() *fakeSubstrateActorControl {
-	return &fakeSubstrateActorControl{actors: map[string]*workspace.SubstrateRuntimeActor{}}
+	return &fakeSubstrateActorControl{
+		actors:                         map[string]*workspace.SubstrateRuntimeActor{},
+		dataCheckpointFencingSupported: true,
+		dataResumeFencingSupported:     true,
+		dataResumeCredentialBootstrapFencingSupported: true,
+		dataResumeCredentialBootstrapWorkerPod: workspace.SubstrateWorkerPodFence{
+			Namespace: substrateTestWorkerNamespace,
+			Name:      substrateTestWorkerPodName,
+			UID:       substrateTestWorkerPodUID,
+		},
+	}
 }
 
 func (f *fakeSubstrateActorControl) GetActor(_ context.Context, actorID string) (*workspace.SubstrateRuntimeActor, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	actor, ok := f.actors[actorID]
 	if !ok {
 		return nil, nil
 	}
 	view := *actor
+	if actor.DataSnapshot != nil {
+		snapshot := *actor.DataSnapshot
+		view.DataSnapshot = &snapshot
+	}
+	if actor.DataResumeOperation != nil {
+		operation := *actor.DataResumeOperation
+		view.DataResumeOperation = &operation
+	}
+	if actor.DataCheckpointOperation != nil {
+		operation := *actor.DataCheckpointOperation
+		view.DataCheckpointOperation = &operation
+	}
 	return &view, nil
 }
 
 func (f *fakeSubstrateActorControl) CreateActor(_ context.Context, actorID, templateNamespace, templateName string) (*workspace.SubstrateRuntimeActor, error) {
 	f.created = append(f.created, actorID)
 	actor := &workspace.SubstrateRuntimeActor{
-		ActorID: actorID, TemplateNamespace: templateNamespace, TemplateName: templateName,
-		Status: substrateTestStatusSuspended,
+		ActorID: actorID, ActorUID: "uid-" + actorID, ActorVersion: 1,
+		TemplateNamespace: templateNamespace, TemplateName: templateName, Status: substrateTestStatusSuspended,
 	}
 	f.actors[actorID] = actor
 	if f.afterCreate != nil {
@@ -199,9 +259,13 @@ func (f *fakeSubstrateActorControl) ResumeActor(_ context.Context, actorID strin
 	}
 	actor := f.actors[actorID]
 	if actor == nil {
-		actor = &workspace.SubstrateRuntimeActor{ActorID: actorID}
+		actor = &workspace.SubstrateRuntimeActor{ActorID: actorID, ActorUID: "uid-" + actorID, ActorVersion: 1}
 		f.actors[actorID] = actor
 	}
+	actor.ActorVersion++
+	actor.LatestDataOperationID = fmt.Sprintf("unfenced-resume:%d", actor.ActorVersion)
+	actor.DataCheckpointOperation = nil
+	actor.DataResumeOperation = nil
 	actor.Status = substrateTestStatusRunning
 	actor.PodNamespace = substrateTestWorkerNamespace
 	actor.PodName = substrateTestWorkerPodName
@@ -213,6 +277,124 @@ func (f *fakeSubstrateActorControl) ResumeActor(_ context.Context, actorID strin
 	return &view, nil
 }
 
+func (f *fakeSubstrateActorControl) DataSnapshotResumeFencingSupported() bool {
+	return f.dataResumeFencingSupported
+}
+
+func (f *fakeSubstrateActorControl) DataResumeCredentialBootstrapFencingSupported() bool {
+	return f.dataResumeCredentialBootstrapFencingSupported
+}
+
+func (f *fakeSubstrateActorControl) ResumeActorFromDataCheckpoint(
+	ctx context.Context,
+	actorID string,
+	expected workspace.SubstrateDataResumeFence,
+) (*workspace.SubstrateRuntimeActor, error) {
+	f.dataResumeFences = append(f.dataResumeFences, expected)
+	actor := f.actors[actorID]
+	if actor == nil {
+		return nil, workspace.NewError("resume actor", workspace.ErrorKindNotFound, "actor not found", false, nil)
+	}
+	if strings.TrimSpace(expected.OperationID) == "" {
+		return nil, workspace.NewError(
+			"resume actor",
+			workspace.ErrorKindFailedPrecondition,
+			"resume operation id is required",
+			false,
+			nil,
+		)
+	}
+	if operation := actor.DataResumeOperation; operation != nil &&
+		strings.TrimSpace(operation.OperationID) == strings.TrimSpace(expected.OperationID) {
+		if _, _, err := actor.VerifiedDataResumeOperation(actorID, expected.OperationID); err != nil {
+			return nil, workspace.NewError(
+				"resume actor",
+				workspace.ErrorKindFailedPrecondition,
+				"recorded resume operation no longer identifies the actor lifetime",
+				false,
+				err,
+			)
+		}
+		view := *actor
+		proof := *operation
+		view.DataResumeOperation = &proof
+		return &view, nil
+	}
+	if f.beforeDataResume != nil {
+		f.beforeDataResume(actor)
+	}
+	if f.validateDataResumeFence != nil {
+		if err := f.validateDataResumeFence(expected); err != nil {
+			return nil, err
+		}
+	}
+	_, currentDigest, currentErr := actor.VerifiedDataSnapshotFence(actorID)
+	expectedActor := &workspace.SubstrateRuntimeActor{
+		ActorID: actorID, ActorUID: expected.Snapshot.ActorUID, ActorVersion: expected.Snapshot.ActorVersion,
+		DataSnapshot: &expected.Snapshot,
+	}
+	_, expectedDigest, expectedErr := expectedActor.VerifiedDataSnapshotFence(actorID)
+	if currentErr != nil || expectedErr != nil || currentDigest != expectedDigest ||
+		expected.Template.Namespace == "" || expected.Template.Name == "" || expected.Template.UID == "" ||
+		expected.Template.ResourceVersion == "" || expected.Template.Revision == "" {
+		return nil, workspace.NewError(
+			"resume actor",
+			workspace.ErrorKindFailedPrecondition,
+			"actor or snapshot fence changed before resume",
+			true,
+			errors.Join(currentErr, expectedErr),
+		)
+	}
+	if _, err := f.ResumeActor(ctx, actorID, false); err != nil {
+		return nil, err
+	}
+	actor = f.actors[actorID]
+	actor.DataResumeOperation = &workspace.SubstrateDataResumeOperationProof{
+		OperationID:  strings.TrimSpace(expected.OperationID),
+		ActorID:      actorID,
+		ActorUID:     actor.ActorUID,
+		ActorVersion: actor.ActorVersion,
+	}
+	actor.LatestDataOperationID = strings.TrimSpace(expected.OperationID)
+	view := *actor
+	proof := *actor.DataResumeOperation
+	view.DataResumeOperation = &proof
+	return &view, nil
+}
+
+func (f *fakeSubstrateActorControl) BootstrapActorCredentialsForDataResume(
+	_ context.Context,
+	actorID string,
+	expected workspace.SubstrateDataResumeCredentialFence,
+	envelope workspace.SubstrateCredentialBootstrapEnvelope,
+) (workspace.SubstrateCredentialBootstrapResult, error) {
+	f.dataResumeCredentialBootstrapAttempts = append(f.dataResumeCredentialBootstrapAttempts, expected)
+	actor := f.actors[actorID]
+	if f.beforeDataResumeCredentialBootstrap != nil {
+		f.beforeDataResumeCredentialBootstrap(actor)
+	}
+	if actor == nil {
+		return workspace.SubstrateCredentialBootstrapResult{FenceConflict: true}, nil
+	}
+	proof, _, err := actor.VerifiedDataResumeOperation(actorID, expected.ResumeOperation.OperationID)
+	if err != nil || proof != expected.ResumeOperation || expected.WorkerPod != f.dataResumeCredentialBootstrapWorkerPod {
+		return workspace.SubstrateCredentialBootstrapResult{FenceConflict: true}, nil
+	}
+	if strings.TrimSpace(envelope.Nonce) == "" || strings.TrimSpace(envelope.Signature) == "" || len(envelope.Body) == 0 {
+		return workspace.SubstrateCredentialBootstrapResult{}, workspace.NewError(
+			"bootstrap actor credentials", workspace.ErrorKindInvalidArgument,
+			"signed credential bootstrap envelope is incomplete", false, nil,
+		)
+	}
+	if f.dataResumeCredentialBootstrapErr != nil {
+		return workspace.SubstrateCredentialBootstrapResult{}, f.dataResumeCredentialBootstrapErr
+	}
+	accepted := envelope
+	accepted.Body = append([]byte(nil), envelope.Body...)
+	f.dataResumeCredentialBootstraps = append(f.dataResumeCredentialBootstraps, accepted)
+	return f.dataResumeCredentialBootstrapResult, nil
+}
+
 func (f *fakeSubstrateActorControl) SettleActor(_ context.Context, actorID string) (*workspace.SubstrateRuntimeActor, error) {
 	f.settled = append(f.settled, actorID)
 	actor, ok := f.actors[actorID]
@@ -220,6 +402,10 @@ func (f *fakeSubstrateActorControl) SettleActor(_ context.Context, actorID strin
 		return nil, fmt.Errorf("settle: actor %s not found", actorID)
 	}
 	actor.Status = substrateTestStatusSuspended
+	actor.ActorVersion++
+	actor.LatestDataOperationID = fmt.Sprintf("unfenced-suspend:%d", actor.ActorVersion)
+	actor.DataCheckpointOperation = nil
+	actor.DataResumeOperation = nil
 	if f.afterSettle != nil {
 		f.afterSettle(actor)
 	}
@@ -227,21 +413,119 @@ func (f *fakeSubstrateActorControl) SettleActor(_ context.Context, actorID strin
 	return &view, nil
 }
 
-func (f *fakeSubstrateActorControl) SuspendActorForDataCheckpoint(_ context.Context, actorID string) (*workspace.SubstrateRuntimeActor, error) {
+func (f *fakeSubstrateActorControl) DataSnapshotCheckpointFencingSupported() bool {
+	return f.dataCheckpointFencingSupported
+}
+
+func (f *fakeSubstrateActorControl) SuspendActorForDataCheckpoint(
+	_ context.Context,
+	actorID string,
+	expected workspace.SubstrateDataCheckpointFence,
+) (*workspace.SubstrateRuntimeActor, error) {
 	f.dataSuspended = append(f.dataSuspended, actorID)
-	if f.suspendErr != nil {
-		return nil, f.suspendErr
-	}
+	f.dataCheckpointFences = append(f.dataCheckpointFences, expected)
 	actor, ok := f.actors[actorID]
 	if !ok {
 		return nil, fmt.Errorf("suspend: actor %s not found", actorID)
 	}
+	operationID := strings.TrimSpace(expected.OperationID)
+	if operationID == "" {
+		return nil, workspace.NewError(
+			"suspend actor",
+			workspace.ErrorKindFailedPrecondition,
+			"checkpoint operation id is required",
+			false,
+			nil,
+		)
+	}
+	if operation := actor.DataCheckpointOperation; operation != nil &&
+		strings.TrimSpace(operation.OperationID) == operationID {
+		if _, _, err := actor.VerifiedDataCheckpointOperation(actorID, operationID, expected.ActorVersion); err != nil {
+			return nil, workspace.NewError(
+				"suspend actor",
+				workspace.ErrorKindFailedPrecondition,
+				"recorded checkpoint operation no longer identifies the actor lifetime",
+				false,
+				err,
+			)
+		}
+		view := *actor
+		if actor.DataSnapshot != nil {
+			snapshot := *actor.DataSnapshot
+			view.DataSnapshot = &snapshot
+		}
+		proof := *operation
+		view.DataCheckpointOperation = &proof
+		return &view, nil
+	}
+	if f.suspendErr != nil {
+		return nil, f.suspendErr
+	}
+	if f.beforeDataSuspend != nil {
+		f.beforeDataSuspend(actor)
+	}
+	if f.validateDataCheckpointFence != nil {
+		if err := f.validateDataCheckpointFence(expected); err != nil {
+			return nil, err
+		}
+	}
+	if expected.ActorID != actorID || expected.ActorUID != actor.ActorUID ||
+		expected.ActorVersion != actor.ActorVersion ||
+		expected.Template.Namespace == "" || expected.Template.Name == "" ||
+		expected.Template.UID == "" || expected.Template.ResourceVersion == "" ||
+		expected.Template.Revision == "" ||
+		expected.Template.Namespace != actor.TemplateNamespace ||
+		expected.Template.Name != actor.TemplateName {
+		return nil, workspace.NewError(
+			"suspend actor",
+			workspace.ErrorKindFailedPrecondition,
+			"actor or ActorTemplate fence changed before checkpoint",
+			true,
+			nil,
+		)
+	}
+	sourceActorVersion := actor.ActorVersion
+	actor.LatestDataOperationID = operationID
+	actor.DataResumeOperation = nil
+	actor.DataCheckpointOperation = &workspace.SubstrateDataCheckpointOperationProof{
+		OperationID:  operationID,
+		ActorID:      actorID,
+		ActorUID:     actor.ActorUID,
+		ActorVersion: sourceActorVersion,
+	}
+	if f.onDataSuspend != nil {
+		view := f.onDataSuspend(actor, len(f.dataSuspended))
+		if f.dataCheckpointResponseErr != nil {
+			return nil, f.dataCheckpointResponseErr
+		}
+		return view, nil
+	}
+	actor.ActorVersion++
 	actor.Status = substrateTestStatusSuspended
 	actor.PodNamespace = ""
 	actor.PodName = ""
 	actor.PodIP = ""
 	actor.SnapshotObserved = true
+	actor.DataSnapshot = &workspace.SubstrateDataSnapshotFence{
+		ActorID:            actorID,
+		ActorUID:           actor.ActorUID,
+		ActorVersion:       actor.ActorVersion,
+		SnapshotAtespace:   substrateTestSnapshotAtespace,
+		SnapshotName:       fmt.Sprintf("snapshot-%d", len(f.dataSuspended)),
+		SnapshotUID:        fmt.Sprintf("snapshot-uid-%d", len(f.dataSuspended)),
+		SnapshotVersion:    1,
+		SourceActorUID:     actor.ActorUID,
+		SourceActorVersion: sourceActorVersion,
+		ContentScope:       workspace.SubstrateSnapshotContentScopeData,
+	}
 	view := *actor
+	snapshot := *actor.DataSnapshot
+	view.DataSnapshot = &snapshot
+	proof := *actor.DataCheckpointOperation
+	view.DataCheckpointOperation = &proof
+	if f.dataCheckpointResponseErr != nil {
+		return nil, f.dataCheckpointResponseErr
+	}
 	return &view, nil
 }
 
@@ -1135,7 +1419,7 @@ func TestSubstrateRuntimePoolMarksForeignCheckpointReplacementAsResumeLoss(t *te
 			current.Spec.ExecutionWorkspace.Substrate.SuspendMode = "DataOnly"
 			current.Annotations[annotation] = actorID
 			if annotation == substrateActorSuspendedAnnotation {
-				current.Annotations[substrateActorSuspendAcceptedAnnotation] = actorID
+				current.Annotations[substrateActorSuspendAcceptedAnnotation] = substrateActorSuspendConsentValue(actorID)
 			}
 			if err := r.Update(context.Background(), &current); err != nil {
 				t.Fatalf("record checkpoint state: %v", err)
@@ -2851,7 +3135,11 @@ func TestRecycleSubstrateActorWithStandingConsentRecordsTerminalLoss(t *testing.
 		current.Annotations = map[string]string{}
 	}
 	current.Annotations[substrateActorSuspendedAnnotation] = actorID
-	current.Annotations[substrateActorSuspendAcceptedAnnotation] = actorID
+	current.Annotations[substrateActorSuspendAcceptedAnnotation] = substrateActorSuspendConsentValue(actorID)
+	current.Annotations[substrateActorSnapshotDigestAnnotation] = "sha256:" + strings.Repeat("a", 64)
+	current.Annotations[substrateActorSnapshotOperationDigestAnnotation] = "sha256:" + strings.Repeat("c", 64)
+	current.Annotations[substrateActorLastSnapshotDigestAnnotation] = current.Annotations[substrateActorSnapshotDigestAnnotation]
+	current.Annotations[substrateActorLastSnapshotIdentityDigestAnnotation] = "sha256:" + strings.Repeat("b", 64)
 	// Consent is honored only on a suspend-capable binding.
 	current.Spec.ExecutionWorkspace.Substrate.SuspendMode = "DataOnly"
 	if err := r.Update(context.Background(), &current); err != nil {

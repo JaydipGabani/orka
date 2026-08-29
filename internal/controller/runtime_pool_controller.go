@@ -348,8 +348,9 @@ type RuntimePoolReconciler struct {
 	// SubstrateActorControlFactory builds the narrow, suspension-free actor
 	// control client. Tests inject fakes; production defaults to the gRPC client.
 	SubstrateActorControlFactory func(SubstrateConfig) (workspace.SubstrateRuntimeActorControl, error)
-	// SubstrateCredentialSeeder overrides the credential bootstrap PUT for
-	// tests; production seeds through the router transport.
+	// SubstrateCredentialSeeder overrides the fresh-boot credential PUT for
+	// tests. Production sends fresh boots through the router; data-resumed actors
+	// require the provider control's operation-fenced bootstrap contract.
 	SubstrateCredentialSeeder func(ctx context.Context, routeHost, nonce string, capabilitySecret []byte, request harnessv2.CredentialBootstrapRequest) error
 	// WorkspaceCredentialSeeder overrides the Agent Sandbox credential
 	// bootstrap PUT for tests. Production seeds the exact attested Pod endpoint
@@ -781,6 +782,26 @@ func (r *RuntimePoolReconciler) reconcileRuntimePoolServing(
 	authSecret *corev1.Secret,
 	status corev1alpha1.RuntimePoolStatus,
 ) (ctrl.Result, error) {
+	return r.reconcileRuntimePoolServingWithPostProbeFence(
+		ctx, pool, cfg, pods, readyPods, authSecret, status, nil,
+	)
+}
+
+type runtimePoolPostProbeFence func(
+	context.Context,
+	*corev1alpha1.RuntimePoolActiveInstanceStatus,
+) (ctrl.Result, bool, error)
+
+func (r *RuntimePoolReconciler) reconcileRuntimePoolServingWithPostProbeFence(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+	cfg runtimePoolConfig,
+	pods []corev1.Pod,
+	readyPods []corev1.Pod,
+	authSecret *corev1.Secret,
+	status corev1alpha1.RuntimePoolStatus,
+	postProbeFence runtimePoolPostProbeFence,
+) (ctrl.Result, error) {
 	if len(readyPods) == 0 {
 		if runtimePoolActiveInstancePodPresent(status.ActiveInstance, pods) {
 			status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDegraded
@@ -839,6 +860,12 @@ func (r *RuntimePoolReconciler) reconcileRuntimePoolServing(
 		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionAdmissionReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonAdmissionClosed, status.Message)
 		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonRolloutFailed, status.Message)
 		return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
+	}
+	if postProbeFence != nil {
+		result, handled, fenceErr := postProbeFence(ctx, active)
+		if fenceErr != nil || handled {
+			return result, fenceErr
+		}
 	}
 	if runtimePoolSupervisorRestartedInPlace(pool.Status.ActiveInstance, active) {
 		return r.reconcileRuntimePoolInPlaceSupervisorRestart(ctx, pool, nil, &readyPods[0], active, status)
