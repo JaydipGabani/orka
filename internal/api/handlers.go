@@ -1143,12 +1143,16 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 		}
 	}
 
+	// A scoped context token can hide CRD tools; the Kubernetes remaining
+	// count then describes the unfiltered collection and must not be exposed.
+	toolsFiltered := false
 	for _, tool := range toolList.Items {
 		allowed, err := contextTokenAllowsToolMetadata(c, h.contextTokenAuthorization, "listTools", tool.Name)
 		if err != nil {
 			return err
 		}
 		if !allowed {
+			toolsFiltered = true
 			continue
 		}
 		toolItems = append(toolItems, fiber.Map{
@@ -1161,11 +1165,15 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 		})
 	}
 
+	toolRemaining := toolList.RemainingItemCount
+	if toolsFiltered {
+		toolRemaining = nil
+	}
 	response := ListResponse{
 		Items: toolItems,
 		Metadata: ListMeta{
 			Continue:           NormalizeListContinue(toolList.Continue),
-			RemainingItemCount: toolList.RemainingItemCount,
+			RemainingItemCount: toolRemaining,
 		},
 	}
 
@@ -1246,7 +1254,12 @@ func (h *Handlers) ListAgents(c fiber.Ctx) error {
 				filtered = append(filtered, *agent)
 			}
 		}
+		agentsFiltered := len(filtered) != len(agentList.Items)
 		agentList.Items = filtered
+		if agentsFiltered {
+			// The raw count describes Agents the caller is not allowed to see.
+			agentList.RemainingItemCount = nil
+		}
 	}
 
 	response := ListResponse{

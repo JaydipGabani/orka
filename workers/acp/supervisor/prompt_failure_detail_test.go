@@ -1,11 +1,13 @@
 package supervisor
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/orka-agents/orka/internal/acp"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
@@ -53,5 +55,29 @@ func TestFailedEventStopReasonNeverEmitsNonFailureReasons(t *testing.T) {
 		if err := (harnessv2.FailedEvent{StopReason: got, Code: "acp_prompt_failed", Message: "x"}).Validate(); err != nil {
 			t.Fatalf("Validate(%q) = %v", got, err)
 		}
+	}
+}
+
+func TestProviderProxySessionWaitReturnsOnceInFlightRequestsRelease(t *testing.T) {
+	t.Parallel()
+	session := &providerProxySession{drained: make(chan struct{})}
+	close(session.drained)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := session.wait(ctx); err != nil {
+		t.Fatalf("wait with no in-flight requests = %v, want nil", err)
+	}
+	session.mu.Lock()
+	session.drained = make(chan struct{})
+	session.inflight = 1
+	session.mu.Unlock()
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer shortCancel()
+	if err := session.wait(shortCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait with an in-flight request = %v, want deadline exceeded", err)
+	}
+	session.releaseRequest()
+	if err := session.wait(ctx); err != nil {
+		t.Fatalf("wait after release = %v, want nil", err)
 	}
 }

@@ -304,6 +304,14 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 			"accepted", result.Accepted,
 		)
 	}
+	// The ACP child can settle its turn while the provider proxy is still
+	// relaying the final bytes of the last inference response. A 2xx is only
+	// accounted once its body has been relayed, so let in-flight proxy
+	// requests drain (bounded) before revoking the prompt's capabilities;
+	// otherwise the upstream-failure classification could read a snapshot
+	// with an earlier failure and no success yet, and turn a successfully
+	// retried prompt into provider_upstream_error.
+	s.waitProviderProxyDrained(state)
 	deactivatePromptCapabilities(state, request.Metadata.PromptID, harnessv2.RuntimeSessionStateCancelling)
 	terminal, settledResult, terminalErr := s.terminalEvent(state, prompt, result)
 	if settledResult.Outcome == acp.PromptOutcomeFailed {
@@ -2163,6 +2171,20 @@ func settlePromptLocked(prompt *promptState, settlement harnessv2.PromptSettleme
 		prompt.settlementDigest = digest
 	}
 	return settlement
+}
+
+// waitProviderProxyDrained waits, bounded by the cancel grace, for the
+// session's in-flight provider requests to finish so their outcomes are
+// accounted before the terminal result is classified.
+func (s *Server) waitProviderProxyDrained(state *sessionState) {
+	if state == nil || state.providerProxy == nil {
+		return
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), defaultDuration(s.cfg.CancelGrace, acp.DefaultStopGrace))
+	defer cancel()
+	if err := state.providerProxy.wait(waitCtx); err != nil {
+		slog.Warn("ACP provider proxy did not drain before prompt settlement", "errorClass", promptStreamErrorClass(err))
+	}
 }
 
 func deactivatePromptCapabilities(state *sessionState, promptID harnessv2.PromptID, next harnessv2.RuntimeSessionState) {
