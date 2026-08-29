@@ -22,6 +22,8 @@ import (
 )
 
 const (
+	reviewContextTestPullPath                = "/repos/orka-agents/orka/pulls/7"
+	reviewContextTestFilesPath               = "/repos/orka-agents/orka/pulls/7/files"
 	repositoryMonitorReviewContextTestPath   = "main.go"
 	repositoryMonitorReviewContextTestPatch  = "@@ -1 +1,2 @@\n package main\n+// change"
 	repositoryMonitorReviewContextTestStatus = "modified"
@@ -345,9 +347,9 @@ func TestRepositoryMonitorBuildReviewContextFailsClosedOnHeadDrift(t *testing.T)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/repos/orka-agents/orka/pulls/7/files":
+		case reviewContextTestFilesPath:
 			_, _ = w.Write([]byte(`[{"filename":"main.go","status":"modified","additions":1,"deletions":0,"patch":"@@ -1 +1 @@\n-a\n+b"}]`))
-		case "/repos/orka-agents/orka/pulls/7":
+		case reviewContextTestPullPath:
 			_, _ = w.Write([]byte(`{"number":7,"state":"open","base":{"ref":"main","sha":"base7","repo":{"full_name":"orka-agents/orka"}},"head":{"ref":"feature","sha":"head7-moved","repo":{"full_name":"orka-agents/orka"}}}`))
 		default:
 			t.Errorf("unexpected GitHub request %s", r.URL.Path)
@@ -374,10 +376,10 @@ func newRepositoryMonitorReviewContextTestServer(t *testing.T, filesStatus int, 
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/repos/orka-agents/orka/pulls/7/files":
+		case reviewContextTestFilesPath:
 			w.WriteHeader(filesStatus)
 			_, _ = w.Write([]byte(filesBody))
-		case "/repos/orka-agents/orka/pulls/7":
+		case reviewContextTestPullPath:
 			_, _ = w.Write([]byte(repositoryMonitorReviewContextTestPullRequestJSON(headSHA)))
 		default:
 			t.Errorf("unexpected GitHub request %s", r.URL.Path)
@@ -417,9 +419,9 @@ func TestRepositoryMonitorBuildReviewContextUsesPatchesWhenHeadIsStable(t *testi
 			t.Errorf("Authorization = %q, want bearer token", got)
 		}
 		switch r.URL.Path {
-		case "/repos/orka-agents/orka/pulls/7/files":
+		case reviewContextTestFilesPath:
 			_, _ = w.Write([]byte(`[{"filename":"main.go","status":"modified","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-a\n+b"},{"filename":"logo.png","status":"added","additions":0,"deletions":0}]`))
-		case "/repos/orka-agents/orka/pulls/7":
+		case reviewContextTestPullPath:
 			_, _ = w.Write([]byte(`{"number":7,"state":"open","base":{"ref":"main","sha":"base7","repo":{"full_name":"orka-agents/orka"}},"head":{"ref":"feature","sha":"head7","repo":{"full_name":"orka-agents/orka"}}}`))
 		default:
 			t.Errorf("unexpected GitHub request %s", r.URL.Path)
@@ -570,7 +572,7 @@ func newRepositoryMonitorReviewContextAdoptionFixture(t *testing.T) *repositoryM
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/repos/orka-agents/orka/pulls/7/files":
+		case reviewContextTestFilesPath:
 			status := int(fixture.filesStatus.Load())
 			w.WriteHeader(status)
 			if status == http.StatusOK {
@@ -578,7 +580,7 @@ func newRepositoryMonitorReviewContextAdoptionFixture(t *testing.T) *repositoryM
 				return
 			}
 			_, _ = w.Write([]byte(`{"message":"boom"}`))
-		case "/repos/orka-agents/orka/pulls/7":
+		case reviewContextTestPullPath:
 			_, _ = w.Write([]byte(repositoryMonitorReviewContextTestPullRequestJSON(repositoryMonitorReviewContextTestHead)))
 		default:
 			t.Errorf("unexpected GitHub request %s", r.URL.Path)
