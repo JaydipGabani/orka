@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { Link, useLocation } from '@tanstack/react-router'
 import { LayoutDashboard, ListTodo, MessageSquare, Bot, Wrench, Sparkles, Columns3, Activity, Shield, Radar, Boxes, RadioTower, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 
@@ -45,6 +45,44 @@ export function Sidebar() {
     else toggleSidebar()
   }
 
+  // The mobile overlay is modal: it takes initial focus, keeps Tab inside the
+  // drawer, closes on Escape, and hands focus back to whatever opened it. The
+  // covered page is made inert by RootLayout while it is open.
+  const asideRef = useRef<HTMLElement>(null)
+  useEffect(() => {
+    if (!overlayOpen) return
+    const aside = asideRef.current
+    if (!aside) return
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const focusables = () =>
+      Array.from(aside.querySelectorAll<HTMLElement>('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+    if (!aside.contains(document.activeElement)) focusables()[0]?.focus()
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setMobileSidebarOpen(false)
+        return
+      }
+      if (event.key !== 'Tab') return
+      const items = focusables()
+      if (items.length === 0) return
+      const first = items[0]
+      const last = items[items.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    aside.addEventListener('keydown', onKeyDown)
+    return () => {
+      aside.removeEventListener('keydown', onKeyDown)
+      if (previouslyFocused && previouslyFocused.isConnected) previouslyFocused.focus()
+    }
+  }, [overlayOpen, setMobileSidebarOpen])
+
   return (
     <>
     {overlayOpen && (
@@ -55,10 +93,16 @@ export function Sidebar() {
         onClick={closeOverlay}
       />
     )}
-    <aside className={cn(
-      'flex shrink-0 flex-col border-r border-border bg-card/80 backdrop-blur-md transition-all duration-200',
-      sidebarCollapsed ? 'w-16' : 'w-64 max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:bg-card max-md:shadow-xl',
-    )}>
+    <aside
+      ref={asideRef}
+      role={overlayOpen ? 'dialog' : undefined}
+      aria-modal={overlayOpen ? true : undefined}
+      aria-label={overlayOpen ? 'Navigation' : undefined}
+      className={cn(
+        'flex shrink-0 flex-col border-r border-border bg-card/80 backdrop-blur-md transition-all duration-200',
+        sidebarCollapsed ? 'w-16' : 'w-64 max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:bg-card max-md:shadow-xl',
+      )}
+    >
       <div className="flex h-14 items-center border-b border-border px-4">
         {!sidebarCollapsed && (
           <Link to="/" className="flex items-center gap-2 font-semibold text-foreground">

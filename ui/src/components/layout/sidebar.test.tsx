@@ -81,9 +81,30 @@ describe('Sidebar', () => {
       expect(screen.queryByTestId('sidebar-backdrop')).not.toBeInTheDocument()
 
       await user.click(screen.getByRole('button', { name: /expand sidebar/i }))
-      expect(screen.getByRole('complementary').className).toContain('max-md:fixed')
+      const drawer = screen.getByRole('dialog', { name: 'Navigation' })
+      expect(drawer.className).toContain('max-md:fixed')
+      expect(drawer).toHaveAttribute('aria-modal', 'true')
+      expect(drawer.contains(document.activeElement)).toBe(true)
       expect(screen.getByTestId('sidebar-backdrop')).toBeInTheDocument()
       expect(useUIStore.getState().sidebarCollapsed).toBe(false)
+
+      // Tab wraps inside the drawer instead of reaching the covered page: from
+      // the last nav link forward to the first focusable (the logo link), and
+      // back again with Shift+Tab.
+      const links = screen.getAllByRole('link')
+      links[links.length - 1].focus()
+      await user.tab()
+      expect(drawer.contains(document.activeElement)).toBe(true)
+      expect(document.activeElement).toBe(links[0])
+      await user.tab({ shift: true })
+      expect(document.activeElement).toBe(links[links.length - 1])
+
+      // Escape closes the drawer and focus returns to the toggle that opened it.
+      await user.keyboard('{Escape}')
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: /expand sidebar/i }))
+
+      await user.click(screen.getByRole('button', { name: /expand sidebar/i }))
 
       // Navigating from the overlay closes it.
       await user.click(screen.getByText('Tasks'))
