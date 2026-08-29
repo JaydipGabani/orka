@@ -2033,7 +2033,7 @@ func providerTurnLimitResult(state *sessionState, prompt *promptState, result ac
 	return result
 }
 
-// providerUpstreamFailureError records that every provider inference request
+// providerUpstreamFailureError records that the final provider inference request
 // made during a prompt failed upstream, even though the ACP agent reported the
 // provider error as ordinary assistant text and ended its turn.
 type providerUpstreamFailureError struct {
@@ -2042,27 +2042,28 @@ type providerUpstreamFailureError struct {
 }
 
 func (e providerUpstreamFailureError) Error() string {
-	message := fmt.Sprintf("provider upstream returned HTTP %d for every inference request", e.Status)
+	message := fmt.Sprintf("provider upstream returned HTTP %d for the final inference request", e.Status)
 	if detail := sanitizeProviderUpstreamDetail(e.Detail); detail != "" {
 		message += ": " + detail
 	}
 	return message
 }
 
-// providerUpstreamFailureResult converts a Completed prompt whose inference
-// requests all failed upstream into a Failed settlement so a provider quota or
-// outage never surfaces as a successful Task result.
+// providerUpstreamFailureResult converts a Completed prompt whose final
+// inference request failed upstream into a Failed settlement so a provider
+// quota or outage never surfaces as a successful Task result, even when an
+// earlier inference round in the same prompt succeeded.
 func providerUpstreamFailureResult(state *sessionState, prompt *promptState, result acp.PromptResult) acp.PromptResult {
 	if state == nil || prompt == nil || state.providerProxy == nil || result.Outcome != acp.PromptOutcomeCompleted {
 		return result
 	}
 	promptID := string(prompt.request.Metadata.PromptID)
-	failed, status, detail := state.providerProxy.upstreamFailureOnly(promptID)
+	failed, status, detail := state.providerProxy.upstreamFailureUnrecovered(promptID)
 	if !failed {
 		return result
 	}
 	slog.Error(
-		"ACP prompt settled as failed: every provider inference request failed upstream",
+		"ACP prompt settled as failed: the final provider inference request failed upstream",
 		"promptID", promptID, "upstreamStatus", status,
 	)
 	result.Outcome = acp.PromptOutcomeFailed

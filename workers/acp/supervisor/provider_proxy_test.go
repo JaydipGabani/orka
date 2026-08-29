@@ -872,11 +872,11 @@ func TestProviderProxyUpstreamFailureAccountingPassesErrorThrough(t *testing.T) 
 	if got := response.Header.Get("X-Upstream-Marker"); got != "quota" {
 		t.Fatalf("passed-through upstream header = %q", got)
 	}
-	failed, status, detail := session.upstreamFailureOnly(testPromptOneID)
+	failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
 	if !failed || status != http.StatusPaymentRequired || detail != "You have exceeded your monthly quota" {
-		t.Fatalf("upstreamFailureOnly = %v/%d/%q", failed, status, detail)
+		t.Fatalf("upstreamFailureUnrecovered = %v/%d/%q", failed, status, detail)
 	}
-	if failed, _, _ := session.upstreamFailureOnly("other-prompt"); failed {
+	if failed, _, _ := session.upstreamFailureUnrecovered("other-prompt"); failed {
 		t.Fatal("upstream failure accounting leaked to another prompt")
 	}
 }
@@ -906,7 +906,7 @@ func TestProviderProxyUpstreamFailureAccountingClearsAfterStreamedSuccess(t *tes
 	defer session.close()
 
 	assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusPaymentRequired)
-	if failed, _, _ := session.upstreamFailureOnly(testPromptOneID); !failed {
+	if failed, _, _ := session.upstreamFailureUnrecovered(testPromptOneID); !failed {
 		t.Fatal("first failed inference response was not accounted")
 	}
 
@@ -922,8 +922,40 @@ func TestProviderProxyUpstreamFailureAccountingClearsAfterStreamedSuccess(t *tes
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "response.completed") {
 		t.Fatalf("streamed success = %d %s", response.StatusCode, body)
 	}
-	if failed, status, detail := session.upstreamFailureOnly(testPromptOneID); failed || status != 0 || detail != "" {
-		t.Fatalf("upstreamFailureOnly after success = %v/%d/%q, want false", failed, status, detail)
+	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed || status != 0 || detail != "" {
+		t.Fatalf("upstreamFailureUnrecovered after success = %v/%d/%q, want false", failed, status, detail)
+	}
+}
+
+func TestProviderProxyUpstreamFailureAccountingFailsWhenFinalInferenceFails(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = io.WriteString(w, `{"id":"resp_1","output":[]}`)
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"rate limit exceeded","type":"rate_limit"}}`)
+	}))
+	defer upstream.Close()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+
+	assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusOK)
+	if failed, _, _ := session.upstreamFailureUnrecovered(testPromptOneID); failed {
+		t.Fatal("successful inference response was accounted as a failure")
+	}
+	assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusTooManyRequests)
+	failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
+	if !failed || status != http.StatusTooManyRequests || detail != "rate limit exceeded" {
+		t.Fatalf("upstreamFailureUnrecovered after success then failure = %v/%d/%q, want the final failure", failed, status, detail)
+	}
+	if successes, failures := session.inferenceSuccesses, session.inferenceFailures; successes != 1 || failures != 1 {
+		t.Fatalf("inference accounting = %d successes / %d failures, want 1/1", successes, failures)
 	}
 }
 
@@ -948,16 +980,16 @@ func TestProviderProxyUpstreamFailureAccountingResetsOnActivation(t *testing.T) 
 		t.Fatal(err)
 	}
 	assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusServiceUnavailable)
-	failed, status, detail := session.upstreamFailureOnly("prompt-one")
+	failed, status, detail := session.upstreamFailureUnrecovered("prompt-one")
 	if !failed || status != http.StatusServiceUnavailable {
-		t.Fatalf("upstreamFailureOnly = %v/%d/%q", failed, status, detail)
+		t.Fatalf("upstreamFailureUnrecovered = %v/%d/%q", failed, status, detail)
 	}
 	if detail != "upstreamunavailable at" || strings.Contains(detail, providerProxyPathPrefix) {
 		t.Fatalf("sanitized upstream detail = %q", detail)
 	}
 
 	session.deactivate("prompt-one")
-	if failed, _, _ := session.upstreamFailureOnly("prompt-one"); !failed {
+	if failed, _, _ := session.upstreamFailureUnrecovered("prompt-one"); !failed {
 		t.Fatal("deactivation cleared upstream failure accounting before settlement")
 	}
 	secondNow := time.Now().UTC()
@@ -965,8 +997,8 @@ func TestProviderProxyUpstreamFailureAccountingResetsOnActivation(t *testing.T) 
 		t.Fatal(err)
 	}
 	for _, promptID := range []string{"prompt-one", "prompt-two"} {
-		if failed, status, detail := session.upstreamFailureOnly(promptID); failed || status != 0 || detail != "" {
-			t.Fatalf("upstreamFailureOnly(%q) after activation = %v/%d/%q, want reset", promptID, failed, status, detail)
+		if failed, status, detail := session.upstreamFailureUnrecovered(promptID); failed || status != 0 || detail != "" {
+			t.Fatalf("upstreamFailureUnrecovered(%q) after activation = %v/%d/%q, want reset", promptID, failed, status, detail)
 		}
 	}
 	session.mu.Lock()
@@ -1045,11 +1077,11 @@ func TestProviderProxyUpstreamFailureDetailRedactsCredentials(t *testing.T) {
 	if response.StatusCode != http.StatusBadRequest || string(body) != credentialShapedUpstreamErrorBody {
 		t.Fatalf("passed-through upstream error = %d %s", response.StatusCode, body)
 	}
-	failed, status, detail := session.upstreamFailureOnly(testPromptOneID)
+	failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
 	if !failed || status != http.StatusBadRequest {
-		t.Fatalf("upstreamFailureOnly = %v/%d/%q", failed, status, detail)
+		t.Fatalf("upstreamFailureUnrecovered = %v/%d/%q", failed, status, detail)
 	}
-	assertNoLeakedCredential(t, "upstreamFailureOnly detail", detail)
+	assertNoLeakedCredential(t, "upstreamFailureUnrecovered detail", detail)
 	if !strings.HasPrefix(detail, "request rejected:") || !strings.Contains(detail, "[REDACTED]") {
 		t.Fatalf("redacted detail lost its surrounding prose: %q", detail)
 	}
@@ -1103,9 +1135,9 @@ func TestProviderProxyStreamedSuccessOverLimitCountsAsFailure(t *testing.T) {
 		}
 	}
 
-	failed, status, detail := session.upstreamFailureOnly(testPromptOneID)
+	failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
 	if !failed || status != http.StatusBadGateway || detail != "provider upstream stream failed" {
-		t.Fatalf("upstreamFailureOnly after oversized 2xx stream = %v/%d/%q, want failure", failed, status, detail)
+		t.Fatalf("upstreamFailureUnrecovered after oversized 2xx stream = %v/%d/%q, want failure", failed, status, detail)
 	}
 	session.mu.Lock()
 	successes, failures := session.inferenceSuccesses, session.inferenceFailures

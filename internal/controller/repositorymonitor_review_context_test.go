@@ -252,6 +252,24 @@ func TestRepositoryMonitorReviewContextSanitizesUntrustedText(t *testing.T) {
 	}
 }
 
+func TestRepositoryMonitorReviewContextRedactsCredentialsSplitByControlCharacters(t *testing.T) {
+	// A control byte inside the token must not let it slip past the redactor
+	// and then be reassembled once the control byte is stripped.
+	const secret = "ak-live-0123456789abcdef"
+	split := "api_key=" + secret[:10] + "\x00" + secret[10:]
+	files := []repositoryMonitorPullRequestFileResponse{
+		{Filename: "config/" + split + ".env", Status: "added", Additions: 1, Patch: "@@ -0,0 +1 @@\n+" + split + "\n"},
+	}
+	reviewContext := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), files)
+	entry := reviewContext.Files[0]
+	if strings.Contains(entry.Patch, secret) || strings.Contains(entry.Path, secret) {
+		t.Fatalf("path=%q patch=%q, want credential redacted after control-character stripping", entry.Path, entry.Patch)
+	}
+	if !strings.Contains(entry.Patch, "[REDACTED]") {
+		t.Fatalf("patch = %q, want the redaction placeholder", entry.Patch)
+	}
+}
+
 func TestRepositoryMonitorReviewContextRedactsCredentialsFromPatchesAndPaths(t *testing.T) {
 	const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
 	const apiKey = "api_key=ak-live-0123456789abcdef"

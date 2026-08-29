@@ -36,6 +36,11 @@ type PromptTerminalEvidence struct {
 	Identity           MappedUpdateIdentity
 	TerminalEvent      harnessv2.EventType
 	CancellationReason harnessv2.CancelReason
+	// FailureCode and FailureMessage carry the journaled (already redacted
+	// and bounded) classification of a Failed terminal so restart recovery
+	// projects the same durable reason the live path would have.
+	FailureCode    string
+	FailureMessage string
 }
 
 // FindPromptTerminal walks the task stream backward and returns the newest
@@ -78,12 +83,13 @@ func (j Journal) FindPromptTerminal(ctx context.Context) (*PromptTerminalEvidenc
 			if !ok || kind != mappedJournalRecordPromptTerminal || !identity.samePrompt(j.RecoveryIdentity) {
 				continue
 			}
-			terminalEvent, cancellationReason, err := promptTerminalClassification(event)
+			terminalEvent, cancellationReason, failure, err := promptTerminalClassification(event)
 			if err != nil {
 				return nil, err
 			}
 			return &PromptTerminalEvidence{
 				Identity: identity, TerminalEvent: terminalEvent, CancellationReason: cancellationReason,
+				FailureCode: failure.code, FailureMessage: failure.message,
 			}, nil
 		}
 		pageEnd = pageStart
@@ -91,21 +97,29 @@ func (j Journal) FindPromptTerminal(ctx context.Context) (*PromptTerminalEvidenc
 	return nil, nil
 }
 
-func promptTerminalClassification(event store.ExecutionEvent) (harnessv2.EventType, harnessv2.CancelReason, error) {
+// promptTerminalFailure is the journaled classification of a Failed terminal.
+type promptTerminalFailure struct {
+	code    string
+	message string
+}
+
+func promptTerminalClassification(event store.ExecutionEvent) (harnessv2.EventType, harnessv2.CancelReason, promptTerminalFailure, error) {
 	var content struct {
 		TerminalEvent         harnessv2.EventType    `json:"terminalEvent"`
 		StopReason            string                 `json:"stopReason"`
 		ControllerSynthesized bool                   `json:"controllerSynthesized"`
 		SettlementProven      bool                   `json:"settlementProven"`
 		CancellationReason    harnessv2.CancelReason `json:"cancellationReason"`
+		Code                  string                 `json:"code"`
+		Message               string                 `json:"message"`
 	}
 	if err := json.Unmarshal(event.Content, &content); err != nil {
-		return "", "", fmt.Errorf("%w: decode mapped harness v2 prompt terminal: %v", store.ErrConflict, err)
+		return "", "", promptTerminalFailure{}, fmt.Errorf("%w: decode mapped harness v2 prompt terminal: %v", store.ErrConflict, err)
 	}
 	if content.CancellationReason != "" {
 		if !content.ControllerSynthesized || !content.SettlementProven ||
 			!validPromptCancellationReason(content.CancellationReason) {
-			return "", "", fmt.Errorf("%w: mapped harness v2 prompt terminal has invalid cancellation reason %q", store.ErrConflict, content.CancellationReason)
+			return "", "", promptTerminalFailure{}, fmt.Errorf("%w: mapped harness v2 prompt terminal has invalid cancellation reason %q", store.ErrConflict, content.CancellationReason)
 		}
 	}
 	terminalEvent := content.TerminalEvent
@@ -128,16 +142,20 @@ func promptTerminalClassification(event store.ExecutionEvent) (harnessv2.EventTy
 		}
 	}
 	if !terminalEvent.IsTerminal() {
-		return "", "", fmt.Errorf("%w: mapped harness v2 prompt terminal has no terminal classification", store.ErrConflict)
+		return "", "", promptTerminalFailure{}, fmt.Errorf("%w: mapped harness v2 prompt terminal has no terminal classification", store.ErrConflict)
 	}
 	wantType := executionevents.ExecutionEventTypeModelRequestFailed
 	if terminalEvent == harnessv2.EventCompleted {
 		wantType = executionevents.ExecutionEventTypeModelRequestCompleted
 	}
 	if event.Type != wantType {
-		return "", "", fmt.Errorf("%w: mapped harness v2 prompt terminal type %q conflicts with %q", store.ErrConflict, event.Type, terminalEvent)
+		return "", "", promptTerminalFailure{}, fmt.Errorf("%w: mapped harness v2 prompt terminal type %q conflicts with %q", store.ErrConflict, event.Type, terminalEvent)
 	}
-	return terminalEvent, content.CancellationReason, nil
+	failure := promptTerminalFailure{}
+	if terminalEvent == harnessv2.EventFailed {
+		failure = promptTerminalFailure{code: content.Code, message: content.Message}
+	}
+	return terminalEvent, content.CancellationReason, failure, nil
 }
 
 // State is the mutable aggregation state for one non-reconnectable prompt

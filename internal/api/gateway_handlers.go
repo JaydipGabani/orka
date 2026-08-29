@@ -7,6 +7,7 @@ MIT License - see LICENSE file for details.
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -114,14 +115,10 @@ func (h *Handlers) ListGatewayClasses(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	list := &gatewayv1alpha1.GatewayClassList{}
-	reader := h.gatewayIdentityReader()
-	if reader == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "gateway API reader is unavailable")
+	if err := h.listGatewayPage(c.Context(), list, client.ListOptions{Limit: pagination.Limit, Continue: pagination.Continue}, "gateway classes"); err != nil {
+		return err
 	}
-	if err := reader.List(c.Context(), list, &client.ListOptions{Limit: pagination.Limit, Continue: pagination.Continue}); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "failed to list gateway classes")
-	}
-	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: NormalizeListContinue(list.Continue), RemainingItemCount: list.RemainingItemCount}})
+	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: list.Continue, RemainingItemCount: list.RemainingItemCount}})
 }
 
 // GetGatewayClass gets one cluster-scoped adapter profile.
@@ -159,14 +156,10 @@ func (h *Handlers) ListGateways(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	list := &gatewayv1alpha1.GatewayList{}
-	reader := h.gatewayIdentityReader()
-	if reader == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "gateway API reader is unavailable")
+	if err := h.listGatewayPage(c.Context(), list, client.ListOptions{Namespace: namespace, Limit: pagination.Limit, Continue: pagination.Continue}, "gateways"); err != nil {
+		return err
 	}
-	if err := reader.List(c.Context(), list, &client.ListOptions{Namespace: namespace, Limit: pagination.Limit, Continue: pagination.Continue}); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "failed to list gateways")
-	}
-	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: NormalizeListContinue(list.Continue), RemainingItemCount: list.RemainingItemCount}})
+	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: list.Continue, RemainingItemCount: list.RemainingItemCount}})
 }
 
 // GetGateway gets one namespaced adapter instance.
@@ -208,14 +201,10 @@ func (h *Handlers) ListGatewayBindings(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	list := &gatewayv1alpha1.GatewayBindingList{}
-	reader := h.gatewayIdentityReader()
-	if reader == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "gateway API reader is unavailable")
+	if err := h.listGatewayPage(c.Context(), list, client.ListOptions{Namespace: namespace, Limit: pagination.Limit, Continue: pagination.Continue}, "gateway bindings"); err != nil {
+		return err
 	}
-	if err := reader.List(c.Context(), list, &client.ListOptions{Namespace: namespace, Limit: pagination.Limit, Continue: pagination.Continue}); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "failed to list gateway bindings")
-	}
-	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: NormalizeListContinue(list.Continue), RemainingItemCount: list.RemainingItemCount}})
+	return c.JSON(ListResponse{Items: list.Items, Metadata: ListMeta{Continue: list.Continue, RemainingItemCount: list.RemainingItemCount}})
 }
 
 // GetGatewayBinding gets one namespaced semantic binding.
@@ -465,6 +454,34 @@ type gatewayCurrentIdentity struct {
 
 func (i gatewayCurrentIdentity) matches(namespaceUID, gatewayUID string) bool {
 	return i.NamespaceUID != "" && i.GatewayUID != "" && i.NamespaceUID == namespaceUID && i.GatewayUID == gatewayUID
+}
+
+// listGatewayPage serves one page of gateway resources. Gateway reads prefer
+// the uncached API reader, which pages natively. When only the cached client
+// is configured, a limited request is served as one unlimited cached list
+// (the cache truncates at Limit and stamps an unusable continue sentinel) and
+// continue tokens are rejected, so a cache-backed fallback never presents a
+// truncated collection as complete behind an empty cursor.
+func (h *Handlers) listGatewayPage(ctx context.Context, list client.ObjectList, opts client.ListOptions, what string) error {
+	switch {
+	case h.apiReader != nil:
+		if err := h.apiReader.List(ctx, list, &opts); err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, "failed to list "+what)
+		}
+	case h.client == nil:
+		return fiber.NewError(fiber.StatusServiceUnavailable, "gateway API reader is unavailable")
+	case opts.Continue != "":
+		return fiber.NewError(fiber.StatusBadRequest, "continue is not supported: list pagination requires an uncached API reader")
+	default:
+		opts.Limit = 0
+		if err := h.client.List(ctx, list, &opts); err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, "failed to list "+what)
+		}
+		list.SetRemainingItemCount(nil)
+	}
+	// Defense in depth: the cache sentinel must never reach a client.
+	list.SetContinue(NormalizeListContinue(list.GetContinue()))
+	return nil
 }
 
 func (h *Handlers) gatewayIdentityReader() client.Reader {

@@ -197,6 +197,61 @@ func TestGatewayResourceListsUseAPIReader(t *testing.T) {
 	}
 }
 
+func TestGatewayResourceListsFallBackToUnlimitedCachedList(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := gatewayv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cached := &cacheEmulatingClient{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&gatewayv1alpha1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "class-a"}},
+		&gatewayv1alpha1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "class-b"}},
+		&gatewayv1alpha1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "chat-a", Namespace: "default"}},
+		&gatewayv1alpha1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "chat-b", Namespace: "default"}},
+		&gatewayv1alpha1.GatewayBinding{ObjectMeta: metav1.ObjectMeta{Name: "room-a", Namespace: "default"}},
+		&gatewayv1alpha1.GatewayBinding{ObjectMeta: metav1.ObjectMeta{Name: "room-b", Namespace: "default"}},
+	).Build()}
+	h := NewHandlers(HandlersConfig{Client: cached})
+	app := fiber.New()
+	app.Get("/gatewayclasses", h.ListGatewayClasses)
+	app.Get("/gateways", h.ListGateways)
+	app.Get("/gatewaybindings", h.ListGatewayBindings)
+	for _, target := range []string{
+		"/gatewayclasses?limit=1",
+		"/gateways?namespace=default&limit=1",
+		"/gatewaybindings?namespace=default&limit=1",
+	} {
+		response, err := app.Test(httptest.NewRequest(http.MethodGet, target, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200", target, response.StatusCode)
+		}
+		var body struct {
+			Items    []json.RawMessage `json:"items"`
+			Metadata ListMeta          `json:"metadata"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if len(body.Items) != 2 || body.Metadata.Continue != "" || body.Metadata.RemainingItemCount != nil {
+			t.Fatalf("GET %s = %d items continue=%q remaining=%v, want the full cached collection with no cursor", target, len(body.Items), body.Metadata.Continue, body.Metadata.RemainingItemCount)
+		}
+		response, err = app.Test(httptest.NewRequest(http.MethodGet, target+"&continue=opaque", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("GET %s with continue status = %d, want 400 without an API reader", target, response.StatusCode)
+		}
+	}
+	if cached.limitedLists != 0 {
+		t.Fatalf("cached client served %d limited lists, want 0", cached.limitedLists)
+	}
+}
+
 func TestGatewayOperatorRoutesRequireExternalAuth(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1alpha1.AddToScheme(scheme)

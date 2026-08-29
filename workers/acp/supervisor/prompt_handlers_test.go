@@ -948,7 +948,7 @@ func TestProviderUpstreamFailureOnlyMapsToTerminalFailure(t *testing.T) {
 	}
 
 	terminal, settledResult := fixture.settleCompleted(t)
-	wantMessage := "provider upstream returned HTTP 402 for every inference request: You have exceeded your monthly quota"
+	wantMessage := "provider upstream returned HTTP 402 for the final inference request: You have exceeded your monthly quota"
 	if terminal.Type != harnessv2.EventFailed || terminal.Failed == nil ||
 		terminal.Failed.StopReason != harnessv2.ACPStopReasonRefusal ||
 		terminal.Failed.Code != "provider_upstream_error" || terminal.Failed.Retryable ||
@@ -971,10 +971,30 @@ func TestProviderUpstreamFailureOnlyMapsToTerminalFailure(t *testing.T) {
 	}
 }
 
+func TestProviderUpstreamFinalFailureAfterSuccessMapsToTerminalFailure(t *testing.T) {
+	// A tool-call round succeeds, then the follow-up inference is rate
+	// limited: the agent may render that error as assistant text and settle
+	// end_turn, but the prompt must fail.
+	fixture := newUpstreamFailureFixture(t)
+	for _, status := range []int{http.StatusOK, http.StatusTooManyRequests} {
+		fixture.recordInference(t, status, "rate limit exceeded")
+	}
+	terminal, settledResult := fixture.settleCompleted(t)
+	if terminal.Type != harnessv2.EventFailed || terminal.Failed == nil ||
+		terminal.Failed.Code != "provider_upstream_error" ||
+		terminal.Failed.Message != "provider upstream returned HTTP 429 for the final inference request: rate limit exceeded" {
+		t.Fatalf("final-failure terminal event = %#v", terminal.Failed)
+	}
+	upstreamErr, ok := errors.AsType[*providerUpstreamFailureError](settledResult.Err)
+	if settledResult.Outcome != acp.PromptOutcomeFailed || !ok || upstreamErr.Status != http.StatusTooManyRequests {
+		t.Fatalf("final-failure settled result = %#v", settledResult)
+	}
+}
+
 func TestProviderUpstreamSuccessKeepsPromptCompleted(t *testing.T) {
-	t.Run("one success among failures", func(t *testing.T) {
+	t.Run("failure recovered by a later success", func(t *testing.T) {
 		fixture := newUpstreamFailureFixture(t)
-		for _, status := range []int{http.StatusPaymentRequired, http.StatusOK, http.StatusPaymentRequired} {
+		for _, status := range []int{http.StatusPaymentRequired, http.StatusOK} {
 			fixture.recordInference(t, status, "detail")
 		}
 		terminal, settledResult := fixture.settleCompleted(t)
@@ -1275,7 +1295,7 @@ func TestProviderUpstreamFailureTerminalEventRedactsCredentials(t *testing.T) {
 		t.Fatalf("upstream-failure terminal event = %#v", terminal.Failed)
 	}
 	assertNoLeakedCredential(t, "terminal Failed event message", terminal.Failed.Message)
-	if !strings.HasPrefix(terminal.Failed.Message, "provider upstream returned HTTP 400 for every inference request: request rejected:") {
+	if !strings.HasPrefix(terminal.Failed.Message, "provider upstream returned HTTP 400 for the final inference request: request rejected:") {
 		t.Fatalf("terminal Failed event message lost its prose: %q", terminal.Failed.Message)
 	}
 	if settledResult.Err != nil {

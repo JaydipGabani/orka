@@ -127,16 +127,19 @@ type providerProxySession struct {
 	turnLimitExceeded bool
 	// Per-prompt upstream inference response accounting. ACP agents such as
 	// Codex and Copilot report provider errors as ordinary assistant text and
-	// end their turn, so the supervisor needs its own evidence that at least
-	// one inference call succeeded before it trusts an end_turn settlement.
-	inferenceSuccesses int32
-	inferenceFailures  int32
-	lastUpstreamStatus int
-	lastUpstreamDetail string
-	inflight           int
-	drained            chan struct{}
-	closed             bool
-	requestSlots       chan struct{}
+	// end their turn, so the supervisor needs its own evidence that the
+	// prompt's final inference call succeeded before it trusts an end_turn
+	// settlement. upstreamFailureLatest tracks whether the most recent
+	// accounted inference response failed without a later success.
+	inferenceSuccesses    int32
+	inferenceFailures     int32
+	upstreamFailureLatest bool
+	lastUpstreamStatus    int
+	lastUpstreamDetail    string
+	inflight              int
+	drained               chan struct{}
+	closed                bool
+	requestSlots          chan struct{}
 }
 
 type providerProxyAuthorization struct {
@@ -344,6 +347,7 @@ func (s *providerProxySession) activateWithMaxTurns(promptID string, maxTurns in
 	s.turnLimitExceeded = false
 	s.inferenceSuccesses = 0
 	s.inferenceFailures = 0
+	s.upstreamFailureLatest = false
 	s.lastUpstreamStatus = 0
 	s.lastUpstreamDetail = ""
 	s.leaseVersion++
@@ -526,9 +530,10 @@ func (s *providerProxySession) maxTurnsExceeded(promptID string) bool {
 
 // recordInferenceResponse accounts one upstream inference response for the
 // prompt that owns the current turn. Status codes below 400 count as
-// successes; everything else is a failure whose bounded, sanitized detail is
-// kept for the terminal failure message. Metadata requests and responses for
-// other prompts are ignored.
+// successes and clear any earlier failure; everything else is a failure whose
+// bounded, sanitized detail is kept for the terminal failure message until a
+// later inference succeeds. Metadata requests and responses for other prompts
+// are ignored.
 func (s *providerProxySession) recordInferenceResponse(promptID string, class providerRequestClass, statusCode int, detail string) {
 	if s == nil || class != providerRequestInference {
 		return
@@ -541,23 +546,31 @@ func (s *providerProxySession) recordInferenceResponse(promptID string, class pr
 	}
 	if statusCode < http.StatusBadRequest {
 		s.inferenceSuccesses++
+		s.upstreamFailureLatest = false
+		s.lastUpstreamStatus = 0
+		s.lastUpstreamDetail = ""
 		return
 	}
 	s.inferenceFailures++
+	s.upstreamFailureLatest = true
 	s.lastUpstreamStatus = statusCode
 	s.lastUpstreamDetail = sanitizeProviderUpstreamDetail(detail)
 }
 
-// upstreamFailureOnly reports whether every accounted inference response for
-// promptID failed. It is false when the prompt made no inference requests or
-// when at least one inference response succeeded.
-func (s *providerProxySession) upstreamFailureOnly(promptID string) (bool, int, string) {
+// upstreamFailureUnrecovered reports whether the most recent accounted
+// inference response for promptID failed and no later inference succeeded.
+// It is false when the prompt made no inference requests or when the latest
+// response succeeded. An earlier success (for example the tool-call round
+// before a 429 on the follow-up request) does not mask a final failure: the
+// agent may render that error as assistant text and settle end_turn, which
+// must not become a successful Task.
+func (s *providerProxySession) upstreamFailureUnrecovered(promptID string) (bool, int, string) {
 	if s == nil {
 		return false, 0, ""
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.turnPromptID != strings.TrimSpace(promptID) || s.inferenceSuccesses != 0 || s.inferenceFailures == 0 {
+	if s.turnPromptID != strings.TrimSpace(promptID) || !s.upstreamFailureLatest {
 		return false, 0, ""
 	}
 	return true, s.lastUpstreamStatus, s.lastUpstreamDetail
@@ -841,7 +854,7 @@ func (p *providerProxy) relayUpstreamResponse(
 		if !upstreamFailed {
 			// A 2xx whose body overran the response limit or broke
 			// mid-stream never delivered a usable inference result; count
-			// it as a failure so upstreamFailureOnly does not mistake it
+			// it as a failure so upstreamFailureUnrecovered does not mistake it
 			// for a success.
 			session.recordInferenceResponse(promptID, requestClass, http.StatusBadGateway, "provider upstream stream failed")
 		}

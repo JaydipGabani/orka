@@ -329,10 +329,11 @@ func repositoryMonitorReviewContextBoundedField(value string, maxBytes int) stri
 // characters other than newline and tab so GitHub-supplied text cannot carry
 // terminal escapes or NUL bytes into the prompt, then redacts credential
 // shapes: patches are untrusted pull request content that is persisted in
-// Task.spec.prompt and readable through the Tasks API.
+// Task.spec.prompt and readable through the Tasks API. Controls are stripped
+// before redaction so a control byte inside a token cannot split it past the
+// redactor and be reassembled into a credential by the strip.
 func repositoryMonitorReviewContextSanitize(value string) string {
-	value = redact.SensitiveText(strings.ToValidUTF8(value, ""))
-	return strings.Map(func(r rune) rune {
+	stripped := strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\t' {
 			return r
 		}
@@ -340,7 +341,8 @@ func repositoryMonitorReviewContextSanitize(value string) string {
 			return -1
 		}
 		return r
-	}, value)
+	}, strings.ToValidUTF8(value, ""))
+	return redact.SensitiveText(stripped)
 }
 
 func repositoryMonitorReviewContextEncodedSize(reviewContext repositoryMonitorReviewContext) int {

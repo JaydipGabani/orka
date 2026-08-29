@@ -29,8 +29,8 @@ func TestACPPromptFailureMessageProjectsRuntimeDetail(t *testing.T) {
 		},
 		{
 			name:     "provider upstream error keeps code and detail",
-			terminal: harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{Code: "provider_upstream_error", Message: "provider upstream returned HTTP 402 for every inference request: quota exceeded"}},
-			want:     "prompt failed: provider_upstream_error: provider upstream returned HTTP 402 for every inference request: quota exceeded",
+			terminal: harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{Code: "provider_upstream_error", Message: "provider upstream returned HTTP 402 for the final inference request: quota exceeded"}},
+			want:     "prompt failed: provider_upstream_error: provider upstream returned HTTP 402 for the final inference request: quota exceeded",
 		},
 		{
 			name:     "code without message",
