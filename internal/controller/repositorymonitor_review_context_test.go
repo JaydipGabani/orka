@@ -700,6 +700,34 @@ func TestRepositoryMonitorReviewTaskAdoptionFailsClosedWhenContextCannotBeReprod
 	}
 }
 
+func TestRepositoryMonitorReviewContextClippedPathMarksChangeSetIncomplete(t *testing.T) {
+	t.Parallel()
+	longPath := "dir/" + strings.Repeat("n", repositoryMonitorReviewContextMaxPathBytes) + ".go"
+	for _, tc := range []struct {
+		name string
+		file repositoryMonitorPullRequestFileResponse
+	}{
+		{name: "deleted long path", file: repositoryMonitorPullRequestFileResponse{Filename: longPath, Status: "removed", Deletions: 1, Patch: "@@ -1 +0,0 @@\n-old\n"}},
+		{name: "renamed from long path", file: repositoryMonitorPullRequestFileResponse{Filename: "short.go", PreviousFilename: longPath, Status: "renamed"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{tc.file})
+			if !got.Truncated.Files {
+				t.Fatalf("truncated = %#v, want files=true when a path identity is clipped", got.Truncated)
+			}
+			prompt := "review\n" + renderRepositoryMonitorReviewContext(got) + "\n"
+			if reason := repositoryMonitorReviewVerdictGateReason(prompt, repositoryMonitorReviewVerdictPassed); reason == "" {
+				t.Fatal("passed verdict was not gated for a clipped path identity")
+			}
+		})
+	}
+	short := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{{Filename: "short.go", Status: repositoryMonitorReviewContextTestStatus, Patch: repositoryMonitorReviewContextTestPatch}})
+	if short.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=false for an in-bound path", short.Truncated)
+	}
+}
+
 func TestRepositoryMonitorReviewVerdictGateReason(t *testing.T) {
 	t.Parallel()
 	complete := "review\n" + renderRepositoryMonitorReviewContext(repositoryMonitorReviewContext{

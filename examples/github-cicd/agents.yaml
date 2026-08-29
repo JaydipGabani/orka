@@ -26,8 +26,6 @@ spec:
       Do not commit, change Git remotes/configuration, push, or create a pull request.
       Orka validates the final tree and publishes it through a separate clean-room service.
       Report changed files and test results.
-  secretRef:
-    name: claude-credentials
 ---
 # Coordinator agent that delegates implementation and uses Orka's GitHub tools
 # only after the child Task has a verified branch-delivery receipt.

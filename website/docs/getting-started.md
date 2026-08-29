@@ -159,18 +159,29 @@ kubectl -n orka-system create role orka-client-read \
   --resource=agents.core.orka.ai,tools.core.orka.ai,skills.core.orka.ai,providers.core.orka.ai,runtimepools.core.orka.ai,agentruntimes.core.orka.ai,repositorymonitors.core.orka.ai
 kubectl -n orka-system create role orka-client-sessions \
   --verb=get,list,delete --resource=sessions.core.orka.ai
+kubectl -n orka-system create role orka-client-gateway \
+  --verb=get,list,watch --resource=gateways.gateway.orka.ai,gatewaybindings.gateway.orka.ai
+kubectl create clusterrole orka-client-gatewayclass-viewer \
+  --verb=get,list,watch --resource=gatewayclasses.gateway.orka.ai
 kubectl -n orka-system create rolebinding orka-client \
   --role=orka-client --serviceaccount=orka-system:orka-client
 kubectl -n orka-system create rolebinding orka-client-read \
   --role=orka-client-read --serviceaccount=orka-system:orka-client
 kubectl -n orka-system create rolebinding orka-client-sessions \
   --role=orka-client-sessions --serviceaccount=orka-system:orka-client
+kubectl -n orka-system create rolebinding orka-client-gateway \
+  --role=orka-client-gateway --serviceaccount=orka-system:orka-client
+kubectl create clusterrolebinding orka-client-gatewayclass-viewer \
+  --clusterrole=orka-client-gatewayclass-viewer --serviceaccount=orka-system:orka-client
 ```
 
 `sessions` is a virtual API resource: the REST API authorizes session reads
 and deletes with a SubjectAccessReview even though no CRD backs it. `providers`
 read access is what the dashboard Chat provider picker (`GET /providers`)
-checks.
+checks. The dashboard Gateways page lists `gateways` and `gatewaybindings`
+(namespaced) and cluster-scoped `gatewayclasses`, each authorized by a
+SubjectAccessReview, so the gateway Role and the `gatewayclasses` ClusterRole
+mirror the reads the Helm client identity is granted.
 
 `make deploy` applies the same resources as the canonical
 `config/acp-production` Kustomize overlay. For direct Kustomize workflows, use

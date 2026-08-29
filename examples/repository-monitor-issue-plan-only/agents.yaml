@@ -4,8 +4,6 @@ metadata:
   name: issue-researcher
   namespace: default
 spec:
-  secretRef:
-    name: claude-runtime-credentials
   model:
     name: claude-sonnet-4.6
   runtime:

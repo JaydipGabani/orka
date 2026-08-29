@@ -23,5 +23,3 @@ spec:
       If you receive FEEDBACK FROM REVIEW, address all feedback items.
       Do not commit, change Git configuration/remotes, push, or create a pull request.
       Orka validates and publishes the final tree through a separate clean-room service.
-  secretRef:
-    name: claude-credentials

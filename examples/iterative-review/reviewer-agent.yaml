@@ -21,5 +21,3 @@ spec:
       Respond with a clear verdict:
       - "APPROVED" if the code is ready
       - "CHANGES_NEEDED" with specific feedback if changes are required
-  secretRef:
-    name: claude-credentials

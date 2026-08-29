@@ -197,6 +197,13 @@ func repositoryMonitorReviewContextFromFiles(owner, repository string, pr reposi
 	entries := make([]repositoryMonitorReviewContextFile, 0, len(files))
 	used := repositoryMonitorReviewContextEncodedSize(reviewContext)
 	for i, file := range files {
+		if repositoryMonitorReviewContextPathClipped(file) {
+			// A clipped path or previous path loses the file's exact
+			// identity, and the checkout carries no Git metadata (and may
+			// not contain a deleted or renamed-from path) to recover it,
+			// so the change set is no longer completely represented.
+			reviewContext.Truncated.Files = true
+		}
 		entry := repositoryMonitorReviewContextIdentityEntry(file, i >= repositoryMonitorReviewContextMaxFiles)
 		entrySize := repositoryMonitorReviewContextEntrySize(entry, len(entries))
 		if used+entrySize > repositoryMonitorReviewContextMaxBytes {
@@ -310,6 +317,17 @@ func repositoryMonitorReviewContextTruncatePatch(patch string, maxEncodedBytes i
 			return candidate, repositoryMonitorReviewContextPatchTruncated
 		}
 	}
+}
+
+// repositoryMonitorReviewContextPathClipped reports whether bounding the
+// file's path or previous path would drop bytes of its identity.
+func repositoryMonitorReviewContextPathClipped(file repositoryMonitorPullRequestFileResponse) bool {
+	for _, value := range []string{file.Filename, file.PreviousFilename} {
+		if len(strings.TrimSpace(repositoryMonitorReviewContextSanitize(value))) > repositoryMonitorReviewContextMaxPathBytes {
+			return true
+		}
+	}
+	return false
 }
 
 func repositoryMonitorReviewContextBoundedField(value string, maxBytes int) string {

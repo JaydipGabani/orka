@@ -23,5 +23,3 @@ spec:
       Keep every change scoped to the linked issue or pull request.
       Run relevant tests before finishing.
       Never print or commit secrets.
-  secretRef:
-    name: codex-runtime-credentials

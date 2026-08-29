@@ -4,8 +4,6 @@ metadata:
   name: issue-implementer
   namespace: default
 spec:
-  secretRef:
-    name: codex-runtime-credentials
   model:
     name: gpt-5.4
   runtime:
@@ -30,8 +28,6 @@ metadata:
   name: issue-researcher
   namespace: default
 spec:
-  secretRef:
-    name: claude-runtime-credentials
   model:
     name: claude-sonnet-4.6
   runtime:
@@ -52,8 +48,6 @@ metadata:
   name: pr-reviewer
   namespace: default
 spec:
-  secretRef:
-    name: claude-runtime-credentials
   model:
     name: claude-sonnet-4.6
   runtime:
