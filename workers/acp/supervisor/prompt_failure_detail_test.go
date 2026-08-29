@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/orka-agents/orka/internal/acp"
+	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 )
 
 func TestPromptFailureErrorDetailRendersRPCErrors(t *testing.T) {
@@ -33,5 +34,25 @@ func TestPromptFailureErrorDetailRendersRPCErrors(t *testing.T) {
 	long := &acp.RPCError{Code: 1, Message: strings.Repeat("x", 2000)}
 	if got := promptFailureErrorDetail(long); len(got) > 520 {
 		t.Fatalf("promptFailureErrorDetail(long) len = %d, want bounded", len(got))
+	}
+}
+
+func TestFailedEventStopReasonNeverEmitsNonFailureReasons(t *testing.T) {
+	t.Parallel()
+	cases := map[acp.StopReason]harnessv2.ACPStopReason{
+		acp.StopReasonCancelled:       harnessv2.ACPStopReasonRefusal,
+		acp.StopReasonEndTurn:         harnessv2.ACPStopReasonRefusal,
+		acp.StopReasonRefusal:         harnessv2.ACPStopReasonRefusal,
+		acp.StopReasonMaxTurnRequests: harnessv2.ACPStopReasonMaxTurnRequests,
+		acp.StopReason(""):            harnessv2.ACPStopReason(""),
+	}
+	for in, want := range cases {
+		got := failedEventStopReason(in)
+		if got != want {
+			t.Fatalf("failedEventStopReason(%q) = %q, want %q", in, got, want)
+		}
+		if err := (harnessv2.FailedEvent{StopReason: got, Code: "acp_prompt_failed", Message: "x"}).Validate(); err != nil {
+			t.Fatalf("Validate(%q) = %v", got, err)
+		}
 	}
 }

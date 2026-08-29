@@ -4539,6 +4539,13 @@ func (d *ACPDispatcher) handlePromptStreamError(
 		"diagnostic", promptStreamDiagnostic(err),
 	)
 	if persistenceErr, ok := errors.AsType[*acpExecutionUpdatePersistenceError](err); ok {
+		// The diagnostic above is intentionally low-cardinality; the store
+		// error itself is what an operator needs to fix a failing journal or
+		// plan write, so record it once here before the Task is failed.
+		logf.FromContext(ctx).Error(persistenceErr, "ACP execution update persistence failed",
+			"namespace", task.Namespace, "task", task.Name,
+			"journalFailed", persistenceErr.journalFailed(),
+		)
 		return d.handlePromptUpdatePersistenceFailure(
 			ctx, runtimeClient, sessionID, task, attemptID, fence, runtimeFence, journalState, accepted, persistenceErr,
 		)

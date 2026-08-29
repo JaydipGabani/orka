@@ -1978,7 +1978,7 @@ func (s *Server) buildTerminalEventLocked(
 			message = "ACP prompt failed: " + detail
 		}
 		event.Failed = &harnessv2.FailedEvent{
-			StopReason: harnessv2.ACPStopReason(result.StopReason),
+			StopReason: failedEventStopReason(result.StopReason),
 			Code:       code,
 			Message:    message,
 			Retryable:  false,
@@ -2085,6 +2085,20 @@ func promptFailureErrorDetail(err error) string {
 		}
 	}
 	return promptStreamErrorDetail(errors.New(sanitizeProviderUpstreamDetail(detail)))
+}
+
+// failedEventStopReason maps a failed prompt's ACP stop reason onto one the
+// harness v2 Failed event accepts. An agent that errors while reporting
+// end_turn or cancelled (for example a provider error surfaced after the
+// child was interrupted) would otherwise produce a malformed terminal event,
+// break the prompt stream, and leave the Task with an unknown settlement.
+func failedEventStopReason(reason acp.StopReason) harnessv2.ACPStopReason {
+	switch reason {
+	case acp.StopReasonEndTurn, acp.StopReasonCancelled:
+		return harnessv2.ACPStopReasonRefusal
+	default:
+		return harnessv2.ACPStopReason(reason)
+	}
 }
 
 func serializedEventWithinLimit(event harnessv2.Event, limit int) bool {
