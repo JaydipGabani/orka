@@ -4191,19 +4191,33 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 		}
 		now := time.Now().UTC()
 		var request harnessv2.RenewPromptLeaseRequest
-		if pending != nil && pending.Metadata.ExpiresAt.After(now.Add(promptLeaseRenewalRetryMargin)) {
+		switch {
+		case pending != nil && pending.Metadata.ExpiresAt.After(now.Add(promptLeaseRenewalRetryMargin)):
 			request = *pending
-		} else {
-			pending = nil
+		case pending != nil:
+			// The ambiguous mutation can no longer be delivered before its
+			// expiry, and there is no evidence it was not applied: resealing
+			// the same operation with fresh timestamps would collide with the
+			// supervisor's recorded operation (digest_conflict) if it was.
+			// The mutation is sealed to outlive the retry window, so reaching
+			// this point means the lease itself is about to expire.
+			log.Info("ACP prompt lease renewal replay expired without a settled outcome; cancelling the prompt",
+				"leaseGeneration", lease.Generation, "pendingGeneration", pending.Lease.Generation)
+			cancelRuntime()
+			return
+		default:
 			proposed := harnessv2.PromptLease{Generation: lease.Generation + 1, IssuedAt: now, ExpiresAt: now.Add(90 * time.Second)}
-			metadata := mutationMetadata(
-				fence, task, "renew-lease-"+strconv.FormatUint(proposed.Generation, 10), true, now.Add(30*time.Second),
-			)
 			authorization.LeaseGeneration = proposed.Generation
 			authorization.ExpiresAt = proposed.ExpiresAt
 			if maximum := now.Add(60 * time.Second); authorization.ExpiresAt.After(maximum) {
 				authorization.ExpiresAt = maximum
 			}
+			// The mutation stays valid for as long as its MCP authorization so
+			// a transient failure can replay the identical sealed request for
+			// the entire retry window instead of resealing it.
+			metadata := mutationMetadata(
+				fence, task, "renew-lease-"+strconv.FormatUint(proposed.Generation, 10), true, authorization.ExpiresAt,
+			)
 			authorization.RuntimeSessionUID = metadata.Fence.RuntimeSessionUID
 			authorization.SessionGeneration = metadata.Fence.RuntimeSessionGeneration
 			authorization.TaskUID = metadata.TaskUID
