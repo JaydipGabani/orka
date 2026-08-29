@@ -86,8 +86,12 @@ type repositoryMonitorPullRequestReviewResponse struct {
 }
 
 type repositoryMonitorPullRequestFileResponse struct {
-	Filename string `json:"filename"`
-	Patch    string `json:"patch"`
+	Filename         string `json:"filename"`
+	PreviousFilename string `json:"previous_filename"`
+	Status           string `json:"status"`
+	Additions        int    `json:"additions"`
+	Deletions        int    `json:"deletions"`
+	Patch            string `json:"patch"`
 }
 
 type repositoryMonitorGitHubAPIError struct {

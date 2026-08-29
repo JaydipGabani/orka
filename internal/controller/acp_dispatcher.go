@@ -1912,12 +1912,13 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		}
 		recordACPPromptOutcome(ctx, acpPromptOutcomeSucceeded)
 		promptTrace.End(nil)
-		if transitionErr := d.transitionDelivery(ctx, attemptID, fence, store.PromptDeliveryValidating, store.PromptDeliveryConflict, "workspace-validation-failed", "workspace validation failed before a trusted delta was established"); transitionErr != nil {
+		validationMessage := acpWorkspaceValidationFailureMessage(err)
+		if transitionErr := d.transitionDelivery(ctx, attemptID, fence, store.PromptDeliveryValidating, store.PromptDeliveryConflict, "workspace-validation-failed", validationMessage); transitionErr != nil {
 			return transitionErr
 		}
 		status := corev1alpha1.TaskDeliveryStatus{
 			State: corev1alpha1.TaskDeliveryStateDeliveryConflict, Outcome: corev1alpha1.TaskDeliveryOutcomeDeliveryConflict,
-			Reason: "WorkspaceValidationFailed", Message: "workspace validation failed before a trusted delta was established", LastTransitionTime: nowMeta(),
+			Reason: "WorkspaceValidationFailed", Message: validationMessage, LastTransitionTime: nowMeta(),
 		}
 		_ = d.patchDeliveryStatus(ctx, task, status)
 		_ = cleanupRuntimeSession("workspace_validation_failed")
@@ -4386,6 +4387,25 @@ func runtimeSessionStartFailureMessage(err error) string {
 	default:
 		return fallback
 	}
+}
+
+// acpWorkspaceValidationFailureMessage projects the supervisor's categorized
+// workspace-validation rejection (for example "reserved workspace path" or
+// "workspace delta exceeds request limits") onto the Task delivery receipt so
+// operators do not need controller logs to learn why a delta was refused.
+// The supervisor already bounds and categorizes the message; only the client
+// error text is used and it is re-bounded here.
+func acpWorkspaceValidationFailureMessage(err error) string {
+	const generic = "workspace validation failed before a trusted delta was established"
+	var clientErr *harnessv2.ClientError
+	if !errors.As(err, &clientErr) || strings.TrimSpace(clientErr.Message) == "" {
+		return generic
+	}
+	detail := boundedRuntimeSessionServerMessage(err)
+	if len(detail) > acpPromptFailureMessageLimit {
+		detail = detail[:acpPromptFailureMessageLimit]
+	}
+	return generic + ": " + detail
 }
 
 func boundedRuntimeSessionServerMessage(err error) string {

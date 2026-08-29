@@ -103,7 +103,11 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestCommandRun(ctx contex
 			}
 			item.CIState = "passed"
 		}
-		taskName, created, err := r.createRepositoryMonitorReviewTask(ctx, monitor, run, owner, repository, pr)
+		token, err := r.repositoryMonitorGitHubToken(ctx, monitor)
+		if err != nil {
+			return true, 0, err
+		}
+		taskName, created, err := r.createRepositoryMonitorReviewTask(ctx, monitor, run, owner, repository, token, pr)
 		if err != nil {
 			return true, 0, err
 		}

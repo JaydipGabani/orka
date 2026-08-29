@@ -64,8 +64,17 @@ spec:
   branch: main
   ref: "v1.2.3"                 # optional tag, branch, or commit SHA checkout override
   subPath: "services/api"        # optional monorepo scope
-  gitSecretRef:                   # optional for private repositories
+  gitSecretRef:                   # optional for private repositories (scan read only)
     name: github-credentials
+  # Required before patch generation / remediation PRs: four distinct Secrets.
+  readCredentialRef:
+    name: github-source-read
+  publicationReadCredentialRef:
+    name: github-publication-read
+  publicationCredentialRef:
+    name: github-publication-write
+  forgeCredentialRef:
+    name: github-forge
   schedule: "0 2 * * *"          # optional cron for incremental scans
   validationMode: light           # off, light, or full
   analysisAgentRef:
@@ -178,7 +187,7 @@ old repository-wide findings by itself.
 ## Safety
 
 - Scan and patch agent Tasks use ACP RuntimePools with private RuntimeSessions; deterministic mapper/container work keeps the native hardened worker path.
-- `RepositoryScan.spec.gitSecretRef` remains the scan-level compatibility reference. Orka maps it to `workspace.readCredentialRef` for scans and to both Task read/publication roles for patch Tasks; the ACP child never receives the Secret.
+- `RepositoryScan.spec.gitSecretRef` remains the scan-level compatibility reference for read-only scan Tasks (`readCredentialRef` takes precedence when both are set). Patch proposals and remediation pull requests are write workflows and require the four explicit, pairwise-distinct roles `readCredentialRef`, `publicationReadCredentialRef`, `publicationCredentialRef`, and `forgeCredentialRef`; a patch request is rejected with `spec.<role> is required for repository scan patch publication` until all four are set. `gitSecretRef` never supplies a publication or forge role, and the ACP child never receives any of these Secrets.
 - Patches and PRs are never created automatically — both are explicit user actions.
 - Patch proposals cannot reach `patch_ready` without a verified publisher branch receipt, patch summary, and
   diff artifact that matches the validated workspace delta.

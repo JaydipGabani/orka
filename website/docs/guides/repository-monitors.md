@@ -95,7 +95,7 @@ Implementation and repair are write workflows and require four explicit, pairwis
 
 ## Review Workspace Context
 
-The review Task is pinned to the exact PR head SHA with `workspace.intent: read`. Before creating it, the controller fetches the pull request identity, requests GitHub's exact `baseSHA...headSHA` comparison, and refetches the pull request to ensure the base, head, and head repository did not change during context assembly. A race fails closed instead of queueing a stale review.
+The review Task is pinned to the exact PR head SHA with `workspace.intent: read`. Before creating it, the controller fetches the pull request identity, lists the pull request's changed files with their patches, and refetches the pull request to ensure the base, head, and head repository did not change during context assembly. A race fails closed instead of queueing a stale review; a GitHub read failure does not fail the run and instead marks the context `contextUnavailable`.
 
 The controller embeds a bounded `orka.prReview.context.v1` payload in the prompt: at most 100 changed files, at most 700 KiB encoded context, at most 64 KiB encoded patch excerpt per file, and bounded paths/short metadata fields. The payload explicitly marks missing patches and local truncation. The prompt treats titles, labels, paths, patches, and repository content as untrusted data and tells the reviewer to inspect the verified checkout whenever GitHub context is incomplete.
 

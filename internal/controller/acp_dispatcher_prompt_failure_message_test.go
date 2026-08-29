@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -53,5 +54,21 @@ func TestACPPromptFailureMessageIsBounded(t *testing.T) {
 	}}
 	if got := acpPromptFailureMessage(terminal); len(got) != acpPromptFailureMessageLimit {
 		t.Fatalf("len(acpPromptFailureMessage()) = %d, want %d", len(got), acpPromptFailureMessageLimit)
+	}
+}
+
+func TestACPWorkspaceValidationFailureMessageProjectsSupervisorReason(t *testing.T) {
+	t.Parallel()
+	const generic = "workspace validation failed before a trusted delta was established"
+	if got := acpWorkspaceValidationFailureMessage(errors.New("dial tcp: connection refused")); got != generic {
+		t.Fatalf("non-client error message = %q, want %q", got, generic)
+	}
+	clientErr := &harnessv2.ClientError{StatusCode: 409, Code: harnessv2.ErrorCodeSessionPoisoned, Message: "workspace validation failed: validate: reserved workspace path"}
+	got := acpWorkspaceValidationFailureMessage(clientErr)
+	if !strings.HasPrefix(got, generic+": ") || !strings.Contains(got, "reserved workspace path") {
+		t.Fatalf("client error message = %q", got)
+	}
+	if got := acpWorkspaceValidationFailureMessage(&harnessv2.ClientError{StatusCode: 409, Message: "   "}); got != generic {
+		t.Fatalf("blank client message = %q, want %q", got, generic)
 	}
 }

@@ -1374,13 +1374,16 @@ func TestRepositoryMonitorReviewTaskReuseAllowsDefaultedTaskScheduleFields(t *te
 		WithStatusSubresource(&corev1alpha1.RepositoryMonitor{}).
 		WithObjects(repositoryMonitorControllerObjects(monitor)...).
 		Build()
+	server := newRepositoryMonitorReviewContextUnavailableServer(t)
+	t.Cleanup(server.Close)
 	reconciler := &RepositoryMonitorReconciler{
-		Client: cl,
-		Scheme: scheme,
-		Store:  setupControllerSQLiteStore(t),
+		Client:           cl,
+		Scheme:           scheme,
+		Store:            setupControllerSQLiteStore(t),
+		GitHubAPIBaseURL: server.URL,
 	}
 
-	taskName, created, err := reconciler.createRepositoryMonitorReviewTask(ctx, monitor, run, "orka-agents", "orka", pr)
+	taskName, created, err := reconciler.createRepositoryMonitorReviewTask(ctx, monitor, run, "orka-agents", "orka", "", pr)
 	if err != nil {
 		t.Fatalf("createRepositoryMonitorReviewTask() error = %v", err)
 	}
@@ -3500,25 +3503,81 @@ func newRepositoryMonitorSinglePullRequestServerWithBodyAndAuth(t *testing.T, nu
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wantPath := fmt.Sprintf("/repos/orka-agents/orka/pulls/%d", number)
-		if r.URL.Path != wantPath {
-			t.Fatalf("request path = %q, want single pull request path %q", r.URL.Path, wantPath)
-		}
 		if got := r.Header.Get("Authorization"); got != wantAuth {
 			t.Fatalf("Authorization header = %q, want %q", got, wantAuth)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == wantPath+"/files" {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		if r.URL.Path != wantPath {
+			t.Fatalf("request path = %q, want single pull request path %q", r.URL.Path, wantPath)
+		}
 		_, _ = w.Write([]byte(body))
 	}))
+}
+
+// newRepositoryMonitorReviewContextUnavailableServer answers every GitHub
+// request with 404 so review Task creation embeds contextUnavailable.
+func newRepositoryMonitorReviewContextUnavailableServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+	}))
+}
+
+// repositoryMonitorInventoryServerRoutesReviewContext serves the single pull
+// request and pull request files endpoints the review-context builder calls,
+// derived from the same inventory body. It returns true when it handled the
+// request.
+func repositoryMonitorInventoryServerRoutesReviewContext(t *testing.T, w http.ResponseWriter, r *http.Request, body string) bool {
+	t.Helper()
+	const prefix = "/repos/orka-agents/orka/pulls/"
+	if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	number, wantFiles := strings.CutSuffix(rest, "/files")
+	w.Header().Set("Content-Type", "application/json")
+	if wantFiles {
+		_, _ = w.Write([]byte(`[{"filename":"main.go","status":"modified","additions":1,"deletions":0,"patch":"@@ -1 +1,2 @@\n package main\n+// change"}]`))
+		return true
+	}
+	var pullRequests []json.RawMessage
+	if err := json.Unmarshal([]byte(body), &pullRequests); err != nil {
+		t.Fatalf("inventory body is not a JSON array: %v", err)
+	}
+	for _, raw := range pullRequests {
+		var pr struct {
+			Number int64 `json:"number"`
+		}
+		if err := json.Unmarshal(raw, &pr); err != nil {
+			t.Fatalf("inventory element is not a pull request: %v", err)
+		}
+		if strconv.FormatInt(pr.Number, 10) == number {
+			_, _ = w.Write(raw)
+			return true
+		}
+	}
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+	return true
 }
 
 func newRepositoryMonitorPullRequestInventoryServerWithAuth(t *testing.T, body, wantAuth string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/orka-agents/orka/pulls" {
-			t.Fatalf("request path = %q, want pull inventory path", r.URL.Path)
-		}
 		if got := r.Header.Get("Authorization"); got != wantAuth {
 			t.Fatalf("Authorization header = %q, want %q", got, wantAuth)
+		}
+		if repositoryMonitorInventoryServerRoutesReviewContext(t, w, r, body) {
+			return
+		}
+		if r.URL.Path != "/repos/orka-agents/orka/pulls" {
+			t.Fatalf("request path = %q, want pull inventory path", r.URL.Path)
 		}
 		if got := r.URL.Query().Get("state"); got != "open" {
 			t.Fatalf("state query = %q, want open", got)
@@ -3923,9 +3982,37 @@ func assertRepositoryMonitorReviewTask(t *testing.T, ctx context.Context, cl crc
 	if !strings.Contains(task.Spec.Prompt, `"schemaVersion": "orka.prReview.input.v1"`) || !strings.Contains(task.Spec.Prompt, `"headSHA": "sha1"`) || !strings.Contains(task.Spec.Prompt, `"schemaVersion": "orka.prReview.v1"`) {
 		t.Fatalf("task prompt does not include expected review input/output contracts:\n%s", task.Spec.Prompt)
 	}
-	if !strings.Contains(task.Spec.Prompt, "/workspace/.git/orka/pr-review.diff") {
-		t.Fatalf("task prompt does not include generated PR diff context path:\n%s", task.Spec.Prompt)
+	if strings.Contains(task.Spec.Prompt, "/workspace/.git/orka") {
+		t.Fatalf("task prompt still references legacy .git/orka review artifacts:\n%s", task.Spec.Prompt)
 	}
+	reviewContext := decodeRepositoryMonitorReviewContextFromPrompt(t, task.Spec.Prompt)
+	if reviewContext.SchemaVersion != repositoryMonitorReviewContextSchemaVersion || reviewContext.Repo != "orka-agents/orka" || reviewContext.PRNumber != 1 || reviewContext.HeadSHA != "sha1" || reviewContext.BaseSHA != "base1" {
+		t.Fatalf("review context = %#v, want orka.prReview.context.v1 for orka-agents/orka#1 at sha1", reviewContext)
+	}
+	if reviewContext.ContextUnavailable != "" || reviewContext.ChangedFileCount != 1 || len(reviewContext.Files) != 1 || reviewContext.Files[0].Path != "main.go" || reviewContext.Files[0].Status != "modified" || !strings.Contains(reviewContext.Files[0].Patch, "+// change") || reviewContext.Files[0].PatchOmitted != "" {
+		t.Fatalf("review context files = %#v, want one modified main.go entry with its patch", reviewContext.Files)
+	}
+	if reviewContext.Truncated.Files || reviewContext.Truncated.Bytes {
+		t.Fatalf("review context truncated = %#v, want no truncation", reviewContext.Truncated)
+	}
+	if !strings.Contains(task.Spec.Prompt, "without Git metadata or history") || !strings.Contains(task.Spec.Prompt, "untrusted data") {
+		t.Fatalf("task prompt does not describe the sanitized checkout and untrusted context:\n%s", task.Spec.Prompt)
+	}
+}
+
+func decodeRepositoryMonitorReviewContextFromPrompt(t *testing.T, prompt string) repositoryMonitorReviewContext {
+	t.Helper()
+	start := strings.Index(prompt, repositoryMonitorReviewContextBeginMarker)
+	end := strings.Index(prompt, repositoryMonitorReviewContextEndMarker)
+	if start < 0 || end < 0 || end < start {
+		t.Fatalf("task prompt does not embed a delimited review context:\n%s", prompt)
+	}
+	encoded := strings.TrimSpace(prompt[start+len(repositoryMonitorReviewContextBeginMarker) : end])
+	var reviewContext repositoryMonitorReviewContext
+	if err := json.Unmarshal([]byte(encoded), &reviewContext); err != nil {
+		t.Fatalf("review context is not valid JSON: %v\n%s", err, encoded)
+	}
+	return reviewContext
 }
 
 func TestRepositoryMonitorReconcileRejectsInvalidRepoURLWithoutPersistingMetadata(t *testing.T) {
@@ -5755,6 +5842,8 @@ func TestRepositoryMonitorPRReviewRepairReadinessAutomergeFakeGitHubE2E(t *testi
 			_, _ = w.Write([]byte(`{"number":88,"title":"Repair me","state":"open","draft":false,"mergeable_state":"clean","user":{"login":"alice"},"base":{"ref":"main","sha":"base88","repo":{"full_name":"orka-agents/orka","clone_url":"https://github.com/orka-agents/orka.git"}},"head":{"ref":"feature-repair","sha":"head88-fixed","repo":{"full_name":"orka-agents/orka","clone_url":"https://github.com/orka-agents/orka.git"}},"labels":[]}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/pulls":
 			_, _ = w.Write([]byte(`[{"number":88,"title":"Repair me","state":"open","draft":false,"mergeable_state":"clean","user":{"login":"alice"},"base":{"ref":"main","sha":"base88","repo":{"full_name":"orka-agents/orka","clone_url":"https://github.com/orka-agents/orka.git"}},"head":{"ref":"feature-repair","sha":"head88-fixed","repo":{"full_name":"orka-agents/orka","clone_url":"https://github.com/orka-agents/orka.git"}},"labels":[]}]`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/pulls/88/files":
+			_, _ = w.Write([]byte(`[{"filename":"pkg/repair.go","status":"modified","additions":2,"deletions":1,"patch":"@@ -1,2 +1,3 @@\n-old\n+new\n+more"}]`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/commits/head88-fixed/check-runs":
 			_, _ = w.Write([]byte(`{"total_count":1,"check_runs":[{"name":"test","status":"completed","conclusion":"success"}]}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/commits/head88-fixed/status":
