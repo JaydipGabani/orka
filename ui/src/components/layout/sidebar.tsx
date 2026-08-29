@@ -25,17 +25,25 @@ const navItems = [
 
 export function Sidebar() {
   const location = useLocation()
-  const { sidebarCollapsed, toggleSidebar, setSidebarCollapsed } = useUIStore()
+  const { sidebarCollapsed: desktopCollapsed, toggleSidebar, mobileSidebarOpen, setMobileSidebarOpen } = useUIStore()
   const isMobile = useIsMobile()
 
   // Below the md breakpoint the expanded sidebar would leave ~135px for content,
-  // so collapse it to the icon rail on entry; expanding it there overlays the
-  // page (see the max-md: classes) instead of squeezing it.
+  // so it starts as the icon rail on entry; expanding it there overlays the
+  // page (see the max-md: classes) instead of squeezing it. The mobile overlay
+  // state is separate from (and never written to) the persisted desktop
+  // preference, so leaving the breakpoint restores the desktop layout.
   useEffect(() => {
-    if (isMobile) setSidebarCollapsed(true)
-  }, [isMobile, setSidebarCollapsed])
+    if (isMobile) setMobileSidebarOpen(false)
+  }, [isMobile, setMobileSidebarOpen])
 
-  const overlayOpen = isMobile && !sidebarCollapsed
+  const sidebarCollapsed = isMobile ? !mobileSidebarOpen : desktopCollapsed
+  const overlayOpen = isMobile && mobileSidebarOpen
+  const closeOverlay = () => setMobileSidebarOpen(false)
+  const handleToggle = () => {
+    if (isMobile) setMobileSidebarOpen(!mobileSidebarOpen)
+    else toggleSidebar()
+  }
 
   return (
     <>
@@ -44,7 +52,7 @@ export function Sidebar() {
         className="fixed inset-0 z-30 bg-black/40 md:hidden"
         aria-hidden="true"
         data-testid="sidebar-backdrop"
-        onClick={() => setSidebarCollapsed(true)}
+        onClick={closeOverlay}
       />
     )}
     <aside className={cn(
@@ -61,7 +69,7 @@ export function Sidebar() {
         <Button
           variant="ghost"
           size="icon"
-          onClick={toggleSidebar}
+          onClick={handleToggle}
           aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
           className={cn('ml-auto h-8 w-8', sidebarCollapsed && 'mx-auto')}
         >
@@ -80,7 +88,7 @@ export function Sidebar() {
               key={to}
               to={to}
               aria-current={isActive ? 'page' : undefined}
-              onClick={() => { if (overlayOpen) setSidebarCollapsed(true) }}
+              onClick={() => { if (overlayOpen) closeOverlay() }}
               className={cn(
                 'relative flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
                 // Refined active state: left accent bar + subtle tint + colored

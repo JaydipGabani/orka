@@ -4,7 +4,7 @@ vi.mock('zustand/middleware', () => ({
   persist: (fn: unknown) => fn,
 }))
 
-import { useUIStore } from './ui'
+import { useUIStore, persistedUIState } from './ui'
 
 describe('useUIStore', () => {
   beforeEach(() => {
@@ -49,5 +49,12 @@ describe('useUIStore', () => {
   it('setNamespace updates namespace', () => {
     useUIStore.getState().setNamespace('production')
     expect(useUIStore.getState().namespace).toBe('production')
+  })
+})
+
+describe('mobileSidebarOpen', () => {
+  it('is not part of the persisted state', () => {
+    useUIStore.setState({ mobileSidebarOpen: true })
+    expect(Object.keys(persistedUIState(useUIStore.getState()))).toEqual(['sidebarCollapsed', 'theme', 'namespace'])
   })
 })

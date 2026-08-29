@@ -73,21 +73,28 @@ describe('Sidebar', () => {
     try {
       const user = userEvent.setup()
       render(<Sidebar />)
-      // Persisted "expanded" state is overridden on a narrow viewport.
-      expect(useUIStore.getState().sidebarCollapsed).toBe(true)
+      // The narrow viewport renders the icon rail without touching the
+      // persisted desktop preference ("expanded").
+      expect(screen.getByRole('complementary').className).toContain('w-16')
+      expect(useUIStore.getState().sidebarCollapsed).toBe(false)
+      expect(useUIStore.getState().mobileSidebarOpen).toBe(false)
       expect(screen.queryByTestId('sidebar-backdrop')).not.toBeInTheDocument()
 
       await user.click(screen.getByRole('button', { name: /expand sidebar/i }))
       expect(screen.getByRole('complementary').className).toContain('max-md:fixed')
       expect(screen.getByTestId('sidebar-backdrop')).toBeInTheDocument()
+      expect(useUIStore.getState().sidebarCollapsed).toBe(false)
 
       // Navigating from the overlay closes it.
       await user.click(screen.getByText('Tasks'))
-      expect(useUIStore.getState().sidebarCollapsed).toBe(true)
+      expect(useUIStore.getState().mobileSidebarOpen).toBe(false)
+      expect(screen.queryByTestId('sidebar-backdrop')).not.toBeInTheDocument()
 
       await user.click(screen.getByRole('button', { name: /expand sidebar/i }))
       await user.click(screen.getByTestId('sidebar-backdrop'))
-      expect(useUIStore.getState().sidebarCollapsed).toBe(true)
+      expect(useUIStore.getState().mobileSidebarOpen).toBe(false)
+      // The desktop preference survived the whole mobile session.
+      expect(useUIStore.getState().sidebarCollapsed).toBe(false)
     } finally {
       window.matchMedia = original
     }
