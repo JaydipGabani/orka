@@ -852,11 +852,21 @@ func (p *providerProxy) relayUpstreamResponse(
 	flusher, _ := w.(http.Flusher)
 	if err := providerproxy.StreamBoundedResponse(w, body, p.maxResponseBytes, flusher); err != nil {
 		if !upstreamFailed {
-			// A 2xx whose body overran the response limit or broke
-			// mid-stream never delivered a usable inference result; count
-			// it as a failure so upstreamFailureUnrecovered does not mistake it
-			// for a success.
-			session.recordInferenceResponse(promptID, requestClass, http.StatusBadGateway, "provider upstream stream failed")
+			if errors.Is(err, providerproxy.ErrDestinationWrite) {
+				// The upstream delivered a healthy 2xx; the ACP child closed
+				// its side of the relay (Codex drops an SSE stream once it
+				// has read what it needs). That is not upstream evidence of
+				// failure, so account the success and let the child's own
+				// settlement decide the prompt outcome.
+				session.recordInferenceResponse(promptID, requestClass, response.StatusCode, "")
+			} else {
+				// A 2xx whose body overran the response limit or broke
+				// mid-stream on the upstream side never delivered a usable
+				// inference result; count it as a failure so
+				// upstreamFailureUnrecovered does not mistake it for a
+				// success.
+				session.recordInferenceResponse(promptID, requestClass, http.StatusBadGateway, "provider upstream stream failed")
+			}
 		}
 		panic(http.ErrAbortHandler)
 	}

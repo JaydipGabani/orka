@@ -3,6 +3,7 @@ package supervisor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1097,6 +1098,46 @@ func TestSanitizeProviderUpstreamDetailRedactsSplitTokens(t *testing.T) {
 	}
 	if got := sanitizeProviderUpstreamDetail("quota exceeded for model"); got != "quota exceeded for model" {
 		t.Fatalf("benign detail was altered: %q", got)
+	}
+}
+
+// childDisconnectedWriter emulates the ACP child closing its side of the
+// relay after the upstream already answered 2xx.
+type childDisconnectedWriter struct {
+	header http.Header
+}
+
+func (w *childDisconnectedWriter) Header() http.Header { return w.header }
+func (w *childDisconnectedWriter) WriteHeader(int)     {}
+func (w *childDisconnectedWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write: broken pipe")
+}
+
+func TestProviderProxyChildDisconnectOnStreamedSuccessCountsAsSuccess(t *testing.T) {
+	proxy, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: "http://upstream.invalid", UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+	session.recordInferenceResponse(testPromptOneID, providerRequestInference, http.StatusTooManyRequests, "rate limit exceeded")
+
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader("data: {}\n\n")),
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != http.ErrAbortHandler {
+				t.Fatalf("relay panic = %v, want http.ErrAbortHandler", recovered)
+			}
+		}()
+		proxy.relayUpstreamResponse(&childDisconnectedWriter{header: http.Header{}}, session, testPromptOneID, providerRequestInference, response)
+	}()
+	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed || status != 0 || detail != "" {
+		t.Fatalf("upstreamFailureUnrecovered after child disconnect on 2xx = %v/%d/%q, want the earlier failure recovered", failed, status, detail)
+	}
+	if successes, failures := session.inferenceSuccesses, session.inferenceFailures; successes != 1 || failures != 1 {
+		t.Fatalf("inference accounting = %d successes / %d failures, want 1/1", successes, failures)
 	}
 }
 
