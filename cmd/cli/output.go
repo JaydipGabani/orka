@@ -85,25 +85,74 @@ func printGenericTable(cmd *cobra.Command, value any) error {
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tNAMESPACE\tSTATUS\tAGE") //nolint:errcheck
 	for _, item := range items {
-		name := firstString(item, "name", "id")
-		if name == "" {
-			name = nestedString(item, "metadata", "name")
-		}
-		namespace := firstString(item, "namespace")
-		if namespace == "" {
-			namespace = nestedString(item, "metadata", "namespace")
-		}
-		status := firstString(item, "phase", "status", "state")
-		if status == "" {
-			status = nestedString(item, "status", "phase")
-		}
-		age := firstString(item, "createdAt")
-		if age == "" {
-			age = nestedString(item, "metadata", "creationTimestamp")
-		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", dash(name), dash(namespace), dash(status), dash(formatAge(age))) //nolint:errcheck
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", dash(genericRowName(item)), dash(genericRowNamespace(item)), dash(genericRowStatus(item)), dash(formatAge(genericRowTimestamp(item)))) //nolint:errcheck
 	}
 	return w.Flush()
+}
+
+const genericRowTitleLimit = 60
+
+// genericRowName labels a row by its resource name, falling back to the
+// "#number title" form used by forge-backed records (monitor items,
+// commands, work actions) that carry no name of their own.
+func genericRowName(item map[string]any) string {
+	name := firstString(item, "name", "id")
+	if name == "" {
+		name = nestedString(item, "metadata", "name")
+	}
+	if name == "" {
+		name = firstString(item, "monitorName")
+	}
+	if number := firstString(item, "number"); number != "" {
+		label := "#" + number
+		if title := strings.TrimSpace(firstString(item, "title")); title != "" {
+			if len(title) > genericRowTitleLimit {
+				title = strings.TrimSpace(title[:genericRowTitleLimit]) + "…"
+			}
+			label += " " + title
+		}
+		if name == "" {
+			return label
+		}
+		return name + " " + label
+	}
+	return name
+}
+
+func genericRowNamespace(item map[string]any) string {
+	namespace := firstString(item, "namespace", "monitorNamespace")
+	if namespace == "" {
+		namespace = nestedString(item, "metadata", "namespace")
+	}
+	return namespace
+}
+
+// genericRowStatus prefers the resource phase and appends the workflow
+// phase when a record tracks both (for example an "open" item that is
+// "approval_required").
+func genericRowStatus(item map[string]any) string {
+	status := firstString(item, "phase", "status", "state")
+	if status == "" {
+		status = nestedString(item, "status", "phase")
+	}
+	if workflow := firstString(item, "workflowPhase"); workflow != "" && workflow != status {
+		if status == "" {
+			return workflow
+		}
+		return status + "/" + workflow
+	}
+	return status
+}
+
+func genericRowTimestamp(item map[string]any) string {
+	age := firstString(item, "createdAt")
+	if age == "" {
+		age = nestedString(item, "metadata", "creationTimestamp")
+	}
+	if age == "" {
+		age = firstString(item, "updatedAt", "lastSeenAt")
+	}
+	return age
 }
 
 func readFileOrStdin(path string) ([]byte, error) {
