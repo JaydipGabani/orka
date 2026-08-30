@@ -14,9 +14,11 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/security"
@@ -255,4 +257,134 @@ func repositoryScanDiffFromPublishedCommit(files []repositoryScanCommitFileRespo
 		paths = append(paths, path)
 	}
 	return diff.String(), paths, ""
+}
+
+const (
+	// repositoryScanGenericPublicationTitlePrefix is the publisher's default
+	// pull request title; a remediation PR still carrying it has not been
+	// decorated with the finding yet.
+	repositoryScanGenericPublicationTitlePrefix = "Orka publication generation "
+	repositoryScanIntentMarkerPrefix            = "<!-- orka.publisher.pr-intent.v1 key="
+	repositoryScanPullRequestBodyField          = "body"
+	repositoryScanPullRequestTitleField         = "title"
+)
+
+// decorateSecurityPatchPullRequest gives the publisher-created remediation
+// pull request a reviewer-facing title and body derived from the finding and
+// the verified patch summary. It is best-effort and idempotent: only a PR
+// that still carries the publisher's generic title is updated, the
+// publisher's intent marker is preserved as the final body line so the PR
+// remains recognizable to the clean-room publisher, and any failure is
+// logged without affecting the proposal.
+func (r *RepositoryScanReconciler) decorateSecurityPatchPullRequest(ctx context.Context, scan *corev1alpha1.RepositoryScan, task *corev1alpha1.Task, findingID string, prNumber int, summaryArtifact string) {
+	logger := log.FromContext(ctx).WithValues("namespace", task.Namespace, "task", task.Name, "finding", findingID, "pullRequest", prNumber)
+	if prNumber <= 0 || r.SecurityStore == nil || r.ArtifactStore == nil {
+		return
+	}
+	finding, err := r.SecurityStore.GetFinding(ctx, scan.Namespace, findingID)
+	if err != nil {
+		logger.Info("skipping remediation pull request decoration", "reason", "finding unavailable")
+		return
+	}
+	var summary *security.PatchSummaryArtifact
+	if strings.TrimSpace(summaryArtifact) != "" {
+		if data, _, err := r.ArtifactStore.GetArtifact(ctx, task.Namespace, task.Name, summaryArtifact); err == nil {
+			var parsed security.PatchSummaryArtifact
+			if json.Unmarshal(data, &parsed) == nil {
+				summary = &parsed
+			}
+		}
+	}
+	token, reason, err := r.repositoryScanForgeToken(ctx, scan)
+	if err != nil || reason != "" {
+		logger.Info("skipping remediation pull request decoration", "reason", "forge credential unavailable")
+		return
+	}
+	targetRepo := security.CanonicalRepositoryCloneURL(scan.Spec.RepoURL)
+	owner, repository, err := security.ParseGitHubRepositoryURL(targetRepo)
+	if err != nil {
+		return
+	}
+	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
+	if baseURL == "" {
+		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", baseURL, url.PathEscape(owner), url.PathEscape(repository), prNumber)
+	client := r.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	current, ok := r.readRemediationPullRequest(ctx, client, endpoint, token, logger)
+	if !ok || !strings.HasPrefix(strings.TrimSpace(current.Title), repositoryScanGenericPublicationTitlePrefix) {
+		return
+	}
+	marker := ""
+	for line := range strings.SplitSeq(current.Body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), repositoryScanIntentMarkerPrefix) {
+			marker = strings.TrimSpace(line)
+		}
+	}
+	if marker == "" {
+		logger.Info("skipping remediation pull request decoration", "reason", "publisher intent marker missing")
+		return
+	}
+	title := security.RemediationPullRequestTitle(finding)
+	body := security.RemediationPullRequestBody(finding, summary) + "\n\n" + marker
+	if security.LooksLikeSecret(title) || security.LooksLikeSecret(body) {
+		logger.Info("skipping remediation pull request decoration", "reason", "rendered text looks like a secret")
+		return
+	}
+	payload, err := json.Marshal(map[string]string{repositoryScanPullRequestTitleField: title, repositoryScanPullRequestBodyField: body})
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, endpoint, strings.NewReader(string(payload)))
+	if err != nil {
+		return
+	}
+	repositoryMonitorSetGitHubHeaders(req, token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Info("skipping remediation pull request decoration", "reason", "GitHub request failed")
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if _, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit); err != nil {
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		logger.Info("remediation pull request decoration rejected by GitHub", "status", resp.StatusCode)
+		return
+	}
+	logger.Info("remediation pull request decorated with the finding")
+}
+
+type repositoryScanPullRequestResponse struct {
+	Title string `json:"title"`
+	Body  string `json:"body"`
+}
+
+func (r *RepositoryScanReconciler) readRemediationPullRequest(ctx context.Context, client *http.Client, endpoint, token string, logger logr.Logger) (repositoryScanPullRequestResponse, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return repositoryScanPullRequestResponse{}, false
+	}
+	repositoryMonitorSetGitHubHeaders(req, token)
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Info("skipping remediation pull request decoration", "reason", "GitHub request failed")
+		return repositoryScanPullRequestResponse{}, false
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	body, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		logger.Info("skipping remediation pull request decoration", "reason", "pull request could not be read", "status", resp.StatusCode)
+		return repositoryScanPullRequestResponse{}, false
+	}
+	var current repositoryScanPullRequestResponse
+	if err := json.Unmarshal(body, &current); err != nil {
+		return repositoryScanPullRequestResponse{}, false
+	}
+	return current, true
 }

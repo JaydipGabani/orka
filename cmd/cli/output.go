@@ -64,6 +64,19 @@ func printStructured(cmd *cobra.Command, value any) error {
 }
 
 func printGenericTable(cmd *cobra.Command, value any) error {
+	// Typed client responses (a single resource struct) are rendered through
+	// their JSON shape so one object prints as a one-row table instead of
+	// "No resources found."
+	if _, isMap := value.(map[string]any); !isMap {
+		if _, isSlice := value.([]any); !isSlice {
+			if encoded, err := json.Marshal(value); err == nil {
+				var generic any
+				if json.Unmarshal(encoded, &generic) == nil {
+					value = generic
+				}
+			}
+		}
+	}
 	items := listItems(value)
 	if len(items) == 0 {
 		fmt.Fprintln(cmd.OutOrStdout(), "No resources found.") //nolint:errcheck

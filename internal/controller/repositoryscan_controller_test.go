@@ -3925,21 +3925,45 @@ func repositoryScanPatchResultEnvelope(fixture patchIngestFixture, changedFiles 
 
 // newPatchCommitServer serves GET /repos/example/kaset/commits/<sha> with the
 // given files, recording the bearer token it saw.
+// patchPullRequestDecoration records the publisher-created PR as GitHub
+// would return it and the PATCH the controller sends to decorate it.
+type patchPullRequestDecoration struct {
+	title   string
+	body    string
+	patched map[string]string
+}
+
 func newPatchCommitServer(t *testing.T, files []repositoryScanCommitFileResponse, seenToken *string) *httptest.Server {
+	server, _ := newPatchCommitServerWithPullRequest(t, files, seenToken)
+	return server
+}
+
+func newPatchCommitServerWithPullRequest(t *testing.T, files []repositoryScanCommitFileResponse, seenToken *string) (*httptest.Server, *patchPullRequestDecoration) {
 	t.Helper()
 	headSHA := strings.Repeat("b", 40)
+	marker := "<!-- orka.publisher.pr-intent.v1 key=sha256:" + strings.Repeat("c", 64) + " -->"
+	pr := &patchPullRequestDecoration{title: "Orka publication generation 1", body: "Created by the Orka clean-room workspace publisher.\n\nPublication generation: 1\n\n" + marker}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/example/kaset/commits/"+headSHA {
-			t.Errorf("unexpected GitHub request %s", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		*seenToken = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(repositoryScanCommitResponse{SHA: headSHA, Files: files})
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/example/kaset/commits/"+headSHA:
+			*seenToken = r.Header.Get("Authorization")
+			_ = json.NewEncoder(w).Encode(repositoryScanCommitResponse{SHA: headSHA, Files: files})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/example/kaset/pulls/42":
+			_ = json.NewEncoder(w).Encode(map[string]string{repositoryScanPullRequestTitleField: pr.title, repositoryScanPullRequestBodyField: pr.body})
+		case r.Method == http.MethodPatch && r.URL.Path == "/repos/example/kaset/pulls/42":
+			var payload map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			pr.patched = payload
+			pr.title, pr.body = payload[repositoryScanPullRequestTitleField], payload[repositoryScanPullRequestBodyField]
+			_ = json.NewEncoder(w).Encode(map[string]string{repositoryScanPullRequestTitleField: pr.title, repositoryScanPullRequestBodyField: pr.body})
+		default:
+			t.Errorf("unexpected GitHub request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	t.Cleanup(server.Close)
-	return server
+	return server, pr
 }
 
 func patchFixtureWithForgeSecret(t *testing.T, id string, server *httptest.Server, withSecret bool) patchIngestFixture {
@@ -3968,7 +3992,7 @@ func patchFixtureWithForgeSecret(t *testing.T, id string, server *httptest.Serve
 func TestIngestPatchTaskDerivesArtifactsFromV2ResultAndPublishedCommit(t *testing.T) {
 	ctx := context.Background()
 	var seenToken string
-	server := newPatchCommitServer(t, []repositoryScanCommitFileResponse{
+	server, pullRequest := newPatchCommitServerWithPullRequest(t, []repositoryScanCommitFileResponse{
 		{Filename: "app.py", Status: repositoryMonitorReviewContextStatusModified, Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"},
 		{Filename: "tests/test_app.py", Status: "added", Patch: "@@ -0,0 +1 @@\n+def test_safe(): pass"},
 	}, &seenToken)
@@ -4006,6 +4030,24 @@ func TestIngestPatchTaskDerivesArtifactsFromV2ResultAndPublishedCommit(t *testin
 	proposals, _ := fixture.store.ListPatchProposals(ctx, fixture.proposal.Namespace, fixture.finding.ID)
 	if proposals[0].DiffArtifact != diffName || proposals[0].SummaryArtifact != summaryName {
 		t.Fatalf("proposal artifacts = %q/%q", proposals[0].DiffArtifact, proposals[0].SummaryArtifact)
+	}
+	// The publisher's generic pull request is decorated with the finding
+	// while its intent marker stays the final body line.
+	if pullRequest.patched == nil || pullRequest.title != "fix(security): Patch target" {
+		t.Fatalf("pull request decoration = %#v", pullRequest.patched)
+	}
+	if !strings.Contains(pullRequest.body, "Security remediation for finding `"+fixture.finding.ID+"`") ||
+		!strings.Contains(pullRequest.body, "escaped the redirect parameter") || !strings.Contains(pullRequest.body, "`app.py`") ||
+		!strings.HasSuffix(pullRequest.body, " -->") || strings.Count(pullRequest.body, "orka.publisher.pr-intent.v1") != 1 {
+		t.Fatalf("decorated body = %q", pullRequest.body)
+	}
+	// A second ingestion leaves the already-decorated pull request alone.
+	pullRequest.patched = nil
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, task); err != nil {
+		t.Fatalf("ingestPatchTask() second pass error = %v", err)
+	}
+	if pullRequest.patched != nil {
+		t.Fatalf("decorated pull request was patched again: %#v", pullRequest.patched)
 	}
 }
 
