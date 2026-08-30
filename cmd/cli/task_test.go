@@ -91,8 +91,8 @@ func TestNewTaskCreateCmdFlags(t *testing.T) {
 		t.Errorf("default type = %q, want %q", typeVal, "ai")
 	}
 	providerVal, _ := cmd.Flags().GetString("provider")
-	if providerVal != "default" {
-		t.Errorf("default provider = %q, want %q", providerVal, "default")
+	if providerVal != "" {
+		t.Errorf("default provider = %q, want it unset so the sole ready Provider is used", providerVal)
 	}
 }
 
@@ -173,6 +173,14 @@ func taskAPIServer() *httptest.Server {
 			w.WriteHeader(http.StatusCreated)
 			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
 				"metadata": map[string]any{"name": "task-abc123", "namespace": "default"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == cliProvidersAPIPath:
+			// One ready Provider: ai tasks created without --provider use it.
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				testProviderItemsKey: []map[string]any{{
+					"metadata":            map[string]any{"name": testProviderSecondary, "namespace": "default"},
+					testProviderStatusKey: map[string]any{testProviderReadyKey: true},
+				}},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == tasksAPIPath:
 			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
@@ -694,5 +702,83 @@ func TestTaskCreateRequiresPromptForDefaultAI(t *testing.T) {
 	root.SetArgs([]string{"task", "create", "--server", "http://127.0.0.1:1"})
 	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "prompt is required") {
 		t.Fatalf("Execute() error = %v, want prompt required", err)
+	}
+}
+
+const (
+	testProviderItemsKey  = "items"
+	testProviderReadyKey  = "ready"
+	testProviderStatusKey = "status"
+	testProviderPrimary   = "anthropic-prod"
+	testProviderSecondary = "openai-prod"
+)
+
+func TestNewTaskCreateCmdInfersTypeAndProvider(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == tasksAPIPath:
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			bodies = append(bodies, body)
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{"name": "task-inferred"}}) //nolint:errcheck
+		case r.Method == http.MethodGet && r.URL.Path == cliProvidersAPIPath:
+			json.NewEncoder(w).Encode(map[string]any{testProviderItemsKey: []map[string]any{ //nolint:errcheck
+				{"metadata": map[string]any{"name": testProviderPrimary}, testProviderStatusKey: map[string]any{testProviderReadyKey: true}},
+				{"metadata": map[string]any{"name": testProviderSecondary}, testProviderStatusKey: map[string]any{testProviderReadyKey: false}},
+			}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// --image without --type is a container task and must not reference a Provider.
+	root := newRootCmd()
+	root.SetArgs([]string{"task", "create", "--server", srv.URL, "--image", "busybox", "--command", "sh", "--arg", "-c", "--arg", "echo hi", "run the container"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("container Execute() error: %v", err)
+	}
+	// An ai task without --provider resolves the sole ready Provider.
+	root = newRootCmd()
+	root.SetArgs([]string{"task", "create", "--server", srv.URL, "summarize"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("ai Execute() error: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("created %d tasks, want 2", len(bodies))
+	}
+	if bodies[0]["type"] != "container" || bodies[0]["ai"] != nil {
+		t.Fatalf("container request = %#v, want type container without ai", bodies[0])
+	}
+	ai, _ := bodies[1]["ai"].(map[string]any)
+	ref, _ := ai["providerRef"].(map[string]any)
+	if bodies[1]["type"] != "ai" || ref["name"] != testProviderPrimary {
+		t.Fatalf("ai request = %#v, want the sole ready Provider anthropic", bodies[1])
+	}
+}
+
+func TestNewTaskCreateCmdExplainsAmbiguousProviders(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == cliProvidersAPIPath {
+			json.NewEncoder(w).Encode(map[string]any{testProviderItemsKey: []map[string]any{ //nolint:errcheck
+				{"metadata": map[string]any{"name": testProviderPrimary}, testProviderStatusKey: map[string]any{testProviderReadyKey: true}},
+				{"metadata": map[string]any{"name": testProviderSecondary}, testProviderStatusKey: map[string]any{testProviderReadyKey: true}},
+			}})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	root := newRootCmd()
+	root.SetArgs([]string{"task", "create", "--server", srv.URL, "summarize"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), testProviderPrimary+", "+testProviderSecondary) || !strings.Contains(err.Error(), "--provider") {
+		t.Fatalf("Execute() error = %v, want the available Providers and a --provider hint", err)
 	}
 }

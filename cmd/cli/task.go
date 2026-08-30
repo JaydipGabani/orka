@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -87,6 +88,17 @@ func newTaskCreateCmd() *cobra.Command {
 			}
 
 			prompt := strings.Join(args, " ")
+			// The default type is ai, but an explicit --image or --agent is
+			// an unambiguous request for a container or agent task; only an
+			// explicit --type overrides that inference.
+			if !cmd.Flags().Changed("type") {
+				switch {
+				case strings.TrimSpace(image) != "":
+					taskType = cliTaskTypeCont
+				case strings.TrimSpace(agent) != "":
+					taskType = cliTaskTypeAgent
+				}
+			}
 			if taskType == "" {
 				taskType = cliTaskTypeAI
 			}
@@ -139,8 +151,15 @@ func newTaskCreateCmd() *cobra.Command {
 			}
 
 			if taskType == cliTaskTypeAI {
-				if provider == "" {
-					provider = defaultNamespace
+				if strings.TrimSpace(provider) == "" && agent == "" {
+					// No Provider named: pick the namespace's only ready
+					// Provider, or explain what is available, instead of
+					// assuming one named "default" exists.
+					resolved, err := resolveDefaultProviderName(cmd.Context(), c)
+					if err != nil {
+						return err
+					}
+					provider = resolved
 				}
 				req.AI = &struct {
 					ProviderRef *struct {
@@ -149,11 +168,13 @@ func newTaskCreateCmd() *cobra.Command {
 					Model  string `json:"model,omitempty"`
 					Prompt string `json:"prompt,omitempty"`
 				}{
-					ProviderRef: &struct {
-						Name string `json:"name"`
-					}{Name: provider},
 					Model:  model,
 					Prompt: prompt,
+				}
+				if strings.TrimSpace(provider) != "" {
+					req.AI.ProviderRef = &struct {
+						Name string `json:"name"`
+					}{Name: strings.TrimSpace(provider)}
 				}
 			}
 
@@ -201,7 +222,7 @@ func newTaskCreateCmd() *cobra.Command {
 	cmd.Flags().StringArrayVar(&envVals, "env", nil, "Environment variable KEY=VALUE (repeatable)")
 	cmd.Flags().Int32Var(&priority, "priority", 0, "Task priority (0-1000)")
 	cmd.Flags().StringVar(&agent, "agent", "", "Agent reference name")
-	cmd.Flags().StringVar(&provider, "provider", defaultNamespace, "Provider reference name")
+	cmd.Flags().StringVar(&provider, "provider", "", "Provider reference name for ai tasks (default: the namespace's only ready Provider)")
 	cmd.Flags().StringVar(&model, "model", "", "Model name for AI tasks")
 	cmd.Flags().StringVar(&timeout, "timeout", "", "Task timeout (e.g., \"5m\", \"1h\")")
 	cmd.Flags().StringVar(&schedule, "schedule", "", "Cron schedule for recurring tasks")
@@ -570,4 +591,57 @@ func formatAge(timestamp string) string {
 	default:
 		return fmt.Sprintf("%dd", int(d.Hours()/24))
 	}
+}
+
+const (
+	cliProvidersAPIPath = "/api/v1/providers"
+	cliNamespaceQuery   = "namespace"
+)
+
+// resolveDefaultProviderName selects the Provider for an ai task when none was
+// named: the namespace's only ready Provider is used; otherwise the error
+// lists what exists so the user can pass --provider.
+func resolveDefaultProviderName(ctx context.Context, c *client.Client) (string, error) {
+	body, _, err := c.GetRaw(ctx, cliProvidersAPIPath, map[string]string{cliNamespaceQuery: c.Namespace})
+	if err != nil {
+		return "", fmt.Errorf("no --provider given and Providers could not be listed: %w", err)
+	}
+	var list struct {
+		Items []struct {
+			Name     string `json:"name"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Ready  bool `json:"ready"`
+			Status struct {
+				Ready bool `json:"ready"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		return "", fmt.Errorf("no --provider given and the Provider list could not be parsed: %w", err)
+	}
+	names := make([]string, 0, len(list.Items))
+	ready := make([]string, 0, len(list.Items))
+	for _, item := range list.Items {
+		name := item.Name
+		if name == "" {
+			name = item.Metadata.Name
+		}
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+		if item.Ready || item.Status.Ready {
+			ready = append(ready, name)
+		}
+	}
+	if len(ready) == 1 {
+		return ready[0], nil
+	}
+	if len(names) == 0 {
+		return "", fmt.Errorf("no --provider given and namespace %q has no Providers; create one first", c.Namespace)
+	}
+	sort.Strings(names)
+	return "", fmt.Errorf("no --provider given and namespace %q has %d Providers (%s); pass --provider", c.Namespace, len(names), strings.Join(names, ", "))
 }
