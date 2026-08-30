@@ -800,7 +800,7 @@ settle_and_delete_test_tasks() {
   local inventory_file="${temp_root}/cleanup-tasks.tsv"
   local name uid session_uid current_uid
   : >"${owners_file}"
-  if [[ "${namespace_shared}" -eq 1 ]]; then
+  if [[ "${namespace_shared:-0}" -eq 1 ]]; then
     # Shared watch-namespace mode: settle and delete only this run's Tasks.
     k -n "${namespace}" get task -l "orka.ai/acp-e2e-run=${run_id}" -o json >"${tasks_file}" || return 1
   else
@@ -854,7 +854,7 @@ delete_test_agents() {
   local agents_file="${temp_root}/cleanup-agents.json"
   local agent
   k -n "${namespace}" get agent -o json >"${agents_file}" || return 1
-  if [[ "${namespace_shared}" -eq 1 ]]; then
+  if [[ "${namespace_shared:-0}" -eq 1 ]]; then
     # Shared watch-namespace mode: only Agents this run created (named with
     # the run id) are removed; unrelated Agents in the namespace stay.
     while IFS= read -r agent; do
@@ -950,7 +950,7 @@ delete_test_namespace_now() {
   log "Settling run-owned Tasks before namespace teardown"
   settle_and_delete_test_tasks "${owners_file}" || return 1
   delete_test_agents || return 1
-  if [[ "${namespace_shared}" -eq 1 ]]; then
+  if [[ "${namespace_shared:-0}" -eq 1 ]]; then
     # RuntimePools are profile-keyed and may serve unrelated Agents in a
     # shared namespace; the controller's idle policy retires them.
     delete_test_branchclaims "${owners_file}" || return 1
@@ -3297,7 +3297,7 @@ remove_provider_resources() {
   local owners_file="${temp_root}/provider-${provider}-owner-uids.txt"
   log "Removing ${provider} Tasks, Agents, and RuntimePools before the next provider"
   assert_all_tasks_validated
-  if [[ "${namespace_shared}" -eq 1 ]]; then
+  if [[ "${namespace_shared:-0}" -eq 1 ]]; then
     # Shared watch-namespace mode: only run-labeled Tasks are removed, and
     # RuntimePools are left alone because they are profile-keyed and may be
     # serving unrelated Agents in the same namespace; the controller's idle
@@ -3466,7 +3466,7 @@ if [[ "${release_gate}" -eq 1 ]]; then
 fi
 
 remove_provider_resources codex "${codex_agent}" "${codex_tool_agent}"
-[[ "${namespace_shared}" -eq 1 ]] || wait_until "Codex runtime children removal" 300 runtime_children_absent
+[[ "${namespace_shared:-0}" -eq 1 ]] || wait_until "Codex runtime children removal" 300 runtime_children_absent
 
 opencode_agent="$(sanitize_name "acp-opencode-${run_id}")"
 opencode_task="$(sanitize_name "acp-opencode-read-${run_id}")"
@@ -3480,7 +3480,7 @@ apply_agent opencode "${opencode_model}" "${opencode_policy_agent}" 12 true
 run_opencode_read_policy_check "${opencode_policy_agent}" "${opencode_model}"
 assert_all_tasks_validated
 remove_provider_resources opencode "${opencode_agent}" "${opencode_policy_agent}"
-[[ "${namespace_shared}" -eq 1 ]] || wait_until "OpenCode runtime children removal" 300 runtime_children_absent
+[[ "${namespace_shared:-0}" -eq 1 ]] || wait_until "OpenCode runtime children removal" 300 runtime_children_absent
 
 claude_agent="$(sanitize_name "acp-claude-${run_id}")"
 claude_task="$(sanitize_name "acp-claude-read-${run_id}")"
@@ -3492,7 +3492,7 @@ run_read_smoke claude "${claude_model}" "${claude_agent}" "${claude_task}" "${cl
 assert_all_tasks_validated
 
 remove_provider_resources claude "${claude_agent}"
-[[ "${namespace_shared}" -eq 1 ]] || wait_until "Claude runtime children removal" 300 runtime_children_absent
+[[ "${namespace_shared:-0}" -eq 1 ]] || wait_until "Claude runtime children removal" 300 runtime_children_absent
 
 copilot_agent="$(sanitize_name "acp-copilot-${run_id}")"
 copilot_task="$(sanitize_name "acp-copilot-read-${run_id}")"

@@ -570,6 +570,66 @@ EOF
   fi
 )
 
+(
+  eval "${provider_handoff_body}"
+  handoff_root="$(mktemp -d "${TMPDIR:-/tmp}/orka-provider-handoff-shared-test.XXXXXX")"
+  trap 'rm -rf "${handoff_root}"' EXIT
+  temp_root="${handoff_root}"
+  namespace="test-namespace"
+  # shellcheck disable=SC2034 # Consumed by remove_provider_resources from the evaluated script body.
+  run_id="test-run"
+  # shellcheck disable=SC2034 # Consumed by remove_provider_resources from the evaluated script body.
+  state_wait_seconds=37
+  # shellcheck disable=SC2034 # Shared watch-namespace mode is the branch under test.
+  namespace_shared=1
+  events_file="${handoff_root}/events"
+  expected_file="${handoff_root}/expected"
+  : >"${events_file}"
+
+  log() { printf 'log:%s\n' "$1" >>"${events_file}"; }
+  assert_all_tasks_validated() { :; }
+  record_runtime_namespace() { printf 'record-runtime-namespace:%s\n' "$1" >>"${events_file}"; }
+  pool_stopped() { printf 'pool-stopped:%s\n' "$1" >>"${events_file}"; }
+  wait_until() { printf 'wait:%s\n' "$1" >>"${events_file}"; }
+  delete_test_branchclaims() { printf 'delete-branchclaims:%s\n' "$1" >>"${events_file}"; }
+  die() {
+    printf 'unexpected die: %s\n' "$*" >&2
+    return 1
+  }
+  k() {
+    if [[ "$*" == "-n ${namespace} get task -l orka.ai/acp-e2e-run=test-run -o json" ]]; then
+      printf '%s\n' '{"items":[{"metadata":{"uid":"run-task-uid"},"status":{"execution":{"runtimeSessionUID":"run-session-uid"}}}]}'
+      return 0
+    fi
+    if [[ "$*" == "-n ${namespace} get task -o json" || "$*" == "-n ${namespace} get runtimepool -o json" ]]; then
+      printf 'unexpected namespace-wide read: %s\n' "$*" >&2
+      return 1
+    fi
+    printf 'kubectl:%s\n' "$*" >>"${events_file}"
+  }
+
+  remove_provider_resources codex codex-agent
+
+  cat >"${expected_file}" <<EOF
+log:Removing codex Tasks, Agents, and RuntimePools before the next provider
+kubectl:-n test-namespace delete task -l orka.ai/acp-e2e-run=test-run --wait=true --timeout=5m
+log:Shared watch namespace: leaving codex RuntimePools to the controller idle policy
+kubectl:-n test-namespace delete agent codex-agent --ignore-not-found=true --wait=true --timeout=2m
+delete-branchclaims:${handoff_root}/provider-codex-owner-uids.txt
+EOF
+  if ! cmp -s "${expected_file}" "${events_file}"; then
+    echo "shared-namespace provider handoff must delete only run-labeled Tasks and leave RuntimePools alone" >&2
+    diff -u "${expected_file}" "${events_file}" >&2 || true
+    exit 1
+  fi
+  if ! grep -q 'run-task-uid' "${handoff_root}/provider-codex-owner-uids.txt"; then
+    echo "shared-namespace provider handoff must record run-owned Task owners for BranchClaim cleanup" >&2
+    exit 1
+  fi
+)
+
+printf '%s\n' 'ok - shared watch-namespace provider handoff removes only run-owned Tasks and Agents'
+
 provider_remove_line="$(line_of_script 'remove_provider_resources codex "${codex_agent}" "${codex_tool_agent}"')"
 provider_children_line="$(line_of_script 'wait_until "Codex runtime children removal" 300 runtime_children_absent')"
 opencode_start_line="$(line_of_script 'run_read_smoke opencode "${opencode_model}"')"
