@@ -6842,6 +6842,22 @@ func TestRepositoryMonitorIssueInventoryPreservesStatusCommentIdentity(t *testin
 	}
 }
 
+func TestRepositoryMonitorIssueRunLimitRetainsActiveWorkflow(t *testing.T) {
+	for _, phase := range []string{repositoryMonitorIssuePhaseApprovalRequired, repositoryMonitorIssuePhaseImplementationQueued, repositoryMonitorIssuePhasePROpened, repositoryMonitorIssuePhaseComplete} {
+		if !repositoryMonitorIssueWorkflowRetainedUnderRunLimit(&store.MonitorItem{WorkflowPhase: phase}) {
+			t.Fatalf("phase %q should be retained under the per-run selection cap", phase)
+		}
+	}
+	for _, phase := range []string{"", repositoryMonitorIssuePhaseDiscovered, repositoryMonitorIssuePhaseBlocked} {
+		if repositoryMonitorIssueWorkflowRetainedUnderRunLimit(&store.MonitorItem{WorkflowPhase: phase}) {
+			t.Fatalf("phase %q should remain subject to the per-run selection cap", phase)
+		}
+	}
+	if repositoryMonitorIssueWorkflowRetainedUnderRunLimit(nil) {
+		t.Fatal("an unknown issue has no workflow to retain")
+	}
+}
+
 func TestRepositoryMonitorStateTransitionValidation(t *testing.T) {
 	if !repositoryMonitorIssuePhaseTransitionAllowed(repositoryMonitorIssuePhasePlanReady, repositoryMonitorIssuePhaseApprovalRequired) {
 		t.Fatal("plan_ready should transition to approval_required")

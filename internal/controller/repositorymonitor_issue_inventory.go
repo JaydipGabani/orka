@@ -136,6 +136,12 @@ func (r *RepositoryMonitorReconciler) processIssueInventoryRun(ctx context.Conte
 			skipReason = repositoryMonitorIssueCommandSkipReason(monitor.Spec, issue)
 		} else {
 			skipReason = repositoryMonitorIssueSkipReason(monitor.Spec, issue, selected, maxPerRun)
+			if skipReason == repositoryMonitorSkipReasonOverLimit && repositoryMonitorIssueWorkflowRetainedUnderRunLimit(existing) {
+				// The per-run cap bounds newly selected issues; it must not
+				// rewrite the recorded workflow (plan approval, an open PR)
+				// of an issue that is already past discovery as "blocked".
+				skipReason = ""
+			}
 		}
 		if skipReason != "" {
 			skipped++
@@ -252,6 +258,21 @@ func (r *RepositoryMonitorReconciler) retireMissingRepositoryMonitorIssues(ctx c
 		}
 	}
 	return nil
+}
+
+// repositoryMonitorIssueWorkflowRetainedUnderRunLimit reports whether an
+// existing item carries workflow state that a background run's selection
+// cap must leave intact.
+func repositoryMonitorIssueWorkflowRetainedUnderRunLimit(existing *store.MonitorItem) bool {
+	if existing == nil {
+		return false
+	}
+	switch strings.TrimSpace(existing.WorkflowPhase) {
+	case "", repositoryMonitorIssuePhaseDiscovered, repositoryMonitorIssuePhaseBlocked:
+		return false
+	default:
+		return true
+	}
 }
 
 func repositoryMonitorIssueInventoryBlockCanClear(reason string) bool {
