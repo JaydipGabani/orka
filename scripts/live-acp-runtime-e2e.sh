@@ -953,17 +953,20 @@ delete_test_namespace_now() {
   if [[ "${namespace_shared:-0}" -eq 1 ]]; then
     # RuntimePools are profile-keyed and may serve unrelated Agents in a
     # shared namespace; the controller's idle policy retires them.
-    delete_test_branchclaims "${owners_file}" || return 1
-    log "Leaving shared namespace ${namespace} and its RuntimePools in place after run-resource cleanup"
-    return 0
-  fi
-  stop_and_delete_test_runtimepools || return 1
-  if ! wait_until "runtime children for ${namespace} to be removed" 300 runtime_children_absent; then
-    warn "runtime children remain or could not be listed before namespace teardown"
-    runtime_children_for_test_namespace 2>&1 | redact >&2
-    return 1
+    log "Shared watch namespace: leaving ${namespace} RuntimePools to the controller idle policy"
+  else
+    stop_and_delete_test_runtimepools || return 1
+    if ! wait_until "runtime children for ${namespace} to be removed" 300 runtime_children_absent; then
+      warn "runtime children remain or could not be listed before namespace teardown"
+      runtime_children_for_test_namespace 2>&1 | redact >&2
+      return 1
+    fi
   fi
   delete_test_branchclaims "${owners_file}" || return 1
+  if [[ "${namespace_shared:-0}" -eq 1 ]]; then
+    log "Leaving shared namespace ${namespace} in place after run-resource cleanup"
+    return 0
+  fi
 
   log "Cleaning up ACP e2e namespace ${namespace}"
   if ! k delete namespace "${namespace}" --ignore-not-found=true --wait=false >/dev/null; then
