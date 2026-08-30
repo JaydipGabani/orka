@@ -32,6 +32,17 @@ describe('splitShellWords', () => {
     expect(splitShellWords('echo "a \\"b\\" \\$c \\\\ \\n"')).toEqual({ words: ['echo', 'a "b" $c \\ \\n'] })
   })
 
+  it('keeps a backslash before an ordinary character inside double quotes', () => {
+    expect(splitShellWords('printf "a\\q" "x\\n"')).toEqual({ words: ['printf', 'a\\q', 'x\\n'] })
+  })
+
+  it('treats backslash-newline as a line continuation outside and inside double quotes', () => {
+    expect(splitShellWords('foo\\\nbar baz')).toEqual({ words: ['foobar', 'baz'] })
+    expect(splitShellWords('"foo\\\nbar"')).toEqual({ words: ['foobar'] })
+    // A single-quoted backslash-newline is literal.
+    expect(splitShellWords("'foo\\\nbar'")).toEqual({ words: ['foo\\\nbar'] })
+  })
+
   it('rejects a trailing unquoted backslash instead of dropping it', () => {
     expect(splitShellWords('echo foo\\')).toEqual({ error: 'Trailing backslash in command' })
     expect(splitShellWords('\\')).toEqual({ error: 'Trailing backslash in command' })

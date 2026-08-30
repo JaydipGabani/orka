@@ -30,9 +30,13 @@ export function splitShellWords(input: string): { words: string[] } | { error: s
     if (quote === '"') {
       if (ch === '"') {
         quote = null
+      } else if (ch === '\\' && i + 1 < input.length && input[i + 1] === '\n') {
+        // Backslash-newline is a line continuation inside double quotes too.
+        i++
       } else if (ch === '\\' && i + 1 < input.length && '"\\$`'.includes(input[i + 1])) {
         current += input[++i]
       } else {
+        // Every other backslash is literal inside double quotes.
         current += ch
       }
       continue
@@ -49,6 +53,12 @@ export function splitShellWords(input: string): { words: string[] } | { error: s
       // silently dropping it.
       if (i + 1 >= input.length) {
         return { error: 'Trailing backslash in command' }
+      }
+      if (input[i + 1] === '\n') {
+        // Backslash-newline is a line continuation: it joins the lines and
+        // contributes no character to the word.
+        i++
+        continue
       }
       current += input[++i]
       inWord = true
