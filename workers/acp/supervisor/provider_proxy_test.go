@@ -1071,6 +1071,52 @@ func TestProviderProxyUpstreamFailureAccountingResetsOnActivation(t *testing.T) 
 	}
 }
 
+func TestRecordRejectedInferenceRequestCountsAsFinalFailure(t *testing.T) {
+	const promptID = "prompt-rejected"
+	now := time.Now().UTC()
+	proxy := &providerProxySession{}
+	if err := proxy.activateWithMaxTurns(promptID, 8, now.Add(time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.close()
+	seq, err := proxy.consumeInferenceRequest(promptID, providerRequestInference, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.recordInferenceOutcome(promptID, providerRequestInference, seq, http.StatusOK, "")
+	// Metadata-route rejections carry no inference evidence.
+	proxy.recordRejectedInferenceRequest(promptID, providerRequestMetadata, http.StatusTooManyRequests, "capacity")
+	if failed, _, _ := proxy.upstreamFailureUnrecovered(promptID); failed {
+		t.Fatal("metadata rejection was accounted as an inference failure")
+	}
+	// A proxy-side capacity rejection of an inference request is the
+	// latest-issued outcome, so an end_turn settlement must not be trusted.
+	proxy.recordRejectedInferenceRequest(promptID, providerRequestInference, http.StatusTooManyRequests, "provider session request capacity is exhausted")
+	failed, status, detail := proxy.upstreamFailureUnrecovered(promptID)
+	if !failed || status != http.StatusTooManyRequests || !strings.Contains(detail, "capacity") {
+		t.Fatalf("upstreamFailureUnrecovered() = (%v, %d, %q), want a 429 capacity failure", failed, status, detail)
+	}
+	// The rejection consumed no turn budget, and a later successful inference
+	// recovers the prompt.
+	seq, err = proxy.consumeInferenceRequest(promptID, providerRequestInference, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq != 3 {
+		t.Fatalf("issuance sequence after a rejection = %d, want 3", seq)
+	}
+	proxy.recordInferenceOutcome(promptID, providerRequestInference, seq, http.StatusOK, "")
+	if failed, _, _ := proxy.upstreamFailureUnrecovered(promptID); failed {
+		t.Fatal("later successful inference did not recover the prompt")
+	}
+	proxy.mu.Lock()
+	requests := proxy.inferenceRequests
+	proxy.mu.Unlock()
+	if requests != 2 {
+		t.Fatalf("inferenceRequests = %d, want 2 (rejections consume no turn budget)", requests)
+	}
+}
+
 func TestSanitizeProviderUpstreamDetailIsBounded(t *testing.T) {
 	long := strings.Repeat("y", providerUpstreamDetailMaxBytes+10) + "界"
 	if got := sanitizeProviderUpstreamDetail(long); len(got) > providerUpstreamDetailMaxBytes {

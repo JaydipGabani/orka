@@ -36,6 +36,8 @@ const (
 	repositoryMonitorReviewContextPatchTruncated   = "truncated"
 	repositoryMonitorReviewContextStatusRemoved    = "removed"
 	repositoryMonitorReviewContextStatusRenamed    = "renamed"
+	repositoryMonitorReviewContextStatusModified   = "modified"
+	repositoryMonitorReviewContextStatusChanged    = "changed"
 	repositoryMonitorReviewContextPatchUnavailable = "unavailable"
 	repositoryMonitorReviewContextPatchCapped      = "capped"
 	repositoryMonitorReviewContextBeginMarker      = "--- BEGIN orka.prReview.context.v1 ---"
@@ -259,9 +261,13 @@ func repositoryMonitorReviewContextFromFiles(owner, repository string, pr reposi
 // repositoryMonitorReviewContextMarkUnreviewableOmissions marks the change set
 // incomplete when an omitted patch (unavailable, truncated, or capped) hides
 // content the Git-free head checkout cannot show: a removed file, a renamed
-// file's previous contents, or lines deleted from any changed file. An omitted
-// patch for a present path whose change only adds lines stays reviewable,
-// because the checkout contains every added line.
+// file's previous contents, lines deleted from any changed file, or a binary
+// modification (no patch, no line counts). An omitted patch for a present
+// path whose change only adds lines stays reviewable, because the checkout
+// contains every added line. A pure rename (no patch, no counts) is treated
+// as fully represented by its new path; GitHub reports a content-changing
+// binary rename identically, which this gate cannot distinguish without the
+// base blob.
 func repositoryMonitorReviewContextMarkUnreviewableOmissions(reviewContext repositoryMonitorReviewContext) repositoryMonitorReviewContext {
 	for _, file := range reviewContext.Files {
 		if file.PatchOmitted == "" {
@@ -282,6 +288,12 @@ func repositoryMonitorReviewContextMarkUnreviewableOmissions(reviewContext repos
 			// Deleted lines (a rename with content changes included) exist
 			// only in the omitted patch, so their removal cannot be reviewed
 			// from the checkout.
+			reviewContext.Truncated.Files = true
+			return reviewContext
+		case (file.Status == repositoryMonitorReviewContextStatusModified || file.Status == repositoryMonitorReviewContextStatusChanged) && file.Additions+file.Deletions == 0:
+			// A modified file with no line counts and no patch is a binary
+			// (or otherwise undiffable) change: the checkout holds only the
+			// new content, so what changed cannot be reviewed.
 			reviewContext.Truncated.Files = true
 			return reviewContext
 		}

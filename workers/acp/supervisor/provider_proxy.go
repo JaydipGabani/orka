@@ -579,6 +579,30 @@ func (s *providerProxySession) recordInferenceOutcome(promptID string, class pro
 	if promptID == "" || s.turnPromptID != promptID {
 		return
 	}
+	s.recordInferenceOutcomeLocked(seq, statusCode, detail)
+}
+
+// recordRejectedInferenceRequest accounts an inference request the proxy
+// itself refused (capacity, profile, or lifecycle rejection) as a failed
+// inference in issuance order, without consuming turn budget. ACP agents can
+// render such a rejection as ordinary assistant text and end their turn, so
+// without this evidence the prompt would settle Completed even though its
+// final inference attempt never reached the provider.
+func (s *providerProxySession) recordRejectedInferenceRequest(promptID string, class providerRequestClass, statusCode int, detail string) {
+	if s == nil || class != providerRequestInference {
+		return
+	}
+	promptID = strings.TrimSpace(promptID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if promptID == "" || s.turnPromptID != promptID {
+		return
+	}
+	s.issuedInference++
+	s.recordInferenceOutcomeLocked(s.issuedInference, statusCode, detail)
+}
+
+func (s *providerProxySession) recordInferenceOutcomeLocked(seq uint64, statusCode int, detail string) {
 	if statusCode < http.StatusBadRequest {
 		s.inferenceSuccesses++
 		s.lastSuccessSeq = max(s.lastSuccessSeq, seq)
@@ -769,26 +793,33 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer authorization.release()
+	// Every rejection from here until the request is admitted upstream is a
+	// failed inference attempt when the route is an inference endpoint.
+	_, _, routeClass := providerRequestRoute(p.providerKind, suffix, r.Method)
+	reject := func(statusCode int, message string) {
+		session.recordRejectedInferenceRequest(authorization.promptID, routeClass, statusCode, message)
+		providerproxy.WriteError(w, statusCode, message)
+	}
 	if !providerproxy.TryAcquireSlot(session.requestSlots) {
-		providerproxy.WriteError(w, http.StatusTooManyRequests, "provider session request capacity is exhausted")
+		reject(http.StatusTooManyRequests, "provider session request capacity is exhausted")
 		return
 	}
 	defer providerproxy.ReleaseSlot(session.requestSlots)
 	if !providerproxy.TryAcquireSlot(p.requestSlots) {
-		providerproxy.WriteError(w, http.StatusTooManyRequests, "provider proxy request capacity is exhausted")
+		reject(http.StatusTooManyRequests, "provider proxy request capacity is exhausted")
 		return
 	}
 	defer providerproxy.ReleaseSlot(p.requestSlots)
 	if r.Method == http.MethodConnect || r.Method == http.MethodTrace {
-		providerproxy.WriteError(w, http.StatusMethodNotAllowed, "provider request method is not allowed")
+		reject(http.StatusMethodNotAllowed, "provider request method is not allowed")
 		return
 	}
 	if providerproxy.HasUnsafePathSegment(suffix) {
-		providerproxy.WriteError(w, http.StatusBadRequest, "provider request path is invalid")
+		reject(http.StatusBadRequest, "provider request path is invalid")
 		return
 	}
 	if providerproxy.HasDisallowedContentEncoding(r.Header) {
-		providerproxy.WriteError(w, http.StatusUnsupportedMediaType, "compressed provider requests are forbidden")
+		reject(http.StatusUnsupportedMediaType, "compressed provider requests are forbidden")
 		return
 	}
 
@@ -816,34 +847,35 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := readBoundedProviderBody(requestContext, r.Body, p.maxRequestBytes)
 	if err != nil {
 		if errors.Is(err, errProviderBodyTooLarge) {
-			providerproxy.WriteError(w, http.StatusRequestEntityTooLarge, "provider request body exceeds limit")
+			reject(http.StatusRequestEntityTooLarge, "provider request body exceeds limit")
 		} else {
-			providerproxy.WriteError(w, http.StatusForbidden, "provider request is no longer active")
+			reject(http.StatusForbidden, "provider request is no longer active")
 		}
 		return
 	}
 	requestClass, err := validateProviderRequest(p.providerKind, p.model, suffix, r.Method, body)
 	if err != nil {
-		providerproxy.WriteError(w, http.StatusForbidden, "provider request is outside the immutable profile")
+		reject(http.StatusForbidden, "provider request is outside the immutable profile")
 		return
 	}
 	body, err = normalizeProviderRequestBody(p.providerKind, p.model, suffix, p.modelOutputLimit, body)
 	if err != nil {
-		providerproxy.WriteError(w, http.StatusForbidden, "provider request is outside the immutable profile")
+		reject(http.StatusForbidden, "provider request is outside the immutable profile")
 		return
 	}
 	select {
 	case <-authorization.gateContext.Done():
-		providerproxy.WriteError(w, http.StatusForbidden, "provider request is no longer active")
+		reject(http.StatusForbidden, "provider request is no longer active")
 		return
 	default:
 	}
 	inferenceSeq, err := session.consumeInferenceRequest(authorization.promptID, requestClass, time.Now().UTC())
 	if err != nil {
 		if errors.Is(err, errProviderTurnLimitExceeded) {
+			session.recordRejectedInferenceRequest(authorization.promptID, requestClass, http.StatusTooManyRequests, "maximum provider inference requests reached for active prompt")
 			writeProviderTurnLimitError(w, p.providerKind)
 		} else {
-			providerproxy.WriteError(w, http.StatusForbidden, "provider request is no longer active")
+			reject(http.StatusForbidden, "provider request is no longer active")
 		}
 		return
 	}
@@ -1118,10 +1150,11 @@ func ensureProviderJSONEOF(decoder *json.Decoder) error {
 	return fmt.Errorf("decode provider request trailer: %w", err)
 }
 
-func validateProviderRequest(providerKind, model, requestPath, method string, body []byte) (providerRequestClass, error) {
-	allowed := false
-	requiresModel := false
-	class := providerRequestMetadata
+// providerRequestRoute classifies a provider request by path and method
+// alone, before the body is read, so proxy-side rejections of inference
+// requests can be accounted in issuance order.
+func providerRequestRoute(providerKind, requestPath, method string) (allowed, requiresModel bool, class providerRequestClass) {
+	class = providerRequestMetadata
 	switch providerKind {
 	case providerKindCodex, providerKindCopilot:
 		switch requestPath {
@@ -1145,6 +1178,11 @@ func validateProviderRequest(providerKind, model, requestPath, method string, bo
 			allowed = method == http.MethodGet
 		}
 	}
+	return allowed, requiresModel, class
+}
+
+func validateProviderRequest(providerKind, model, requestPath, method string, body []byte) (providerRequestClass, error) {
+	allowed, requiresModel, class := providerRequestRoute(providerKind, requestPath, method)
 	if !allowed {
 		return providerRequestMetadata, fmt.Errorf("provider path or method is not allowed")
 	}
