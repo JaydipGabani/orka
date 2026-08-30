@@ -532,10 +532,7 @@ func (r *RepositoryMonitorReconciler) ingestCompletedRepositoryMonitorRepairTask
 		if err == nil {
 			item.RepairState = job.Phase
 			if job.Phase == repositoryMonitorRepairPhaseSucceeded {
-				item.LastReviewedHeadSHA = ""
-				item.LastVerdict = ""
-				item.AutomergeState = ""
-				item.SkipReason = ""
+				repositoryMonitorResetItemAfterRepairPush(item)
 			}
 			if updateErr := r.Store.UpsertMonitorItem(ctx, item); updateErr != nil {
 				return ingested, updateErr
@@ -546,4 +543,22 @@ func (r *RepositoryMonitorReconciler) ingestCompletedRepositoryMonitorRepairTask
 		ingested = true
 	}
 	return ingested, nil
+}
+
+// repositoryMonitorResetItemAfterRepairPush clears the review state that a
+// repair push invalidates so the new head is reviewed afresh. A review that
+// the pull_request synchronize event already queued for the pushed head is
+// kept: clearing its "queued" verdict would orphan the completed review
+// task, which is only ingested while the item still reports it as queued.
+func repositoryMonitorResetItemAfterRepairPush(item *store.MonitorItem) {
+	if item == nil {
+		return
+	}
+	item.LastReviewedHeadSHA = ""
+	item.AutomergeState = ""
+	item.SkipReason = ""
+	if item.LastVerdict == repositoryMonitorRunPhaseQueued && strings.TrimSpace(item.LastReviewID) != "" {
+		return
+	}
+	item.LastVerdict = ""
 }

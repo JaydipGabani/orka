@@ -6858,6 +6858,23 @@ func TestRepositoryMonitorIssueRunLimitRetainsActiveWorkflow(t *testing.T) {
 	}
 }
 
+func TestRepositoryMonitorRepairPushKeepsQueuedReview(t *testing.T) {
+	queued := &store.MonitorItem{LastVerdict: repositoryMonitorRunPhaseQueued, LastReviewID: "monrev-358-newhead", LastReviewedHeadSHA: "old", AutomergeState: "merge_ready", SkipReason: "already_reviewed"}
+	repositoryMonitorResetItemAfterRepairPush(queued)
+	if queued.LastVerdict != repositoryMonitorRunPhaseQueued || queued.LastReviewID != "monrev-358-newhead" {
+		t.Fatalf("queued review was cleared by the repair push: %#v", queued)
+	}
+	if queued.LastReviewedHeadSHA != "" || queued.AutomergeState != "" || queued.SkipReason != "" {
+		t.Fatalf("stale review state survived the repair push: %#v", queued)
+	}
+	reviewed := &store.MonitorItem{LastVerdict: repositoryMonitorReviewVerdictNeedsChanges, LastReviewID: "monrev-358-oldhead", LastReviewedHeadSHA: "old"}
+	repositoryMonitorResetItemAfterRepairPush(reviewed)
+	if reviewed.LastVerdict != "" || reviewed.LastReviewedHeadSHA != "" {
+		t.Fatalf("previous verdict survived the repair push: %#v", reviewed)
+	}
+	repositoryMonitorResetItemAfterRepairPush(nil)
+}
+
 func TestRepositoryMonitorStateTransitionValidation(t *testing.T) {
 	if !repositoryMonitorIssuePhaseTransitionAllowed(repositoryMonitorIssuePhasePlanReady, repositoryMonitorIssuePhaseApprovalRequired) {
 		t.Fatal("plan_ready should transition to approval_required")
