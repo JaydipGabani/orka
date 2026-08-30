@@ -34,7 +34,10 @@ const (
 	repositoryMonitorTokenKey                = "token"
 	repositoryMonitorPasswordKey             = "password"
 	repositoryMonitorGitHubPerPage           = 50
-	repositoryMonitorGitHubResponseLimit     = 10 << 20
+	// repositoryMonitorGitHubCompareMaxFiles is the documented ceiling of
+	// the compare endpoint's unpaginated "files" array.
+	repositoryMonitorGitHubCompareMaxFiles = 300
+	repositoryMonitorGitHubResponseLimit   = 10 << 20
 
 	repositoryMonitorItemStateOpen       = "open"
 	repositoryMonitorItemStateOutOfScope = "out_of_scope"
@@ -67,6 +70,9 @@ type repositoryMonitorPullRequest struct {
 	MergeableState string
 	Merged         bool
 	MergeCommitSHA string
+	// ChangedFiles is GitHub's authoritative changed-file total. It is only
+	// present on a single pull request read; list responses leave it zero.
+	ChangedFiles int
 }
 
 //nolint:gocyclo // Pull request inventory combines selection, CI gating, and audit decisions.
@@ -1104,6 +1110,7 @@ type repositoryMonitorPullRequestResponse struct {
 	MergeableState string `json:"mergeable_state"`
 	Merged         bool   `json:"merged"`
 	MergeCommitSHA string `json:"merge_commit_sha"`
+	ChangedFiles   int    `json:"changed_files"`
 	User           struct {
 		Login string `json:"login"`
 	} `json:"user"`
@@ -1157,6 +1164,7 @@ func repositoryMonitorPullRequestFromGitHub(pr repositoryMonitorPullRequestRespo
 		MergeableState: pr.MergeableState,
 		Merged:         pr.Merged,
 		MergeCommitSHA: pr.MergeCommitSHA,
+		ChangedFiles:   pr.ChangedFiles,
 	}
 }
 

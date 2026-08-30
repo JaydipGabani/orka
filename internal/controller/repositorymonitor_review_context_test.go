@@ -471,6 +471,50 @@ func TestRepositoryMonitorBuildReviewContextUsesPatchesWhenHeadIsStable(t *testi
 	}
 }
 
+func TestRepositoryMonitorBuildReviewContextMarksTruncatedBelowChangedFileTotal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case reviewContextTestFilesPath:
+			_, _ = w.Write([]byte(`{"files":[{"filename":"main.go","status":"modified","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-a\n+b"},{"filename":"logo.png","status":"added","additions":0,"deletions":0}]}`))
+		case reviewContextTestPullPath:
+			// GitHub reports more changed files than the compare listing
+			// carried, as it does once the compare file cap is reached.
+			_, _ = w.Write([]byte(`{"number":7,"state":"open","changed_files":3,"base":{"ref":"main","sha":"base7","repo":{"full_name":"orka-agents/orka"}},"head":{"ref":"feature","sha":"head7","repo":{"full_name":"orka-agents/orka"}}}`))
+		default:
+			t.Errorf("unexpected GitHub request %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	reconciler := &RepositoryMonitorReconciler{GitHubAPIBaseURL: server.URL}
+	got, err := reconciler.buildRepositoryMonitorReviewContext(context.Background(), repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, "token", repositoryMonitorReviewContextTestPR())
+	if err != nil {
+		t.Fatalf("buildRepositoryMonitorReviewContext() error = %v", err)
+	}
+	if got.ContextUnavailable != "" || got.ChangedFileCount != 3 || len(got.Files) != 2 || !got.Truncated.Files {
+		t.Fatalf("context = %#v, want the GitHub total of 3, two listed files, and files=true", got)
+	}
+}
+
+func TestRepositoryMonitorReviewContextBindChangedFileCount(t *testing.T) {
+	t.Parallel()
+	base := repositoryMonitorReviewContext{ChangedFileCount: 2}
+	if got := repositoryMonitorReviewContextBindChangedFileCount(base, 2, 2); got.Truncated.Files || got.ChangedFileCount != 2 {
+		t.Fatalf("complete listing = %#v, want untouched", got)
+	}
+	if got := repositoryMonitorReviewContextBindChangedFileCount(base, 2, 0); got.Truncated.Files {
+		t.Fatalf("short listing with unknown total = %#v, want untouched (below the compare cap)", got)
+	}
+	capped := repositoryMonitorReviewContext{ChangedFileCount: repositoryMonitorGitHubCompareMaxFiles}
+	if got := repositoryMonitorReviewContextBindChangedFileCount(capped, repositoryMonitorGitHubCompareMaxFiles, 0); !got.Truncated.Files {
+		t.Fatalf("cap-sized listing with unknown total = %#v, want files=true", got)
+	}
+	if got := repositoryMonitorReviewContextBindChangedFileCount(capped, repositoryMonitorGitHubCompareMaxFiles, repositoryMonitorGitHubCompareMaxFiles+1); !got.Truncated.Files || got.ChangedFileCount != repositoryMonitorGitHubCompareMaxFiles+1 {
+		t.Fatalf("cap-sized listing below total = %#v, want files=true and the GitHub total", got)
+	}
+}
+
 func TestRepositoryMonitorReviewPromptContextIgnoresEndMarkerInsidePatch(t *testing.T) {
 	pr := repositoryMonitorReviewContextTestPR()
 	monitor := repositoryMonitorInventoryTestMonitor()

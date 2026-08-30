@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -445,6 +446,38 @@ func rawIDValue(raw json.RawMessage) any {
 	var value any
 	_ = json.Unmarshal(raw, &value)
 	return value
+}
+
+func TestHandleRequestChargesPermissionEventsToByteBudget(t *testing.T) {
+	session := &RuntimeSession{config: RuntimeSessionConfig{MaxBufferedEvents: 16, MaxBufferedEventBytes: 1 << 20, PermissionTimeout: time.Second, CancelGrace: 50 * time.Millisecond}, providerSessionID: "sess-1"}
+	active := &activePrompt{id: "prompt-perm", events: make(chan PromptEvent, 16), accepted: true, done: make(chan struct{}), permissions: map[string]*pendingPermission{}}
+	session.active = active
+	params := json.RawMessage(`{"sessionId":"sess-1","toolCall":{"title":"` + strings.Repeat("x", 4096) + `"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}`)
+	go func() {
+		_, _ = session.handleRequest(context.Background(), IncomingRequest{ID: json.RawMessage(`"req-1"`), Method: MethodRequestPermission, Params: params})
+	}()
+	select {
+	case event := <-active.events:
+		if event.Type != PromptEventPermissionRequested || event.Size != len(params) {
+			t.Fatalf("event = %+v, want a permission event sized %d", event, len(params))
+		}
+		session.mu.Lock()
+		buffered := active.bufferedBytes
+		var pending *pendingPermission
+		for _, candidate := range active.permissions {
+			pending = candidate
+		}
+		session.mu.Unlock()
+		if buffered != len(params) {
+			t.Fatalf("bufferedBytes = %d, want %d", buffered, len(params))
+		}
+		if pending == nil {
+			t.Fatal("permission request was not registered")
+		}
+		pending.result <- RequestPermissionOutcome{Outcome: "selected", OptionID: "allow"}
+	case <-time.After(2 * time.Second):
+		t.Fatal("permission event was not emitted")
+	}
 }
 
 func TestEmitLockedEnforcesBufferedByteBudget(t *testing.T) {

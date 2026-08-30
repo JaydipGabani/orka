@@ -1087,6 +1087,20 @@ func TestSanitizeProviderUpstreamDetailIsBounded(t *testing.T) {
 	}
 }
 
+func TestProviderUpstreamErrorDetailRedactsBeforeDisplayBound(t *testing.T) {
+	// The URL password is longer than the display bound, so a pre-redaction
+	// cut would remove the "@" the URL-credential recognizer relies on.
+	password := strings.Repeat("p", providerUpstreamDetailMaxBytes+16)
+	raw := "upstream rejected https://svc:" + password + "@provider.example.com/v1/responses"
+	got := sanitizeProviderUpstreamDetail(providerUpstreamErrorDetail([]byte(raw)))
+	if strings.Contains(got, strings.Repeat("p", 16)) {
+		t.Fatalf("sanitized detail leaked the URL credential: %q", got)
+	}
+	if len(got) > providerUpstreamDetailMaxBytes || !strings.Contains(got, "upstream rejected") {
+		t.Fatalf("sanitized detail = %q (%d bytes), want bounded text that keeps the prose", got, len(got))
+	}
+}
+
 // credentialShapedUpstreamErrorBody is an upstream error payload that echoes
 // several credential shapes back into error.message; none of them may reach
 // the persisted failure detail.

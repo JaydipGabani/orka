@@ -980,24 +980,16 @@ func (r *RepositoryMonitorReconciler) listRepositoryMonitorPullRequestFiles(ctx 
 // listRepositoryMonitorCompareFiles lists the changed files with patches for
 // the exact base...head commit range through the compare endpoint, so the
 // returned file set is bound to immutable SHAs rather than to whatever the
-// pull request branch points at when the request is served.
+// pull request branch points at when the request is served. GitHub does not
+// paginate the compare "files" array: it is returned on the first page only
+// and capped at repositoryMonitorGitHubCompareMaxFiles entries, so the caller
+// must reconcile the result against the pull request's changed-file total.
 func (r *RepositoryMonitorReconciler) listRepositoryMonitorCompareFiles(ctx context.Context, owner, repository, token, baseSHA, headSHA string) ([]repositoryMonitorPullRequestFileResponse, error) {
 	baseSHA, headSHA = strings.TrimSpace(baseSHA), strings.TrimSpace(headSHA)
 	if baseSHA == "" || headSHA == "" {
 		return nil, fmt.Errorf("pull request base and head SHAs are required to bind the review context")
 	}
-	var files []repositoryMonitorPullRequestFileResponse
-	for page := 1; ; page++ {
-		pageFiles, err := r.fetchRepositoryMonitorCompareFilesPage(ctx, owner, repository, token, baseSHA, headSHA, page)
-		if err != nil {
-			return nil, err
-		}
-		files = append(files, pageFiles...)
-		if len(pageFiles) < repositoryMonitorGitHubPerPage {
-			break
-		}
-	}
-	return files, nil
+	return r.fetchRepositoryMonitorCompareFilesPage(ctx, owner, repository, token, baseSHA, headSHA, 1)
 }
 
 func (r *RepositoryMonitorReconciler) fetchRepositoryMonitorCompareFilesPage(ctx context.Context, owner, repository, token, baseSHA, headSHA string, page int) ([]repositoryMonitorPullRequestFileResponse, error) {

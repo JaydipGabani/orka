@@ -135,7 +135,24 @@ func (r *RepositoryMonitorReconciler) buildRepositoryMonitorReviewContext(ctx co
 		logger.Info("pull request review context unavailable", "pr", pr.Number, "operation", "list_files", "errorClass", reviewContext.ContextUnavailable)
 		return reviewContext, nil
 	}
-	return repositoryMonitorReviewContextFromFiles(owner, repository, pr, files), nil
+	return repositoryMonitorReviewContextBindChangedFileCount(repositoryMonitorReviewContextFromFiles(owner, repository, pr, files), len(files), current.ChangedFiles), nil
+}
+
+// repositoryMonitorReviewContextBindChangedFileCount reconciles the compare
+// listing against GitHub's authoritative changed-file total from the pull
+// request read. The compare endpoint silently caps its file array, so a
+// listing shorter than the total (or a cap-sized listing when the total is
+// unknown) means files were never represented to the reviewer and the change
+// set is incomplete.
+func repositoryMonitorReviewContextBindChangedFileCount(reviewContext repositoryMonitorReviewContext, listed, total int) repositoryMonitorReviewContext {
+	switch {
+	case total > listed:
+		reviewContext.ChangedFileCount = total
+		reviewContext.Truncated.Files = true
+	case total <= 0 && listed >= repositoryMonitorGitHubCompareMaxFiles:
+		reviewContext.Truncated.Files = true
+	}
+	return reviewContext
 }
 
 func repositoryMonitorReviewContextDrift(expected, current repositoryMonitorPullRequest) error {

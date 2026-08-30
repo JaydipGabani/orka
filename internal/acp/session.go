@@ -570,7 +570,7 @@ func (s *RuntimeSession) handleRequest(ctx context.Context, request IncomingRequ
 		pending.options[option.OptionID] = struct{}{}
 	}
 	active.permissions[requestID] = pending
-	s.emitLocked(active, PromptEvent{Type: PromptEventPermissionRequested, Permission: &PermissionRequestEvent{RequestID: requestID, Request: permission}})
+	s.emitLocked(active, PromptEvent{Type: PromptEventPermissionRequested, Permission: &PermissionRequestEvent{RequestID: requestID, Request: permission}, Size: len(request.Params)})
 	done := active.done
 	s.mu.Unlock()
 

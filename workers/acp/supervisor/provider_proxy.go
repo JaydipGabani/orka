@@ -666,9 +666,12 @@ func sanitizeProviderUpstreamDetail(detail string) string {
 	return strings.TrimSpace(sanitized[:limit])
 }
 
-// providerUpstreamErrorDetail extracts a bounded human-readable detail from a
+// providerUpstreamErrorDetail extracts a human-readable detail from a
 // buffered upstream error body prefix: the JSON error.message when present,
-// otherwise the trimmed raw prefix.
+// otherwise the trimmed raw prefix. The result is not display-bounded here:
+// sanitizeProviderUpstreamDetail redacts the whole captured prefix first and
+// bounds afterwards, so a credential whose recognizer needs trailing syntax
+// (such as the "@" of a URL userinfo) is never cut away before redaction.
 func providerUpstreamErrorDetail(prefix []byte) string {
 	var payload struct {
 		Error json.RawMessage `json:"error"`
@@ -685,11 +688,7 @@ func providerUpstreamErrorDetail(prefix []byte) string {
 			return message
 		}
 	}
-	raw := strings.TrimSpace(string(prefix))
-	if len(raw) > providerUpstreamDetailMaxBytes {
-		raw = raw[:providerUpstreamDetailMaxBytes]
-	}
-	return raw
+	return strings.TrimSpace(string(prefix))
 }
 
 // countingWriter counts the bytes that reached the downstream client.
