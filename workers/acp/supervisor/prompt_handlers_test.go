@@ -22,6 +22,23 @@ import (
 
 const testE2EPromptWriteAmbiguityMarker = "ORKA_E2E_WS_LC_AMBIGUOUS_OK"
 
+func TestRedactedPromptErrorDetailStripsC1ControlsBeforeRedaction(t *testing.T) {
+	t.Parallel()
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	// A C1 control (U+0085) and a C0 control inside the credential must not
+	// split the token past the redactor.
+	err := errors.New("upstream rejected api_key=" + key[:12] + "\u0085" + key[12:24] + "\x01" + key[24:] + " for the model")
+	got := redactedPromptErrorDetail(err)
+	for _, fragment := range []string{key[:12], key[12:24], key[24:]} {
+		if strings.Contains(got, fragment) {
+			t.Fatalf("redactedPromptErrorDetail() leaked credential fragment %q: %q", fragment, got)
+		}
+	}
+	if !strings.Contains(got, "upstream rejected") || !strings.Contains(got, "[REDACTED]") || strings.ContainsRune(got, '\u0085') {
+		t.Fatalf("redactedPromptErrorDetail() = %q, want redacted prose without control runes", got)
+	}
+}
+
 func TestPromptStreamErrorDetailIsBoundedAndSingleLine(t *testing.T) {
 	if got := promptStreamErrorDetail(fmt.Errorf("first\nsecond\rthird")); got != "first second third" {
 		t.Fatalf("single-line detail = %q", got)

@@ -123,6 +123,23 @@ func TestACPStatusMessagesRedactCredentialShapedDetail(t *testing.T) {
 	}))
 }
 
+func TestACPPromptFailureMessageRedactsCredentialsSplitByControlRunes(t *testing.T) {
+	t.Parallel()
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	// C0, DEL, and C1 controls inside the token must be dropped (not
+	// replaced) so the token reassembles and is redacted as a whole.
+	split := "upstream rejected api_key=" + key[:10] + "\x00" + key[10:20] + "\x7f" + key[20:30] + "\u0085" + key[30:] + " for the model"
+	got := acpPromptFailureMessage(harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{Code: "provider_upstream_error", Message: split}})
+	for _, fragment := range []string{key[:10], key[10:20], key[20:30], key[30:]} {
+		if strings.Contains(got, fragment) {
+			t.Fatalf("acpPromptFailureMessage() leaked credential fragment %q: %q", fragment, got)
+		}
+	}
+	if !strings.Contains(got, "upstream rejected") || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("acpPromptFailureMessage() = %q, want redacted prose", got)
+	}
+}
+
 func TestACPPromptFailureMessageRedactsCredentialShapedCode(t *testing.T) {
 	t.Parallel()
 	terminal := harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{

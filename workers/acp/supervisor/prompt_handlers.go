@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/orka-agents/orka/internal/acp"
@@ -412,15 +413,22 @@ func promptTerminalDiagnostic(result acp.PromptResult) (string, string) {
 	return outcome, stopReason
 }
 
-// redactedPromptErrorDetail strips controls and redacts the complete error
-// text before bounding it for a log field.
+// redactedPromptErrorDetail removes controls (C0, DEL, and C1) and redacts the
+// complete error text before bounding it for a log field. Line breaks and
+// tabs become spaces; every other control rune is dropped rather than
+// replaced so a control inserted inside a credential-shaped token cannot
+// split it into fragments that survive redaction and can be reassembled by a
+// reader.
 func redactedPromptErrorDetail(err error) string {
 	if err == nil {
 		return ""
 	}
 	cleaned := strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
 			return ' '
+		case unicode.IsControl(r):
+			return -1
 		}
 		return r
 	}, strings.ToValidUTF8(err.Error(), ""))

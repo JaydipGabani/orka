@@ -4555,13 +4555,19 @@ func boundedRuntimeSessionServerMessage(err error) string {
 	return message
 }
 
-// stripACPControlRunes replaces control characters in runtime-supplied text
-// with spaces so persisted status and logs carry no terminal escapes and no
-// control byte can split a credential past redaction.
+// stripACPControlRunes removes control characters (C0, DEL, and C1) from
+// runtime-supplied text so persisted status and logs carry no terminal
+// escapes and no control byte can split a credential past redaction. Line
+// breaks and tabs become spaces; every other control rune is dropped rather
+// than replaced, because a space would leave fragments of a split token that
+// survive redaction and can be reassembled by a reader.
 func stripACPControlRunes(value string) string {
 	return strings.Map(func(current rune) rune {
-		if current < 0x20 || current == 0x7f || (current >= 0x80 && current < 0xa0) {
+		switch {
+		case current == '\n' || current == '\r' || current == '\t':
 			return ' '
+		case current < 0x20 || current == 0x7f || (current >= 0x80 && current < 0xa0):
+			return -1
 		}
 		return current
 	}, strings.ToValidUTF8(value, ""))
