@@ -747,19 +747,12 @@ func BuildValidationResultPrompt(scan *corev1alpha1.RepositoryScan, finding *sto
 	return prompt.String()
 }
 
-func appendRequiredArtifactsDirective(prompt *strings.Builder, artifacts ...string) {
-	if len(artifacts) == 0 {
-		return
-	}
-	prompt.WriteString("REQUIRED_SECURITY_ARTIFACTS: ")
-	prompt.WriteString(strings.Join(artifacts, ", "))
-	prompt.WriteString("\n")
-}
-
-// BuildPatchPrompt returns the prompt for patch proposal tasks.
+// BuildPatchPrompt returns the harness-v2 prompt for patch proposal tasks:
+// the agent edits the workspace and returns an identity-bound patch result
+// envelope; Orka publishes the delta and derives the reviewable diff from the
+// published commit.
 func BuildPatchPrompt(scan *corev1alpha1.RepositoryScan, finding *store.Finding, patchBranch string) string {
 	var prompt strings.Builder
-	artifactDir := ArtifactWorkspacePath(scan.Spec.SubPath)
 	fmt.Fprintf(&prompt, "Generate a minimal security patch for repository %s on branch %s.\n", scan.Spec.RepoURL, EffectiveBranch(scan))
 	if strings.TrimSpace(patchBranch) != "" {
 		fmt.Fprintf(&prompt, "Orka will push the final diff to patch branch %s after the task finishes.\n", patchBranch)
@@ -782,20 +775,23 @@ func BuildPatchPrompt(scan *corev1alpha1.RepositoryScan, finding *store.Finding,
 	prompt.WriteString("5. Run focused tests when available.\n")
 	prompt.WriteString("6. The diff artifact must match the actual workspace changes after your edit.\n")
 	prompt.WriteString("7. Do not commit, push, or open a pull request directly. Leave the final file changes in the workspace so Orka can create the commit and push it to the patch branch automatically.\n")
-	fmt.Fprintf(&prompt, "\nWrite these artifacts under %s/:\n", artifactDir)
-	diffArtifact := fmt.Sprintf("security-patch-%s.diff", finding.ID)
-	summaryArtifact := fmt.Sprintf("security-patch-%s.json", finding.ID)
-	fmt.Fprintf(&prompt, "- %s/%s\n", artifactDir, diffArtifact)
-	fmt.Fprintf(&prompt, "- %s/%s\n", artifactDir, summaryArtifact)
-	appendRequiredArtifactsDirective(&prompt, diffArtifact, summaryArtifact)
-	prompt.WriteString("The JSON patch summary must be valid JSON with this exact shape:\n")
-	fmt.Fprintf(
-		&prompt,
-		`{"schemaVersion":%d,"findingId":%q,"summary":"...","changedFiles":["path/to/changed-file"],"testsRun":[{"command":"go test ./...","exitCode":0}],"risk":"low|medium|high"}`+"\n",
-		SchemaVersionPatchSummary,
-		finding.ID,
-	)
-	prompt.WriteString("The changedFiles array must exactly match the files changed in the workspace diff.\n")
-	prompt.WriteString("Prefer Bash heredocs or shell redirection when writing artifact files so they are persisted on disk.\n")
+	prompt.WriteString("8. Change only source files that belong to the fix. Do not create diff, summary, or metadata files anywhere in the workspace (no .orka-artifacts directory): every workspace change becomes part of the published commit, and unexpected files fail the proposal.\n")
+	result := PatchResultEnvelope{
+		SchemaVersion:  AgentResultSchemaVersion,
+		Kind:           AgentResultKindPatch,
+		RepositoryScan: scan.Name,
+		FindingID:      finding.ID,
+		Summary:        "...",
+		ChangedFiles:   []string{"path/to/changed-file"},
+		TestsRun:       []PatchTestRun{{Command: "go test ./...", ExitCode: 0}},
+		Risk:           "low|medium|high",
+	}
+	resultJSON, _ := json.Marshal(result)
+	prompt.WriteString("\nTERMINAL RESULT CONTRACT:\n")
+	prompt.WriteString("Do not write artifacts. Return exactly one JSON object and no markdown fence, commentary, or tool transcript.\n")
+	prompt.WriteString("Use this exact envelope and identity values; replace only summary, changedFiles, testsRun, and risk:\n")
+	prompt.Write(resultJSON)
+	prompt.WriteString("\n")
+	prompt.WriteString("changedFiles must list every file you changed, as repository-root-relative paths, and must exactly match the files in the published commit; Orka derives the reviewable diff from that commit, and a mismatch fails the proposal.\n")
 	return prompt.String()
 }

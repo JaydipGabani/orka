@@ -382,7 +382,7 @@ A typical remediation workflow is:
 2. Inspect evidence with `GET /api/v1/security/findings/:id`.
 3. Optionally validate with `POST /api/v1/security/findings/:id/validate`.
 4. Generate a patch with `POST /api/v1/security/findings/:id/patch`.
-5. Review patch proposals with `GET /api/v1/security/findings/:id/patches`. A proposal is successful only after patch summary and diff verification passes.
+5. Review patch proposals with `GET /api/v1/security/findings/:id/patches`. A proposal is successful only after the governed publication is verified and the agent's patch result envelope matches the diff derived from the published commit; the stored diff and summary artifacts come from that verification, never from agent-written files.
 6. Create a remediation pull request with `POST /api/v1/security/findings/:id/pull-request`.
 
 Review slice and dropped-output inspection:

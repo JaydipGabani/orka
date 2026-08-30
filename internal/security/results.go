@@ -19,10 +19,15 @@ const (
 	AgentResultKindThreatModel = "orka.security.threat-model.v1"
 	AgentResultKindFindings    = "orka.security.findings.v1"
 	AgentResultKindValidation  = "orka.security.validation.v1"
+	AgentResultKindPatch       = "orka.security.patch.v1"
 
 	maxThreatModelResultBytes = 1 << 20
 	maxFindingsResultBytes    = 512 << 10
 	maxValidationResultBytes  = 256 << 10
+	maxPatchResultBytes       = 64 << 10
+	maxPatchSummaryBytes      = 16 << 10
+	maxPatchChangedFiles      = 64
+	maxPatchTestsRun          = 64
 	maxReviewContextBytes     = 256 << 10
 	maxThreatModelBytes       = 768 << 10
 	maxFindingTextBytes       = 64 << 10
@@ -475,4 +480,103 @@ func ReviewContextDigest(manifest ReviewContextManifest) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+// PatchResultEnvelope is the harness-v2 terminal result of a security patch
+// task. The agent applies the fix to the workspace and returns this envelope
+// as its only output; it never writes artifact files. The authoritative diff
+// is derived by the controller from the governed publication, so the envelope
+// carries only the agent's account of what it changed.
+type PatchResultEnvelope struct {
+	SchemaVersion  int            `json:"schemaVersion"`
+	Kind           string         `json:"kind"`
+	RepositoryScan string         `json:"repositoryScan"`
+	FindingID      string         `json:"findingId"`
+	Summary        string         `json:"summary"`
+	ChangedFiles   []string       `json:"changedFiles"`
+	TestsRun       []PatchTestRun `json:"testsRun,omitempty"`
+	Risk           string         `json:"risk"`
+}
+
+// PatchResultExpectation is the controller-owned identity a patch result must
+// match exactly.
+type PatchResultExpectation struct {
+	RepositoryScan string
+	FindingID      string
+}
+
+// ParsePatchResult strictly decodes a terminal patch result and requires the
+// exact repository scan and finding identity. It returns the bounded patch
+// summary the controller persists alongside the publication-derived diff.
+func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSummaryArtifact, error) {
+	var result PatchResultEnvelope
+	if err := decodeStrictResult(data, maxPatchResultBytes, &result); err != nil {
+		return nil, err
+	}
+	if result.SchemaVersion != AgentResultSchemaVersion {
+		return nil, fmt.Errorf("unsupported security result schemaVersion %d", result.SchemaVersion)
+	}
+	if result.Kind != AgentResultKindPatch {
+		return nil, fmt.Errorf("security result kind %q is not a patch", result.Kind)
+	}
+	if strings.TrimSpace(expected.RepositoryScan) == "" || result.RepositoryScan != expected.RepositoryScan {
+		return nil, fmt.Errorf("patch result repositoryScan does not match the expected scan")
+	}
+	if strings.TrimSpace(expected.FindingID) == "" || result.FindingID != expected.FindingID {
+		return nil, fmt.Errorf("patch result findingId does not match the expected finding")
+	}
+	summary := strings.TrimSpace(result.Summary)
+	if summary == "" {
+		return nil, fmt.Errorf("patch summary is required")
+	}
+	if len(summary) > maxPatchSummaryBytes {
+		return nil, fmt.Errorf("patch summary exceeds %d bytes", maxPatchSummaryBytes)
+	}
+	if securityResultLooksLikeToolTranscript(summary) {
+		return nil, fmt.Errorf("patch summary looks like a tool transcript")
+	}
+	if len(result.ChangedFiles) == 0 {
+		return nil, fmt.Errorf("patch changedFiles is required")
+	}
+	if len(result.ChangedFiles) > maxPatchChangedFiles {
+		return nil, fmt.Errorf("patch changedFiles exceeds %d entries", maxPatchChangedFiles)
+	}
+	changed := make([]string, 0, len(result.ChangedFiles))
+	seen := make(map[string]struct{}, len(result.ChangedFiles))
+	for _, file := range result.ChangedFiles {
+		file = strings.TrimSpace(strings.ReplaceAll(file, "\\", "/"))
+		for strings.HasPrefix(file, "./") {
+			file = strings.TrimPrefix(file, "./")
+		}
+		if file == "" || !SafeRepoPath(file) {
+			return nil, fmt.Errorf("patch changedFiles contains an unsafe path")
+		}
+		if _, duplicate := seen[file]; duplicate {
+			continue
+		}
+		seen[file] = struct{}{}
+		changed = append(changed, file)
+	}
+	if len(result.TestsRun) > maxPatchTestsRun {
+		return nil, fmt.Errorf("patch testsRun exceeds %d entries", maxPatchTestsRun)
+	}
+	for _, test := range result.TestsRun {
+		if strings.TrimSpace(test.Command) == "" || len(test.Command) > maxValidationItemBytes {
+			return nil, fmt.Errorf("patch testsRun contains an invalid command")
+		}
+	}
+	risk := strings.ToLower(strings.TrimSpace(result.Risk))
+	switch risk {
+	case "low", "medium", "high":
+	default:
+		return nil, fmt.Errorf("patch risk must be low, medium, or high")
+	}
+	return &PatchSummaryArtifact{
+		SchemaVersion: SchemaVersionPatchSummary,
+		FindingID:     result.FindingID,
+		Summary:       summary,
+		ChangedFiles:  changed,
+		TestsRun:      result.TestsRun,
+		Risk:          risk,
+	}, nil
 }

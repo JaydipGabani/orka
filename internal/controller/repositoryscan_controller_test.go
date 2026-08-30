@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -3897,5 +3899,155 @@ func TestTerminalScannerPolicyLoadErrorOnlyTerminalForDeterministicErrors(t *tes
 	}
 	if terminalScannerPolicyLoadError(fmt.Errorf("customScanInstructionsRef: %w", context.DeadlineExceeded)) {
 		t.Fatal("terminalScannerPolicyLoadError() = true, want false for context deadline")
+	}
+}
+
+const (
+	testPatchForgeSecretName = "github-forge"
+	testPatchBinaryFile      = "logo.png"
+)
+
+// repositoryScanPatchResultEnvelope renders the harness-v2 terminal result a
+// patch agent returns instead of writing artifact files.
+func repositoryScanPatchResultEnvelope(fixture patchIngestFixture, changedFiles []string) []byte {
+	data, _ := json.Marshal(security.PatchResultEnvelope{
+		SchemaVersion:  security.AgentResultSchemaVersion,
+		Kind:           security.AgentResultKindPatch,
+		RepositoryScan: fixture.scan.Name,
+		FindingID:      fixture.finding.ID,
+		Summary:        "escaped the redirect parameter",
+		ChangedFiles:   changedFiles,
+		TestsRun:       []security.PatchTestRun{{Command: "npm test", ExitCode: 0}},
+		Risk:           "low",
+	})
+	return data
+}
+
+// newPatchCommitServer serves GET /repos/example/kaset/commits/<sha> with the
+// given files, recording the bearer token it saw.
+func newPatchCommitServer(t *testing.T, files []repositoryScanCommitFileResponse, seenToken *string) *httptest.Server {
+	t.Helper()
+	headSHA := strings.Repeat("b", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/example/kaset/commits/"+headSHA {
+			t.Errorf("unexpected GitHub request %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		*seenToken = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(repositoryScanCommitResponse{SHA: headSHA, Files: files})
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func patchFixtureWithForgeSecret(t *testing.T, id string, server *httptest.Server, withSecret bool) patchIngestFixture {
+	t.Helper()
+	fixture := newPatchIngestFixture(t, id)
+	fixture.scan.Spec.ForgeCredentialRef = &corev1.LocalObjectReference{Name: testPatchForgeSecretName}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	builder := fake.NewClientBuilder().WithScheme(scheme)
+	if withSecret {
+		builder = builder.WithObjects(&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS},
+			Data:       map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")},
+		})
+	}
+	fixture.reconciler.Client = builder.Build()
+	fixture.reconciler.GitHubAPIBaseURL = server.URL
+	return fixture
+}
+
+func TestIngestPatchTaskDerivesArtifactsFromV2ResultAndPublishedCommit(t *testing.T) {
+	ctx := context.Background()
+	var seenToken string
+	server := newPatchCommitServer(t, []repositoryScanCommitFileResponse{
+		{Filename: "app.py", Status: repositoryMonitorReviewContextStatusModified, Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"},
+		{Filename: "tests/test_app.py", Status: "added", Patch: "@@ -0,0 +1 @@\n+def test_safe(): pass"},
+	}, &seenToken)
+	fixture := patchFixtureWithForgeSecret(t, "v2-envelope", server, true)
+	if err := fixture.store.SaveResult(ctx, fixture.proposal.Namespace, fixture.proposal.TaskName, repositoryScanPatchResultEnvelope(fixture, []string{"app.py", "tests/test_app.py"})); err != nil {
+		t.Fatalf("SaveResult() error = %v", err)
+	}
+	task := patchTaskForFixture(fixture, true)
+	task.Spec.Prompt = security.BuildPatchPrompt(fixture.scan, fixture.finding, fixture.proposal.Branch)
+
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, task); err != nil {
+		t.Fatalf("ingestPatchTask() error = %v", err)
+	}
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
+	if seenToken != "Bearer forge-token-value" {
+		t.Fatalf("GitHub request authorization = %q, want the forge token", seenToken)
+	}
+	diffName, summaryName := patchArtifactNames(fixture.finding.ID)
+	diff, _, err := fixture.store.GetArtifact(ctx, fixture.proposal.Namespace, fixture.proposal.TaskName, diffName)
+	if err != nil {
+		t.Fatalf("GetArtifact(diff) error = %v", err)
+	}
+	if !strings.Contains(string(diff), "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n") ||
+		!strings.Contains(string(diff), "diff --git a/tests/test_app.py b/tests/test_app.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_app.py\n") {
+		t.Fatalf("derived diff = %q", diff)
+	}
+	summaryData, _, err := fixture.store.GetArtifact(ctx, fixture.proposal.Namespace, fixture.proposal.TaskName, summaryName)
+	if err != nil {
+		t.Fatalf("GetArtifact(summary) error = %v", err)
+	}
+	var summary security.PatchSummaryArtifact
+	if err := json.Unmarshal(summaryData, &summary); err != nil || summary.FindingID != fixture.finding.ID || summary.Risk != "low" || len(summary.ChangedFiles) != 2 {
+		t.Fatalf("summary artifact = %s (err %v)", summaryData, err)
+	}
+	proposals, _ := fixture.store.ListPatchProposals(ctx, fixture.proposal.Namespace, fixture.finding.ID)
+	if proposals[0].DiffArtifact != diffName || proposals[0].SummaryArtifact != summaryName {
+		t.Fatalf("proposal artifacts = %q/%q", proposals[0].DiffArtifact, proposals[0].SummaryArtifact)
+	}
+}
+
+func TestIngestPatchTaskV2ResultFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	textFiles := []repositoryScanCommitFileResponse{{Filename: "app.py", Status: repositoryMonitorReviewContextStatusModified, Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}
+	cases := []struct {
+		name         string
+		files        []repositoryScanCommitFileResponse
+		changedFiles []string
+		withSecret   bool
+		result       func(fixture patchIngestFixture) []byte
+	}{
+		{name: "changedFiles do not match the published commit", files: textFiles, changedFiles: []string{"app.py", "other.py"}, withSecret: true},
+		{name: "published commit has a binary file", files: []repositoryScanCommitFileResponse{{Filename: testPatchBinaryFile, Status: repositoryMonitorReviewContextStatusModified}}, changedFiles: []string{testPatchBinaryFile}, withSecret: true},
+		{name: "published commit renames a file", files: []repositoryScanCommitFileResponse{{Filename: "b.py", PreviousFilename: "a.py", Status: "renamed", Patch: "@@ -1 +1 @@\n-x\n+y"}}, changedFiles: []string{"b.py"}, withSecret: true},
+		{name: "forge credential is missing", files: textFiles, changedFiles: []string{"app.py"}, withSecret: false},
+		{name: "agent-supplied diff is not trusted without a commit match", files: textFiles, changedFiles: []string{"app.py"}, withSecret: true, result: func(fixture patchIngestFixture) []byte {
+			data, _ := common.FormatStructuredResult(&common.StructuredResult{Summary: "patched", Diff: "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n", Files: []string{"app.py"}})
+			return data
+		}},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var seenToken string
+			server := newPatchCommitServer(t, tc.files, &seenToken)
+			fixture := patchFixtureWithForgeSecret(t, fmt.Sprintf("v2-fail-%d", i), server, tc.withSecret)
+			result := repositoryScanPatchResultEnvelope(fixture, tc.changedFiles)
+			if tc.result != nil {
+				result = tc.result(fixture)
+			}
+			if err := fixture.store.SaveResult(ctx, fixture.proposal.Namespace, fixture.proposal.TaskName, result); err != nil {
+				t.Fatalf("SaveResult() error = %v", err)
+			}
+			if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {
+				t.Fatalf("ingestPatchTask() error = %v", err)
+			}
+			assertPatchIngestState(t, fixture, scanRunPhaseFailed, findingStateOpen)
+			diffName, _ := patchArtifactNames(fixture.finding.ID)
+			if _, _, err := fixture.store.GetArtifact(ctx, fixture.proposal.Namespace, fixture.proposal.TaskName, diffName); err == nil {
+				t.Fatal("a failed proposal must not persist a diff artifact")
+			}
+		})
 	}
 }

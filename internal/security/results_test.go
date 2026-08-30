@@ -219,3 +219,45 @@ func mustMarshalSecurityResult(t *testing.T, value any) []byte {
 	}
 	return data
 }
+
+const testPatchFindingID = "fnd_1"
+
+func TestParsePatchResultAcceptsIdentityBoundEnvelope(t *testing.T) {
+	t.Parallel()
+	data := []byte(`{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"Escaped the redirect parameter.","changedFiles":["./routes/index.js","routes/index.js","views/login.hbs"],"testsRun":[{"command":"npm test","exitCode":0}],"risk":"LOW"}`)
+	got, err := ParsePatchResult(data, PatchResultExpectation{RepositoryScan: "kaset", FindingID: testPatchFindingID})
+	if err != nil {
+		t.Fatalf("ParsePatchResult() error = %v", err)
+	}
+	if got.SchemaVersion != SchemaVersionPatchSummary || got.FindingID != testPatchFindingID || got.Risk != "low" || len(got.TestsRun) != 1 {
+		t.Fatalf("summary = %#v", got)
+	}
+	if len(got.ChangedFiles) != 2 || got.ChangedFiles[0] != "routes/index.js" || got.ChangedFiles[1] != "views/login.hbs" {
+		t.Fatalf("changedFiles = %#v, want deduplicated normalized paths", got.ChangedFiles)
+	}
+}
+
+func TestParsePatchResultRejectsInvalidEnvelopes(t *testing.T) {
+	t.Parallel()
+	expected := PatchResultExpectation{RepositoryScan: "kaset", FindingID: testPatchFindingID}
+	cases := map[string]string{
+		"wrong kind":       `{"schemaVersion":1,"kind":"orka.security.findings.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"risk":"low"}`,
+		"wrong finding":    `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_2","summary":"s","changedFiles":["a.go"],"risk":"low"}`,
+		"wrong scan":       `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"other","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"risk":"low"}`,
+		"unknown field":    `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"risk":"low","diff":"x"}`,
+		"no changed files": `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":[],"risk":"low"}`,
+		"unsafe path":      `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["../etc/passwd"],"risk":"low"}`,
+		"bad risk":         `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"risk":"critical"}`,
+		"tool transcript":  `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"<tool_call>rm</tool_call>","changedFiles":["a.go"],"risk":"low"}`,
+		"markdown fence":   "```json\n{\"schemaVersion\":1}\n```",
+		"empty":            ``,
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := ParsePatchResult([]byte(payload), expected); err == nil {
+				t.Fatalf("ParsePatchResult() accepted %s", name)
+			}
+		})
+	}
+}

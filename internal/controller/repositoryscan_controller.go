@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"sort"
 	"strconv"
@@ -102,6 +103,10 @@ type RepositoryScanReconciler struct {
 	ArtifactStore    store.ArtifactStore
 	ResultStore      store.ResultStore
 	PublicationStore store.PublicationStore
+	// HTTPClient and GitHubAPIBaseURL serve the published-commit read that
+	// backs harness-v2 patch evidence; zero values use the defaults.
+	HTTPClient       *http.Client
+	GitHubAPIBaseURL string
 }
 
 func repositoryScanConditionMessage(message, fallback string) string {
@@ -1429,7 +1434,7 @@ func (r *RepositoryScanReconciler) loadMapperReviewContext(
 	sliceID string,
 ) (string, string, string, error) {
 	if r.ArtifactStore == nil {
-		return "", "", "artifact store is not configured", nil
+		return "", "", repositoryScanArtifactStoreNotConfigured, nil
 	}
 	artifactName := security.ReviewContextArtifactName(sliceID)
 	data, err := r.getArtifactWithRetry(ctx, task.Namespace, task.Name, artifactName)
@@ -2863,7 +2868,7 @@ func patchTaskRequiresArtifactVerification(task *corev1alpha1.Task, findingID st
 
 func (r *RepositoryScanReconciler) verifyPatchTaskArtifacts(ctx context.Context, scan *corev1alpha1.RepositoryScan, task *corev1alpha1.Task, findingID string) (patchVerificationResult, string, error) {
 	if r.ArtifactStore == nil {
-		return patchVerificationResult{}, "artifact store is not configured", nil
+		return patchVerificationResult{}, repositoryScanArtifactStoreNotConfigured, nil
 	}
 
 	diffName, summaryName := patchArtifactNames(findingID)
@@ -3106,23 +3111,12 @@ func (r *RepositoryScanReconciler) verifiedSecurityPatchPublication(
 }
 
 func (r *RepositoryScanReconciler) updatePatchProposalFromSucceededTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, task *corev1alpha1.Task, findingID string, proposal *store.PatchProposal) error {
-	var verified patchVerificationResult
-	if patchTaskRequiresArtifactVerification(task, findingID) {
-		var reason string
-		var err error
-		verified, reason, err = r.verifyPatchTaskArtifacts(ctx, scan, task, findingID)
-		if err != nil {
-			return err
-		}
-		if reason != "" {
-			proposal.Status = scanRunPhaseFailed
-			return nil
-		}
-	}
 	requestedBranch := ""
 	if task.Spec.Workspace != nil {
 		requestedBranch = strings.TrimSpace(task.Spec.Workspace.PushBranch)
 	}
+	// The publication is verified first: the harness-v2 evidence path derives
+	// the reviewable diff from the exact commit it proves.
 	publication, reason, err := r.verifiedSecurityPatchPublication(ctx, scan, task, requestedBranch)
 	if err != nil {
 		return err
@@ -3130,6 +3124,18 @@ func (r *RepositoryScanReconciler) updatePatchProposalFromSucceededTask(ctx cont
 	if reason != "" {
 		proposal.Status = scanRunPhaseFailed
 		return nil
+	}
+	var verified patchVerificationResult
+	if patchTaskRequiresArtifactVerification(task, findingID) {
+		var reason string
+		verified, reason, err = r.verifyPatchTaskEvidence(ctx, scan, task, findingID, publication)
+		if err != nil {
+			return err
+		}
+		if reason != "" {
+			proposal.Status = scanRunPhaseFailed
+			return nil
+		}
 	}
 	proposal.Branch = publication.branch
 	proposal.DiffArtifact = verified.diffArtifact

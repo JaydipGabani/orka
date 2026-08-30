@@ -471,13 +471,17 @@ func TestBuildPatchPromptRequiresWorkspaceEditAndManagedPush(t *testing.T) {
 	if !strings.Contains(got, "Orka can create the commit and push it to the patch branch automatically.") {
 		t.Fatalf("BuildPatchPrompt() missing Orka-managed push instruction:\n%s", got)
 	}
-	if !strings.Contains(got, "REQUIRED_SECURITY_ARTIFACTS: security-patch-fnd_123.diff, security-patch-fnd_123.json") {
-		t.Fatalf("BuildPatchPrompt() missing required patch artifacts directive:\n%s", got)
+	if strings.Contains(got, "REQUIRED_SECURITY_ARTIFACTS") || strings.Contains(got, ".orka-artifacts/") {
+		t.Fatalf("BuildPatchPrompt() still asks for workspace artifact files, which poison the harness-v2 delta:\n%s", got)
 	}
-	if !strings.Contains(got, `"schemaVersion":1,"findingId":"fnd_123"`) {
-		t.Fatalf("BuildPatchPrompt() missing patch summary schema:\n%s", got)
+	if !strings.Contains(got, "no .orka-artifacts directory") {
+		t.Fatalf("BuildPatchPrompt() missing the no-artifact-files requirement:\n%s", got)
 	}
-	if !strings.Contains(got, "changedFiles array must exactly match") {
+	if !strings.Contains(got, "TERMINAL RESULT CONTRACT:") ||
+		!strings.Contains(got, `"kind":"orka.security.patch.v1","repositoryScan":"","findingId":"fnd_123"`) {
+		t.Fatalf("BuildPatchPrompt() missing the identity-bound patch result envelope:\n%s", got)
+	}
+	if !strings.Contains(got, "must exactly match the files in the published commit") {
 		t.Fatalf("BuildPatchPrompt() missing changedFiles verification guidance:\n%s", got)
 	}
 }
