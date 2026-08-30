@@ -20,6 +20,7 @@ import (
 
 	"github.com/orka-agents/orka/internal/acp"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
+	"github.com/orka-agents/orka/internal/redact"
 	"github.com/orka-agents/orka/internal/security"
 	"github.com/orka-agents/orka/internal/workspacedelta"
 )
@@ -302,6 +303,12 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 			"rpcService", rpcService,
 			"rpcErrorName", rpcErrorName,
 			"accepted", result.Accepted,
+			"resultOutcome", string(result.Outcome),
+			"resultStopReason", string(result.StopReason),
+			"errorType", fmt.Sprintf("%T", result.Err),
+			// Bounded and credential-redacted: the error text is the ACP
+			// transport/client diagnostic, never provider response content.
+			"errorDetail", redact.SensitiveText(promptStreamErrorDetail(result.Err)),
 		)
 	}
 	// The ACP child can settle its turn while the provider proxy is still
