@@ -3541,11 +3541,12 @@ func TestRetireRecoveredRuntimeSessionBindingKeepsSessionBoundReadBindings(t *te
 	}}
 	complete := ACPRuntimeSessionBinding{SessionUID: sessionUID, Generation: 1}
 	cases := []struct {
-		name    string
-		task    *corev1alpha1.Task
-		attempt *store.PromptAttempt
-		binding ACPRuntimeSessionBinding
-		keep    bool
+		name           string
+		task           *corev1alpha1.Task
+		attempt        *store.PromptAttempt
+		binding        ACPRuntimeSessionBinding
+		liveIncomplete bool
+		keep           bool
 	}{
 		{name: "session-bound prompt-only success keeps the live binding", keep: true, attempt: promptOnly, binding: complete, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{SessionRef: sessionRef}}},
 		{name: "session-bound read success keeps the live binding", keep: true, attempt: succeeded, binding: complete, task: readTask},
@@ -3557,16 +3558,39 @@ func TestRetireRecoveredRuntimeSessionBindingKeepsSessionBoundReadBindings(t *te
 		{name: "cancelled session-bound read retires the binding", keep: false, binding: complete, attempt: &store.PromptAttempt{ExecutionState: store.PromptExecutionCancelled}, task: readTask},
 		{name: "outcome-unknown session-bound read retires the binding", keep: false, binding: complete, attempt: &store.PromptAttempt{ExecutionState: store.PromptExecutionOutcomeUnknown}, task: readTask},
 		{name: "succeeded read with a delivery conflict retires the binding", keep: false, binding: complete, attempt: &store.PromptAttempt{ExecutionState: store.PromptExecutionSucceeded, DeliveryState: store.PromptDeliveryConflict}, task: readTask},
-		{name: "incomplete recovered binding (no generation) is not retained", keep: false, attempt: succeeded, binding: ACPRuntimeSessionBinding{SessionUID: sessionUID}, task: readTask},
+		{name: "incomplete recovered binding keeps a complete live binding", keep: true, attempt: succeeded, binding: ACPRuntimeSessionBinding{SessionUID: sessionUID}, task: readTask},
+		{name: "incomplete recovered binding without a complete live binding is retired", keep: false, attempt: succeeded, binding: ACPRuntimeSessionBinding{SessionUID: sessionUID}, task: readTask, liveIncomplete: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			d := newDispatcher()
+			if tc.liveIncomplete {
+				d.setRuntimeSessionBinding(ACPRuntimeSessionBinding{SessionUID: sessionUID})
+			}
 			d.retireRecoveredRuntimeSessionBinding(tc.task, tc.attempt, tc.binding)
 			if got := d.currentRuntimeSessionBinding(sessionUID) != nil; got != tc.keep {
 				t.Fatalf("binding retained = %v, want %v", got, tc.keep)
 			}
 		})
+	}
+}
+
+func TestRecoveredRuntimeSessionBindingRebuildsFromTaskStatus(t *testing.T) {
+	t.Parallel()
+	digest := acpSessionTestDigest("recovered-workspace")
+	const recoveredSessionUID = "recovered-status-session"
+	const recoveredBootID = "recovered-boot"
+	task := &corev1alpha1.Task{Status: corev1alpha1.TaskStatus{Execution: &corev1alpha1.TaskExecutionStatus{
+		RuntimeInstanceID: "instance", RuntimeSessionUID: recoveredSessionUID, RuntimeSessionGeneration: 3,
+		RuntimeSessionSupervisorBootID: recoveredBootID, RuntimeSessionProfileDigest: acpSessionTestDigest("profile"),
+		RuntimeSessionMCPDigest: acpSessionTestDigest("mcp"), RuntimeSessionWorkspaceDigest: digest,
+	}}}
+	got := recoveredRuntimeSessionBinding(task, recoveredSessionUID)
+	if got.Generation != 3 || got.RuntimeInstanceID != "instance" || got.SupervisorBootID != recoveredBootID || got.WorkspaceDigest != digest {
+		t.Fatalf("recovered binding = %#v, want the durable Task status binding", got)
+	}
+	if got := recoveredRuntimeSessionBinding(&corev1alpha1.Task{}, recoveredSessionUID); got.Generation != 0 || got.SessionUID != recoveredSessionUID {
+		t.Fatalf("recovered binding without status = %#v, want identity-only", got)
 	}
 }

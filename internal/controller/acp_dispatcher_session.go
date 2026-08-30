@@ -859,7 +859,12 @@ func (d *ACPDispatcher) finalizeTaskSessionResult(
 	})
 	if err == nil {
 		session.finalized = true
-		d.setRuntimeSessionBinding(session.Binding)
+		// Only a complete binding may replace the live one: a recovered
+		// session that could not rebuild its generation must not clobber
+		// the binding the live path recorded.
+		if session.Binding.Generation > 0 {
+			d.setRuntimeSessionBinding(session.Binding)
+		}
 	}
 	return err
 }
@@ -1014,14 +1019,23 @@ func (d *ACPDispatcher) removeRuntimeSessionBinding(sessionUID string) {
 // retaining a binding without a generation would make the next continuation
 // fail planning instead of recreating the runtime.
 func (d *ACPDispatcher) retireRecoveredRuntimeSessionBinding(task *corev1alpha1.Task, attempt *store.PromptAttempt, binding ACPRuntimeSessionBinding) {
-	if task != nil && attempt != nil && attempt.ExecutionState == store.PromptExecutionSucceeded &&
+	sessionUID := strings.TrimSpace(binding.SessionUID)
+	reusable := task != nil && attempt != nil && sessionUID != "" &&
+		attempt.ExecutionState == store.PromptExecutionSucceeded &&
 		(attempt.DeliveryState == store.PromptDeliveryNotRequested || attempt.DeliveryState == store.PromptDeliveryReadValidated) &&
-		binding.Generation > 0 && strings.TrimSpace(binding.SessionUID) != "" &&
 		task.Spec.SessionRef != nil &&
-		(task.Spec.Workspace == nil || task.Spec.Workspace.Intent != corev1alpha1.WorkspaceIntentWrite) {
-		return
+		(task.Spec.Workspace == nil || task.Spec.Workspace.Intent != corev1alpha1.WorkspaceIntentWrite)
+	if reusable {
+		if binding.Generation > 0 {
+			return
+		}
+		// The recovered binding could not be rebuilt; the live binding, if
+		// complete, is still authoritative and stays.
+		if current := d.currentRuntimeSessionBinding(sessionUID); current != nil && current.Generation > 0 {
+			return
+		}
 	}
-	d.removeRuntimeSessionBinding(binding.SessionUID)
+	d.removeRuntimeSessionBinding(sessionUID)
 }
 
 func bootstrapPromptText(bootstrap *ACPBootstrapTranscript) string {

@@ -1561,10 +1561,22 @@ func (d *ACPDispatcher) recoveredTaskSession(ctx context.Context, task *corev1al
 			SkipTranscriptAppend: appendPolicy.skipTranscriptAppend,
 			SkipUserPromptAppend: appendPolicy.skipUserPromptAppend,
 		},
-		Binding:    ACPRuntimeSessionBinding{SessionUID: control.SessionUID},
+		Binding:    recoveredRuntimeSessionBinding(task, control.SessionUID),
 		Bootstrap:  bootstrap,
 		UserPrompt: userPrompt,
 	}, nil
+}
+
+// recoveredRuntimeSessionBinding rebuilds the RuntimeSession binding of a
+// recovered Task from its durable execution status so recovery-owned
+// settlement carries the same generation and digests the live path recorded.
+// A Task whose status never bound a RuntimeSession yields the identity-only
+// binding, which callers must not treat as a reusable live binding.
+func recoveredRuntimeSessionBinding(task *corev1alpha1.Task, sessionUID string) ACPRuntimeSessionBinding {
+	if binding, err := runtimeSessionBindingFromTaskStatus(task, sessionUID, "", "", ""); err == nil && binding != nil && binding.Generation > 0 {
+		return *binding
+	}
+	return ACPRuntimeSessionBinding{SessionUID: sessionUID}
 }
 
 func (d *ACPDispatcher) finalizeRecoveredTerminalSession(ctx context.Context, task *corev1alpha1.Task, attempt *store.PromptAttempt, fence store.ControllerEpochFence) error {
