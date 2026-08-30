@@ -211,6 +211,16 @@ func (r *RepositoryMonitorReconciler) processIssueCommandRun(ctx context.Context
 	if actionKind == "" {
 		return 0, nil
 	}
+	if command.Intent == repositoryMonitorCommandIntentImplement && repositoryMonitorIssueImplementationInProgress(item.WorkflowPhase) {
+		// Plan approval already queued the implementation; a maintainer's
+		// explicit implement label arriving now must not restart planning
+		// (which would discard the approved plan) or start a second job.
+		reason := "implementation_already_active:" + item.WorkflowPhase
+		if err := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorIssueKind, item.Number, "", item.SnapshotDigest, repositoryMonitorIssueActionImplementation, repositoryMonitorWorkActionStatusSucceeded, item.WorkflowPhase, "", reason); err != nil {
+			return 0, err
+		}
+		return 0, r.createMonitorEvent(ctx, monitor, run.ID, repositoryMonitorIssueKind, item.Number, item.SnapshotDigest, "issue_action_skipped", fmt.Sprintf("Issue #%d implement command skipped: %s", item.Number, reason), map[string]any{repositoryMonitorEventActionKindKey: repositoryMonitorIssueActionImplementation, "phase": item.WorkflowPhase})
+	}
 	if command.Intent == repositoryMonitorCommandIntentImplement && repositoryMonitorRequireApprovedPlan(monitor) && item.WorkflowPhase != repositoryMonitorIssuePhaseApproved {
 		actionKind, phase, agent = repositoryMonitorIssueActionPlan, repositoryMonitorIssuePhasePlanQueued, monitor.Spec.Agents.Planner
 	}
@@ -337,6 +347,20 @@ func repositoryMonitorIssueActionForIntent(monitor *corev1alpha1.RepositoryMonit
 	default:
 		return "", "", nil
 	}
+}
+
+const repositoryMonitorEventActionKindKey = "actionKind"
+
+// repositoryMonitorIssueImplementationInProgress reports whether the issue
+// already has an implementation queued, running, or being turned into a pull
+// request, so a repeated implement command is a no-op rather than a restart.
+func repositoryMonitorIssueImplementationInProgress(phase string) bool {
+	switch phase {
+	case repositoryMonitorIssuePhaseImplementationQueued, repositoryMonitorIssuePhaseImplementing,
+		repositoryMonitorIssuePhasePatchReady, repositoryMonitorIssuePhaseMutationQueued, repositoryMonitorIssuePhaseMutatingToPR:
+		return true
+	}
+	return false
 }
 
 func repositoryMonitorRequireApprovedPlan(monitor *corev1alpha1.RepositoryMonitor) bool {

@@ -7762,3 +7762,16 @@ func TestRepositoryMonitorUpdateBranchNoChangeVerifiesBaseAncestry(t *testing.T)
 		t.Fatalf("repositoryMonitorHeadContainsBase() = %v, %v", ok, err)
 	}
 }
+
+func TestRepositoryMonitorRepeatedImplementCommandDoesNotRestartPlanning(t *testing.T) {
+	for _, phase := range []string{repositoryMonitorIssuePhaseImplementationQueued, repositoryMonitorIssuePhaseImplementing, repositoryMonitorIssuePhaseMutatingToPR} {
+		if !repositoryMonitorIssueImplementationInProgress(phase) {
+			t.Fatalf("phase %q should count as implementation in progress", phase)
+		}
+	}
+	for _, phase := range []string{repositoryMonitorIssuePhaseApproved, repositoryMonitorIssuePhaseApprovalRequired, repositoryMonitorIssuePhaseBlocked, repositoryMonitorIssuePhasePROpened, repositoryMonitorIssuePhaseComplete} {
+		if repositoryMonitorIssueImplementationInProgress(phase) {
+			t.Fatalf("phase %q should not count as implementation in progress", phase)
+		}
+	}
+}
