@@ -1055,7 +1055,29 @@ func repositoryMonitorIssueFailedTaskSummary(actionKind string, task *corev1alph
 		}
 		return fmt.Sprintf("Task `%s` timed out before producing a result.", name)
 	}
+	if guidance := repositoryMonitorWorkspaceValidationGuidance(task); guidance != "" {
+		return fmt.Sprintf("Task `%s` produced changes that were rejected before publication: %s.", name, guidance)
+	}
 	return fmt.Sprintf("Task `%s` ended in phase %s without producing a valid result.", name, phase)
+}
+
+// repositoryMonitorWorkspaceValidationGuidance turns a workspace content
+// policy rejection into public, actionable guidance. Only the policy class is
+// surfaced; the Task status message (which names the file) stays private to
+// the namespace.
+func repositoryMonitorWorkspaceValidationGuidance(task *corev1alpha1.Task) string {
+	if task == nil || task.Status.Delivery == nil || task.Status.Delivery.Reason != corev1alpha1.TaskDeliveryReason(corev1alpha1.ExecutionWorkspaceReasonValidationFailed) {
+		return ""
+	}
+	lower := strings.ToLower(task.Status.Delivery.Message)
+	switch {
+	case strings.Contains(lower, "secret-like"):
+		return "a changed file contains secret-like content such as an API key or token literal. Use placeholders like `${env:VAR}` or `<your-api-key>` in examples and tests instead of realistic values, then request implementation again"
+	case strings.Contains(lower, "binary"):
+		return "a changed file is binary, and implementation may only publish text changes"
+	default:
+		return "the workspace changes did not pass content policy; see the Task status in the Orka namespace for details"
+	}
 }
 
 func anySliceField(body map[string]any, key string) []any {

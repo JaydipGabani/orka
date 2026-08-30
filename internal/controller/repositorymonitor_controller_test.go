@@ -7489,6 +7489,36 @@ func TestRepositoryMonitorFailedTaskSummaryDoesNotExposeStatusMessage(t *testing
 	}
 }
 
+func TestRepositoryMonitorFailedTaskSummaryExplainsWorkspaceValidationFailure(t *testing.T) {
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "impl-task"},
+		Status: corev1alpha1.TaskStatus{
+			Phase:   corev1alpha1.TaskPhaseFailed,
+			Message: "ACP delivery failed: workspace validation failed before a trusted delta was established: workspace delta contains secret-like file content: docs/private-config.md",
+			Delivery: &corev1alpha1.TaskDeliveryStatus{
+				State:   corev1alpha1.TaskDeliveryStateDeliveryConflict,
+				Reason:  corev1alpha1.TaskDeliveryReason(corev1alpha1.ExecutionWorkspaceReasonValidationFailed),
+				Message: "workspace validation failed before a trusted delta was established: workspace delta contains secret-like file content: docs/private-config.md",
+			},
+		},
+	}
+	summary := repositoryMonitorIssueFailedTaskSummary(repositoryMonitorIssueActionImplementation, task)
+	if !strings.Contains(summary, "secret-like content") || !strings.Contains(summary, "${env:VAR}") {
+		t.Fatalf("summary did not explain the secret policy rejection: %q", summary)
+	}
+	if strings.Contains(summary, "private-config") || strings.Contains(summary, "trusted delta") {
+		t.Fatalf("public summary leaked the task status message: %q", summary)
+	}
+	task.Status.Delivery.Message = "workspace delta contains binary file content: assets/logo.png"
+	if summary = repositoryMonitorIssueFailedTaskSummary(repositoryMonitorIssueActionImplementation, task); !strings.Contains(summary, "binary") || strings.Contains(summary, "logo.png") {
+		t.Fatalf("binary summary = %q", summary)
+	}
+	task.Status.Delivery = nil
+	if summary = repositoryMonitorIssueFailedTaskSummary(repositoryMonitorIssueActionImplementation, task); !strings.Contains(summary, "without producing a valid result") {
+		t.Fatalf("summary without delivery status = %q", summary)
+	}
+}
+
 func TestRepositoryMonitorJSONExtractionBoundsDecodeAttempts(t *testing.T) {
 	raw := strings.Repeat("{", repositoryMonitorIssueJSONDecodeAttempts+1) + `{"status":"ready"}`
 	if got := repositoryMonitorFirstJSONObject(raw); got != "" {

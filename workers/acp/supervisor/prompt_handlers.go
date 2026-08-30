@@ -1571,11 +1571,13 @@ func workspaceDeltaContentPolicyViolationContext(ctx context.Context, artifact [
 		if int64(len(content)) != header.Size {
 			return "", fmt.Errorf("workspace delta file content is incomplete")
 		}
+		// The violating path is safe to surface: it names the file, never
+		// the content, and lets the operator or agent fix the right file.
 		if fileContent && limits.RejectBinaryFiles && (bytes.IndexByte(content, 0) >= 0 || !utf8.Valid(content)) {
-			return "workspace delta contains binary file content", nil
+			return "workspace delta contains binary file content: " + strings.TrimPrefix(header.Name, "files/"), nil
 		}
 		if limits.RejectSecretLikeContent && security.LooksLikeSecret(string(content)) {
-			return "workspace delta contains secret-like file content", nil
+			return "workspace delta contains secret-like file content: " + strings.TrimPrefix(header.Name, "files/"), nil
 		}
 	}
 }
