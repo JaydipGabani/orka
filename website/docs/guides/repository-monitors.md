@@ -66,6 +66,8 @@ spec:
       - Read
       - Grep
       - Glob
+  model:
+    name: claude-opus-5
   systemPrompt:
     inline: |
       Review the exact pull request head for correctness, tests, security, and maintainability.
