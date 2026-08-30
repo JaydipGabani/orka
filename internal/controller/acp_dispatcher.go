@@ -5116,15 +5116,15 @@ func acpPromptFailureMessage(terminal harnessv2.Event) string {
 	if terminal.Failed == nil {
 		return generic
 	}
-	// The supervisor already bounds and redacts what it sends; redacting
-	// again here keeps a credential out of durable Task status even if a
-	// runtime does not.
+	// Both fields are runtime-controlled (only bounded by the harness).
 	// Controls are stripped before redaction so a control byte cannot split a
-	// credential-shaped value past the redactor.
-	detail := redact.SensitiveText(strings.TrimSpace(stripACPControlRunes(terminal.Failed.Message)))
-	// The code is runtime-controlled too (only bounded by the harness), so
-	// it gets the same treatment before it becomes durable.
-	code := redact.SensitiveText(strings.TrimSpace(stripACPControlRunes(terminal.Failed.Code)))
+	// credential-shaped value past the redactor, and the composed logical
+	// value is redacted as one string: a credential assignment split across
+	// the code and the message ("password" / "hunter2") is only recognizable
+	// once they are joined, so redacting the fields separately would persist
+	// the raw value in Task status, the PromptAttempt, and the Session turn.
+	detail := strings.TrimSpace(stripACPControlRunes(terminal.Failed.Message))
+	code := strings.TrimSpace(stripACPControlRunes(terminal.Failed.Code))
 	switch {
 	case detail == "" && code == "":
 		return generic
@@ -5133,7 +5133,7 @@ func acpPromptFailureMessage(terminal harnessv2.Event) string {
 	case code != "" && code != "acp_prompt_failed" && !strings.HasPrefix(detail, code):
 		detail = code + ": " + detail
 	}
-	return boundACPStatusMessage(generic + ": " + detail)
+	return boundACPStatusMessage(generic + ": " + redact.SensitiveText(detail))
 }
 
 // boundACPStatusMessage truncates a runtime-derived status message to

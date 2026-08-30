@@ -141,6 +141,21 @@ func TestACPPromptFailureMessageRedactsCredentialsSplitByControlRunes(t *testing
 	}
 }
 
+func TestACPPromptFailureMessageRedactsCredentialSplitAcrossCodeAndMessage(t *testing.T) {
+	t.Parallel()
+	// Neither field is credential-shaped on its own; the composed
+	// "password: <value>" is, and must be redacted as one logical value.
+	got := acpPromptFailureMessage(harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{
+		Code: "password", Message: "correcthorsebatterystaple",
+	}})
+	if strings.Contains(got, "correcthorsebatterystaple") {
+		t.Fatalf("acpPromptFailureMessage() persisted a credential split across code and message: %q", got)
+	}
+	if !strings.HasPrefix(got, "prompt failed: password: [REDACTED]") {
+		t.Fatalf("acpPromptFailureMessage() = %q, want the composed value redacted", got)
+	}
+}
+
 func TestACPPromptFailureMessageRedactsCredentialShapedCode(t *testing.T) {
 	t.Parallel()
 	terminal := harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{
