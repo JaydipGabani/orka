@@ -47,6 +47,20 @@ describe('TaskDetail', () => {
     expect(skeletons.length).toBeGreaterThan(0)
   })
 
+  it('renders a permission failure instead of "Task not found" when the task 403s', async () => {
+    server.use(
+      http.get('/api/v1/tasks/test-task', () =>
+        HttpResponse.json({ error: { code: 403, message: 'scope missing' } }, { status: 403 }),
+      ),
+    )
+    render(<TaskDetail taskId="test-task" />)
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent('Not authorized to view this task')
+    })
+    expect(screen.getByText(/scope missing/)).toBeInTheDocument()
+    expect(screen.queryByText('Task not found')).not.toBeInTheDocument()
+  })
+
   it('stops polling the task and its dependent endpoints once the task 404s', async () => {
     mockSearch.current = { tab: 'runtime' }
     const hits: Record<string, number> = {}

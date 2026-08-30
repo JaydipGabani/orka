@@ -664,7 +664,22 @@ func (s *providerProxySession) upstreamFailureUnrecovered(promptID string) (bool
 // before redaction so a control character cannot split a token past the
 // redactor.
 func sanitizeProviderUpstreamDetail(detail string) string {
-	fields := strings.Fields(detail)
+	// Drop non-printable runes first: U+0085 and friends are both controls
+	// and Unicode whitespace, so splitting into fields before removing them
+	// would fragment a credential (or the private proxy path) past both the
+	// path filter and the redactor.
+	var printable strings.Builder
+	for _, r := range detail {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			printable.WriteRune(' ')
+		case r == utf8.RuneError || !unicode.IsPrint(r):
+			continue
+		default:
+			printable.WriteRune(r)
+		}
+	}
+	fields := strings.Fields(printable.String())
 	kept := fields[:0]
 	for _, field := range fields {
 		if strings.Contains(field, providerProxyPathPrefix) {
@@ -672,14 +687,7 @@ func sanitizeProviderUpstreamDetail(detail string) string {
 		}
 		kept = append(kept, field)
 	}
-	var builder strings.Builder
-	for _, r := range strings.Join(kept, " ") {
-		if r == utf8.RuneError || !unicode.IsPrint(r) {
-			continue
-		}
-		builder.WriteRune(r)
-	}
-	sanitized := strings.TrimSpace(redact.SensitiveText(builder.String()))
+	sanitized := strings.TrimSpace(redact.SensitiveText(strings.Join(kept, " ")))
 	limit := providerUpstreamDetailMaxBytes
 	if len(sanitized) <= limit {
 		return sanitized
@@ -846,9 +854,14 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 	body, err := readBoundedProviderBody(requestContext, r.Body, p.maxRequestBytes)
 	if err != nil {
-		if errors.Is(err, errProviderBodyTooLarge) {
+		switch {
+		case errors.Is(err, errProviderBodyTooLarge):
 			reject(http.StatusRequestEntityTooLarge, "provider request body exceeds limit")
-		} else {
+		case requestContext.Err() != nil && authorization.gateContext.Err() == nil:
+			// The ACP child abandoned its own request mid-body; that is
+			// not provider evidence and must not outrank an earlier success.
+			providerproxy.WriteError(w, http.StatusForbidden, "provider request is no longer active")
+		default:
 			reject(http.StatusForbidden, "provider request is no longer active")
 		}
 		return

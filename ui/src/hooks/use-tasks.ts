@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ApiError, api, isNotFoundError } from '@/lib/api-client'
+import { ApiError, api, isForbiddenError, isNotFoundError } from '@/lib/api-client'
 import { useUIStore } from '@/stores/ui'
 import type { ExecutionEvent, Task, TaskEventsResponse } from '@/schemas/task'
 
@@ -43,14 +43,18 @@ export function useTaskListAll(pageLimit = '100', refetchInterval: number | fals
   })
 }
 
+const isTerminalTaskError = (error: unknown) => isNotFoundError(error) || isForbiddenError(error)
+
 export function useTask(id: string, refetchInterval: number | false = 5000) {
   const namespace = useUIStore((s) => s.namespace)
   return useQuery({
     queryKey: ['task', id, namespace],
     queryFn: () => api.get<Task>(`/tasks/${id}`, { namespace }),
-    // A deleted task stays deleted; retrying or polling a 404 only spams the API.
-    retry: (failureCount, error) => !isNotFoundError(error) && failureCount < 3,
-    refetchInterval: (query) => (isNotFoundError(query.state.error) ? false : refetchInterval),
+    // A deleted task stays deleted and a forbidden one stays forbidden for
+    // this token; retrying or polling a 404/403 only spams the API and keeps
+    // the page on skeletons instead of showing the actionable error.
+    retry: (failureCount, error) => !isTerminalTaskError(error) && failureCount < 3,
+    refetchInterval: (query) => (isTerminalTaskError(query.state.error) ? false : refetchInterval),
   })
 }
 

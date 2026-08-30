@@ -222,12 +222,14 @@ func repositoryMonitorReviewContextFromFiles(owner, repository string, pr reposi
 	entries := make([]repositoryMonitorReviewContextFile, 0, len(files))
 	used := repositoryMonitorReviewContextEncodedSize(reviewContext)
 	for i, file := range files {
-		if repositoryMonitorReviewContextPathAltered(file) {
+		if repositoryMonitorReviewContextPathAltered(file) || repositoryMonitorReviewContextDeletedLinesAltered(file.Patch) {
 			// A clipped, redacted, or control-stripped path or previous
 			// path loses the file's exact identity, and the checkout
 			// carries no Git metadata (and may not contain a deleted or
 			// renamed-from path) to recover it, so the change set is no
-			// longer completely represented.
+			// longer completely represented. Likewise, a deleted patch
+			// line that sanitization rewrote exists nowhere else: the
+			// checkout holds only the new content.
 			reviewContext.Truncated.Files = true
 		}
 		entry := repositoryMonitorReviewContextIdentityEntry(file, i >= repositoryMonitorReviewContextMaxFiles)
@@ -421,6 +423,24 @@ func repositoryMonitorReviewContextBoundedField(value string, maxBytes int) stri
 // Task.spec.prompt and readable through the Tasks API. Controls are stripped
 // before redaction so a control byte inside a token cannot split it past the
 // redactor and be reassembled into a credential by the strip.
+// repositoryMonitorReviewContextDeletedLinesAltered reports whether
+// sanitizing the patch would rewrite a deleted ("-") line — a redacted
+// credential-shaped value, a stripped control rune, or invalid UTF-8. The
+// reviewer cannot recover the original deleted content from the Git-free
+// checkout, so the change set must be marked incomplete. The original text is
+// never retained.
+func repositoryMonitorReviewContextDeletedLinesAltered(patch string) bool {
+	for line := range strings.SplitSeq(patch, "\n") {
+		if !strings.HasPrefix(line, "-") || strings.HasPrefix(line, "---") {
+			continue
+		}
+		if repositoryMonitorReviewContextSanitize(line) != line {
+			return true
+		}
+	}
+	return false
+}
+
 func repositoryMonitorReviewContextSanitize(value string) string {
 	stripped := strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\t' {

@@ -23,7 +23,7 @@ import { TaskExecutionRouteLedger } from '@/components/execution/execution-route
 import { useTask, useDeleteTask, useTaskEvents } from '@/hooks/use-tasks'
 import { useTaskTrace, useTaskApprovals } from '@/hooks/use-execution-events'
 import { useTaskArtifacts } from '@/hooks/use-task-artifacts'
-import { ApiError, isNotFoundError } from '@/lib/api-client'
+import { ApiError, isForbiddenError, isNotFoundError } from '@/lib/api-client'
 import { useNavigate, useSearch } from '@tanstack/react-router'
 import type { ExecutionEvent, PlanState } from '@/schemas/task'
 
@@ -155,6 +155,19 @@ export function TaskDetail({ taskId }: { taskId: string }) {
       <div className="space-y-4">
         <Skeleton className="h-8 w-64" />
         <Skeleton className="h-64 w-full" />
+      </div>
+    )
+  }
+
+  // A 403 is an actionable permission failure, not a missing task; it must
+  // not fall through to "Task not found" just because `task` is undefined.
+  if (isForbiddenError(taskError)) {
+    return (
+      <div role="alert" className="space-y-1">
+        <p className="text-sm font-medium">Not authorized to view this task</p>
+        <p className="text-sm text-muted-foreground">
+          Your token lacks <code>tasks</code> read permission ({taskError.message}).
+        </p>
       </div>
     )
   }

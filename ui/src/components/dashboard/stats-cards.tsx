@@ -8,12 +8,30 @@ import { cn } from '@/lib/utils'
 
 interface StatsCardsProps {
   tasks?: Task[]
+  /** Set when the tasks list failed with 403; the task cards show this instead of "0". */
+  tasksForbiddenMessage?: string
   sessionCount?: number
   /** Set when the sessions list failed with 403; the card shows this instead of "0". */
   sessionsForbiddenMessage?: string
   agentCount?: number
+  /** Set when the agents list failed with 403; the card shows this instead of "0". */
+  agentsForbiddenMessage?: string
   toolCount?: number
+  /** Set when the tools list failed with 403; the card shows this instead of "0". */
+  toolsForbiddenMessage?: string
   isLoading?: boolean
+}
+
+/** The "Not authorized" body a stat card renders instead of a fabricated count. */
+function ForbiddenStat({ resource, message }: { resource: string; message: string }) {
+  return (
+    <div className="space-y-0.5" role="alert">
+      <div className="text-sm font-medium">Not authorized</div>
+      <div className="text-xs text-muted-foreground">
+        Your token lacks <code>{resource}</code> read permission ({message}).
+      </div>
+    </div>
+  )
 }
 
 /**
@@ -57,7 +75,17 @@ function taskWindow(tasks: Task[]): { min: number; max: number } | null {
   return { min: Math.min(...times), max: Math.max(...times) }
 }
 
-export function StatsCards({ tasks, sessionCount, sessionsForbiddenMessage, agentCount, toolCount, isLoading }: StatsCardsProps) {
+export function StatsCards({
+  tasks,
+  tasksForbiddenMessage,
+  sessionCount,
+  sessionsForbiddenMessage,
+  agentCount,
+  agentsForbiddenMessage,
+  toolCount,
+  toolsForbiddenMessage,
+  isLoading,
+}: StatsCardsProps) {
   if (isLoading) {
     return (
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
@@ -116,15 +144,19 @@ export function StatsCards({ tasks, sessionCount, sessionsForbiddenMessage, agen
             <Icon className={`h-4 w-4 ${color}`} />
           </CardHeader>
           <CardContent>
-            <div className="flex items-end justify-between gap-2">
-              <div>
-                <div className="text-2xl font-bold tabular-nums">{value}</div>
-                {sub && <div className="text-xs text-muted-foreground">{sub}</div>}
+            {tasksForbiddenMessage ? (
+              <ForbiddenStat resource="tasks" message={tasksForbiddenMessage} />
+            ) : (
+              <div className="flex items-end justify-between gap-2">
+                <div>
+                  <div className="text-2xl font-bold tabular-nums">{value}</div>
+                  {sub && <div className="text-xs text-muted-foreground">{sub}</div>}
+                </div>
+                {series.length > 1 && (
+                  <Sparkline data={series} className={cn('opacity-80', spark)} aria-label={`${label} trend`} />
+                )}
               </div>
-              {series.length > 1 && (
-                <Sparkline data={series} className={cn('opacity-80', spark)} aria-label={`${label} trend`} />
-              )}
-            </div>
+            )}
           </CardContent>
         </Card>
       ))}
@@ -135,12 +167,7 @@ export function StatsCards({ tasks, sessionCount, sessionsForbiddenMessage, agen
         </CardHeader>
         <CardContent>
           {sessionsForbiddenMessage ? (
-            <div className="space-y-0.5" role="alert">
-              <div className="text-sm font-medium">Not authorized</div>
-              <div className="text-xs text-muted-foreground">
-                Your token lacks <code>sessions</code> read permission ({sessionsForbiddenMessage}).
-              </div>
-            </div>
+            <ForbiddenStat resource="sessions" message={sessionsForbiddenMessage} />
           ) : (
             <div className="text-2xl font-bold tabular-nums">{sessionCount ?? 0}</div>
           )}
@@ -152,7 +179,11 @@ export function StatsCards({ tasks, sessionCount, sessionsForbiddenMessage, agen
           <Bot className="h-4 w-4 text-muted-foreground" />
         </CardHeader>
         <CardContent>
-          <div className="text-2xl font-bold tabular-nums">{agentCount ?? 0}</div>
+          {agentsForbiddenMessage ? (
+            <ForbiddenStat resource="agents" message={agentsForbiddenMessage} />
+          ) : (
+            <div className="text-2xl font-bold tabular-nums">{agentCount ?? 0}</div>
+          )}
         </CardContent>
       </Card>
       <Card>
@@ -161,7 +192,11 @@ export function StatsCards({ tasks, sessionCount, sessionsForbiddenMessage, agen
           <Wrench className="h-4 w-4 text-muted-foreground" />
         </CardHeader>
         <CardContent>
-          <div className="text-2xl font-bold tabular-nums">{toolCount ?? 0}</div>
+          {toolsForbiddenMessage ? (
+            <ForbiddenStat resource="tools" message={toolsForbiddenMessage} />
+          ) : (
+            <div className="text-2xl font-bold tabular-nums">{toolCount ?? 0}</div>
+          )}
         </CardContent>
       </Card>
     </div>

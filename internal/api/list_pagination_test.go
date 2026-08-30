@@ -308,3 +308,57 @@ func splitBuiltinListNames(names []string) (crd, builtins []string) {
 	}
 	return crd, builtins
 }
+
+func TestCollectAuthorizedPagesFillsAcrossFilteredPages(t *testing.T) {
+	// Pages of two where the filter hides every item on page 2 and one item
+	// on page 3: a scoped caller must receive one filled page and one cursor,
+	// not an empty page (and cursor) per hidden object.
+	pages := map[string]struct {
+		items []string
+		next  string
+	}{
+		"":  {items: []string{"a", "b"}, next: "2"},
+		"2": {items: []string{}, next: "3"},
+		"3": {items: []string{"c"}, next: "4"},
+		"4": {items: []string{"d"}, next: ""},
+	}
+	var fetched []string
+	fetch := func(continueToken string) ([]string, string, error) {
+		fetched = append(fetched, continueToken)
+		page := pages[continueToken]
+		return page.items, page.next, nil
+	}
+	items, next, err := collectAuthorizedPages(2, "", fetch)
+	require.NoError(t, err)
+	require.Equal(t, []string{"a", "b"}, items)
+	require.Equal(t, "2", next)
+
+	fetched = nil
+	items, next, err = collectAuthorizedPages(2, "2", fetch)
+	require.NoError(t, err)
+	require.Equal(t, []string{"c", "d"}, items, "the walk must continue past the emptied page until the page is filled or the collection ends")
+	require.Equal(t, "", next)
+	require.Equal(t, []string{"2", "3", "4"}, fetched)
+
+	// An unlimited request is served as one complete page.
+	fetched = nil
+	items, next, err = collectAuthorizedPages(0, "", fetch)
+	require.NoError(t, err)
+	require.Equal(t, []string{"a", "b"}, items)
+	require.Equal(t, "2", next)
+	require.Equal(t, []string{""}, fetched)
+
+	// The page budget bounds the walk and hands back the cursor to resume.
+	calls := 0
+	items, next, err = collectAuthorizedPages(1, "", func(continueToken string) ([]string, string, error) {
+		calls++
+		return nil, "more", nil
+	})
+	require.NoError(t, err)
+	require.Empty(t, items)
+	require.Equal(t, "more", next)
+	require.Equal(t, maxAuthorizedListPages, calls)
+
+	_, _, err = collectAuthorizedPages(1, "", func(string) ([]string, string, error) { return nil, "", errors.New("boom") })
+	require.EqualError(t, err, "boom")
+}

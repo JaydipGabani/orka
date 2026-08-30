@@ -51,6 +51,19 @@ describe('Overview', () => {
     expect(screen.getByText(/read permission \(not authorized\)/)).toBeInTheDocument()
   })
 
+  it('renders Not authorized for tasks, agents, and tools that 403 instead of zero counts', async () => {
+    const forbidden = () => HttpResponse.json({ error: { code: 403, message: 'scope missing' } }, { status: 403 })
+    server.use(http.get('/api/v1/tasks', forbidden), http.get('/api/v1/agents', forbidden), http.get('/api/v1/tools', forbidden))
+    render(<Overview />)
+    await waitFor(() => {
+      expect(screen.getAllByText('Not authorized').length).toBeGreaterThanOrEqual(6)
+    })
+    expect(screen.getByText(/Not authorized to list tasks \(scope missing\)/)).toBeInTheDocument()
+    expect(screen.getAllByText(/lacks/).map((el) => el.textContent)).toEqual(
+      expect.arrayContaining([expect.stringContaining('agents'), expect.stringContaining('tools'), expect.stringContaining('tasks')]),
+    )
+  })
+
   it('includes Scheduled and Cancelled tasks in the phase distribution', async () => {
     const mk = (name: string, phase: string) => ({
       metadata: { name, namespace: 'default', uid: name, creationTimestamp: new Date().toISOString() },

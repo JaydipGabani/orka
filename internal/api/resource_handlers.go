@@ -208,43 +208,53 @@ func (h *Handlers) ListProviders(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
-	list := &corev1alpha1.ProviderList{}
-	if err := h.listPage(c.Context(), list, &client.ListOptions{
-		Namespace: namespace,
-		Limit:     pagination.Limit,
-		Continue:  pagination.Continue,
-	}, "providers"); err != nil {
+	filteredList := false
+	var remainingItemCount *int64
+	items, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string) ([]corev1alpha1.Provider, string, error) {
+		list := &corev1alpha1.ProviderList{}
+		if err := h.listPage(c.Context(), list, &client.ListOptions{
+			Namespace: namespace,
+			Limit:     pagination.Limit,
+			Continue:  continueToken,
+		}, "providers"); err != nil {
+			return nil, "", err
+		}
+		remainingItemCount = list.RemainingItemCount
+		items := list.Items
+		if h.contextTokenAuthorization.Enabled() {
+			filtered := make([]corev1alpha1.Provider, 0, len(items))
+			for i := range items {
+				provider := &items[i]
+				allowed := contextTokenAllowsListedProviderModel(
+					c,
+					h.contextTokenAuthorization,
+					"listProviders",
+					namespace,
+					providerResolutionInfo(provider),
+					provider.Spec.DefaultModel,
+				)
+				if allowed {
+					filtered = append(filtered, *provider)
+				}
+			}
+			if len(filtered) != len(items) {
+				filteredList = true
+			}
+			items = filtered
+		}
+		return items, list.Continue, nil
+	})
+	if err != nil {
 		return err
 	}
-	items := list.Items
-	filteredList := false
-	if h.contextTokenAuthorization.Enabled() {
-		filtered := make([]corev1alpha1.Provider, 0, len(items))
-		for i := range items {
-			provider := &items[i]
-			allowed := contextTokenAllowsListedProviderModel(
-				c,
-				h.contextTokenAuthorization,
-				"listProviders",
-				namespace,
-				providerResolutionInfo(provider),
-				provider.Spec.DefaultModel,
-			)
-			if allowed {
-				filtered = append(filtered, *provider)
-			}
-		}
-		filteredList = len(filtered) != len(items)
-		items = filtered
-	}
-	remainingItemCount := list.RemainingItemCount
 	if filteredList {
+		// The raw count describes Providers the caller is not allowed to see.
 		remainingItemCount = nil
 	}
 	return c.JSON(ListResponse{
 		Items: providerReadItems(c, items),
 		Metadata: ListMeta{
-			Continue:           NormalizeListContinue(list.Continue),
+			Continue:           NormalizeListContinue(continueToken),
 			RemainingItemCount: remainingItemCount,
 		},
 	})

@@ -604,43 +604,54 @@ func (h *Handlers) ListTasks(c fiber.Ctx) error {
 		opts.Continue = pagination.Continue
 	}
 
-	taskList := &corev1alpha1.TaskList{}
 	ctx := c.Context()
-	if err := h.listPage(ctx, taskList, opts, "tasks"); err != nil {
+	filteredList := false
+	var remainingItemCount *int64
+	gatewayAuthorizations := map[gatewayTaskAuthorizationKey]bool{}
+	items, continueToken, err := collectAuthorizedPages(opts.Limit, opts.Continue, func(continueToken string) ([]corev1alpha1.Task, string, error) {
+		taskList := &corev1alpha1.TaskList{}
+		pageOpts := *opts
+		pageOpts.Continue = continueToken
+		if err := h.listPage(ctx, taskList, &pageOpts, "tasks"); err != nil {
+			return nil, "", err
+		}
+		remainingItemCount = taskList.RemainingItemCount
+		filtered := taskList.Items[:0]
+		for i := range taskList.Items {
+			task := &taskList.Items[i]
+			allowed := true
+			if h.contextTokenAuthorization.Enabled() {
+				allowed, err = h.contextTokenAllowsLoadedTask(c, "listTasks", task)
+				if err != nil {
+					return nil, "", err
+				}
+			}
+			if allowed {
+				allowed, err = h.taskAccess().gatewayTaskReadableCached(c, "listTasks", task, gatewayAuthorizations)
+				if err != nil {
+					return nil, "", err
+				}
+			}
+			if allowed {
+				filtered = append(filtered, *task)
+			}
+		}
+		if len(filtered) != len(taskList.Items) {
+			filteredList = true
+		}
+		return filtered, taskList.Continue, nil
+	})
+	if err != nil {
 		return err
 	}
-	filtered := taskList.Items[:0]
-	gatewayAuthorizations := map[gatewayTaskAuthorizationKey]bool{}
-	for i := range taskList.Items {
-		task := &taskList.Items[i]
-		allowed := true
-		if h.contextTokenAuthorization.Enabled() {
-			allowed, err = h.contextTokenAllowsLoadedTask(c, "listTasks", task)
-			if err != nil {
-				return err
-			}
-		}
-		if allowed {
-			allowed, err = h.taskAccess().gatewayTaskReadableCached(c, "listTasks", task, gatewayAuthorizations)
-			if err != nil {
-				return err
-			}
-		}
-		if allowed {
-			filtered = append(filtered, *task)
-		}
-	}
-	filteredList := len(filtered) != len(taskList.Items)
-	taskList.Items = filtered
-	remainingItemCount := taskList.RemainingItemCount
 	if filteredList {
 		remainingItemCount = nil
 	}
 
 	response := ListResponse{
-		Items: taskList.Items,
+		Items: items,
 		Metadata: ListMeta{
-			Continue:           NormalizeListContinue(taskList.Continue),
+			Continue:           NormalizeListContinue(continueToken),
 			RemainingItemCount: remainingItemCount,
 		},
 	}
@@ -1120,11 +1131,7 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 	opts.Limit = pagination.Limit
 	opts.Continue = pagination.Continue
 
-	toolList := &corev1alpha1.ToolList{}
 	ctx := c.Context()
-	if err := h.listPage(ctx, toolList, opts, "tools"); err != nil {
-		return err
-	}
 
 	// Add built-in tools to the response. They are not part of the paginated
 	// Tool CRD collection, so they are emitted once, on the first page only;
@@ -1146,33 +1153,47 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 	// A scoped context token can hide CRD tools; the Kubernetes remaining
 	// count then describes the unfiltered collection and must not be exposed.
 	toolsFiltered := false
-	for _, tool := range toolList.Items {
-		allowed, err := contextTokenAllowsToolMetadata(c, h.contextTokenAuthorization, "listTools", tool.Name)
-		if err != nil {
-			return err
+	var toolRemaining *int64
+	crdTools, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string) ([]fiber.Map, string, error) {
+		toolList := &corev1alpha1.ToolList{}
+		pageOpts := *opts
+		pageOpts.Continue = continueToken
+		if err := h.listPage(ctx, toolList, &pageOpts, "tools"); err != nil {
+			return nil, "", err
 		}
-		if !allowed {
-			toolsFiltered = true
-			continue
+		toolRemaining = toolList.RemainingItemCount
+		page := make([]fiber.Map, 0, len(toolList.Items))
+		for _, tool := range toolList.Items {
+			allowed, err := contextTokenAllowsToolMetadata(c, h.contextTokenAuthorization, "listTools", tool.Name)
+			if err != nil {
+				return nil, "", err
+			}
+			if !allowed {
+				toolsFiltered = true
+				continue
+			}
+			page = append(page, fiber.Map{
+				"name":        tool.Name,
+				"namespace":   tool.Namespace,
+				"builtin":     false,
+				"description": tool.Spec.Description,
+				"available":   tool.Status.Available,
+				"url":         toolSpecHTTPURL(&tool),
+			})
 		}
-		toolItems = append(toolItems, fiber.Map{
-			"name":        tool.Name,
-			"namespace":   tool.Namespace,
-			"builtin":     false,
-			"description": tool.Spec.Description,
-			"available":   tool.Status.Available,
-			"url":         toolSpecHTTPURL(&tool),
-		})
+		return page, toolList.Continue, nil
+	})
+	if err != nil {
+		return err
 	}
-
-	toolRemaining := toolList.RemainingItemCount
+	toolItems = append(toolItems, crdTools...)
 	if toolsFiltered {
 		toolRemaining = nil
 	}
 	response := ListResponse{
 		Items: toolItems,
 		Metadata: ListMeta{
-			Continue:           NormalizeListContinue(toolList.Continue),
+			Continue:           NormalizeListContinue(continueToken),
 			RemainingItemCount: toolRemaining,
 		},
 	}
@@ -1237,36 +1258,49 @@ func (h *Handlers) ListAgents(c fiber.Ctx) error {
 	opts.Limit = pagination.Limit
 	opts.Continue = pagination.Continue
 
-	agentList := &corev1alpha1.AgentList{}
 	ctx := c.Context()
-	if err := h.listPage(ctx, agentList, opts, "agents"); err != nil {
-		return err
-	}
-	if h.contextTokenAuthorization.Enabled() {
+	agentsFiltered := false
+	var remainingItemCount *int64
+	items, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string) ([]corev1alpha1.Agent, string, error) {
+		agentList := &corev1alpha1.AgentList{}
+		pageOpts := *opts
+		pageOpts.Continue = continueToken
+		if err := h.listPage(ctx, agentList, &pageOpts, "agents"); err != nil {
+			return nil, "", err
+		}
+		remainingItemCount = agentList.RemainingItemCount
+		if !h.contextTokenAuthorization.Enabled() {
+			return agentList.Items, agentList.Continue, nil
+		}
 		filtered := agentList.Items[:0]
 		for i := range agentList.Items {
 			agent := &agentList.Items[i]
 			allowed, err := contextTokenAllowsAgentContext(c, h.contextTokenAuthorization, "listAgents", agent.Namespace, agent.Name)
 			if err != nil {
-				return err
+				return nil, "", err
 			}
 			if allowed {
 				filtered = append(filtered, *agent)
 			}
 		}
-		agentsFiltered := len(filtered) != len(agentList.Items)
-		agentList.Items = filtered
-		if agentsFiltered {
-			// The raw count describes Agents the caller is not allowed to see.
-			agentList.RemainingItemCount = nil
+		if len(filtered) != len(agentList.Items) {
+			agentsFiltered = true
 		}
+		return filtered, agentList.Continue, nil
+	})
+	if err != nil {
+		return err
+	}
+	if agentsFiltered {
+		// The raw count describes Agents the caller is not allowed to see.
+		remainingItemCount = nil
 	}
 
 	response := ListResponse{
-		Items: agentList.Items,
+		Items: items,
 		Metadata: ListMeta{
-			Continue:           NormalizeListContinue(agentList.Continue),
-			RemainingItemCount: agentList.RemainingItemCount,
+			Continue:           NormalizeListContinue(continueToken),
+			RemainingItemCount: remainingItemCount,
 		},
 	}
 

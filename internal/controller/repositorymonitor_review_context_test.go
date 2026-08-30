@@ -275,6 +275,36 @@ func TestRepositoryMonitorReviewContextRedactsCredentialsSplitByControlCharacter
 	}
 }
 
+func TestRepositoryMonitorReviewContextRedactedDeletedLineMarksChangeSetIncomplete(t *testing.T) {
+	t.Parallel()
+	const secret = "ak-live-0123456789abcdef"
+	build := func(patch string) repositoryMonitorReviewContext {
+		return repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{
+			{Filename: "config.env", Status: repositoryMonitorReviewContextTestStatus, Additions: 1, Deletions: 1, Patch: patch},
+		})
+	}
+	// A deleted line carrying a credential is redacted, so the original
+	// deleted content is recoverable neither from the context nor from the
+	// checkout: the change set is incomplete and the secret is not kept.
+	got := build("@@ -1 +1 @@\n-api_key=" + secret + "\n+api_key=vault://key\n")
+	if !got.Truncated.Files || strings.Contains(got.Files[0].Patch, secret) || !strings.Contains(got.Files[0].Patch, "-api_key=[REDACTED]") {
+		t.Fatalf("context = %#v, want files=true with the deleted credential redacted", got)
+	}
+	// A control rune on a deleted line is likewise an alteration.
+	if got := build("@@ -1 +1 @@\n-old\x1b[0m\n+new\n"); !got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=true for a control-stripped deleted line", got.Truncated)
+	}
+	// Redaction on an added line leaves the deleted content intact and the
+	// added content reviewable from the checkout, so nothing is hidden.
+	if got := build("@@ -1 +1 @@\n-endpoint=https://api.example.com\n+api_key=" + secret + "\n"); got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=false when only an added line was redacted", got.Truncated)
+	}
+	// The "---" file header is not a deleted line.
+	if got := build("--- a/config.env\n+++ b/config.env\n@@ -1 +1 @@\n-plain\n+plain2\n"); got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=false for an unaltered patch", got.Truncated)
+	}
+}
+
 func TestRepositoryMonitorReviewContextRedactsCredentialsFromPatchesAndPaths(t *testing.T) {
 	const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
 	const apiKey = "api_key=ak-live-0123456789abcdef"

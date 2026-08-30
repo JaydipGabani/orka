@@ -1136,6 +1136,21 @@ func TestSanitizeProviderUpstreamDetailIsBounded(t *testing.T) {
 	}
 }
 
+func TestSanitizeProviderUpstreamDetailDropsC1ControlsBeforeSplitting(t *testing.T) {
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	// U+0085 is both a control and Unicode whitespace: splitting into fields
+	// first would fragment the token past the redactor and the path filter.
+	got := sanitizeProviderUpstreamDetail("rejected api_key=" + key[:14] + "\u0085" + key[14:] + " via " + providerProxyPathPrefix[:len(providerProxyPathPrefix)/2] + "\u0085" + providerProxyPathPrefix[len(providerProxyPathPrefix)/2:] + "abc")
+	for _, fragment := range []string{key[:14], key[14:], providerProxyPathPrefix} {
+		if strings.Contains(got, fragment) {
+			t.Fatalf("sanitized detail leaked %q: %q", fragment, got)
+		}
+	}
+	if !strings.Contains(got, "rejected api_key=[REDACTED]") {
+		t.Fatalf("sanitized detail = %q, want the whole token redacted", got)
+	}
+}
+
 func TestProviderUpstreamErrorDetailRedactsBeforeDisplayBound(t *testing.T) {
 	// The URL password is longer than the display bound, so a pre-redaction
 	// cut would remove the "@" the URL-credential recognizer relies on.
@@ -1411,6 +1426,52 @@ func TestProviderProxyChildCancelBeforeHeadersIsNotAnUpstreamFailure(t *testing.
 	waitProviderProxyIdle(t, session)
 	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed {
 		t.Fatalf("pre-header child cancel accounted as upstream failure: %d %q", status, detail)
+	}
+	if failures := session.inferenceFailures; failures != 0 {
+		t.Fatalf("inferenceFailures = %d, want 0", failures)
+	}
+}
+
+func TestProviderProxyChildCancelDuringBodyIsNotAnUpstreamFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("upstream must not be reached when the child abandons its request body")
+	}))
+	defer upstream.Close()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+	// An earlier request already succeeded; the abandoned one is later-issued.
+	session.recordInferenceResponse(testPromptOneID, providerRequestInference, http.StatusOK, "")
+
+	bodyReader, bodyWriter := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, bodyReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(providerAuthorizationHeader, "Bearer "+binding.Credential)
+	done := make(chan error, 1)
+	go func() {
+		response, err := http.DefaultClient.Do(request)
+		if err == nil {
+			_ = response.Body.Close()
+		}
+		done <- err
+	}()
+	// Deliver a partial body so the proxy is blocked inside the body read,
+	// then abandon the request from the child side.
+	if _, err := bodyWriter.Write([]byte(`{"model":`)); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	_ = bodyWriter.CloseWithError(context.Canceled)
+	<-done
+	waitProviderProxyIdle(t, session)
+	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed {
+		t.Fatalf("mid-body child cancel accounted as upstream failure: %d %q", status, detail)
 	}
 	if failures := session.inferenceFailures; failures != 0 {
 		t.Fatalf("inferenceFailures = %d, want 0", failures)

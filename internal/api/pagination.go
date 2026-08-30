@@ -124,3 +124,35 @@ func (h *Handlers) listPage(ctx context.Context, list client.ObjectList, opts *c
 func listPageError(what string, err error) error {
 	return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list %s: %v", what, err))
 }
+
+// maxAuthorizedListPages bounds how many Kubernetes pages one filtered list
+// request may walk while filling a page with authorized items.
+const maxAuthorizedListPages = 20
+
+// collectAuthorizedPages walks Kubernetes pages until the post-authorization
+// result holds at least limit items, the collection is exhausted, or the page
+// budget is spent, and returns the items with the continuation cursor of the
+// last page read. Filtering a single raw page would otherwise hand a scoped
+// caller one cursor per Kubernetes page — including pages the filter emptied
+// — and let it count and order objects it is not allowed to list. A page may
+// overfill by up to one Kubernetes page; items are never trimmed because the
+// cursor has already moved past them.
+func collectAuthorizedPages[T any](limit int64, start string, fetch func(continueToken string) ([]T, string, error)) ([]T, string, error) {
+	if limit <= 0 {
+		// An unlimited request is served as one complete page.
+		return fetch(start)
+	}
+	items := []T{}
+	continueToken := start
+	for page := 1; ; page++ {
+		pageItems, next, err := fetch(continueToken)
+		if err != nil {
+			return nil, "", err
+		}
+		items = append(items, pageItems...)
+		continueToken = next
+		if next == "" || (limit > 0 && int64(len(items)) >= limit) || page >= maxAuthorizedListPages {
+			return items, continueToken, nil
+		}
+	}
+}

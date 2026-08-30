@@ -16,12 +16,16 @@ import { RecentTasks } from './recent-tasks'
 const PHASES = taskPhaseSchema.options
 
 export function Overview() {
-  const { data: tasksData, isLoading: tasksLoading } = useTaskList('100')
+  const { data: tasksData, isLoading: tasksLoading, error: tasksError } = useTaskList('100')
   const { data: sessionsData, isLoading: sessionsLoading, error: sessionsError } = useSessionList('100')
-  const { data: agentsData, isLoading: agentsLoading } = useAgentList()
-  const { data: toolsData, isLoading: toolsLoading } = useToolList()
+  const { data: agentsData, isLoading: agentsLoading, error: agentsError } = useAgentList()
+  const { data: toolsData, isLoading: toolsLoading, error: toolsError } = useToolList()
 
   const isLoading = tasksLoading || sessionsLoading || agentsLoading || toolsLoading
+  // A 403 leaves `data` undefined; surface it per resource instead of letting
+  // the missing collection render as a fabricated zero.
+  const forbidden = (error: unknown) => (isForbiddenError(error) ? error.message : undefined)
+  const tasksForbiddenMessage = forbidden(tasksError)
 
   const tasks = tasksData?.items ?? []
   const distribution = PHASES.map((phase) => ({
@@ -34,10 +38,13 @@ export function Overview() {
       <PageHeader title="Dashboard" description="Overview of your Orka workspace" />
       <StatsCards
         tasks={tasksData?.items}
+        tasksForbiddenMessage={tasksForbiddenMessage}
         sessionCount={sessionsData?.items?.length}
-        sessionsForbiddenMessage={isForbiddenError(sessionsError) ? sessionsError.message : undefined}
+        sessionsForbiddenMessage={forbidden(sessionsError)}
         agentCount={agentsData?.items?.length}
+        agentsForbiddenMessage={forbidden(agentsError)}
         toolCount={toolsData?.items?.length}
+        toolsForbiddenMessage={forbidden(toolsError)}
         isLoading={isLoading}
       />
       <div className="grid gap-6 lg:grid-cols-3">
@@ -46,7 +53,13 @@ export function Overview() {
             <CardTitle className="text-sm font-medium">Phase Distribution</CardTitle>
           </CardHeader>
           <CardContent>
-            <Distribution segments={distribution} />
+            {tasksForbiddenMessage ? (
+              <p className="text-sm text-muted-foreground" role="alert">
+                Not authorized to list tasks ({tasksForbiddenMessage}).
+              </p>
+            ) : (
+              <Distribution segments={distribution} />
+            )}
           </CardContent>
         </Card>
         <div className="lg:col-span-2">
