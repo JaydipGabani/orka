@@ -517,7 +517,7 @@ func (s *RuntimeSession) finishPrompt(active *activePrompt, result PromptResult)
 	cancelPendingPermissions(active)
 	if active.overflowed && result.Outcome != PromptOutcomeOutcomeUnknown {
 		result.Outcome = PromptOutcomeFailed
-		result.Err = fmt.Errorf("ACP prompt event buffer overflowed")
+		result.Err = ErrPromptEventBufferOverflow
 	}
 	s.tombstones[active.id] = PromptTombstone{PromptID: active.id, RequestDigest: active.requestDigest, Result: result}
 	if s.active == active {

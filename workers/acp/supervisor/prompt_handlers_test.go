@@ -516,6 +516,13 @@ func TestPromptExecutionDiagnosticDoesNotExposeRPCMessage(t *testing.T) {
 	if stage != "transport-closed" || code != 0 || service != "" || errorName != "" {
 		t.Fatalf("closed diagnostic = %q/%d/%q/%q", stage, code, service, errorName)
 	}
+	stage, code, service, errorName = promptExecutionDiagnostic(fmt.Errorf("prompt: %w", acp.ErrPromptEventBufferOverflow))
+	if stage != "event-buffer-overflow" || code != 0 || service != "" || errorName != "" {
+		t.Fatalf("overflow diagnostic = %q/%d/%q/%q", stage, code, service, errorName)
+	}
+	if got := promptFailureErrorDetail(acp.ErrPromptEventBufferOverflow); got != "event-buffer-overflow" {
+		t.Fatalf("overflow failure detail = %q", got)
+	}
 }
 
 func TestPromptTerminalDiagnosticAllowsOnlyProtocolEnums(t *testing.T) {

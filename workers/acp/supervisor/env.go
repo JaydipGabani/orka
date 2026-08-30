@@ -86,8 +86,10 @@ const (
 	// concurrent prompts a tool-output burst (Codex streams file contents as
 	// many small update events) can outrun it for a few seconds; an overflow
 	// cancels an otherwise healthy prompt, so the buffer must absorb such
-	// bursts (events are small; the line limit bounds each one).
-	supervisorMaxBufferedPromptEvents = 4096
+	// bursts. Six concurrent Codex prompts overflowed 4096 events at 2.5 MiB,
+	// so the count is the protocol maximum and the byte cap below is the
+	// effective memory bound (events are small; the line limit bounds each).
+	supervisorMaxBufferedPromptEvents = 16_384
 	// supervisorMaxBufferedPromptEventBytes bounds the aggregate raw payload of
 	// buffered, unconsumed events per prompt: the count limit alone would let a
 	// burst of line-limit-sized events reserve gigabytes before overflowing.

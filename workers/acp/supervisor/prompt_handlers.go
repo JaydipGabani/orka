@@ -552,6 +552,8 @@ func promptExecutionDiagnostic(err error) (string, int, string, string) {
 		return promptExecutionStageJSONRPCError, rpcErr.Code, "", ""
 	case errors.Is(err, acp.ErrClosed):
 		return "transport-closed", 0, "", ""
+	case errors.Is(err, acp.ErrPromptEventBufferOverflow):
+		return "event-buffer-overflow", 0, "", ""
 	case errors.Is(err, context.DeadlineExceeded):
 		return "deadline-exceeded", 0, "", ""
 	case errors.Is(err, context.Canceled):
