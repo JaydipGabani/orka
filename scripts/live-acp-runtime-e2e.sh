@@ -2232,9 +2232,13 @@ assert_restart_task_settled() {
   mark_task_validated "${task}"
 }
 
+# assert_all_tasks_validated requires every Task this run created to have
+# passed exact fence/result validation. It is scoped to run-owned Tasks so a
+# shared watch namespace (adopted harness-v2 mode) that also hosts unrelated
+# Tasks does not fail the release gate.
 assert_all_tasks_validated() {
   local unvalidated
-  unvalidated="$(k -n "${namespace}" get tasks -o json | jq -r '
+  unvalidated="$(k -n "${namespace}" get tasks -l "orka.ai/acp-e2e-run=${run_id}" -o json | jq -r '
     .items[]
     | select((.status.execution.state // "") != "" or (.status.phase // "") != "")
     | select(.metadata.labels["orka.ai/acp-e2e-validated"] != "true")
