@@ -1042,6 +1042,9 @@ func TestProviderProxyUpstreamFailureAccountingResetsOnActivation(t *testing.T) 
 		t.Fatal(err)
 	}
 	assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusServiceUnavailable)
+	// The failure detail is attached once the relayed error body has been
+	// observed, which completes after the status line is available.
+	waitProviderProxyIdle(t, session)
 	failed, status, detail := session.upstreamFailureUnrecovered("prompt-one")
 	if !failed || status != http.StatusServiceUnavailable {
 		t.Fatalf("upstreamFailureUnrecovered = %v/%d/%q", failed, status, detail)

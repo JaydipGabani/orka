@@ -12,6 +12,7 @@ import (
 const (
 	promptFailureTestGenericMessage = "prompt failed"
 	promptFailureTestGenericCode    = "acp_prompt_failed"
+	promptFailureTestUpstreamCode   = "provider_upstream_error"
 )
 
 func TestACPPromptFailureMessageProjectsRuntimeDetail(t *testing.T) {
@@ -29,7 +30,7 @@ func TestACPPromptFailureMessageProjectsRuntimeDetail(t *testing.T) {
 		},
 		{
 			name:     "provider upstream error keeps code and detail",
-			terminal: harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{Code: "provider_upstream_error", Message: "provider upstream returned HTTP 402 for the final inference request: quota exceeded"}},
+			terminal: harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{Code: promptFailureTestUpstreamCode, Message: "provider upstream returned HTTP 402 for the final inference request: quota exceeded"}},
 			want:     "prompt failed: provider_upstream_error: provider upstream returned HTTP 402 for the final inference request: quota exceeded",
 		},
 		{
@@ -116,7 +117,7 @@ func TestACPStatusMessagesRedactCredentialShapedDetail(t *testing.T) {
 		}
 	}
 	assertRedacted("acpPromptFailureMessage", acpPromptFailureMessage(harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{
-		Code: "provider_upstream_error", Message: detail,
+		Code: promptFailureTestUpstreamCode, Message: detail,
 	}}))
 	assertRedacted("acpWorkspaceValidationFailureMessage", acpWorkspaceValidationFailureMessage(&harnessv2.ClientError{
 		StatusCode: 409, Code: harnessv2.ErrorCodeSessionPoisoned, Message: detail,
@@ -129,7 +130,7 @@ func TestACPPromptFailureMessageRedactsCredentialsSplitByControlRunes(t *testing
 	// C0, DEL, and C1 controls inside the token must be dropped (not
 	// replaced) so the token reassembles and is redacted as a whole.
 	split := "upstream rejected api_key=" + key[:10] + "\x00" + key[10:20] + "\x7f" + key[20:30] + "\u0085" + key[30:] + " for the model"
-	got := acpPromptFailureMessage(harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{Code: "provider_upstream_error", Message: split}})
+	got := acpPromptFailureMessage(harnessv2.Event{Type: harnessv2.EventFailed, Failed: &harnessv2.FailedEvent{Code: promptFailureTestUpstreamCode, Message: split}})
 	for _, fragment := range []string{key[:10], key[10:20], key[20:30], key[30:]} {
 		if strings.Contains(got, fragment) {
 			t.Fatalf("acpPromptFailureMessage() leaked credential fragment %q: %q", fragment, got)
