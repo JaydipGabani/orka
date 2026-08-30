@@ -272,7 +272,26 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			opts: ResolveOpts{
 				Namespace: ns,
 			},
-			wantErr: "no provider",
+			wantErr: "no provider selected and namespace \"default\" has no Providers",
+		},
+		{
+			name:    "no provider configured falls back to the sole ready Provider",
+			objects: []runtime.Object{readyProvider(anthropicProvider), anthropicSecret},
+			config:  DefaultChatConfig(),
+			opts: ResolveOpts{
+				Namespace: ns,
+			},
+			wantModel: "claude-sonnet-4-20250514",
+			wantPType: "anthropic",
+		},
+		{
+			name:    "no provider configured with several Providers names the candidates",
+			objects: []runtime.Object{readyProvider(anthropicProvider), anthropicSecret, readyProvider(openaiProvider), openaiSecret},
+			config:  DefaultChatConfig(),
+			opts: ResolveOpts{
+				Namespace: ns,
+			},
+			wantErr: "available in namespace \"default\": anthropic, openai",
 		},
 		{
 			name:    "secret not found during resolve",
@@ -422,4 +441,12 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			}
 		})
 	}
+}
+
+// readyProvider returns a copy of the Provider with status.ready set, as the
+// controller reports for a usable Provider.
+func readyProvider(provider *corev1alpha1.Provider) *corev1alpha1.Provider {
+	ready := provider.DeepCopy()
+	ready.Status.Ready = true
+	return ready
 }

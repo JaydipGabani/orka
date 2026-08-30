@@ -9,6 +9,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -170,10 +171,16 @@ func (r *ProviderResolver) resolveFromModelStr(ctx context.Context, opts Resolve
 
 	if providerCRD == nil {
 		p := &corev1alpha1.Provider{}
-		if err := r.client.Get(ctx, types.NamespacedName{Name: "default", Namespace: opts.Namespace}, p); err != nil {
-			return nil, "", ProviderResolutionInfo{}, fmt.Errorf("no provider %q found and no 'default' Provider CRD exists", providerName)
+		if err := r.client.Get(ctx, types.NamespacedName{Name: "default", Namespace: opts.Namespace}, p); err == nil {
+			providerCRD = p
 		}
-		providerCRD = p
+	}
+	if providerCRD == nil {
+		fallback, err := r.soleReadyProvider(ctx, opts.Namespace, providerName)
+		if err != nil {
+			return nil, "", ProviderResolutionInfo{}, err
+		}
+		providerCRD = fallback
 	}
 
 	apiKey, err := r.ResolveAPIKey(ctx, providerCRD)
@@ -255,4 +262,44 @@ func (r *ProviderResolver) ResolveAPIKey(ctx context.Context, providerCRD *corev
 		return "", fmt.Errorf("secret %q has no key %q", secretName, secretKey)
 	}
 	return string(apiKeyBytes), nil
+}
+
+// maxProviderSuggestions bounds the Provider names echoed in a resolution
+// error.
+const maxProviderSuggestions = 8
+
+// soleReadyProvider selects the namespace's only ready Provider when no
+// provider was named and no default is configured: an unambiguous choice is
+// friendlier than an error, and the caller's provider-use authorization still
+// applies to the selected Provider. With zero or several candidates the error
+// names what exists so the caller can choose.
+func (r *ProviderResolver) soleReadyProvider(ctx context.Context, namespace, requestedName string) (*corev1alpha1.Provider, error) {
+	list := &corev1alpha1.ProviderList{}
+	if err := r.client.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("no provider %q found and no default Provider is configured (listing Providers failed: %w)", requestedName, err)
+	}
+	names := make([]string, 0, len(list.Items))
+	var ready []*corev1alpha1.Provider
+	for i := range list.Items {
+		item := &list.Items[i]
+		names = append(names, item.Name)
+		if item.Status.Ready {
+			ready = append(ready, item)
+		}
+	}
+	if len(ready) == 1 {
+		return ready[0], nil
+	}
+	slices.Sort(names)
+	if len(names) > maxProviderSuggestions {
+		names = append(names[:maxProviderSuggestions], "…")
+	}
+	prefix := "no provider selected"
+	if requestedName != "" {
+		prefix = fmt.Sprintf("no provider %q found", requestedName)
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("%s and namespace %q has no Providers; create a Provider (or one named \"default\") or configure the chat default provider", prefix, namespace)
+	}
+	return nil, fmt.Errorf("%s and no default Provider is configured; pass a provider (available in namespace %q: %s), create a Provider named \"default\", or configure the chat default provider", prefix, namespace, strings.Join(names, ", "))
 }
