@@ -4541,20 +4541,30 @@ func boundedRuntimeSessionServerMessage(err error) string {
 	if !errors.As(err, &clientErr) {
 		return "non-client runtime session error"
 	}
-	message := strings.TrimSpace(strings.Map(func(current rune) rune {
-		if current < 0x20 || current == 0x7f {
-			return ' '
-		}
-		return current
-	}, clientErr.Message))
+	message := strings.TrimSpace(stripACPControlRunes(clientErr.Message))
 	if message == "" {
 		return "empty runtime error response"
 	}
+	// Redact the complete message before bounding it: truncating first could
+	// cut a credential-shaped value ahead of the text its recognizer needs.
+	message = redact.SensitiveText(message)
 	runes := []rune(message)
 	if len(runes) > 256 {
 		message = string(runes[:256])
 	}
 	return message
+}
+
+// stripACPControlRunes replaces control characters in runtime-supplied text
+// with spaces so persisted status and logs carry no terminal escapes and no
+// control byte can split a credential past redaction.
+func stripACPControlRunes(value string) string {
+	return strings.Map(func(current rune) rune {
+		if current < 0x20 || current == 0x7f || (current >= 0x80 && current < 0xa0) {
+			return ' '
+		}
+		return current
+	}, strings.ToValidUTF8(value, ""))
 }
 
 func runtimeSessionCreationMayHaveApplied(err error) bool {
@@ -5103,10 +5113,12 @@ func acpPromptFailureMessage(terminal harnessv2.Event) string {
 	// The supervisor already bounds and redacts what it sends; redacting
 	// again here keeps a credential out of durable Task status even if a
 	// runtime does not.
-	detail := redact.SensitiveText(strings.TrimSpace(terminal.Failed.Message))
+	// Controls are stripped before redaction so a control byte cannot split a
+	// credential-shaped value past the redactor.
+	detail := redact.SensitiveText(strings.TrimSpace(stripACPControlRunes(terminal.Failed.Message)))
 	// The code is runtime-controlled too (only bounded by the harness), so
 	// it gets the same treatment before it becomes durable.
-	code := redact.SensitiveText(strings.TrimSpace(terminal.Failed.Code))
+	code := redact.SensitiveText(strings.TrimSpace(stripACPControlRunes(terminal.Failed.Code)))
 	switch {
 	case detail == "" && code == "":
 		return generic

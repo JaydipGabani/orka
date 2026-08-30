@@ -1006,13 +1006,22 @@ func (d *ACPDispatcher) removeRuntimeSessionBinding(sessionUID string) {
 // settlement (failed, cancelled, outcome unknown) schedules supervisor
 // cleanup of the RuntimeSession, so those bindings are dropped exactly as the
 // normal failure path does.
-func (d *ACPDispatcher) retireRecoveredRuntimeSessionBinding(task *corev1alpha1.Task, attempt *store.PromptAttempt, sessionUID string) {
+//
+// Retention additionally requires a reusable terminal delivery state (a read
+// prompt that succeeded but whose delivery failed, for example a modified
+// read-only workspace, is cleaned up by the live failure paths) and a
+// complete binding: a recovered session may carry only the SessionUID, and
+// retaining a binding without a generation would make the next continuation
+// fail planning instead of recreating the runtime.
+func (d *ACPDispatcher) retireRecoveredRuntimeSessionBinding(task *corev1alpha1.Task, attempt *store.PromptAttempt, binding ACPRuntimeSessionBinding) {
 	if task != nil && attempt != nil && attempt.ExecutionState == store.PromptExecutionSucceeded &&
+		(attempt.DeliveryState == store.PromptDeliveryNotRequested || attempt.DeliveryState == store.PromptDeliveryReadValidated) &&
+		binding.Generation > 0 && strings.TrimSpace(binding.SessionUID) != "" &&
 		task.Spec.SessionRef != nil &&
 		(task.Spec.Workspace == nil || task.Spec.Workspace.Intent != corev1alpha1.WorkspaceIntentWrite) {
 		return
 	}
-	d.removeRuntimeSessionBinding(sessionUID)
+	d.removeRuntimeSessionBinding(binding.SessionUID)
 }
 
 func bootstrapPromptText(bootstrap *ACPBootstrapTranscript) string {

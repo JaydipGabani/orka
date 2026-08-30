@@ -692,6 +692,18 @@ func providerUpstreamErrorDetail(prefix []byte) string {
 	return raw
 }
 
+// countingWriter counts the bytes that reached the downstream client.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
 // prefixCapture retains the first limit bytes written through it so an
 // upstream error body can be relayed to the ACP child as it arrives while a
 // bounded prefix is kept for the failure detail.
@@ -919,7 +931,8 @@ func (p *providerProxy) relayUpstreamResponse(
 	// Flushing after every chunk keeps streamed provider responses (SSE)
 	// flowing to the ACP child without buffering delays.
 	flusher, _ := w.(http.Flusher)
-	err := providerproxy.StreamBoundedResponse(w, body, p.maxResponseBytes, flusher)
+	relayed := &countingWriter{w: w}
+	err := providerproxy.StreamBoundedResponse(relayed, body, p.maxResponseBytes, flusher)
 	if upstreamFailed {
 		session.attachInferenceFailureDetail(promptID, requestClass, seq, providerUpstreamErrorDetail(capture.buffer))
 	}
@@ -932,9 +945,15 @@ func (p *providerProxy) relayUpstreamResponse(
 				// destination write error or, because the upstream request
 				// context is derived from the child's request, as a
 				// cancelled upstream read. Neither is upstream evidence of
-				// failure, so account the success and let the child's own
-				// settlement decide the prompt outcome.
-				session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
+				// failure. It is accounted as a success only when response
+				// bytes actually reached the child; a relay abandoned before
+				// any body byte was delivered proves nothing about the
+				// inference and is left unaccounted, so a later-issued
+				// abandoned request cannot mask an earlier failure the child
+				// settled on.
+				if relayed.n > 0 {
+					session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
+				}
 			} else {
 				// A 2xx whose body overran the response limit or broke
 				// mid-stream on the upstream side never delivered a usable

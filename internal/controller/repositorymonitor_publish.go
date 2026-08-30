@@ -977,6 +977,61 @@ func (r *RepositoryMonitorReconciler) listRepositoryMonitorPullRequestFiles(ctx 
 	return files, nil
 }
 
+// listRepositoryMonitorCompareFiles lists the changed files with patches for
+// the exact base...head commit range through the compare endpoint, so the
+// returned file set is bound to immutable SHAs rather than to whatever the
+// pull request branch points at when the request is served.
+func (r *RepositoryMonitorReconciler) listRepositoryMonitorCompareFiles(ctx context.Context, owner, repository, token, baseSHA, headSHA string) ([]repositoryMonitorPullRequestFileResponse, error) {
+	baseSHA, headSHA = strings.TrimSpace(baseSHA), strings.TrimSpace(headSHA)
+	if baseSHA == "" || headSHA == "" {
+		return nil, fmt.Errorf("pull request base and head SHAs are required to bind the review context")
+	}
+	var files []repositoryMonitorPullRequestFileResponse
+	for page := 1; ; page++ {
+		pageFiles, err := r.fetchRepositoryMonitorCompareFilesPage(ctx, owner, repository, token, baseSHA, headSHA, page)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, pageFiles...)
+		if len(pageFiles) < repositoryMonitorGitHubPerPage {
+			break
+		}
+	}
+	return files, nil
+}
+
+func (r *RepositoryMonitorReconciler) fetchRepositoryMonitorCompareFilesPage(ctx context.Context, owner, repository, token, baseSHA, headSHA string, page int) ([]repositoryMonitorPullRequestFileResponse, error) {
+	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
+	if baseURL == "" {
+		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/compare/%s...%s?per_page=%d&page=%d", baseURL, url.PathEscape(owner), url.PathEscape(repository), url.PathEscape(baseSHA), url.PathEscape(headSHA), repositoryMonitorGitHubPerPage, page)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	repositoryMonitorSetGitHubHeaders(req, token)
+	resp, err := repositoryMonitorHTTPClient(r).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GitHub compare request failed: %w", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	respBody, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &repositoryMonitorGitHubAPIError{Operation: "compare request", StatusCode: resp.StatusCode, Body: string(respBody)}
+	}
+	var response struct {
+		Files []repositoryMonitorPullRequestFileResponse `json:"files"`
+	}
+	if err := json.Unmarshal(respBody, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse GitHub compare response: %w", err)
+	}
+	return response.Files, nil
+}
+
 func (r *RepositoryMonitorReconciler) fetchRepositoryMonitorPullRequestFilesPage(ctx context.Context, owner, repository, token string, number int64, page int) ([]repositoryMonitorPullRequestFileResponse, error) {
 	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
 	if baseURL == "" {

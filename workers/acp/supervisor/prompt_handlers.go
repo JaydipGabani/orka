@@ -284,6 +284,9 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 				events = nil
 				continue
 			}
+			if run.Release != nil {
+				run.Release(event)
+			}
 			for _, ready := range compactor.push(event, time.Now()) {
 				mapAndEncode(ready)
 			}
@@ -306,9 +309,10 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 			"resultOutcome", string(result.Outcome),
 			"resultStopReason", string(result.StopReason),
 			"errorType", fmt.Sprintf("%T", result.Err),
-			// Bounded and credential-redacted: the error text is the ACP
-			// transport/client diagnostic, never provider response content.
-			"errorDetail", redact.SensitiveText(promptStreamErrorDetail(result.Err)),
+			// Credential-redacted before bounding (a truncation could cut a
+			// credential ahead of the text its recognizer needs), then
+			// bounded: the text is the ACP transport/client diagnostic.
+			"errorDetail", redactedPromptErrorDetail(result.Err),
 		)
 	}
 	// The ACP child can settle its turn while the provider proxy is still
@@ -406,6 +410,21 @@ func promptTerminalDiagnostic(result acp.PromptResult) (string, string) {
 		stopReason = ""
 	}
 	return outcome, stopReason
+}
+
+// redactedPromptErrorDetail strips controls and redacts the complete error
+// text before bounding it for a log field.
+func redactedPromptErrorDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	cleaned := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, strings.ToValidUTF8(err.Error(), ""))
+	return promptStreamErrorDetail(errors.New(redact.SensitiveText(cleaned)))
 }
 
 func promptStreamErrorDetail(err error) string {
@@ -1942,6 +1961,13 @@ func (s *Server) terminalEvent(
 	} else {
 		effective = providerTurnLimitResult(state, prompt, effective)
 		effective = providerUpstreamFailureResult(state, prompt, effective)
+		// The durable settlement is derived from the same result the Failed
+		// event is built from: a failed result that still carries the child's
+		// end_turn or cancelled stop reason would otherwise settle as
+		// Completed or Cancelled while the controller received Failed.
+		if effective.Outcome == acp.PromptOutcomeFailed {
+			effective.StopReason = acp.StopReason(failedEventStopReason(effective.StopReason))
+		}
 	}
 	now := effective.SettledAt
 	if now.IsZero() {

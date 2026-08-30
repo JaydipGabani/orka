@@ -88,6 +88,10 @@ const (
 	// cancels an otherwise healthy prompt, so the buffer must absorb such
 	// bursts (events are small; the line limit bounds each one).
 	supervisorMaxBufferedPromptEvents = 4096
+	// supervisorMaxBufferedPromptEventBytes bounds the aggregate raw payload of
+	// buffered, unconsumed events per prompt: the count limit alone would let a
+	// burst of line-limit-sized events reserve gigabytes before overflowing.
+	supervisorMaxBufferedPromptEventBytes = 32 << 20
 
 	// Publisher workspace artifacts are inbound runtime materialization inputs,
 	// while workspace deltas are outbound runtime artifacts. Keep independently

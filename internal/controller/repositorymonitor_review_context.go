@@ -35,6 +35,7 @@ const (
 	repositoryMonitorReviewContextMaxStatusBytes   = 32
 	repositoryMonitorReviewContextPatchTruncated   = "truncated"
 	repositoryMonitorReviewContextStatusRemoved    = "removed"
+	repositoryMonitorReviewContextStatusRenamed    = "renamed"
 	repositoryMonitorReviewContextPatchUnavailable = "unavailable"
 	repositoryMonitorReviewContextPatchCapped      = "capped"
 	repositoryMonitorReviewContextBeginMarker      = "--- BEGIN orka.prReview.context.v1 ---"
@@ -113,7 +114,11 @@ func newRepositoryMonitorReviewContext(owner, repository string, pr repositoryMo
 // inspects the checked-out tree instead.
 func (r *RepositoryMonitorReconciler) buildRepositoryMonitorReviewContext(ctx context.Context, owner, repository, token string, pr repositoryMonitorPullRequest) (repositoryMonitorReviewContext, error) {
 	logger := log.FromContext(ctx).WithName("repositorymonitor")
-	files, filesErr := r.listRepositoryMonitorPullRequestFiles(ctx, owner, repository, token, pr.Number)
+	// The file set is bound to the exact base/head SHAs through the compare
+	// endpoint rather than the mutable pull request listing: a force-push
+	// A->B->A between two PR reads would otherwise pass the drift check while
+	// labelling B's patches as A.
+	files, filesErr := r.listRepositoryMonitorCompareFiles(ctx, owner, repository, token, pr.BaseSHA, pr.HeadSHA)
 	current, err := r.fetchRepositoryMonitorPullRequest(ctx, owner, repository, token, pr.Number)
 	if err != nil {
 		reviewContext := newRepositoryMonitorReviewContext(owner, repository, pr)
@@ -235,15 +240,29 @@ func repositoryMonitorReviewContextFromFiles(owner, repository string, pr reposi
 }
 
 // repositoryMonitorReviewContextMarkUnreviewableRemovals marks the change set
-// incomplete when a removed file's patch is omitted (unavailable, truncated, or
-// capped): the Git-free head checkout cannot contain a deleted file, so the
-// reviewer has no way to inspect what was removed, unlike an omitted patch
-// for a present path which is reviewed from the checkout itself.
+// incomplete when a removed or renamed file's patch is omitted (unavailable,
+// truncated, or capped): the Git-free head checkout contains neither a
+// deleted file nor a renamed file's previous contents, so the reviewer cannot
+// inspect what was removed, unlike an omitted patch for a present, unmoved
+// path which is reviewed from the checkout itself.
 func repositoryMonitorReviewContextMarkUnreviewableRemovals(reviewContext repositoryMonitorReviewContext) repositoryMonitorReviewContext {
 	for _, file := range reviewContext.Files {
-		if file.Status == repositoryMonitorReviewContextStatusRemoved && file.PatchOmitted != "" {
+		if file.PatchOmitted == "" {
+			continue
+		}
+		switch file.Status {
+		case repositoryMonitorReviewContextStatusRemoved:
 			reviewContext.Truncated.Files = true
 			return reviewContext
+		case repositoryMonitorReviewContextStatusRenamed:
+			// A pure rename (no line changes) legitimately has no patch and
+			// is fully represented by the new path in the checkout; a rename
+			// that also changed content, or whose patch was cut or capped,
+			// hides what the previous file contained.
+			if file.PatchOmitted != repositoryMonitorReviewContextPatchUnavailable || file.Additions+file.Deletions > 0 {
+				reviewContext.Truncated.Files = true
+				return reviewContext
+			}
 		}
 	}
 	return reviewContext

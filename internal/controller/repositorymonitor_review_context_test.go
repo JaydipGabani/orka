@@ -23,7 +23,7 @@ import (
 
 const (
 	reviewContextTestPullPath                 = "/repos/orka-agents/orka/pulls/7"
-	reviewContextTestFilesPath                = "/repos/orka-agents/orka/pulls/7/files"
+	reviewContextTestFilesPath                = "/repos/orka-agents/orka/compare/base7...head7"
 	repositoryMonitorReviewContextTestPath    = "main.go"
 	repositoryMonitorReviewContextTestPatch   = "@@ -1 +1,2 @@\n package main\n+// change"
 	repositoryMonitorReviewContextTestStatus  = "modified"
@@ -401,6 +401,10 @@ func newRepositoryMonitorReviewContextTestServer(t *testing.T, filesStatus int, 
 		switch r.URL.Path {
 		case reviewContextTestFilesPath:
 			w.WriteHeader(filesStatus)
+			// The compare endpoint wraps the file list; error bodies are served verbatim.
+			if strings.HasPrefix(strings.TrimSpace(filesBody), "[") {
+				filesBody = `{"files":` + filesBody + `}`
+			}
 			_, _ = w.Write([]byte(filesBody))
 		case reviewContextTestPullPath:
 			_, _ = w.Write([]byte(repositoryMonitorReviewContextTestPullRequestJSON(headSHA)))
@@ -443,7 +447,7 @@ func TestRepositoryMonitorBuildReviewContextUsesPatchesWhenHeadIsStable(t *testi
 		}
 		switch r.URL.Path {
 		case reviewContextTestFilesPath:
-			_, _ = w.Write([]byte(`[{"filename":"main.go","status":"modified","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-a\n+b"},{"filename":"logo.png","status":"added","additions":0,"deletions":0}]`))
+			_, _ = w.Write([]byte(`{"files":[{"filename":"main.go","status":"modified","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-a\n+b"},{"filename":"logo.png","status":"added","additions":0,"deletions":0}]}`))
 		case reviewContextTestPullPath:
 			_, _ = w.Write([]byte(`{"number":7,"state":"open","base":{"ref":"main","sha":"base7","repo":{"full_name":"orka-agents/orka"}},"head":{"ref":"feature","sha":"head7","repo":{"full_name":"orka-agents/orka"}}}`))
 		default:
@@ -599,7 +603,7 @@ func newRepositoryMonitorReviewContextAdoptionFixture(t *testing.T) *repositoryM
 			status := int(fixture.filesStatus.Load())
 			w.WriteHeader(status)
 			if status == http.StatusOK {
-				_, _ = w.Write([]byte(`[{"filename":"main.go","status":"modified","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-a\n+b"}]`))
+				_, _ = w.Write([]byte(`{"files":[{"filename":"main.go","status":"modified","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-a\n+b"}]}`))
 				return
 			}
 			_, _ = w.Write([]byte(`{"message":"boom"}`))
@@ -744,6 +748,12 @@ func TestRepositoryMonitorReviewContextRemovedFileWithoutPatchMarksChangeSetInco
 	}
 	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "gone.go", Status: repositoryMonitorReviewContextStatusRemoved, Deletions: 1, Patch: "@@ -1 +0,0 @@\n-old\n"}); got.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=false for a removed file with its patch", got.Truncated)
+	}
+	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "new.go", PreviousFilename: "old.go", Status: repositoryMonitorReviewContextStatusRenamed, Additions: 2, Deletions: 1}); !got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=true for a renamed file with content changes whose patch is unavailable (previous contents are not in the checkout)", got.Truncated)
+	}
+	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "new.go", PreviousFilename: "old.go", Status: repositoryMonitorReviewContextStatusRenamed}); got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=false for a pure rename (no patch, no line changes)", got.Truncated)
 	}
 	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "image.png", Status: repositoryMonitorReviewContextTestAdded, Additions: 0}); got.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=false for a present path without a patch (reviewed from the checkout)", got.Truncated)

@@ -21,6 +21,8 @@ const (
 	testConnectionSecretHeader = "X-Connection-Secret"
 )
 
+const testUnreachableUpstreamURL = "http://upstream.invalid"
+
 func TestProviderProxyConfigValidationAndRedaction(t *testing.T) {
 	const secret = "do-not-print-this-provider-token"
 	cfg := ProviderProxyConfig{UpstreamBaseURL: "http://vekil.example/v1", UpstreamBearerToken: secret}
@@ -1169,13 +1171,58 @@ type childDisconnectedWriter struct {
 
 func (w *childDisconnectedWriter) Header() http.Header { return w.header }
 func (w *childDisconnectedWriter) WriteHeader(int)     {}
-func (w *childDisconnectedWriter) Write([]byte) (int, error) {
+
+// The first chunk reaches the child before its side of the relay breaks.
+func (w *childDisconnectedWriter) Write(p []byte) (int, error) {
+	return len(p), errors.New("write: broken pipe")
+}
+
+// zeroByteDisconnectedWriter emulates a child that abandons the relay before
+// any response byte was delivered.
+type zeroByteDisconnectedWriter struct{ header http.Header }
+
+func (w *zeroByteDisconnectedWriter) Header() http.Header { return w.header }
+func (w *zeroByteDisconnectedWriter) WriteHeader(int)     {}
+func (w *zeroByteDisconnectedWriter) Write([]byte) (int, error) {
 	return 0, errors.New("write: broken pipe")
+}
+
+func TestProviderProxyChildAbandonBeforeAnyByteIsUnaccounted(t *testing.T) {
+	proxy, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+	// An earlier request failed; a later-issued request the child abandoned
+	// before receiving a single body byte must not mask that failure.
+	session.recordInferenceResponse(testPromptOneID, providerRequestInference, http.StatusTooManyRequests, "rate limit exceeded")
+	seq, err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader("data: {}\n\n")),
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != http.ErrAbortHandler {
+				t.Fatalf("relay panic = %v, want http.ErrAbortHandler", recovered)
+			}
+		}()
+		proxy.relayUpstreamResponse(context.Background(), &zeroByteDisconnectedWriter{header: http.Header{}}, session, testPromptOneID, providerRequestInference, seq, response)
+	}()
+	if failed, status, _ := session.upstreamFailureUnrecovered(testPromptOneID); !failed || status != http.StatusTooManyRequests {
+		t.Fatalf("upstreamFailureUnrecovered = %v/%d, want the earlier failure still unrecovered", failed, status)
+	}
+	if successes := session.inferenceSuccesses; successes != 0 {
+		t.Fatalf("inferenceSuccesses = %d, want 0 for a zero-byte abandoned relay", successes)
+	}
 }
 
 func TestProviderProxyChildDisconnectOnStreamedSuccessCountsAsSuccess(t *testing.T) {
 	proxy, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
-		UpstreamBaseURL: "http://upstream.invalid", UpstreamBearerToken: testUpstreamToken,
+		UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
 	})
 	defer session.close()
 	session.recordInferenceResponse(testPromptOneID, providerRequestInference, http.StatusTooManyRequests, "rate limit exceeded")
@@ -1367,7 +1414,7 @@ func (s *providerProxySession) recordInferenceResponse(promptID string, class pr
 
 func TestProviderProxyInferenceAccountingOrdersByIssuance(t *testing.T) {
 	_, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
-		UpstreamBaseURL: "http://upstream.invalid", UpstreamBearerToken: testUpstreamToken,
+		UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
 	})
 	defer session.close()
 	first, err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())

@@ -446,3 +446,31 @@ func rawIDValue(raw json.RawMessage) any {
 	_ = json.Unmarshal(raw, &value)
 	return value
 }
+
+func TestEmitLockedEnforcesBufferedByteBudget(t *testing.T) {
+	session := &RuntimeSession{config: RuntimeSessionConfig{MaxBufferedEvents: 16, MaxBufferedEventBytes: 100, CancelGrace: 50 * time.Millisecond}}
+	active := &activePrompt{id: "prompt-bytes", events: make(chan PromptEvent, 16), accepted: true, done: make(chan struct{})}
+	session.mu.Lock()
+	session.emitLocked(active, PromptEvent{Type: PromptEventUpdate, Size: 60})
+	session.emitLocked(active, PromptEvent{Type: PromptEventUpdate, Size: 30})
+	overflowedEarly := active.overflowed
+	session.emitLocked(active, PromptEvent{Type: PromptEventUpdate, Size: 20})
+	overflowedLate := active.overflowed
+	session.mu.Unlock()
+	if overflowedEarly {
+		t.Fatal("buffer overflowed below the byte budget")
+	}
+	if !overflowedLate {
+		t.Fatal("buffer did not overflow once the byte budget was exceeded")
+	}
+	if got := len(active.events); got != 2 {
+		t.Fatalf("buffered events = %d, want 2 (the over-budget event was dropped)", got)
+	}
+	session.releaseBufferedEvent(active, <-active.events)
+	session.mu.Lock()
+	remaining := active.bufferedBytes
+	session.mu.Unlock()
+	if remaining != 30 {
+		t.Fatalf("bufferedBytes after release = %d, want 30", remaining)
+	}
+}

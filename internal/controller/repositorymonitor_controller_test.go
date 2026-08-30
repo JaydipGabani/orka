@@ -3550,6 +3550,10 @@ func newRepositoryMonitorSinglePullRequestServerWithBodyAndAuth(t *testing.T, nu
 			_, _ = w.Write([]byte(`[]`))
 			return
 		}
+		if strings.HasPrefix(r.URL.Path, "/repos/orka-agents/orka/compare/") {
+			_, _ = w.Write([]byte(`{"files":[]}`))
+			return
+		}
 		if r.URL.Path != wantPath {
 			t.Fatalf("request path = %q, want single pull request path %q", r.URL.Path, wantPath)
 		}
@@ -3575,6 +3579,13 @@ func newRepositoryMonitorReviewContextUnavailableServer(t *testing.T) *httptest.
 func repositoryMonitorInventoryServerRoutesReviewContext(t *testing.T, w http.ResponseWriter, r *http.Request, body string) bool {
 	t.Helper()
 	const prefix = "/repos/orka-agents/orka/pulls/"
+	const comparePrefix = "/repos/orka-agents/orka/compare/"
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, comparePrefix) {
+		// The review-context builder binds the file set to base...head SHAs.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"files":[{"filename":"main.go","status":"modified","additions":1,"deletions":0,"patch":"@@ -1 +1,2 @@\n package main\n+// change"}]}`))
+		return true
+	}
 	if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, prefix) {
 		return false
 	}
@@ -3830,6 +3841,12 @@ func newRepositoryMonitorPublishTestServer(t *testing.T, cfg repositoryMonitorPu
 			_, _ = w.Write([]byte(cfg.ReviewsBody))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/pulls/1/files":
 			_, _ = w.Write([]byte(cfg.FilesBody))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/orka-agents/orka/compare/"):
+			body := cfg.FilesBody
+			if strings.HasPrefix(strings.TrimSpace(body), "[") {
+				body = `{"files":` + body + `}`
+			}
+			_, _ = w.Write([]byte(body))
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/orka-agents/orka/pulls/1/reviews":
 			testServer.PostCount++
 			if err := json.NewDecoder(r.Body).Decode(&testServer.PostedReview); err != nil {
@@ -5891,6 +5908,8 @@ func TestRepositoryMonitorPRReviewRepairReadinessAutomergeFakeGitHubE2E(t *testi
 			_, _ = w.Write([]byte(`[{"number":88,"title":"Repair me","state":"open","draft":false,"mergeable_state":"clean","user":{"login":"alice"},"base":{"ref":"main","sha":"base88","repo":{"full_name":"orka-agents/orka","clone_url":"https://github.com/orka-agents/orka.git"}},"head":{"ref":"feature-repair","sha":"head88-fixed","repo":{"full_name":"orka-agents/orka","clone_url":"https://github.com/orka-agents/orka.git"}},"labels":[]}]`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/pulls/88/files":
 			_, _ = w.Write([]byte(`[{"filename":"pkg/repair.go","status":"modified","additions":2,"deletions":1,"patch":"@@ -1,2 +1,3 @@\n-old\n+new\n+more"}]`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/orka-agents/orka/compare/"):
+			_, _ = w.Write([]byte(`{"files":[{"filename":"pkg/repair.go","status":"modified","additions":2,"deletions":1,"patch":"@@ -1,2 +1,3 @@\n-old\n+new\n+more"}]}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/commits/head88-fixed/check-runs":
 			_, _ = w.Write([]byte(`{"total_count":1,"check_runs":[{"name":"test","status":"completed","conclusion":"success"}]}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/commits/head88-fixed/status":
