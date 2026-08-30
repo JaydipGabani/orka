@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -597,6 +598,8 @@ func (s *RuntimeSession) markOverflowedLocked(active *activePrompt) {
 		return
 	}
 	active.overflowed = true
+	slog.Warn("ACP prompt event buffer overflowed; cancelling the prompt",
+		"promptID", active.id, "bufferedEvents", s.config.MaxBufferedEvents, "lastSequence", active.seq, "accepted", active.accepted)
 	go func(promptID string) {
 		ctx, cancel := context.WithTimeout(context.Background(), s.config.CancelGrace*2)
 		defer cancel()

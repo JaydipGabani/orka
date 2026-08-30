@@ -80,6 +80,14 @@ const (
 	// generic protocol default. Keep a bounded runtime-specific ceiling that the
 	// supervisor advertises and the controller then enforces symmetrically.
 	runtimeCodexMaxUpdateEventsPerSecond = 1000
+	// supervisorMaxBufferedPromptEvents bounds the per-prompt ACP event buffer
+	// between the child adapter and the controller-facing prompt stream. The
+	// controller journals every event before reading the next one, so under
+	// concurrent prompts a tool-output burst (Codex streams file contents as
+	// many small update events) can outrun it for a few seconds; an overflow
+	// cancels an otherwise healthy prompt, so the buffer must absorb such
+	// bursts (events are small; the line limit bounds each one).
+	supervisorMaxBufferedPromptEvents = 4096
 
 	// Publisher workspace artifacts are inbound runtime materialization inputs,
 	// while workspace deltas are outbound runtime artifacts. Keep independently
@@ -915,7 +923,7 @@ func defaultProtocolLimits(provider string) harnessv2.ProtocolLimits {
 	}
 	return harnessv2.ProtocolLimits{
 		MaxResidentSessions: 10, MaxConcurrentPrompts: 4, MaxRequestBytes: 2 << 20,
-		MaxEventLineBytes: 1 << 20, MaxTerminalResultBytes: 1 << 20, MaxBufferedEvents: 256,
+		MaxEventLineBytes: 1 << 20, MaxTerminalResultBytes: 1 << 20, MaxBufferedEvents: supervisorMaxBufferedPromptEvents,
 		MaxUpdateEventsPerSecond: maxUpdates, MinPromptLeaseMillis: 5_000, MaxPromptLeaseMillis: 120_000,
 		MaxPendingPermissions: 32, MaxWorkspaceDeltaBytes: defaultWorkspaceDeltaUploadBytes,
 	}
