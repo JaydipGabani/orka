@@ -236,33 +236,37 @@ func repositoryMonitorReviewContextFromFiles(owner, repository string, pr reposi
 	}
 	reviewContext.Files = entries
 	reviewContext = repositoryMonitorReviewContextTrimToBudget(reviewContext)
-	return repositoryMonitorReviewContextMarkUnreviewableRemovals(reviewContext)
+	return repositoryMonitorReviewContextMarkUnreviewableOmissions(reviewContext)
 }
 
-// repositoryMonitorReviewContextMarkUnreviewableRemovals marks the change set
-// incomplete when a removed or renamed file's patch is omitted (unavailable,
-// truncated, or capped): the Git-free head checkout contains neither a
-// deleted file nor a renamed file's previous contents, so the reviewer cannot
-// inspect what was removed, unlike an omitted patch for a present, unmoved
-// path which is reviewed from the checkout itself.
-func repositoryMonitorReviewContextMarkUnreviewableRemovals(reviewContext repositoryMonitorReviewContext) repositoryMonitorReviewContext {
+// repositoryMonitorReviewContextMarkUnreviewableOmissions marks the change set
+// incomplete when an omitted patch (unavailable, truncated, or capped) hides
+// content the Git-free head checkout cannot show: a removed file, a renamed
+// file's previous contents, or lines deleted from any changed file. An omitted
+// patch for a present path whose change only adds lines stays reviewable,
+// because the checkout contains every added line.
+func repositoryMonitorReviewContextMarkUnreviewableOmissions(reviewContext repositoryMonitorReviewContext) repositoryMonitorReviewContext {
 	for _, file := range reviewContext.Files {
 		if file.PatchOmitted == "" {
 			continue
 		}
-		switch file.Status {
-		case repositoryMonitorReviewContextStatusRemoved:
+		switch {
+		case file.Status == repositoryMonitorReviewContextStatusRemoved:
 			reviewContext.Truncated.Files = true
 			return reviewContext
-		case repositoryMonitorReviewContextStatusRenamed:
+		case file.Status == repositoryMonitorReviewContextStatusRenamed && file.PatchOmitted != repositoryMonitorReviewContextPatchUnavailable:
 			// A pure rename (no line changes) legitimately has no patch and
 			// is fully represented by the new path in the checkout; a rename
-			// that also changed content, or whose patch was cut or capped,
-			// hides what the previous file contained.
-			if file.PatchOmitted != repositoryMonitorReviewContextPatchUnavailable || file.Additions+file.Deletions > 0 {
-				reviewContext.Truncated.Files = true
-				return reviewContext
-			}
+			// whose patch was cut or capped hides what the previous file
+			// contained.
+			reviewContext.Truncated.Files = true
+			return reviewContext
+		case file.Deletions > 0:
+			// Deleted lines (a rename with content changes included) exist
+			// only in the omitted patch, so their removal cannot be reviewed
+			// from the checkout.
+			reviewContext.Truncated.Files = true
+			return reviewContext
 		}
 	}
 	return reviewContext

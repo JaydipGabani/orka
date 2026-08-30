@@ -38,6 +38,7 @@ Common environment:
   ACP_E2E_CONCURRENCY_TASKS          Concurrent Codex task count (default: 6)
   ACP_E2E_REQUIRE_PARALLEL=1         Require >=2 running prompts in smoke; release always requires it
   ACP_E2E_BLOCKING_PROMPT            Prompt that remains Running long enough to cancel
+  ACP_E2E_TASK_MAX_TURNS             Provider inference-request budget per Task (default 24)
   ACP_E2E_TIMEOUT_DURATION           Task timeout; Running must be observed before expiry (default: 90s)
   ACP_E2E_CANCEL_SETTLE_SECONDS      Explicit-cancel settlement bound (default: 120)
   ACP_E2E_WAIT_SECONDS               Terminal wait bound (default: 900)
@@ -229,7 +230,11 @@ keep_resources="${ACP_E2E_KEEP_RESOURCES:-0}"
 require_parallel="${ACP_E2E_REQUIRE_PARALLEL:-1}"
 timeout_duration="${ACP_E2E_TIMEOUT_DURATION:-90s}"
 cancel_settle_seconds="${ACP_E2E_CANCEL_SETTLE_SECONDS:-120}"
-blocking_prompt="${ACP_E2E_BLOCKING_PROMPT:-Immediately use the Bash tool to run sleep 180. Do not return a final answer before the command completes. Do not modify repository files.}"
+blocking_prompt="${ACP_E2E_BLOCKING_PROMPT:-Immediately use the Bash tool to run sleep 180 with a command timeout of at least 240 seconds (timeout_ms 240000). Do not return a final answer before the command completes. Do not modify repository files.}"
+# Real agents may spend one inference request per file read or per retried
+# sleep, so the per-Task budget is twice what the prompts below need on a good
+# day; Task timeouts still bound every stage.
+task_max_turns="${ACP_E2E_TASK_MAX_TURNS:-24}"
 long_prompt="${ACP_E2E_LONG_PROMPT:-Read LICENSE, NOTICE.md, go.mod, Makefile, and the first ten Go source files you find. Compare their purpose and provide a detailed evidence-backed summary. Do not modify files.}"
 api_local_port="${ACP_E2E_API_LOCAL_PORT:-$((20000 + ($$ % 20000)))}"
 
@@ -1469,7 +1474,7 @@ apply_agent() {
   local provider="$1"
   local model="$2"
   local name="$3"
-  local max_turns="${4:-12}"
+  local max_turns="${4:-${task_max_turns}}"
   local allow_bash="${5:-false}"
   jq -n \
     --arg provider "${provider}" \
@@ -1532,6 +1537,7 @@ apply_read_task() {
     --arg timeout "${timeout}" \
     --arg provider "${provider}" \
     --argjson create "${create}" \
+    --argjson maxTurns "${task_max_turns}" \
     --argjson allowBash "${allow_bash}" \
     '{
       apiVersion:"core.orka.ai/v1alpha1",
@@ -1543,7 +1549,7 @@ apply_read_task() {
         prompt:$prompt,
         workspace:({intent:"read",gitRepo:$repo,ref:$ref} +
           (if ($identity|length)>0 then {sourceRepository:{provider:"github",id:$identity}} else {} end)),
-        agentRuntime:({maxTurns:12} + (
+        agentRuntime:({maxTurns:$maxTurns} + (
           if $provider == "codex" and $allowBash then {} else {
             allowBash:$allowBash,
             allowedTools:(if $allowBash then ["Read","Glob","Grep","Bash"] else ["Read","Glob","Grep"] end)
@@ -2905,7 +2911,8 @@ apply_write_task() {
     --arg forgeCredential "${write_forge_credential_target}" \
     --arg forgeCredentialKey "${write_forge_credential_key}" \
     --arg branch "${write_branch}" \
-    --arg base "${write_pr_base}" '{
+    --arg base "${write_pr_base}" \
+    --argjson maxTurns "${task_max_turns}" '{
       apiVersion:"core.orka.ai/v1alpha1",
       kind:"Task",
       metadata:{name:$task,labels:{"orka.ai/acp-e2e-run":$run}},
@@ -2928,7 +2935,7 @@ apply_write_task() {
           prBaseBranch:$base,
           createPR:true
         },
-        agentRuntime:({maxTurns:12} + (if $provider == "codex" then {} else {
+        agentRuntime:({maxTurns:$maxTurns} + (if $provider == "codex" then {} else {
           allowBash:true,
           allowedTools:["Read","Glob","Grep","Bash","Write","Edit"]
         } end)),

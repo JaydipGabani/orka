@@ -95,8 +95,10 @@ func TestRepositoryMonitorReviewContextFromFilesKeepsIdentitiesBeyondPatchCap(t 
 	if got.ChangedFileCount != repositoryMonitorReviewContextMaxFiles+25 {
 		t.Fatalf("changedFileCount = %d, want the GitHub total", got.ChangedFileCount)
 	}
-	if len(got.Files) != repositoryMonitorReviewContextMaxFiles+25 || got.Truncated.Files || got.Truncated.Bytes {
-		t.Fatalf("files = %d truncated = %#v, want every identity kept with no truncation", len(got.Files), got.Truncated)
+	// Every identity is kept, but the last capped entry hides three deleted
+	// lines, so the change set is marked incomplete for the verdict gate.
+	if len(got.Files) != repositoryMonitorReviewContextMaxFiles+25 || !got.Truncated.Files || got.Truncated.Bytes {
+		t.Fatalf("files = %d truncated = %#v, want every identity kept with files=true from the capped deletion", len(got.Files), got.Truncated)
 	}
 	for i, file := range got.Files {
 		if i < repositoryMonitorReviewContextMaxFiles {
@@ -757,6 +759,16 @@ func TestRepositoryMonitorReviewContextRemovedFileWithoutPatchMarksChangeSetInco
 	}
 	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "image.png", Status: repositoryMonitorReviewContextTestAdded, Additions: 0}); got.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=false for a present path without a patch (reviewed from the checkout)", got.Truncated)
+	}
+	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "auth.go", Status: repositoryMonitorReviewContextTestStatus, Additions: 2, Deletions: 1}); !got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=true for a modified file with deleted lines whose patch is unavailable (the removed lines are not in the checkout)", got.Truncated)
+	}
+	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "generated.pb.go", Status: repositoryMonitorReviewContextTestStatus, Additions: 4000, Deletions: 0}); got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=false for an additions-only modified file without a patch (every added line is in the checkout)", got.Truncated)
+	}
+	longPatch := "@@ -1,2 +1,2 @@\n-old\n+" + strings.Repeat("x", repositoryMonitorReviewContextMaxPatchBytes) + "\n"
+	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "cut.go", Status: repositoryMonitorReviewContextTestStatus, Additions: 1, Deletions: 1, Patch: longPatch}); !got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=true for a modified file with deleted lines whose patch was truncated", got.Truncated)
 	}
 }
 
