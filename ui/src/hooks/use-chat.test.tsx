@@ -306,6 +306,41 @@ describe('useSendMessage', () => {
     expect(state.isStreaming).toBe(false)
   })
 
+  it('never posts a turn orphaned while the chat config lookup was pending', async () => {
+    useChatStore.setState({ provider: '', model: 'gpt-5' })
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    fetchSpy.mockImplementation(async (input) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes('/chat/config')) {
+        await gate
+        return new Response(JSON.stringify({ provider: 'openai', model: 'gpt-4o' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      throw new Error(`unexpected request ${url}`)
+    })
+    const { result } = renderHook(() => useSendMessage(), { wrapper: createWrapper() })
+    let turn: Promise<void> = Promise.resolve()
+    act(() => {
+      turn = result.current('Hi there')
+    })
+    act(() => {
+      useChatStore.getState().newSession()
+    })
+    release()
+    await act(async () => {
+      await turn
+    })
+    const posted = fetchSpy.mock.calls.filter(([input]) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      return url.endsWith('/chat')
+    })
+    expect(posted).toHaveLength(0)
+    expect(useChatStore.getState().messages).toEqual([])
+    expect(useChatStore.getState().isStreaming).toBe(false)
+  })
+
   it('handles fetch error — adds error message', async () => {
     fetchSpy.mockImplementation((input, init) => {
       const url = typeof input === 'string' ? input : (input as Request).url

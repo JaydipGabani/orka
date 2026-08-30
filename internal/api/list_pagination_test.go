@@ -355,8 +355,39 @@ func TestCollectAuthorizedPagesFillsAcrossFilteredPages(t *testing.T) {
 	require.Equal(t, "2", next)
 	require.Equal(t, []string{""}, fetched)
 
-	// The page budget bounds the walk and hands back the cursor to resume.
+	// While the page is still empty the walk continues past the fill budget,
+	// so an authorized object after a long run of hidden ones is still found
+	// instead of an empty page and a raw cursor being returned.
 	calls := 0
+	items, next, err = collectAuthorizedPages(1, "", func(string, int64) ([]string, string, error) {
+		calls++
+		if calls == maxAuthorizedListPages+5 {
+			return []string{"late"}, "after-late", nil
+		}
+		return nil, "more", nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"late"}, items)
+	require.Equal(t, "after-late", next)
+	require.Equal(t, maxAuthorizedListPages+5, calls)
+
+	// The fill budget applies once something authorized was found.
+	const firstAuthorized = "first-authorized"
+	calls = 0
+	items, next, err = collectAuthorizedPages(2, "", func(string, int64) ([]string, string, error) {
+		calls++
+		if calls == 1 {
+			return []string{firstAuthorized}, "more", nil
+		}
+		return nil, "more", nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{firstAuthorized}, items)
+	require.Equal(t, "more", next)
+	require.Equal(t, maxAuthorizedListPages, calls)
+
+	// The empty-page budget is the residual bound and hands back the cursor.
+	calls = 0
 	items, next, err = collectAuthorizedPages(1, "", func(string, int64) ([]string, string, error) {
 		calls++
 		return nil, "more", nil
@@ -364,7 +395,7 @@ func TestCollectAuthorizedPagesFillsAcrossFilteredPages(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, items)
 	require.Equal(t, "more", next)
-	require.Equal(t, maxAuthorizedListPages, calls)
+	require.Equal(t, maxAuthorizedListEmptyPages, calls)
 
 	_, _, err = collectAuthorizedPages(1, "", func(string, int64) ([]string, string, error) { return nil, "", errors.New("boom") })
 	require.EqualError(t, err, "boom")

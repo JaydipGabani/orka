@@ -54,6 +54,13 @@ describe('Sidebar', () => {
     expect(screen.queryByText('Tasks')).not.toBeInTheDocument()
   })
 
+  it('collapsed navigation links keep an accessible name', () => {
+    useUIStore.setState({ sidebarCollapsed: true })
+    render(<Sidebar />)
+    expect(screen.getByRole('link', { name: 'Tasks' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Dashboard' })).toHaveAttribute('title', 'Dashboard')
+  })
+
   it('toggle button collapses sidebar', async () => {
     const user = userEvent.setup()
     render(<Sidebar />)

@@ -132,6 +132,10 @@ export function Sidebar() {
               key={to}
               to={to}
               aria-current={isActive ? 'page' : undefined}
+              // The collapsed rail hides the visible text, so the link needs
+              // an explicit accessible name.
+              aria-label={sidebarCollapsed ? label : undefined}
+              title={sidebarCollapsed ? label : undefined}
               onClick={() => { if (overlayOpen) closeOverlay() }}
               className={cn(
                 'relative flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',

@@ -206,6 +206,10 @@ export function useSendMessage() {
           body.provider = effectiveProvider
           if (model.trim()) body.model = model.trim()
         }
+        // The config lookup above may have yielded; a New Chat or namespace
+        // switch in the meantime means this turn must never reach the server
+        // (it could still run tools or create Tasks before being cancelled).
+        if (!live()) return
 
         const response = await fetch(`${API_BASE_URL}/chat`, {
           method: 'POST',
