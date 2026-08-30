@@ -79,11 +79,33 @@ func secretValuePlaceholder(value string) bool {
 	return false
 }
 
+// codeReferencePattern matches a qualified identifier such as
+// strings.TrimSpace or cfg.Provider.APIKey: source code that reads a secret
+// from configuration, not the secret itself.
+var codeReferencePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$`)
+
+// secretValueIsCode reports whether a credential-position value is source
+// code rather than a literal: a call such as strings.TrimSpace(cfg.APIKey)
+// (the value is immediately followed by "(") or a qualified identifier.
+// Go/TS/Python that assigns apiKey from configuration would otherwise make
+// any file that touches credential plumbing unpublishable.
+func secretValueIsCode(text string, value string, end int) bool {
+	if end < len(text) && text[end] == '(' {
+		return true
+	}
+	return codeReferencePattern.MatchString(value)
+}
+
 func sensitiveValueMatch(pattern *regexp.Regexp, text string) bool {
-	for _, match := range pattern.FindAllStringSubmatch(text, -1) {
-		if len(match) > 1 && !secretValuePlaceholder(match[1]) {
-			return true
+	for _, match := range pattern.FindAllStringSubmatchIndex(text, -1) {
+		if len(match) < 4 || match[2] < 0 {
+			continue
 		}
+		value := text[match[2]:match[3]]
+		if secretValuePlaceholder(value) || secretValueIsCode(text, value, match[3]) {
+			continue
+		}
+		return true
 	}
 	return false
 }

@@ -559,6 +559,10 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"api_key=${OPENAI_API_KEY}",
 		"The token is validated by the proxy; set TOKEN=xxxx in .env",
 		"Txn-Token: <transaction token>",
+		"runtime.apiKey = strings.TrimSpace(cfg.APIKey)",
+		"apiKey = strings.TrimSpace(os.Getenv(apiKeyEnv))",
+		"token: config.Providers.Default.AccessToken",
+		"password = readPasswordFromKeychain(ctx)",
 	} {
 		if LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = true, want false for a placeholder or bare keyword", text)
@@ -571,6 +575,8 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"Txn-Token: " + strings.Repeat("t", 32),
 		"-----" + "BEGIN RSA PRIVATE KEY-----",
 		"g" + "hp_" + strings.Repeat("x", 36),
+		"api_key = " + strings.Repeat("abcd", 5) + "-secret.v2",
+		"password: " + strings.Repeat("p", 20),
 	} {
 		if !LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = false, want true for a credential-shaped value", text)
