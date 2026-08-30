@@ -2440,7 +2440,11 @@ func renderRepositoryMonitorIssuePRBody(item *store.MonitorItem, task *corev1alp
 
 func repositoryMonitorIssueActionUpdatesStatusComment(actionKind, workflowPhase string) bool {
 	switch actionKind {
-	case repositoryMonitorIssueActionPlan, repositoryMonitorIssueActionMutateToPR, repositoryMonitorIssueActionDecompose:
+	case repositoryMonitorIssueActionPlan, repositoryMonitorIssueActionMutateToPR, repositoryMonitorIssueActionDecompose,
+		repositoryMonitorIssueActionResearch:
+		// Research is user-triggered (orka:research); without a status-comment
+		// update its result would be stored only as internal planning context
+		// and the requester would see nothing on the issue.
 		return true
 	case repositoryMonitorIssueActionImplementation:
 		return workflowPhase == repositoryMonitorIssuePhaseBlocked || workflowPhase == repositoryMonitorIssuePhasePROpened
@@ -2569,7 +2573,7 @@ func renderRepositoryMonitorIssueStatusComment(item *store.MonitorItem, record *
 	}
 	var payload map[string]any
 	_ = json.Unmarshal([]byte(record.PayloadJSON), &payload)
-	planSummary := sanitizeRepositoryMonitorPublicCommentText(firstNonEmptyIssueAction(stringField(payload, "summary"), record.Summary))
+	planSummary := sanitizeRepositoryMonitorPublicCommentText(firstNonEmptyIssueAction(stringField(payload, "summary"), stringField(payload, "problemStatement"), record.Summary))
 	if planSummary == "" {
 		planSummary = "No summary provided."
 	}

@@ -6875,6 +6875,21 @@ func TestRepositoryMonitorRepairPushKeepsQueuedReview(t *testing.T) {
 	repositoryMonitorResetItemAfterRepairPush(nil)
 }
 
+func TestRepositoryMonitorResearchUpdatesStatusComment(t *testing.T) {
+	if !repositoryMonitorIssueActionUpdatesStatusComment(repositoryMonitorIssueActionResearch, "blocked") {
+		t.Fatal("research completion should surface on the issue status comment")
+	}
+	record := &store.ActionRecord{PayloadJSON: `{"schemaVersion":"orka.issueResearch.v1","problemStatement":"CI lacks performance regression coverage for the proxy hot path.","needsHuman":true}`}
+	item := &store.MonitorItem{MonitorName: "m", Number: 354, WorkflowPhase: "blocked", SkipReason: "needs_human"}
+	body := renderRepositoryMonitorIssueStatusComment(item, record)
+	if !strings.Contains(body, "CI lacks performance regression coverage") {
+		t.Fatalf("research problem statement missing from status comment: %q", body)
+	}
+	if strings.Contains(body, "No summary provided.") {
+		t.Fatalf("research comment fell back to the empty-summary placeholder: %q", body)
+	}
+}
+
 func TestRepositoryMonitorStateTransitionValidation(t *testing.T) {
 	if !repositoryMonitorIssuePhaseTransitionAllowed(repositoryMonitorIssuePhasePlanReady, repositoryMonitorIssuePhaseApprovalRequired) {
 		t.Fatal("plan_ready should transition to approval_required")
