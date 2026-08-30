@@ -1805,13 +1805,16 @@ func main() {
 	}
 
 	if err := (&controller.RepositoryScanReconciler{
-		Client:           mgr.GetClient(),
-		APIReader:        mgr.GetAPIReader(),
-		Scheme:           mgr.GetScheme(),
-		SecurityStore:    sqliteStore,
-		ArtifactStore:    sqliteStore,
-		ResultStore:      sqliteStore,
-		PublicationStore: sqliteStore,
+		Client:        mgr.GetClient(),
+		APIReader:     mgr.GetAPIReader(),
+		Scheme:        mgr.GetScheme(),
+		SecurityStore: sqliteStore,
+		ArtifactStore: sqliteStore,
+		ResultStore:   sqliteStore,
+		// Governed publications are recorded by the ACP dispatcher in the
+		// durable control store; verifying patch proposals must read the same
+		// store, not the SQLite payload store.
+		PublicationStore: durableControlStore,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RepositoryScan")
 		os.Exit(1)
