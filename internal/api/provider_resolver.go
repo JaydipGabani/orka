@@ -93,12 +93,17 @@ func (r *ProviderResolver) resolveFromExplicit(ctx context.Context, opts Resolve
 		}
 	}
 
-	if providerCRD == nil && opts.ProviderName != "" {
-		p, err := r.LookupProvider(ctx, opts.ProviderName, opts.Namespace)
-		if err != nil {
-			return nil, "", ProviderResolutionInfo{}, err
+	if opts.ProviderName != "" {
+		if providerCRD != nil && providerCRD.Name != opts.ProviderName {
+			return nil, "", ProviderResolutionInfo{}, fmt.Errorf("agent %q is bound to provider %q; omit the provider or choose an agent without a providerRef", opts.AgentRef, providerCRD.Name)
 		}
-		providerCRD = p
+		if providerCRD == nil {
+			p, err := r.LookupProvider(ctx, opts.ProviderName, opts.Namespace)
+			if err != nil {
+				return nil, "", ProviderResolutionInfo{}, err
+			}
+			providerCRD = p
+		}
 	}
 
 	if providerCRD == nil && r.config.Provider != "" {
@@ -112,7 +117,14 @@ func (r *ProviderResolver) resolveFromExplicit(ctx context.Context, opts Resolve
 	if providerCRD == nil {
 		p, err := r.LookupProvider(ctx, "default", opts.Namespace)
 		if err != nil {
-			return nil, "", ProviderResolutionInfo{}, fmt.Errorf("no provider configured and no 'default' Provider CRD found: %w", err)
+			// Runtime Agents carry no providerRef; the coordinator still needs
+			// a chat Provider, so apply the same sole-ready fallback as the
+			// model-string path instead of demanding one named "default".
+			fallback, fallbackErr := r.soleReadyProvider(ctx, opts.Namespace, "")
+			if fallbackErr != nil {
+				return nil, "", ProviderResolutionInfo{}, fallbackErr
+			}
+			p = fallback
 		}
 		providerCRD = p
 	}

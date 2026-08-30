@@ -59,6 +59,11 @@ func makeAgent(name, ns string, providerRef *corev1alpha1.ProviderReference, mod
 
 // Tests
 
+const (
+	testRuntimeAgentModel = "gpt-5.6-sol"
+	testRuntimeAgentName  = "runtime-agent"
+)
+
 func TestProviderResolver_LookupProvider(t *testing.T) {
 	provider := makeProvider("my-provider", "default", corev1alpha1.ProviderTypeOpenAI, "my-secret", "gpt-4")
 	k := fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(provider).Build()
@@ -273,6 +278,62 @@ func TestProviderResolver_Resolve(t *testing.T) {
 				Namespace: ns,
 			},
 			wantErr: "no provider selected and namespace \"default\" has no Providers",
+		},
+		{
+			name: "runtime agent without providerRef falls back to the sole ready Provider",
+			objects: []runtime.Object{
+				readyProvider(openaiProvider), openaiSecret,
+				makeAgent(testRuntimeAgentName, ns, nil, &corev1alpha1.ModelConfig{Name: testRuntimeAgentModel}),
+			},
+			config: DefaultChatConfig(),
+			opts: ResolveOpts{
+				AgentRef:  testRuntimeAgentName,
+				Namespace: ns,
+			},
+			wantModel: testRuntimeAgentModel,
+			wantPType: openaiProviderName,
+		},
+		{
+			name: "runtime agent without providerRef and several Providers names the candidates",
+			objects: []runtime.Object{
+				readyProvider(anthropicProvider), anthropicSecret, readyProvider(openaiProvider), openaiSecret,
+				makeAgent(testRuntimeAgentName, ns, nil, &corev1alpha1.ModelConfig{Name: testRuntimeAgentModel}),
+			},
+			config: DefaultChatConfig(),
+			opts: ResolveOpts{
+				AgentRef:  testRuntimeAgentName,
+				Namespace: ns,
+			},
+			wantErr: "no provider selected and no default Provider is configured; pass a provider (available in namespace \"default\": anthropic, openai)",
+		},
+		{
+			name: "runtime agent accepts an explicit provider",
+			objects: []runtime.Object{
+				readyProvider(anthropicProvider), anthropicSecret, readyProvider(openaiProvider), openaiSecret,
+				makeAgent(testRuntimeAgentName, ns, nil, &corev1alpha1.ModelConfig{Name: testRuntimeAgentModel}),
+			},
+			config: DefaultChatConfig(),
+			opts: ResolveOpts{
+				AgentRef:     testRuntimeAgentName,
+				ProviderName: openaiProviderName,
+				Namespace:    ns,
+			},
+			wantModel: testRuntimeAgentModel,
+			wantPType: openaiProviderName,
+		},
+		{
+			name: "agent bound to a provider rejects a different explicit provider",
+			objects: []runtime.Object{
+				readyProvider(anthropicProvider), anthropicSecret, readyProvider(openaiProvider), openaiSecret,
+				makeAgent("bound-agent", ns, &corev1alpha1.ProviderReference{Name: openaiProviderName}, &corev1alpha1.ModelConfig{Name: "gpt-4o"}),
+			},
+			config: DefaultChatConfig(),
+			opts: ResolveOpts{
+				AgentRef:     "bound-agent",
+				ProviderName: "anthropic",
+				Namespace:    ns,
+			},
+			wantErr: "agent \"bound-agent\" is bound to provider \"openai\"",
 		},
 		{
 			name:    "no provider configured falls back to the sole ready Provider",
