@@ -437,9 +437,13 @@ func TestOpenCodeSessionConfigRequiresProviderModel(t *testing.T) {
 	}
 }
 
-func TestOpenCodeDefaultProtocolLimitUsesStandardUpdateRate(t *testing.T) {
-	if got := defaultProtocolLimits(providerKindOpencode).MaxUpdateEventsPerSecond; got != harnessv2.DefaultMaxUpdateEventsPerSecond {
-		t.Fatalf("MaxUpdateEventsPerSecond = %d, want %d", got, harnessv2.DefaultMaxUpdateEventsPerSecond)
+func TestOpenCodeDefaultProtocolLimitUsesRuntimeUpdateRate(t *testing.T) {
+	// A live OpenCode research prompt streamed tool output above the generic
+	// 100/s protocol default; the controller enforced the advertised limit,
+	// broke the stream at the terminal event, and a completed prompt was lost
+	// as RuntimeLost. Every built-in runtime advertises the burst ceiling.
+	if got := defaultProtocolLimits(providerKindOpencode).MaxUpdateEventsPerSecond; got != runtimeMaxUpdateEventsPerSecond {
+		t.Fatalf("MaxUpdateEventsPerSecond = %d, want %d", got, runtimeMaxUpdateEventsPerSecond)
 	}
 }
 

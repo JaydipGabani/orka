@@ -627,7 +627,7 @@ func TestMapRuntimeEventSuppressesStatuslessToolOutputBurstWithoutWeakeningRateL
 	}
 
 	ignoredDelta := `{"sessionUpdate":"tool_call_update","toolCallId":"call-1","_meta":{"terminal_output_delta":{"terminal_id":"call-1","data":"x"}}}`
-	for index := range runtimeCodexMaxUpdateEventsPerSecond + 1 {
+	for index := range runtimeMaxUpdateEventsPerSecond + 1 {
 		if mapped := mapEvent(prompt, state, acp.PromptEventUpdate, ignoredDelta, now); mapped != nil {
 			t.Fatalf("status-less tool output delta %d mapped to %#v", index, mapped)
 		}

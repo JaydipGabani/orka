@@ -76,10 +76,12 @@ const (
 	openCodePermissionDeny      = "deny"
 	openCodeRootInstructionPath = "/opt/opencode/AGENTS.md"
 
-	// Codex ACP can flush buffered token/tool updates in short bursts above the
-	// generic protocol default. Keep a bounded runtime-specific ceiling that the
-	// supervisor advertises and the controller then enforces symmetrically.
-	runtimeCodexMaxUpdateEventsPerSecond = 1000
+	// Built-in ACP runtimes flush buffered token/tool updates in short bursts
+	// far above the generic protocol default (a live OpenCode research prompt
+	// exceeded 100/s while streaming tool output, breaking the stream at its
+	// terminal event). Keep one bounded runtime ceiling that the supervisor
+	// advertises and the controller then enforces symmetrically.
+	runtimeMaxUpdateEventsPerSecond = 1000
 	// supervisorMaxBufferedPromptEvents bounds the per-prompt ACP event buffer
 	// between the child adapter and the controller-facing prompt stream. The
 	// controller journals every event before reading the next one, so under
@@ -923,10 +925,7 @@ func copilotAdapterIdentity(goarch string) (string, string, error) {
 }
 
 func defaultProtocolLimits(provider string) harnessv2.ProtocolLimits {
-	maxUpdates := harnessv2.DefaultMaxUpdateEventsPerSecond
-	if provider == providerKindCodex {
-		maxUpdates = runtimeCodexMaxUpdateEventsPerSecond
-	}
+	maxUpdates := runtimeMaxUpdateEventsPerSecond
 	return harnessv2.ProtocolLimits{
 		MaxResidentSessions: 10, MaxConcurrentPrompts: 4, MaxRequestBytes: 2 << 20,
 		MaxEventLineBytes: 1 << 20, MaxTerminalResultBytes: 1 << 20, MaxBufferedEvents: supervisorMaxBufferedPromptEvents,

@@ -464,7 +464,7 @@ func TestSupervisorCompactsAssistantBurstBeforeHarnessRateLimit(t *testing.T) {
 			streamed.WriteString(event.Update.AssistantMessage.Text)
 		}
 	}
-	want := strings.Repeat("x", runtimeCodexMaxUpdateEventsPerSecond+1)
+	want := strings.Repeat("x", runtimeMaxUpdateEventsPerSecond+1)
 	if streamed.String() != want {
 		t.Fatalf("streamed assistant bytes = %d, want %d exact bytes", streamed.Len(), len(want))
 	}
@@ -1359,7 +1359,7 @@ func TestSupervisorACPHelper(t *testing.T) {
 						"sessionUpdate": "tool_call", "toolCallId": "provider-call-1", "title": "Read repository", "kind": "read",
 					},
 				}})
-				for range runtimeCodexMaxUpdateEventsPerSecond + 1 {
+				for range runtimeMaxUpdateEventsPerSecond + 1 {
 					writeHelperMessage(writer, map[string]any{testJSONRPCKey: testJSONRPCVersion, "method": acp.MethodSessionUpdate, "params": map[string]any{
 						"sessionId": sessionID, "update": map[string]any{
 							"sessionUpdate": "tool_call_update", "toolCallId": "provider-call-1",
@@ -1384,7 +1384,7 @@ func TestSupervisorACPHelper(t *testing.T) {
 			}
 			assistantUpdates := []string{"hello from ACP"}
 			if mode == assistantBurstMode {
-				assistantUpdates = make([]string, runtimeCodexMaxUpdateEventsPerSecond+1)
+				assistantUpdates = make([]string, runtimeMaxUpdateEventsPerSecond+1)
 				for index := range assistantUpdates {
 					assistantUpdates[index] = "x"
 				}

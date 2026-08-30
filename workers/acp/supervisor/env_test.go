@@ -434,8 +434,8 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		cfg.Provider.AdapterName != "codex-acp-orka-dist" || cfg.Provider.AdapterDigest != "sha256:"+acp.CodexACPOrkaDistSHA256 {
 		t.Fatalf("unexpected adapter digests: capabilities=%#v provider=%#v", cfg.Capabilities.AdapterDigests, cfg.Provider)
 	}
-	if cfg.Capabilities.Limits.MaxUpdateEventsPerSecond != runtimeCodexMaxUpdateEventsPerSecond {
-		t.Fatalf("max update events per second = %d, want %d", cfg.Capabilities.Limits.MaxUpdateEventsPerSecond, runtimeCodexMaxUpdateEventsPerSecond)
+	if cfg.Capabilities.Limits.MaxUpdateEventsPerSecond != runtimeMaxUpdateEventsPerSecond {
+		t.Fatalf("max update events per second = %d, want %d", cfg.Capabilities.Limits.MaxUpdateEventsPerSecond, runtimeMaxUpdateEventsPerSecond)
 	}
 	if cfg.ProviderProxy.UpstreamBaseURL != "http://vekil.vekil-system.svc:1337/v1" {
 		t.Fatalf("unexpected provider proxy base URL: %q", cfg.ProviderProxy.UpstreamBaseURL)
@@ -531,9 +531,10 @@ func TestDefaultProtocolLimitsUseProviderSpecificUpdateRates(t *testing.T) {
 		provider string
 		want     int
 	}{
-		{provider: providerKindCodex, want: runtimeCodexMaxUpdateEventsPerSecond},
-		{provider: providerKindClaude, want: harnessv2.DefaultMaxUpdateEventsPerSecond},
-		{provider: providerKindCopilot, want: harnessv2.DefaultMaxUpdateEventsPerSecond},
+		{provider: providerKindCodex, want: runtimeMaxUpdateEventsPerSecond},
+		{provider: providerKindClaude, want: runtimeMaxUpdateEventsPerSecond},
+		{provider: providerKindCopilot, want: runtimeMaxUpdateEventsPerSecond},
+		{provider: providerKindOpencode, want: runtimeMaxUpdateEventsPerSecond},
 	}
 	for _, test := range tests {
 		t.Run(test.provider, func(t *testing.T) {
