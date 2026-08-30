@@ -243,7 +243,7 @@ func TestAgentContractValidatorRequiresModelForHarnessV2Agents(t *testing.T) {
 		decoder: ctrladmission.NewDecoder(scheme),
 		reader:  fake.NewClientBuilder().WithScheme(scheme).WithObjects(namespace).Build(),
 	}
-	contract := corev1alpha1.AgentRuntimeContractVersion(executionmode.HarnessV2.ContractVersion())
+	contract := executionmode.HarnessV2.ContractVersion()
 	agent := func(model string) *corev1alpha1.Agent {
 		object := &corev1alpha1.Agent{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "core.orka.ai/v1alpha1", Kind: "Agent"},
