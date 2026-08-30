@@ -1706,7 +1706,7 @@ func (d *ACPDispatcher) recoverSucceededTaskProjection(ctx context.Context, task
 			}
 			switch result.Status.Outcome {
 			case corev1alpha1.TaskDeliveryOutcomeVerifiedExact, corev1alpha1.TaskDeliveryOutcomeDeliveredSuperseded:
-				return d.completeSuccessWithDelivery(ctx, task, result.Status, "ACP publication recovered after controller restart")
+				return d.completeSuccessWithDelivery(ctx, task, result.Status, "ACP publication settled from the durable attempt record after the live settlement was interrupted")
 			case corev1alpha1.TaskDeliveryOutcomeCancelledBeforePublish:
 				return d.cancelTaskAfterExecution(ctx, task, result.Status, "publication cancelled before push during recovery")
 			default:
@@ -1772,7 +1772,7 @@ func (d *ACPDispatcher) patchRecoveredTerminalExecution(ctx context.Context, tas
 		switch attempt.DeliveryState {
 		case store.PromptDeliveryNotRequested, store.PromptDeliveryReadValidated, store.PromptDeliveryNoChange,
 			store.PromptDeliveryVerifiedExact, store.PromptDeliveryDeliveredSuperseded:
-			return d.completeSuccessWithDelivery(ctx, task, *status, "ACP task recovered after controller restart")
+			return d.completeSuccessWithDelivery(ctx, task, *status, "ACP task settled from the durable attempt record after the live settlement was interrupted")
 		default:
 			// The authoritative attempt settles the Task; it may reach this
 			// path after a controller restart or when the live settlement
