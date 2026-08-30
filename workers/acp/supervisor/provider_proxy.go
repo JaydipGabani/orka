@@ -481,6 +481,10 @@ func (s *providerProxySession) wait(ctx context.Context) error {
 	s.mu.Lock()
 	drained := s.drained
 	s.mu.Unlock()
+	if drained == nil {
+		// No request was ever authorized on this session: nothing to drain.
+		return nil
+	}
 	select {
 	case <-drained:
 		return nil

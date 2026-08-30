@@ -333,7 +333,7 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 	if state.providerProxy != nil {
 		state.providerProxy.closeAdmission(string(request.Metadata.PromptID))
 	}
-	s.waitProviderProxyDrained(state)
+	s.waitProviderProxyDrained(state, prompt)
 	if state.providerProxy != nil {
 		state.providerProxy.deactivate(string(request.Metadata.PromptID))
 	}
@@ -1969,6 +1969,7 @@ func (s *Server) terminalEvent(
 	} else {
 		effective = providerTurnLimitResult(state, prompt, effective)
 		effective = providerUpstreamFailureResult(state, prompt, effective)
+		effective = providerDrainFailureResult(prompt, effective)
 		// The durable settlement is derived from the same result the Failed
 		// event is built from: a failed result that still carries the child's
 		// end_turn or cancelled stop reason would otherwise settle as
@@ -2049,6 +2050,9 @@ func (s *Server) buildTerminalEventLocked(
 		} else if upstreamFailure, ok := errors.AsType[*providerUpstreamFailureError](result.Err); ok {
 			code = providerUpstreamErrorCode
 			message = promptStreamErrorDetail(upstreamFailure)
+		} else if drainFailure, ok := errors.AsType[*providerDrainTimeoutError](result.Err); ok {
+			code = providerUpstreamErrorCode
+			message = drainFailure.Error()
 		} else if detail := promptFailureErrorDetail(result.Err); detail != "" {
 			// Keep the generic code but carry the agent's own error text
 			// (JSON-RPC error message and service/errorName data) so a
@@ -2121,6 +2125,32 @@ func (e providerUpstreamFailureError) Error() string {
 		message += ": " + detail
 	}
 	return message
+}
+
+// providerDrainTimeoutError records that an admitted inference request was
+// still unresolved when the child settled and did not finish within the
+// cancel grace, so the prompt's final inference outcome is unknown.
+type providerDrainTimeoutError struct{}
+
+func (providerDrainTimeoutError) Error() string {
+	return "a provider inference request was still in flight when the prompt settled and did not complete within the cancel grace"
+}
+
+// providerDrainFailureResult converts a Completed prompt whose inference
+// accounting is incomplete (an in-flight request never resolved) into a
+// Failed settlement: a successful Task must rest on accounted evidence, and
+// an unresolved request could still be a final failure that a child-reported
+// end_turn would otherwise mask.
+func providerDrainFailureResult(prompt *promptState, result acp.PromptResult) acp.PromptResult {
+	if prompt == nil || !prompt.providerDrainTimedOut || result.Outcome != acp.PromptOutcomeCompleted {
+		return result
+	}
+	slog.Error("ACP prompt settled as failed: an inference request did not drain before settlement", "promptID", string(prompt.request.Metadata.PromptID))
+	result.Outcome = acp.PromptOutcomeFailed
+	result.StopReason = acp.StopReasonRefusal
+	result.Accepted = true
+	result.Err = &providerDrainTimeoutError{}
+	return result
 }
 
 // providerUpstreamFailureResult converts a Completed prompt whose final
@@ -2250,15 +2280,23 @@ func settlePromptLocked(prompt *promptState, settlement harnessv2.PromptSettleme
 
 // waitProviderProxyDrained waits, bounded by the cancel grace, for the
 // session's in-flight provider requests to finish so their outcomes are
-// accounted before the terminal result is classified.
-func (s *Server) waitProviderProxyDrained(state *sessionState) {
+// accounted before the terminal result is classified. A request that does
+// not finish in time leaves the accounting incomplete: the prompt is marked
+// so a child-reported Completed result settles fail-closed instead of
+// trusting evidence that never arrived.
+func (s *Server) waitProviderProxyDrained(state *sessionState, prompt *promptState) {
 	if state == nil || state.providerProxy == nil {
 		return
 	}
 	waitCtx, cancel := context.WithTimeout(context.Background(), defaultDuration(s.cfg.CancelGrace, acp.DefaultStopGrace))
 	defer cancel()
 	if err := state.providerProxy.wait(waitCtx); err != nil {
-		slog.Warn("ACP provider proxy did not drain before prompt settlement", "errorClass", promptStreamErrorClass(err))
+		slog.Warn("ACP provider proxy did not drain before prompt settlement; settling fail-closed", "errorClass", promptStreamErrorClass(err))
+		if prompt != nil {
+			s.mu.Lock()
+			prompt.providerDrainTimedOut = true
+			s.mu.Unlock()
+		}
 	}
 }
 
