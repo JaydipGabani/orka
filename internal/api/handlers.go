@@ -608,10 +608,11 @@ func (h *Handlers) ListTasks(c fiber.Ctx) error {
 	filteredList := false
 	var remainingItemCount *int64
 	gatewayAuthorizations := map[gatewayTaskAuthorizationKey]bool{}
-	items, continueToken, err := collectAuthorizedPages(opts.Limit, opts.Continue, func(continueToken string) ([]corev1alpha1.Task, string, error) {
+	items, continueToken, err := collectAuthorizedPages(opts.Limit, opts.Continue, func(continueToken string, pageLimit int64) ([]corev1alpha1.Task, string, error) {
 		taskList := &corev1alpha1.TaskList{}
 		pageOpts := *opts
 		pageOpts.Continue = continueToken
+		pageOpts.Limit = pageLimit
 		if err := h.listPage(ctx, taskList, &pageOpts, "tasks"); err != nil {
 			return nil, "", err
 		}
@@ -1154,10 +1155,11 @@ func (h *Handlers) ListTools(c fiber.Ctx) error {
 	// count then describes the unfiltered collection and must not be exposed.
 	toolsFiltered := false
 	var toolRemaining *int64
-	crdTools, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string) ([]fiber.Map, string, error) {
+	crdTools, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string, pageLimit int64) ([]fiber.Map, string, error) {
 		toolList := &corev1alpha1.ToolList{}
 		pageOpts := *opts
 		pageOpts.Continue = continueToken
+		pageOpts.Limit = pageLimit
 		if err := h.listPage(ctx, toolList, &pageOpts, "tools"); err != nil {
 			return nil, "", err
 		}
@@ -1261,10 +1263,11 @@ func (h *Handlers) ListAgents(c fiber.Ctx) error {
 	ctx := c.Context()
 	agentsFiltered := false
 	var remainingItemCount *int64
-	items, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string) ([]corev1alpha1.Agent, string, error) {
+	items, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string, pageLimit int64) ([]corev1alpha1.Agent, string, error) {
 		agentList := &corev1alpha1.AgentList{}
 		pageOpts := *opts
 		pageOpts.Continue = continueToken
+		pageOpts.Limit = pageLimit
 		if err := h.listPage(ctx, agentList, &pageOpts, "agents"); err != nil {
 			return nil, "", err
 		}

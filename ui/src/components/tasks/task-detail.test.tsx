@@ -47,11 +47,19 @@ describe('TaskDetail', () => {
     expect(skeletons.length).toBeGreaterThan(0)
   })
 
-  it('renders a permission failure instead of "Task not found" when the task 403s', async () => {
+  it('renders a permission failure instead of "Task not found" when the task 403s and stops dependent polling', async () => {
+    mockSearch.current = { tab: 'runtime' }
+    const hits: Record<string, number> = {}
+    const forbidden = (key: string) => () => {
+      hits[key] = (hits[key] ?? 0) + 1
+      return HttpResponse.json({ error: { code: 403, message: 'scope missing' } }, { status: 403 })
+    }
     server.use(
-      http.get('/api/v1/tasks/test-task', () =>
-        HttpResponse.json({ error: { code: 403, message: 'scope missing' } }, { status: 403 }),
-      ),
+      http.get('/api/v1/tasks/:id', forbidden('task')),
+      http.get('/api/v1/tasks/:id/events', forbidden('events')),
+      http.get('/api/v1/tasks/:id/trace', forbidden('trace')),
+      http.get('/api/v1/tasks/:id/approvals', forbidden('approvals')),
+      http.get('/api/v1/tasks/:id/artifacts', forbidden('artifacts')),
     )
     render(<TaskDetail taskId="test-task" />)
     await waitFor(() => {
@@ -59,6 +67,17 @@ describe('TaskDetail', () => {
     })
     expect(screen.getByText(/scope missing/)).toBeInTheDocument()
     expect(screen.queryByText('Task not found')).not.toBeInTheDocument()
+    // Nothing keeps polling once access is forbidden: no task retries and no
+    // hidden dependent 403 traffic beyond a single request that raced the lookup.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const snapshot = { ...hits }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(hits).toEqual(snapshot)
+    expect(hits.task).toBe(1)
+    expect(hits.events ?? 0).toBeLessThanOrEqual(1)
+    expect(hits.trace ?? 0).toBeLessThanOrEqual(1)
+    expect(hits.approvals ?? 0).toBeLessThanOrEqual(1)
+    expect(hits.artifacts ?? 0).toBeLessThanOrEqual(1)
   })
 
   it('stops polling the task and its dependent endpoints once the task 404s', async () => {

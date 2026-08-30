@@ -62,14 +62,17 @@ function latestEventPlan(events: ExecutionEvent[]): PlanState | undefined {
 export function TaskDetail({ taskId }: { taskId: string }) {
   const [following, setFollowing] = useState(true)
   const { data: task, isLoading, error: taskError } = useTask(taskId, following ? 5000 : false)
-  // Once the primary task query 404s, every dependent query (events, trace,
-  // approvals, artifacts) is disabled so a missing task stops polling entirely.
+  // Once the primary task query 404s or 403s, every dependent query (events,
+  // trace, approvals, artifacts) is disabled so a missing or forbidden task
+  // stops polling entirely instead of generating hidden 403 traffic.
   const taskMissing = isNotFoundError(taskError)
+  const taskForbidden = isForbiddenError(taskError)
+  const taskUnavailable = taskMissing || taskForbidden
   const { data: taskEventsResponse, error: taskEventsError, failureReason: taskEventsFailureReason } = useTaskEvents(
     taskId,
     following ? 5000 : false,
     task?.metadata.uid,
-    !taskMissing,
+    !taskUnavailable,
   )
   // Fork and the runtime timeline need execution-event storage; a 501 means it's off.
   // While retries are pending, failureReason carries the current fetch failure.
@@ -107,7 +110,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
   const deleteArmed = confirmDelete === deleteIdentity
   // Runtime-tab data: fetched only when that tab is active so other tabs don't
   // pay for trace/approvals/artifacts. Each hook is namespace+uid scoped.
-  const runtimeActive = activeTab === 'runtime' && !taskMissing
+  const runtimeActive = activeTab === 'runtime' && !taskUnavailable
   const taskRunning = task?.status?.phase === 'Running'
   const taskTerminal = ['Succeeded', 'Failed', 'Cancelled'].includes(task?.status?.phase ?? '')
   const traceRefetchInterval = runtimeActive && taskRunning && following ? 5000 : false
@@ -161,7 +164,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
 
   // A 403 is an actionable permission failure, not a missing task; it must
   // not fall through to "Task not found" just because `task` is undefined.
-  if (isForbiddenError(taskError)) {
+  if (taskForbidden) {
     return (
       <div role="alert" className="space-y-1">
         <p className="text-sm font-medium">Not authorized to view this task</p>

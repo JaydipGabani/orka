@@ -210,11 +210,11 @@ func (h *Handlers) ListProviders(c fiber.Ctx) error {
 	}
 	filteredList := false
 	var remainingItemCount *int64
-	items, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string) ([]corev1alpha1.Provider, string, error) {
+	items, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string, pageLimit int64) ([]corev1alpha1.Provider, string, error) {
 		list := &corev1alpha1.ProviderList{}
 		if err := h.listPage(c.Context(), list, &client.ListOptions{
 			Namespace: namespace,
-			Limit:     pagination.Limit,
+			Limit:     pageLimit,
 			Continue:  continueToken,
 		}, "providers"); err != nil {
 			return nil, "", err

@@ -130,28 +130,28 @@ func listPageError(what string, err error) error {
 const maxAuthorizedListPages = 20
 
 // collectAuthorizedPages walks Kubernetes pages until the post-authorization
-// result holds at least limit items, the collection is exhausted, or the page
-// budget is spent, and returns the items with the continuation cursor of the
-// last page read. Filtering a single raw page would otherwise hand a scoped
-// caller one cursor per Kubernetes page — including pages the filter emptied
-// — and let it count and order objects it is not allowed to list. A page may
-// overfill by up to one Kubernetes page; items are never trimmed because the
-// cursor has already moved past them.
-func collectAuthorizedPages[T any](limit int64, start string, fetch func(continueToken string) ([]T, string, error)) ([]T, string, error) {
+// result holds limit items, the collection is exhausted, or the page budget
+// is spent, and returns the items with the continuation cursor of the last
+// page read. Filtering a single raw page would otherwise hand a scoped caller
+// one cursor per Kubernetes page — including pages the filter emptied — and
+// let it count and order objects it is not allowed to list. Each fetch is
+// asked for only the remaining authorized capacity, so a response never
+// exceeds the requested page size and no item is trimmed past its cursor.
+func collectAuthorizedPages[T any](limit int64, start string, fetch func(continueToken string, pageLimit int64) ([]T, string, error)) ([]T, string, error) {
 	if limit <= 0 {
 		// An unlimited request is served as one complete page.
-		return fetch(start)
+		return fetch(start, limit)
 	}
 	items := []T{}
 	continueToken := start
 	for page := 1; ; page++ {
-		pageItems, next, err := fetch(continueToken)
+		pageItems, next, err := fetch(continueToken, limit-int64(len(items)))
 		if err != nil {
 			return nil, "", err
 		}
 		items = append(items, pageItems...)
 		continueToken = next
-		if next == "" || (limit > 0 && int64(len(items)) >= limit) || page >= maxAuthorizedListPages {
+		if next == "" || int64(len(items)) >= limit || page >= maxAuthorizedListPages {
 			return items, continueToken, nil
 		}
 	}
