@@ -16,6 +16,32 @@ describe('useChatStore', () => {
     useChatStore.setState({ messages: [], currentSessionId: null, isStreaming: false, activeNamespace: 'default', selections: {} })
   })
 
+  it('resets the transcript and session when switching between namespaces', () => {
+    useChatStore.setState({
+      activeNamespace: 'alpha',
+      messages: [{ id: 'm1', role: 'user', content: 'hi', timestamp: new Date().toISOString() }],
+      currentSessionId: 'sess-alpha',
+      isStreaming: true,
+      turnEpoch: 3,
+    })
+    useChatStore.getState().selectNamespace('beta')
+    const state = useChatStore.getState()
+    expect(state.messages).toEqual([])
+    expect(state.currentSessionId).toBeNull()
+    expect(state.isStreaming).toBe(false)
+    expect(state.turnEpoch).toBe(4)
+
+    // Re-selecting the active namespace and the initial activation keep the
+    // transcript.
+    useChatStore.setState({ messages: [{ id: 'm2', role: 'user', content: 'again', timestamp: new Date().toISOString() }], currentSessionId: 'sess-beta' })
+    useChatStore.getState().selectNamespace('beta')
+    expect(useChatStore.getState().currentSessionId).toBe('sess-beta')
+    useChatStore.setState({ activeNamespace: '' })
+    useChatStore.getState().selectNamespace('gamma')
+    expect(useChatStore.getState().currentSessionId).toBe('sess-beta')
+    expect(useChatStore.getState().turnEpoch).toBe(4)
+  })
+
   it('keeps a separate provider/model selection per namespace', () => {
     useChatStore.getState().selectNamespace('alpha')
     useChatStore.getState().setProvider('anthropic')

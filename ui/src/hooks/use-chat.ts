@@ -66,7 +66,14 @@ export function useSendMessage() {
       // results, so the assistant message can render cross-linking chips.
       const createdTaskNames: string[] = []
 
+      // The turn owns the transcript only while the store's epoch is the one
+      // it started under; a namespace switch or New Chat mid-stream orphans
+      // it, after which nothing from this response may reach the store.
+      const epoch = useChatStore.getState().turnEpoch
+      const live = () => useChatStore.getState().turnEpoch === epoch
+
       function handleSSEEvent(event: string, data: string) {
+        if (!live()) return
         const now = new Date().toISOString()
 
         switch (event) {
@@ -209,6 +216,10 @@ export function useSendMessage() {
           body: JSON.stringify(body),
         })
 
+        if (!live()) {
+          await response.body?.cancel().catch(() => {})
+          return
+        }
         if (!response.ok) {
           const errText = await response.text().catch(() => 'Unknown error')
           addMessage({
@@ -239,6 +250,10 @@ export function useSendMessage() {
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
+          if (!live()) {
+            await reader.cancel().catch(() => {})
+            return
+          }
 
           buffer += decoder.decode(value, { stream: true })
 
@@ -271,6 +286,7 @@ export function useSendMessage() {
           }
         }
       } catch (err) {
+        if (!live()) return
         addMessage({
           id: generateMessageId(),
           role: 'error',
@@ -278,7 +294,9 @@ export function useSendMessage() {
           timestamp: new Date().toISOString(),
         })
       } finally {
-        setStreaming(false)
+        // An orphaned turn's transcript was already reset; its streaming flag
+        // was cleared with it and must not be touched again.
+        if (live()) setStreaming(false)
       }
     },
     [token, namespace, currentSessionId, provider, model, queryClient, addMessage, setSessionId, setStreaming, setUsageOnLastAssistant],

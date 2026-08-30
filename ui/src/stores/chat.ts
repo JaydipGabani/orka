@@ -14,6 +14,9 @@ interface ChatState {
   model: string
   activeNamespace: string
   selections: Record<string, ChatSelection>
+  // Incremented whenever the transcript is reset (namespace switch, new
+  // session) so an in-flight turn can tell it no longer owns the transcript.
+  turnEpoch: number
   // Actions
   setProvider: (provider: string) => void
   setModel: (model: string) => void
@@ -88,6 +91,7 @@ export const useChatStore = create<ChatState>()(
   provider: '',
   model: '',
   activeNamespace: '',
+  turnEpoch: 0,
   selections: {},
 
   setProvider: (provider) =>
@@ -103,10 +107,16 @@ export const useChatStore = create<ChatState>()(
   selectNamespace: (namespace) =>
     set((state) => {
       const selection = state.selections[namespace]
+      // Chat sessions are server-side namespace-scoped: moving between two
+      // namespaces drops the previous transcript and session ID (and orphans
+      // any turn still streaming) instead of replaying them against a
+      // different namespace. The initial activation keeps whatever is there.
+      const switching = state.activeNamespace !== '' && state.activeNamespace !== namespace
       return {
         activeNamespace: namespace,
         provider: selection?.provider ?? '',
         model: selection?.model ?? '',
+        ...(switching ? { messages: [], currentSessionId: null, isStreaming: false, turnEpoch: state.turnEpoch + 1 } : {}),
       }
     }),
 
@@ -127,7 +137,7 @@ export const useChatStore = create<ChatState>()(
 
   setSessionId: (id) => set({ currentSessionId: id }),
   setStreaming: (streaming) => set({ isStreaming: streaming }),
-  newSession: () => set({ messages: [], currentSessionId: null }),
+  newSession: () => set((state) => ({ messages: [], currentSessionId: null, isStreaming: false, turnEpoch: state.turnEpoch + 1 })),
 
   setUsageOnLastAssistant: (usage, tasksCreatedNames) =>
     set((state) => {

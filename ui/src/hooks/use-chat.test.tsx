@@ -274,6 +274,38 @@ describe('useSendMessage', () => {
     expect(assistant?.tasksCreatedNames).toBeUndefined()
   })
 
+  it('drops a turn orphaned by a namespace switch instead of writing into the new transcript', async () => {
+    // The response arrives only after the namespace has moved on.
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    fetchSpy.mockImplementation(async () => {
+      await gate
+      return createSSEResponse([
+        { event: 'status', data: JSON.stringify({ sessionId: 'sess-old', provider: 'openai', model: 'gpt-4o' }) },
+        { event: 'message', data: JSON.stringify({ content: 'stale answer' }) },
+      ])
+    })
+    const { result } = renderHook(() => useSendMessage(), { wrapper: createWrapper() })
+    let turn: Promise<void> = Promise.resolve()
+    act(() => {
+      turn = result.current('Hi there')
+    })
+    expect(useChatStore.getState().isStreaming).toBe(true)
+    act(() => {
+      useChatStore.getState().selectNamespace('team')
+    })
+    release()
+    await act(async () => {
+      await turn
+    })
+    const state = useChatStore.getState()
+    expect(state.currentSessionId).toBeNull()
+    expect(state.messages).toEqual([])
+    expect(state.isStreaming).toBe(false)
+  })
+
   it('handles fetch error — adds error message', async () => {
     fetchSpy.mockImplementation((input, init) => {
       const url = typeof input === 'string' ? input : (input as Request).url

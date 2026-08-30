@@ -115,6 +115,18 @@ describe('ChatPage', () => {
     expect(screen.queryByRole('option', { name: /anthropic \(/ })).not.toBeInTheDocument()
   })
 
+  it('ignores cached Provider items once listing them is forbidden', async () => {
+    providerList.current = {
+      data: { items: [{ name: 'anthropic', type: 'anthropic', defaultModel: 'claude-sonnet-4-20250514', ready: true }] },
+      error: new ApiError(403, JSON.stringify({ error: { code: 403, message: 'not authorized' } })),
+    }
+    render(<ChatPage />)
+    expect(screen.getByRole('alert')).toHaveTextContent('Not authorized to list Providers in default')
+    fireEvent.pointerDown(screen.getByRole('combobox', { name: 'Chat provider' }), { button: 0, pointerId: 1, pointerType: 'mouse' })
+    expect(await screen.findByRole('option', { name: /Server default/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /anthropic \(/ })).not.toBeInTheDocument()
+  })
+
   it('shows other provider list failures with their message', () => {
     providerList.current = { data: undefined, error: new ApiError(500, 'boom') }
     render(<ChatPage />)

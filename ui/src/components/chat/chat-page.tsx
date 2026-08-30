@@ -35,8 +35,10 @@ export function ChatPage() {
   useEffect(() => {
     selectNamespace(namespace)
   }, [namespace, selectNamespace])
-  const providers = providersData?.items ?? []
   const providersForbidden = isForbiddenError(providersError)
+  // React Query keeps the last successful data alongside a failed refetch; a
+  // 403 must not keep rendering Provider names the current token may not list.
+  const providers = providersForbidden ? [] : (providersData?.items ?? [])
   // A persisted pick can outlive its Provider (deleted, or listing now
   // forbidden). Sending that stale name would fail provider resolution on
   // every turn, so fall back to the server default once the list has
