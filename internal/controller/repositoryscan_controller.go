@@ -103,6 +103,9 @@ type RepositoryScanReconciler struct {
 	ArtifactStore    store.ArtifactStore
 	ResultStore      store.ResultStore
 	PublicationStore store.PublicationStore
+	// APIReader reads Secrets that the manager cache does not hold (the
+	// cache is scoped to runtime namespaces); nil falls back to Client.
+	APIReader client.Reader
 	// HTTPClient and GitHubAPIBaseURL serve the published-commit read that
 	// backs harness-v2 patch evidence; zero values use the defaults.
 	HTTPClient       *http.Client
@@ -3122,7 +3125,7 @@ func (r *RepositoryScanReconciler) updatePatchProposalFromSucceededTask(ctx cont
 		return err
 	}
 	if reason != "" {
-		proposal.Status = scanRunPhaseFailed
+		r.failPatchProposal(ctx, task, proposal, reason)
 		return nil
 	}
 	var verified patchVerificationResult
@@ -3133,10 +3136,11 @@ func (r *RepositoryScanReconciler) updatePatchProposalFromSucceededTask(ctx cont
 			return err
 		}
 		if reason != "" {
-			proposal.Status = scanRunPhaseFailed
+			r.failPatchProposal(ctx, task, proposal, reason)
 			return nil
 		}
 	}
+	proposal.Reason = ""
 	proposal.Branch = publication.branch
 	proposal.DiffArtifact = verified.diffArtifact
 	proposal.SummaryArtifact = verified.summaryArtifact
@@ -3145,6 +3149,16 @@ func (r *RepositoryScanReconciler) updatePatchProposalFromSucceededTask(ctx cont
 	proposal.PublicationEvidence = publication.publication
 	proposal.Status = patchProposalStatusPROpened
 	return nil
+}
+
+// failPatchProposal marks a proposal failed with an operator-facing reason
+// and logs it, so a succeeded patch Task whose evidence could not be verified
+// is diagnosable from the API, the dashboard, and the controller log.
+func (r *RepositoryScanReconciler) failPatchProposal(ctx context.Context, task *corev1alpha1.Task, proposal *store.PatchProposal, reason string) {
+	proposal.Status = scanRunPhaseFailed
+	proposal.Reason = boundACPStatusMessage(reason)
+	log.FromContext(ctx).Info("security patch proposal failed verification",
+		"namespace", task.Namespace, "task", task.Name, "finding", proposal.FindingID, "proposal", proposal.ID, "reason", proposal.Reason)
 }
 
 func (r *RepositoryScanReconciler) ingestPatchTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, task *corev1alpha1.Task) error {

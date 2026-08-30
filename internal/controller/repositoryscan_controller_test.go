@@ -4048,6 +4048,10 @@ func TestIngestPatchTaskV2ResultFailsClosed(t *testing.T) {
 			if _, _, err := fixture.store.GetArtifact(ctx, fixture.proposal.Namespace, fixture.proposal.TaskName, diffName); err == nil {
 				t.Fatal("a failed proposal must not persist a diff artifact")
 			}
+			proposals, _ := fixture.store.ListPatchProposals(ctx, fixture.proposal.Namespace, fixture.finding.ID)
+			if len(proposals) != 1 || strings.TrimSpace(proposals[0].Reason) == "" {
+				t.Fatalf("failed proposal must carry a reason, got %#v", proposals)
+			}
 		})
 	}
 }

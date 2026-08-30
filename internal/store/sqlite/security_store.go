@@ -875,10 +875,10 @@ func (s *Store) CreatePatchProposal(ctx context.Context, proposal *store.PatchPr
 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO security_patch_proposals
-		 (id, namespace, repository_scan, finding_id, task_name, branch, diff_artifact, summary_artifact, status, pr_number, pr_url, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 (id, namespace, repository_scan, finding_id, task_name, branch, diff_artifact, summary_artifact, status, reason, pr_number, pr_url, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		proposal.ID, proposal.Namespace, proposal.RepositoryScan, proposal.FindingID, proposal.TaskName, proposal.Branch,
-		proposal.DiffArtifact, proposal.SummaryArtifact, proposal.Status, proposal.PRNumber, proposal.PRURL, proposal.CreatedAt, proposal.UpdatedAt,
+		proposal.DiffArtifact, proposal.SummaryArtifact, proposal.Status, proposal.Reason, proposal.PRNumber, proposal.PRURL, proposal.CreatedAt, proposal.UpdatedAt,
 	)
 	return err
 }
@@ -913,10 +913,10 @@ func (s *Store) BindPatchProposalPublicationEvidence(ctx context.Context, propos
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx,
 		`UPDATE security_patch_proposals
-		 SET branch = ?, diff_artifact = ?, summary_artifact = ?, status = ?, pr_number = ?, pr_url = ?,
+		 SET branch = ?, diff_artifact = ?, summary_artifact = ?, status = ?, reason = ?, pr_number = ?, pr_url = ?,
 		     publication_evidence_json = ?, updated_at = ?
 		 WHERE namespace = ? AND id = ? AND publication_evidence_json = ''`,
-		proposal.Branch, proposal.DiffArtifact, proposal.SummaryArtifact, proposal.Status, proposal.PRNumber, proposal.PRURL,
+		proposal.Branch, proposal.DiffArtifact, proposal.SummaryArtifact, proposal.Status, proposal.Reason, proposal.PRNumber, proposal.PRURL,
 		evidenceJSON, now, proposal.Namespace, proposal.ID,
 	)
 	if err != nil {
@@ -956,7 +956,7 @@ func getPatchProposalPublicationBinding(
 	id string,
 ) (store.PatchProposal, string, error) {
 	row := queryer.QueryRowContext(ctx,
-		`SELECT namespace, id, task_name, branch, diff_artifact, summary_artifact, status, pr_number, pr_url,
+		`SELECT namespace, id, task_name, branch, diff_artifact, summary_artifact, status, reason, pr_number, pr_url,
 		        publication_evidence_json, created_at, updated_at
 		 FROM security_patch_proposals WHERE namespace = ? AND id = ?`,
 		namespace, id,
@@ -969,7 +969,7 @@ func scanPatchProposalPublicationBinding(scanner patchProposalPublicationBinding
 	var evidenceJSON string
 	if err := scanner.Scan(
 		&proposal.Namespace, &proposal.ID, &proposal.TaskName, &proposal.Branch, &proposal.DiffArtifact, &proposal.SummaryArtifact,
-		&proposal.Status, &proposal.PRNumber, &proposal.PRURL, &evidenceJSON, &proposal.CreatedAt, &proposal.UpdatedAt,
+		&proposal.Status, &proposal.Reason, &proposal.PRNumber, &proposal.PRURL, &evidenceJSON, &proposal.CreatedAt, &proposal.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return store.PatchProposal{}, "", store.ErrNotFound
@@ -1089,9 +1089,9 @@ func (s *Store) UpdatePatchProposal(ctx context.Context, proposal *store.PatchPr
 	now := time.Now().UTC()
 	result, err := s.db.ExecContext(ctx,
 		`UPDATE security_patch_proposals
-		 SET task_name = ?, branch = ?, diff_artifact = ?, summary_artifact = ?, status = ?, pr_number = ?, pr_url = ?, updated_at = ?
+		 SET task_name = ?, branch = ?, diff_artifact = ?, summary_artifact = ?, status = ?, reason = ?, pr_number = ?, pr_url = ?, updated_at = ?
 		 WHERE namespace = ? AND id = ? AND publication_evidence_json = ''`,
-		proposal.TaskName, proposal.Branch, proposal.DiffArtifact, proposal.SummaryArtifact, proposal.Status, proposal.PRNumber,
+		proposal.TaskName, proposal.Branch, proposal.DiffArtifact, proposal.SummaryArtifact, proposal.Status, proposal.Reason, proposal.PRNumber,
 		proposal.PRURL, now, proposal.Namespace, proposal.ID,
 	)
 	if err != nil {
@@ -1127,7 +1127,7 @@ func (s *Store) UpdatePatchProposal(ctx context.Context, proposal *store.PatchPr
 func (s *Store) ListPatchProposals(ctx context.Context, namespace, findingID string) ([]store.PatchProposal, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, namespace, repository_scan, finding_id, task_name, branch, diff_artifact, summary_artifact,
-		        status, pr_number, pr_url, publication_evidence_json, created_at, updated_at
+		        status, reason, pr_number, pr_url, publication_evidence_json, created_at, updated_at
 		 FROM security_patch_proposals
 		 WHERE namespace = ? AND finding_id = ?
 		 ORDER BY created_at DESC, id DESC`,
@@ -1144,7 +1144,7 @@ func (s *Store) ListPatchProposals(ctx context.Context, namespace, findingID str
 		var evidenceJSON string
 		if err := rows.Scan(
 			&proposal.ID, &proposal.Namespace, &proposal.RepositoryScan, &proposal.FindingID, &proposal.TaskName, &proposal.Branch,
-			&proposal.DiffArtifact, &proposal.SummaryArtifact, &proposal.Status, &proposal.PRNumber, &proposal.PRURL,
+			&proposal.DiffArtifact, &proposal.SummaryArtifact, &proposal.Status, &proposal.Reason, &proposal.PRNumber, &proposal.PRURL,
 			&evidenceJSON, &proposal.CreatedAt, &proposal.UpdatedAt,
 		); err != nil {
 			return nil, err

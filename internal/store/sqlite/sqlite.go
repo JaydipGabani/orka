@@ -408,6 +408,7 @@ func migrate(db *sql.DB) error {
 			diff_artifact     TEXT NOT NULL DEFAULT '',
 			summary_artifact  TEXT NOT NULL DEFAULT '',
 			status            TEXT NOT NULL,
+			reason            TEXT NOT NULL DEFAULT '',
 			pr_number         INTEGER,
 			pr_url            TEXT NOT NULL DEFAULT '',
 			publication_evidence_json TEXT NOT NULL DEFAULT '',
@@ -1079,6 +1080,7 @@ func migrate(db *sql.DB) error {
 	}
 	if err := ensureSQLiteColumns(db, "security_patch_proposals", []sqliteColumnMigration{
 		{Name: "publication_evidence_json", Definition: "publication_evidence_json TEXT NOT NULL DEFAULT ''"},
+		{Name: "reason", Definition: "reason TEXT NOT NULL DEFAULT ''"},
 	}); err != nil {
 		return err
 	}

@@ -90,15 +90,18 @@ type Finding struct {
 
 // PatchProposal represents a patch generation attempt for a finding.
 type PatchProposal struct {
-	ID                  string                    `json:"id"`
-	Namespace           string                    `json:"namespace"`
-	RepositoryScan      string                    `json:"repositoryScan"`
-	FindingID           string                    `json:"findingID"`
-	TaskName            string                    `json:"taskName"`
-	Branch              string                    `json:"branch"`
-	DiffArtifact        string                    `json:"diffArtifact,omitempty"`
-	SummaryArtifact     string                    `json:"summaryArtifact,omitempty"`
-	Status              string                    `json:"status"`
+	ID              string `json:"id"`
+	Namespace       string `json:"namespace"`
+	RepositoryScan  string `json:"repositoryScan"`
+	FindingID       string `json:"findingID"`
+	TaskName        string `json:"taskName"`
+	Branch          string `json:"branch"`
+	DiffArtifact    string `json:"diffArtifact,omitempty"`
+	SummaryArtifact string `json:"summaryArtifact,omitempty"`
+	Status          string `json:"status"`
+	// Reason explains a failed proposal in operator-facing terms (no
+	// credential or agent-controlled text); empty while pending or succeeded.
+	Reason              string                    `json:"reason,omitempty"`
 	PRNumber            *int                      `json:"prNumber,omitempty"`
 	PRURL               string                    `json:"prURL,omitempty"`
 	PublicationEvidence *PatchPublicationEvidence `json:"publicationEvidence,omitempty"`

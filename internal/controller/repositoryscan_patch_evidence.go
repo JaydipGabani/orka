@@ -136,12 +136,16 @@ func (r *RepositoryScanReconciler) repositoryScanForgeToken(ctx context.Context,
 	if scan.Spec.ForgeCredentialRef == nil || strings.TrimSpace(scan.Spec.ForgeCredentialRef.Name) == "" {
 		return "", "spec.forgeCredentialRef is required to verify the published patch", nil
 	}
-	if r.Client == nil {
+	var reader = r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if reader == nil {
 		return "", "forge credential client is not configured", nil
 	}
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: scan.Namespace, Name: strings.TrimSpace(scan.Spec.ForgeCredentialRef.Name)}
-	if err := r.Get(ctx, key, secret); err != nil {
+	if err := reader.Get(ctx, key, secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			return "", "forge credential secret was not found", nil
 		}

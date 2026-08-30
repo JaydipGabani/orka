@@ -1806,6 +1806,7 @@ func main() {
 
 	if err := (&controller.RepositoryScanReconciler{
 		Client:           mgr.GetClient(),
+		APIReader:        mgr.GetAPIReader(),
 		Scheme:           mgr.GetScheme(),
 		SecurityStore:    sqliteStore,
 		ArtifactStore:    sqliteStore,
