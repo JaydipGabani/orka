@@ -55,37 +55,58 @@ func ValidateCustomPolicyText(text string) error {
 
 var (
 	policySensitivePrefixPattern     = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9])(?:(?:github` + `_pat_|` + `g` + `hp_|xo` + `xb-|s` + `k-)[A-Za-z0-9_./+=:-]{8,}|(?:A` + `KIA|A` + `SIA)[A-Z0-9]{16})`)
-	policySensitiveAssignmentPattern = regexp.MustCompile(`(?i)\b(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|client[_-]?` + `secret|private[_-]?` + `key)\s*[:=]\s*["']?[A-Za-z0-9_./+=:-]{16,}`)
+	policySensitiveAssignmentPattern = regexp.MustCompile(`(?i)\b(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|priv` + `ate[_-]?key)\s*[:=]\s*["']?([A-Za-z0-9_./+=:-]{16,})`)
 	policyJWTPattern                 = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])ey` + `J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}([^A-Za-z0-9_-]|$)`)
+	// Header-carried credentials are flagged only when a credential-shaped
+	// value follows: "Authorization: Bearer $TOKEN" in documentation is not
+	// a secret, "Authorization: Bearer eyJ…" or a 16+ character opaque token
+	// is.
+	policyBearerHeaderPattern = regexp.MustCompile(`(?i)auth` + `orization\s*:\s*be` + `arer\s+([A-Za-z0-9_./+=:-]{16,})`)
+	policyTxnTokenPattern     = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=:-]{16,})`)
 )
 
+// secretValuePlaceholder reports whether a credential-position value is an
+// obvious placeholder (a shell or template variable reference, or a
+// bracketed/braced example) rather than a literal secret.
+func secretValuePlaceholder(value string) bool {
+	if value == "" {
+		return true
+	}
+	switch value[0] {
+	case '$', '<', '{', '%', '[':
+		return true
+	}
+	return false
+}
+
+func sensitiveValueMatch(pattern *regexp.Regexp, text string) bool {
+	for _, match := range pattern.FindAllStringSubmatch(text, -1) {
+		if len(match) > 1 && !secretValuePlaceholder(match[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// LooksLikeSecret reports whether text carries a credential-shaped value:
+// known token prefixes, JWTs, PEM blocks, or an assignment/header whose value
+// is long enough to be a real secret. Bare keywords such as
+// "OPENAI_API_KEY=dummy" or "Authorization: Bearer $TOKEN" are not secrets
+// and must not block documentation or code that merely mentions them.
 func LooksLikeSecret(text string) bool {
 	if policySensitivePrefixPattern.MatchString(text) {
 		return true
 	}
-	if policySensitiveAssignmentPattern.MatchString(text) {
+	if sensitiveValueMatch(policySensitiveAssignmentPattern, text) {
 		return true
 	}
 	if policyJWTPattern.MatchString(text) {
 		return true
 	}
-	lower := strings.ToLower(text)
-	for _, marker := range []string{
-		"-----" + "begin ",
-		"authorization" + ": bearer",
-		"api" + "_key=",
-		"api" + "key=",
-		"pass" + "word=",
-		"client" + "_secret=",
-		"private" + "_key=",
-		"txn" + "-token:",
-		"tx" + "-token:",
-	} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
+	if sensitiveValueMatch(policyBearerHeaderPattern, text) || sensitiveValueMatch(policyTxnTokenPattern, text) {
+		return true
 	}
-	return false
+	return strings.Contains(strings.ToLower(text), "-----"+"begin ")
 }
 
 func PolicyTextDigest(text string) string {

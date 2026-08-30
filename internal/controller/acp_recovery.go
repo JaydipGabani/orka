@@ -1774,7 +1774,15 @@ func (d *ACPDispatcher) patchRecoveredTerminalExecution(ctx context.Context, tas
 			store.PromptDeliveryVerifiedExact, store.PromptDeliveryDeliveredSuperseded:
 			return d.completeSuccessWithDelivery(ctx, task, *status, "ACP task recovered after controller restart")
 		default:
-			return d.failTaskForDelivery(ctx, task, *status, "ACP delivery recovered as terminal failure after controller restart")
+			// The authoritative attempt settles the Task; it may reach this
+			// path after a controller restart or when the live settlement
+			// was interrupted, so the message must not claim a restart and
+			// should carry the delivery failure the user needs to act on.
+			message := "ACP delivery failed"
+			if detail := strings.TrimSpace(status.Message); detail != "" {
+				message += ": " + detail
+			}
+			return d.failTaskForDelivery(ctx, task, *status, message)
 		}
 	}
 	key := types.NamespacedName{Namespace: task.Namespace, Name: task.Name}

@@ -547,3 +547,33 @@ func TestLoadScannerPolicyRequiresPolicyConfigMapOptInLabel(t *testing.T) {
 		t.Fatalf("LoadScannerPolicy() error = %v, want opt-in label error", err)
 	}
 }
+
+func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
+	t.Parallel()
+	for _, text := range []string{
+		"env OPENAI_API_KEY=dummy ANTHROPIC_API_KEY=dummy vekil",
+		"curl -H 'Authorization: Bearer $VEKIL_TOKEN' http://host.docker.internal:1337/v1/models",
+		"Authorization: Bearer <your-token>",
+		"Authorization: Bearer {{ .Token }}",
+		"password=changeme",
+		"api_key=${OPENAI_API_KEY}",
+		"The token is validated by the proxy; set TOKEN=xxxx in .env",
+		"Txn-Token: <transaction token>",
+	} {
+		if LooksLikeSecret(text) {
+			t.Fatalf("LooksLikeSecret(%q) = true, want false for a placeholder or bare keyword", text)
+		}
+	}
+	for _, text := range []string{
+		"Authorization: Bearer " + strings.Repeat("q", 24) + "-opaque",
+		"api_key=" + strings.Repeat("0123456789abcdef", 2),
+		"OPENAI_API_KEY=" + "s" + "k-" + strings.Repeat("a", 24),
+		"Txn-Token: " + strings.Repeat("t", 32),
+		"-----" + "BEGIN RSA PRIVATE KEY-----",
+		"g" + "hp_" + strings.Repeat("x", 36),
+	} {
+		if !LooksLikeSecret(text) {
+			t.Fatalf("LooksLikeSecret(%q) = false, want true for a credential-shaped value", text)
+		}
+	}
+}
