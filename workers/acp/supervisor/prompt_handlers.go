@@ -856,6 +856,7 @@ func (s *Server) handleCancelPrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	if state.prompt == nil {
 		s.mu.Unlock()
+		slog.Info("ACP prompt cancellation rejected: no active prompt", "promptID", request.Metadata.PromptID, "reason", request.Reason)
 		writeError(w, http.StatusGone, harnessv2.ErrorCodeSettled, "prompt is not active", nil, false)
 		return
 	}
@@ -890,6 +891,11 @@ func (s *Server) handleCancelPrompt(w http.ResponseWriter, r *http.Request) {
 	result, cancelErr := mutations.CancelPrompt(cancelCtx, string(request.Metadata.PromptID))
 	if cancelErr != nil && result.Outcome == "" {
 		result = acp.PromptResult{Outcome: acp.PromptOutcomeOutcomeUnknown, Accepted: true, Err: cancelErr, SettledAt: time.Now().UTC()}
+	}
+	if cancelErr != nil || result.Outcome == acp.PromptOutcomeOutcomeUnknown {
+		slog.Warn("ACP prompt cancellation did not settle cleanly",
+			"promptID", request.Metadata.PromptID, "reason", request.Reason, "outcome", result.Outcome,
+			"errorClass", promptStreamErrorClass(cancelErr), "deadlineExceeded", errors.Is(cancelErr, context.DeadlineExceeded))
 	}
 	settlement := settlementFromResult(result, time.Now().UTC())
 	forced := cancelErr != nil && result.Outcome == acp.PromptOutcomeOutcomeUnknown

@@ -4790,6 +4790,9 @@ func (d *ACPDispatcher) handlePromptStreamError(
 					)
 				}
 			}
+			logACPCancelSettlementUnknown(ctx, task, reason, response, cancelErr)
+		} else {
+			logf.FromContext(ctx).Error(sealErr, "seal ACP prompt cancellation request", "namespace", task.Namespace, "task", task.Name)
 		}
 		if lifecycleErr := appendPromptStreamFailureLifecycleDetached(ctx, journalState, err); lifecycleErr != nil {
 			logf.FromContext(ctx).Error(lifecycleErr, "persist unknown ACP prompt settlement", "namespace", task.Namespace, "task", task.Name)
@@ -4873,6 +4876,7 @@ func (d *ACPDispatcher) handlePromptUpdatePersistenceFailure(
 				ctx, task, attemptID, fence, "prompt was settled after execution update persistence failed",
 			)
 		}
+		logACPCancelSettlementUnknown(ctx, task, cancelRequest.Reason, response, cancelErr)
 	}
 	if !persistenceErr.journalFailed() {
 		if lifecycleErr := appendPromptStreamFailureLifecycleDetached(ctx, journalState, persistenceErr); lifecycleErr != nil {
@@ -4914,6 +4918,51 @@ const promptStreamMissingTerminalDiagnostic = "runtime stream ended without a te
 // turns ordinary contention between concurrent ACP prompts into a failed
 // Task with ExecutionEventPersistenceFailed.
 const acpInterruptedOutputFlushTimeout = 60 * time.Second
+
+const (
+	acpCancelLogKeyNamespace = "namespace"
+	acpCancelLogKeyTask      = "task"
+	acpCancelLogKeyStatus    = "status"
+	acpCancelLogKeyKind      = "kind"
+)
+
+// logACPCancelSettlementUnknown records why an explicit prompt cancellation
+// could not prove settlement, so an OutcomeUnknown/RuntimeLost Task can be
+// diagnosed from controller logs. Fields stay low-cardinality: transport
+// status/code/kind for a client error, and the runtime's barrier, forced
+// termination, and terminal event when the request itself succeeded.
+func logACPCancelSettlementUnknown(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	reason harnessv2.CancelReason,
+	response *harnessv2.CancelPromptResponse,
+	cancelErr error,
+) {
+	httpStatus, code, kind := 0, harnessv2.ErrorCode(""), harnessv2.ClientErrorKind("")
+	if clientErr, ok := errors.AsType[*harnessv2.ClientError](cancelErr); ok {
+		httpStatus, code, kind = clientErr.StatusCode, clientErr.Code, clientErr.Kind
+	}
+	fields := []any{
+		acpCancelLogKeyNamespace, task.Namespace,
+		acpCancelLogKeyTask, task.Name,
+		eventReasonField, reason,
+		"requestFailed", cancelErr != nil,
+		"timedOut", errors.Is(cancelErr, context.DeadlineExceeded),
+		acpCancelLogKeyStatus, httpStatus,
+		"code", code,
+		acpCancelLogKeyKind, kind,
+	}
+	if response != nil {
+		fields = append(fields,
+			"classification", response.Classification.Class,
+			"barrier", response.BarrierState,
+			"forcedTermination", response.ForcedTermination,
+			"terminalEvent", response.Settlement.TerminalEvent,
+			"settlementProven", response.SettlementProven,
+		)
+	}
+	logf.FromContext(ctx).Info("ACP prompt cancellation settlement unknown", fields...)
+}
 
 func promptStreamDiagnostic(err error) string {
 	var persistenceErr *acpExecutionUpdatePersistenceError
