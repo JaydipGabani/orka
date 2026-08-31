@@ -2105,13 +2105,22 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 		for i := range matches {
 			mergeFindingEvidenceAndRemediation(existing, &matches[i])
 		}
+		aliases := make([]string, 0, len(matches)-1)
 		for i := range matches {
 			candidate := &matches[i]
 			if candidate.ID == existing.ID || candidate.DuplicateOf == existing.ID {
 				continue
 			}
-			if err := r.SecurityStore.MarkFindingDuplicate(ctx, scan.Namespace, candidate.ID, existing.ID); err != nil {
+			aliases = append(aliases, candidate.ID)
+		}
+		if len(aliases) > 0 {
+			if err := r.SecurityStore.UpsertFinding(ctx, existing); err != nil {
 				return err
+			}
+			for _, aliasID := range aliases {
+				if err := r.SecurityStore.MarkFindingDuplicate(ctx, scan.Namespace, aliasID, existing.ID); err != nil {
+					return err
+				}
 			}
 		}
 	} else if existing.DuplicateOf != "" {

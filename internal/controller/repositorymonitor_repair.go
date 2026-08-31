@@ -150,19 +150,19 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestCommandRun(ctx contex
 		}
 		return true, 0, nil
 	case repositoryMonitorCommandIntentUpdateBranch:
-		if blockedLabel := repositoryMonitorBlockedLabel(monitor.Spec, pr.Labels); blockedLabel != "" {
-			item.RepairState = repositoryMonitorRepairPhaseFailed
-			item.SkipReason = repositoryMonitorSkipReasonBlockedLabel
-			if err := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, pr.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusBlocked, "update_branch_blocked", "", repositoryMonitorSkipReasonBlockedLabel); err != nil {
-				return true, 0, err
-			}
-			return true, 0, r.Store.UpsertMonitorItem(ctx, item)
-		}
 		accepted, err := r.repositoryMonitorUpdateBranchAccepted(ctx, monitor, command.ID)
 		if err != nil {
 			return true, 0, err
 		}
 		if !accepted {
+			if blockedLabel := repositoryMonitorBlockedLabel(monitor.Spec, pr.Labels); blockedLabel != "" {
+				item.RepairState = repositoryMonitorRepairPhaseFailed
+				item.SkipReason = repositoryMonitorSkipReasonBlockedLabel
+				if err := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, pr.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusBlocked, "update_branch_blocked", "", repositoryMonitorSkipReasonBlockedLabel); err != nil {
+					return true, 0, err
+				}
+				return true, 0, r.Store.UpsertMonitorItem(ctx, item)
+			}
 			if cancelled, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent); err != nil || cancelled {
 				return true, 0, err
 			}

@@ -3840,6 +3840,153 @@ func TestMergeExistingFindingCollapsesSemanticDuplicates(t *testing.T) {
 	}
 }
 
+type failingObservedFindingStore struct {
+	storepkg.SecurityStore
+}
+
+func (failingObservedFindingStore) UpsertObservedFinding(context.Context, *storepkg.Finding) error {
+	return errors.New("observed finding write unavailable")
+}
+
+func TestMergeExistingFindingPersistsCanonicalBeforeMarkingDuplicates(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	reconciler := &RepositoryScanReconciler{SecurityStore: failingObservedFindingStore{SecurityStore: securityStore}}
+	scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}}
+	created := mustParseTime(t, "2026-08-01T00:00:00Z")
+	decisionAt := created.Add(2 * time.Hour)
+	prNumber := 42
+	canonical := &storepkg.Finding{
+		ID:               "fnd_durable_canonical",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_old",
+		Fingerprint:      "durable-canonical",
+		Title:            "Archive extraction permits traversal",
+		Category:         "path traversal",
+		Summary:          "old wording",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: "unvalidated",
+		State:            findingStateOpen,
+		FilePath:         "archive.go",
+		Line:             100,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 100, EndLine: 108, Symbol: "extractArchive", Quote: "canonical"}},
+		CreatedAt:        created,
+	}
+	remediated := &storepkg.Finding{
+		ID:               "fnd_durable_remediation",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_old",
+		Fingerprint:      "durable-remediation",
+		Title:            "ZIP entries can escape the destination",
+		Category:         "CWE-22 path traversal",
+		Summary:          "remediation wording",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusPending,
+		State:            findingStatePROpen,
+		FilePath:         "archive.go",
+		Line:             103,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 103, EndLine: 111, Symbol: "extractArchive", Quote: "remediation"}},
+		PatchProposalID:  "patch-1",
+		PRNumber:         &prNumber,
+		PRURL:            "https://github.com/example/kaset/pull/42",
+		CreatedAt:        created.Add(time.Hour),
+	}
+	governed := &storepkg.Finding{
+		ID:               "fnd_durable_governance",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_old",
+		Fingerprint:      "durable-governance",
+		Title:            "Unsafe ZIP paths reach the filesystem",
+		Category:         "ZIP path traversal",
+		Summary:          "governance wording",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusValidated,
+		ValidationJSON:   `{"status":"validated"}`,
+		State:            "suppressed",
+		DecisionAt:       decisionAt,
+		FilePath:         "archive.go",
+		Line:             105,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 105, EndLine: 113, Symbol: "extractArchive", Quote: "governance"}},
+		CreatedAt:        decisionAt,
+	}
+	for _, finding := range []*storepkg.Finding{canonical, remediated, governed} {
+		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
+		}
+	}
+
+	incoming := &storepkg.Finding{
+		ID:               "fnd_durable_incoming",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_current",
+		Fingerprint:      "durable-incoming",
+		Title:            "Untrusted ZIP paths write outside the extraction root",
+		Category:         "ZIP path traversal",
+		Summary:          "current wording",
+		Severity:         "critical",
+		Confidence:       "high",
+		ValidationStatus: "unvalidated",
+		State:            findingStateOpen,
+		FilePath:         "archive.go",
+		Line:             106,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 106, EndLine: 114, Symbol: "extractArchive", Quote: "incoming"}},
+	}
+	if err := reconciler.mergeExistingFinding(ctx, scan, incoming); err != nil {
+		t.Fatalf("mergeExistingFinding() error = %v", err)
+	}
+	if err := reconciler.SecurityStore.UpsertObservedFinding(ctx, incoming); err == nil {
+		t.Fatal("UpsertObservedFinding() error = nil, want injected failure")
+	}
+
+	stored, err := securityStore.GetFinding(ctx, defaultNS, canonical.ID)
+	if err != nil {
+		t.Fatalf("GetFinding(canonical) error = %v", err)
+	}
+	if stored.State != "suppressed" || !stored.DecisionAt.Equal(decisionAt) || stored.PatchProposalID != remediated.PatchProposalID || stored.PRNumber == nil || *stored.PRNumber != prNumber || stored.ValidationStatus != findingValidationStatusValidated || stored.ValidationJSON != governed.ValidationJSON {
+		t.Fatalf("canonical finding = %#v, want merged durable state", stored)
+	}
+	if len(stored.Evidence) != 3 {
+		t.Fatalf("canonical evidence = %#v, want all durable preexisting evidence", stored.Evidence)
+	}
+	for _, aliasID := range []string{remediated.ID, governed.ID} {
+		alias, getErr := securityStore.GetFinding(ctx, defaultNS, aliasID)
+		if getErr != nil || alias.DuplicateOf != canonical.ID {
+			t.Fatalf("duplicate alias %s = %#v, err %v", aliasID, alias, getErr)
+		}
+	}
+
+	retry := &storepkg.Finding{
+		ID:               "fnd_durable_retry",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_retry",
+		Fingerprint:      "durable-retry",
+		Title:            incoming.Title,
+		Category:         incoming.Category,
+		Summary:          incoming.Summary,
+		Severity:         incoming.Severity,
+		Confidence:       incoming.Confidence,
+		ValidationStatus: "unvalidated",
+		State:            findingStateOpen,
+		FilePath:         incoming.FilePath,
+		Line:             incoming.Line,
+		Evidence:         incoming.Evidence,
+	}
+	if err := reconciler.mergeExistingFinding(ctx, scan, retry); err != nil {
+		t.Fatalf("mergeExistingFinding(retry) error = %v", err)
+	}
+	if retry.ID != canonical.ID || retry.State != "suppressed" || retry.PatchProposalID != remediated.PatchProposalID || retry.ValidationStatus != findingValidationStatusValidated {
+		t.Fatalf("retry finding = %#v, want state recovered from canonical", retry)
+	}
+}
+
 func TestMergeExistingFindingDoesNotBridgeCanonicalThroughAlias(t *testing.T) {
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)
