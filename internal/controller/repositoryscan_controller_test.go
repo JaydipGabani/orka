@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -840,6 +841,98 @@ func TestIngestReviewTaskRejectsConflictingDeterministicRetry(t *testing.T) {
 	if run.Phase != scanRunPhaseRunning || run.ErrorMessage != "" {
 		t.Fatalf("run after collision = %#v, want unchanged active run", run)
 	}
+}
+
+func TestIngestReviewTaskReplacesTerminalRetryFromPriorRun(t *testing.T) {
+	fixture := newReviewResultRetryFixture(t)
+	scheduledScan := &corev1alpha1.RepositoryScan{}
+	if err := fixture.client.Get(fixture.ctx, client.ObjectKeyFromObject(fixture.scan), scheduledScan); err != nil {
+		t.Fatalf("Get(RepositoryScan) error = %v", err)
+	}
+	scheduledScan.Spec.Schedule = "* * * * *"
+	if err := fixture.client.Update(fixture.ctx, scheduledScan); err != nil {
+		t.Fatalf("Update(RepositoryScan schedule) error = %v", err)
+	}
+	fixture.scan = scheduledScan
+	conflict := priorRunReviewRetryTask(t, fixture, corev1alpha1.TaskPhaseSucceeded)
+	if err := fixture.client.Create(fixture.ctx, conflict); err != nil {
+		t.Fatalf("Create(stale retry) error = %v", err)
+	}
+
+	result, err := fixture.reconciler.Reconcile(fixture.ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(fixture.scan)})
+	if err != nil {
+		t.Fatalf("Reconcile(stale retry) error = %v", err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("Reconcile(stale retry) result = %#v, want immediate replacement requeue", result)
+	}
+	deleted := &corev1alpha1.Task{}
+	err = fixture.client.Get(fixture.ctx, client.ObjectKeyFromObject(conflict), deleted)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("Get(stale retry) error = %v, want not found after replacement handoff", err)
+	}
+	run, err := fixture.store.GetScanRun(fixture.ctx, defaultNS, fixture.run.ID)
+	if err != nil {
+		t.Fatalf("GetScanRun() error = %v", err)
+	}
+	if run.Phase != scanRunPhaseRunning || run.ErrorMessage != "" {
+		t.Fatalf("run after stale retry deletion = %#v, want unchanged active run", run)
+	}
+
+	if _, err := fixture.reconciler.Reconcile(fixture.ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(fixture.scan)}); err != nil {
+		t.Fatalf("Reconcile(replacement retry) error = %v", err)
+	}
+	retryTask := fixture.getRetryTask(t)
+	if retryTask.Labels[labels.LabelSecurityScanID] != fixture.run.ID ||
+		retryTask.Annotations[labels.AnnotationSecurityReviewAttempt] != strconv.Itoa(securityReviewRetryAttempt) {
+		t.Fatalf("replacement retry identity = labels %#v annotations %#v", retryTask.Labels, retryTask.Annotations)
+	}
+}
+
+func TestIngestReviewTaskDoesNotReplaceRunningRetryFromPriorRun(t *testing.T) {
+	fixture := newReviewResultRetryFixture(t)
+	conflict := priorRunReviewRetryTask(t, fixture, corev1alpha1.TaskPhaseRunning)
+	if err := fixture.client.Create(fixture.ctx, conflict); err != nil {
+		t.Fatalf("Create(running retry) error = %v", err)
+	}
+
+	err := fixture.reconciler.ingestScanTask(fixture.ctx, fixture.scan, fixture.sourceTask)
+	if err == nil || !strings.Contains(err.Error(), "conflicts with the expected retry identity") {
+		t.Fatalf("ingestScanTask(source) error = %v, want running retry conflict", err)
+	}
+	existing := &corev1alpha1.Task{}
+	if getErr := fixture.client.Get(fixture.ctx, client.ObjectKeyFromObject(conflict), existing); getErr != nil {
+		t.Fatalf("Get(running retry) error = %v, want task preserved", getErr)
+	}
+}
+
+func priorRunReviewRetryTask(t *testing.T, fixture *reviewResultRetryFixture, phase corev1alpha1.TaskPhase) *corev1alpha1.Task {
+	t.Helper()
+	task := &corev1alpha1.Task{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "Task"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fixture.retryTaskName(),
+			Namespace: defaultNS,
+			UID:       types.UID("prior-run-retry-uid"),
+			Labels: map[string]string{
+				labels.LabelManaged:         "true",
+				labels.LabelCreatedBy:       "repository-security",
+				labels.LabelSecurityTarget:  labels.SelectorValue(fixture.scan.Name),
+				labels.LabelSecurityScanID:  "scan_prior_retry_result",
+				labels.LabelSecurityMode:    fixture.run.Mode,
+				labels.LabelSecurityStage:   security.StageReview,
+				labels.LabelSecuritySliceID: fixture.slice.ID,
+			},
+			Annotations: map[string]string{
+				labels.AnnotationSecurityReviewAttempt: strconv.Itoa(securityReviewRetryAttempt),
+			},
+		},
+		Status: corev1alpha1.TaskStatus{Phase: phase},
+	}
+	if err := controllerutil.SetControllerReference(fixture.scan, task, fixture.reconciler.Scheme); err != nil {
+		t.Fatalf("SetControllerReference(stale retry) error = %v", err)
+	}
+	return task
 }
 
 func TestIngestReviewTaskRejectsInvalidAttemptIdentityWithoutRetry(t *testing.T) {

@@ -91,7 +91,10 @@ const (
 		"Do not include prose, Markdown fences, or tool transcripts."
 )
 
-var errScannerPolicyDigestChanged = errors.New("scanner policy digest changed during scan run")
+var (
+	errScannerPolicyDigestChanged    = errors.New("scanner policy digest changed during scan run")
+	errReviewRetryReplacementPending = errors.New("stale review retry task replacement pending")
+)
 
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
 
@@ -177,6 +180,9 @@ func (r *RepositoryScanReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	if err := r.ingestOwnedTasks(ctx, scan); err != nil {
+		if errors.Is(err, errReviewRetryReplacementPending) {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
 		logger.Error(err, "failed to ingest security tasks")
 		return ctrl.Result{}, err
 	}
@@ -2512,6 +2518,14 @@ func (r *RepositoryScanReconciler) ensureReviewResultRetry(
 			return false, getErr
 		}
 		if !matchingReviewRetryTask(existing, desired) {
+			if replaceableStaleReviewRetryTask(existing, desired) {
+				if existing.DeletionTimestamp.IsZero() {
+					if deleteErr := r.Delete(ctx, existing, deleteCurrentObjectPreconditions(existing)...); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+						return false, fmt.Errorf("deleting stale review retry task %s/%s: %w", existing.Namespace, existing.Name, deleteErr)
+					}
+				}
+				return false, fmt.Errorf("%w: %s/%s", errReviewRetryReplacementPending, existing.Namespace, existing.Name)
+			}
 			return false, fmt.Errorf("review retry task %s/%s conflicts with the expected retry identity", desired.Namespace, desired.Name)
 		}
 	}
@@ -2569,6 +2583,40 @@ func matchingReviewRetryTask(existing, desired *corev1alpha1.Task) bool {
 		return false
 	}
 	return apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec)
+}
+
+func replaceableStaleReviewRetryTask(existing, desired *corev1alpha1.Task) bool {
+	if existing == nil || desired == nil ||
+		existing.Namespace != desired.Namespace || existing.Name != desired.Name ||
+		!isTerminalScanTaskPhase(existing.Status.Phase) ||
+		existing.Annotations[labels.AnnotationSecurityReviewAttempt] != strconv.Itoa(securityReviewRetryAttempt) {
+		return false
+	}
+
+	existingRunID := strings.TrimSpace(existing.Labels[labels.LabelSecurityScanID])
+	desiredRunID := strings.TrimSpace(desired.Labels[labels.LabelSecurityScanID])
+	if existingRunID == "" || desiredRunID == "" || existingRunID == desiredRunID {
+		return false
+	}
+	for _, key := range []string{
+		labels.LabelManaged,
+		labels.LabelCreatedBy,
+		labels.LabelSecurityTarget,
+		labels.LabelSecurityStage,
+		labels.LabelSecuritySliceID,
+	} {
+		if existing.Labels[key] != desired.Labels[key] {
+			return false
+		}
+	}
+
+	existingOwner := metav1.GetControllerOf(existing)
+	desiredOwner := metav1.GetControllerOf(desired)
+	return existingOwner != nil && desiredOwner != nil &&
+		existingOwner.APIVersion == desiredOwner.APIVersion &&
+		existingOwner.Kind == desiredOwner.Kind &&
+		existingOwner.Name == desiredOwner.Name &&
+		existingOwner.UID == desiredOwner.UID
 }
 
 func capAcceptedFindingsForRun(scan *corev1alpha1.RepositoryScan, run *store.ScanRun, accepted []*store.Finding) ([]*store.Finding, []security.DroppedFindingDiagnostic) {

@@ -507,19 +507,23 @@ func TestGeneratedSecurityTaskNamesStayLabelSafe(t *testing.T) {
 	}
 }
 
-func TestScanStageRetryTaskNameIsDeterministicAndAttemptBound(t *testing.T) {
+func TestScanStageRetryTaskNameIsDeterministicAndIdentityBound(t *testing.T) {
 	first := ScanStageRetryTaskName("demo-security-repository", "scan_1234567890abcdef", StageReview, "slice_api", 1)
 	repeated := ScanStageRetryTaskName("demo-security-repository", "scan_1234567890abcdef", StageReview, "slice_api", 1)
+	secondRun := ScanStageRetryTaskName("demo-security-repository", "scan_fedcba0987654321", StageReview, "slice_api", 1)
 	secondAttempt := ScanStageRetryTaskName("demo-security-repository", "scan_1234567890abcdef", StageReview, "slice_api", 2)
 
 	if first != repeated {
 		t.Fatalf("ScanStageRetryTaskName() = %q then %q, want deterministic", first, repeated)
 	}
+	if first == secondRun {
+		t.Fatalf("ScanStageRetryTaskName() = %q for two scan runs, want run-bound names", first)
+	}
 	if first == secondAttempt {
 		t.Fatalf("ScanStageRetryTaskName() = %q for attempts 1 and 2, want attempt-bound names", first)
 	}
-	if len(first) > maxGeneratedTaskName || len(secondAttempt) > maxGeneratedTaskName {
-		t.Fatalf("retry task names lengths = %d/%d, want <= %d", len(first), len(secondAttempt), maxGeneratedTaskName)
+	if len(first) > maxGeneratedTaskName || len(secondRun) > maxGeneratedTaskName || len(secondAttempt) > maxGeneratedTaskName {
+		t.Fatalf("retry task names lengths = %d/%d/%d, want <= %d", len(first), len(secondRun), len(secondAttempt), maxGeneratedTaskName)
 	}
 }
 
