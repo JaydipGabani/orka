@@ -11,6 +11,9 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 		"data: {\"type\": \"response.failed\", \"response\": {}}\n\n",
 		"data: { \"type\" : \"error\" , \"error\": {} }\n\n",
 	}
+	// The last failure stream deliberately ends without a trailing newline:
+	// the flush at end-of-stream must scan the residual line.
+	failures = append(failures, "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\"}")
 	for _, stream := range failures {
 		scanner := &sseTerminalErrorScanner{}
 		// Feed byte-by-byte to prove chunk boundaries cannot hide a marker.
@@ -19,6 +22,7 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+		scanner.flush()
 		if !scanner.failed {
 			t.Fatalf("scanner missed terminal error in %q", stream[:40])
 		}

@@ -55,3 +55,10 @@ func TestSensitiveTextRedactsSignedURLQueries(t *testing.T) {
 		}
 	}
 }
+
+func TestSensitiveTextRedactsCompleteCommaBearingValue(t *testing.T) {
+	got := SensitiveText("dial failed: password=short,correct-horse-battery-staple rejected")
+	if strings.Contains(got, "correct-horse-battery-staple") || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("SensitiveText() = %q, want the complete comma-bearing value redacted", got)
+	}
+}

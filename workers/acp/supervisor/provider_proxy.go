@@ -1077,7 +1077,15 @@ func (p *providerProxy) relayUpstreamResponse(
 	flusher, _ := w.(http.Flusher)
 	relayed := &countingWriter{w: w}
 	err := providerproxy.StreamBoundedResponse(relayed, body, p.maxResponseBytes, flusher)
-	streamFailed := func() bool { return streamScanner != nil && streamScanner.failed }
+	streamFailed := func() bool {
+		if streamScanner == nil {
+			return false
+		}
+		// A stream can end on an unterminated line (no trailing newline);
+		// the residual buffer must be scanned before the verdict.
+		streamScanner.flush()
+		return streamScanner.failed
+	}
 	recordStreamFailure := func() {
 		session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider stream reported a terminal error: "+streamScanner.detail)
 	}
@@ -1169,6 +1177,14 @@ func (c *sseTerminalErrorScanner) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// flush scans any residual unterminated line at end of stream.
+func (c *sseTerminalErrorScanner) flush() {
+	if len(c.line) > 0 && !c.failed {
+		c.scanLine()
+		c.line = c.line[:0]
+	}
 }
 
 func (c *sseTerminalErrorScanner) scanLine() {
