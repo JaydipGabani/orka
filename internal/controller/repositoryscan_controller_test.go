@@ -4193,6 +4193,12 @@ func TestPatchEvidenceRejectsTruncatedAndDuplicateCommitContent(t *testing.T) {
 	if samePatchHunks(spoof, genuine) {
 		t.Fatal("duplicate file block was accepted as matching the commit")
 	}
+	// A hunkless duplicate block (arbitrary non-hunk lines under a repeated
+	// header) must invalidate the diff just the same.
+	hunkless := genuine + "diff --git a/a.go b/a.go\narbitrary smuggled line\n"
+	if samePatchHunks(hunkless, genuine) {
+		t.Fatal("hunkless duplicate file block was accepted as matching the commit")
+	}
 }
 
 func TestIngestPatchTaskSecondReconcileAcceptsSanitizedStoredDiff(t *testing.T) {

@@ -23,6 +23,13 @@ export function useTaskList(limit = '25', refetchInterval: number | false = 1000
   })
 }
 
+// maxListWalkPages bounds every full-list walk: terminal objects accumulate
+// without limit, and an unbounded walk on a polling interval would grow into
+// an ever-larger request burst against the API server (and browser memory).
+// Views built on these walks are summaries; beyond the cap they see the most
+// recent pages rather than complete history.
+export const maxListWalkPages = 20
+
 export function useTaskListAll(pageLimit = '100', refetchInterval: number | false = 10000) {
   const namespace = useUIStore((s) => s.namespace)
   return useQuery({
@@ -32,6 +39,7 @@ export function useTaskListAll(pageLimit = '100', refetchInterval: number | fals
       const seen = new Set<string>()
       let metadata: ListResponse<Task>['metadata'] = {}
       let continueToken: string | undefined
+      let pages = 0
       do {
         const page = await fetchTaskListPage(namespace, pageLimit, continueToken)
         items.push(...page.items)
@@ -40,7 +48,8 @@ export function useTaskListAll(pageLimit = '100', refetchInterval: number | fals
         if (next && seen.has(next)) throw new Error('task list pagination repeated continuation cursor')
         if (next) seen.add(next)
         continueToken = next
-      } while (continueToken)
+        pages += 1
+      } while (continueToken && pages < maxListWalkPages)
       return { items, metadata }
     },
     refetchInterval,

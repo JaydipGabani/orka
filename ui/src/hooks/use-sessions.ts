@@ -27,7 +27,11 @@ export function useSessionList(limit = '25') {
   })
 }
 
-export function useSessionListAll(pageLimit = '100') {
+// The walk is bounded like the task-list walk (see maxListWalkPages there):
+// unbounded history on a polling interval grows without limit.
+const maxSessionWalkPages = 20
+
+export function useSessionListAll(pageLimit = '100', refetchInterval: number | false = 15000) {
   const namespace = useUIStore((s) => s.namespace)
   return useQuery({
     queryKey: ['sessions', 'all', namespace, pageLimit],
@@ -35,6 +39,7 @@ export function useSessionListAll(pageLimit = '100') {
       const items: SessionListItem[] = []
       const seen = new Set<string>()
       let continueToken: string | undefined
+      let pages = 0
       do {
         const params: Record<string, string> = { namespace, limit: pageLimit }
         if (continueToken) params.continue = continueToken
@@ -44,11 +49,12 @@ export function useSessionListAll(pageLimit = '100') {
         if (next && seen.has(next)) throw new Error('session list pagination repeated continuation cursor')
         if (next) seen.add(next)
         continueToken = next || undefined
-      } while (continueToken)
+        pages += 1
+      } while (continueToken && pages < maxSessionWalkPages)
       return { items, metadata: {} } as ListResponse<SessionListItem>
     },
     retry: retryUnlessClientError,
-    refetchInterval: (query) => (isForbiddenError(query.state.error) ? false : 15000),
+    refetchInterval: (query) => (isForbiddenError(query.state.error) ? false : refetchInterval),
   })
 }
 

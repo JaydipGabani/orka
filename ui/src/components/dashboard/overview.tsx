@@ -16,8 +16,10 @@ import { RecentTasks } from './recent-tasks'
 const PHASES = taskPhaseSchema.options
 
 export function Overview() {
-  const { data: tasksData, isLoading: tasksLoading, error: tasksError } = useTaskListAll('100')
-  const { data: sessionsData, isLoading: sessionsLoading, error: sessionsError } = useSessionListAll('100')
+  // The dashboard is a glanceable summary: it polls the bounded list walks
+  // at a relaxed cadence instead of hammering full-history queries.
+  const { data: tasksData, isLoading: tasksLoading, error: tasksError } = useTaskListAll('100', 60000)
+  const { data: sessionsData, isLoading: sessionsLoading, error: sessionsError } = useSessionListAll('100', 60000)
   const { data: agentsData, isLoading: agentsLoading, error: agentsError } = useAgentListAll()
   const { data: toolsData, isLoading: toolsLoading, error: toolsError } = useToolListAll()
 
@@ -63,7 +65,11 @@ export function Overview() {
           </CardContent>
         </Card>
         <div className="lg:col-span-2">
-          <RecentTasks tasks={tasksData?.items} isLoading={tasksLoading} />
+          <RecentTasks
+            tasks={tasksError ? undefined : tasksData?.items}
+            isLoading={tasksLoading}
+            forbiddenMessage={tasksForbiddenMessage}
+          />
         </div>
       </div>
     </div>

@@ -15,7 +15,21 @@ function timeAgo(timestamp?: string): string {
   return `${Math.floor(seconds / 86400)}d ago`
 }
 
-export function RecentTasks({ tasks, isLoading }: { tasks?: Task[]; isLoading?: boolean }) {
+export function RecentTasks({ tasks, isLoading, forbiddenMessage }: { tasks?: Task[]; isLoading?: boolean; forbiddenMessage?: string }) {
+  if (forbiddenMessage) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Recent Tasks</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-muted-foreground" role="alert">
+            Not authorized to list tasks ({forbiddenMessage}).
+          </p>
+        </CardContent>
+      </Card>
+    )
+  }
   if (isLoading) {
     return (
       <Card>

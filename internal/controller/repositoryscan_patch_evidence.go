@@ -221,18 +221,13 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 // its first "@@" line to the next file header — from a unified diff.
 func patchHunksByFile(diff string) (map[string]string, bool) {
 	hunks := map[string]string{}
+	seenPaths := map[string]struct{}{}
 	var body []string
 	current := ""
 	inHunk := false
 	duplicate := false
 	flush := func() {
 		if current != "" && len(body) > 0 {
-			// A repeated file block could hide arbitrary content behind a
-			// second block carrying the genuine hunks; it invalidates the
-			// whole diff rather than overwriting the earlier block.
-			if _, exists := hunks[current]; exists {
-				duplicate = true
-			}
 			hunks[current] = strings.TrimRight(strings.Join(body, "\n"), "\n")
 		}
 		body = nil
@@ -245,6 +240,15 @@ func patchHunksByFile(diff string) (map[string]string, bool) {
 			fields := strings.Fields(line)
 			if len(fields) == 4 {
 				current = strings.TrimPrefix(fields[3], "b/")
+			}
+			// Any repeated file block — hunkless or not — invalidates the
+			// diff: a second header for the same path could hide arbitrary
+			// content the comparison would never see.
+			if current != "" {
+				if _, exists := seenPaths[current]; exists {
+					duplicate = true
+				}
+				seenPaths[current] = struct{}{}
 			}
 			continue
 		}
