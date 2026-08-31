@@ -78,6 +78,7 @@ const (
 	validationModeFull               = "full"
 	validationThresholdLow           = "low"
 	findingCategoryCWEPrefix         = "cwe"
+	findingCategoryFromTerm          = "from"
 
 	scanSummaryRunning            = "scan is running"
 	scanSummaryThreatModelPending = "Threat model generated; deterministic mapper pending"
@@ -2406,6 +2407,10 @@ func findingCategoryMatches(left, right string) bool {
 	if slices.Equal(leftTokens, rightTokens) {
 		return true
 	}
+	leftTokens, rightTokens = findingCategoryDiscriminatingTerms(leftTokens), findingCategoryDiscriminatingTerms(rightTokens)
+	if len(leftTokens) == 0 || len(rightTokens) == 0 {
+		return false
+	}
 	rightSet := make(map[string]struct{}, len(rightTokens))
 	for _, token := range rightTokens {
 		rightSet[token] = struct{}{}
@@ -2457,6 +2462,19 @@ func findingCategoryTerms(tokens []string) []string {
 		}
 		seen[token] = struct{}{}
 		terms = append(terms, token)
+	}
+	return terms
+}
+
+func findingCategoryDiscriminatingTerms(tokens []string) []string {
+	terms := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		switch token {
+		case "attacker", "controlled", findingCategoryFromTerm, "input", "through", "untrusted", "user", "using", "via", "with":
+			continue
+		default:
+			terms = append(terms, token)
+		}
 	}
 	return terms
 }

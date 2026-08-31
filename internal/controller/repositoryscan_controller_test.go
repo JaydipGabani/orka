@@ -4164,6 +4164,8 @@ func TestFindingCategoryMatchesRequiresSpecificSharedIdentity(t *testing.T) {
 		{name: "matching cwe", left: "CWE-78 command execution", right: "OS command injection (CWE-78)", want: true},
 		{name: "mismatched cwe", left: "path traversal CWE-22", right: "path traversal CWE-23", want: false},
 		{name: "two shared terms", left: "sensitive information disclosure", right: "information disclosure", want: true},
+		{name: "same class with different qualifiers", left: "SQL injection via untrusted input", right: "SQL injection through user input", want: true},
+		{name: "different classes with shared qualifiers", left: "SQL injection via untrusted user input", right: "command injection via untrusted user input", want: false},
 		{name: "generic injection term", left: "command injection", right: "SQL injection", want: false},
 		{name: "single generic subset", left: "injection", right: "NoSQL injection", want: false},
 	}
