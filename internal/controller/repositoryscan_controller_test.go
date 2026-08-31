@@ -4142,3 +4142,28 @@ func TestIngestPatchTaskV2ResultFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+func TestPatchHunkBindingRejectsRelocatedAndPrefixAmbiguousContent(t *testing.T) {
+	t.Parallel()
+	commit := "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n"
+	// Same added/deleted strings at a different hunk position must not match.
+	relocated := "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -40 +40 @@\n-unsafe()\n+safe()\n"
+	if samePatchHunks(relocated, commit) {
+		t.Fatal("relocated hunk content was accepted as the published commit")
+	}
+	// In-hunk content that begins with "+++"/"---" is change content, not a
+	// header, and must participate in the comparison.
+	plusCommit := "diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ b/notes.md\n@@ -1 +1 @@\n-old\n+++extra line\n"
+	plusOther := "diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ b/notes.md\n@@ -1 +1 @@\n-old\n+different\n"
+	if samePatchHunks(plusOther, plusCommit) {
+		t.Fatal("in-hunk +++ content was excluded from the comparison")
+	}
+	if !samePatchHunks(commit, commit) {
+		t.Fatal("identical diffs did not match")
+	}
+	// Index-line formatting differences outside hunks stay tolerated.
+	withIndex := "diff --git a/app.py b/app.py\nindex 111..222 100644\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n"
+	if !samePatchHunks(withIndex, commit) {
+		t.Fatal("index-line formatting difference was not tolerated")
+	}
+}

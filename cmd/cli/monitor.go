@@ -912,7 +912,8 @@ func monitorDoctorSummary(monitor any) map[string]any {
 	}
 	if status != nil {
 		for _, key := range []string{"phase", "lastRunID", "lastRunTime", "lastSuccessfulRunTime", "observedGeneration",
-			"openIssues", "openPullRequests", "blockedIssues", "blockedItems"} {
+			"openIssues", "openPullRequests", "blockedIssues", "blockedItems",
+			"pendingReviews", "activeRepairs", "mergeReadyItems", "pendingIssueActions"} {
 			if value, ok := status[key]; ok {
 				summary[key] = value
 			}

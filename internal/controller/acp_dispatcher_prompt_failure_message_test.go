@@ -3,8 +3,11 @@ package controller
 import (
 	"errors"
 	"strings"
+
 	"testing"
 	"unicode/utf8"
+
+	"github.com/orka-agents/orka/internal/redact"
 
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 )
@@ -167,5 +170,17 @@ func TestACPPromptFailureMessageRedactsCredentialShapedCode(t *testing.T) {
 	}
 	if !strings.Contains(got, "upstream rejected the request") {
 		t.Fatalf("acpPromptFailureMessage() dropped the redacted detail: %q", got)
+	}
+}
+
+func TestStripACPControlRunesDropsFormatRunesBeforeRedaction(t *testing.T) {
+	t.Parallel()
+	// A zero-width space (U+200B, category Cf) inside a credential must not
+	// split the token past the redactor in persisted status or logs.
+	const secret = "ak-live-0123456789abcdef"
+	split := "api_key=" + secret[:10] + "\u200b" + secret[10:]
+	got := redact.SensitiveText(stripACPControlRunes(split))
+	if strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("sanitized detail = %q, want the reassembled credential redacted", got)
 	}
 }

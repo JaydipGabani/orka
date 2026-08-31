@@ -144,7 +144,10 @@ func TestRepositoryMonitorReviewContextTruncatesPatchOnLineBoundary(t *testing.T
 		fmt.Fprintf(&builder, "+line %04d %s\n", i, strings.Repeat("x", 90))
 	}
 	patch := builder.String()
-	got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{repositoryMonitorReviewContextTestFile(repositoryMonitorReviewContextTestPath, patch)})
+	// An added file: its complete content is in the checkout, so patch
+	// truncation alone must not mark the change set incomplete — this test
+	// exercises the truncation mechanics, not the completeness gate.
+	got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{{Filename: repositoryMonitorReviewContextTestPath, Status: repositoryMonitorReviewContextTestAdded, Additions: 1, Patch: patch}})
 	if len(got.Files) != 1 || got.Files[0].PatchOmitted != repositoryMonitorReviewContextPatchTruncated {
 		t.Fatalf("files = %#v, want one entry marked truncated", got.Files)
 	}
@@ -168,7 +171,9 @@ func TestRepositoryMonitorReviewContextFromFilesCapsTotalBytes(t *testing.T) {
 	bigPatch := "@@ -1,5 +1,5 @@\n" + strings.Repeat("+"+strings.Repeat("y", 118)+"\n", 480) // ~57 KiB
 	files := make([]repositoryMonitorPullRequestFileResponse, 0, repositoryMonitorReviewContextMaxFiles)
 	for i := range cap(files) {
-		files = append(files, repositoryMonitorReviewContextTestFile(fmt.Sprintf("pkg/big%03d.go", i), bigPatch))
+		// Added files: dropped patches on them do not gate completeness, so
+		// the test isolates the byte-budget mechanics.
+		files = append(files, repositoryMonitorPullRequestFileResponse{Filename: fmt.Sprintf("pkg/big%03d.go", i), Status: repositoryMonitorReviewContextTestAdded, Additions: 1, Patch: bigPatch})
 	}
 	got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), files)
 	encoded, err := json.MarshalIndent(got, "", repositoryMonitorReviewContextIndent)
@@ -615,7 +620,9 @@ func TestRepositoryMonitorReviewPromptStaysUnderBudgetWithMaximalContext(t *test
 	bigPatch := "@@ -1,5 +1,5 @@\n" + strings.Repeat("+"+strings.Repeat("w", 118)+"\n", 600)
 	files := make([]repositoryMonitorPullRequestFileResponse, 0, repositoryMonitorReviewContextMaxFiles*2)
 	for i := range cap(files) {
-		files = append(files, repositoryMonitorReviewContextTestFile(fmt.Sprintf("pkg/%03d/%s.go", i, strings.Repeat("n", 200)), bigPatch))
+		// Added files: capped patches on them do not gate completeness, so
+		// this test isolates the prompt-budget mechanics.
+		files = append(files, repositoryMonitorPullRequestFileResponse{Filename: fmt.Sprintf("pkg/%03d/%s.go", i, strings.Repeat("n", 200)), Status: repositoryMonitorReviewContextTestAdded, Additions: 1, Patch: bigPatch})
 	}
 	pr := repositoryMonitorReviewContextTestPR()
 	prompt := buildRepositoryMonitorReviewPrompt(repositoryMonitorInventoryTestMonitor(), repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, pr, repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, pr, files))
@@ -840,8 +847,11 @@ func TestRepositoryMonitorReviewContextRemovedFileWithoutPatchMarksChangeSetInco
 	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "auth.go", Status: repositoryMonitorReviewContextTestStatus, Additions: 2, Deletions: 1}); !got.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=true for a modified file with deleted lines whose patch is unavailable (the removed lines are not in the checkout)", got.Truncated)
 	}
-	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "generated.pb.go", Status: repositoryMonitorReviewContextTestStatus, Additions: 4000, Deletions: 0}); got.Truncated.Files {
-		t.Fatalf("truncated = %#v, want files=false for an additions-only modified file without a patch (every added line is in the checkout)", got.Truncated)
+	// An additions-only modified file without its patch is no longer
+	// reviewable: the checkout holds the final file but cannot identify
+	// which lines the change introduced.
+	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "generated.pb.go", Status: repositoryMonitorReviewContextTestStatus, Additions: 4000, Deletions: 0}); !got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=true for an additions-only modified file without a patch (the added lines cannot be identified from the checkout)", got.Truncated)
 	}
 	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "logo.png", Status: repositoryMonitorReviewContextTestStatus, Additions: 0, Deletions: 0}); !got.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=true for a modified binary (no patch, no line counts; the previous content is not in the checkout)", got.Truncated)

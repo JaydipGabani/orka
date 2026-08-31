@@ -263,46 +263,26 @@ func repositoryMonitorReviewContextFromFiles(owner, repository string, pr reposi
 	return repositoryMonitorReviewContextMarkUnreviewableOmissions(reviewContext)
 }
 
-// repositoryMonitorReviewContextMarkUnreviewableOmissions marks the change set
-// incomplete when an omitted patch (unavailable, truncated, or capped) hides
-// content the Git-free head checkout cannot show: a removed file, any
-// renamed file (a pure rename and a content-changing binary rename are
-// reported identically, so the pure case cannot be proven without the base
-// blob), lines deleted from any changed file, or any other patchless
-// zero-count change (binary or otherwise undiffable). The only patchless
-// entries that stay reviewable are added and copied files with no deletions:
-// their complete new content is positively present in the checkout.
+// repositoryMonitorReviewContextMarkUnreviewableOmissions marks the change
+// set incomplete whenever an omitted patch (unavailable, truncated, or
+// capped) hides what changed. The only exemption is a wholly added or copied
+// file with no deletions: its complete new content is positively present in
+// the head checkout, so nothing about the change is hidden. Everything else
+// fails closed — a removed file, any patchless rename (a pure rename and a
+// content-changing binary rename are reported identically, so the harmless
+// case cannot be proven without the base blob), any deleted lines, and any
+// modified/changed file (even addition-only: the checkout shows the final
+// file but cannot identify which lines the change introduced).
 func repositoryMonitorReviewContextMarkUnreviewableOmissions(reviewContext repositoryMonitorReviewContext) repositoryMonitorReviewContext {
 	for _, file := range reviewContext.Files {
 		if file.PatchOmitted == "" {
 			continue
 		}
-		switch {
-		case file.Status == repositoryMonitorReviewContextStatusRemoved:
-			reviewContext.Truncated.Files = true
-			return reviewContext
-		case file.Status == repositoryMonitorReviewContextStatusRenamed:
-			// GitHub reports a pure rename and a content-changing binary
-			// rename identically (no patch, zero counts); without the base
-			// blob the harmless case cannot be proven, so every patchless
-			// rename fails closed.
-			reviewContext.Truncated.Files = true
-			return reviewContext
-		case file.Deletions > 0:
-			// Deleted lines exist only in the omitted patch, so their
-			// removal cannot be reviewed from the checkout.
-			reviewContext.Truncated.Files = true
-			return reviewContext
-		case file.Status == repositoryMonitorReviewContextStatusAdded || file.Status == repositoryMonitorReviewContextStatusCopied:
-			// The complete new content is in the checkout; nothing about
-			// the change is hidden by the missing patch.
-		case file.Additions+file.Deletions == 0:
-			// Any other patchless change with no line counts is a binary
-			// (or otherwise undiffable) change: the checkout holds only the
-			// new content, so what changed cannot be reviewed.
-			reviewContext.Truncated.Files = true
-			return reviewContext
+		if (file.Status == repositoryMonitorReviewContextStatusAdded || file.Status == repositoryMonitorReviewContextStatusCopied) && file.Deletions == 0 {
+			continue
 		}
+		reviewContext.Truncated.Files = true
+		return reviewContext
 	}
 	return reviewContext
 }

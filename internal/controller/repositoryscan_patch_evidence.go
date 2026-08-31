@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"time"
 
@@ -195,50 +194,59 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 		return "patch diff artifact does not match the published commit", nil
 	}
 	// Filenames alone are spoofable: an unrelated diff touching the same
-	// paths would pass the set check. Bind the content too — the added and
-	// deleted lines per file must be identical to the published commit's
-	// (context rendering and index/mode headers may differ between diff
-	// generators, but for the same commit the change content cannot).
-	if !samePatchChangedLines(string(diffData), commitDiff) {
+	// paths would pass the set check. Bind the content too — each file's
+	// complete hunk body (headers, positions, context, and every changed
+	// line, however it is prefixed) must be identical to the published
+	// commit's. Only pre-hunk metadata (index/mode/---/+++ header lines),
+	// which legitimately varies between diff generators, is excluded.
+	if !samePatchHunks(string(diffData), commitDiff) {
 		return "patch diff artifact content does not match the published commit", nil
 	}
 	return "", nil
 }
 
-// patchChangedLinesByFile extracts each file's added and deleted line
-// content from a unified diff, ignoring headers, hunk markers, and context.
-func patchChangedLinesByFile(diff string) map[string][]string {
-	changed := map[string][]string{}
+// patchHunksByFile extracts each file's verbatim hunk body — everything from
+// its first "@@" line to the next file header — from a unified diff.
+func patchHunksByFile(diff string) map[string]string {
+	hunks := map[string]string{}
+	var body []string
 	current := ""
 	inHunk := false
+	flush := func() {
+		if current != "" && len(body) > 0 {
+			hunks[current] = strings.TrimRight(strings.Join(body, "\n"), "\n")
+		}
+		body = nil
+		inHunk = false
+	}
 	for line := range strings.SplitSeq(diff, "\n") {
-		switch {
-		case strings.HasPrefix(line, "diff --git "):
-			inHunk = false
+		if strings.HasPrefix(line, "diff --git ") {
+			flush()
 			current = ""
 			fields := strings.Fields(line)
 			if len(fields) == 4 {
 				current = strings.TrimPrefix(fields[3], "b/")
 			}
-		case strings.HasPrefix(line, "@@"):
+			continue
+		}
+		if !inHunk && strings.HasPrefix(line, "@@") {
 			inHunk = true
-		case inHunk && current != "" && len(line) > 0 && (line[0] == '+' || line[0] == '-'):
-			if strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
-				continue
-			}
-			changed[current] = append(changed[current], line)
+		}
+		if inHunk {
+			body = append(body, line)
 		}
 	}
-	return changed
+	flush()
+	return hunks
 }
 
-func samePatchChangedLines(a, b string) bool {
-	linesA, linesB := patchChangedLinesByFile(a), patchChangedLinesByFile(b)
-	if len(linesA) != len(linesB) {
+func samePatchHunks(a, b string) bool {
+	hunksA, hunksB := patchHunksByFile(a), patchHunksByFile(b)
+	if len(hunksA) != len(hunksB) {
 		return false
 	}
-	for path, lines := range linesA {
-		if !slices.Equal(lines, linesB[path]) {
+	for path, hunk := range hunksA {
+		if other, ok := hunksB[path]; !ok || hunk != other {
 			return false
 		}
 	}

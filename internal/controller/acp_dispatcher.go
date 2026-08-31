@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
@@ -4555,18 +4556,23 @@ func boundedRuntimeSessionServerMessage(err error) string {
 	return message
 }
 
-// stripACPControlRunes removes control characters (C0, DEL, and C1) from
-// runtime-supplied text so persisted status and logs carry no terminal
-// escapes and no control byte can split a credential past redaction. Line
-// breaks and tabs become spaces; every other control rune is dropped rather
-// than replaced, because a space would leave fragments of a split token that
-// survive redaction and can be reassembled by a reader.
+// stripACPControlRunes removes control characters (C0, DEL, and C1) and
+// Unicode format runes from runtime-supplied text so persisted status and
+// logs carry no terminal escapes and no invisible rune can split a
+// credential past redaction. Line breaks and tabs become spaces; every other
+// stripped rune is dropped rather than replaced, because a space would leave
+// fragments of a split token that survive redaction and can be reassembled
+// by a reader.
 func stripACPControlRunes(value string) string {
 	return strings.Map(func(current rune) rune {
 		switch {
 		case current == '\n' || current == '\r' || current == '\t':
 			return ' '
 		case current < 0x20 || current == 0x7f || (current >= 0x80 && current < 0xa0):
+			return -1
+		// Format runes (zero-width spaces, joiners, directional marks) are
+		// as invisible as controls and equally capable of splitting a token.
+		case unicode.Is(unicode.Cf, current):
 			return -1
 		}
 		return current
