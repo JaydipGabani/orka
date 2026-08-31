@@ -1558,6 +1558,46 @@ func TestComplete_ResponsesAPI_WithToolCalls(t *testing.T) {
 	}
 }
 
+func TestComplete_ResponsesAPI_MaxOutputTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id": "resp_limit",
+			"object": "response",
+			"created_at": 1700000000,
+			"status": "incomplete",
+			"incomplete_details": {"reason": "max_output_tokens"},
+			"model": "gpt-4",
+			"output": [{
+				"id": "msg_1",
+				"type": "message",
+				"role": "assistant",
+				"status": "incomplete",
+				"content": [{"type": "output_text", "text": "partial"}]
+			}],
+			"usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+		}`)
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(llm.ProviderConfig{APIKey: "test-key", BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	provider.mode.Store(int32(apiModeResponses))
+
+	resp, err := provider.Complete(context.Background(), &llm.CompletionRequest{
+		Model:    "gpt-4",
+		Messages: []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if resp.Content != "partial" || resp.StopReason != stopReasonLength {
+		t.Fatalf("response = content %q, stop reason %q; want partial content with %q", resp.Content, resp.StopReason, stopReasonLength)
+	}
+}
+
 func TestComplete_ResponsesAPI_WithAllOptions(t *testing.T) {
 	var receivedBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2007,6 +2047,46 @@ func TestStream_ResponsesAPI_Failed(t *testing.T) {
 	}
 	if stopReason != "response.failed" {
 		t.Errorf("expected stop reason 'response.failed', got %q", stopReason)
+	}
+}
+
+func TestStream_ResponsesAPI_MaxOutputTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		fmt.Fprint(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\",\"item_id\":\"i1\",\"output_index\":0,\"content_index\":0}\n\n") //nolint:errcheck
+		flusher.Flush()
+		fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_limit\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"model\":\"gpt-4\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n") //nolint:errcheck
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(llm.ProviderConfig{APIKey: "test-key", BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	provider.mode.Store(int32(apiModeResponses))
+
+	ch, err := provider.Stream(context.Background(), &llm.CompletionRequest{
+		Model:    "gpt-4",
+		Messages: []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+
+	var content, stopReason string
+	for chunk := range ch {
+		if chunk.Error != nil {
+			t.Fatalf("unexpected error: %v", chunk.Error)
+		}
+		content += chunk.Content
+		if chunk.Done {
+			stopReason = chunk.StopReason
+		}
+	}
+	if content != "partial" || stopReason != stopReasonLength {
+		t.Fatalf("stream = content %q, stop reason %q; want partial content with %q", content, stopReason, stopReasonLength)
 	}
 }
 

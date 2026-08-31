@@ -3678,10 +3678,14 @@ func (r *TaskReconciler) handleScheduled(ctx context.Context, task *corev1alpha1
 		// for a skipped window: without it the same missed tick is
 		// re-evaluated on every reconcile and the schedule never resumes.
 		reanchor := metav1.NewTime(now)
-		_ = r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
+		if err := r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
 			t.Status.NextScheduleTime = &nextScheduleCopy
 			t.Status.LastScheduleTime = &reanchor
-		})
+		}); err != nil {
+			// A failed cursor write must retry promptly: sleeping to the
+			// next cron tick with the stale cursor would skip that run too.
+			return ctrl.Result{}, fmt.Errorf("re-anchoring schedule cursor: %w", err)
+		}
 		return ctrl.Result{RequeueAfter: time.Until(next)}, nil
 	}
 

@@ -4557,17 +4557,12 @@ func boundedRuntimeSessionServerMessage(err error) string {
 }
 
 // stripACPControlRunes removes control characters (C0, DEL, and C1) and
-// Unicode format runes from runtime-supplied text so persisted status and
-// logs carry no terminal escapes and no invisible rune can split a
-// credential past redaction. Line breaks and tabs become spaces; every other
-// stripped rune is dropped rather than replaced, because a space would leave
-// fragments of a split token that survive redaction and can be reassembled
-// by a reader.
+// Unicode format runes from runtime-supplied text. Dropping every separator
+// before redaction reassembles credentials split across lines or tabs while
+// keeping terminal escapes and invisible runes out of status and logs.
 func stripACPControlRunes(value string) string {
 	return strings.Map(func(current rune) rune {
 		switch {
-		case current == '\n' || current == '\r' || current == '\t':
-			return ' '
 		case current < 0x20 || current == 0x7f || (current >= 0x80 && current < 0xa0):
 			return -1
 		// Format runes (zero-width spaces, joiners, directional marks) are

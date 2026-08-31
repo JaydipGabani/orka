@@ -560,8 +560,10 @@ func TestRuntimeSessionStartFailureMessageAllowsOnlyKnownStages(t *testing.T) {
 	if status != http.StatusBadRequest || code != harnessv2.ErrorCodeInvalidRequest || diagnostic != "runtime session request rejected before classified creation" {
 		t.Fatalf("unknown stage diagnostic = %d/%s/%q", status, code, diagnostic)
 	}
+	// Separators are dropped, not spaced, so a line-wrapped credential
+	// reassembles for the redactor; prose merely loses the break.
 	unknown.Message = "  fixed server detail\nwith control  "
-	if got := boundedRuntimeSessionServerMessage(unknown); got != "fixed server detail with control" {
+	if got := boundedRuntimeSessionServerMessage(unknown); got != "fixed server detailwith control" {
 		t.Fatalf("bounded server message = %q", got)
 	}
 	if got := runtimeSessionStartFailureMessage(errors.New("raw-secret")); got != fallback {

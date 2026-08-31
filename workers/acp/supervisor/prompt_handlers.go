@@ -413,25 +413,18 @@ func promptTerminalDiagnostic(result acp.PromptResult) (string, string) {
 	return outcome, stopReason
 }
 
-// redactedPromptErrorDetail removes controls (C0, DEL, and C1) and redacts the
-// complete error text before bounding it for a log field. Line breaks and
-// tabs become spaces; every other control rune is dropped rather than
-// replaced so a control inserted inside a credential-shaped token cannot
-// split it into fragments that survive redaction and can be reassembled by a
-// reader.
+// redactedPromptErrorDetail removes control and format runes before redacting
+// the complete error text and bounding it for a log field. Dropping every
+// separator reassembles credentials split across lines or tabs so the
+// redactor can recognize the complete value.
 func redactedPromptErrorDetail(err error) string {
 	if err == nil {
 		return ""
 	}
 	cleaned := strings.Map(func(r rune) rune {
 		switch {
-		case r == '\n' || r == '\r' || r == '\t':
-			return ' '
 		case unicode.IsControl(r):
 			return -1
-		// Unicode format runes (zero-width spaces, joiners, directional
-		// marks) are as invisible as controls and can split a credential
-		// past the redactor; drop them before redaction too.
 		case unicode.Is(unicode.Cf, r):
 			return -1
 		}

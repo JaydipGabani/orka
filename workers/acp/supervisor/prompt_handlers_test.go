@@ -39,6 +39,18 @@ func TestRedactedPromptErrorDetailStripsC1ControlsBeforeRedaction(t *testing.T) 
 	}
 }
 
+func TestRedactedPromptErrorDetailReassemblesLineWrappedCredential(t *testing.T) {
+	t.Parallel()
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	// A credential wrapped across a line break must reassemble into one
+	// contiguous token for the redactor, not survive as two fragments.
+	err := errors.New("upstream rejected " + key[:11] + "\n" + key[11:] + " for the model")
+	got := redactedPromptErrorDetail(err)
+	if strings.Contains(got, key[:11]) || strings.Contains(got, key[11:]) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("redactedPromptErrorDetail() = %q, want line-wrapped credential redacted", got)
+	}
+}
+
 func TestRedactedPromptErrorDetailStripsFormatRunesBeforeRedaction(t *testing.T) {
 	t.Parallel()
 	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
