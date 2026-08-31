@@ -805,15 +805,10 @@ const (
 	maxRemediationBodySectionBytes    = 4 << 10
 )
 
-// neutralizePublishedText prepares agent-produced text for publication in
-// GitHub Markdown (remediation PR titles and bodies): invalid UTF-8 and
-// control/format runes are stripped so nothing invisible survives, credential
-// shapes are redacted, and active constructs are defanged — @mentions and
-// HTML comment markers gain a zero-width break, and lines that would read as
-// slash-commands are prefixed with one — so a repository cannot prompt-inject
-// pings or bot commands through a scanner result.
-func neutralizePublishedText(value string) string {
-	stripped := strings.Map(func(r rune) rune {
+// stripUnsafeTextRunes removes invalid UTF-8 and control or format runes that
+// could hide content when agent-produced text is validated or persisted.
+func stripUnsafeTextRunes(value string) string {
+	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\t' {
 			return r
 		}
@@ -822,6 +817,17 @@ func neutralizePublishedText(value string) string {
 		}
 		return r
 	}, strings.ToValidUTF8(value, ""))
+}
+
+// neutralizePublishedText prepares agent-produced text for publication in
+// GitHub Markdown (remediation PR titles and bodies): invalid UTF-8 and
+// control/format runes are stripped so nothing invisible survives, credential
+// shapes are redacted, and active constructs are defanged — @mentions and
+// HTML comment markers gain a zero-width break, and lines that would read as
+// slash-commands are prefixed with one — so a repository cannot prompt-inject
+// pings or bot commands through a scanner result.
+func neutralizePublishedText(value string) string {
+	stripped := stripUnsafeTextRunes(value)
 	stripped = redact.SensitiveText(stripped)
 	stripped = strings.ReplaceAll(stripped, "<!--", "<\u200b!--")
 	stripped = strings.ReplaceAll(stripped, "-->", "--\u200b>")

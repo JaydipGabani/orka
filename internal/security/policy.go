@@ -77,9 +77,10 @@ var (
 	// Signed-URL query credentials (S3/GCS presigned URLs, SAS tokens) use
 	// the same parameter set internal/redact scrubs; a published URL with a
 	// live signature grants access just like a bearer token.
-	policySignedURLPattern = regexp.MustCompile(`(?i)[?&](?:sig|sign` + `ature|sas|x-amz-sign` + `ature|x-amz-sec` + `urity-token|x-amz-cred` + `ential|x-goog-sign` + `ature|x-goog-cred` + `ential)=([^&#\s"'<>,;()\[\]]{16,})`)
-	policyTxnTokenPattern  = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=~:-]{16,})`)
-	policyCookiePattern    = regexp.MustCompile(`(?i)\b(?:set-cookie|cookie)\s*:\s*([^\r\n]+)`)
+	policySignedURLPattern   = regexp.MustCompile(`(?i)[?&](?:sig|sign` + `ature|sas|x-amz-sign` + `ature|x-amz-sec` + `urity-token|x-amz-cred` + `ential|x-goog-sign` + `ature|x-goog-cred` + `ential)=([^&#\s"'<>,;()\[\]]{16,})`)
+	policyTxnTokenPattern    = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=~:-]{16,})`)
+	policyCookiePattern      = regexp.MustCompile(`(?i)\b(set-cookie|cookie)\s*:\s*([^\r\n]+)`)
+	policyCookieValuePattern = regexp.MustCompile("^[A-Za-z0-9_./+=~:@#$%^&*!?|,'\\\\`-]{16,}$")
 )
 
 // placeholderFormPattern matches complete variable/template forms: a shell
@@ -214,12 +215,36 @@ func sensitiveValueMatch(pattern *regexp.Regexp, text string) bool {
 	return false
 }
 
+func cookieHeadersLookLikeSecret(text string) bool {
+	for _, match := range policyCookiePattern.FindAllStringSubmatch(text, -1) {
+		parts := strings.Split(match[2], ";")
+		if strings.EqualFold(match[1], "set-cookie") && len(parts) > 1 {
+			parts = parts[:1]
+		}
+		for _, part := range parts {
+			_, value, ok := strings.Cut(part, "=")
+			if !ok {
+				continue
+			}
+			value = strings.TrimSpace(value)
+			if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
+				value = value[1 : len(value)-1]
+			}
+			if !secretValuePlaceholder(value) && policyCookieValuePattern.MatchString(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // LooksLikeSecret reports whether text carries a credential-shaped value:
 // known token prefixes, JWTs, PEM blocks, or an assignment/header whose value
 // is long enough to be a real secret. Bare keywords such as
 // "OPENAI_API_KEY=dummy" or "Authorization: Bearer $TOKEN" are not secrets
 // and must not block documentation or code that merely mentions them.
 func LooksLikeSecret(text string) bool {
+	text = stripUnsafeTextRunes(text)
 	if policySensitivePrefixPattern.MatchString(text) {
 		return true
 	}
@@ -232,7 +257,7 @@ func LooksLikeSecret(text string) bool {
 	if sensitiveValueMatch(policyBearerHeaderPattern, text) || sensitiveValueMatch(policyTxnTokenPattern, text) {
 		return true
 	}
-	if sensitiveValueMatch(policyCookiePattern, text) {
+	if cookieHeadersLookLikeSecret(text) {
 		return true
 	}
 	if sensitiveValueMatch(policySignedURLPattern, text) {

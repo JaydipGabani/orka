@@ -567,6 +567,9 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"apiKey = cfg.Provider.APIKey",
 		"https://example.com/download?signature=$SIGNED_URL_TOKEN",
 		"token = os.Getenv(tokenEnv)",
+		"Cookie: theme=dark",
+		"Cookie: session=$TOKEN",
+		"Set-Cookie: theme=dark; Path=/; HttpOnly",
 	} {
 		if LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = true, want false for a placeholder or bare keyword", text)
@@ -603,7 +606,9 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"PASSWORD=short;correct-horse-battery-staple",
 		`PASSWORD=short\correct-horse-battery-staple`,
 		"PASSWORD: short`correct-horse-battery-staple",
+		"PASSWORD=short\u200bcorrect-horse-battery-staple",
 		"Cookie: sessionid=correct-horse-battery-staple",
+		"Cookie: theme=dark; sessionid=correct-horse-battery-staple",
 		"Set-Cookie: sessionid=correct-horse-battery-staple; HttpOnly",
 	} {
 		if !LooksLikeSecret(text) {
