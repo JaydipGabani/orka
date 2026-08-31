@@ -85,4 +85,13 @@ jobs:
             -v \
             -ginkgo.v \
             -ginkgo.fail-on-empty \
-            -ginkgo.focus "Gateway live E2E"
+            -ginkgo.focus "Gateway live E2E" \
+            | tee gateway-e2e.log
+          # -ginkgo.fail-on-empty only catches an empty focus match. When the
+          # gateway spec matches but skips itself (for example E2E_GATEWAY is
+          # unset), Ginkgo reports "Ran 0 of N Specs" and exits 0, so the lane
+          # would go green without validating anything. Fail that shape.
+          if grep -Eq 'Ran 0 of [0-9]+ Specs' gateway-e2e.log; then
+            echo "::error::Gateway live E2E ran zero specs; the suite skipped itself instead of running (check E2E_GATEWAY and the ginkgo focus)."
+            exit 1
+          fi

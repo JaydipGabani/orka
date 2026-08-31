@@ -82,4 +82,13 @@ jobs:
 
       - name: Run live copilot proxy e2e
         if: steps.gate.outputs.run == 'true'
-        run: bash scripts/live-copilot-proxy-e2e.sh
+        # This lane depends on an external upstream proxy, so a transient
+        # upstream failure gets one clean retry (the script tears down its
+        # Kind cluster on exit) before the lane is reported red.
+        run: |
+          set -Eeuo pipefail
+          if bash scripts/live-copilot-proxy-e2e.sh; then
+            exit 0
+          fi
+          echo "::warning::live copilot proxy e2e failed once; retrying in case the external proxy flaked"
+          bash scripts/live-copilot-proxy-e2e.sh
