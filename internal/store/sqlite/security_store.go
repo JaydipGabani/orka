@@ -552,6 +552,16 @@ func unmarshalEvidence(payload string) ([]store.FindingEvidenceRef, error) {
 
 // UpsertFinding inserts or updates a finding keyed by repository fingerprint.
 func (s *Store) UpsertFinding(ctx context.Context, finding *store.Finding) error {
+	return s.upsertFinding(ctx, finding, false)
+}
+
+// UpsertObservedFinding inserts or updates a finding from a current scan
+// observation, which may explicitly reopen a remediated finding.
+func (s *Store) UpsertObservedFinding(ctx context.Context, finding *store.Finding) error {
+	return s.upsertFinding(ctx, finding, true)
+}
+
+func (s *Store) upsertFinding(ctx context.Context, finding *store.Finding, observed bool) error {
 	if finding.ID == "" {
 		finding.ID = finding.Fingerprint
 	}
@@ -606,11 +616,14 @@ func (s *Store) UpsertFinding(ctx context.Context, finding *store.Finding) error
 		       ELSE 0
 		     END THEN security_findings.validation_status
 		     ELSE excluded.validation_status
-		   END,
-		   state = CASE
-			     WHEN security_findings.state IN ('dismissed', 'suppressed', 'false_positive')
-		       THEN security_findings.state
-		     WHEN security_findings.state = 'patch_pending'
+			   END,
+			   state = CASE
+				     WHEN security_findings.state IN ('dismissed', 'suppressed', 'false_positive')
+			       THEN security_findings.state
+			     WHEN security_findings.state IN ('fixed', 'resolved')
+			       AND NOT (? AND excluded.state = 'open')
+			       THEN security_findings.state
+			     WHEN security_findings.state = 'patch_pending'
 		       AND excluded.state = 'open'
 		       THEN excluded.state
 		     WHEN CASE security_findings.state
@@ -665,23 +678,23 @@ func (s *Store) UpsertFinding(ctx context.Context, finding *store.Finding) error
 		       ELSE 0
 		     END THEN security_findings.validation_json
 		     ELSE excluded.validation_json
-		   END,
-		   patch_proposal_id = CASE
-		     WHEN security_findings.state IN ('fixed', 'resolved')
-		       AND excluded.state = 'open'
+			   END,
+			   patch_proposal_id = CASE
+			     WHEN ? AND security_findings.state IN ('fixed', 'resolved')
+			       AND excluded.state = 'open'
 		       THEN excluded.patch_proposal_id
 		     WHEN excluded.patch_proposal_id IS NOT NULL AND excluded.patch_proposal_id != '' THEN excluded.patch_proposal_id
 		     ELSE security_findings.patch_proposal_id
-		   END,
-		   pr_number = CASE
-		     WHEN security_findings.state IN ('fixed', 'resolved')
-		       AND excluded.state = 'open'
+			   END,
+			   pr_number = CASE
+			     WHEN ? AND security_findings.state IN ('fixed', 'resolved')
+			       AND excluded.state = 'open'
 		       THEN excluded.pr_number
 		     ELSE COALESCE(excluded.pr_number, security_findings.pr_number)
-		   END,
-		   pr_url = CASE
-		     WHEN security_findings.state IN ('fixed', 'resolved')
-		       AND excluded.state = 'open'
+			   END,
+			   pr_url = CASE
+			     WHEN ? AND security_findings.state IN ('fixed', 'resolved')
+			       AND excluded.state = 'open'
 		       THEN excluded.pr_url
 		     WHEN excluded.pr_url IS NOT NULL AND excluded.pr_url != '' THEN excluded.pr_url
 		     ELSE security_findings.pr_url
@@ -692,7 +705,7 @@ func (s *Store) UpsertFinding(ctx context.Context, finding *store.Finding) error
 		finding.ValidationStatus, finding.State, finding.DuplicateOf, finding.FilePath, finding.Line, finding.CommitSHA, finding.RootCause,
 		finding.Reproduction, finding.Remediation, finding.SuggestedAction, finding.WhyTestsDoNotAlreadyCoverThis,
 		finding.SuggestedRegressionTest, finding.MinimumFixScope, evidenceJSON, finding.ValidationJSON, finding.PatchProposalID,
-		finding.PRNumber, finding.PRURL, finding.CreatedAt, finding.UpdatedAt,
+		finding.PRNumber, finding.PRURL, finding.CreatedAt, finding.UpdatedAt, observed, observed, observed, observed,
 	)
 	return err
 }

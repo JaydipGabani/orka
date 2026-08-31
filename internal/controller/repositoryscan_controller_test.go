@@ -3376,6 +3376,31 @@ func TestIngestPatchTaskMarksPROpenAfterExactPublicationReceipt(t *testing.T) {
 	}
 }
 
+func TestIngestPatchTaskDoesNotReopenResolvedFinding(t *testing.T) {
+	ctx := context.Background()
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "resolved-reconcile", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "app.py", Status: "modified", Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
+	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+		Summary:    "patched successfully",
+		Diff:       testPatchFullDiff,
+		Files:      []string{"app.py"},
+		PushBranch: fixture.proposal.Branch,
+	})
+	savePatchArtifacts(t, fixture, testPatchFullDiff, []string{"app.py"})
+	task := patchTaskForFixture(fixture, true)
+
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, task); err != nil {
+		t.Fatalf("ingestPatchTask() first pass error = %v", err)
+	}
+	if err := fixture.store.UpdateFindingState(ctx, fixture.finding.Namespace, fixture.finding.ID, findingStateResolved); err != nil {
+		t.Fatalf("UpdateFindingState(resolved) error = %v", err)
+	}
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, task); err != nil {
+		t.Fatalf("ingestPatchTask() second pass error = %v", err)
+	}
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStateResolved)
+}
+
 func TestIngestPatchTaskAcceptsDiffArtifactWithDifferentIndexFormatting(t *testing.T) {
 	ctx := context.Background()
 	var seenToken string
@@ -3789,8 +3814,8 @@ func TestMergeExistingFindingCollapsesSemanticDuplicates(t *testing.T) {
 	if err := reconciler.mergeExistingFinding(ctx, scan, incoming); err != nil {
 		t.Fatalf("mergeExistingFinding() error = %v", err)
 	}
-	if err := securityStore.UpsertFinding(ctx, incoming); err != nil {
-		t.Fatalf("UpsertFinding(incoming) error = %v", err)
+	if err := securityStore.UpsertObservedFinding(ctx, incoming); err != nil {
+		t.Fatalf("UpsertObservedFinding(incoming) error = %v", err)
 	}
 
 	listed, _, err := securityStore.ListFindings(ctx, storepkg.FindingFilter{Namespace: defaultNS, RepositoryScan: scan.Name, Limit: 10})
@@ -3864,8 +3889,8 @@ func TestMergeExistingFindingReopensResolvedFindingWithoutRemediationProjection(
 	if incoming.State != findingStateOpen || incoming.PatchProposalID != "" || incoming.PRNumber != nil || incoming.PRURL != "" {
 		t.Fatalf("incoming recurrence = %#v", incoming)
 	}
-	if err := securityStore.UpsertFinding(ctx, incoming); err != nil {
-		t.Fatalf("UpsertFinding(incoming) error = %v", err)
+	if err := securityStore.UpsertObservedFinding(ctx, incoming); err != nil {
+		t.Fatalf("UpsertObservedFinding(incoming) error = %v", err)
 	}
 	stored, err := securityStore.GetFinding(ctx, defaultNS, existing.ID)
 	if err != nil || stored.State != findingStateOpen || stored.PatchProposalID != "" || stored.PRNumber != nil || stored.PRURL != "" {
@@ -3977,6 +4002,47 @@ func TestFindingIdentityMatchScoreRequiresCategoryAndStableLocation(t *testing.T
 				t.Fatalf("findingIdentityMatchScore() match = %v, want %v", got, tt.match)
 			}
 		})
+	}
+}
+
+func TestFindingIdentityMatchScoreRejectsConflictingPrimarySymbolsWithSharedSupport(t *testing.T) {
+	left := &storepkg.Finding{
+		Category: "path traversal",
+		FilePath: "archive.go",
+		Line:     100,
+		Evidence: []storepkg.FindingEvidenceRef{
+			{Path: "archive.go", StartLine: 100, EndLine: 108, Symbol: "extractArchive"},
+			{Path: "archive.go", StartLine: 200, EndLine: 205, Symbol: "sanitizePath"},
+		},
+	}
+	right := &storepkg.Finding{
+		Category: "CWE-22 path traversal",
+		FilePath: "archive.go",
+		Line:     104,
+		Evidence: []storepkg.FindingEvidenceRef{
+			{Path: "archive.go", StartLine: 104, EndLine: 112, Symbol: "writeManifest"},
+			{Path: "archive.go", StartLine: 200, EndLine: 205, Symbol: "sanitizePath"},
+		},
+	}
+	if score := findingIdentityMatchScore(left, right); score != 0 {
+		t.Fatalf("findingIdentityMatchScore() = %d, want primary symbol conflict rejected", score)
+	}
+}
+
+func TestMergeFindingValidationStateRanksFailedAboveSkipped(t *testing.T) {
+	failed := &storepkg.Finding{ID: "finding", ValidationStatus: findingValidationStatusFailed, ValidationJSON: `{"status":"failed"}`}
+	skipped := &storepkg.Finding{ID: "finding", ValidationStatus: findingValidationStatusSkipped, ValidationJSON: `{"status":"skipped"}`}
+
+	target := *skipped
+	mergeFindingValidationState(&target, failed)
+	if target.ValidationStatus != findingValidationStatusFailed || target.ValidationJSON != failed.ValidationJSON {
+		t.Fatalf("skipped then failed = %#v, want failed", target)
+	}
+
+	target = *failed
+	mergeFindingValidationState(&target, skipped)
+	if target.ValidationStatus != findingValidationStatusFailed || target.ValidationJSON != failed.ValidationJSON {
+		t.Fatalf("failed then skipped = %#v, want failed", target)
 	}
 }
 

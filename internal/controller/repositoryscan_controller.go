@@ -2265,6 +2265,9 @@ func findingIdentityMatchScore(left, right *store.Finding) int {
 	if left == nil || right == nil || !findingCategoryMatches(left.Category, right.Category) || strings.TrimSpace(left.FilePath) == "" || left.FilePath != right.FilePath {
 		return 0
 	}
+	if findingPrimaryEvidenceSymbolsConflict(left, right) {
+		return 0
+	}
 	best := 0
 	conflictingSymbols := false
 	for _, leftRef := range left.Evidence {
@@ -2299,6 +2302,40 @@ func findingIdentityMatchScore(left, right *store.Finding) int {
 		best = 2
 	}
 	return best
+}
+
+func findingPrimaryEvidenceSymbolsConflict(left, right *store.Finding) bool {
+	leftSymbols := findingPrimaryEvidenceSymbols(left)
+	rightSymbols := findingPrimaryEvidenceSymbols(right)
+	if len(leftSymbols) == 0 || len(rightSymbols) == 0 {
+		return false
+	}
+	for symbol := range leftSymbols {
+		if _, ok := rightSymbols[symbol]; ok {
+			return false
+		}
+	}
+	return true
+}
+
+func findingPrimaryEvidenceSymbols(finding *store.Finding) map[string]struct{} {
+	symbols := map[string]struct{}{}
+	if finding == nil || finding.Line <= 0 {
+		return symbols
+	}
+	for _, ref := range finding.Evidence {
+		if ref.Path != finding.FilePath || ref.StartLine <= 0 {
+			continue
+		}
+		endLine := max(ref.StartLine, ref.EndLine)
+		if finding.Line < ref.StartLine || finding.Line > endLine {
+			continue
+		}
+		if symbol := normalizeFindingIdentityText(ref.Symbol); symbol != "" {
+			symbols[symbol] = struct{}{}
+		}
+	}
+	return symbols
 }
 
 func findingCategoryMatches(left, right string) bool {
@@ -2828,7 +2865,7 @@ func (r *RepositoryScanReconciler) ingestReviewTask(ctx context.Context, scan *c
 		if err := r.mergeExistingFinding(ctx, scan, finding); err != nil {
 			return err
 		}
-		if err := r.SecurityStore.UpsertFinding(ctx, finding); err != nil {
+		if err := r.SecurityStore.UpsertObservedFinding(ctx, finding); err != nil {
 			return err
 		}
 		upserted = append(upserted, finding)
@@ -3369,8 +3406,10 @@ func validationJSONForFinding(raw, findingID string) string {
 func findingValidationStatusRank(status string) int {
 	switch strings.TrimSpace(status) {
 	case findingValidationStatusValidated:
+		return 5
+	case findingValidationStatusFailed:
 		return 4
-	case findingValidationStatusFailed, findingValidationStatusSkipped:
+	case findingValidationStatusSkipped:
 		return 3
 	case findingValidationStatusPending:
 		return 2

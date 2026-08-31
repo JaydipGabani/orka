@@ -7847,6 +7847,90 @@ func TestRepositoryMonitorUpdateBranchNoChangeUsesLiveBaseTip(t *testing.T) {
 	}
 }
 
+type failingUpdateBranchProjectionStore struct {
+	store.RepositoryMonitorStore
+	projection string
+}
+
+func (s failingUpdateBranchProjectionStore) UpsertMonitorItem(ctx context.Context, item *store.MonitorItem) error {
+	if s.projection == "monitor item" {
+		return errors.New("monitor item projection unavailable")
+	}
+	return s.RepositoryMonitorStore.UpsertMonitorItem(ctx, item)
+}
+
+func (s failingUpdateBranchProjectionStore) CreateWorkAction(ctx context.Context, action *store.WorkAction) error {
+	if s.projection == "work action" {
+		return errors.New("work action projection unavailable")
+	}
+	return s.RepositoryMonitorStore.CreateWorkAction(ctx, action)
+}
+
+func (s failingUpdateBranchProjectionStore) UpdateWorkAction(ctx context.Context, action *store.WorkAction) error {
+	if s.projection == "work action" {
+		return errors.New("work action projection unavailable")
+	}
+	return s.RepositoryMonitorStore.UpdateWorkAction(ctx, action)
+}
+
+func (s failingUpdateBranchProjectionStore) CreateMonitorEvent(ctx context.Context, event *store.MonitorEvent) error {
+	if s.projection == "event" {
+		return errors.New("event projection unavailable")
+	}
+	return s.RepositoryMonitorStore.CreateMonitorEvent(ctx, event)
+}
+
+func TestRepositoryMonitorUpdateBranchKeepsAcceptedMutationRetryableWhenProjectionFails(t *testing.T) {
+	for _, projection := range []string{"monitor item", "work action", "event"} {
+		t.Run(projection, func(t *testing.T) {
+			ctx := context.Background()
+			monitorStore := setupControllerSQLiteStore(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/compare/live-base-sha...old-head-sha":
+					_, _ = w.Write([]byte(`{"status":"diverged"}`))
+				case r.Method == http.MethodPut && r.URL.Path == "/repos/orka-agents/orka/pulls/42/update-branch":
+					w.Header().Set("X-GitHub-Request-Id", "request-42")
+					w.WriteHeader(http.StatusAccepted)
+				default:
+					t.Fatalf("unexpected GitHub request %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			scheme := runtime.NewScheme()
+			_ = corev1alpha1.AddToScheme(scheme)
+			_ = corev1.AddToScheme(scheme)
+			monitor, secret := repositoryMonitorInventoryTestObjects("update-branch-projection-" + strings.ReplaceAll(projection, " ", "-"))
+			client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(monitor, secret).Build()
+			failingStore := failingUpdateBranchProjectionStore{RepositoryMonitorStore: monitorStore, projection: projection}
+			reconciler := &RepositoryMonitorReconciler{Client: client, Store: failingStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
+			command := &store.CommandEvent{ID: "cmd-update-projection-" + strings.ReplaceAll(projection, " ", "-"), MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Repo: "orka-agents/orka", Kind: repositoryMonitorPullRequestKind, Number: 42, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "old-head-sha", Status: "accepted", CreatedAt: time.Now()}
+			if err := monitorStore.CreateCommandEvent(ctx, command); err != nil {
+				t.Fatalf("CreateCommandEvent() error = %v", err)
+			}
+			run := &store.MonitorRun{ID: "run-update-projection-" + strings.ReplaceAll(projection, " ", "-"), MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Trigger: repositoryMonitorTriggerLabelCommand, TargetKind: repositoryMonitorPullRequestKind, TargetNumber: 42, TargetSHA: command.HeadSHA, CommandEventID: command.ID, Phase: repositoryMonitorRunPhaseQueued, StartedAt: time.Now()}
+			if err := monitorStore.CreateMonitorRun(ctx, run); err != nil {
+				t.Fatalf("CreateMonitorRun() error = %v", err)
+			}
+			pr := repositoryMonitorPullRequest{Number: 42, State: repositoryMonitorItemStateOpen, BaseBranch: "main", BaseSHA: "live-base-sha", HeadBranch: "feature", HeadRepo: "orka-agents/orka", HeadSHA: command.HeadSHA}
+			item := repositoryMonitorItemFromPullRequest(monitor, pr, nil)
+
+			handled, created, err := reconciler.tryProcessPullRequestUpdateBranchCommand(ctx, monitor, run, command, "orka-agents", "orka", pr, item)
+			if err == nil || !handled || created != 0 {
+				t.Fatalf("update branch = handled %v, created %d, err %v", handled, created, err)
+			}
+			if failureState := repositoryMonitorRunFailureState(err); failureState != repositoryMonitorRunRetryScheduled {
+				t.Fatalf("failure state = %q, want %q for %v", failureState, repositoryMonitorRunRetryScheduled, err)
+			}
+			mutation, getErr := monitorStore.GetGitHubMutationRecord(ctx, monitor.Namespace, repositoryMonitorUpdateBranchMutationID(command.ID))
+			if getErr != nil || mutation.Status != repositoryMonitorAutomergeStatePending || mutation.GitHubRequestID != "request-42" {
+				t.Fatalf("pending mutation = %#v, err %v", mutation, getErr)
+			}
+		})
+	}
+}
+
 //nolint:gocyclo // The regression covers one complete controller-owned mutation lifecycle.
 func TestRepositoryMonitorUpdateBranchUsesNativeMutationAndWaitsForLiveBase(t *testing.T) {
 	ctx := context.Background()

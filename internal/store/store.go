@@ -199,6 +199,7 @@ type SecurityStore interface {
 	SaveThreatModel(ctx context.Context, model *ThreatModel) error
 
 	UpsertFinding(ctx context.Context, finding *Finding) error
+	UpsertObservedFinding(ctx context.Context, finding *Finding) error
 	GetFinding(ctx context.Context, namespace, id string) (*Finding, error)
 	ListFindings(ctx context.Context, filter FindingFilter) ([]Finding, string, error)
 	GetFindingCounts(ctx context.Context, namespace, repositoryScan string) (FindingCounts, error)

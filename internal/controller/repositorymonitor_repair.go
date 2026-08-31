@@ -35,6 +35,23 @@ const (
 	repositoryMonitorFieldHeadSHA          = "headSHA"
 )
 
+type repositoryMonitorPendingMutationProjectionError struct {
+	projection string
+	err        error
+}
+
+func (e *repositoryMonitorPendingMutationProjectionError) Error() string {
+	return fmt.Sprintf("pending GitHub mutation %s projection failed: %v", e.projection, e.err)
+}
+
+func (e *repositoryMonitorPendingMutationProjectionError) Unwrap() error {
+	return e.err
+}
+
+func pendingMutationProjectionError(projection string, err error) error {
+	return &repositoryMonitorPendingMutationProjectionError{projection: projection, err: err}
+}
+
 //nolint:gocyclo // PR command safety gates are intentionally explicit.
 func (r *RepositoryMonitorReconciler) tryProcessPullRequestCommandRun(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, run *store.MonitorRun, owner, repository string, pr repositoryMonitorPullRequest, item *store.MonitorItem) (bool, int, error) {
 	if run == nil || strings.TrimSpace(run.CommandEventID) == "" || item == nil {
@@ -248,9 +265,12 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 		item.RepairState = repositoryMonitorRepairPhaseQueued
 		item.SkipReason = ""
 		if err := r.Store.UpsertMonitorItem(ctx, item); err != nil {
-			return true, 0, err
+			return true, 0, pendingMutationProjectionError("monitor item", err)
 		}
-		return true, 0, r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusRunning, repositoryMonitorAutomergeStatePending, "", "")
+		if err := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusRunning, repositoryMonitorAutomergeStatePending, "", ""); err != nil {
+			return true, 0, pendingMutationProjectionError("work action", err)
+		}
+		return true, 0, nil
 	case repositoryMonitorAutomergeStateStarted:
 	default:
 		return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "update-branch mutation has an invalid state")
@@ -301,12 +321,15 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 	item.RepairState = repositoryMonitorRepairPhaseQueued
 	item.SkipReason = ""
 	if err := r.Store.UpsertMonitorItem(ctx, item); err != nil {
-		return true, 0, err
+		return true, 0, pendingMutationProjectionError("monitor item", err)
 	}
 	if err := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusRunning, repositoryMonitorAutomergeStatePending, "", ""); err != nil {
-		return true, 0, err
+		return true, 0, pendingMutationProjectionError("work action", err)
 	}
-	return true, 0, r.createMonitorEvent(ctx, monitor, run.ID, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "update_branch_started", fmt.Sprintf("Pull request #%d branch update started", pr.Number), map[string]any{repositoryMonitorFieldBaseSHA: mutation.ExternalID})
+	if err := r.createMonitorEvent(ctx, monitor, run.ID, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "update_branch_started", fmt.Sprintf("Pull request #%d branch update started", pr.Number), map[string]any{repositoryMonitorFieldBaseSHA: mutation.ExternalID}); err != nil {
+		return true, 0, pendingMutationProjectionError("event", err)
+	}
+	return true, 0, nil
 }
 
 func repositoryMonitorUpdateBranchMutationID(commandID string) string {

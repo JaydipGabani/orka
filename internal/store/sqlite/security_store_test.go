@@ -611,8 +611,8 @@ func TestUpsertFindingAllowsPatchPendingToReturnOpen(t *testing.T) {
 	}
 }
 
-func TestUpsertFindingPreservesUserFinalStatesOverOpen(t *testing.T) {
-	for _, finalState := range []string{"dismissed", "suppressed", "false_positive"} {
+func TestUpsertFindingPreservesFinalStatesOverOpen(t *testing.T) {
+	for _, finalState := range []string{"fixed", "resolved", "dismissed", "suppressed", "false_positive"} {
 		t.Run(finalState, func(t *testing.T) {
 			s := setupTestStore(t)
 			ctx := context.Background()
@@ -652,7 +652,7 @@ func TestUpsertFindingPreservesUserFinalStatesOverOpen(t *testing.T) {
 	}
 }
 
-func TestUpsertFindingReopensRemediatedStatesWhenObservedAgain(t *testing.T) {
+func TestUpsertObservedFindingReopensRemediatedStatesWhenObservedAgain(t *testing.T) {
 	for _, remediatedState := range []string{"fixed", "resolved"} {
 		t.Run(remediatedState, func(t *testing.T) {
 			s := setupTestStore(t)
@@ -676,8 +676,8 @@ func TestUpsertFindingReopensRemediatedStatesWhenObservedAgain(t *testing.T) {
 			reopened := *initial
 			reopened.ScanRunID = testScanRunID2
 			reopened.State = testStateOpen
-			if err := s.UpsertFinding(ctx, &reopened); err != nil {
-				t.Fatalf("UpsertFinding(reopened): %v", err)
+			if err := s.UpsertObservedFinding(ctx, &reopened); err != nil {
+				t.Fatalf("UpsertObservedFinding(reopened): %v", err)
 			}
 			got, err := s.GetFinding(ctx, "ns1", initial.ID)
 			if err != nil {

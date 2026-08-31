@@ -1682,7 +1682,7 @@ func TestCreateSecurityPullRequestReturnsGovernedReceiptWithoutGitHubMutation(t 
 	reobserved.PatchProposalID = ""
 	reobserved.PRNumber = nil
 	reobserved.PRURL = ""
-	require.NoError(t, securityStore.UpsertFinding(ctx, reobserved))
+	require.NoError(t, securityStore.UpsertObservedFinding(ctx, reobserved))
 
 	staleReq := httptest.NewRequest(http.MethodPost, "/security/findings/finding-1/pull-request?namespace=demo", nil)
 	staleResp, err := app.Test(staleReq)
