@@ -992,12 +992,68 @@ func TestRuntimePoolReconcilerRolloutFailureAndTimeoutPreserveOldPod(t *testing.
 			t.Fatal("rollout timeout replaced or stopped the live old template")
 		}
 
+		runtimePoolReconcile(t, r, pool)
+		status = runtimePoolTestGetPool(t, r, pool).Status
+		condition = meta.FindStatusCondition(status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+		if status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDraining || condition == nil || condition.Reason != runtimePoolRolloutReasonDraining {
+			t.Fatalf("timeout retry status/condition = %s/%#v, want Draining/RolloutDraining", status.Lifecycle, condition)
+		}
+
 		supervisor.probe.Status.Pressure.LiveDescendants = 0
 		runtimePoolReconcile(t, r, pool)
 		if got := runtimePoolTestGetPool(t, r, pool).Status.Lifecycle; got != corev1alpha1.RuntimePoolLifecycleQuiescent {
 			t.Fatalf("lifecycle after late quiescence = %s, want Quiescent", got)
 		}
 	})
+}
+
+func TestRuntimePoolReconcilerRolloutRecoversWhenActivePodDisappears(t *testing.T) {
+	scheme := runtimePoolTestScheme(t)
+	pool := runtimePoolTestObject(1)
+	supervisor := &fakeRuntimePoolSupervisorClient{}
+	r := runtimePoolTestReconciler(t, scheme, supervisor, pool)
+	deployment, oldPod := runtimePoolTestStartServing(t, r, pool, supervisor, "lost-rollout-pod", "lost-rollout-pod-uid", "10.0.0.93", "lost-rollout-boot")
+	oldRevision := deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation]
+
+	r.ProviderProxy.BearerToken = bytes.Clone(runtimePoolTestProviderTokenNext)
+	if err := r.Delete(context.Background(), &oldPod); err != nil {
+		t.Fatalf("delete old runtime Pod: %v", err)
+	}
+	replacement := runtimePoolReadyPodForDeployment(pool, deployment, "unadmitted-replacement-pod", "unadmitted-replacement-pod-uid", "10.0.0.94")
+	runtimePoolTestCreatePod(t, r, &replacement)
+
+	runtimePoolReconcile(t, r, pool)
+	got := runtimePoolTestGetPool(t, r, pool)
+	if got.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
+		got.Status.ActiveInstance == nil || got.Status.ActiveInstance.PodUID != string(oldPod.UID) {
+		t.Fatalf("active-Pod loss closure = %s active=%#v, want Closed with the old fence preserved", got.Status.AdmissionState, got.Status.ActiveInstance)
+	}
+	deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
+	if replicas := ptr.Deref(deployment.Spec.Replicas, -1); replicas != 1 {
+		t.Fatalf("replicas before admission closure persisted = %d, want 1", replicas)
+	}
+
+	runtimePoolReconcile(t, r, pool)
+	got = runtimePoolTestGetPool(t, r, pool)
+	if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopping || got.Status.ActiveInstance != nil {
+		t.Fatalf("active-Pod loss recovery = %s active=%#v, want Stopping with no active fence", got.Status.Lifecycle, got.Status.ActiveInstance)
+	}
+	deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
+	if replicas := ptr.Deref(deployment.Spec.Replicas, -1); replicas != 0 {
+		t.Fatalf("replicas while removing the unadmitted replacement = %d, want 0", replicas)
+	}
+
+	if err := r.Delete(context.Background(), &replacement); err != nil {
+		t.Fatalf("delete unadmitted replacement Pod: %v", err)
+	}
+	runtimePoolReconcile(t, r, pool)
+	deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
+	if replicas := ptr.Deref(deployment.Spec.Replicas, -1); replicas != 1 {
+		t.Fatalf("replacement replicas after active-Pod loss = %d, want 1", replicas)
+	}
+	if revision := deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation]; revision == oldRevision {
+		t.Fatalf("replacement retained superseded template revision %q", revision)
+	}
 }
 
 func TestRuntimePoolPodTemplateRevisionChangesForEveryRuntimeIdentityInput(t *testing.T) {
@@ -1290,6 +1346,40 @@ func TestRuntimePoolReconcilerClosesAdmissionForTwoReadyPods(t *testing.T) {
 	condition := meta.FindStatusCondition(got.Status.Conditions, corev1alpha1.RuntimePoolConditionAdmissionReady)
 	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != corev1alpha1.RuntimePoolReasonRuntimeAmbiguous {
 		t.Fatalf("AdmissionReady condition = %#v", condition)
+	}
+}
+
+func TestRuntimePoolReconcilerRetiresSupersededPlainPool(t *testing.T) {
+	scheme := runtimePoolTestScheme(t)
+	pool := runtimePoolTestObject(1)
+	identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+		"profileDigest": pool.Spec.Runtime.Profile.Digest,
+		"runtimeImage":  pool.Spec.Runtime.Image,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Name = acpRuntimePoolName(pool.Spec.Runtime.Profile.ProviderKind, harnessv2.ProfileDigest(identity))
+	pool.UID = types.UID(pool.Namespace + "-retired-pool-uid")
+	r := runtimePoolTestReconciler(t, scheme, &fakeRuntimePoolSupervisorClient{}, pool)
+	r.AllowedImages.Codex = "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
+
+	runtimePoolReconcile(t, r, pool)
+	got := runtimePoolTestGetPool(t, r, pool)
+	if got.Spec.DesiredReplicas != 0 {
+		t.Fatalf("retired desired replicas = %d, want 0", got.Spec.DesiredReplicas)
+	}
+	if got.Spec.Runtime.Image != pool.Spec.Runtime.Image {
+		t.Fatalf("retired pool image = %q, want immutable original %q", got.Spec.Runtime.Image, pool.Spec.Runtime.Image)
+	}
+
+	runtimePoolReconcile(t, r, pool)
+	got = runtimePoolTestGetPool(t, r, pool)
+	condition := meta.FindStatusCondition(got.Status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+	if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopped ||
+		got.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
+		condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("retired pool status = %s/%s condition=%#v, want Stopped/Closed with rollout complete", got.Status.Lifecycle, got.Status.AdmissionState, condition)
 	}
 }
 

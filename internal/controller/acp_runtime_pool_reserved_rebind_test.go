@@ -19,14 +19,14 @@ import (
 	"github.com/orka-agents/orka/internal/store/sqlite"
 )
 
-//nolint:gocyclo // The table verifies frozen pool and reservation lifecycle invariants together.
-func TestQueueACPRuntimeTaskKeepsFrozenPoolForReservedAttemptAfterRuntimeImageRotation(t *testing.T) {
+//nolint:gocyclo // The table verifies safe reserved rebind and reservation lifecycle invariants together.
+func TestQueueACPRuntimeTaskRebindsSafeReservedAttemptAfterRuntimeImageRotation(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
 		activeReservation bool
 		wantRebound       bool
 	}{
-		{name: "recovered without active reservation", wantRebound: false},
+		{name: "recovered without active reservation", wantRebound: true},
 		{name: "active old-pool reservation blocks rebind", activeReservation: true, wantRebound: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

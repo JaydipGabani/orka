@@ -97,6 +97,7 @@ type ACPDispatcher struct {
 	ReservationTTL           time.Duration
 	RateLimitRetryInterval   time.Duration
 	AdmissionGate            *ACPAdmissionGate
+	ACPRuntimeImages         ACPRuntimeImages
 	runtimeContextFactory    func(context.Context, *corev1alpha1.Task) (context.Context, context.CancelFunc)
 
 	// SubstrateRouterURL and SubstrateActorDNSSuffix route Substrate-backed
@@ -509,6 +510,9 @@ func (d *ACPDispatcher) reapIdlePools(ctx context.Context, tasks []corev1alpha1.
 		}
 		pool = latest
 		if pool.Spec.DesiredReplicas == 0 {
+			if err := d.reapStoppedRetiredPlainPool(ctx, pool, activeByPool[key], now); err != nil {
+				return err
+			}
 			if err := d.reapStoppedWorkspacePool(ctx, pool, activeByPool[key], now); err != nil {
 				return err
 			}
@@ -552,6 +556,30 @@ func (d *ACPDispatcher) reapIdlePools(ctx context.Context, tasks []corev1alpha1.
 		if err := d.Client.Patch(ctx, pool, patch); err != nil && !apierrors.IsConflict(err) {
 			return err
 		}
+	}
+	return nil
+}
+
+func (d *ACPDispatcher) reapStoppedRetiredPlainPool(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+	activeTasks int,
+	now time.Time,
+) error {
+	if !acpRuntimePoolImageRetired(pool, d.ACPRuntimeImages) || activeTasks > 0 ||
+		pool.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopped ||
+		pool.Status.ObservedGeneration != pool.Generation || pool.Status.ActiveInstance != nil ||
+		pool.Status.Capacity.QueuedTasks > 0 || pool.Status.Capacity.FinalizingSessions > 0 ||
+		len(pool.Status.Capacity.Reservations) > 0 {
+		return nil
+	}
+	lastDemand, err := time.Parse(time.RFC3339Nano, pool.Annotations[acpRuntimeLastDemandAnnotation])
+	if err != nil || now.Sub(lastDemand) < 2*d.IdlePoolTTL {
+		return nil
+	}
+	if err := d.Client.Delete(ctx, pool, deleteCurrentObjectPreconditions(pool)...); err != nil &&
+		!apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+		return err
 	}
 	return nil
 }
@@ -968,17 +996,18 @@ func validateFrozenACPDispatchTarget(
 	task *corev1alpha1.Task,
 	target acpDispatchTarget,
 	bound *verifiedAgentExecution,
+	deliveryPlan ACPRuntimePlan,
 ) error {
 	if task == nil || task.Status.Execution == nil || target.pool == nil || bound == nil || bound.binding == nil {
 		return errors.New("frozen ACP Task, RuntimePool target, and execution binding are required")
 	}
-	if target.pool.Name != bound.plan.PoolName || target.pool.Spec.Runtime.Image != bound.plan.Image ||
+	if target.pool.Name != deliveryPlan.PoolName || target.pool.Spec.Runtime.Image != deliveryPlan.Image ||
 		target.pool.Spec.Runtime.Profile.Digest != bound.body.ProfileDigest ||
 		task.Status.Execution.RuntimePoolName != target.pool.Name ||
 		task.Status.Execution.RuntimePoolUID != string(target.pool.UID) {
-		return errors.New("reserved RuntimePool does not exactly match the immutable execution snapshot")
+		return errors.New("reserved RuntimePool does not exactly match the approved pre-submission delivery plan")
 	}
-	if !acpRuntimePoolWorkspaceMatchesPlan(target.pool, bound.plan) {
+	if !acpRuntimePoolWorkspaceMatchesPlan(target.pool, deliveryPlan) {
 		return errors.New("reserved RuntimePool execution workspace binding does not exactly match the immutable execution snapshot")
 	}
 	return nil
@@ -1004,7 +1033,11 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		return err
 	}
 	task = bound.frozenTask
-	if err := validateFrozenACPDispatchTarget(task, target, bound); err != nil {
+	deliveryPlan, err := currentACPRuntimeDeliveryPlan(bound.plan, d.ACPRuntimeImages)
+	if err != nil {
+		return err
+	}
+	if err := validateFrozenACPDispatchTarget(task, target, bound, deliveryPlan); err != nil {
 		return err
 	}
 	if reservationLease != nil {

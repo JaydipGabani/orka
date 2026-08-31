@@ -54,7 +54,10 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 		return ctrl.Result{}, fmt.Errorf("verify immutable v2 execution before ACP queueing: %w", err)
 	}
 	frozenTask := bound.frozenTask
-	plan := bound.plan
+	plan, err := currentACPRuntimeDeliveryPlan(bound.plan, r.ACPRuntimeImages)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("resolve current ACP runtime delivery plan: %w", err)
+	}
 	if reason := r.frozenWorkspaceDispatchDisabledReason(plan.Workspace); reason != "" {
 		// The single configuration gate for bound Tasks: ordinary planning
 		// AND bound-task recovery both flow through this chokepoint before

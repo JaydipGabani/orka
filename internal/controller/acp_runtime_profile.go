@@ -146,6 +146,62 @@ func PlanACPRuntimeWithConfiguration(
 	}, nil
 }
 
+// currentACPRuntimeDeliveryPlan refreshes the controller-owned image and
+// derived plain-pool identity while preserving the Task's immutable runtime
+// profile. This is safe only before a runtime or RuntimeSession is bound.
+// Workspace-backed pools keep their frozen plan because rotating their
+// physical workspace has separate lifecycle and lineage requirements.
+func currentACPRuntimeDeliveryPlan(plan ACPRuntimePlan, images ACPRuntimeImages) (ACPRuntimePlan, error) {
+	if plan.Workspace != nil {
+		return plan, nil
+	}
+	image, err := configuredACPRuntimeImage(plan.Profile.ProviderKind, images)
+	if err != nil {
+		return ACPRuntimePlan{}, err
+	}
+	if image == "" || image == plan.Image {
+		return plan, nil
+	}
+	if !ACPRuntimeImageAvailable(image) {
+		return ACPRuntimePlan{}, fmt.Errorf("current ACP runtime image for %s must be a configured digest-pinned image", plan.Profile.ProviderKind)
+	}
+	identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+		"profileDigest": string(plan.Digest), "runtimeImage": image,
+	})
+	if err != nil {
+		return ACPRuntimePlan{}, err
+	}
+	plan.Image = image
+	plan.PoolName = acpRuntimePoolName(plan.Profile.ProviderKind, harnessv2.ProfileDigest(identity))
+	return plan, nil
+}
+
+func configuredACPRuntimeImage(provider string, images ACPRuntimeImages) (string, error) {
+	_, image, err := acpRuntimeArtifacts(corev1alpha1.AgentRuntimeType(strings.TrimSpace(provider)), images)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(image), nil
+}
+
+func acpRuntimePoolImageRetired(pool *corev1alpha1.RuntimePool, images ACPRuntimeImages) bool {
+	if pool == nil || pool.Spec.ExecutionWorkspace != nil || validateRuntimePoolImageReference(pool) != nil {
+		return false
+	}
+	identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+		"profileDigest": pool.Spec.Runtime.Profile.Digest,
+		"runtimeImage":  strings.TrimSpace(pool.Spec.Runtime.Image),
+	})
+	if err != nil || pool.Name != acpRuntimePoolName(
+		pool.Spec.Runtime.Profile.ProviderKind,
+		harnessv2.ProfileDigest(identity),
+	) {
+		return false
+	}
+	approved, err := configuredACPRuntimeImage(pool.Spec.Runtime.Profile.ProviderKind, images)
+	return err == nil && ACPRuntimeImageAvailable(approved) && approved != strings.TrimSpace(pool.Spec.Runtime.Image)
+}
+
 func RuntimePoolProfileFromPlan(plan ACPRuntimePlan) corev1alpha1.RuntimePoolProfileSpec {
 	var modelLimits *corev1alpha1.ModelTokenLimits
 	if plan.Profile.ModelLimits != nil {
