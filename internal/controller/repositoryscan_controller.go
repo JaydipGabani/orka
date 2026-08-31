@@ -3157,7 +3157,10 @@ func (r *RepositoryScanReconciler) updatePatchProposalFromSucceededTask(ctx cont
 // is diagnosable from the API, the dashboard, and the controller log.
 func (r *RepositoryScanReconciler) failPatchProposal(ctx context.Context, task *corev1alpha1.Task, proposal *store.PatchProposal, reason string) {
 	proposal.Status = scanRunPhaseFailed
-	proposal.Reason = boundACPStatusMessage(reason)
+	// Reasons can embed agent-echoed text (for example a parser error quoting
+	// the supplied result kind); strip controls and redact credential shapes
+	// before the reason is persisted and logged.
+	proposal.Reason = boundACPStatusMessage(repositoryMonitorReviewContextSanitize(reason))
 	log.FromContext(ctx).Info("security patch proposal failed verification",
 		"namespace", task.Namespace, "task", task.Name, "finding", proposal.FindingID, "proposal", proposal.ID, "reason", proposal.Reason)
 }

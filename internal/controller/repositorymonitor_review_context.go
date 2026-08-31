@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -431,7 +432,10 @@ func repositoryMonitorReviewContextBoundedField(value string, maxBytes int) stri
 // never retained.
 func repositoryMonitorReviewContextDeletedLinesAltered(patch string) bool {
 	for line := range strings.SplitSeq(patch, "\n") {
-		if !strings.HasPrefix(line, "-") || strings.HasPrefix(line, "---") {
+		// GitHub file patches are hunk fragments without "--- a/…" file
+		// headers, so every "-"-prefixed line is deleted content — including
+		// one whose original text begins with "--".
+		if !strings.HasPrefix(line, "-") {
 			continue
 		}
 		if repositoryMonitorReviewContextSanitize(line) != line {
@@ -447,6 +451,12 @@ func repositoryMonitorReviewContextSanitize(value string) string {
 			return r
 		}
 		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+			return -1
+		}
+		// Unicode format runes (zero-width spaces, joiners, directional
+		// marks) are as invisible as C0/C1 controls and can split a
+		// credential past the redactor; drop them before redaction too.
+		if unicode.Is(unicode.Cf, r) {
 			return -1
 		}
 		return r

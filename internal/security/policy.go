@@ -54,15 +54,21 @@ func ValidateCustomPolicyText(text string) error {
 }
 
 var (
-	policySensitivePrefixPattern     = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9])(?:(?:github` + `_pat_|` + `g` + `hp_|xo` + `xb-|s` + `k-)[A-Za-z0-9_./+=:-]{8,}|(?:A` + `KIA|A` + `SIA)[A-Z0-9]{16})`)
-	policySensitiveAssignmentPattern = regexp.MustCompile(`(?i)\b(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|priv` + `ate[_-]?key)\s*[:=]\s*["']?([A-Za-z0-9_./+=:-]{16,})`)
+	policySensitivePrefixPattern = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9])(?:(?:github` + `_pat_|` + `g` + `hp_|xo` + `xb-|s` + `k-)[A-Za-z0-9_./+=:-]{8,}|(?:A` + `KIA|A` + `SIA)[A-Z0-9]{16})`)
+	// The credential keyword may carry a conventional identifier prefix
+	// ("OPENAI_API_KEY", "SLACK_BOT_TOKEN"): "\b" alone cannot see past the
+	// "_" word character, so the prefix is matched explicitly. Quoted values
+	// additionally admit spaces and symbols ("correct horse battery staple")
+	// that the bare token alphabet excludes.
+	policySensitiveAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|priv` + `ate[_-]?key)\s*[:=]\s*(?:"([^"\r\n]{16,})"|'([^'\r\n]{16,})'|([A-Za-z0-9_./+=~:-]{16,}))`)
 	policyJWTPattern                 = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])ey` + `J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}([^A-Za-z0-9_-]|$)`)
 	// Header-carried credentials are flagged only when a credential-shaped
 	// value follows: "Authorization: Bearer $TOKEN" in documentation is not
 	// a secret, "Authorization: Bearer eyJ…" or a 16+ character opaque token
-	// is.
-	policyBearerHeaderPattern = regexp.MustCompile(`(?i)auth` + `orization\s*:\s*be` + `arer\s+([A-Za-z0-9_./+=:-]{16,})`)
-	policyTxnTokenPattern     = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=:-]{16,})`)
+	// is. The value alphabet is the RFC 6750 token68 grammar, which includes
+	// "~".
+	policyBearerHeaderPattern = regexp.MustCompile(`(?i)auth` + `orization\s*:\s*be` + `arer\s+([A-Za-z0-9_./+=~:-]{16,})`)
+	policyTxnTokenPattern     = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=~:-]{16,})`)
 )
 
 // secretValuePlaceholder reports whether a credential-position value is an
@@ -84,28 +90,44 @@ func secretValuePlaceholder(value string) bool {
 // from configuration, not the secret itself.
 var codeReferencePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$`)
 
+// codeReferenceCredentialTail matches the final dotted segment of a code
+// reference that names a credential field. Code that reads a secret refers to
+// it by name (cfg.Provider.APIKey, settings.auth_token); a literal dotted
+// secret ("correct.horse.battery.staple") does not end in the credential
+// keyword it is assigned to, so only credential-named references are exempt.
+var codeReferenceCredentialTail = regexp.MustCompile(`(?i)^(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|passwd|clien` + `t[_-]?secret|secr` + `et|credentials?|priv` + `ate[_-]?key|key)$`)
+
 // secretValueIsCode reports whether a credential-position value is source
 // code rather than a literal: a call such as strings.TrimSpace(cfg.APIKey)
-// (the value is immediately followed by "(") or a qualified identifier.
-// Go/TS/Python that assigns apiKey from configuration would otherwise make
-// any file that touches credential plumbing unpublishable.
+// (the value is immediately followed by "(") or a qualified identifier whose
+// final segment names a credential field. Go/TS/Python that assigns apiKey
+// from configuration would otherwise make any file that touches credential
+// plumbing unpublishable, while arbitrary dotted literals stay flagged.
 func secretValueIsCode(text string, value string, end int) bool {
 	if end < len(text) && text[end] == '(' {
 		return true
 	}
-	return codeReferencePattern.MatchString(value)
+	if !codeReferencePattern.MatchString(value) {
+		return false
+	}
+	tail := value[strings.LastIndexByte(value, '.')+1:]
+	return codeReferenceCredentialTail.MatchString(tail)
 }
 
 func sensitiveValueMatch(pattern *regexp.Regexp, text string) bool {
 	for _, match := range pattern.FindAllStringSubmatchIndex(text, -1) {
-		if len(match) < 4 || match[2] < 0 {
-			continue
+		// Exactly one value alternative captures per match; find it.
+		for group := 1; 2*group+1 < len(match); group++ {
+			start, end := match[2*group], match[2*group+1]
+			if start < 0 {
+				continue
+			}
+			value := text[start:end]
+			if !secretValuePlaceholder(value) && !secretValueIsCode(text, value, end) {
+				return true
+			}
+			break
 		}
-		value := text[match[2]:match[3]]
-		if secretValuePlaceholder(value) || secretValueIsCode(text, value, match[3]) {
-			continue
-		}
-		return true
 	}
 	return false
 }

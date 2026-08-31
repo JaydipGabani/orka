@@ -4016,7 +4016,7 @@ func TestIngestPatchTaskDerivesArtifactsFromV2ResultAndPublishedCommit(t *testin
 		t.Fatalf("GetArtifact(diff) error = %v", err)
 	}
 	if !strings.Contains(string(diff), "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n") ||
-		!strings.Contains(string(diff), "diff --git a/tests/test_app.py b/tests/test_app.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_app.py\n") {
+		!strings.Contains(string(diff), "diff --git a/tests/test_app.py b/tests/test_app.py\n--- /dev/null\n+++ b/tests/test_app.py\n") {
 		t.Fatalf("derived diff = %q", diff)
 	}
 	summaryData, _, err := fixture.store.GetArtifact(ctx, fixture.proposal.Namespace, fixture.proposal.TaskName, summaryName)

@@ -886,3 +886,24 @@ func TestRepositoryMonitorReviewVerdictGateReason(t *testing.T) {
 		})
 	}
 }
+
+func TestRepositoryMonitorReviewContextStripsFormatRunesBeforeRedacting(t *testing.T) {
+	t.Parallel()
+	// A zero-width space inside the token must not split it past the redactor.
+	const secret = "ak-live-0123456789abcdef"
+	split := "api_key=" + secret[:10] + "​" + secret[10:]
+	if got := repositoryMonitorReviewContextSanitize(split); strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("sanitize(%q) = %q, want the reassembled credential redacted", split, got)
+	}
+}
+
+func TestRepositoryMonitorReviewContextDeletedLineStartingWithDashesIsNotAHeader(t *testing.T) {
+	t.Parallel()
+	// GitHub file patches carry no "--- a/…" headers, so a deleted line whose
+	// content begins with "--" ("---content" in the patch) is deleted content
+	// and must mark the change set incomplete when sanitization rewrites it.
+	patch := "@@ -1 +1 @@\n---api_key=0123456789abcdef0123\n+clean\n"
+	if !repositoryMonitorReviewContextDeletedLinesAltered(patch) {
+		t.Fatalf("deleted line beginning with dashes was skipped as a file header")
+	}
+}

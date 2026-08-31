@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -110,6 +111,11 @@ func (r *RepositoryScanReconciler) verifyPatchTaskEvidence(
 	if err != nil {
 		return patchVerificationResult{}, "", err
 	}
+	// The published diff can legitimately carry a removed credential on a
+	// deleted line; redact credential shapes (and strip controls) so the
+	// durable artifact never preserves the secret the remediation removed.
+	// Path and changed-file checks above ran on the unmodified diff.
+	diff = repositoryMonitorReviewContextSanitize(diff)
 	if err := r.ArtifactStore.SaveArtifact(ctx, task.Namespace, task.Name, diffName, "text/x-diff", []byte(diff)); err != nil {
 		return patchVerificationResult{}, "", err
 	}
@@ -117,6 +123,16 @@ func (r *RepositoryScanReconciler) verifyPatchTaskEvidence(
 		return patchVerificationResult{}, "", err
 	}
 	return patchVerificationResult{diffArtifact: diffName, summaryArtifact: summaryName}, "", nil
+}
+
+// repositoryScanHTTPClient returns the reconciler's client or a bounded
+// default. http.DefaultClient has no timeout, and a stalled GitHub response
+// would block the scan reconcile worker indefinitely.
+func (r *RepositoryScanReconciler) repositoryScanHTTPClient() *http.Client {
+	if r.HTTPClient != nil {
+		return r.HTTPClient
+	}
+	return &http.Client{Timeout: 30 * time.Second}
 }
 
 func (r *RepositoryScanReconciler) patchArtifactsPresent(ctx context.Context, task *corev1alpha1.Task, names ...string) (bool, error) {
@@ -181,17 +197,16 @@ func (r *RepositoryScanReconciler) fetchRepositoryScanPublishedCommit(ctx contex
 	if baseURL == "" {
 		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
 	}
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/commits/%s", baseURL, url.PathEscape(owner), url.PathEscape(repository), url.PathEscape(sha))
+	// per_page pins the maximum file page; the commit endpoint otherwise
+	// returns a smaller default page and silently paginates the rest.
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/commits/%s?per_page=%d",
+		baseURL, url.PathEscape(owner), url.PathEscape(repository), url.PathEscape(sha), repositoryScanPublishedCommitMaxFiles)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, "", err
 	}
 	repositoryMonitorSetGitHubHeaders(req, token)
-	client := r.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
+	resp, err := r.repositoryScanHTTPClient().Do(req)
 	if err != nil {
 		// The error text may carry the request URL; keep the persisted
 		// reason class-only.
@@ -204,6 +219,12 @@ func (r *RepositoryScanReconciler) fetchRepositoryScanPublishedCommit(ctx contex
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Sprintf("published patch commit could not be read from GitHub (HTTP %d)", resp.StatusCode), nil
+	}
+	// A next page means the commit's file list is incomplete at the maximum
+	// page size; verifying a partial file set would let unreviewed changes
+	// through, so it fails closed like the explicit file-count bound below.
+	if strings.Contains(resp.Header.Get("Link"), `rel="next"`) {
+		return nil, "published patch commit exceeds the supported file count", nil
 	}
 	var commit repositoryScanCommitResponse
 	if err := json.Unmarshal(body, &commit); err != nil {
@@ -240,12 +261,13 @@ func repositoryScanDiffFromPublishedCommit(files []repositoryScanCommitFileRespo
 			return "", nil, "published patch commit contains a file without a text patch: " + path
 		}
 		fmt.Fprintf(&diff, "diff --git a/%s b/%s\n", path, path)
+		// Mode lines are intentionally omitted: the commit file listing does
+		// not carry file modes, and fabricating "100644" would misrepresent
+		// an executable-bit change to reviewers.
 		switch strings.ToLower(strings.TrimSpace(file.Status)) {
 		case "added":
-			diff.WriteString("new file mode 100644\n")
 			fmt.Fprintf(&diff, "--- /dev/null\n+++ b/%s\n", path)
 		case "removed":
-			diff.WriteString("deleted file mode 100644\n")
 			fmt.Fprintf(&diff, "--- a/%s\n+++ /dev/null\n", path)
 		case "modified", "changed", "":
 			fmt.Fprintf(&diff, "--- a/%s\n+++ b/%s\n", path, path)
@@ -310,10 +332,7 @@ func (r *RepositoryScanReconciler) decorateSecurityPatchPullRequest(ctx context.
 		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
 	}
 	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", baseURL, url.PathEscape(owner), url.PathEscape(repository), prNumber)
-	client := r.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
+	client := r.repositoryScanHTTPClient()
 	current, ok := r.readRemediationPullRequest(ctx, client, endpoint, token, logger)
 	if !ok || !strings.HasPrefix(strings.TrimSpace(current.Title), repositoryScanGenericPublicationTitlePrefix) {
 		return

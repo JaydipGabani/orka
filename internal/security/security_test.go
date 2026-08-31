@@ -563,6 +563,7 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"apiKey = strings.TrimSpace(os.Getenv(apiKeyEnv))",
 		"token: config.Providers.Default.AccessToken",
 		"password = readPasswordFromKeychain(ctx)",
+		"apiKey = cfg.Provider.APIKey",
 	} {
 		if LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = true, want false for a placeholder or bare keyword", text)
@@ -577,6 +578,12 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"g" + "hp_" + strings.Repeat("x", 36),
 		"api_key = " + strings.Repeat("abcd", 5) + "-secret.v2",
 		"password: " + strings.Repeat("p", 20),
+		"OPENAI_API_KEY=" + strings.Repeat("a1b2c3d4", 3),
+		"SLACK_BOT_TOKEN: " + strings.Repeat("z9y8", 6),
+		`password="correct horse battery staple"`,
+		"client_secret='pass phrase with spaces!'",
+		"password=correct.horse.battery.staple",
+		"Authorization: Bearer ~" + strings.Repeat("a", 20),
 	} {
 		if !LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = false, want true for a credential-shaped value", text)

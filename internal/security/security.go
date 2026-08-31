@@ -10,6 +10,7 @@ import (
 	"path"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/store"
@@ -773,7 +774,7 @@ func BuildPatchPrompt(scan *corev1alpha1.RepositoryScan, finding *store.Finding,
 	prompt.WriteString("3. Keep the code diff as small and reviewable as possible.\n")
 	prompt.WriteString("4. Preserve existing behavior unless the vulnerability requires a behavior change.\n")
 	prompt.WriteString("5. Run focused tests when available.\n")
-	prompt.WriteString("6. The diff artifact must match the actual workspace changes after your edit.\n")
+	prompt.WriteString("6. The changedFiles you report in the terminal result below must exactly match the workspace files you actually edited.\n")
 	prompt.WriteString("7. Do not commit, push, or open a pull request directly. Leave the final file changes in the workspace so Orka can create the commit and push it to the patch branch automatically.\n")
 	prompt.WriteString("8. Change only source files that belong to the fix. Do not create diff, summary, or metadata files anywhere in the workspace (no .orka-artifacts directory): every workspace change becomes part of the published commit, and unexpected files fail the proposal.\n")
 	result := PatchResultEnvelope{
@@ -802,6 +803,20 @@ const (
 	maxRemediationBodySectionBytes    = 4 << 10
 )
 
+// truncateOnRuneBoundary bounds text to at most limit bytes without splitting
+// a multibyte character; a byte-index cut would leave invalid UTF-8 that
+// json.Marshal replaces with U+FFFD.
+func truncateOnRuneBoundary(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(text[:cut])
+}
+
 // RemediationPullRequestTitle renders the reviewer-facing title of a
 // remediation pull request from the finding.
 func RemediationPullRequestTitle(finding *store.Finding) string {
@@ -812,9 +827,7 @@ func RemediationPullRequestTitle(finding *store.Finding) string {
 	if title == "" {
 		title = "security remediation"
 	}
-	if len(title) > maxRemediationTitleBytes {
-		title = strings.TrimSpace(title[:maxRemediationTitleBytes])
-	}
+	title = truncateOnRuneBoundary(title, maxRemediationTitleBytes)
 	return remediationPullRequestTitlePrefix + title
 }
 
@@ -831,7 +844,7 @@ func RemediationPullRequestBody(finding *store.Finding, summary *PatchSummaryArt
 			return
 		}
 		if len(text) > maxRemediationBodySectionBytes {
-			text = strings.TrimSpace(text[:maxRemediationBodySectionBytes]) + "…"
+			text = truncateOnRuneBoundary(text, maxRemediationBodySectionBytes) + "…"
 		}
 		body.WriteString(heading)
 		body.WriteString("\n")

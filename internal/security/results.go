@@ -535,6 +535,13 @@ func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSumma
 	if securityResultLooksLikeToolTranscript(summary) {
 		return nil, fmt.Errorf("patch summary looks like a tool transcript")
 	}
+	// Summary and test commands are agent-controlled and become a durable
+	// artifact; a credential echoed there (for example while describing the
+	// secret a remediation removed) must never persist. The value itself is
+	// deliberately kept out of the error.
+	if LooksLikeSecret(summary) {
+		return nil, fmt.Errorf("patch summary contains a credential-shaped value")
+	}
 	if len(result.ChangedFiles) == 0 {
 		return nil, fmt.Errorf("patch changedFiles is required")
 	}
@@ -563,6 +570,9 @@ func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSumma
 	for _, test := range result.TestsRun {
 		if strings.TrimSpace(test.Command) == "" || len(test.Command) > maxValidationItemBytes {
 			return nil, fmt.Errorf("patch testsRun contains an invalid command")
+		}
+		if LooksLikeSecret(test.Command) {
+			return nil, fmt.Errorf("patch testsRun contains a credential-shaped command")
 		}
 	}
 	risk := strings.ToLower(strings.TrimSpace(result.Risk))
