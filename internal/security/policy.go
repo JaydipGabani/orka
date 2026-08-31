@@ -81,7 +81,7 @@ var (
 var placeholderFormPattern = regexp.MustCompile(
 	`^(?:` +
 		`\$[A-Za-z_][A-Za-z0-9_]*` + // $VAR
-		`|\$\{[^}]*\}` + // ${VAR}, ${VAR:-default}
+		`|\$\{[A-Za-z_][A-Za-z0-9_]*\}` + // ${VAR} — variable-only; ${VAR:-fallback} can embed a literal secret and stays flagged
 		`|\{\{.*\}\}` + // {{ .Token }}, {{ secret }}
 		`|\{[^{}]*\}` + // {placeholder}
 		`|<[^<>]*>` + // <your-token>

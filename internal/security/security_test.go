@@ -587,6 +587,7 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"PASSWORD=p@ssword-correct-horse",
 		`password="$tr0ng-passw0rd-2024!extra"`,
 		`api_key="<не-placeholder>` + "0123456789abcdef" + `"`,
+		`password="${UNSET:-correct-horse-battery-staple}"`,
 	} {
 		if !LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = false, want true for a credential-shaped value", text)
