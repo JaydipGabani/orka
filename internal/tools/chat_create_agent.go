@@ -164,7 +164,7 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 		agent.Spec.Resources = resources
 	}
 
-	if errResult, ok := parseRuntimeConfig(a, agent); !ok {
+	if errResult, ok := parseRuntimeConfig(a, agent, tc.ExecutionMode); !ok {
 		return errResult, nil
 	}
 	if err := executionmode.DefaultBuiltInAgentContract(agent, tc.ExecutionMode); err != nil {
@@ -306,7 +306,7 @@ func parseResourceListArg(resourcesMap map[string]any, key string) (corev1.Resou
 }
 
 // parseRuntimeConfig extracts runtime configuration from chat args into the agent spec.
-func parseRuntimeConfig(a map[string]any, agent *corev1alpha1.Agent) (string, bool) {
+func parseRuntimeConfig(a map[string]any, agent *corev1alpha1.Agent, mode executionmode.Mode) (string, bool) {
 	if coord, ok := a["coordination"].(map[string]any); ok {
 		if enabled, ok := coord[enabledString].(bool); ok && enabled {
 			return "", true
@@ -343,6 +343,18 @@ func parseRuntimeConfig(a map[string]any, agent *corev1alpha1.Agent) (string, bo
 			"invalid_arguments",
 			err.Error(),
 			"Remove contextWindow/maxTokens for Codex, Claude, or Copilot; those reviewed limits are OpenCode-only.",
+		)
+		return result, false
+	}
+	if mode == executionmode.HarnessV2 && resolvedRuntimeType != corev1alpha1.AgentRuntimeOpencode &&
+		(agent.Spec.Model == nil || strings.TrimSpace(agent.Spec.Model.Name) == "") {
+		// Admission rejects a harness-v2 built-in runtime Agent without
+		// spec.model.name; surface the requirement here instead of after a
+		// denied create.
+		result, _ := ChatToolErrorResult(
+			"invalid_arguments",
+			fmt.Sprintf("model.name is required for %s runtime Agents: the ACP runtime session has no default model", resolvedRuntimeType),
+			"Set model.name to the model this runtime should use.",
 		)
 		return result, false
 	}

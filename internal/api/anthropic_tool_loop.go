@@ -328,7 +328,8 @@ your bug — read this section before calling create_agent):
     instructions belong in initialPrompt or Task prompts and credentials come from
     the controller proxy.
     For credential-backed compatibility runtimes, set runtime.secretRef when required.
-    For codex, claude, and copilot, model.name is optional because the runtime can select a default.
+    For codex, claude, and copilot, model.name is REQUIRED: the ACP runtime session has
+    no default model, and admission rejects a built-in runtime Agent without it.
   - For pure LLM analysis personas (no git, no shell): set model.provider
     + model.name, OMIT runtime.
 - Built-in ACP RuntimePool Agents (runtime.type=codex|claude|copilot|opencode)

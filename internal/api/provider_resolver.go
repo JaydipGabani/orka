@@ -9,7 +9,6 @@ package api
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -276,10 +275,6 @@ func (r *ProviderResolver) ResolveAPIKey(ctx context.Context, providerCRD *corev
 	return string(apiKeyBytes), nil
 }
 
-// maxProviderSuggestions bounds the Provider names echoed in a resolution
-// error.
-const maxProviderSuggestions = 8
-
 // soleReadyProvider selects the namespace's only ready Provider when no
 // provider was named and no default is configured: an unambiguous choice is
 // friendlier than an error, and the caller's provider-use authorization still
@@ -290,11 +285,10 @@ func (r *ProviderResolver) soleReadyProvider(ctx context.Context, namespace, req
 	if err := r.client.List(ctx, list, client.InNamespace(namespace)); err != nil {
 		return nil, fmt.Errorf("no provider %q found and no default Provider is configured (listing Providers failed: %w)", requestedName, err)
 	}
-	names := make([]string, 0, len(list.Items))
+	count := len(list.Items)
 	var ready []*corev1alpha1.Provider
 	for i := range list.Items {
 		item := &list.Items[i]
-		names = append(names, item.Name)
 		if item.Status.Ready {
 			ready = append(ready, item)
 		}
@@ -302,16 +296,16 @@ func (r *ProviderResolver) soleReadyProvider(ctx context.Context, namespace, req
 	if len(ready) == 1 {
 		return ready[0], nil
 	}
-	slices.Sort(names)
-	if len(names) > maxProviderSuggestions {
-		names = append(names[:maxProviderSuggestions], "…")
-	}
 	prefix := "no provider selected"
 	if requestedName != "" {
 		prefix = fmt.Sprintf("no provider %q found", requestedName)
 	}
-	if len(names) == 0 {
+	if count == 0 {
 		return nil, fmt.Errorf("%s and namespace %q has no Providers; create a Provider (or one named \"default\") or configure the chat default provider", prefix, namespace)
 	}
-	return nil, fmt.Errorf("%s and no default Provider is configured; pass a provider (available in namespace %q: %s), create a Provider named \"default\", or configure the chat default provider", prefix, namespace, strings.Join(names, ", "))
+	// The error deliberately names no Providers: resolution runs before the
+	// caller's provider-use authorization, and a scoped context token must
+	// not recover Provider identities outside its scopes from this message.
+	// The authorization-aware list endpoints are the enumeration surface.
+	return nil, fmt.Errorf("%s and no default Provider is configured; namespace %q has %d Providers — list them with the providers API and pass one, create a Provider named \"default\", or configure the chat default provider", prefix, namespace, count)
 }

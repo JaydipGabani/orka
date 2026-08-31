@@ -1470,7 +1470,8 @@ func TestExecuteCreateAgent_WithRuntime(t *testing.T) {
 		},
 	})
 	args := map[string]any{
-		"name": "runtime-agent",
+		"name":  "runtime-agent",
+		"model": map[string]any{"name": "test-model"},
 		"runtime": map[string]any{
 			"type": "copilot",
 		},
@@ -1862,6 +1863,7 @@ func TestHandleInitialPrompt_WithRuntimeAgent(t *testing.T) {
 	})
 	r := e.executeTool(context.Background(), "create_agent", map[string]any{
 		"name":          "rt-agent",
+		"model":         map[string]any{"name": "test-model"},
 		"runtime":       map[string]any{"type": "copilot"},
 		"initialPrompt": "do work",
 	})

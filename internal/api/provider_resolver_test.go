@@ -294,7 +294,7 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			wantPType: openaiProviderName,
 		},
 		{
-			name: "runtime agent without providerRef and several Providers names the candidates",
+			name: "runtime agent without providerRef and several Providers stays non-enumerating",
 			objects: []runtime.Object{
 				readyProvider(anthropicProvider), anthropicSecret, readyProvider(openaiProvider), openaiSecret,
 				makeAgent(testRuntimeAgentName, ns, nil, &corev1alpha1.ModelConfig{Name: testRuntimeAgentModel}),
@@ -304,7 +304,7 @@ func TestProviderResolver_Resolve(t *testing.T) {
 				AgentRef:  testRuntimeAgentName,
 				Namespace: ns,
 			},
-			wantErr: "no provider selected and no default Provider is configured; pass a provider (available in namespace \"default\": anthropic, openai)",
+			wantErr: "no provider selected and no default Provider is configured; namespace \"default\" has 2 Providers",
 		},
 		{
 			name: "runtime agent accepts an explicit provider",
@@ -346,13 +346,13 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			wantPType: "anthropic",
 		},
 		{
-			name:    "no provider configured with several Providers names the candidates",
+			name:    "no provider configured with several Providers stays non-enumerating",
 			objects: []runtime.Object{readyProvider(anthropicProvider), anthropicSecret, readyProvider(openaiProvider), openaiSecret},
 			config:  DefaultChatConfig(),
 			opts: ResolveOpts{
 				Namespace: ns,
 			},
-			wantErr: "available in namespace \"default\": anthropic, openai",
+			wantErr: "namespace \"default\" has 2 Providers",
 		},
 		{
 			name:    "secret not found during resolve",
