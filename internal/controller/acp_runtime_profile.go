@@ -155,15 +155,22 @@ func currentACPRuntimeDeliveryPlan(plan ACPRuntimePlan, images ACPRuntimeImages)
 	if plan.Workspace != nil {
 		return plan, nil
 	}
-	image, err := configuredACPRuntimeImage(plan.Profile.ProviderKind, images)
+	adapterDigests, image, err := acpRuntimeArtifacts(
+		corev1alpha1.AgentRuntimeType(strings.TrimSpace(plan.Profile.ProviderKind)),
+		images,
+	)
 	if err != nil {
 		return ACPRuntimePlan{}, err
 	}
+	image = strings.TrimSpace(image)
 	if image == "" || image == plan.Image {
 		return plan, nil
 	}
 	if !ACPRuntimeImageAvailable(image) {
 		return ACPRuntimePlan{}, fmt.Errorf("current ACP runtime image for %s must be a configured digest-pinned image", plan.Profile.ProviderKind)
+	}
+	if !maps.Equal(adapterDigests, plan.Profile.AdapterDigests) {
+		return plan, nil
 	}
 	identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
 		"profileDigest": string(plan.Digest), "runtimeImage": image,
@@ -176,6 +183,18 @@ func currentACPRuntimeDeliveryPlan(plan ACPRuntimePlan, images ACPRuntimeImages)
 	return plan, nil
 }
 
+func acpRuntimePlanUsesRetainedImage(plan ACPRuntimePlan, images ACPRuntimeImages) bool {
+	if plan.Workspace != nil {
+		return false
+	}
+	adapterDigests, image, err := acpRuntimeArtifacts(
+		corev1alpha1.AgentRuntimeType(strings.TrimSpace(plan.Profile.ProviderKind)),
+		images,
+	)
+	return err == nil && ACPRuntimeImageAvailable(image) && strings.TrimSpace(image) != strings.TrimSpace(plan.Image) &&
+		!maps.Equal(adapterDigests, plan.Profile.AdapterDigests)
+}
+
 func configuredACPRuntimeImage(provider string, images ACPRuntimeImages) (string, error) {
 	_, image, err := acpRuntimeArtifacts(corev1alpha1.AgentRuntimeType(strings.TrimSpace(provider)), images)
 	if err != nil {
@@ -184,7 +203,7 @@ func configuredACPRuntimeImage(provider string, images ACPRuntimeImages) (string
 	return strings.TrimSpace(image), nil
 }
 
-func acpRuntimePoolImageRetired(pool *corev1alpha1.RuntimePool, images ACPRuntimeImages) bool {
+func acpRuntimePoolImageSuperseded(pool *corev1alpha1.RuntimePool, images ACPRuntimeImages) bool {
 	if pool == nil || pool.Spec.ExecutionWorkspace != nil || validateRuntimePoolImageReference(pool) != nil {
 		return false
 	}

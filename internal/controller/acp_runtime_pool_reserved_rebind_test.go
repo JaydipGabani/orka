@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -15,9 +16,66 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/store/sqlite"
 )
+
+func TestValidateFrozenACPDispatchTargetKeepsBoundRetryOnOriginalPool(t *testing.T) {
+	profile := harnessProfileForTest()
+	digest, err := harnessv2.CanonicalProfileDigest(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := "docker.io/example/codex@sha256:" + strings.Repeat("a", 64)
+	identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+		"profileDigest": string(digest), "runtimeImage": image,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := ACPRuntimePlan{
+		PoolName: acpRuntimePoolName(profile.ProviderKind, harnessv2.ProfileDigest(identity)),
+		Image:    image, Profile: profile, Digest: digest,
+	}
+	pool := runtimePoolForImageRotationTest("default", types.UID("old-pool-uid"), plan)
+	task := &corev1alpha1.Task{
+		Status: corev1alpha1.TaskStatus{Execution: &corev1alpha1.TaskExecutionStatus{
+			RuntimePoolName: pool.Name, RuntimePoolUID: string(pool.UID),
+			RuntimeInstanceID: "old-runtime-instance", RuntimeSessionUID: "old-session-uid",
+		}},
+	}
+	bound := &verifiedAgentExecution{
+		binding: &corev1alpha1.AgentExecutionBinding{},
+		body:    agentExecutionSnapshotBody{ProfileDigest: string(plan.Digest)},
+		plan:    plan,
+	}
+	if err := validateFrozenACPDispatchTarget(task, acpDispatchTarget{pool: pool}, bound); err != nil {
+		t.Fatalf("bound retry no longer matched its exact original RuntimePool: %v", err)
+	}
+}
+
+func TestEnsureACPRuntimePoolWithPolicyDoesNotRecreateRetainedPool(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &TaskReconciler{Client: kubeClient}
+	plan := ACPRuntimePlan{PoolName: "acp-codex-retained"}
+	if _, _, err := reconciler.ensureACPRuntimePoolWithPolicy(
+		context.Background(), "default", plan, "", "", "", false, types.UID("missing-pool-uid"),
+	); !errors.Is(err, store.ErrValidation) {
+		t.Fatalf("missing retained RuntimePool error = %v, want validation failure", err)
+	}
+	var pools corev1alpha1.RuntimePoolList
+	if err := kubeClient.List(context.Background(), &pools); err != nil {
+		t.Fatal(err)
+	}
+	if len(pools.Items) != 0 {
+		t.Fatalf("missing retained RuntimePool was recreated: %#v", pools.Items)
+	}
+}
 
 //nolint:gocyclo // The table verifies safe reserved rebind and reservation lifecycle invariants together.
 func TestQueueACPRuntimeTaskRebindsSafeReservedAttemptAfterRuntimeImageRotation(t *testing.T) {

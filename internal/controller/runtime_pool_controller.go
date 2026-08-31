@@ -412,14 +412,13 @@ func (r *RuntimePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	cfg, err := r.runtimePoolConfig(pool)
-	if err != nil {
-		if acpRuntimePoolImageRetired(pool, r.AllowedImages) {
-			retiredPool := pool.DeepCopy()
-			retiredPool.Spec.DesiredReplicas = 0
-			if retiredConfig, retiredErr := r.runtimePoolConfigForDrain(retiredPool); retiredErr == nil {
-				return r.reconcileRetiredRuntimePool(ctx, pool, retiredConfig)
-			}
+	if err != nil && acpRuntimePoolImageSuperseded(pool, r.AllowedImages) {
+		if historicalConfig, historicalErr := r.runtimePoolConfigForDrain(pool); historicalErr == nil {
+			cfg = historicalConfig
+			err = nil
 		}
+	}
+	if err != nil {
 		if pool.Spec.ExecutionWorkspace != nil {
 			preserveFence, preserveErr := r.workspacePoolFailureRequiresDurableStatePreservation(ctx, pool)
 			if preserveErr != nil {
@@ -516,71 +515,6 @@ func (r *RuntimePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcileRuntimePoolScaleDown(ctx, pool, cfg, deployment, pods, readyPods, authSecret, status)
 	}
 	return r.reconcileRuntimePoolServing(ctx, pool, cfg, pods, readyPods, authSecret, status)
-}
-
-// reconcileRetiredRuntimePool closes admission and drives a superseded plain
-// pool through the normal authenticated scale-down barriers. The immutable
-// image remains available only long enough to drain its exact instance.
-func (r *RuntimePoolReconciler) reconcileRetiredRuntimePool(
-	ctx context.Context,
-	pool *corev1alpha1.RuntimePool,
-	cfg runtimePoolConfig,
-) (ctrl.Result, error) {
-	if pool.Spec.DesiredReplicas != 0 {
-		base := pool.DeepCopy()
-		pool.Spec.DesiredReplicas = 0
-		if err := r.Patch(ctx, pool, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: time.Second}, nil
-	}
-	if err := r.ensureRuntimePoolNamespace(ctx, cfg); err != nil {
-		return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, err)
-	}
-	authSecret, providerSecret, err := r.ensureRuntimePoolSecrets(ctx, pool, cfg)
-	if err != nil {
-		return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, err)
-	}
-	if err := r.ensureRuntimePoolAncillaryResources(ctx, pool, cfg); err != nil {
-		return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, err)
-	}
-	selector := map[string]string{runtimePoolKeyLabel: cfg.labels[runtimePoolKeyLabel]}
-	desiredTemplate := r.runtimePoolPodTemplate(pool, cfg, selector, authSecret.Name, providerSecret.Name)
-	deployment := &appsv1.Deployment{}
-	deploymentErr := r.Get(ctx, types.NamespacedName{Namespace: cfg.namespace, Name: cfg.baseName}, deployment)
-	if deploymentErr != nil && !apierrors.IsNotFound(deploymentErr) {
-		return ctrl.Result{}, deploymentErr
-	}
-	if apierrors.IsNotFound(deploymentErr) {
-		deployment = nil
-	}
-	pods, err := r.listRuntimePoolPods(ctx, cfg)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if deployment != nil && runtimePoolDeploymentNeedsRollout(deployment, desiredTemplate) {
-		return r.reconcileRuntimePoolRollout(ctx, pool, cfg, deployment, pods, desiredTemplate)
-	}
-	deployment, err = r.ensureRuntimePoolDeployment(ctx, pool, cfg, desiredTemplate, 0, deployment == nil)
-	if err != nil {
-		return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, err)
-	}
-	if err := r.pruneStaleRuntimePoolSecrets(ctx, pool, cfg, deployment, authSecret.Name, providerSecret.Name); err != nil {
-		return r.finishRuntimePoolResourceFailure(ctx, pool, cfg, err)
-	}
-	status := r.baseRuntimePoolStatus(pool, countRuntimePoolPods(pods))
-	r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionPodSecurityReady, metav1.ConditionTrue, "PodSecurityConfigured", "runtime Pod security controls are configured")
-	r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionQuotaReady, metav1.ConditionTrue, "ResourcesAdmitted", "runtime resources were admitted")
-	readyPods := readyRuntimePoolPods(pods)
-	if len(readyPods) > 1 {
-		status.Lifecycle = corev1alpha1.RuntimePoolLifecycleAmbiguous
-		status.AdmissionState = corev1alpha1.RuntimePoolAdmissionAmbiguous
-		status.ActiveInstance = nil
-		status.Message = fmt.Sprintf("found %d Ready runtime Pods while retiring a superseded image", len(readyPods))
-		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionAdmissionReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonRuntimeAmbiguous, status.Message)
-		return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
-	}
-	return r.reconcileRuntimePoolScaleDown(ctx, pool, cfg, deployment, pods, readyPods, authSecret, status)
 }
 
 func runtimePoolWorkspaceDeletionDrainComplete(pool *corev1alpha1.RuntimePool) bool {
@@ -1165,58 +1099,10 @@ func (r *RuntimePoolReconciler) reconcileRuntimePoolRollout(
 	if ptr.Deref(deployment.Spec.Replicas, 0) == 0 {
 		return r.reconcileStoppedRuntimePoolRollout(ctx, pool, cfg, pods, desiredTemplate, status)
 	}
-	if pool.Status.ActiveInstance != nil && !runtimePoolActiveInstancePodPresent(pool.Status.ActiveInstance, pods) {
-		return r.reconcileRuntimePoolAfterActiveInstanceLoss(ctx, pool, deployment, status)
-	}
 	if len(readyPods) == 0 {
 		return r.reconcileUnreadyRuntimePoolRollout(ctx, pool, deployment, pods, status)
 	}
 	return r.reconcileReadyRuntimePoolRollout(ctx, pool, cfg, deployment, &readyPods[0], desiredTemplate, status)
-}
-
-// reconcileRuntimePoolAfterActiveInstanceLoss handles a rollout whose exact
-// admitted Pod has already disappeared. Pod UID absence proves the old
-// process cannot retain RuntimeSession memory, so authenticated drain evidence
-// is no longer obtainable or necessary. Any replacement Pod is unadmitted and
-// is stopped before the desired template is installed.
-func (r *RuntimePoolReconciler) reconcileRuntimePoolAfterActiveInstanceLoss(
-	ctx context.Context,
-	pool *corev1alpha1.RuntimePool,
-	deployment *appsv1.Deployment,
-	status corev1alpha1.RuntimePoolStatus,
-) (ctrl.Result, error) {
-	status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
-	r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionSchedulingReady, metav1.ConditionUnknown, runtimePoolSchedulingReasonPodNotReady, "the previously active runtime Pod is absent")
-	if !runtimePoolActiveInstanceLossAdmissionClosurePersisted(pool) {
-		status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDraining
-		status.Message = "previous active runtime Pod is absent; admission is closed before replacement"
-		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionUnknown, runtimePoolRolloutReasonDraining, status.Message)
-		return r.finishRuntimePoolStatus(ctx, pool, status, time.Second)
-	}
-	if !runtimePoolRolloutControllerWorkIsQuiescent(status.Capacity) {
-		status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDraining
-		status.Message = "previous active runtime Pod is absent; waiting for controller reservations or finalization work before replacement"
-		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionUnknown, runtimePoolRolloutReasonDraining, status.Message)
-		return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
-	}
-	if err := r.stopRuntimePoolDeployment(ctx, deployment); err != nil {
-		return ctrl.Result{}, err
-	}
-	status.ActiveInstance = nil
-	status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopping
-	status.Message = "previous active runtime Pod is absent; stopping any unadmitted replacement before applying the new Recreate template"
-	r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionUnknown, runtimePoolRolloutReasonStopping, status.Message)
-	return r.finishRuntimePoolStatus(ctx, pool, status, time.Second)
-}
-
-func runtimePoolActiveInstanceLossAdmissionClosurePersisted(pool *corev1alpha1.RuntimePool) bool {
-	if pool == nil || pool.Status.ActiveInstance == nil ||
-		pool.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed {
-		return false
-	}
-	condition := meta.FindStatusCondition(pool.Status.Conditions, corev1alpha1.RuntimePoolConditionAdmissionReady)
-	return condition != nil && condition.ObservedGeneration == pool.Generation &&
-		condition.Status == metav1.ConditionFalse
 }
 
 func (r *RuntimePoolReconciler) reconcileStoppedRuntimePoolRollout(

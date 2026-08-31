@@ -95,8 +95,27 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 	if reader == nil {
 		reader = r.Client
 	}
-	pool, poolPreexisting, err := r.ensureACPRuntimePool(ctx, task.Namespace, plan, workspaceName,
-		task.Annotations[acpExecutionWorkspaceUIDAnnotation], string(task.UID))
+	var pool *corev1alpha1.RuntimePool
+	var poolPreexisting bool
+	if acpRuntimePlanUsesRetainedImage(bound.plan, r.ACPRuntimeImages) {
+		execution := task.Status.Execution
+		if execution == nil || execution.RuntimePoolName != plan.PoolName || strings.TrimSpace(execution.RuntimePoolUID) == "" {
+			return r.failACPPlanningTask(
+				ctx,
+				task,
+				corev1alpha1.TaskExecutionReason("InvalidRuntimeProfile"),
+				"the frozen ACP runtime profile is incompatible with the current runtime image and has no already-bound RuntimePool; create a new Task for the upgraded runtime",
+			)
+		}
+		pool, poolPreexisting, err = r.ensureACPRuntimePoolWithPolicy(
+			ctx, task.Namespace, plan, workspaceName,
+			task.Annotations[acpExecutionWorkspaceUIDAnnotation], string(task.UID),
+			false, types.UID(execution.RuntimePoolUID),
+		)
+	} else {
+		pool, poolPreexisting, err = r.ensureACPRuntimePool(ctx, task.Namespace, plan, workspaceName,
+			task.Annotations[acpExecutionWorkspaceUIDAnnotation], string(task.UID))
+	}
 	if err != nil {
 		if errors.Is(err, errACPRuntimeWorkspaceNamespace) {
 			return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), err.Error())
@@ -1123,10 +1142,32 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 	workspaceUID string,
 	workspaceTaskUID string,
 ) (*corev1alpha1.RuntimePool, bool, error) {
+	return r.ensureACPRuntimePoolWithPolicy(
+		ctx, namespace, plan, workspaceName, workspaceUID, workspaceTaskUID, true, "",
+	)
+}
+
+//nolint:gocyclo // Pool creation, immutable identity checks, and activation form one optimistic state transition.
+func (r *TaskReconciler) ensureACPRuntimePoolWithPolicy(
+	ctx context.Context,
+	namespace string,
+	plan ACPRuntimePlan,
+	workspaceName string,
+	workspaceUID string,
+	workspaceTaskUID string,
+	allowCreate bool,
+	requiredUID types.UID,
+) (*corev1alpha1.RuntimePool, bool, error) {
 	pool := &corev1alpha1.RuntimePool{}
 	key := types.NamespacedName{Namespace: namespace, Name: plan.PoolName}
 	err := r.Get(ctx, key, pool)
 	if apierrors.IsNotFound(err) {
+		if !allowCreate {
+			return nil, false, store.ValidationErrorf(
+				"the already-bound RuntimePool %s for the frozen ACP runtime profile no longer exists; create a new Task for the upgraded runtime",
+				plan.PoolName,
+			)
+		}
 		// The pool's runtime namespace is FROZEN from the linked workspace's
 		// creation-time annotation, not re-read from the mutable controller
 		// flag: workspace creation and pool creation happen on different
@@ -1243,6 +1284,12 @@ func (r *TaskReconciler) ensureACPRuntimePool(
 	}
 	if err != nil {
 		return nil, false, err
+	}
+	if requiredUID != "" && pool.UID != requiredUID {
+		return nil, false, store.ValidationErrorf(
+			"the already-bound RuntimePool %s was replaced with a different object; create a new Task for the upgraded runtime",
+			plan.PoolName,
+		)
 	}
 	poolRuntimeNamespace := strings.TrimSpace(pool.Spec.RuntimeNamespace)
 	if poolRuntimeNamespace == "" {

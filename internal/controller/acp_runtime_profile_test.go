@@ -529,6 +529,57 @@ func harnessProfileForTest() harnessv2.RuntimeProfile {
 	}
 }
 
+func TestCurrentACPRuntimeDeliveryPlanRequiresCompatibleAdapters(t *testing.T) {
+	oldImage := "docker.io/example/codex@sha256:" + strings.Repeat("a", 64)
+	newImage := "docker.io/example/codex@sha256:" + strings.Repeat("b", 64)
+	buildPlan := func(profile harnessv2.RuntimeProfile) ACPRuntimePlan {
+		t.Helper()
+		digest, err := harnessv2.CanonicalProfileDigest(profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+			"profileDigest": string(digest), "runtimeImage": oldImage,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ACPRuntimePlan{
+			PoolName: acpRuntimePoolName(profile.ProviderKind, harnessv2.ProfileDigest(identity)),
+			Image:    oldImage, Profile: profile, Digest: digest,
+		}
+	}
+
+	compatibleProfile := harnessProfileForTest()
+	compatibleProfile.AdapterDigests = acp.BuiltInRuntimeAdapterDigests(compatibleProfile.ProviderKind)
+	compatible := buildPlan(compatibleProfile)
+	rotated, err := currentACPRuntimeDeliveryPlan(compatible, ACPRuntimeImages{Codex: newImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated.Image != newImage || rotated.PoolName == compatible.PoolName || rotated.Digest != compatible.Digest {
+		t.Fatalf("compatible image rotation = %#v, want new image/pool with frozen profile digest %q", rotated, compatible.Digest)
+	}
+	if acpRuntimePlanUsesRetainedImage(compatible, ACPRuntimeImages{Codex: newImage}) {
+		t.Fatal("compatible frozen profile was classified as requiring its old image")
+	}
+
+	incompatibleProfile := compatibleProfile
+	incompatibleProfile.AdapterDigests = cloneMap(compatibleProfile.AdapterDigests)
+	incompatibleProfile.AdapterDigests["codex-acp"] = "sha256:" + strings.Repeat("9", 64)
+	incompatible := buildPlan(incompatibleProfile)
+	retained, err := currentACPRuntimeDeliveryPlan(incompatible, ACPRuntimeImages{Codex: newImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(retained, incompatible) {
+		t.Fatalf("incompatible adapter rotation changed frozen delivery plan:\n got: %#v\nwant: %#v", retained, incompatible)
+	}
+	if !acpRuntimePlanUsesRetainedImage(incompatible, ACPRuntimeImages{Codex: newImage}) {
+		t.Fatal("incompatible frozen profile did not retain its original image")
+	}
+}
+
 func TestPlanACPRuntimePoolIdentityRotatesWithImageDigest(t *testing.T) {
 	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent}}
 	agent := &corev1alpha1.Agent{

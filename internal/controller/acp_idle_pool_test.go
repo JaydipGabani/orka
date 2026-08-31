@@ -408,7 +408,7 @@ func TestRecordPoolLastDemandAtPreservesConcurrentNewerTimestamp(t *testing.T) {
 	}
 }
 
-func TestReapStoppedRetiredPlainPoolDeletesAfterGrace(t *testing.T) {
+func TestReapStoppedSupersededPlainPoolDeletesAfterGrace(t *testing.T) {
 	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
 	oldImage := "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("a", 64)
 	newImage := "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
@@ -451,7 +451,7 @@ func TestReapStoppedRetiredPlainPoolDeletesAfterGrace(t *testing.T) {
 				WithObjects(pool).
 				Build()
 			dispatcher := &ACPDispatcher{Client: kubeClient, IdlePoolTTL: time.Minute, ACPRuntimeImages: tt.images}
-			if err := dispatcher.reapStoppedRetiredPlainPool(context.Background(), pool, tt.activeTasks, now); err != nil {
+			if err := dispatcher.reapStoppedSupersededPlainPool(context.Background(), pool, tt.activeTasks, now); err != nil {
 				t.Fatal(err)
 			}
 			var pools corev1alpha1.RuntimePoolList

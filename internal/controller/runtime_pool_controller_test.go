@@ -1007,7 +1007,7 @@ func TestRuntimePoolReconcilerRolloutFailureAndTimeoutPreserveOldPod(t *testing.
 	})
 }
 
-func TestRuntimePoolReconcilerRolloutRecoversWhenActivePodDisappears(t *testing.T) {
+func TestRuntimePoolReconcilerRolloutFailsClosedWhenActivePodDisappears(t *testing.T) {
 	scheme := runtimePoolTestScheme(t)
 	pool := runtimePoolTestObject(1)
 	supervisor := &fakeRuntimePoolSupervisorClient{}
@@ -1024,35 +1024,19 @@ func TestRuntimePoolReconcilerRolloutRecoversWhenActivePodDisappears(t *testing.
 
 	runtimePoolReconcile(t, r, pool)
 	got := runtimePoolTestGetPool(t, r, pool)
-	if got.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
-		got.Status.ActiveInstance == nil || got.Status.ActiveInstance.PodUID != string(oldPod.UID) {
-		t.Fatalf("active-Pod loss closure = %s active=%#v, want Closed with the old fence preserved", got.Status.AdmissionState, got.Status.ActiveInstance)
+	condition := meta.FindStatusCondition(got.Status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+	if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDegraded ||
+		got.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
+		got.Status.ActiveInstance == nil || got.Status.ActiveInstance.PodUID != string(oldPod.UID) ||
+		condition == nil || condition.Reason != corev1alpha1.RuntimePoolReasonRolloutFailed {
+		t.Fatalf("active-Pod loss status = %s/%s active=%#v condition=%#v, want fail-closed with the old fence preserved", got.Status.Lifecycle, got.Status.AdmissionState, got.Status.ActiveInstance, condition)
 	}
 	deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
 	if replicas := ptr.Deref(deployment.Spec.Replicas, -1); replicas != 1 {
-		t.Fatalf("replicas before admission closure persisted = %d, want 1", replicas)
+		t.Fatalf("replicas after active-Pod loss = %d, want 1", replicas)
 	}
-
-	runtimePoolReconcile(t, r, pool)
-	got = runtimePoolTestGetPool(t, r, pool)
-	if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopping || got.Status.ActiveInstance != nil {
-		t.Fatalf("active-Pod loss recovery = %s active=%#v, want Stopping with no active fence", got.Status.Lifecycle, got.Status.ActiveInstance)
-	}
-	deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
-	if replicas := ptr.Deref(deployment.Spec.Replicas, -1); replicas != 0 {
-		t.Fatalf("replicas while removing the unadmitted replacement = %d, want 0", replicas)
-	}
-
-	if err := r.Delete(context.Background(), &replacement); err != nil {
-		t.Fatalf("delete unadmitted replacement Pod: %v", err)
-	}
-	runtimePoolReconcile(t, r, pool)
-	deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
-	if replicas := ptr.Deref(deployment.Spec.Replicas, -1); replicas != 1 {
-		t.Fatalf("replacement replicas after active-Pod loss = %d, want 1", replicas)
-	}
-	if revision := deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation]; revision == oldRevision {
-		t.Fatalf("replacement retained superseded template revision %q", revision)
+	if revision := deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation]; revision != oldRevision {
+		t.Fatalf("active-Pod loss installed replacement template %q without termination proof; want %q", revision, oldRevision)
 	}
 }
 
@@ -1349,7 +1333,7 @@ func TestRuntimePoolReconcilerClosesAdmissionForTwoReadyPods(t *testing.T) {
 	}
 }
 
-func TestRuntimePoolReconcilerRetiresSupersededPlainPool(t *testing.T) {
+func TestRuntimePoolReconcilerKeepsSupersededPlainPoolAvailableForBoundDemand(t *testing.T) {
 	scheme := runtimePoolTestScheme(t)
 	pool := runtimePoolTestObject(1)
 	identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
@@ -1361,25 +1345,48 @@ func TestRuntimePoolReconcilerRetiresSupersededPlainPool(t *testing.T) {
 	}
 	pool.Name = acpRuntimePoolName(pool.Spec.Runtime.Profile.ProviderKind, harnessv2.ProfileDigest(identity))
 	pool.UID = types.UID(pool.Namespace + "-retired-pool-uid")
+	supervisor := &fakeRuntimePoolSupervisorClient{}
+	r := runtimePoolTestReconciler(t, scheme, supervisor, pool)
+	deployment, _ := runtimePoolTestStartServing(t, r, pool, supervisor, "retained-pod", "retained-pod-uid", "10.0.0.95", "retained-boot")
+	r.AllowedImages.Codex = "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
+
+	runtimePoolReconcile(t, r, pool)
+	got := runtimePoolTestGetPool(t, r, pool)
+	if got.Spec.DesiredReplicas != 1 || got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleServing ||
+		got.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionAccepting {
+		t.Fatalf("superseded pool = replicas %d status %s/%s, want 1 and Serving/Accepting", got.Spec.DesiredReplicas, got.Status.Lifecycle, got.Status.AdmissionState)
+	}
+	if got.Spec.Runtime.Image != pool.Spec.Runtime.Image {
+		t.Fatalf("superseded pool image = %q, want immutable original %q", got.Spec.Runtime.Image, pool.Spec.Runtime.Image)
+	}
+	deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
+	if replicas := ptr.Deref(deployment.Spec.Replicas, -1); replicas != 1 {
+		t.Fatalf("superseded deployment replicas = %d, want 1 while bound demand may remain", replicas)
+	}
+}
+
+func TestRuntimePoolReconcilerReportsSupersededScaleToZeroPoolStopped(t *testing.T) {
+	scheme := runtimePoolTestScheme(t)
+	pool := runtimePoolTestObject(0)
+	identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+		"profileDigest": pool.Spec.Runtime.Profile.Digest,
+		"runtimeImage":  pool.Spec.Runtime.Image,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Name = acpRuntimePoolName(pool.Spec.Runtime.Profile.ProviderKind, harnessv2.ProfileDigest(identity))
+	pool.UID = types.UID(pool.Namespace + "-superseded-stopped-pool-uid")
 	r := runtimePoolTestReconciler(t, scheme, &fakeRuntimePoolSupervisorClient{}, pool)
 	r.AllowedImages.Codex = "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
 
 	runtimePoolReconcile(t, r, pool)
 	got := runtimePoolTestGetPool(t, r, pool)
-	if got.Spec.DesiredReplicas != 0 {
-		t.Fatalf("retired desired replicas = %d, want 0", got.Spec.DesiredReplicas)
-	}
-	if got.Spec.Runtime.Image != pool.Spec.Runtime.Image {
-		t.Fatalf("retired pool image = %q, want immutable original %q", got.Spec.Runtime.Image, pool.Spec.Runtime.Image)
-	}
-
-	runtimePoolReconcile(t, r, pool)
-	got = runtimePoolTestGetPool(t, r, pool)
 	condition := meta.FindStatusCondition(got.Status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
 	if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopped ||
 		got.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
 		condition == nil || condition.Status != metav1.ConditionTrue {
-		t.Fatalf("retired pool status = %s/%s condition=%#v, want Stopped/Closed with rollout complete", got.Status.Lifecycle, got.Status.AdmissionState, condition)
+		t.Fatalf("superseded scale-to-zero status = %s/%s condition=%#v, want Stopped/Closed with rollout ready", got.Status.Lifecycle, got.Status.AdmissionState, condition)
 	}
 }
 
