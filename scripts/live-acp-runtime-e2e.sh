@@ -855,15 +855,16 @@ delete_test_agents() {
   local agent
   k -n "${namespace}" get agent -o json >"${agents_file}" || return 1
   if [[ "${namespace_shared:-0}" -eq 1 ]]; then
-    # Shared watch-namespace mode: only Agents this run created (named with
-    # the run id) are removed; unrelated Agents in the namespace stay.
+    # Shared watch-namespace mode: only Agents this run labeled as its own
+    # are removed; a name-suffix match could select unrelated Agents (a
+    # short run id such as "test" would also match "latest").
     while IFS= read -r agent; do
       [[ -n "${agent}" ]] || continue
       k -n "${namespace}" delete agent "${agent}" --ignore-not-found=true --wait=true --timeout=2m >/dev/null || return 1
-    done < <(jq -r --arg run "${run_id}" '.items[] | select(.metadata.name | endswith($run)) | .metadata.name' "${agents_file}")
+    done < <(jq -r --arg run "${run_id}" '.items[] | select(.metadata.labels["orka.ai/acp-e2e-run"] == $run) | .metadata.name' "${agents_file}")
     return 0
   fi
-  if ! jq -e --arg run "${run_id}" 'all(.items[]; (.metadata.name | endswith($run)))' "${agents_file}" >/dev/null; then
+  if ! jq -e --arg run "${run_id}" 'all(.items[]; .metadata.labels["orka.ai/acp-e2e-run"] == $run)' "${agents_file}" >/dev/null; then
     warn "test namespace contains an Agent not owned by release-gate run ${run_id}"
     return 1
   fi
@@ -1500,6 +1501,7 @@ apply_agent() {
     --arg provider "${provider}" \
     --arg model "${model}" \
     --arg name "${name}" \
+    --arg run "${run_id}" \
     --argjson maxTurns "${max_turns}" \
     --argjson allowBash "${allow_bash}" \
     --argjson opencodeContextWindow "${opencode_context_window}" \
@@ -1507,7 +1509,7 @@ apply_agent() {
     '{
       apiVersion:"core.orka.ai/v1alpha1",
       kind:"Agent",
-      metadata:{name:$name},
+      metadata:{name:$name,labels:{"orka.ai/acp-e2e-run":$run,"app.kubernetes.io/managed-by":"live-acp-runtime-e2e"}},
       spec:{
         runtime:({
           type:$provider,

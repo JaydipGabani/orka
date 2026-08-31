@@ -3674,6 +3674,9 @@ func (r *TaskReconciler) handleScheduled(ctx context.Context, task *corev1alpha1
 		next := sched.Next(now)
 		nextSchedule := metav1.NewTime(next)
 		nextScheduleCopy := nextSchedule
+		// Advancing the cursor is the documented LastScheduleTime contract
+		// for a skipped window: without it the same missed tick is
+		// re-evaluated on every reconcile and the schedule never resumes.
 		reanchor := metav1.NewTime(now)
 		_ = r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
 			t.Status.NextScheduleTime = &nextScheduleCopy
