@@ -210,6 +210,11 @@ func (r *RepositoryMonitorReconciler) terminalizeRepositoryMonitorFailedCommand(
 			return r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, &command, command.Kind, command.Number, command.HeadSHA, command.IssueSnapshotDigest, actionKind, repositoryMonitorWorkActionStatusSucceeded, repositoryMonitorAutomergeStateMerged, "", "")
 		}
 	}
+	if command.Intent == repositoryMonitorCommandIntentUpdateBranch {
+		if err := r.terminalizeRepositoryMonitorUpdateBranch(ctx, monitor, command, reason); err != nil {
+			return err
+		}
+	}
 	desiredAction := store.RepositoryMonitorDesiredActionForActionKind(actionKind)
 	actionID := store.RepositoryMonitorWorkActionID(command.ID, desiredAction)
 	if existing, err := r.Store.GetWorkAction(ctx, monitor.Namespace, actionID); err == nil {

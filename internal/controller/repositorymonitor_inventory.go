@@ -1011,8 +1011,11 @@ func (r *RepositoryMonitorReconciler) listRepositoryMonitorPullRequestsForRun(ct
 				return nil, nil
 			}
 			command, commandErr := r.Store.GetCommandEvent(ctx, run.MonitorNamespace, run.CommandEventID)
-			if commandErr != nil || command.Intent != repositoryMonitorCommandIntentAutomerge {
+			if commandErr != nil {
 				return nil, commandErr
+			}
+			if command.Intent != repositoryMonitorCommandIntentAutomerge && command.Intent != repositoryMonitorCommandIntentUpdateBranch {
+				return nil, nil
 			}
 		}
 		return []repositoryMonitorPullRequest{*pr}, nil

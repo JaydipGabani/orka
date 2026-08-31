@@ -257,6 +257,23 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 
 	requestID, err := r.updateRepositoryMonitorPullRequestBranch(ctx, owner, repository, token, pr.Number, command.HeadSHA)
 	if err != nil {
+		failureState := repositoryMonitorRunFailureState(err)
+		if repositoryMonitorFailedCommandRunRetryable("[" + failureState + "]") {
+			mutation.Status = repositoryMonitorAutomergeStateStarted
+			mutation.Error = err.Error()
+			if updateErr := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); updateErr != nil {
+				return true, 0, fmt.Errorf("update branch retry failed: %w; additionally failed to update mutation audit: %v", err, updateErr)
+			}
+			item.RepairState = repositoryMonitorRepairPhaseQueued
+			item.SkipReason = failureState
+			if updateErr := r.Store.UpsertMonitorItem(ctx, item); updateErr != nil {
+				return true, 0, updateErr
+			}
+			if actionErr := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusRunning, failureState, "", err.Error()); actionErr != nil {
+				return true, 0, actionErr
+			}
+			return true, 0, err
+		}
 		mutation.Status = repositoryMonitorRunPhaseFailed
 		mutation.Error = err.Error()
 		if updateErr := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); updateErr != nil {
@@ -348,16 +365,27 @@ func (r *RepositoryMonitorReconciler) reconcileRepositoryMonitorCompletedUpdateB
 	if err != nil {
 		return true, err
 	}
-	containsBase, err := r.repositoryMonitorRepoHeadContainsBase(ctx, monitor, owner+"/"+repository, current.BaseSHA, current.HeadSHA)
+	verificationBaseSHA := current.BaseSHA
+	if current.Merged {
+		verificationBaseSHA = mutation.ExternalID
+	}
+	containsBase, err := r.repositoryMonitorRepoHeadContainsBase(ctx, monitor, owner+"/"+repository, verificationBaseSHA, current.HeadSHA)
 	if err != nil {
 		return true, err
 	}
-	item, err := r.Store.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, repositoryMonitorPullRequestKind, fmt.Sprintf("%d", current.Number))
+	existing, err := r.Store.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, repositoryMonitorPullRequestKind, fmt.Sprintf("%d", current.Number))
 	if err != nil {
 		return true, err
 	}
+	item := repositoryMonitorItemFromPullRequest(monitor, *current, existing)
 	if containsBase {
 		return true, r.completeRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, *current)
+	}
+	if current.Merged {
+		return true, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "merged PR head does not contain the captured base revision")
+	}
+	if !strings.EqualFold(strings.TrimSpace(current.State), repositoryMonitorItemStateOpen) {
+		return true, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "pull request closed before the branch update completed")
 	}
 	if current.HeadSHA != mutation.TargetSHA {
 		return true, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "updated PR head does not contain the live base revision")
@@ -377,6 +405,9 @@ func (r *RepositoryMonitorReconciler) completeRepositoryMonitorUpdateBranch(ctx 
 	}
 	item.HeadSHA = pr.HeadSHA
 	item.BaseSHA = pr.BaseSHA
+	if pr.Merged {
+		item.State = repositoryMonitorAutomergeStateMerged
+	}
 	item.RepairState = repositoryMonitorRepairPhaseSucceeded
 	item.SkipReason = ""
 	if err := r.Store.UpsertMonitorItem(ctx, item); err != nil {
@@ -403,6 +434,30 @@ func (r *RepositoryMonitorReconciler) failRepositoryMonitorUpdateBranch(ctx cont
 		return err
 	}
 	return r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, item.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusFailed, repositoryMonitorRepairPhaseFailed, "", reason)
+}
+
+func (r *RepositoryMonitorReconciler) terminalizeRepositoryMonitorUpdateBranch(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, command store.CommandEvent, reason string) error {
+	mutation, err := r.Store.GetGitHubMutationRecord(ctx, monitor.Namespace, repositoryMonitorUpdateBranchMutationID(command.ID))
+	if err != nil && !errorsIsStoreNotFound(err) {
+		return err
+	}
+	if mutation != nil && mutation.Status != repositoryMonitorRunPhaseSucceeded {
+		mutation.Status = repositoryMonitorRunPhaseFailed
+		mutation.Error = reason
+		if err := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); err != nil {
+			return err
+		}
+	}
+	item, err := r.Store.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, repositoryMonitorPullRequestKind, fmt.Sprintf("%d", command.Number))
+	if errorsIsStoreNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	item.RepairState = repositoryMonitorRepairPhaseFailed
+	item.SkipReason = "update_branch_failed"
+	return r.Store.UpsertMonitorItem(ctx, item)
 }
 
 func (r *RepositoryMonitorReconciler) updateRepositoryMonitorPullRequestBranch(ctx context.Context, owner, repository, token string, number int64, expectedHeadSHA string) (string, error) {

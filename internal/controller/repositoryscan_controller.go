@@ -2277,18 +2277,24 @@ func findingIdentityMatchScore(left, right *store.Finding) int {
 				continue
 			}
 			leftSymbol, rightSymbol := normalizeFindingIdentityText(leftRef.Symbol), normalizeFindingIdentityText(rightRef.Symbol)
-			if leftSymbol != "" && rightSymbol != "" {
-				if leftSymbol == rightSymbol {
-					best = max(best, 4)
-				}
+			sameSymbol := leftSymbol != "" && rightSymbol != "" && leftSymbol == rightSymbol
+			if leftSymbol != "" && rightSymbol != "" && !sameSymbol {
 				continue
 			}
 			if findingRangesOverlap(leftRef.StartLine, leftRef.EndLine, rightRef.StartLine, rightRef.EndLine) {
-				best = max(best, 3)
+				if sameSymbol {
+					best = max(best, 4)
+				} else {
+					best = max(best, 3)
+				}
 				continue
 			}
 			if leftRef.StartLine > 0 && rightRef.StartLine > 0 && absInt(leftRef.StartLine-rightRef.StartLine) <= 5 {
-				best = max(best, 2)
+				if sameSymbol {
+					best = max(best, 3)
+				} else {
+					best = max(best, 2)
+				}
 			}
 		}
 	}
@@ -2399,18 +2405,35 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 	if r.SecurityStore == nil || scan == nil || run == nil || run.Phase != scanRunPhaseSucceeded || run.ReviewedSliceCount == 0 {
 		return nil
 	}
-	droppedAtCap, _, err := r.SecurityStore.ListDroppedFindings(ctx, store.DroppedFindingFilter{
-		Namespace:      scan.Namespace,
-		RepositoryScan: scan.Name,
-		ScanRunID:      run.ID,
-		Layer:          "cap",
-		Limit:          1,
-	})
-	if err != nil {
-		return err
-	}
-	if len(droppedAtCap) > 0 {
-		return nil
+	inconclusiveSlices := map[string]struct{}{}
+	allSlicesInconclusive := false
+	droppedCursor := ""
+	for {
+		dropped, next, err := r.SecurityStore.ListDroppedFindings(ctx, store.DroppedFindingFilter{
+			Namespace:      scan.Namespace,
+			RepositoryScan: scan.Name,
+			ScanRunID:      run.ID,
+			Limit:          200,
+			Cursor:         droppedCursor,
+		})
+		if err != nil {
+			return err
+		}
+		for i := range dropped {
+			if dropped[i].Layer == "cap" {
+				return nil
+			}
+			sliceID := strings.TrimSpace(dropped[i].SliceID)
+			if sliceID == "" {
+				allSlicesInconclusive = true
+				continue
+			}
+			inconclusiveSlices[sliceID] = struct{}{}
+		}
+		if next == "" {
+			break
+		}
+		droppedCursor = next
 	}
 
 	reviewedSlices := map[string]struct{}{}
@@ -2470,6 +2493,12 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 			if finding.ScanRunID == run.ID || finding.PRNumber == nil || *finding.PRNumber < 1 {
 				continue
 			}
+			if allSlicesInconclusive || (strings.TrimSpace(finding.SliceID) == "" && len(inconclusiveSlices) > 0) {
+				continue
+			}
+			if _, inconclusive := inconclusiveSlices[finding.SliceID]; inconclusive {
+				continue
+			}
 			if run.Mode == scanModeIncremental {
 				if _, reviewed := reviewedSlices[finding.SliceID]; !reviewed {
 					continue
@@ -2477,9 +2506,9 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 			}
 			prNumber := *finding.PRNumber
 			if _, verified := verifiedPRs[prNumber]; !verified {
-				merged, ok := r.repositoryScanPullRequestMerged(ctx, owner, repository, token, prNumber)
-				if !ok {
-					continue
+				merged, err := r.repositoryScanPullRequestMerged(ctx, owner, repository, token, prNumber)
+				if err != nil {
+					return err
 				}
 				verifiedPRs[prNumber] = struct{}{}
 				mergeStateByPR[prNumber] = merged
@@ -3623,6 +3652,12 @@ func (r *RepositoryScanReconciler) ingestPatchTask(ctx context.Context, scan *co
 	finding, err := r.SecurityStore.GetFinding(ctx, scan.Namespace, findingID)
 	if err != nil {
 		return err
+	}
+	if finding.DuplicateOf != "" {
+		finding, err = r.SecurityStore.GetFinding(ctx, scan.Namespace, finding.DuplicateOf)
+		if err != nil {
+			return err
+		}
 	}
 	finding.PatchProposalID = proposal.ID
 	switch proposal.Status {

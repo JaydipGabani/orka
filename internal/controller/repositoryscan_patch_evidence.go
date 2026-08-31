@@ -504,7 +504,7 @@ type repositoryScanPullRequestResponse struct {
 	MergedAt *time.Time `json:"merged_at"`
 }
 
-func (r *RepositoryScanReconciler) repositoryScanPullRequestMerged(ctx context.Context, owner, repository, token string, prNumber int) (bool, bool) {
+func (r *RepositoryScanReconciler) repositoryScanPullRequestMerged(ctx context.Context, owner, repository, token string, prNumber int) (bool, error) {
 	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
 	if baseURL == "" {
 		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
@@ -512,23 +512,30 @@ func (r *RepositoryScanReconciler) repositoryScanPullRequestMerged(ctx context.C
 	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", baseURL, url.PathEscape(owner), url.PathEscape(repository), prNumber)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return false, false
+		return false, err
 	}
 	repositoryMonitorSetGitHubHeaders(req, token)
 	resp, err := r.repositoryScanHTTPClient().Do(req)
 	if err != nil {
-		return false, false
+		return false, fmt.Errorf("read remediation pull request: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 	body, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
-	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, false
+	if err != nil {
+		return false, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		failure := &repositoryMonitorGitHubAPIError{Operation: "read remediation pull request", StatusCode: resp.StatusCode, Body: string(body)}
+		if repositoryMonitorFailedCommandRunRetryable("[" + repositoryMonitorRunFailureState(failure) + "]") {
+			return false, failure
+		}
+		return false, nil
 	}
 	var current repositoryScanPullRequestResponse
 	if err := json.Unmarshal(body, &current); err != nil {
-		return false, false
+		return false, fmt.Errorf("decode remediation pull request: %w", err)
 	}
-	return current.Merged || current.MergedAt != nil, true
+	return current.Merged || current.MergedAt != nil, nil
 }
 
 func (r *RepositoryScanReconciler) readRemediationPullRequest(ctx context.Context, client *http.Client, endpoint, token string, logger logr.Logger) (repositoryScanPullRequestResponse, bool) {

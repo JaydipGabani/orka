@@ -3727,7 +3727,8 @@ func TestFindingIdentityMatchScoreRequiresCategoryAndStableLocation(t *testing.T
 		other storepkg.Finding
 		match bool
 	}{
-		{name: "same symbol after line drift", other: storepkg.Finding{Category: "CWE-22 path traversal", FilePath: "archive.go", Line: 180, Evidence: []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 180, EndLine: 188, Symbol: "extractArchive"}}}, match: true},
+		{name: "same symbol with nearby line drift", other: storepkg.Finding{Category: "CWE-22 path traversal", FilePath: "archive.go", Line: 104, Evidence: []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 104, EndLine: 112, Symbol: "extractArchive"}}}, match: true},
+		{name: "same symbol at a distinct location", other: storepkg.Finding{Category: "CWE-22 path traversal", FilePath: "archive.go", Line: 180, Evidence: []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 180, EndLine: 188, Symbol: "extractArchive"}}}},
 		{name: "nearby line without symbols", other: storepkg.Finding{Category: "path traversal", FilePath: "archive.go", Line: 104, Evidence: []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 104, EndLine: 112}}}, match: true},
 		{name: "different symbol and location", other: storepkg.Finding{Category: "path traversal", FilePath: "archive.go", Line: 180, Evidence: []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 180, EndLine: 188, Symbol: "writeManifest"}}}},
 		{name: "different category", other: storepkg.Finding{Category: "command injection", FilePath: "archive.go", Line: 100, Evidence: []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 100, EndLine: 108, Symbol: "extractArchive"}}}},
@@ -3857,6 +3858,75 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 	}
 }
 
+func TestRefreshScanRunStatusRetriesMergedPRLookup(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/example/kaset/pulls/42" {
+			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer forge-token-value" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"message":"try again"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:            "https://github.com/example/kaset",
+			ForgeCredentialRef: &corev1.LocalObjectReference{Name: testPatchForgeSecretName},
+		},
+	}
+	completed := metav1.Now()
+	threatTask := newSucceededSecurityTask("kaset-retry-threat", "scan_retry", security.StageThreatModel, completed)
+	mapperTask := newSucceededSecurityTask("kaset-retry-mapper", "scan_retry", security.StageMapper, completed)
+	reviewTask := newSucceededSecurityTask("kaset-retry-review", "scan_retry", security.StageReview, completed)
+	reviewTask.Labels[labels.LabelSecuritySliceID] = "slice_api"
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, threatTask, mapperTask, reviewTask).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
+	run := &storepkg.ScanRun{ID: "scan_retry", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, StartedAt: time.Now()}
+	if err := securityStore.CreateScanRun(ctx, run); err != nil {
+		t.Fatalf("CreateScanRun() error = %v", err)
+	}
+	prNumber := 42
+	finding := &storepkg.Finding{ID: "fnd_retry", Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: "slice_api", Fingerprint: "fnd_retry", Title: "finding", Summary: "finding", Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, FilePath: "api.go", PRNumber: &prNumber}
+	if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+		t.Fatalf("UpsertFinding() error = %v", err)
+	}
+
+	if err := reconciler.refreshScanRunStatus(ctx, scan, run, run.ID, false); err == nil {
+		t.Fatal("refreshScanRunStatus() error = nil, want transient GitHub failure")
+	}
+	persistedRun, err := securityStore.GetScanRun(ctx, defaultNS, run.ID)
+	if err != nil || persistedRun.Phase != scanRunPhaseRunning {
+		t.Fatalf("persisted run after transient failure = %#v, err %v", persistedRun, err)
+	}
+	if err := reconciler.refreshScanRunStatus(ctx, scan, persistedRun, persistedRun.ID, false); err != nil {
+		t.Fatalf("refreshScanRunStatus(retry) error = %v", err)
+	}
+	got, err := securityStore.GetFinding(ctx, defaultNS, finding.ID)
+	if err != nil || got.State != findingStateResolved || attempts != 2 {
+		t.Fatalf("finding = %#v, attempts = %d, err %v", got, attempts, err)
+	}
+}
+
 func TestResolveMergedFindingsScopesIncrementalRunToReviewedSlices(t *testing.T) {
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)
@@ -3926,6 +3996,56 @@ func TestResolveMergedFindingsSkipsRunWithCappedOutput(t *testing.T) {
 	got, err := securityStore.GetFinding(ctx, defaultNS, finding.ID)
 	if err != nil || got.State != findingStatePROpen {
 		t.Fatalf("finding = %#v, err %v, want unresolved", got, err)
+	}
+}
+
+func TestResolveMergedFindingsSkipsSlicesWithDroppedResults(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	requests := map[int]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var prNumber int
+		if _, err := fmt.Sscanf(r.URL.Path, "/repos/example/kaset/pulls/%d", &prNumber); err != nil {
+			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
+		}
+		requests[prNumber]++
+		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}, Spec: corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/kaset", ForgeCredentialRef: &corev1.LocalObjectReference{Name: testPatchForgeSecretName}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
+	run := &storepkg.ScanRun{ID: "scan_dropped", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 2}
+	for _, candidate := range []struct {
+		id      string
+		sliceID string
+		pr      int
+	}{
+		{id: "fnd_dropped_slice", sliceID: "slice_dropped", pr: 42},
+		{id: "fnd_clean_slice", sliceID: "slice_clean", pr: 43},
+	} {
+		prNumber := candidate.pr
+		finding := &storepkg.Finding{ID: candidate.id, Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: candidate.sliceID, Fingerprint: candidate.id, Title: candidate.id, Summary: candidate.id, Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, PRNumber: &prNumber}
+		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
+		}
+	}
+	if err := securityStore.CreateDroppedFinding(ctx, &storepkg.DroppedFinding{ID: "drop_validation", Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: run.ID, TaskName: "review", SliceID: "slice_dropped", Reason: "evidence quote does not match cited file range", Layer: "validation"}); err != nil {
+		t.Fatalf("CreateDroppedFinding() error = %v", err)
+	}
+	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run); err != nil {
+		t.Fatalf("resolveMergedFindingsNotObserved() error = %v", err)
+	}
+	droppedSlice, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_dropped_slice")
+	cleanSlice, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_clean_slice")
+	if droppedSlice.State != findingStatePROpen || cleanSlice.State != findingStateResolved || requests[42] != 0 || requests[43] != 1 {
+		t.Fatalf("dropped = %#v, clean = %#v, requests = %#v", droppedSlice, cleanSlice, requests)
 	}
 }
 

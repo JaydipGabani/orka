@@ -725,6 +725,34 @@ func TestMarkFindingDuplicateExcludesAliasFromListsAndCounts(t *testing.T) {
 	}
 }
 
+func TestListPatchProposalsFollowsFindingAliases(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	newFinding := func(suffix string) *store.Finding {
+		return &store.Finding{ID: "fnd-" + suffix, Namespace: "ns1", RepositoryScan: "repo1", ScanRunID: "scan-1", Fingerprint: "fingerprint-" + suffix, Title: "Finding " + suffix, Summary: "summary", Severity: "high", Confidence: "high", ValidationStatus: "validated", State: testStateOpen}
+	}
+	canonical := newFinding("canonical-proposal")
+	alias := newFinding("alias-proposal")
+	for _, finding := range []*store.Finding{canonical, alias} {
+		if err := s.UpsertFinding(ctx, finding); err != nil {
+			t.Fatalf("UpsertFinding(%s): %v", finding.ID, err)
+		}
+	}
+	proposal := &store.PatchProposal{ID: "patch-alias", Namespace: alias.Namespace, RepositoryScan: alias.RepositoryScan, FindingID: alias.ID, TaskName: "patch-task", Branch: "orka/security/alias", Status: "pending"}
+	if err := s.CreatePatchProposal(ctx, proposal); err != nil {
+		t.Fatalf("CreatePatchProposal: %v", err)
+	}
+	if err := s.MarkFindingDuplicate(ctx, alias.Namespace, alias.ID, canonical.ID); err != nil {
+		t.Fatalf("MarkFindingDuplicate: %v", err)
+	}
+	for _, findingID := range []string{canonical.ID, alias.ID} {
+		proposals, err := s.ListPatchProposals(ctx, alias.Namespace, findingID)
+		if err != nil || len(proposals) != 1 || proposals[0].ID != proposal.ID {
+			t.Fatalf("ListPatchProposals(%s) = %#v, err %v", findingID, proposals, err)
+		}
+	}
+}
+
 func TestReviewSliceStoreRoundTripFilteringAndNamespaceIsolation(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
