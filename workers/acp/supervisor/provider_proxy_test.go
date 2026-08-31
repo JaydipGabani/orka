@@ -931,6 +931,33 @@ func TestProviderProxyUpstreamFailureAccountingClearsAfterStreamedSuccess(t *tes
 	}
 }
 
+func TestProviderProxyIncompleteStreamIsAccountedAsFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: response.created\ndata: {}\n\n")
+	}))
+	defer upstream.Close()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+
+	response := doProviderProxyRequest(
+		t, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential,
+		[]byte(`{"model":"test-model","stream":true}`), nil,
+	)
+	defer func() { _ = response.Body.Close() }()
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
+	failure, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
+	if !failure || status != http.StatusBadGateway || detail != "provider stream ended before a terminal success event" {
+		t.Fatalf("incomplete stream accounting = %v/%d/%q, want terminal-marker failure", failure, status, detail)
+	}
+}
+
 func TestProviderProxyUpstreamFailureAccountingFailsWhenFinalInferenceFails(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

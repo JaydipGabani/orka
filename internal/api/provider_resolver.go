@@ -152,8 +152,9 @@ func (r *ProviderResolver) resolveFromExplicit(ctx context.Context, opts Resolve
 	return provider, resolvedModel, providerResolutionInfo(providerCRD), nil
 }
 
-// resolveFromModelStr handles the compat handler path with "provider/model" format
-// strings. Intermediate provider lookups are non-fatal (silently fall through).
+// resolveFromModelStr handles the compat handler path with "provider/model"
+// format strings. An explicit provider prefix is authoritative and fails
+// closed; fallback applies only when the model string names no provider.
 func (r *ProviderResolver) resolveFromModelStr(ctx context.Context, opts ResolveOpts) (llm.Provider, string, ProviderResolutionInfo, error) {
 	var providerName, model string
 
@@ -167,10 +168,11 @@ func (r *ProviderResolver) resolveFromModelStr(ctx context.Context, opts Resolve
 	var providerCRD *corev1alpha1.Provider
 
 	if providerName != "" {
-		p := &corev1alpha1.Provider{}
-		if err := r.client.Get(ctx, types.NamespacedName{Name: providerName, Namespace: opts.Namespace}, p); err == nil {
-			providerCRD = p
+		p, err := r.LookupProvider(ctx, providerName, opts.Namespace)
+		if err != nil {
+			return nil, "", ProviderResolutionInfo{}, err
 		}
+		providerCRD = p
 	}
 
 	if providerCRD == nil && r.config.Provider != "" {

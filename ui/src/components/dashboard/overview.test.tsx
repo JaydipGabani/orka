@@ -90,4 +90,34 @@ describe('Overview', () => {
     expect(within(card).getByText('Cancelled')).toBeInTheDocument()
     expect(within(card).getByText('Running')).toBeInTheDocument()
   })
+
+  it('follows list pagination before calculating dashboard totals', async () => {
+    const paged = (resource: string, first: unknown[], second: unknown[]) =>
+      http.get(`/api/v1/${resource}`, ({ request }) => {
+        const cursor = new URL(request.url).searchParams.get('continue')
+        return HttpResponse.json(cursor ? { items: second, metadata: {} } : { items: first, metadata: { continue: `${resource}-next` } })
+      })
+    const task = (name: string) => ({
+      metadata: { name, namespace: 'default', uid: name, creationTimestamp: new Date().toISOString() },
+      spec: { type: 'container' },
+      status: { phase: 'Succeeded' },
+    })
+    server.use(
+      paged('tasks', [task('one')], [task('two')]),
+      paged('sessions', [{ id: 'one' }], [{ id: 'two' }, { id: 'three' }]),
+      paged('agents', [{ metadata: { name: 'one' }, spec: {} }], [{ metadata: { name: 'two' }, spec: {} }, { metadata: { name: 'three' }, spec: {} }, { metadata: { name: 'four' }, spec: {} }]),
+      paged('tools', [{ metadata: { name: 'one' } }], [{ metadata: { name: 'two' } }, { metadata: { name: 'three' } }, { metadata: { name: 'four' } }, { metadata: { name: 'five' } }]),
+    )
+
+    render(<Overview />)
+    const cardValue = async (title: string, value: string) => {
+      const heading = await screen.findByText(title)
+      const card = heading.closest('[data-slot="card"]') as HTMLElement
+      await waitFor(() => expect(within(card).getByText(value)).toBeInTheDocument())
+    }
+    await cardValue('Total Tasks', '2')
+    await cardValue('Sessions', '3')
+    await cardValue('Agents', '4')
+    await cardValue('Tools', '5')
+  })
 })

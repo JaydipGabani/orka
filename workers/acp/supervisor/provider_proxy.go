@@ -1089,6 +1089,9 @@ func (p *providerProxy) relayUpstreamResponse(
 	recordStreamFailure := func() {
 		session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider stream reported a terminal error: "+streamScanner.detail)
 	}
+	recordIncompleteStream := func() {
+		session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider stream ended before a terminal success event")
+	}
 	if upstreamFailed {
 		session.attachInferenceFailureDetail(promptID, requestClass, seq, providerUpstreamErrorDetail(capture.buffer))
 	}
@@ -1128,24 +1131,27 @@ func (p *providerProxy) relayUpstreamResponse(
 			recordStreamFailure()
 			return
 		}
+		if streamScanner != nil && !streamScanner.completed {
+			recordIncompleteStream()
+			return
+		}
 		// A success is only accounted once the whole body reached the
-		// child; a chunked response is not known to be usable earlier.
+		// child; a streamed response must also carry a provider terminal
+		// success marker so a truncated 2xx cannot mask an earlier failure.
 		session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
 	}
 }
 
 // sseTerminalErrorScanner watches a relayed text/event-stream body for an
-// explicit terminal error event. Providers can fail after a 200 status line:
-// Anthropic emits `event: error` mid-stream, and OpenAI-style streams emit
-// `response.failed` / top-level error payloads. Detection is marker-based on
-// raw stream lines: model-generated content cannot spoof the markers because
-// content deltas carry them only JSON-escaped (\" not "). Only explicit
-// error markers flip the result — unknown dialects change nothing — so this
-// strictly removes false successes without inventing false failures.
+// explicit terminal result. Providers can fail after a 200 status line, and
+// a clean EOF without a success marker is only evidence of a truncated
+// stream. Marker matching uses raw stream lines: model-generated content
+// carries embedded markers JSON-escaped and cannot spoof them.
 type sseTerminalErrorScanner struct {
-	line   []byte
-	failed bool
-	detail string
+	line      []byte
+	failed    bool
+	completed bool
+	detail    string
 }
 
 const sseScannerMaxLineBytes = 1024
@@ -1160,6 +1166,13 @@ var sseTerminalErrorMarkers = []string{
 	`"type":"error"`,
 	`"type":"response.failed"`,
 	`data:{"error"`,
+}
+
+var sseTerminalSuccessMarkers = []string{
+	"event:message_stop",
+	"event:response.completed",
+	`"type":"message_stop"`,
+	`"type":"response.completed"`,
 }
 
 func (c *sseTerminalErrorScanner) Write(p []byte) (int, error) {
@@ -1199,6 +1212,16 @@ func (c *sseTerminalErrorScanner) scanLine() {
 		if strings.Contains(compact, marker) {
 			c.failed = true
 			c.detail = providerUpstreamErrorDetail([]byte(line))
+			return
+		}
+	}
+	if compact == "data:[DONE]" {
+		c.completed = true
+		return
+	}
+	for _, marker := range sseTerminalSuccessMarkers {
+		if strings.Contains(compact, marker) {
+			c.completed = true
 			return
 		}
 	}

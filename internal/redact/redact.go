@@ -10,6 +10,7 @@ const redactedValue = "[REDACTED]"
 var (
 	authorizationHeaderRe = regexp.MustCompile(`(?i)\b(authorization\s*:\s*)(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+`)
 	txnTokenHeaderRe      = regexp.MustCompile(`(?i)\b(txn-token\s*:\s*)[A-Za-z0-9._~+/=-]+`)
+	cookieHeaderRe        = regexp.MustCompile(`(?i)\b((?:set-cookie|cookie)\s*:\s*)[^\r\n]+`)
 	// Unquoted assignment values consume every non-space character: a
 	// redactor must never leave a recoverable credential tail behind a
 	// comma or semicolon, and over-redacting a following word in prose is
@@ -36,6 +37,7 @@ func SensitiveText(s string) string {
 	}
 	s = authorizationHeaderRe.ReplaceAllString(s, `${1}`+redactedValue)
 	s = txnTokenHeaderRe.ReplaceAllString(s, `${1}`+redactedValue)
+	s = cookieHeaderRe.ReplaceAllString(s, `${1}`+redactedValue)
 	s = sensitiveAssignmentRe.ReplaceAllString(s, `${1}${2}${3}${4}`+redactedValue)
 	s = naturalLanguageSecretRe.ReplaceAllString(s, `${1}`+redactedValue)
 	s = urlCredentialRe.ReplaceAllString(s, `${1}`+redactedValue+`@`)

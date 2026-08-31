@@ -29,13 +29,17 @@ export function useTaskListAll(pageLimit = '100', refetchInterval: number | fals
     queryKey: ['tasks', 'all', namespace, pageLimit],
     queryFn: async () => {
       const items: Task[] = []
+      const seen = new Set<string>()
       let metadata: ListResponse<Task>['metadata'] = {}
       let continueToken: string | undefined
       do {
         const page = await fetchTaskListPage(namespace, pageLimit, continueToken)
         items.push(...page.items)
         metadata = page.metadata ?? {}
-        continueToken = metadata.continue
+        const next = metadata.continue
+        if (next && seen.has(next)) throw new Error('task list pagination repeated continuation cursor')
+        if (next) seen.add(next)
+        continueToken = next
       } while (continueToken)
       return { items, metadata }
     },

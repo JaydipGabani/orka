@@ -946,4 +946,28 @@ describe('TaskCreateForm', () => {
     expect(screen.queryByRole('option', { name: /external-agent/ })).not.toBeInTheDocument()
     expect(screen.queryByRole('option', { name: /provider-agent/ })).not.toBeInTheDocument()
   })
+
+  it('clears a runtime Agent selection when the namespace changes', async () => {
+    useStateTypeOverride = 'agent'
+    server.use(
+      http.get('/api/v1/agents', ({ request }) => {
+        const namespace = new URL(request.url).searchParams.get('namespace')
+        return HttpResponse.json({
+          items: [{ metadata: { name: 'shared-agent', namespace }, spec: { runtime: { type: 'codex' } } }],
+          metadata: {},
+        })
+      }),
+    )
+    render(<TaskCreateForm />)
+
+    const trigger = screen.getByText('Agent Reference').closest('.space-y-2')!.querySelector('[role="combobox"]')!
+    await waitFor(() => expect(trigger).not.toBeDisabled())
+    fireEvent.pointerDown(trigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: /shared-agent/ }))
+    await waitFor(() => expect(screen.getByTestId('agent-info-card')).toBeInTheDocument())
+
+    act(() => useUIStore.setState({ namespace: 'other' }))
+    await waitFor(() => expect(screen.queryByTestId('agent-info-card')).not.toBeInTheDocument())
+    expect(trigger).toHaveTextContent('Select an agent')
+  })
 })

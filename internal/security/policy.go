@@ -79,6 +79,7 @@ var (
 	// live signature grants access just like a bearer token.
 	policySignedURLPattern = regexp.MustCompile(`(?i)[?&](?:sig|sign` + `ature|sas|x-amz-sign` + `ature|x-amz-sec` + `urity-token|x-amz-cred` + `ential|x-goog-sign` + `ature|x-goog-cred` + `ential)=([^&#\s"'<>,;()\[\]]{16,})`)
 	policyTxnTokenPattern  = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=~:-]{16,})`)
+	policyCookiePattern    = regexp.MustCompile(`(?i)\b(?:set-cookie|cookie)\s*:\s*([^\r\n]+)`)
 )
 
 // placeholderFormPattern matches complete variable/template forms: a shell
@@ -127,25 +128,65 @@ var codeReferenceCredentialTail = regexp.MustCompile(`(?i)^(?:api[_-]?key|access
 // from configuration would otherwise make any file that touches credential
 // plumbing unpublishable, while arbitrary dotted literals stay flagged.
 // callableReferencePattern matches an identifier that can legally precede a
-// call AND carries real identifier structure — a dot (os.Getenv), an
-// underscore (read_password), or mixed case (readPasswordFromKeychain). A
-// bare single-case alphanumeric run is excluded: values only reach this
-// exemption at 16+ characters, where an undifferentiated run is far more
-// likely a credential with "(" appended than a function name, so appending "(" to a secret cannot buy the exemption.
+// call and is either qualified (os.Getenv) or an unqualified credential
+// reader (readPasswordFromKeychain). Requiring a complete call suffix and a
+// reader-shaped unqualified name prevents arbitrary mixed-case or underscored
+// credentials from buying the exemption by appending call punctuation.
 var callableReferencePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$`)
+var unqualifiedCredentialReaderPattern = regexp.MustCompile(`(?i)^(?:fetch|get|load|lookup|read|resolve)[A-Za-z0-9_]*(?:api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[A-Za-z0-9_]*$`)
 
 func callableReferenceShape(value string) bool {
 	if !callableReferencePattern.MatchString(value) {
 		return false
 	}
-	if strings.ContainsAny(value, "._") {
+	if strings.Contains(value, ".") {
 		return true
 	}
-	return strings.ToLower(value) != value && strings.ToUpper(value) != value
+	return unqualifiedCredentialReaderPattern.MatchString(value)
+}
+
+func hasCompleteCallSuffix(text string, start int) bool {
+	if start >= len(text) || text[start] != '(' {
+		return false
+	}
+	depth := 0
+	var quote byte
+	escaped := false
+	for i := start; i < len(text); i++ {
+		ch := text[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"', '`':
+			quote = ch
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return true
+			}
+		case '\r', '\n':
+			return false
+		}
+	}
+	return false
 }
 
 func secretValueIsCode(text string, value string, end int) bool {
-	if end < len(text) && text[end] == '(' && callableReferenceShape(value) {
+	if callableReferenceShape(value) && hasCompleteCallSuffix(text, end) {
 		return true
 	}
 	if !codeReferencePattern.MatchString(value) {
@@ -189,6 +230,9 @@ func LooksLikeSecret(text string) bool {
 		return true
 	}
 	if sensitiveValueMatch(policyBearerHeaderPattern, text) || sensitiveValueMatch(policyTxnTokenPattern, text) {
+		return true
+	}
+	if sensitiveValueMatch(policyCookiePattern, text) {
 		return true
 	}
 	if sensitiveValueMatch(policySignedURLPattern, text) {

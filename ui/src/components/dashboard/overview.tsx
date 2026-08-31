@@ -1,7 +1,7 @@
-import { useTaskList } from '@/hooks/use-tasks'
-import { useSessionList } from '@/hooks/use-sessions'
-import { useAgentList } from '@/hooks/use-agents'
-import { useToolList } from '@/hooks/use-tools'
+import { useTaskListAll } from '@/hooks/use-tasks'
+import { useSessionListAll } from '@/hooks/use-sessions'
+import { useAgentListAll } from '@/hooks/use-agents'
+import { useToolListAll } from '@/hooks/use-tools'
 import { isForbiddenError } from '@/lib/api-client'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { PageHeader } from '@/components/layout/page-header'
@@ -16,10 +16,10 @@ import { RecentTasks } from './recent-tasks'
 const PHASES = taskPhaseSchema.options
 
 export function Overview() {
-  const { data: tasksData, isLoading: tasksLoading, error: tasksError } = useTaskList('100')
-  const { data: sessionsData, isLoading: sessionsLoading, error: sessionsError } = useSessionList('100')
-  const { data: agentsData, isLoading: agentsLoading, error: agentsError } = useAgentList()
-  const { data: toolsData, isLoading: toolsLoading, error: toolsError } = useToolList()
+  const { data: tasksData, isLoading: tasksLoading, error: tasksError } = useTaskListAll('100')
+  const { data: sessionsData, isLoading: sessionsLoading, error: sessionsError } = useSessionListAll('100')
+  const { data: agentsData, isLoading: agentsLoading, error: agentsError } = useAgentListAll()
+  const { data: toolsData, isLoading: toolsLoading, error: toolsError } = useToolListAll()
 
   const isLoading = tasksLoading || sessionsLoading || agentsLoading || toolsLoading
   // A 403 leaves `data` undefined; surface it per resource instead of letting

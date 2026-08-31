@@ -16,6 +16,29 @@ export function useToolList() {
   })
 }
 
+export function useToolListAll(pageLimit = '100') {
+  const namespace = useUIStore((s) => s.namespace)
+  return useQuery({
+    queryKey: ['tools', 'all', namespace, pageLimit],
+    queryFn: async () => {
+      const items: ToolListItem[] = []
+      const seen = new Set<string>()
+      let continueToken: string | undefined
+      do {
+        const params: Record<string, string> = { namespace, limit: pageLimit }
+        if (continueToken) params.continue = continueToken
+        const page = await api.get<ListResponse<ToolListItem>>('/tools', params)
+        items.push(...page.items)
+        const next = page.metadata?.continue
+        if (next && seen.has(next)) throw new Error('tool list pagination repeated continuation cursor')
+        if (next) seen.add(next)
+        continueToken = next || undefined
+      } while (continueToken)
+      return { items, metadata: {} } as ListResponse<ToolListItem>
+    },
+  })
+}
+
 export function useTool(name: string) {
   const namespace = useUIStore((s) => s.namespace)
   return useQuery({

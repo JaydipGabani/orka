@@ -40,6 +40,16 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 		if scanner.failed {
 			t.Fatalf("scanner false-failed clean stream %q (detail %q)", stream[:40], scanner.detail)
 		}
+		if !scanner.completed {
+			t.Fatalf("scanner missed terminal success in %q", stream[:40])
+		}
+	}
+	scanner := &sseTerminalErrorScanner{}
+	if _, err := scanner.Write([]byte("event: response.created\ndata: {}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if scanner.failed || scanner.completed {
+		t.Fatalf("incomplete stream verdict = failed:%t completed:%t, want neither", scanner.failed, scanner.completed)
 	}
 }
 
