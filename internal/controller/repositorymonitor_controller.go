@@ -46,6 +46,8 @@ const (
 	repositoryMonitorRunPhaseFailed            = "failed"
 	repositoryMonitorRunRetryScheduled         = "retry_scheduled"
 	repositoryMonitorRunFailurePermanent       = "run_failed"
+	repositoryMonitorCommandIntentReview       = "review"
+	repositoryMonitorCommandIntentFixCI        = "fix_ci"
 	repositoryMonitorCommandIntentUpdateBranch = "update_branch"
 	repositoryMonitorCommandIntentDecompose    = "decompose"
 
@@ -247,7 +249,7 @@ func validateRepositoryMonitorCommandLabels(spec corev1alpha1.RepositoryMonitorS
 	labels := spec.Triggers.GitHub.Labels
 	groups := [][]struct{ intent, label string }{
 		{{"triage", labels.Issues.Triage}, {"research", labels.Issues.Research}, {"plan", labels.Issues.Plan}, {"approve_plan", labels.Issues.ApprovePlan}, {"implement", labels.Issues.Implement}, {repositoryMonitorCommandIntentDecompose, labels.Issues.Decompose}, {"stop", labels.Issues.Stop}, {"resume", labels.Issues.Resume}},
-		{{"review", labels.PullRequests.Review}, {"fix", labels.PullRequests.Fix}, {"fix_ci", labels.PullRequests.FixCI}, {repositoryMonitorCommandIntentUpdateBranch, labels.PullRequests.UpdateBranch}, {"automerge", labels.PullRequests.Automerge}, {"stop", labels.PullRequests.Stop}, {"resume", labels.PullRequests.Resume}},
+		{{repositoryMonitorCommandIntentReview, labels.PullRequests.Review}, {"fix", labels.PullRequests.Fix}, {repositoryMonitorCommandIntentFixCI, labels.PullRequests.FixCI}, {repositoryMonitorCommandIntentUpdateBranch, labels.PullRequests.UpdateBranch}, {repositoryMonitorCommandIntentAutomerge, labels.PullRequests.Automerge}, {"stop", labels.PullRequests.Stop}, {"resume", labels.PullRequests.Resume}},
 	}
 	for _, group := range groups {
 		seen := map[string]string{}
@@ -269,7 +271,7 @@ func defaultRepositoryMonitorCommandLabel(intent string) string {
 	switch intent {
 	case "approve_plan":
 		return "orka:approve-plan"
-	case "fix_ci":
+	case repositoryMonitorCommandIntentFixCI:
 		return "orka:fix-ci"
 	case repositoryMonitorCommandIntentUpdateBranch:
 		return "orka:update-branch"

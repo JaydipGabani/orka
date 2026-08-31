@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	cron "github.com/robfig/cron/v3"
@@ -66,6 +67,8 @@ const (
 	findingStatePatchPending         = "patch_pending"
 	findingStatePatchReady           = "patch_ready"
 	findingStatePROpen               = "pr_open"
+	findingStateFixed                = "fixed"
+	findingStateResolved             = "resolved"
 	patchProposalStatusPROpened      = "pr_opened"
 	findingValidationStatusPending   = "pending"
 	findingValidationStatusValidated = "validated"
@@ -73,6 +76,7 @@ const (
 	validationModeOff                = "off"
 	validationModeFull               = "full"
 	validationThresholdLow           = "low"
+	findingCategoryCWEPrefix         = "cwe"
 
 	scanSummaryRunning            = "scan is running"
 	scanSummaryThreatModelPending = "Threat model generated; deterministic mapper pending"
@@ -1793,10 +1797,16 @@ func (r *RepositoryScanReconciler) refreshScanRunStatus(
 		return strings.Compare(a.Name, b.Name)
 	})
 
+	previousPhase := run.Phase
 	progress := r.collectScanRunProgress(ctx, tasks.Items)
 	applyScanRunProgress(run, progress)
 	if err := r.keepScanRunningForPendingReviewSlices(ctx, scan, run, progress); err != nil {
 		return err
+	}
+	if previousPhase != scanRunPhaseSucceeded && run.Phase == scanRunPhaseSucceeded {
+		if err := r.resolveMergedFindingsNotObserved(ctx, scan, run); err != nil {
+			return err
+		}
 	}
 
 	if err := r.SecurityStore.UpdateScanRun(ctx, run); err != nil {
@@ -2078,12 +2088,41 @@ func evidenceRefKey(ref store.FindingEvidenceRef) string {
 func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding) error {
 	existing, err := r.SecurityStore.GetFinding(ctx, scan.Namespace, finding.ID)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		matches, matchErr := r.semanticFindingMatches(ctx, scan, finding)
+		if matchErr != nil {
+			return matchErr
+		}
+		if len(matches) == 0 {
 			return nil
 		}
-		return err
+		existing = canonicalFinding(matches)
+		for i := range matches {
+			mergeFindingEvidenceAndRemediation(existing, &matches[i])
+		}
+		for i := range matches {
+			candidate := &matches[i]
+			if candidate.ID == existing.ID || candidate.DuplicateOf == existing.ID {
+				continue
+			}
+			if err := r.SecurityStore.MarkFindingDuplicate(ctx, scan.Namespace, candidate.ID, existing.ID); err != nil {
+				return err
+			}
+		}
+	} else if existing.DuplicateOf != "" {
+		canonical, canonicalErr := r.SecurityStore.GetFinding(ctx, scan.Namespace, existing.DuplicateOf)
+		if canonicalErr != nil {
+			return canonicalErr
+		}
+		mergeFindingEvidenceAndRemediation(canonical, existing)
+		existing = canonical
 	}
-	if existing.State != "" && existing.State != findingStateOpen {
+	finding.ID = existing.ID
+	finding.Fingerprint = existing.Fingerprint
+	finding.CreatedAt = existing.CreatedAt
+	if existing.State != "" && existing.State != findingStateOpen && existing.State != findingStateFixed && existing.State != findingStateResolved {
 		finding.State = existing.State
 	}
 	if existing.PatchProposalID != "" {
@@ -2101,6 +2140,360 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 	}
 	if existing.ValidationJSON != "" {
 		finding.ValidationJSON = existing.ValidationJSON
+	}
+	return nil
+}
+
+func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding) ([]store.Finding, error) {
+	if finding == nil || strings.TrimSpace(finding.FilePath) == "" || strings.TrimSpace(finding.Category) == "" {
+		return nil, nil
+	}
+	matchesByID := map[string]store.Finding{}
+	cursor := ""
+	for {
+		candidates, next, err := r.SecurityStore.ListFindings(ctx, store.FindingFilter{
+			Namespace:         scan.Namespace,
+			RepositoryScan:    scan.Name,
+			FilePath:          finding.FilePath,
+			IncludeDuplicates: true,
+			Limit:             200,
+			Cursor:            cursor,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for i := range candidates {
+			candidate := candidates[i]
+			if findingIdentityMatchScore(finding, &candidate) < 2 {
+				continue
+			}
+			matchesByID[candidate.ID] = candidate
+			seenAliases := map[string]struct{}{}
+			for strings.TrimSpace(candidate.DuplicateOf) != "" {
+				if _, seen := seenAliases[candidate.ID]; seen {
+					return nil, fmt.Errorf("finding duplicate chain contains a cycle at %s", candidate.ID)
+				}
+				seenAliases[candidate.ID] = struct{}{}
+				canonical, err := r.SecurityStore.GetFinding(ctx, scan.Namespace, candidate.DuplicateOf)
+				if err != nil {
+					return nil, err
+				}
+				if canonical.RepositoryScan != scan.Name {
+					return nil, fmt.Errorf("finding duplicate %s points outside repository scan %s", candidate.ID, scan.Name)
+				}
+				candidate = *canonical
+				matchesByID[candidate.ID] = candidate
+			}
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	matches := make([]store.Finding, 0, len(matchesByID))
+	for _, match := range matchesByID {
+		matches = append(matches, match)
+	}
+	slices.SortFunc(matches, func(a, b store.Finding) int {
+		return strings.Compare(a.ID, b.ID)
+	})
+	return matches, nil
+}
+
+func canonicalFinding(matches []store.Finding) *store.Finding {
+	canonical := &matches[0]
+	for i := 1; i < len(matches); i++ {
+		candidate := &matches[i]
+		if candidate.DuplicateOf != "" {
+			continue
+		}
+		if canonical.DuplicateOf != "" || candidate.CreatedAt.Before(canonical.CreatedAt) || (candidate.CreatedAt.Equal(canonical.CreatedAt) && candidate.ID < canonical.ID) {
+			canonical = candidate
+		}
+	}
+	return canonical
+}
+
+func mergeFindingEvidenceAndRemediation(target, candidate *store.Finding) {
+	if target == nil || candidate == nil || target.ID == candidate.ID {
+		return
+	}
+	target.Evidence = mergeEvidenceRefs(target.Evidence, candidate.Evidence...)
+	if candidate.DuplicateOf != "" {
+		return
+	}
+	if target.PatchProposalID == "" || findingWorkflowStateRank(candidate.State) > findingWorkflowStateRank(target.State) {
+		target.PatchProposalID = candidate.PatchProposalID
+		target.PRNumber = candidate.PRNumber
+		target.PRURL = candidate.PRURL
+	}
+	if findingUserFinalState(candidate.State) && (!findingUserFinalState(target.State) || candidate.UpdatedAt.After(target.UpdatedAt)) {
+		target.State = candidate.State
+	}
+	if findingWorkflowStateRank(candidate.State) > findingWorkflowStateRank(target.State) && !findingUserFinalState(target.State) {
+		target.State = candidate.State
+	}
+	if candidate.ValidationStatus == findingValidationStatusValidated {
+		target.ValidationStatus = findingValidationStatusValidated
+		target.ValidationJSON = candidate.ValidationJSON
+	} else if target.ValidationStatus != findingValidationStatusValidated && candidate.ValidationStatus == findingValidationStatusPending {
+		target.ValidationStatus = findingValidationStatusPending
+		target.ValidationJSON = candidate.ValidationJSON
+	}
+}
+
+func findingUserFinalState(state string) bool {
+	switch strings.TrimSpace(state) {
+	case "dismissed", "suppressed", "false_positive":
+		return true
+	default:
+		return false
+	}
+}
+
+func findingWorkflowStateRank(state string) int {
+	switch strings.TrimSpace(state) {
+	case findingStatePROpen:
+		return 4
+	case findingStatePatchReady:
+		return 3
+	case findingStatePatchPending:
+		return 2
+	case findingStateOpen:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func findingIdentityMatchScore(left, right *store.Finding) int {
+	if left == nil || right == nil || !findingCategoryMatches(left.Category, right.Category) || strings.TrimSpace(left.FilePath) == "" || left.FilePath != right.FilePath {
+		return 0
+	}
+	best := 0
+	for _, leftRef := range left.Evidence {
+		for _, rightRef := range right.Evidence {
+			if leftRef.Path == "" || leftRef.Path != rightRef.Path {
+				continue
+			}
+			leftSymbol, rightSymbol := normalizeFindingIdentityText(leftRef.Symbol), normalizeFindingIdentityText(rightRef.Symbol)
+			if leftSymbol != "" && rightSymbol != "" {
+				if leftSymbol == rightSymbol {
+					best = max(best, 4)
+				}
+				continue
+			}
+			if findingRangesOverlap(leftRef.StartLine, leftRef.EndLine, rightRef.StartLine, rightRef.EndLine) {
+				best = max(best, 3)
+				continue
+			}
+			if leftRef.StartLine > 0 && rightRef.StartLine > 0 && absInt(leftRef.StartLine-rightRef.StartLine) <= 5 {
+				best = max(best, 2)
+			}
+		}
+	}
+	if best == 0 && left.Line > 0 && right.Line > 0 && absInt(left.Line-right.Line) <= 5 {
+		best = 2
+	}
+	return best
+}
+
+func findingCategoryMatches(left, right string) bool {
+	leftTokens, rightTokens := findingIdentityTokens(left), findingIdentityTokens(right)
+	if len(leftTokens) == 0 || len(rightTokens) == 0 {
+		return false
+	}
+	leftCWEs, rightCWEs := findingCategoryCWEIDs(leftTokens), findingCategoryCWEIDs(rightTokens)
+	if len(leftCWEs) > 0 && len(rightCWEs) > 0 {
+		for cwe := range leftCWEs {
+			if _, ok := rightCWEs[cwe]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	leftTokens, rightTokens = findingCategoryTerms(leftTokens), findingCategoryTerms(rightTokens)
+	if len(leftTokens) == 0 || len(rightTokens) == 0 {
+		return false
+	}
+	if slices.Equal(leftTokens, rightTokens) {
+		return true
+	}
+	rightSet := make(map[string]struct{}, len(rightTokens))
+	for _, token := range rightTokens {
+		rightSet[token] = struct{}{}
+	}
+	shared := 0
+	for _, token := range leftTokens {
+		if _, ok := rightSet[token]; ok {
+			shared++
+		}
+	}
+	return shared >= 2 && shared*2 >= max(len(leftTokens), len(rightTokens))
+}
+
+func findingCategoryCWEIDs(tokens []string) map[string]struct{} {
+	ids := map[string]struct{}{}
+	for i, token := range tokens {
+		if token == findingCategoryCWEPrefix && i+1 < len(tokens) {
+			if _, err := strconv.Atoi(tokens[i+1]); err == nil {
+				ids[tokens[i+1]] = struct{}{}
+			}
+			continue
+		}
+		if after, ok := strings.CutPrefix(token, findingCategoryCWEPrefix); ok {
+			id := after
+			if id != "" {
+				if _, err := strconv.Atoi(id); err == nil {
+					ids[id] = struct{}{}
+				}
+			}
+		}
+	}
+	return ids
+}
+
+func findingCategoryTerms(tokens []string) []string {
+	terms := make([]string, 0, len(tokens))
+	seen := map[string]struct{}{}
+	for i, token := range tokens {
+		if token == findingCategoryCWEPrefix || strings.HasPrefix(token, findingCategoryCWEPrefix) {
+			continue
+		}
+		if i > 0 && tokens[i-1] == findingCategoryCWEPrefix {
+			if _, err := strconv.Atoi(token); err == nil {
+				continue
+			}
+		}
+		if _, ok := seen[token]; ok {
+			continue
+		}
+		seen[token] = struct{}{}
+		terms = append(terms, token)
+	}
+	return terms
+}
+
+func findingIdentityTokens(value string) []string {
+	return strings.FieldsFunc(strings.ToLower(strings.TrimSpace(value)), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+func normalizeFindingIdentityText(value string) string {
+	return strings.Join(findingIdentityTokens(value), " ")
+}
+
+func findingRangesOverlap(leftStart, leftEnd, rightStart, rightEnd int) bool {
+	return leftStart > 0 && rightStart > 0 && leftEnd >= leftStart && rightEnd >= rightStart && leftStart <= rightEnd && rightStart <= leftEnd
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) error {
+	if r.SecurityStore == nil || scan == nil || run == nil || run.Phase != scanRunPhaseSucceeded || run.ReviewedSliceCount == 0 {
+		return nil
+	}
+	droppedAtCap, _, err := r.SecurityStore.ListDroppedFindings(ctx, store.DroppedFindingFilter{
+		Namespace:      scan.Namespace,
+		RepositoryScan: scan.Name,
+		ScanRunID:      run.ID,
+		Layer:          "cap",
+		Limit:          1,
+	})
+	if err != nil {
+		return err
+	}
+	if len(droppedAtCap) > 0 {
+		return nil
+	}
+
+	reviewedSlices := map[string]struct{}{}
+	if run.Mode == scanModeIncremental {
+		cursor := ""
+		for {
+			scanSlices, next, err := r.SecurityStore.ListReviewSlices(ctx, store.ReviewSliceFilter{
+				Namespace:      scan.Namespace,
+				RepositoryScan: scan.Name,
+				Status:         reviewSliceStatusReviewed,
+				LastScanRunID:  run.ID,
+				Limit:          200,
+				Cursor:         cursor,
+			})
+			if err != nil {
+				return err
+			}
+			for i := range scanSlices {
+				reviewedSlices[scanSlices[i].ID] = struct{}{}
+			}
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+		if len(reviewedSlices) == 0 {
+			return nil
+		}
+	}
+
+	token, reason, tokenErr := r.repositoryScanForgeToken(ctx, scan)
+	if tokenErr != nil || reason != "" {
+		return nil
+	}
+	targetRepo := security.CanonicalRepositoryCloneURL(scan.Spec.RepoURL)
+	owner, repository, err := security.ParseGitHubRepositoryURL(targetRepo)
+	if err != nil {
+		return nil
+	}
+
+	mergeStateByPR := map[int]bool{}
+	verifiedPRs := map[int]struct{}{}
+	cursor := ""
+	for {
+		findings, next, err := r.SecurityStore.ListFindings(ctx, store.FindingFilter{
+			Namespace:      scan.Namespace,
+			RepositoryScan: scan.Name,
+			State:          findingStatePROpen,
+			Limit:          200,
+			Cursor:         cursor,
+		})
+		if err != nil {
+			return err
+		}
+		for i := range findings {
+			finding := &findings[i]
+			if finding.ScanRunID == run.ID || finding.PRNumber == nil || *finding.PRNumber < 1 {
+				continue
+			}
+			if run.Mode == scanModeIncremental {
+				if _, reviewed := reviewedSlices[finding.SliceID]; !reviewed {
+					continue
+				}
+			}
+			prNumber := *finding.PRNumber
+			if _, verified := verifiedPRs[prNumber]; !verified {
+				merged, ok := r.repositoryScanPullRequestMerged(ctx, owner, repository, token, prNumber)
+				if !ok {
+					continue
+				}
+				verifiedPRs[prNumber] = struct{}{}
+				mergeStateByPR[prNumber] = merged
+			}
+			if mergeStateByPR[prNumber] {
+				if err := r.SecurityStore.UpdateFindingState(ctx, scan.Namespace, finding.ID, findingStateResolved); err != nil {
+					return err
+				}
+			}
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
 	}
 	return nil
 }

@@ -611,8 +611,8 @@ func TestUpsertFindingAllowsPatchPendingToReturnOpen(t *testing.T) {
 	}
 }
 
-func TestUpsertFindingPreservesFinalStatesOverOpen(t *testing.T) {
-	for _, finalState := range []string{"fixed", "resolved", "dismissed", "suppressed", "false_positive"} {
+func TestUpsertFindingPreservesUserFinalStatesOverOpen(t *testing.T) {
+	for _, finalState := range []string{"dismissed", "suppressed", "false_positive"} {
 		t.Run(finalState, func(t *testing.T) {
 			s := setupTestStore(t)
 			ctx := context.Background()
@@ -649,6 +649,79 @@ func TestUpsertFindingPreservesFinalStatesOverOpen(t *testing.T) {
 				t.Fatalf("State = %q, want %q", got.State, finalState)
 			}
 		})
+	}
+}
+
+func TestUpsertFindingReopensRemediatedStatesWhenObservedAgain(t *testing.T) {
+	for _, remediatedState := range []string{"fixed", "resolved"} {
+		t.Run(remediatedState, func(t *testing.T) {
+			s := setupTestStore(t)
+			ctx := context.Background()
+			initial := &store.Finding{
+				ID:               "fnd-" + remediatedState,
+				Namespace:        "ns1",
+				RepositoryScan:   "repo1",
+				ScanRunID:        "scan-1",
+				Fingerprint:      "repo1:file.go:" + remediatedState,
+				Title:            "Finding",
+				Summary:          "remediated state",
+				Severity:         "high",
+				Confidence:       "medium",
+				ValidationStatus: "validated",
+				State:            remediatedState,
+			}
+			if err := s.UpsertFinding(ctx, initial); err != nil {
+				t.Fatalf("UpsertFinding(initial): %v", err)
+			}
+			reopened := *initial
+			reopened.ScanRunID = testScanRunID2
+			reopened.State = testStateOpen
+			if err := s.UpsertFinding(ctx, &reopened); err != nil {
+				t.Fatalf("UpsertFinding(reopened): %v", err)
+			}
+			got, err := s.GetFinding(ctx, "ns1", initial.ID)
+			if err != nil {
+				t.Fatalf("GetFinding: %v", err)
+			}
+			if got.State != testStateOpen || got.ScanRunID != testScanRunID2 {
+				t.Fatalf("finding = %#v, want reopened in latest run", got)
+			}
+		})
+	}
+}
+
+func TestMarkFindingDuplicateExcludesAliasFromListsAndCounts(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	newFinding := func(suffix string) *store.Finding {
+		return &store.Finding{ID: "fnd-" + suffix, Namespace: "ns1", RepositoryScan: "repo1", ScanRunID: "scan-1", Fingerprint: "fingerprint-" + suffix, Title: "Finding " + suffix, Summary: "summary", Severity: "high", Confidence: "high", ValidationStatus: "validated", State: testStateOpen}
+	}
+	canonical := newFinding("canonical")
+	alias := newFinding("alias")
+	if err := s.UpsertFinding(ctx, canonical); err != nil {
+		t.Fatalf("UpsertFinding(canonical): %v", err)
+	}
+	if err := s.UpsertFinding(ctx, alias); err != nil {
+		t.Fatalf("UpsertFinding(alias): %v", err)
+	}
+	if err := s.MarkFindingDuplicate(ctx, canonical.Namespace, alias.ID, canonical.ID); err != nil {
+		t.Fatalf("MarkFindingDuplicate: %v", err)
+	}
+	listed, _, err := s.ListFindings(ctx, store.FindingFilter{Namespace: canonical.Namespace, RepositoryScan: canonical.RepositoryScan, Limit: 10})
+	if err != nil || len(listed) != 1 || listed[0].ID != canonical.ID {
+		t.Fatalf("canonical findings = %#v, err %v", listed, err)
+	}
+	all, _, err := s.ListFindings(ctx, store.FindingFilter{Namespace: canonical.Namespace, RepositoryScan: canonical.RepositoryScan, IncludeDuplicates: true, Limit: 10})
+	if err != nil || len(all) != 2 {
+		t.Fatalf("all findings = %#v, err %v", all, err)
+	}
+	storedAlias, err := s.GetFinding(ctx, canonical.Namespace, alias.ID)
+	if err != nil || storedAlias.DuplicateOf != canonical.ID {
+		t.Fatalf("stored alias = %#v, err %v", storedAlias, err)
+	}
+	counts, err := s.GetFindingCounts(ctx, canonical.Namespace, canonical.RepositoryScan)
+	if err != nil || counts.Total != 1 {
+		t.Fatalf("finding counts = %#v, err %v", counts, err)
 	}
 }
 

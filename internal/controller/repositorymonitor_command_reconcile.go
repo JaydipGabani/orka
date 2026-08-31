@@ -81,8 +81,11 @@ func (r *RepositoryMonitorReconciler) ensureNoExistingCommandRunBlocksQueue(ctx 
 	if err != nil {
 		return false, false, err
 	}
-	if run.Phase == repositoryMonitorRunPhaseSucceeded && command.Intent == repositoryMonitorCommandIntentAutomerge {
-		if item, err := r.Store.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, command.Kind, fmt.Sprintf("%d", command.Number)); err == nil && item.AutomergeState == repositoryMonitorAutomergeStatePending {
+	if run.Phase == repositoryMonitorRunPhaseSucceeded {
+		item, itemErr := r.Store.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, command.Kind, fmt.Sprintf("%d", command.Number))
+		pending := itemErr == nil && ((command.Intent == repositoryMonitorCommandIntentAutomerge && item.AutomergeState == repositoryMonitorAutomergeStatePending) ||
+			(command.Intent == repositoryMonitorCommandIntentUpdateBranch && item.RepairState == repositoryMonitorRepairPhaseQueued))
+		if pending {
 			now := time.Now()
 			run.Phase = repositoryMonitorRunPhaseQueued
 			run.StartedAt = now
@@ -268,8 +271,6 @@ func (r *RepositoryMonitorReconciler) terminalizeRepositoryMonitorAutomerge(ctx 
 }
 
 func repositoryMonitorCommandActionKind(intent string) string {
-	const repositoryMonitorCommandIntentReview = "review"
-
 	switch strings.TrimSpace(intent) {
 	case repositoryMonitorCommandIntentReview:
 		return "pr_review"

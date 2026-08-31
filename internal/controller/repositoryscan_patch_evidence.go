@@ -498,8 +498,37 @@ func (r *RepositoryScanReconciler) decorateSecurityPatchPullRequest(ctx context.
 }
 
 type repositoryScanPullRequestResponse struct {
-	Title string `json:"title"`
-	Body  string `json:"body"`
+	Title    string     `json:"title"`
+	Body     string     `json:"body"`
+	Merged   bool       `json:"merged"`
+	MergedAt *time.Time `json:"merged_at"`
+}
+
+func (r *RepositoryScanReconciler) repositoryScanPullRequestMerged(ctx context.Context, owner, repository, token string, prNumber int) (bool, bool) {
+	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
+	if baseURL == "" {
+		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", baseURL, url.PathEscape(owner), url.PathEscape(repository), prNumber)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, false
+	}
+	repositoryMonitorSetGitHubHeaders(req, token)
+	resp, err := r.repositoryScanHTTPClient().Do(req)
+	if err != nil {
+		return false, false
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	body, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, false
+	}
+	var current repositoryScanPullRequestResponse
+	if err := json.Unmarshal(body, &current); err != nil {
+		return false, false
+	}
+	return current.Merged || current.MergedAt != nil, true
 }
 
 func (r *RepositoryScanReconciler) readRemediationPullRequest(ctx context.Context, client *http.Client, endpoint, token string, logger logr.Logger) (repositoryScanPullRequestResponse, bool) {

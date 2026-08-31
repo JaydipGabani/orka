@@ -571,10 +571,10 @@ func (s *Store) UpsertFinding(ctx context.Context, finding *store.Finding) error
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO security_findings
 		 (id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, title, category, summary, severity, confidence, triage,
-		  validation_status, state, file_path, line, commit_sha, root_cause, reproduction, remediation, suggested_action,
+			  validation_status, state, duplicate_of, file_path, line, commit_sha, root_cause, reproduction, remediation, suggested_action,
 		  why_tests_do_not_cover, suggested_regression_test, minimum_fix_scope, evidence_json, validation_json, patch_proposal_id,
 		  pr_number, pr_url, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(namespace, repository_scan, fingerprint) DO UPDATE SET
 		   scan_run_id = excluded.scan_run_id,
 		   slice_id = excluded.slice_id,
@@ -608,7 +608,7 @@ func (s *Store) UpsertFinding(ctx context.Context, finding *store.Finding) error
 		     ELSE excluded.validation_status
 		   END,
 		   state = CASE
-		     WHEN security_findings.state IN ('fixed', 'resolved', 'dismissed', 'suppressed', 'false_positive')
+			     WHEN security_findings.state IN ('dismissed', 'suppressed', 'false_positive')
 		       THEN security_findings.state
 		     WHEN security_findings.state = 'patch_pending'
 		       AND excluded.state = 'open'
@@ -628,7 +628,11 @@ func (s *Store) UpsertFinding(ctx context.Context, finding *store.Finding) error
 		     END THEN security_findings.state
 		     ELSE excluded.state
 		   END,
-		   file_path = excluded.file_path,
+			   duplicate_of = CASE
+			     WHEN excluded.duplicate_of != '' THEN excluded.duplicate_of
+			     ELSE security_findings.duplicate_of
+			   END,
+			   file_path = excluded.file_path,
 		   line = excluded.line,
 		   commit_sha = excluded.commit_sha,
 		   root_cause = excluded.root_cause,
@@ -674,7 +678,7 @@ func (s *Store) UpsertFinding(ctx context.Context, finding *store.Finding) error
 		   updated_at = excluded.updated_at`,
 		finding.ID, finding.Namespace, finding.RepositoryScan, finding.ScanRunID, finding.SliceID, finding.Fingerprint,
 		finding.Title, finding.Category, finding.Summary, finding.Severity, finding.Confidence, finding.Triage,
-		finding.ValidationStatus, finding.State, finding.FilePath, finding.Line, finding.CommitSHA, finding.RootCause,
+		finding.ValidationStatus, finding.State, finding.DuplicateOf, finding.FilePath, finding.Line, finding.CommitSHA, finding.RootCause,
 		finding.Reproduction, finding.Remediation, finding.SuggestedAction, finding.WhyTestsDoNotAlreadyCoverThis,
 		finding.SuggestedRegressionTest, finding.MinimumFixScope, evidenceJSON, finding.ValidationJSON, finding.PatchProposalID,
 		finding.PRNumber, finding.PRURL, finding.CreatedAt, finding.UpdatedAt,
@@ -692,7 +696,7 @@ func scanFinding(scanner interface {
 	err := scanner.Scan(
 		&finding.ID, &finding.Namespace, &finding.RepositoryScan, &finding.ScanRunID, &finding.SliceID, &finding.Fingerprint,
 		&finding.Title, &finding.Category, &finding.Summary, &finding.Severity, &finding.Confidence, &finding.Triage,
-		&finding.ValidationStatus, &finding.State, &finding.FilePath, &finding.Line, &finding.CommitSHA, &finding.RootCause,
+		&finding.ValidationStatus, &finding.State, &finding.DuplicateOf, &finding.FilePath, &finding.Line, &finding.CommitSHA, &finding.RootCause,
 		&finding.Reproduction, &finding.Remediation, &finding.SuggestedAction, &finding.WhyTestsDoNotAlreadyCoverThis,
 		&finding.SuggestedRegressionTest, &finding.MinimumFixScope, &evidenceJSON, &finding.ValidationJSON, &finding.PatchProposalID,
 		&finding.PRNumber, &finding.PRURL, &finding.CreatedAt, &finding.UpdatedAt,
@@ -711,7 +715,7 @@ func scanFinding(scanner interface {
 func (s *Store) GetFinding(ctx context.Context, namespace, id string) (*store.Finding, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, title, category, summary, severity,
-		        confidence, triage, validation_status, state, file_path, line, commit_sha, root_cause, reproduction,
+			        confidence, triage, validation_status, state, duplicate_of, file_path, line, commit_sha, root_cause, reproduction,
 		        remediation, suggested_action, why_tests_do_not_cover, suggested_regression_test, minimum_fix_scope,
 		        evidence_json, validation_json, patch_proposal_id, pr_number, pr_url, created_at, updated_at
 		 FROM security_findings
@@ -740,7 +744,7 @@ func (s *Store) ListFindings(ctx context.Context, filter store.FindingFilter) ([
 
 	query := strings.Builder{}
 	query.WriteString(`SELECT id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, title, category, summary, severity,
-		confidence, triage, validation_status, state, file_path, line, commit_sha, root_cause, reproduction,
+		confidence, triage, validation_status, state, duplicate_of, file_path, line, commit_sha, root_cause, reproduction,
 		remediation, suggested_action, why_tests_do_not_cover, suggested_regression_test, minimum_fix_scope,
 		evidence_json, validation_json, patch_proposal_id, pr_number, pr_url, created_at, updated_at
 		FROM security_findings WHERE namespace = ?`)
@@ -769,6 +773,13 @@ func (s *Store) ListFindings(ctx context.Context, filter store.FindingFilter) ([
 	if filter.State != "" {
 		query.WriteString(` AND state = ?`)
 		args = append(args, filter.State)
+	}
+	if filter.FilePath != "" {
+		query.WriteString(` AND file_path = ?`)
+		args = append(args, filter.FilePath)
+	}
+	if !filter.IncludeDuplicates {
+		query.WriteString(` AND duplicate_of = ''`)
 	}
 
 	if filter.Recommended {
@@ -832,7 +843,7 @@ func (s *Store) GetFindingCounts(ctx context.Context, namespace, repositoryScan 
 			COALESCE(SUM(CASE WHEN severity = 'medium' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN severity = 'low' THEN 1 ELSE 0 END), 0)
 		FROM security_findings
-		WHERE namespace = ? AND repository_scan = ? AND state IN ('open', 'patch_pending', 'patch_ready', 'pr_open')`,
+			WHERE namespace = ? AND repository_scan = ? AND duplicate_of = '' AND state IN ('open', 'patch_pending', 'patch_ready', 'pr_open')`,
 		namespace, repositoryScan,
 	)
 	var counts store.FindingCounts
@@ -859,6 +870,39 @@ func (s *Store) UpdateFindingState(ctx context.Context, namespace, id, state str
 		return store.ErrNotFound
 	}
 	return nil
+}
+
+// MarkFindingDuplicate keeps an old finding addressable while removing it from
+// canonical lists and counts.
+func (s *Store) MarkFindingDuplicate(ctx context.Context, namespace, id, canonicalID string) error {
+	if strings.TrimSpace(namespace) == "" || strings.TrimSpace(id) == "" || strings.TrimSpace(canonicalID) == "" || id == canonicalID {
+		return store.ValidationErrorf("duplicate finding namespace, ID, and distinct canonical ID are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var sourceRepo, canonicalRepo, canonicalDuplicate string
+	if err := tx.QueryRowContext(ctx, `SELECT repository_scan FROM security_findings WHERE namespace = ? AND id = ?`, namespace, id).Scan(&sourceRepo); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return store.ErrNotFound
+		}
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT repository_scan, duplicate_of FROM security_findings WHERE namespace = ? AND id = ?`, namespace, canonicalID).Scan(&canonicalRepo, &canonicalDuplicate); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return store.ErrNotFound
+		}
+		return err
+	}
+	if sourceRepo != canonicalRepo || canonicalDuplicate != "" {
+		return store.ValidationErrorf("duplicate and canonical findings must share a repository scan and the canonical finding cannot be an alias")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE security_findings SET duplicate_of = ?, updated_at = CURRENT_TIMESTAMP WHERE namespace = ? AND id = ?`, canonicalID, namespace, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CreatePatchProposal inserts a new patch proposal.

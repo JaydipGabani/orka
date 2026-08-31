@@ -69,6 +69,7 @@ type Finding struct {
 	Triage                        string               `json:"triage,omitempty"`
 	ValidationStatus              string               `json:"validationStatus"`
 	State                         string               `json:"state"`
+	DuplicateOf                   string               `json:"duplicateOf,omitempty"`
 	FilePath                      string               `json:"filePath,omitempty"`
 	Line                          int                  `json:"line,omitempty"`
 	CommitSHA                     string               `json:"commitSHA,omitempty"`
@@ -147,16 +148,18 @@ type FindingCounts struct {
 
 // FindingFilter constrains finding queries.
 type FindingFilter struct {
-	Namespace        string
-	RepositoryScan   string
-	SliceID          string
-	Category         string
-	Severity         string
-	ValidationStatus string
-	State            string
-	Recommended      bool
-	Limit            int
-	Cursor           string
+	Namespace         string
+	RepositoryScan    string
+	SliceID           string
+	Category          string
+	Severity          string
+	ValidationStatus  string
+	State             string
+	FilePath          string
+	Recommended       bool
+	IncludeDuplicates bool
+	Limit             int
+	Cursor            string
 }
 
 // ChangedLineRange identifies lines introduced or modified between two scan commits.

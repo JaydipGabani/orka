@@ -338,6 +338,7 @@ func migrate(db *sql.DB) error {
 			triage            TEXT NOT NULL DEFAULT '',
 			validation_status TEXT NOT NULL,
 			state             TEXT NOT NULL,
+			duplicate_of      TEXT NOT NULL DEFAULT '',
 			file_path         TEXT NOT NULL DEFAULT '',
 			line              INTEGER NOT NULL DEFAULT 0,
 			commit_sha        TEXT NOT NULL DEFAULT '',
@@ -1062,6 +1063,7 @@ func migrate(db *sql.DB) error {
 		{Name: "why_tests_do_not_cover", Definition: "why_tests_do_not_cover TEXT NOT NULL DEFAULT ''"},
 		{Name: "suggested_regression_test", Definition: "suggested_regression_test TEXT NOT NULL DEFAULT ''"},
 		{Name: "minimum_fix_scope", Definition: "minimum_fix_scope TEXT NOT NULL DEFAULT ''"},
+		{Name: "duplicate_of", Definition: "duplicate_of TEXT NOT NULL DEFAULT ''"},
 	}); err != nil {
 		return err
 	}
@@ -1089,6 +1091,10 @@ func migrate(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_security_findings_slice
 		ON security_findings(namespace, repository_scan, slice_id, category, updated_at DESC)`); err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_security_findings_duplicates
+		ON security_findings(namespace, repository_scan, duplicate_of, updated_at DESC)`); err != nil {
 		return fmt.Errorf("migration failed: %w", err)
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_security_review_slices_repo
