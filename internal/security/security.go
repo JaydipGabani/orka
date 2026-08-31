@@ -10,9 +10,11 @@ import (
 	"path"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/redact"
 	"github.com/orka-agents/orka/internal/store"
 )
 
@@ -803,6 +805,49 @@ const (
 	maxRemediationBodySectionBytes    = 4 << 10
 )
 
+// neutralizePublishedText prepares agent-produced text for publication in
+// GitHub Markdown (remediation PR titles and bodies): invalid UTF-8 and
+// control/format runes are stripped so nothing invisible survives, credential
+// shapes are redacted, and active constructs are defanged — @mentions and
+// HTML comment markers gain a zero-width break, and lines that would read as
+// slash-commands are prefixed with one — so a repository cannot prompt-inject
+// pings or bot commands through a scanner result.
+func neutralizePublishedText(value string) string {
+	stripped := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(value, ""))
+	stripped = redact.SensitiveText(stripped)
+	stripped = strings.ReplaceAll(stripped, "<!--", "<\u200b!--")
+	stripped = strings.ReplaceAll(stripped, "-->", "--\u200b>")
+	var b strings.Builder
+	b.Grow(len(stripped))
+	for i := 0; i < len(stripped); i++ {
+		ch := stripped[i]
+		b.WriteByte(ch)
+		if ch == '@' && i+1 < len(stripped) {
+			next := stripped[i+1]
+			if (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') {
+				b.WriteRune('\u200b')
+			}
+		}
+	}
+	lines := strings.Split(b.String(), "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		if strings.HasPrefix(trimmed, "/") {
+			indent := line[:len(line)-len(trimmed)]
+			lines[i] = indent + "\u200b" + trimmed
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // truncateOnRuneBoundary bounds text to at most limit bytes without splitting
 // a multibyte character; a byte-index cut would leave invalid UTF-8 that
 // json.Marshal replaces with U+FFFD.
@@ -822,7 +867,7 @@ func truncateOnRuneBoundary(text string, limit int) string {
 func RemediationPullRequestTitle(finding *store.Finding) string {
 	title := ""
 	if finding != nil {
-		title = strings.Join(strings.Fields(finding.Title), " ")
+		title = strings.Join(strings.Fields(neutralizePublishedText(finding.Title)), " ")
 	}
 	if title == "" {
 		title = "security remediation"
@@ -839,7 +884,7 @@ func RemediationPullRequestTitle(finding *store.Finding) string {
 func RemediationPullRequestBody(finding *store.Finding, summary *PatchSummaryArtifact) string {
 	var body strings.Builder
 	section := func(heading, text string) {
-		text = strings.TrimSpace(text)
+		text = strings.TrimSpace(neutralizePublishedText(text))
 		if text == "" {
 			return
 		}

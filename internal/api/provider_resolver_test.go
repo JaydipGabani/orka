@@ -304,7 +304,7 @@ func TestProviderResolver_Resolve(t *testing.T) {
 				AgentRef:  testRuntimeAgentName,
 				Namespace: ns,
 			},
-			wantErr: "no provider selected and no default Provider is configured; namespace \"default\" has 2 Providers",
+			wantErr: "no provider selected and no default Provider is configured; list the Providers you can use",
 		},
 		{
 			name: "runtime agent accepts an explicit provider",
@@ -352,7 +352,7 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			opts: ResolveOpts{
 				Namespace: ns,
 			},
-			wantErr: "namespace \"default\" has 2 Providers",
+			wantErr: "list the Providers you can use with the providers API",
 		},
 		{
 			name:    "secret not found during resolve",

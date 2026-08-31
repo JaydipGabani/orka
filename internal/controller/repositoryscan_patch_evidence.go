@@ -210,13 +210,20 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 
 // patchHunksByFile extracts each file's verbatim hunk body — everything from
 // its first "@@" line to the next file header — from a unified diff.
-func patchHunksByFile(diff string) map[string]string {
+func patchHunksByFile(diff string) (map[string]string, bool) {
 	hunks := map[string]string{}
 	var body []string
 	current := ""
 	inHunk := false
+	duplicate := false
 	flush := func() {
 		if current != "" && len(body) > 0 {
+			// A repeated file block could hide arbitrary content behind a
+			// second block carrying the genuine hunks; it invalidates the
+			// whole diff rather than overwriting the earlier block.
+			if _, exists := hunks[current]; exists {
+				duplicate = true
+			}
 			hunks[current] = strings.TrimRight(strings.Join(body, "\n"), "\n")
 		}
 		body = nil
@@ -240,12 +247,13 @@ func patchHunksByFile(diff string) map[string]string {
 		}
 	}
 	flush()
-	return hunks
+	return hunks, !duplicate
 }
 
 func samePatchHunks(a, b string) bool {
-	hunksA, hunksB := patchHunksByFile(a), patchHunksByFile(b)
-	if len(hunksA) != len(hunksB) {
+	hunksA, okA := patchHunksByFile(a)
+	hunksB, okB := patchHunksByFile(b)
+	if !okA || !okB || len(hunksA) != len(hunksB) {
 		return false
 	}
 	for path, hunk := range hunksA {
@@ -303,6 +311,8 @@ type repositoryScanCommitFileResponse struct {
 	PreviousFilename string `json:"previous_filename"`
 	Status           string `json:"status"`
 	Patch            string `json:"patch"`
+	Additions        int    `json:"additions"`
+	Deletions        int    `json:"deletions"`
 }
 
 type repositoryScanCommitResponse struct {
@@ -377,16 +387,27 @@ func (r *RepositoryScanReconciler) fetchRepositoryScanPublishedCommit(ctx contex
 func repositoryScanDiffFromPublishedCommit(files []repositoryScanCommitFileResponse) (string, []string, string) {
 	var diff strings.Builder
 	paths := make([]string, 0, len(files))
+	seen := make(map[string]struct{}, len(files))
 	for _, file := range files {
 		path := strings.TrimSpace(file.Filename)
 		if path == "" || !security.SafeRepoPath(path) || strings.ContainsAny(path, " \"\\\t\r\n") {
 			return "", nil, "published patch commit contains an unsafe file path"
 		}
+		if _, duplicate := seen[path]; duplicate {
+			return "", nil, "published patch commit repeats a file path: " + path
+		}
+		seen[path] = struct{}{}
 		if strings.TrimSpace(file.PreviousFilename) != "" && strings.TrimSpace(file.PreviousFilename) != path {
 			return "", nil, "published patch commit renames or copies a file, which security patches do not support"
 		}
 		if strings.TrimSpace(file.Patch) == "" {
 			return "", nil, "published patch commit contains a file without a text patch: " + path
+		}
+		// GitHub can serve a nonempty but truncated patch for a large
+		// change; a fragment whose line totals disagree with the reported
+		// counts would hide part of the actual commit from the evidence.
+		if !patchMatchesLineCounts(file.Patch, file.Additions, file.Deletions) {
+			return "", nil, "published patch commit contains an inconsistent file patch: " + path
 		}
 		fmt.Fprintf(&diff, "diff --git a/%s b/%s\n", path, path)
 		// Mode lines are intentionally omitted: the commit file listing does

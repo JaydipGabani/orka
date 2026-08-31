@@ -123,14 +123,26 @@ var codeReferenceCredentialTail = regexp.MustCompile(`(?i)^(?:api[_-]?key|access
 // final segment names a credential field. Go/TS/Python that assigns apiKey
 // from configuration would otherwise make any file that touches credential
 // plumbing unpublishable, while arbitrary dotted literals stay flagged.
-// callableReferencePattern matches a bare or qualified identifier that can
-// legally precede a call: os.Getenv, readSecret. A literal credential
-// followed by "(" does not match (symbols and non-identifier dots break
-// the shape), so appending "(" to a secret cannot buy the exemption.
+// callableReferencePattern matches an identifier that can legally precede a
+// call AND carries real identifier structure — a dot (os.Getenv), an
+// underscore (read_password), or mixed case (readPasswordFromKeychain). A
+// bare single-case alphanumeric run is excluded: values only reach this
+// exemption at 16+ characters, where an undifferentiated run is far more
+// likely a credential with "(" appended than a function name, so appending "(" to a secret cannot buy the exemption.
 var callableReferencePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$`)
 
+func callableReferenceShape(value string) bool {
+	if !callableReferencePattern.MatchString(value) {
+		return false
+	}
+	if strings.ContainsAny(value, "._") {
+		return true
+	}
+	return strings.ToLower(value) != value && strings.ToUpper(value) != value
+}
+
 func secretValueIsCode(text string, value string, end int) bool {
-	if end < len(text) && text[end] == '(' && callableReferencePattern.MatchString(value) {
+	if end < len(text) && text[end] == '(' && callableReferenceShape(value) {
 		return true
 	}
 	if !codeReferencePattern.MatchString(value) {

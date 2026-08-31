@@ -285,7 +285,6 @@ func (r *ProviderResolver) soleReadyProvider(ctx context.Context, namespace, req
 	if err := r.client.List(ctx, list, client.InNamespace(namespace)); err != nil {
 		return nil, fmt.Errorf("no provider %q found and no default Provider is configured (listing Providers failed: %w)", requestedName, err)
 	}
-	count := len(list.Items)
 	var ready []*corev1alpha1.Provider
 	for i := range list.Items {
 		item := &list.Items[i]
@@ -300,12 +299,13 @@ func (r *ProviderResolver) soleReadyProvider(ctx context.Context, namespace, req
 	if requestedName != "" {
 		prefix = fmt.Sprintf("no provider %q found", requestedName)
 	}
-	if count == 0 {
+	if len(list.Items) == 0 {
 		return nil, fmt.Errorf("%s and namespace %q has no Providers; create a Provider (or one named \"default\") or configure the chat default provider", prefix, namespace)
 	}
-	// The error deliberately names no Providers: resolution runs before the
-	// caller's provider-use authorization, and a scoped context token must
-	// not recover Provider identities outside its scopes from this message.
-	// The authorization-aware list endpoints are the enumeration surface.
-	return nil, fmt.Errorf("%s and no default Provider is configured; namespace %q has %d Providers — list them with the providers API and pass one, create a Provider named \"default\", or configure the chat default provider", prefix, namespace, count)
+	// The error deliberately names and counts no Providers: resolution runs
+	// with controller credentials before the caller's provider-use
+	// authorization, and a scoped context token must not learn anything
+	// about Providers outside its scopes from this message. The
+	// authorization-aware list endpoints are the enumeration surface.
+	return nil, fmt.Errorf("%s and no default Provider is configured; list the Providers you can use with the providers API and pass one, create a Provider named \"default\", or configure the chat default provider", prefix)
 }

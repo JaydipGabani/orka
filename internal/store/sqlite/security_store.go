@@ -1116,7 +1116,8 @@ func (s *Store) UpdatePatchProposal(ctx context.Context, proposal *store.PatchPr
 	}
 	if existing.TaskName == proposal.TaskName && existing.Branch == proposal.Branch &&
 		existing.DiffArtifact == proposal.DiffArtifact && existing.SummaryArtifact == proposal.SummaryArtifact &&
-		existing.Status == proposal.Status && existing.PRURL == proposal.PRURL && reflect.DeepEqual(existing.PRNumber, proposal.PRNumber) {
+		existing.Status == proposal.Status && existing.Reason == proposal.Reason &&
+		existing.PRURL == proposal.PRURL && reflect.DeepEqual(existing.PRNumber, proposal.PRNumber) {
 		proposal.CreatedAt = existing.CreatedAt
 		proposal.UpdatedAt = existing.UpdatedAt
 		return nil
