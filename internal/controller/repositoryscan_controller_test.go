@@ -3873,6 +3873,84 @@ func TestMergeExistingFindingReopensResolvedFindingWithoutRemediationProjection(
 	}
 }
 
+func TestMergeExistingFindingPreservesTerminalValidationFromSemanticMatch(t *testing.T) {
+	for _, validationStatus := range []string{findingValidationStatusFailed, findingValidationStatusSkipped} {
+		t.Run(validationStatus, func(t *testing.T) {
+			ctx := context.Background()
+			securityStore := setupControllerSQLiteStore(t)
+			reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
+			scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}}
+			created := mustParseTime(t, "2026-08-01T00:00:00Z")
+			canonical := &storepkg.Finding{
+				ID:               "fnd_canonical_" + validationStatus,
+				Namespace:        defaultNS,
+				RepositoryScan:   scan.Name,
+				ScanRunID:        "scan_old",
+				Fingerprint:      "canonical-" + validationStatus,
+				Title:            "Archive extraction permits traversal",
+				Category:         "path traversal",
+				Summary:          "canonical wording",
+				Severity:         "high",
+				Confidence:       "high",
+				ValidationStatus: "unvalidated",
+				State:            findingStateOpen,
+				FilePath:         "archive.go",
+				Line:             100,
+				CreatedAt:        created,
+			}
+			terminal := &storepkg.Finding{
+				ID:               "fnd_terminal_" + validationStatus,
+				Namespace:        defaultNS,
+				RepositoryScan:   scan.Name,
+				ScanRunID:        "scan_middle",
+				Fingerprint:      "terminal-" + validationStatus,
+				Title:            "ZIP entries can escape the destination",
+				Category:         "CWE-22 path traversal",
+				Summary:          "terminal validation wording",
+				Severity:         "high",
+				Confidence:       "high",
+				ValidationStatus: validationStatus,
+				ValidationJSON:   fmt.Sprintf(`{"version":1,"finding_id":%q,"status":%q,"summary":"terminal result"}`, "fnd_terminal_"+validationStatus, validationStatus),
+				State:            findingStateOpen,
+				FilePath:         "archive.go",
+				Line:             103,
+				CreatedAt:        created.Add(time.Hour),
+			}
+			for _, finding := range []*storepkg.Finding{canonical, terminal} {
+				if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+					t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
+				}
+			}
+
+			incoming := &storepkg.Finding{
+				ID:               "fnd_incoming_" + validationStatus,
+				Namespace:        defaultNS,
+				RepositoryScan:   scan.Name,
+				ScanRunID:        "scan_current",
+				Fingerprint:      "incoming-" + validationStatus,
+				Title:            "Untrusted ZIP paths escape the extraction root",
+				Category:         "ZIP path traversal",
+				Summary:          "current wording",
+				Severity:         "high",
+				Confidence:       "high",
+				ValidationStatus: "unvalidated",
+				State:            findingStateOpen,
+				FilePath:         "archive.go",
+				Line:             105,
+			}
+			if err := reconciler.mergeExistingFinding(ctx, scan, incoming); err != nil {
+				t.Fatalf("mergeExistingFinding() error = %v", err)
+			}
+			if incoming.ID != canonical.ID || incoming.ValidationStatus != validationStatus {
+				t.Fatalf("merged finding = %#v", incoming)
+			}
+			if !strings.Contains(incoming.ValidationJSON, canonical.ID) || strings.Contains(incoming.ValidationJSON, terminal.ID) {
+				t.Fatalf("ValidationJSON = %q, want canonical finding ID", incoming.ValidationJSON)
+			}
+		})
+	}
+}
+
 func TestFindingIdentityMatchScoreRequiresCategoryAndStableLocation(t *testing.T) {
 	base := &storepkg.Finding{
 		Category: "path traversal",
@@ -3926,10 +4004,13 @@ func TestFindingCategoryMatchesRequiresSpecificSharedIdentity(t *testing.T) {
 
 func TestMergeFindingEvidenceAndRemediationPreservesUserDecisionAndIgnoresAliasWorkflow(t *testing.T) {
 	target := &storepkg.Finding{ID: "canonical", State: findingStateOpen, UpdatedAt: mustParseTime(t, "2026-08-01T00:00:00Z")}
-	dismissed := &storepkg.Finding{ID: "dismissed", State: "dismissed", UpdatedAt: mustParseTime(t, "2026-08-02T00:00:00Z")}
+	dismissedAt := mustParseTime(t, "2026-08-03T00:00:00Z")
+	dismissed := &storepkg.Finding{ID: "dismissed", State: "dismissed", UpdatedAt: dismissedAt}
 	mergeFindingEvidenceAndRemediation(target, dismissed)
-	if target.State != dismissed.State {
-		t.Fatalf("target state = %q, want %q", target.State, dismissed.State)
+	olderSuppression := &storepkg.Finding{ID: "suppressed", State: "suppressed", UpdatedAt: mustParseTime(t, "2026-08-02T00:00:00Z")}
+	mergeFindingEvidenceAndRemediation(target, olderSuppression)
+	if target.State != dismissed.State || !target.UpdatedAt.Equal(dismissedAt) {
+		t.Fatalf("target state/timestamp = %q/%s, want %q/%s", target.State, target.UpdatedAt, dismissed.State, dismissedAt)
 	}
 
 	resolved := &storepkg.Finding{ID: "resolved", State: findingStateResolved}

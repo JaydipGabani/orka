@@ -1283,6 +1283,26 @@ func (h *Handlers) authorizeContextTokenSecurityScanTask(c fiber.Ctx, action str
 	return h.handleContextTokenAuthorizationFailures(token, action, failures)
 }
 
+func (h *Handlers) canonicalSecurityFinding(ctx context.Context, namespace string, finding *store.Finding) (*store.Finding, error) {
+	repositoryScan := finding.RepositoryScan
+	seen := map[string]struct{}{finding.ID: {}}
+	for duplicateID := strings.TrimSpace(finding.DuplicateOf); duplicateID != ""; duplicateID = strings.TrimSpace(finding.DuplicateOf) {
+		if _, ok := seen[duplicateID]; ok {
+			return nil, fmt.Errorf("finding duplicate chain contains a cycle at %s", duplicateID)
+		}
+		seen[duplicateID] = struct{}{}
+		canonical, err := h.securityStore.GetFinding(ctx, namespace, duplicateID)
+		if err != nil {
+			return nil, err
+		}
+		if canonical.RepositoryScan != repositoryScan {
+			return nil, fmt.Errorf("finding duplicate %s points outside repository scan %s", finding.ID, repositoryScan)
+		}
+		finding = canonical
+	}
+	return finding, nil
+}
+
 // CreateSecurityPullRequest returns the pull request reconciled by the governed patch Task.
 func (h *Handlers) CreateSecurityPullRequest(c fiber.Ctx) error {
 	if err := h.ensureSecurityStore(); err != nil {
@@ -1301,6 +1321,10 @@ func (h *Handlers) CreateSecurityPullRequest(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusNotFound, "finding not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get finding: %v", err))
+	}
+	finding, err = h.canonicalSecurityFinding(c.Context(), namespace, finding)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to resolve canonical finding: %v", err))
 	}
 	scan, err := h.fetchRepositoryScan(c.Context(), namespace, finding.RepositoryScan)
 	if err != nil {

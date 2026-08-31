@@ -1484,6 +1484,21 @@ func TestCreateSecurityPullRequestReturnsGovernedReceiptWithoutGitHubMutation(t 
 		PRNumber:       &prNumber,
 		PRURL:          prURL,
 	}))
+	require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
+		ID:               "finding-alias",
+		Namespace:        "demo",
+		RepositoryScan:   "scan-1",
+		ScanRunID:        "scan-run-2",
+		Fingerprint:      "fp-alias",
+		Title:            "Command injection alias",
+		Summary:          "A duplicate observation of the command injection finding.",
+		Severity:         "critical",
+		Confidence:       "high",
+		State:            "open",
+		DuplicateOf:      "finding-1",
+		PatchProposalID:  "",
+		ValidationStatus: "validated",
+	}))
 
 	app := fiber.New()
 	app.Post("/security/findings/:id/pull-request", handlers.CreateSecurityPullRequest)
@@ -1502,6 +1517,20 @@ func TestCreateSecurityPullRequestReturnsGovernedReceiptWithoutGitHubMutation(t 
 	require.Equal(t, prURL, body.PRURL)
 	require.Equal(t, "Open", body.Status)
 	require.False(t, githubCalled)
+
+	aliasReq := httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/pull-request?namespace=demo", nil)
+	aliasResp, err := app.Test(aliasReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, aliasResp.StatusCode)
+	var aliasBody struct {
+		PRNumber int    `json:"prNumber"`
+		PRURL    string `json:"prURL"`
+		Status   string `json:"status"`
+	}
+	require.NoError(t, json.NewDecoder(aliasResp.Body).Decode(&aliasBody))
+	require.Equal(t, prNumber, aliasBody.PRNumber)
+	require.Equal(t, prURL, aliasBody.PRURL)
+	require.Equal(t, "Open", aliasBody.Status)
 
 	proposals, err := securityStore.ListPatchProposals(ctx, "demo", "finding-1")
 	require.NoError(t, err)

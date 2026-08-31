@@ -2137,16 +2137,10 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 		finding.PRURL = existing.PRURL
 	}
 	finding.CreatedAt = existing.CreatedAt
-	if existing.ValidationStatus == findingValidationStatusValidated ||
-		existing.ValidationStatus == findingValidationStatusPending {
-		finding.ValidationStatus = existing.ValidationStatus
-	}
 	if len(existing.Evidence) > 0 {
 		finding.Evidence = mergeEvidenceRefs(existing.Evidence, finding.Evidence...)
 	}
-	if existing.ValidationJSON != "" {
-		finding.ValidationJSON = existing.ValidationJSON
-	}
+	mergeFindingValidationState(finding, existing)
 	return nil
 }
 
@@ -2235,17 +2229,12 @@ func mergeFindingEvidenceAndRemediation(target, candidate *store.Finding) {
 	}
 	if findingUserFinalState(candidate.State) && (!findingUserFinalState(target.State) || candidate.UpdatedAt.After(target.UpdatedAt)) {
 		target.State = candidate.State
+		target.UpdatedAt = candidate.UpdatedAt
 	}
 	if findingWorkflowStateRank(candidate.State) > findingWorkflowStateRank(target.State) && !findingUserFinalState(target.State) {
 		target.State = candidate.State
 	}
-	if candidate.ValidationStatus == findingValidationStatusValidated {
-		target.ValidationStatus = findingValidationStatusValidated
-		target.ValidationJSON = candidate.ValidationJSON
-	} else if target.ValidationStatus != findingValidationStatusValidated && candidate.ValidationStatus == findingValidationStatusPending {
-		target.ValidationStatus = findingValidationStatusPending
-		target.ValidationJSON = candidate.ValidationJSON
-	}
+	mergeFindingValidationState(target, candidate)
 }
 
 func findingUserFinalState(state string) bool {
@@ -3350,6 +3339,13 @@ func mergeFindingValidationResult(target, source *store.Finding) {
 		return
 	}
 	target.Evidence = mergeEvidenceRefs(target.Evidence, source.Evidence...)
+	mergeFindingValidationState(target, source)
+}
+
+func mergeFindingValidationState(target, source *store.Finding) {
+	if target == nil || source == nil {
+		return
+	}
 	if findingValidationStatusRank(source.ValidationStatus) < findingValidationStatusRank(target.ValidationStatus) {
 		return
 	}

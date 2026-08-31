@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"strings"
@@ -862,6 +863,9 @@ func repositoryMonitorRunFailureState(err error) string {
 		if ghErr.StatusCode >= 400 && ghErr.StatusCode < 500 {
 			return "run_failed"
 		}
+	}
+	if errors.Is(err, io.EOF) {
+		return repositoryMonitorRunRetryScheduled
 	}
 	lower := strings.ToLower(err.Error())
 	if apierrors.IsTooManyRequests(err) || strings.Contains(lower, "insufficient quota") || strings.Contains(lower, "cluster capacity") {
