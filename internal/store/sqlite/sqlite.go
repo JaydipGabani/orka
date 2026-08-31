@@ -338,6 +338,7 @@ func migrate(db *sql.DB) error {
 			triage            TEXT NOT NULL DEFAULT '',
 			validation_status TEXT NOT NULL,
 			state             TEXT NOT NULL,
+			decision_at       TIMESTAMP,
 			duplicate_of      TEXT NOT NULL DEFAULT '',
 			file_path         TEXT NOT NULL DEFAULT '',
 			line              INTEGER NOT NULL DEFAULT 0,
@@ -1071,6 +1072,7 @@ func migrate(db *sql.DB) error {
 		{Name: "suggested_regression_test", Definition: "suggested_regression_test TEXT NOT NULL DEFAULT ''"},
 		{Name: "minimum_fix_scope", Definition: "minimum_fix_scope TEXT NOT NULL DEFAULT ''"},
 		{Name: "duplicate_of", Definition: "duplicate_of TEXT NOT NULL DEFAULT ''"},
+		{Name: "decision_at", Definition: "decision_at TIMESTAMP"},
 	}); err != nil {
 		return err
 	}

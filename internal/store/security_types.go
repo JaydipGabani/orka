@@ -69,6 +69,7 @@ type Finding struct {
 	Triage                        string               `json:"triage,omitempty"`
 	ValidationStatus              string               `json:"validationStatus"`
 	State                         string               `json:"state"`
+	DecisionAt                    time.Time            `json:"-"`
 	DuplicateOf                   string               `json:"duplicateOf,omitempty"`
 	FilePath                      string               `json:"filePath,omitempty"`
 	Line                          int                  `json:"line,omitempty"`

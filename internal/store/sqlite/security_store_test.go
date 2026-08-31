@@ -652,6 +652,115 @@ func TestUpsertFindingPreservesFinalStatesOverOpen(t *testing.T) {
 	}
 }
 
+func TestUpsertObservedFindingPreservesAndOrdersUserDecisionTime(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	firstDecision := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	initial := &store.Finding{
+		ID:               "fnd-user-decision",
+		Namespace:        "ns1",
+		RepositoryScan:   "repo1",
+		ScanRunID:        "scan-1",
+		Fingerprint:      "repo1:file.go:user-decision",
+		Title:            "Finding",
+		Summary:          "dismissed finding",
+		Severity:         "high",
+		Confidence:       "medium",
+		ValidationStatus: "validated",
+		State:            "dismissed",
+		DecisionAt:       firstDecision,
+	}
+	if err := s.UpsertFinding(ctx, initial); err != nil {
+		t.Fatalf("UpsertFinding(initial): %v", err)
+	}
+
+	reobserved := *initial
+	reobserved.ScanRunID = testScanRunID2
+	reobserved.DecisionAt = time.Time{}
+	if err := s.UpsertObservedFinding(ctx, &reobserved); err != nil {
+		t.Fatalf("UpsertObservedFinding(reobserved): %v", err)
+	}
+	got, err := s.GetFinding(ctx, initial.Namespace, initial.ID)
+	if err != nil {
+		t.Fatalf("GetFinding(reobserved): %v", err)
+	}
+	if got.State != initial.State || !got.DecisionAt.Equal(firstDecision) {
+		t.Fatalf("reobserved state/decision = %q/%s, want %q/%s", got.State, got.DecisionAt, initial.State, firstDecision)
+	}
+
+	newerDecision := firstDecision.Add(time.Hour)
+	newer := *initial
+	newer.ScanRunID = "scan-3"
+	newer.State = "suppressed"
+	newer.DecisionAt = newerDecision
+	if err := s.UpsertObservedFinding(ctx, &newer); err != nil {
+		t.Fatalf("UpsertObservedFinding(newer): %v", err)
+	}
+	got, err = s.GetFinding(ctx, initial.Namespace, initial.ID)
+	if err != nil {
+		t.Fatalf("GetFinding(newer): %v", err)
+	}
+	if got.State != newer.State || !got.DecisionAt.Equal(newerDecision) {
+		t.Fatalf("newer state/decision = %q/%s, want %q/%s", got.State, got.DecisionAt, newer.State, newerDecision)
+	}
+
+	older := *initial
+	older.ScanRunID = "scan-4"
+	older.State = "false_positive"
+	older.DecisionAt = firstDecision.Add(-time.Hour)
+	if err := s.UpsertObservedFinding(ctx, &older); err != nil {
+		t.Fatalf("UpsertObservedFinding(older): %v", err)
+	}
+	got, err = s.GetFinding(ctx, initial.Namespace, initial.ID)
+	if err != nil {
+		t.Fatalf("GetFinding(older): %v", err)
+	}
+	if got.State != newer.State || !got.DecisionAt.Equal(newerDecision) {
+		t.Fatalf("final state/decision = %q/%s, want %q/%s", got.State, got.DecisionAt, newer.State, newerDecision)
+	}
+}
+
+func TestUpdateFindingStateTracksUserDecisionTime(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	finding := &store.Finding{
+		ID:               "fnd-state-decision",
+		Namespace:        "ns1",
+		RepositoryScan:   "repo1",
+		ScanRunID:        "scan-1",
+		Fingerprint:      "repo1:file.go:state-decision",
+		Title:            "Finding",
+		Summary:          "open finding",
+		Severity:         "high",
+		Confidence:       "medium",
+		ValidationStatus: "validated",
+		State:            testStateOpen,
+	}
+	if err := s.UpsertFinding(ctx, finding); err != nil {
+		t.Fatalf("UpsertFinding(): %v", err)
+	}
+	if err := s.UpdateFindingState(ctx, finding.Namespace, finding.ID, "dismissed"); err != nil {
+		t.Fatalf("UpdateFindingState(dismissed): %v", err)
+	}
+	dismissed, err := s.GetFinding(ctx, finding.Namespace, finding.ID)
+	if err != nil {
+		t.Fatalf("GetFinding(dismissed): %v", err)
+	}
+	if dismissed.DecisionAt.IsZero() || !dismissed.DecisionAt.Equal(dismissed.UpdatedAt) {
+		t.Fatalf("dismissed decision/updated = %v/%v", dismissed.DecisionAt, dismissed.UpdatedAt)
+	}
+	if err := s.UpdateFindingState(ctx, finding.Namespace, finding.ID, testStateOpen); err != nil {
+		t.Fatalf("UpdateFindingState(open): %v", err)
+	}
+	reopened, err := s.GetFinding(ctx, finding.Namespace, finding.ID)
+	if err != nil {
+		t.Fatalf("GetFinding(open): %v", err)
+	}
+	if !reopened.DecisionAt.IsZero() {
+		t.Fatalf("reopened decisionAt = %v, want cleared", reopened.DecisionAt)
+	}
+}
+
 func TestUpsertObservedFindingReopensRemediatedStatesWhenObservedAgain(t *testing.T) {
 	for _, remediatedState := range []string{"fixed", "resolved"} {
 		t.Run(remediatedState, func(t *testing.T) {

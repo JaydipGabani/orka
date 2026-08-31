@@ -2129,6 +2129,11 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 	} else if existing.State != "" && existing.State != findingStateOpen {
 		finding.State = existing.State
 	}
+	if findingUserFinalState(finding.State) {
+		finding.DecisionAt = existing.DecisionAt
+	} else {
+		finding.DecisionAt = time.Time{}
+	}
 	if !reopened {
 		if existing.PatchProposalID != "" {
 			finding.PatchProposalID = existing.PatchProposalID
@@ -2167,7 +2172,7 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 			if findingIdentityMatchScore(finding, &candidate) < 2 {
 				continue
 			}
-			matchesByID[candidate.ID] = candidate
+			family := []store.Finding{candidate}
 			seenAliases := map[string]struct{}{}
 			for strings.TrimSpace(candidate.DuplicateOf) != "" {
 				if _, seen := seenAliases[candidate.ID]; seen {
@@ -2182,7 +2187,13 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 					return nil, fmt.Errorf("finding duplicate %s points outside repository scan %s", candidate.ID, scan.Name)
 				}
 				candidate = *canonical
-				matchesByID[candidate.ID] = candidate
+				family = append(family, candidate)
+			}
+			if findingIdentityMatchScore(finding, &candidate) < 2 {
+				continue
+			}
+			for _, member := range family {
+				matchesByID[member.ID] = member
 			}
 		}
 		if next == "" {
@@ -2227,9 +2238,9 @@ func mergeFindingEvidenceAndRemediation(target, candidate *store.Finding) {
 		target.PRNumber = candidate.PRNumber
 		target.PRURL = candidate.PRURL
 	}
-	if findingUserFinalState(candidate.State) && (!findingUserFinalState(target.State) || candidate.UpdatedAt.After(target.UpdatedAt)) {
+	if findingUserFinalState(candidate.State) && (!findingUserFinalState(target.State) || candidate.DecisionAt.After(target.DecisionAt)) {
 		target.State = candidate.State
-		target.UpdatedAt = candidate.UpdatedAt
+		target.DecisionAt = candidate.DecisionAt
 	}
 	if findingWorkflowStateRank(candidate.State) > findingWorkflowStateRank(target.State) && !findingUserFinalState(target.State) {
 		target.State = candidate.State

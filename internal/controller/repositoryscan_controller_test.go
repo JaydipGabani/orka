@@ -3840,6 +3840,58 @@ func TestMergeExistingFindingCollapsesSemanticDuplicates(t *testing.T) {
 	}
 }
 
+func TestMergeExistingFindingDoesNotBridgeCanonicalThroughAlias(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
+	scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}}
+	newFinding := func(id string, line int) *storepkg.Finding {
+		return &storepkg.Finding{
+			ID:               id,
+			Namespace:        defaultNS,
+			RepositoryScan:   scan.Name,
+			ScanRunID:        "scan_old",
+			Fingerprint:      id + "-fingerprint",
+			Title:            "Archive extraction permits traversal",
+			Category:         "path traversal",
+			Summary:          "path traversal finding",
+			Severity:         "high",
+			Confidence:       "high",
+			ValidationStatus: findingValidationStatusValidated,
+			State:            findingStateOpen,
+			FilePath:         "archive.go",
+			Line:             line,
+			Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: line, EndLine: line}},
+		}
+	}
+	canonical := newFinding("fnd_canonical_drift", 100)
+	alias := newFinding("fnd_alias_drift", 105)
+	for _, finding := range []*storepkg.Finding{canonical, alias} {
+		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
+		}
+	}
+	if err := securityStore.MarkFindingDuplicate(ctx, defaultNS, alias.ID, canonical.ID); err != nil {
+		t.Fatalf("MarkFindingDuplicate() error = %v", err)
+	}
+
+	incoming := newFinding("fnd_independent_drift", 110)
+	incoming.ScanRunID = "scan_current"
+	if err := reconciler.mergeExistingFinding(ctx, scan, incoming); err != nil {
+		t.Fatalf("mergeExistingFinding() error = %v", err)
+	}
+	if incoming.ID != "fnd_independent_drift" {
+		t.Fatalf("incoming.ID = %q, want independent finding", incoming.ID)
+	}
+	if err := securityStore.UpsertObservedFinding(ctx, incoming); err != nil {
+		t.Fatalf("UpsertObservedFinding() error = %v", err)
+	}
+	listed, _, err := securityStore.ListFindings(ctx, storepkg.FindingFilter{Namespace: defaultNS, RepositoryScan: scan.Name, Limit: 10})
+	if err != nil || len(listed) != 2 {
+		t.Fatalf("canonical findings = %#v, err %v, want two independent findings", listed, err)
+	}
+}
+
 func TestMergeExistingFindingReopensResolvedFindingWithoutRemediationProjection(t *testing.T) {
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)
@@ -4071,13 +4123,20 @@ func TestFindingCategoryMatchesRequiresSpecificSharedIdentity(t *testing.T) {
 
 func TestMergeFindingEvidenceAndRemediationPreservesUserDecisionAndIgnoresAliasWorkflow(t *testing.T) {
 	target := &storepkg.Finding{ID: "canonical", State: findingStateOpen, UpdatedAt: mustParseTime(t, "2026-08-01T00:00:00Z")}
-	dismissedAt := mustParseTime(t, "2026-08-03T00:00:00Z")
-	dismissed := &storepkg.Finding{ID: "dismissed", State: "dismissed", UpdatedAt: dismissedAt}
+	dismissedAt := mustParseTime(t, "2026-08-02T00:00:00Z")
+	dismissed := &storepkg.Finding{ID: "dismissed", State: "dismissed", DecisionAt: dismissedAt, UpdatedAt: dismissedAt}
 	mergeFindingEvidenceAndRemediation(target, dismissed)
-	olderSuppression := &storepkg.Finding{ID: "suppressed", State: "suppressed", UpdatedAt: mustParseTime(t, "2026-08-02T00:00:00Z")}
+	target.UpdatedAt = mustParseTime(t, "2026-08-05T00:00:00Z")
+	olderSuppression := &storepkg.Finding{ID: "older-suppression", State: "suppressed", DecisionAt: mustParseTime(t, "2026-08-01T00:00:00Z"), UpdatedAt: mustParseTime(t, "2026-08-06T00:00:00Z")}
 	mergeFindingEvidenceAndRemediation(target, olderSuppression)
-	if target.State != dismissed.State || !target.UpdatedAt.Equal(dismissedAt) {
-		t.Fatalf("target state/timestamp = %q/%s, want %q/%s", target.State, target.UpdatedAt, dismissed.State, dismissedAt)
+	if target.State != dismissed.State || !target.DecisionAt.Equal(dismissedAt) {
+		t.Fatalf("target state/decision = %q/%s, want %q/%s", target.State, target.DecisionAt, dismissed.State, dismissedAt)
+	}
+	newerSuppressionAt := mustParseTime(t, "2026-08-03T00:00:00Z")
+	newerSuppression := &storepkg.Finding{ID: "newer-suppression", State: "suppressed", DecisionAt: newerSuppressionAt, UpdatedAt: mustParseTime(t, "2026-08-03T00:00:00Z")}
+	mergeFindingEvidenceAndRemediation(target, newerSuppression)
+	if target.State != newerSuppression.State || !target.DecisionAt.Equal(newerSuppressionAt) {
+		t.Fatalf("target state/decision = %q/%s, want %q/%s", target.State, target.DecisionAt, newerSuppression.State, newerSuppressionAt)
 	}
 
 	resolved := &storepkg.Finding{ID: "resolved", State: findingStateResolved}
