@@ -184,6 +184,12 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorCommandWorkActionTerminal
 	if err != nil {
 		return false, err
 	}
+	if action.Status == repositoryMonitorWorkActionStatusCancelled && command.Intent == repositoryMonitorCommandIntentUpdateBranch {
+		accepted, err := r.repositoryMonitorUpdateBranchAccepted(ctx, monitor, command.ID)
+		if err != nil || accepted {
+			return false, err
+		}
+	}
 	switch action.Status {
 	case repositoryMonitorWorkActionStatusSucceeded, repositoryMonitorWorkActionStatusFailed, repositoryMonitorWorkActionStatusBlocked, repositoryMonitorWorkActionStatusCancelled:
 		now := time.Now()

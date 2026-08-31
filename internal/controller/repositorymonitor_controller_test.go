@@ -7881,14 +7881,14 @@ func (s failingUpdateBranchProjectionStore) CreateMonitorEvent(ctx context.Conte
 }
 
 func (s failingUpdateBranchProjectionStore) UpdateGitHubMutationRecord(ctx context.Context, record *store.GitHubMutationRecord) error {
-	if s.projection == "mutation record" && record.Status == repositoryMonitorRunPhaseSucceeded {
+	if s.projection == "mutation record" {
 		return errors.New("mutation record projection unavailable")
 	}
 	return s.RepositoryMonitorStore.UpdateGitHubMutationRecord(ctx, record)
 }
 
 func TestRepositoryMonitorUpdateBranchKeepsAcceptedMutationRetryableWhenProjectionFails(t *testing.T) {
-	for _, projection := range []string{"monitor item", "work action", "event"} {
+	for _, projection := range []string{"mutation record", "monitor item", "work action", "event"} {
 		t.Run(projection, func(t *testing.T) {
 			ctx := context.Background()
 			monitorStore := setupControllerSQLiteStore(t)
@@ -7931,10 +7931,76 @@ func TestRepositoryMonitorUpdateBranchKeepsAcceptedMutationRetryableWhenProjecti
 				t.Fatalf("failure state = %q, want %q for %v", failureState, repositoryMonitorRunRetryScheduled, err)
 			}
 			mutation, getErr := monitorStore.GetGitHubMutationRecord(ctx, monitor.Namespace, repositoryMonitorUpdateBranchMutationID(command.ID))
-			if getErr != nil || mutation.Status != repositoryMonitorAutomergeStatePending || mutation.GitHubRequestID != "request-42" {
-				t.Fatalf("pending mutation = %#v, err %v", mutation, getErr)
+			wantStatus, wantRequestID := repositoryMonitorAutomergeStatePending, "request-42"
+			if projection == "mutation record" {
+				wantStatus, wantRequestID = repositoryMonitorAutomergeStateStarted, ""
+			}
+			if getErr != nil || mutation.Status != wantStatus || mutation.GitHubRequestID != wantRequestID {
+				t.Fatalf("mutation = %#v, err %v, want status %q request ID %q", mutation, getErr, wantStatus, wantRequestID)
 			}
 		})
+	}
+}
+
+func TestRepositoryMonitorUpdateBranchRequeuesAcceptedMutationAfterCancellation(t *testing.T) {
+	ctx := context.Background()
+	monitorStore := setupControllerSQLiteStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/repos/orka-agents/orka/compare/live-base-sha...old-head-sha" {
+			t.Fatalf("unexpected GitHub request %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"status":"diverged"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	scheme := runtime.NewScheme()
+	_ = corev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	monitor, secret := repositoryMonitorInventoryTestObjects("update-branch-cancelled-pending")
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(monitor, secret).Build()
+	reconciler := &RepositoryMonitorReconciler{Client: client, Store: monitorStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
+	command := &store.CommandEvent{ID: "cmd-update-cancelled-pending", MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Repo: "orka-agents/orka", Kind: repositoryMonitorPullRequestKind, Number: 42, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "old-head-sha", Status: "accepted", CreatedAt: time.Now()}
+	if err := monitorStore.CreateCommandEvent(ctx, command); err != nil {
+		t.Fatalf("CreateCommandEvent() error = %v", err)
+	}
+	completedAt := time.Now()
+	run := &store.MonitorRun{ID: repositoryMonitorCommandRunIDFromCommand(command.ID), MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Trigger: repositoryMonitorTriggerLabelCommand, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, CommandEventID: command.ID, Phase: repositoryMonitorRunPhaseSucceeded, StartedAt: completedAt.Add(-time.Minute), CompletedAt: &completedAt}
+	if err := monitorStore.CreateMonitorRun(ctx, run); err != nil {
+		t.Fatalf("CreateMonitorRun() error = %v", err)
+	}
+	pr := repositoryMonitorPullRequest{Number: command.Number, State: repositoryMonitorItemStateOpen, BaseBranch: "main", BaseSHA: "live-base-sha", HeadBranch: "feature", HeadRepo: "orka-agents/orka", HeadSHA: command.HeadSHA}
+	item := repositoryMonitorItemFromPullRequest(monitor, pr, nil)
+	if err := monitorStore.UpsertMonitorItem(ctx, item); err != nil {
+		t.Fatalf("UpsertMonitorItem() error = %v", err)
+	}
+	pendingAt := time.Now()
+	if err := monitorStore.CreateGitHubMutationRecord(ctx, &store.GitHubMutationRecord{ID: repositoryMonitorUpdateBranchMutationID(command.ID), MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, RunID: run.ID, CommandEventID: command.ID, Operation: repositoryMonitorUpdateBranchOperation, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, Reason: command.Intent, GitHubURL: pr.BaseBranch, ExternalID: pr.BaseSHA, Status: repositoryMonitorAutomergeStatePending, PendingAt: &pendingAt, CreatedAt: pendingAt}); err != nil {
+		t.Fatalf("CreateGitHubMutationRecord() error = %v", err)
+	}
+	actionID := store.RepositoryMonitorWorkActionID(command.ID, repositoryMonitorCommandIntentUpdateBranch)
+	if err := monitorStore.CreateWorkAction(ctx, &store.WorkAction{ID: actionID, MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, RunID: run.ID, CommandEventID: command.ID, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, Intent: command.Intent, DesiredAction: repositoryMonitorCommandIntentUpdateBranch, Status: repositoryMonitorWorkActionStatusCancelled, Phase: repositoryMonitorWorkActionStatusCancelled, CreatedAt: pendingAt, CompletedAt: &completedAt}); err != nil {
+		t.Fatalf("CreateWorkAction() error = %v", err)
+	}
+
+	handled, created, err := reconciler.tryProcessPullRequestCommandRun(ctx, monitor, run, "orka-agents", "orka", pr, item)
+	if err != nil || !handled || created != 0 {
+		t.Fatalf("tryProcessPullRequestCommandRun() = handled %v, created %d, err %v", handled, created, err)
+	}
+	storedItem, err := monitorStore.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, command.Kind, "42")
+	if err != nil || storedItem.RepairState != repositoryMonitorRepairPhaseQueued {
+		t.Fatalf("stored item = %#v, err %v, want accepted update queued", storedItem, err)
+	}
+	handled, reset, err := reconciler.ensureNoExistingCommandRunBlocksQueue(ctx, monitor, *command, run.ID)
+	if err != nil || !handled || !reset {
+		t.Fatalf("ensureNoExistingCommandRunBlocksQueue() = handled %v, reset %v, err %v", handled, reset, err)
+	}
+	storedRun, err := monitorStore.GetMonitorRun(ctx, monitor.Namespace, run.ID)
+	if err != nil || storedRun.Phase != repositoryMonitorRunPhaseQueued {
+		t.Fatalf("stored run = %#v, err %v, want queued for outcome polling", storedRun, err)
+	}
+	storedAction, err := monitorStore.GetWorkAction(ctx, monitor.Namespace, actionID)
+	if err != nil || storedAction.Status != repositoryMonitorWorkActionStatusCancelled {
+		t.Fatalf("stored action = %#v, err %v, want cancellation preserved", storedAction, err)
 	}
 }
 

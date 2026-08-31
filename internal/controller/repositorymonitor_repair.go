@@ -158,8 +158,14 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestCommandRun(ctx contex
 			}
 			return true, 0, r.Store.UpsertMonitorItem(ctx, item)
 		}
-		if cancelled, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent); err != nil || cancelled {
+		accepted, err := r.repositoryMonitorUpdateBranchAccepted(ctx, monitor, command.ID)
+		if err != nil {
 			return true, 0, err
+		}
+		if !accepted {
+			if cancelled, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent); err != nil || cancelled {
+				return true, 0, err
+			}
 		}
 		return r.tryProcessPullRequestUpdateBranchCommand(ctx, monitor, run, command, owner, repository, pr, item)
 	case repositoryMonitorCommandIntentFix, repositoryMonitorCommandIntentFixCI:
@@ -316,7 +322,7 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 	mutation.GitHubRequestID = requestID
 	mutation.Error = ""
 	if err := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); err != nil {
-		return true, 0, err
+		return true, 0, pendingMutationProjectionError("mutation record", err)
 	}
 	item.RepairState = repositoryMonitorRepairPhaseQueued
 	item.SkipReason = ""
@@ -334,6 +340,17 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 
 func repositoryMonitorUpdateBranchMutationID(commandID string) string {
 	return "ghmut-" + repositoryMonitorShortHash(commandID+"-update-branch")
+}
+
+func (r *RepositoryMonitorReconciler) repositoryMonitorUpdateBranchAccepted(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, commandID string) (bool, error) {
+	mutation, err := r.Store.GetGitHubMutationRecord(ctx, monitor.Namespace, repositoryMonitorUpdateBranchMutationID(commandID))
+	if errorsIsStoreNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return mutation.Status == repositoryMonitorAutomergeStatePending, nil
 }
 
 func repositoryMonitorUpdateBranchMutationMismatch(mutation *store.GitHubMutationRecord, command *store.CommandEvent, pr repositoryMonitorPullRequest) string {
