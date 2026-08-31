@@ -570,6 +570,7 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"Cookie: theme=dark",
 		"Cookie: session=$TOKEN",
 		"Set-Cookie: theme=dark; Path=/; HttpOnly",
+		"password: $PASSWORD # injected at runtime",
 	} {
 		if LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = true, want false for a placeholder or bare keyword", text)
@@ -606,6 +607,8 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"PASSWORD=short;correct-horse-battery-staple",
 		`PASSWORD=short\correct-horse-battery-staple`,
 		"PASSWORD: short`correct-horse-battery-staple",
+		"PASSWORD: short correct-horse-battery-staple",
+		"PASSWORD: short correct-horse-battery-staple # rotated credential",
 		"PASSWORD=short\u200bcorrect-horse-battery-staple",
 		"Cookie: sessionid=correct-horse-battery-staple",
 		"Cookie: theme=dark; sessionid=correct-horse-battery-staple",

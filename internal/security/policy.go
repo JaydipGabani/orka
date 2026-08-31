@@ -67,7 +67,14 @@ var (
 	// negatives (apiKey = strings.TrimSpace(cfg.APIKey)). Placeholder ($VAR, <example>, {{ .Token }}) and
 	// code-reference exemptions run on the captured value either way.
 	policySensitiveAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|priv` + `ate[_-]?key)\s*[:=]\s*(?:"([^"\r\n]{16,})"|'([^'\r\n]{16,})'|([A-Za-z0-9_./+=~:@#$%^&*!?|,;\\` + "`" + `-]{16,}))`)
-	policyJWTPattern                 = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])ey` + `J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}([^A-Za-z0-9_-]|$)`)
+	// YAML plain scalars may contain spaces without quoting. Scan the complete
+	// line value so a short first word cannot hide a long credential value.
+	// Requiring whitespace after ':' excludes Go's ':=' assignments; the
+	// token-part filter below keeps call expressions and other source syntax
+	// out of this YAML-specific fallback.
+	policySensitiveYAMLAssignmentPattern = regexp.MustCompile(`(?im)^[\t ]*(?:-\s*)?(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|priv` + `ate[_-]?key)\s*:\s+([^\r\n]+)$`)
+	policyYAMLPlainScalarPartPattern     = regexp.MustCompile("^[A-Za-z0-9_./+=~:@#$%^&*!?|,;\\\\`-]+$")
+	policyJWTPattern                     = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])ey` + `J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}([^A-Za-z0-9_-]|$)`)
 	// Header-carried credentials are flagged only when a credential-shaped
 	// value follows: "Authorization: Bearer $TOKEN" in documentation is not
 	// a secret, "Authorization: Bearer eyJ…" or a 16+ character opaque token
@@ -215,6 +222,44 @@ func sensitiveValueMatch(pattern *regexp.Regexp, text string) bool {
 	return false
 }
 
+func trimYAMLPlainScalarComment(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value[0] == '#' {
+		return ""
+	}
+	for i := 1; i < len(value); i++ {
+		if value[i] == '#' && (value[i-1] == ' ' || value[i-1] == '\t') {
+			value = value[:i]
+			break
+		}
+	}
+	return strings.TrimSpace(value)
+}
+
+func yamlPlainScalarAssignmentsLookLikeSecret(text string) bool {
+	for _, match := range policySensitiveYAMLAssignmentPattern.FindAllStringSubmatch(text, -1) {
+		value := trimYAMLPlainScalarComment(match[1])
+		if len(value) < 16 {
+			continue
+		}
+		parts := strings.Fields(value)
+		if len(parts) < 2 {
+			continue
+		}
+		credentialShaped := true
+		for _, part := range parts {
+			if !policyYAMLPlainScalarPartPattern.MatchString(part) {
+				credentialShaped = false
+				break
+			}
+		}
+		if credentialShaped && !secretValuePlaceholder(value) {
+			return true
+		}
+	}
+	return false
+}
+
 func cookieHeadersLookLikeSecret(text string) bool {
 	for _, match := range policyCookiePattern.FindAllStringSubmatch(text, -1) {
 		parts := strings.Split(match[2], ";")
@@ -249,6 +294,9 @@ func LooksLikeSecret(text string) bool {
 		return true
 	}
 	if sensitiveValueMatch(policySensitiveAssignmentPattern, text) {
+		return true
+	}
+	if yamlPlainScalarAssignmentsLookLikeSecret(text) {
 		return true
 	}
 	if policyJWTPattern.MatchString(text) {
