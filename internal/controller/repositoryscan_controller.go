@@ -2099,6 +2099,7 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 		if len(matches) == 0 {
 			return nil
 		}
+		matches = compatibleFindingMatches(matches)
 		existing = canonicalFinding(matches)
 		for i := range matches {
 			mergeFindingEvidenceAndRemediation(existing, &matches[i])
@@ -2223,6 +2224,41 @@ func canonicalFinding(matches []store.Finding) *store.Finding {
 		}
 	}
 	return canonical
+}
+
+func compatibleFindingMatches(matches []store.Finding) []store.Finding {
+	if len(matches) < 2 {
+		return matches
+	}
+	canonical := canonicalFinding(matches)
+	matchesByID := make(map[string]store.Finding, len(matches))
+	for i := range matches {
+		matchesByID[matches[i].ID] = matches[i]
+	}
+	compatibleCanonicalIDs := map[string]struct{}{canonical.ID: {}}
+	for i := range matches {
+		candidate := &matches[i]
+		if candidate.DuplicateOf == "" && findingIdentityMatchScore(canonical, candidate) >= 2 {
+			compatibleCanonicalIDs[candidate.ID] = struct{}{}
+		}
+	}
+	compatible := make([]store.Finding, 0, len(matches))
+	for i := range matches {
+		canonicalID := matches[i].ID
+		current := matches[i]
+		for strings.TrimSpace(current.DuplicateOf) != "" {
+			canonicalID = strings.TrimSpace(current.DuplicateOf)
+			parent, ok := matchesByID[canonicalID]
+			if !ok {
+				break
+			}
+			current = parent
+		}
+		if _, ok := compatibleCanonicalIDs[canonicalID]; ok {
+			compatible = append(compatible, matches[i])
+		}
+	}
+	return compatible
 }
 
 func mergeFindingEvidenceAndRemediation(target, candidate *store.Finding) {
@@ -2481,9 +2517,6 @@ func (r *RepositoryScanReconciler) repositoryScanInconclusiveFindingSlices(ctx c
 
 func (r *RepositoryScanReconciler) repositoryScanReviewedSlicesForResolution(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) (map[string]struct{}, error) {
 	reviewedSlices := map[string]struct{}{}
-	if run.Mode != scanModeIncremental {
-		return reviewedSlices, nil
-	}
 	cursor := ""
 	for {
 		scanSlices, next, err := r.SecurityStore.ListReviewSlices(ctx, store.ReviewSliceFilter{
@@ -2518,11 +2551,8 @@ func findingEligibleForMergedResolution(finding *store.Finding, run *store.ScanR
 	if _, inconclusive := inconclusiveSlices[sliceID]; inconclusive {
 		return false
 	}
-	if run.Mode == scanModeIncremental {
-		_, reviewed := reviewedSlices[sliceID]
-		return reviewed
-	}
-	return true
+	_, reviewed := reviewedSlices[sliceID]
+	return reviewed
 }
 
 func (r *RepositoryScanReconciler) repositoryScanOpenFindingsForResolution(ctx context.Context, scan *corev1alpha1.RepositoryScan) ([]store.Finding, error) {
@@ -2563,7 +2593,7 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 	if err != nil {
 		return err
 	}
-	if run.Mode == scanModeIncremental && len(reviewedSlices) == 0 {
+	if len(reviewedSlices) == 0 {
 		return nil
 	}
 
