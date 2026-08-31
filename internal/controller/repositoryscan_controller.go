@@ -2557,7 +2557,10 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 	}
 
 	token, reason, tokenErr := r.repositoryScanForgeToken(ctx, scan)
-	if tokenErr != nil || reason != "" {
+	if tokenErr != nil {
+		return tokenErr
+	}
+	if reason != "" {
 		return nil
 	}
 	targetRepo := security.CanonicalRepositoryCloneURL(scan.Spec.RepoURL)

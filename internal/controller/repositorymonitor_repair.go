@@ -438,7 +438,7 @@ func (r *RepositoryMonitorReconciler) completeRepositoryMonitorUpdateBranch(ctx 
 	mutation.Status = repositoryMonitorRunPhaseSucceeded
 	mutation.Error = ""
 	if err := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); err != nil {
-		return err
+		return pendingMutationProjectionError("mutation record", err)
 	}
 	item.HeadSHA = pr.HeadSHA
 	item.BaseSHA = pr.BaseSHA

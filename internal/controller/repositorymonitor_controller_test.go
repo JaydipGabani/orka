@@ -7880,6 +7880,13 @@ func (s failingUpdateBranchProjectionStore) CreateMonitorEvent(ctx context.Conte
 	return s.RepositoryMonitorStore.CreateMonitorEvent(ctx, event)
 }
 
+func (s failingUpdateBranchProjectionStore) UpdateGitHubMutationRecord(ctx context.Context, record *store.GitHubMutationRecord) error {
+	if s.projection == "mutation record" && record.Status == repositoryMonitorRunPhaseSucceeded {
+		return errors.New("mutation record projection unavailable")
+	}
+	return s.RepositoryMonitorStore.UpdateGitHubMutationRecord(ctx, record)
+}
+
 func TestRepositoryMonitorUpdateBranchKeepsAcceptedMutationRetryableWhenProjectionFails(t *testing.T) {
 	for _, projection := range []string{"monitor item", "work action", "event"} {
 		t.Run(projection, func(t *testing.T) {
@@ -7928,6 +7935,49 @@ func TestRepositoryMonitorUpdateBranchKeepsAcceptedMutationRetryableWhenProjecti
 				t.Fatalf("pending mutation = %#v, err %v", mutation, getErr)
 			}
 		})
+	}
+}
+
+func TestRepositoryMonitorUpdateBranchKeepsVerifiedMutationRetryableWhenStatusProjectionFails(t *testing.T) {
+	ctx := context.Background()
+	monitorStore := setupControllerSQLiteStore(t)
+	monitor, _ := repositoryMonitorInventoryTestObjects("update-branch-verified-projection")
+	command := &store.CommandEvent{ID: "cmd-update-verified-projection", MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Kind: repositoryMonitorPullRequestKind, Number: 42, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "old-head-sha"}
+	run := &store.MonitorRun{ID: "run-update-verified-projection", MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, CommandEventID: command.ID}
+	mutationID := repositoryMonitorUpdateBranchMutationID(command.ID)
+	if err := monitorStore.CreateGitHubMutationRecord(ctx, &store.GitHubMutationRecord{
+		ID:               mutationID,
+		MonitorNamespace: monitor.Namespace,
+		MonitorName:      monitor.Name,
+		RunID:            run.ID,
+		CommandEventID:   command.ID,
+		Operation:        repositoryMonitorUpdateBranchOperation,
+		TargetKind:       repositoryMonitorPullRequestKind,
+		TargetNumber:     command.Number,
+		TargetSHA:        command.HeadSHA,
+		Status:           repositoryMonitorAutomergeStatePending,
+		CreatedAt:        time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateGitHubMutationRecord() error = %v", err)
+	}
+	mutation, err := monitorStore.GetGitHubMutationRecord(ctx, monitor.Namespace, mutationID)
+	if err != nil {
+		t.Fatalf("GetGitHubMutationRecord() error = %v", err)
+	}
+	item := &store.MonitorItem{MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Kind: repositoryMonitorPullRequestKind, ItemKey: "42", Number: 42}
+	pr := repositoryMonitorPullRequest{Number: 42, BaseSHA: "live-base-sha", HeadSHA: "updated-head-sha"}
+	reconciler := &RepositoryMonitorReconciler{Store: failingUpdateBranchProjectionStore{RepositoryMonitorStore: monitorStore, projection: "mutation record"}}
+
+	err = reconciler.completeRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, pr)
+	if err == nil {
+		t.Fatal("completeRepositoryMonitorUpdateBranch() error = nil, want projection failure")
+	}
+	if failureState := repositoryMonitorRunFailureState(err); failureState != repositoryMonitorRunRetryScheduled {
+		t.Fatalf("failure state = %q, want %q for %v", failureState, repositoryMonitorRunRetryScheduled, err)
+	}
+	stored, getErr := monitorStore.GetGitHubMutationRecord(ctx, monitor.Namespace, mutationID)
+	if getErr != nil || stored.Status != repositoryMonitorAutomergeStatePending {
+		t.Fatalf("stored mutation = %#v, err %v, want pending retry", stored, getErr)
 	}
 }
 

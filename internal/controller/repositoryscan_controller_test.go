@@ -9,6 +9,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -4230,6 +4231,35 @@ func TestRefreshScanRunStatusRetriesMergedPRLookup(t *testing.T) {
 	got, err := securityStore.GetFinding(ctx, defaultNS, finding.ID)
 	if err != nil || got.State != findingStateResolved || attempts != 2 {
 		t.Fatalf("finding = %#v, attempts = %d, err %v", got, attempts, err)
+	}
+}
+
+type failingRepositoryScanReader struct {
+	client.Reader
+	err error
+}
+
+func (r failingRepositoryScanReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return r.err
+}
+
+func TestResolveMergedFindingsRetriesForgeCredentialReadErrors(t *testing.T) {
+	transientErr := errors.New("transient secret read failure")
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:            "https://github.com/example/kaset",
+			ForgeCredentialRef: &corev1.LocalObjectReference{Name: testPatchForgeSecretName},
+		},
+	}
+	run := &storepkg.ScanRun{ID: "scan_retry_secret", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 1}
+	reconciler := &RepositoryScanReconciler{
+		APIReader:     failingRepositoryScanReader{err: transientErr},
+		SecurityStore: setupControllerSQLiteStore(t),
+	}
+
+	if err := reconciler.resolveMergedFindingsNotObserved(context.Background(), scan, run); !errors.Is(err, transientErr) {
+		t.Fatalf("resolveMergedFindingsNotObserved() error = %v, want %v", err, transientErr)
 	}
 }
 
