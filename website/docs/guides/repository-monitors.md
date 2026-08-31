@@ -317,6 +317,39 @@ orka monitor commands list orka-main --namespace default
 orka monitor commands get <command-id> --namespace default
 ```
 
+### Label quick reference
+
+Once label intake is enabled, applying one label on GitHub is the whole user
+interface. This table maps each default label to what Orka does and where the
+result appears:
+
+| Label | Target | What Orka does | Where you see the result |
+|---|---|---|---|
+| `orka:triage` | issue | Read-only triage task classifies the issue | Orka's status comment on the issue; `orka monitor actions list` |
+| `orka:research` | issue | Read-only research task investigates the problem | Status comment (problem statement and findings); action record |
+| `orka:plan` | issue | Read-only planning task drafts an implementation plan | Status comment; issue moves to `plan_ready` (or `approval_required`) |
+| `orka:approve-plan` | issue | Records human approval of the plan | Issue state moves to `approved` |
+| `orka:implement` | issue | Write task implements the approved plan in a sanitized workspace | A pull request opened by the clean-room publisher |
+| `orka:review` | PR | Exact-head review of the PR | Review comment and readiness state on the PR |
+| `orka:fix` | PR | Repair task on the PR head branch | New commits pushed to the PR branch |
+| `orka:fix-ci` | PR | CI-focused repair on the PR head branch | New commits pushed to the PR branch |
+| `orka:update-branch` | PR | Merges the base branch into the PR head | Updated PR branch |
+| `orka:automerge` | PR | Arms the optional automerge workflow (if enabled) | PR merges once review and CI gates pass |
+
+Notes:
+
+- Label names are configurable per monitor (`spec.triggers.github.labels`);
+  the table shows the conventional defaults.
+- Orka maintains **one status comment per issue** and edits it in place as
+  phases complete, rather than posting a new comment per phase.
+- Labels listed in `spec.policy.pauseLabels` (and `protectedLabels`) block
+  command intake for that item: the command is recorded as blocked and no work
+  is queued.
+- Commands act on the monitor's *inventoried* view of an item. If the PR or
+  issue changed very recently, run a targeted inventory pass first
+  (`orka monitor run <name> --target-kind pr --target-number <n>`) so the
+  command binds to the current head.
+
 ## Issue Triage, Research, Planning, and Implementation
 
 When issue command labels are enabled, accepted issue commands now drive monitor-owned task phases:
