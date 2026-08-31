@@ -3632,3 +3632,19 @@ func TestValidateReadOnlyAgentRuntimeRejectsExternalRuntimeRef(t *testing.T) {
 		t.Fatalf("validateReadOnlyAgentRuntime() error = %v, want external runtimeRef rejection", err)
 	}
 }
+
+func TestValidateContainerDeliveredPromptSize(t *testing.T) {
+	small := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Prompt: "hello"}}
+	if err := validateContainerDeliveredPromptSize(small, nil); err != nil {
+		t.Fatalf("small prompt rejected: %v", err)
+	}
+	big := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI, AI: &corev1alpha1.AISpec{Prompt: strings.Repeat("x", maxContainerDeliveredPromptBytes+1)}}}
+	err := validateContainerDeliveredPromptSize(big, nil)
+	if err == nil || !strings.Contains(err.Error(), "MAX_ARG_STRLEN") {
+		t.Fatalf("oversized prompt error = %v, want actionable env-limit message", err)
+	}
+	bigSystem := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI, AI: &corev1alpha1.AISpec{Prompt: "ok", SystemPrompt: strings.Repeat("s", maxContainerDeliveredPromptBytes+1)}}}
+	if err := validateContainerDeliveredPromptSize(bigSystem, nil); err == nil {
+		t.Fatal("oversized system prompt was accepted")
+	}
+}

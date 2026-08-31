@@ -343,6 +343,9 @@ func (b *JobBuilder) BuildWithOptions(ctx context.Context, task *corev1alpha1.Ta
 	if err := validateReadOnlyAgentRuntime(task, agent); err != nil {
 		return nil, err
 	}
+	if err := validateContainerDeliveredPromptSize(task, agent); err != nil {
+		return nil, err
+	}
 
 	jobName := buildTaskJobName(task)
 	execution := resolveExecution(task, agent)
@@ -2651,5 +2654,38 @@ func (b *JobBuilder) addSkillVolumes(ctx context.Context, job *batchv1.Job, task
 		},
 	)
 
+	return nil
+}
+
+// maxContainerDeliveredPromptBytes bounds the prompt and system prompt a
+// worker Job can carry: both travel as environment variables, and Linux
+// rejects any single execve argument or environment string over
+// MAX_ARG_STRLEN (128 KiB) with the opaque "argument list too long" exec
+// failure. Guard well below that so the Task fails with an actionable
+// message instead of a dead container.
+const maxContainerDeliveredPromptBytes = 110 * 1024
+
+func validateContainerDeliveredPromptSize(task *corev1alpha1.Task, agent *corev1alpha1.Agent) error {
+	if task == nil {
+		return nil
+	}
+	prompt := task.Spec.Prompt
+	if prompt == "" && task.Spec.AI != nil {
+		prompt = task.Spec.AI.Prompt
+	}
+	systemPrompt := ""
+	if task.Spec.AI != nil {
+		systemPrompt = task.Spec.AI.SystemPrompt
+	}
+	if systemPrompt == "" && agent != nil && agent.Spec.SystemPrompt != nil {
+		systemPrompt = agent.Spec.SystemPrompt.Inline
+	}
+	for name, value := range map[string]string{"prompt": prompt, "system prompt": systemPrompt} {
+		if len(value) > maxContainerDeliveredPromptBytes {
+			return fmt.Errorf(
+				"%s is %d bytes; container-delivered prompts are limited to %d bytes because they are passed as process environment (Linux MAX_ARG_STRLEN). Shorten the %s or supply the content through the workspace instead",
+				name, len(value), maxContainerDeliveredPromptBytes, name)
+		}
+	}
 	return nil
 }
