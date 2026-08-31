@@ -602,6 +602,7 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"PASSWORD=short,correct-horse-battery-staple",
 		"PASSWORD=short;correct-horse-battery-staple",
 		`PASSWORD=short\correct-horse-battery-staple`,
+		"PASSWORD: short`correct-horse-battery-staple",
 		"Cookie: sessionid=correct-horse-battery-staple",
 		"Set-Cookie: sessionid=correct-horse-battery-staple; HttpOnly",
 	} {

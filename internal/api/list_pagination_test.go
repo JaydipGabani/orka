@@ -376,7 +376,8 @@ func TestCollectAuthorizedPagesFillsAcrossFilteredPages(t *testing.T) {
 	require.Equal(t, "after-late", next)
 	require.Equal(t, 40, calls)
 
-	// The page budget is the residual bound and hands back the cursor.
+	// The page budget is the residual bound. It must not expose a raw storage
+	// cursor whose boundary was set by objects hidden from the caller.
 	calls = 0
 	items, next, err = collectAuthorizedPages(1, "", func(string, int64) ([]string, string, error) {
 		calls++
@@ -384,7 +385,7 @@ func TestCollectAuthorizedPagesFillsAcrossFilteredPages(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Empty(t, items)
-	require.Equal(t, hiddenCursor, next)
+	require.Empty(t, next)
 	require.Equal(t, maxAuthorizedListPages, calls)
 
 	_, _, err = collectAuthorizedPages(1, "", func(string, int64) ([]string, string, error) { return nil, "", errors.New("boom") })

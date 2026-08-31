@@ -126,12 +126,9 @@ func listPageError(what string, err error) error {
 }
 
 // maxAuthorizedListPages bounds how many Kubernetes pages one filtered list
-// request may walk. A raw cursor is handed back only once the page is full or
-// the collection ended, so a scoped caller sees pages of results rather than
-// cursor boundaries of objects it may not list, and a non-paging client is
-// not told that nothing is permitted while permitted objects follow. The
-// budget is the residual bound: a caller whose permitted objects sit beyond
-// it receives a partial (possibly empty) page with a cursor.
+// request may walk. A raw cursor is handed back only once the page is full;
+// reaching the scan budget before that suppresses the cursor because its
+// storage boundary may name an object the caller was not authorized to see.
 const maxAuthorizedListPages = 200
 
 // collectAuthorizedPages walks Kubernetes pages until the post-authorization
@@ -153,9 +150,12 @@ func collectAuthorizedPages[T any](limit int64, start string, fetch func(continu
 			return nil, "", err
 		}
 		items = append(items, pageItems...)
-		continueToken = next
-		if next == "" || int64(len(items)) >= limit || page >= maxAuthorizedListPages {
-			return items, continueToken, nil
+		if next == "" || int64(len(items)) >= limit {
+			return items, next, nil
 		}
+		if page >= maxAuthorizedListPages {
+			return items, "", nil
+		}
+		continueToken = next
 	}
 }

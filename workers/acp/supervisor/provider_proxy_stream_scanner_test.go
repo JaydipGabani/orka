@@ -1,6 +1,9 @@
 package supervisor
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 	t.Parallel()
@@ -10,10 +13,11 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 		"data: {\"error\": {\"message\": \"rate limited\"}}\n\n",
 		"data: {\"type\": \"response.failed\", \"response\": {}}\n\n",
 		"data: { \"type\" : \"error\" , \"error\": {} }\n\n",
+		"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\"}",
+		"data: {\"padding\":\"" + strings.Repeat("x", 2048) + "\",\"type\":\"response.failed\"}\n\n",
 	}
-	// The last failure stream deliberately ends without a trailing newline:
+	// One failure stream deliberately ends without a trailing newline:
 	// the flush at end-of-stream must scan the residual line.
-	failures = append(failures, "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\"}")
 	for _, stream := range failures {
 		scanner := &sseTerminalErrorScanner{}
 		// Feed byte-by-byte to prove chunk boundaries cannot hide a marker.
@@ -29,7 +33,7 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 	}
 	clean := []string{
 		"event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
-		"data: {\"choices\":[{\"delta\":{\"content\":\"discussing \\\"type\\\":\\\"error\\\" handling\"}}]}\n\ndata: [DONE]\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\"discussing event: response.failed and \\\"type\\\":\\\"error\\\" handling\"}}]}\n\ndata: [DONE]\n\n",
 		"data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
 	}
 	for _, stream := range clean {
