@@ -211,8 +211,12 @@ func (r *RepositoryMonitorReconciler) terminalizeRepositoryMonitorFailedCommand(
 		}
 	}
 	if command.Intent == repositoryMonitorCommandIntentUpdateBranch {
-		if err := r.terminalizeRepositoryMonitorUpdateBranch(ctx, monitor, command, reason); err != nil {
+		preserveSuccess, err := r.terminalizeRepositoryMonitorUpdateBranch(ctx, monitor, command, reason)
+		if err != nil {
 			return err
+		}
+		if preserveSuccess {
+			return r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, &command, command.Kind, command.Number, command.HeadSHA, command.IssueSnapshotDigest, actionKind, repositoryMonitorWorkActionStatusSucceeded, repositoryMonitorRepairPhaseSucceeded, "", "")
 		}
 	}
 	desiredAction := store.RepositoryMonitorDesiredActionForActionKind(actionKind)

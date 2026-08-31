@@ -242,7 +242,7 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 	case repositoryMonitorRunPhaseFailed:
 		return true, 0, r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusFailed, repositoryMonitorRepairPhaseFailed, "", mutation.Error)
 	case repositoryMonitorAutomergeStatePending:
-		if !mutation.CreatedAt.IsZero() && time.Since(mutation.CreatedAt) >= repositoryMonitorUpdateBranchTimeout {
+		if repositoryMonitorUpdateBranchTimedOut(mutation) {
 			return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "timed out waiting for GitHub to update the PR branch")
 		}
 		item.RepairState = repositoryMonitorRepairPhaseQueued
@@ -291,6 +291,8 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 		return true, 0, err
 	}
 	mutation.Status = repositoryMonitorAutomergeStatePending
+	pendingAt := time.Now()
+	mutation.PendingAt = &pendingAt
 	mutation.GitHubRequestID = requestID
 	mutation.Error = ""
 	if err := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); err != nil {
@@ -391,10 +393,21 @@ func (r *RepositoryMonitorReconciler) reconcileRepositoryMonitorCompletedUpdateB
 	if current.HeadSHA != mutation.TargetSHA {
 		return true, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "updated PR head does not contain the live base revision")
 	}
-	if mutation.Status == repositoryMonitorAutomergeStatePending && !mutation.CreatedAt.IsZero() && time.Since(mutation.CreatedAt) >= repositoryMonitorUpdateBranchTimeout {
+	if repositoryMonitorUpdateBranchTimedOut(mutation) {
 		return true, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "timed out waiting for GitHub to update the PR branch")
 	}
 	return false, nil
+}
+
+func repositoryMonitorUpdateBranchTimedOut(mutation *store.GitHubMutationRecord) bool {
+	if mutation == nil || mutation.Status != repositoryMonitorAutomergeStatePending {
+		return false
+	}
+	pendingSince := mutation.CreatedAt
+	if mutation.PendingAt != nil && !mutation.PendingAt.IsZero() {
+		pendingSince = *mutation.PendingAt
+	}
+	return !pendingSince.IsZero() && time.Since(pendingSince) >= repositoryMonitorUpdateBranchTimeout
 }
 
 func (r *RepositoryMonitorReconciler) completeRepositoryMonitorUpdateBranch(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, run *store.MonitorRun, command *store.CommandEvent, item *store.MonitorItem, mutation *store.GitHubMutationRecord, pr repositoryMonitorPullRequest) error {
@@ -437,28 +450,40 @@ func (r *RepositoryMonitorReconciler) failRepositoryMonitorUpdateBranch(ctx cont
 	return r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, item.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusFailed, repositoryMonitorRepairPhaseFailed, "", reason)
 }
 
-func (r *RepositoryMonitorReconciler) terminalizeRepositoryMonitorUpdateBranch(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, command store.CommandEvent, reason string) error {
+func (r *RepositoryMonitorReconciler) terminalizeRepositoryMonitorUpdateBranch(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, command store.CommandEvent, reason string) (bool, error) {
 	mutation, err := r.Store.GetGitHubMutationRecord(ctx, monitor.Namespace, repositoryMonitorUpdateBranchMutationID(command.ID))
 	if err != nil && !errorsIsStoreNotFound(err) {
-		return err
+		return false, err
 	}
-	if mutation != nil && mutation.Status != repositoryMonitorRunPhaseSucceeded {
+	if mutation != nil && mutation.Status == repositoryMonitorRunPhaseSucceeded {
+		item, itemErr := r.Store.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, repositoryMonitorPullRequestKind, fmt.Sprintf("%d", command.Number))
+		if errorsIsStoreNotFound(itemErr) {
+			return true, nil
+		}
+		if itemErr != nil {
+			return true, itemErr
+		}
+		item.RepairState = repositoryMonitorRepairPhaseSucceeded
+		item.SkipReason = ""
+		return true, r.Store.UpsertMonitorItem(ctx, item)
+	}
+	if mutation != nil {
 		mutation.Status = repositoryMonitorRunPhaseFailed
 		mutation.Error = reason
 		if err := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); err != nil {
-			return err
+			return false, err
 		}
 	}
 	item, err := r.Store.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, repositoryMonitorPullRequestKind, fmt.Sprintf("%d", command.Number))
 	if errorsIsStoreNotFound(err) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	item.RepairState = repositoryMonitorRepairPhaseFailed
 	item.SkipReason = repositoryMonitorUpdateBranchFailure
-	return r.Store.UpsertMonitorItem(ctx, item)
+	return false, r.Store.UpsertMonitorItem(ctx, item)
 }
 
 func (r *RepositoryMonitorReconciler) updateRepositoryMonitorPullRequestBranch(ctx context.Context, owner, repository, token string, number int64, expectedHeadSHA string) (string, error) {

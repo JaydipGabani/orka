@@ -73,6 +73,7 @@ const (
 	findingValidationStatusPending   = "pending"
 	findingValidationStatusValidated = "validated"
 	findingValidationStatusFailed    = "failed"
+	findingValidationStatusSkipped   = "skipped"
 	validationModeOff                = "off"
 	validationModeFull               = "full"
 	validationThresholdLow           = "low"
@@ -2271,6 +2272,7 @@ func findingIdentityMatchScore(left, right *store.Finding) int {
 		return 0
 	}
 	best := 0
+	conflictingSymbols := false
 	for _, leftRef := range left.Evidence {
 		for _, rightRef := range right.Evidence {
 			if leftRef.Path == "" || leftRef.Path != rightRef.Path {
@@ -2279,6 +2281,7 @@ func findingIdentityMatchScore(left, right *store.Finding) int {
 			leftSymbol, rightSymbol := normalizeFindingIdentityText(leftRef.Symbol), normalizeFindingIdentityText(rightRef.Symbol)
 			sameSymbol := leftSymbol != "" && rightSymbol != "" && leftSymbol == rightSymbol
 			if leftSymbol != "" && rightSymbol != "" && !sameSymbol {
+				conflictingSymbols = true
 				continue
 			}
 			if findingRangesOverlap(leftRef.StartLine, leftRef.EndLine, rightRef.StartLine, rightRef.EndLine) {
@@ -2298,7 +2301,7 @@ func findingIdentityMatchScore(left, right *store.Finding) int {
 			}
 		}
 	}
-	if best == 0 && left.Line > 0 && right.Line > 0 && absInt(left.Line-right.Line) <= 5 {
+	if best == 0 && !conflictingSymbols && left.Line > 0 && right.Line > 0 && absInt(left.Line-right.Line) <= 5 {
 		best = 2
 	}
 	return best
@@ -2480,6 +2483,28 @@ func findingEligibleForMergedResolution(finding *store.Finding, run *store.ScanR
 	return true
 }
 
+func (r *RepositoryScanReconciler) repositoryScanOpenFindingsForResolution(ctx context.Context, scan *corev1alpha1.RepositoryScan) ([]store.Finding, error) {
+	var findings []store.Finding
+	cursor := ""
+	for {
+		page, next, err := r.SecurityStore.ListFindings(ctx, store.FindingFilter{
+			Namespace:      scan.Namespace,
+			RepositoryScan: scan.Name,
+			State:          findingStatePROpen,
+			Limit:          200,
+			Cursor:         cursor,
+		})
+		if err != nil {
+			return nil, err
+		}
+		findings = append(findings, page...)
+		if next == "" {
+			return findings, nil
+		}
+		cursor = next
+	}
+}
+
 func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) error {
 	if r.SecurityStore == nil || scan == nil || run == nil || run.Phase != scanRunPhaseSucceeded || run.ReviewedSliceCount == 0 {
 		return nil
@@ -2512,42 +2537,29 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 
 	mergeStateByPR := map[int]bool{}
 	verifiedPRs := map[int]struct{}{}
-	cursor := ""
-	for {
-		findings, next, err := r.SecurityStore.ListFindings(ctx, store.FindingFilter{
-			Namespace:      scan.Namespace,
-			RepositoryScan: scan.Name,
-			State:          findingStatePROpen,
-			Limit:          200,
-			Cursor:         cursor,
-		})
-		if err != nil {
-			return err
+	findings, err := r.repositoryScanOpenFindingsForResolution(ctx, scan)
+	if err != nil {
+		return err
+	}
+	for i := range findings {
+		finding := &findings[i]
+		if !findingEligibleForMergedResolution(finding, run, inconclusiveSlices, reviewedSlices, allSlicesInconclusive) {
+			continue
 		}
-		for i := range findings {
-			finding := &findings[i]
-			if !findingEligibleForMergedResolution(finding, run, inconclusiveSlices, reviewedSlices, allSlicesInconclusive) {
-				continue
+		prNumber := *finding.PRNumber
+		if _, verified := verifiedPRs[prNumber]; !verified {
+			merged, err := r.repositoryScanPullRequestMerged(ctx, owner, repository, token, prNumber)
+			if err != nil {
+				return err
 			}
-			prNumber := *finding.PRNumber
-			if _, verified := verifiedPRs[prNumber]; !verified {
-				merged, err := r.repositoryScanPullRequestMerged(ctx, owner, repository, token, prNumber)
-				if err != nil {
-					return err
-				}
-				verifiedPRs[prNumber] = struct{}{}
-				mergeStateByPR[prNumber] = merged
-			}
-			if mergeStateByPR[prNumber] {
-				if err := r.SecurityStore.UpdateFindingState(ctx, scan.Namespace, finding.ID, findingStateResolved); err != nil {
-					return err
-				}
+			verifiedPRs[prNumber] = struct{}{}
+			mergeStateByPR[prNumber] = merged
+		}
+		if mergeStateByPR[prNumber] {
+			if err := r.SecurityStore.UpdateFindingState(ctx, scan.Namespace, finding.ID, findingStateResolved); err != nil {
+				return err
 			}
 		}
-		if next == "" {
-			break
-		}
-		cursor = next
 	}
 	return nil
 }
@@ -3293,7 +3305,79 @@ func (r *RepositoryScanReconciler) ingestValidationTask(ctx context.Context, sca
 		)
 	}
 
-	return r.SecurityStore.UpsertFinding(ctx, finding)
+	if finding.DuplicateOf == "" {
+		return r.SecurityStore.UpsertFinding(ctx, finding)
+	}
+	canonical, err := r.canonicalFindingForUpdate(ctx, scan, finding)
+	if err != nil {
+		return err
+	}
+	if err := r.SecurityStore.UpsertFinding(ctx, finding); err != nil {
+		return err
+	}
+	mergeFindingValidationResult(canonical, finding)
+	return r.SecurityStore.UpsertFinding(ctx, canonical)
+}
+
+func (r *RepositoryScanReconciler) canonicalFindingForUpdate(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding) (*store.Finding, error) {
+	current := finding
+	seen := map[string]struct{}{finding.ID: {}}
+	for strings.TrimSpace(current.DuplicateOf) != "" {
+		canonicalID := strings.TrimSpace(current.DuplicateOf)
+		if _, duplicate := seen[canonicalID]; duplicate {
+			return nil, fmt.Errorf("finding duplicate chain contains a cycle at %s", canonicalID)
+		}
+		seen[canonicalID] = struct{}{}
+		canonical, err := r.SecurityStore.GetFinding(ctx, scan.Namespace, canonicalID)
+		if err != nil {
+			return nil, err
+		}
+		if canonical.RepositoryScan != scan.Name {
+			return nil, fmt.Errorf("finding duplicate %s points outside repository scan %s", current.ID, scan.Name)
+		}
+		current = canonical
+	}
+	return current, nil
+}
+
+func mergeFindingValidationResult(target, source *store.Finding) {
+	if target == nil || source == nil {
+		return
+	}
+	target.Evidence = mergeEvidenceRefs(target.Evidence, source.Evidence...)
+	if findingValidationStatusRank(source.ValidationStatus) < findingValidationStatusRank(target.ValidationStatus) {
+		return
+	}
+	target.ValidationStatus = source.ValidationStatus
+	target.ValidationJSON = validationJSONForFinding(source.ValidationJSON, target.ID)
+}
+
+func validationJSONForFinding(raw, findingID string) string {
+	var artifact security.ValidationArtifact
+	if err := json.Unmarshal([]byte(raw), &artifact); err != nil || strings.TrimSpace(artifact.FindingID) == "" {
+		return raw
+	}
+	artifact.FindingID = findingID
+	data, err := json.Marshal(artifact)
+	if err != nil {
+		return raw
+	}
+	return string(data)
+}
+
+func findingValidationStatusRank(status string) int {
+	switch strings.TrimSpace(status) {
+	case findingValidationStatusValidated:
+		return 4
+	case findingValidationStatusFailed, findingValidationStatusSkipped:
+		return 3
+	case findingValidationStatusPending:
+		return 2
+	case "unvalidated":
+		return 1
+	default:
+		return 0
+	}
 }
 
 type patchVerificationResult struct {

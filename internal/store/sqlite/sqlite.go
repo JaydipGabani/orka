@@ -701,6 +701,7 @@ func migrate(db *sql.DB) error {
 			external_id        TEXT NOT NULL DEFAULT '',
 			status             TEXT NOT NULL DEFAULT '',
 			error              TEXT NOT NULL DEFAULT '',
+			pending_at         TIMESTAMP,
 			created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_github_mutation_records_monitor
@@ -868,6 +869,12 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("migration failed: %w", err)
 		}
+	}
+
+	if err := ensureSQLiteColumns(db, "github_mutation_records", []sqliteColumnMigration{
+		{Name: "pending_at", Definition: "pending_at TIMESTAMP"},
+	}); err != nil {
+		return err
 	}
 
 	if err := ensureSQLiteColumns(db, "sessions", []sqliteColumnMigration{

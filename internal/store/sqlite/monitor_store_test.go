@@ -671,6 +671,8 @@ func TestMonitorWorkflowStoresActionsJobsAndMutations(t *testing.T) {
 	mutation.Status = testPhaseSucceeded
 	mutation.ExternalID = "456"
 	mutation.GitHubURL = "https://github.example/pr/456"
+	pendingAt := time.Now().UTC().Truncate(time.Second)
+	mutation.PendingAt = &pendingAt
 	if err := s.UpdateGitHubMutationRecord(ctx, mutation); err != nil {
 		t.Fatalf("UpdateGitHubMutationRecord() error = %v", err)
 	}
@@ -678,7 +680,7 @@ func TestMonitorWorkflowStoresActionsJobsAndMutations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGitHubMutationRecord() error = %v", err)
 	}
-	if updatedMutation.Status != testPhaseSucceeded || updatedMutation.ExternalID != "456" {
+	if updatedMutation.Status != testPhaseSucceeded || updatedMutation.ExternalID != "456" || updatedMutation.PendingAt == nil || !updatedMutation.PendingAt.Equal(pendingAt) {
 		t.Fatalf("updated mutation = %#v, want succeeded outcome", updatedMutation)
 	}
 	mutations, _, err := s.ListGitHubMutationRecords(ctx, store.GitHubMutationRecordFilter{Namespace: "demo", MonitorName: "orka", Operation: "create_pr", TargetKind: "issue", TargetNumber: 123})
