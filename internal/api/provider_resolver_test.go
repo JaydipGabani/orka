@@ -190,6 +190,16 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			wantPType: "anthropic",
 		},
 		{
+			name:    "model str explicit missing provider fails closed",
+			objects: []runtime.Object{readyProvider(anthropicProvider), anthropicSecret},
+			config:  DefaultChatConfig(),
+			opts: ResolveOpts{
+				ModelStr:  "missing/claude-sonnet-4-20250514",
+				Namespace: ns,
+			},
+			wantErr: `provider "missing" not found`,
+		},
+		{
 			name:    "model str plain model uses config default provider",
 			objects: []runtime.Object{openaiProvider, openaiSecret},
 			config: func() ChatConfig {
@@ -429,7 +439,7 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			wantErr: "no model specified",
 		},
 		{
-			name:    "fallback chain: explicit -> config.Provider -> default",
+			name:    "fallback chain: config.Provider -> default",
 			objects: []runtime.Object{defaultProvider, defaultSecret},
 			config: func() ChatConfig {
 				c := DefaultChatConfig()
@@ -438,7 +448,7 @@ func TestProviderResolver_Resolve(t *testing.T) {
 				return c
 			}(),
 			opts: ResolveOpts{
-				ModelStr:  "also-nonexistent/some-model",
+				ModelStr:  "some-model",
 				Namespace: ns,
 			},
 			wantModel: "some-model",

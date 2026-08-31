@@ -27,6 +27,31 @@ export function useSessionList(limit = '25') {
   })
 }
 
+export function useSessionListAll(pageLimit = '100') {
+  const namespace = useUIStore((s) => s.namespace)
+  return useQuery({
+    queryKey: ['sessions', 'all', namespace, pageLimit],
+    queryFn: async () => {
+      const items: SessionListItem[] = []
+      const seen = new Set<string>()
+      let continueToken: string | undefined
+      do {
+        const params: Record<string, string> = { namespace, limit: pageLimit }
+        if (continueToken) params.continue = continueToken
+        const page = await api.get<ListResponse<SessionListItem>>('/sessions', params)
+        items.push(...page.items)
+        const next = page.metadata?.continue
+        if (next && seen.has(next)) throw new Error('session list pagination repeated continuation cursor')
+        if (next) seen.add(next)
+        continueToken = next || undefined
+      } while (continueToken)
+      return { items, metadata: {} } as ListResponse<SessionListItem>
+    },
+    retry: retryUnlessClientError,
+    refetchInterval: (query) => (isForbiddenError(query.state.error) ? false : 15000),
+  })
+}
+
 export function useSession(id: string) {
   const namespace = useUIStore((s) => s.namespace)
   return useQuery({

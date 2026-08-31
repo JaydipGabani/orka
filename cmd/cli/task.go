@@ -623,13 +623,16 @@ func resolveAgentTaskType(ctx context.Context, c *client.Client, agent string) (
 		}
 		return "", fmt.Errorf("cannot infer the task type for --agent %q (%v); pass --type ai or --type agent explicitly", agent, err)
 	}
-	var object struct {
+	var object *struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
 		Spec struct {
 			Runtime json.RawMessage `json:"runtime"`
 		} `json:"spec"`
 	}
-	if json.Unmarshal(body, &object) != nil {
-		return cliTaskTypeAI, nil
+	if err := json.Unmarshal(body, &object); err != nil || object == nil || strings.TrimSpace(object.Metadata.Name) == "" {
+		return "", fmt.Errorf("cannot infer the task type for --agent %q from an invalid Agent response; pass --type ai or --type agent explicitly", agent)
 	}
 	if len(object.Spec.Runtime) > 0 && string(object.Spec.Runtime) != "null" {
 		return cliTaskTypeAgent, nil

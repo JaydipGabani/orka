@@ -563,9 +563,13 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"apiKey = strings.TrimSpace(os.Getenv(apiKeyEnv))",
 		"token: config.Providers.Default.AccessToken",
 		"password = readPasswordFromKeychain(ctx)",
+		"password = read_password(ctx)",
 		"apiKey = cfg.Provider.APIKey",
 		"https://example.com/download?signature=$SIGNED_URL_TOKEN",
 		"token = os.Getenv(tokenEnv)",
+		"Cookie: theme=dark",
+		"Cookie: session=$TOKEN",
+		"Set-Cookie: theme=dark; Path=/; HttpOnly",
 	} {
 		if LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = true, want false for a placeholder or bare keyword", text)
@@ -594,8 +598,18 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"curl 'https://acct.blob.core.windows.net/c/b?sig=" + strings.Repeat("Zx", 12) + "'",
 		"api_key=" + strings.Repeat("0123456789abcdef", 2) + "(",
 		"api_key=abcdefghijklmnopqrst(",
+		"password=CorrectHorseBattery(ctx)",
+		"password=correct_horse_battery(ctx)",
 		"PASSWORD=p@ssword&correct-horse-battery-staple",
 		"PASSWORD=short|correct-horse-battery-staple",
+		"PASSWORD=short,correct-horse-battery-staple",
+		"PASSWORD=short;correct-horse-battery-staple",
+		`PASSWORD=short\correct-horse-battery-staple`,
+		"PASSWORD: short`correct-horse-battery-staple",
+		"PASSWORD=short\u200bcorrect-horse-battery-staple",
+		"Cookie: sessionid=correct-horse-battery-staple",
+		"Cookie: theme=dark; sessionid=correct-horse-battery-staple",
+		"Set-Cookie: sessionid=correct-horse-battery-staple; HttpOnly",
 	} {
 		if !LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = false, want true for a credential-shaped value", text)

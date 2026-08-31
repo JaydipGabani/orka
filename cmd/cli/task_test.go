@@ -851,6 +851,37 @@ func TestTaskCreateAgentTypeSurfacesForbiddenLookup(t *testing.T) {
 	}
 }
 
+func TestTaskCreateAgentTypeRejectsMalformedLookup(t *testing.T) {
+	for name, responseBody := range map[string]string{
+		"invalid json": `{"spec":`,
+		"null object":  `null`,
+		"missing name": `{ "spec": {} }`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.Path == "/api/v1/agents/broken" {
+					fmt.Fprint(w, responseBody) //nolint:errcheck
+					return
+				}
+				if r.Method == http.MethodPost && r.URL.Path == "/api/v1/tasks" {
+					t.Error("task was created despite an invalid Agent response")
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer srv.Close()
+
+			root := newRootCmd()
+			root.SetArgs([]string{"task", "create", "--server", srv.URL, "--agent", "broken", "do stuff"})
+			err := root.Execute()
+			if err == nil || !strings.Contains(err.Error(), "pass --type") {
+				t.Fatalf("Execute() error = %v, want explicit --type guidance", err)
+			}
+		})
+	}
+}
+
 func TestTaskCreateAgentTypeInference(t *testing.T) {
 	cases := []struct {
 		name     string

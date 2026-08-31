@@ -525,7 +525,7 @@ func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSumma
 	if strings.TrimSpace(expected.FindingID) == "" || result.FindingID != expected.FindingID {
 		return nil, fmt.Errorf("patch result findingId does not match the expected finding")
 	}
-	summary := strings.TrimSpace(result.Summary)
+	summary := strings.TrimSpace(stripUnsafeTextRunes(result.Summary))
 	if summary == "" {
 		return nil, fmt.Errorf("patch summary is required")
 	}
@@ -551,7 +551,7 @@ func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSumma
 	changed := make([]string, 0, len(result.ChangedFiles))
 	seen := make(map[string]struct{}, len(result.ChangedFiles))
 	for _, file := range result.ChangedFiles {
-		file = strings.TrimSpace(strings.ReplaceAll(file, "\\", "/"))
+		file = strings.TrimSpace(strings.ReplaceAll(stripUnsafeTextRunes(file), "\\", "/"))
 		for strings.HasPrefix(file, "./") {
 			file = strings.TrimPrefix(file, "./")
 		}
@@ -572,13 +572,15 @@ func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSumma
 	if len(result.TestsRun) > maxPatchTestsRun {
 		return nil, fmt.Errorf("patch testsRun exceeds %d entries", maxPatchTestsRun)
 	}
-	for _, test := range result.TestsRun {
-		if strings.TrimSpace(test.Command) == "" || len(test.Command) > maxValidationItemBytes {
+	for i := range result.TestsRun {
+		command := strings.TrimSpace(stripUnsafeTextRunes(result.TestsRun[i].Command))
+		if command == "" || len(command) > maxValidationItemBytes {
 			return nil, fmt.Errorf("patch testsRun contains an invalid command")
 		}
-		if LooksLikeSecret(test.Command) {
+		if LooksLikeSecret(command) {
 			return nil, fmt.Errorf("patch testsRun contains a credential-shaped command")
 		}
+		result.TestsRun[i].Command = command
 	}
 	risk := strings.ToLower(strings.TrimSpace(result.Risk))
 	switch risk {

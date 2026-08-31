@@ -1,6 +1,9 @@
 package supervisor
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 	t.Parallel()
@@ -10,7 +13,11 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 		"data: {\"error\": {\"message\": \"rate limited\"}}\n\n",
 		"data: {\"type\": \"response.failed\", \"response\": {}}\n\n",
 		"data: { \"type\" : \"error\" , \"error\": {} }\n\n",
+		"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\"}",
+		"data: {\"padding\":\"" + strings.Repeat("x", 2048) + "\",\"type\":\"response.failed\"}\n\n",
 	}
+	// One failure stream deliberately ends without a trailing newline:
+	// the flush at end-of-stream must scan the residual line.
 	for _, stream := range failures {
 		scanner := &sseTerminalErrorScanner{}
 		// Feed byte-by-byte to prove chunk boundaries cannot hide a marker.
@@ -19,13 +26,14 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+		scanner.flush()
 		if !scanner.failed {
 			t.Fatalf("scanner missed terminal error in %q", stream[:40])
 		}
 	}
 	clean := []string{
 		"event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
-		"data: {\"choices\":[{\"delta\":{\"content\":\"discussing \\\"type\\\":\\\"error\\\" handling\"}}]}\n\ndata: [DONE]\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\"discussing event: response.failed and \\\"type\\\":\\\"error\\\" handling\"}}]}\n\ndata: [DONE]\n\n",
 		"data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
 	}
 	for _, stream := range clean {
@@ -36,6 +44,16 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 		if scanner.failed {
 			t.Fatalf("scanner false-failed clean stream %q (detail %q)", stream[:40], scanner.detail)
 		}
+		if !scanner.completed {
+			t.Fatalf("scanner missed terminal success in %q", stream[:40])
+		}
+	}
+	scanner := &sseTerminalErrorScanner{}
+	if _, err := scanner.Write([]byte("event: response.created\ndata: {}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if scanner.failed || scanner.completed {
+		t.Fatalf("incomplete stream verdict = failed:%t completed:%t, want neither", scanner.failed, scanner.completed)
 	}
 }
 

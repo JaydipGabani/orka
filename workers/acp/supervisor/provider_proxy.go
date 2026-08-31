@@ -1077,9 +1077,20 @@ func (p *providerProxy) relayUpstreamResponse(
 	flusher, _ := w.(http.Flusher)
 	relayed := &countingWriter{w: w}
 	err := providerproxy.StreamBoundedResponse(relayed, body, p.maxResponseBytes, flusher)
-	streamFailed := func() bool { return streamScanner != nil && streamScanner.failed }
+	streamFailed := func() bool {
+		if streamScanner == nil {
+			return false
+		}
+		// A stream can end on an unterminated line (no trailing newline);
+		// the residual buffer must be scanned before the verdict.
+		streamScanner.flush()
+		return streamScanner.failed
+	}
 	recordStreamFailure := func() {
 		session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider stream reported a terminal error: "+streamScanner.detail)
+	}
+	recordIncompleteStream := func() {
+		session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider stream ended before a terminal success event")
 	}
 	if upstreamFailed {
 		session.attachInferenceFailureDetail(promptID, requestClass, seq, providerUpstreamErrorDetail(capture.buffer))
@@ -1120,39 +1131,63 @@ func (p *providerProxy) relayUpstreamResponse(
 			recordStreamFailure()
 			return
 		}
+		if streamScanner != nil && !streamScanner.completed {
+			recordIncompleteStream()
+			return
+		}
 		// A success is only accounted once the whole body reached the
-		// child; a chunked response is not known to be usable earlier.
+		// child; a streamed response must also carry a provider terminal
+		// success marker so a truncated 2xx cannot mask an earlier failure.
 		session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
 	}
 }
 
 // sseTerminalErrorScanner watches a relayed text/event-stream body for an
-// explicit terminal error event. Providers can fail after a 200 status line:
-// Anthropic emits `event: error` mid-stream, and OpenAI-style streams emit
-// `response.failed` / top-level error payloads. Detection is marker-based on
-// raw stream lines: model-generated content cannot spoof the markers because
-// content deltas carry them only JSON-escaped (\" not "). Only explicit
-// error markers flip the result — unknown dialects change nothing — so this
-// strictly removes false successes without inventing false failures.
+// explicit terminal result. Providers can fail after a 200 status line, and
+// a clean EOF without a success marker is only evidence of a truncated
+// stream. Marker matching uses a bounded rolling window of compacted line
+// bytes: model-generated content carries embedded markers JSON-escaped and
+// cannot spoof them.
 type sseTerminalErrorScanner struct {
-	line   []byte
-	failed bool
-	detail string
+	linePrefix []byte
+	lineWindow []byte
+	compactLen int
+	failed     bool
+	completed  bool
+	detail     string
 }
 
-const sseScannerMaxLineBytes = 1024
+const (
+	sseScannerDetailPrefixBytes = 1024
+	sseScannerWindowBytes       = 64
+)
 
 // Markers are matched against a whitespace-stripped copy of each line, so
 // valid spaced JSON ({"type": "response.failed"}) and unspaced JSON match
 // identically. Content deltas still cannot spoof them: quotes inside model
 // text arrive JSON-escaped (\"), and stripping whitespace does not unescape.
-var sseTerminalErrorMarkers = []string{
-	"event:error",
-	"event:response.failed",
-	`"type":"error"`,
-	`"type":"response.failed"`,
-	`data:{"error"`,
+var sseTerminalErrorEventMarkers = [][]byte{
+	[]byte("event:error"),
+	[]byte("event:response.failed"),
 }
+
+var sseTerminalErrorPayloadMarkers = [][]byte{
+	[]byte(`"type":"error"`),
+	[]byte(`"type":"response.failed"`),
+	[]byte(`data:{"error"`),
+}
+
+var sseTerminalSuccessEventMarkers = [][]byte{
+	[]byte("event:message_stop"),
+	[]byte("event:response.completed"),
+}
+
+var sseTerminalSuccessPayloadMarkers = [][]byte{
+	[]byte(`"type":"message_stop"`),
+	[]byte(`"type":"response.completed"`),
+}
+
+var sseDoneMarker = []byte("data:[DONE]")
 
 func (c *sseTerminalErrorScanner) Write(p []byte) (int, error) {
 	if c.failed {
@@ -1160,32 +1195,90 @@ func (c *sseTerminalErrorScanner) Write(p []byte) (int, error) {
 	}
 	for _, b := range p {
 		if b == '\n' {
-			c.scanLine()
-			c.line = c.line[:0]
+			c.finishLine()
+			if c.failed {
+				return len(p), nil
+			}
+			c.resetLine()
 			continue
 		}
-		if len(c.line) < sseScannerMaxLineBytes {
-			c.line = append(c.line, b)
+		if len(c.linePrefix) < sseScannerDetailPrefixBytes {
+			c.linePrefix = append(c.linePrefix, b)
+		}
+		if b == ' ' || b == '\t' || b == '\r' {
+			continue
+		}
+		c.compactLen++
+		if len(c.lineWindow) < sseScannerWindowBytes {
+			c.lineWindow = append(c.lineWindow, b)
+		} else {
+			copy(c.lineWindow, c.lineWindow[1:])
+			c.lineWindow[len(c.lineWindow)-1] = b
+		}
+		c.scanWindow()
+		if c.failed {
+			return len(p), nil
 		}
 	}
 	return len(p), nil
 }
 
-func (c *sseTerminalErrorScanner) scanLine() {
-	line := strings.TrimRight(string(c.line), "\r")
-	compact := strings.Map(func(r rune) rune {
-		if r == ' ' || r == '\t' {
-			return -1
-		}
-		return r
-	}, line)
-	for _, marker := range sseTerminalErrorMarkers {
-		if strings.Contains(compact, marker) {
-			c.failed = true
-			c.detail = providerUpstreamErrorDetail([]byte(line))
+// flush scans any residual unterminated line at end of stream.
+func (c *sseTerminalErrorScanner) flush() {
+	if c.compactLen > 0 && !c.failed {
+		c.finishLine()
+		c.resetLine()
+	}
+}
+
+func (c *sseTerminalErrorScanner) scanWindow() {
+	for _, marker := range sseTerminalErrorPayloadMarkers {
+		if bytes.HasSuffix(c.lineWindow, marker) {
+			c.markFailure(marker)
 			return
 		}
 	}
+	for _, marker := range sseTerminalSuccessPayloadMarkers {
+		if bytes.HasSuffix(c.lineWindow, marker) {
+			c.completed = true
+			return
+		}
+	}
+}
+
+func (c *sseTerminalErrorScanner) finishLine() {
+	for _, marker := range sseTerminalErrorEventMarkers {
+		if c.compactLen == len(marker) && bytes.Equal(c.lineWindow, marker) {
+			c.markFailure(marker)
+			return
+		}
+	}
+	if c.compactLen == len(sseDoneMarker) && bytes.Equal(c.lineWindow, sseDoneMarker) {
+		c.completed = true
+		return
+	}
+	for _, marker := range sseTerminalSuccessEventMarkers {
+		if c.compactLen == len(marker) && bytes.Equal(c.lineWindow, marker) {
+			c.completed = true
+			return
+		}
+	}
+}
+
+func (c *sseTerminalErrorScanner) markFailure(marker []byte) {
+	c.failed = true
+	if len(c.linePrefix) < sseScannerDetailPrefixBytes {
+		c.detail = providerUpstreamErrorDetail(bytes.TrimSuffix(c.linePrefix, []byte{'\r'}))
+	}
+	if c.detail == "" {
+		c.detail = string(marker)
+	}
+}
+
+func (c *sseTerminalErrorScanner) resetLine() {
+	c.linePrefix = c.linePrefix[:0]
+	c.lineWindow = c.lineWindow[:0]
+	c.compactLen = 0
 }
 
 func normalizeProviderRequestBody(providerKind, model, requestPath string, modelOutputLimit int64, body []byte) ([]byte, error) {

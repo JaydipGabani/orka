@@ -60,6 +60,16 @@ describe('useTaskListAll', () => {
     await waitFor(() => expect(result.current.data?.items[0]?.metadata.name).toBe('late-running'))
     expect(seen).toEqual([null, 'next-page'])
   })
+
+  it('rejects a repeated continuation cursor', async () => {
+    server.use(http.get('/api/v1/tasks', () =>
+      HttpResponse.json({ items: [], metadata: { continue: 'same-page' } }),
+    ))
+
+    const { result } = renderHook(() => useTaskListAll('100', false), { wrapper: createWrapper() })
+    await waitFor(() => expect(result.current.isError).toBe(true))
+    expect(result.current.error).toEqual(new Error('task list pagination repeated continuation cursor'))
+  })
 })
 
 describe('useTask', () => {

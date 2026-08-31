@@ -60,13 +60,13 @@ var (
 	// "_" word character, so the prefix is matched explicitly. Quoted values
 	// additionally admit spaces and any symbol ("correct horse battery
 	// staple"); the unquoted alternative admits common password symbols
-	// (@#$%^&*!?|) so a dotenv literal like p@ssword-… is still measured as
-	// one value. Structural characters stay excluded deliberately: quotes
-	// and backticks delimit, and ()<>[]{} feed the placeholder and
+	// (@#$%^&*!?|,;\\`) so a dotenv or YAML literal like p@ssword-… is still
+	// measured as one value. Structural characters stay excluded deliberately:
+	// quotes delimit, and ()<>[]{} feed the placeholder and
 	// call-syntax exemptions — swallowing them would break the code-plumbing
 	// negatives (apiKey = strings.TrimSpace(cfg.APIKey)). Placeholder ($VAR, <example>, {{ .Token }}) and
 	// code-reference exemptions run on the captured value either way.
-	policySensitiveAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|priv` + `ate[_-]?key)\s*[:=]\s*(?:"([^"\r\n]{16,})"|'([^'\r\n]{16,})'|([A-Za-z0-9_./+=~:@#$%^&*!?|-]{16,}))`)
+	policySensitiveAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|priv` + `ate[_-]?key)\s*[:=]\s*(?:"([^"\r\n]{16,})"|'([^'\r\n]{16,})'|([A-Za-z0-9_./+=~:@#$%^&*!?|,;\\` + "`" + `-]{16,}))`)
 	policyJWTPattern                 = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])ey` + `J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}([^A-Za-z0-9_-]|$)`)
 	// Header-carried credentials are flagged only when a credential-shaped
 	// value follows: "Authorization: Bearer $TOKEN" in documentation is not
@@ -77,8 +77,10 @@ var (
 	// Signed-URL query credentials (S3/GCS presigned URLs, SAS tokens) use
 	// the same parameter set internal/redact scrubs; a published URL with a
 	// live signature grants access just like a bearer token.
-	policySignedURLPattern = regexp.MustCompile(`(?i)[?&](?:sig|sign` + `ature|sas|x-amz-sign` + `ature|x-amz-sec` + `urity-token|x-amz-cred` + `ential|x-goog-sign` + `ature|x-goog-cred` + `ential)=([^&#\s"'<>,;()\[\]]{16,})`)
-	policyTxnTokenPattern  = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=~:-]{16,})`)
+	policySignedURLPattern   = regexp.MustCompile(`(?i)[?&](?:sig|sign` + `ature|sas|x-amz-sign` + `ature|x-amz-sec` + `urity-token|x-amz-cred` + `ential|x-goog-sign` + `ature|x-goog-cred` + `ential)=([^&#\s"'<>,;()\[\]]{16,})`)
+	policyTxnTokenPattern    = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=~:-]{16,})`)
+	policyCookiePattern      = regexp.MustCompile(`(?i)\b(set-cookie|cookie)\s*:\s*([^\r\n]+)`)
+	policyCookieValuePattern = regexp.MustCompile("^[A-Za-z0-9_./+=~:@#$%^&*!?|,'\\\\`-]{16,}$")
 )
 
 // placeholderFormPattern matches complete variable/template forms: a shell
@@ -127,25 +129,65 @@ var codeReferenceCredentialTail = regexp.MustCompile(`(?i)^(?:api[_-]?key|access
 // from configuration would otherwise make any file that touches credential
 // plumbing unpublishable, while arbitrary dotted literals stay flagged.
 // callableReferencePattern matches an identifier that can legally precede a
-// call AND carries real identifier structure — a dot (os.Getenv), an
-// underscore (read_password), or mixed case (readPasswordFromKeychain). A
-// bare single-case alphanumeric run is excluded: values only reach this
-// exemption at 16+ characters, where an undifferentiated run is far more
-// likely a credential with "(" appended than a function name, so appending "(" to a secret cannot buy the exemption.
+// call and is either qualified (os.Getenv) or an unqualified credential
+// reader (readPasswordFromKeychain). Requiring a complete call suffix and a
+// reader-shaped unqualified name prevents arbitrary mixed-case or underscored
+// credentials from buying the exemption by appending call punctuation.
 var callableReferencePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$`)
+var unqualifiedCredentialReaderPattern = regexp.MustCompile(`(?i)^(?:fetch|get|load|lookup|read|resolve)[A-Za-z0-9_]*(?:api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[A-Za-z0-9_]*$`)
 
 func callableReferenceShape(value string) bool {
 	if !callableReferencePattern.MatchString(value) {
 		return false
 	}
-	if strings.ContainsAny(value, "._") {
+	if strings.Contains(value, ".") {
 		return true
 	}
-	return strings.ToLower(value) != value && strings.ToUpper(value) != value
+	return unqualifiedCredentialReaderPattern.MatchString(value)
+}
+
+func hasCompleteCallSuffix(text string, start int) bool {
+	if start >= len(text) || text[start] != '(' {
+		return false
+	}
+	depth := 0
+	var quote byte
+	escaped := false
+	for i := start; i < len(text); i++ {
+		ch := text[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"', '`':
+			quote = ch
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return true
+			}
+		case '\r', '\n':
+			return false
+		}
+	}
+	return false
 }
 
 func secretValueIsCode(text string, value string, end int) bool {
-	if end < len(text) && text[end] == '(' && callableReferenceShape(value) {
+	if callableReferenceShape(value) && hasCompleteCallSuffix(text, end) {
 		return true
 	}
 	if !codeReferencePattern.MatchString(value) {
@@ -173,12 +215,36 @@ func sensitiveValueMatch(pattern *regexp.Regexp, text string) bool {
 	return false
 }
 
+func cookieHeadersLookLikeSecret(text string) bool {
+	for _, match := range policyCookiePattern.FindAllStringSubmatch(text, -1) {
+		parts := strings.Split(match[2], ";")
+		if strings.EqualFold(match[1], "set-cookie") && len(parts) > 1 {
+			parts = parts[:1]
+		}
+		for _, part := range parts {
+			_, value, ok := strings.Cut(part, "=")
+			if !ok {
+				continue
+			}
+			value = strings.TrimSpace(value)
+			if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
+				value = value[1 : len(value)-1]
+			}
+			if !secretValuePlaceholder(value) && policyCookieValuePattern.MatchString(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // LooksLikeSecret reports whether text carries a credential-shaped value:
 // known token prefixes, JWTs, PEM blocks, or an assignment/header whose value
 // is long enough to be a real secret. Bare keywords such as
 // "OPENAI_API_KEY=dummy" or "Authorization: Bearer $TOKEN" are not secrets
 // and must not block documentation or code that merely mentions them.
 func LooksLikeSecret(text string) bool {
+	text = stripUnsafeTextRunes(text)
 	if policySensitivePrefixPattern.MatchString(text) {
 		return true
 	}
@@ -189,6 +255,9 @@ func LooksLikeSecret(text string) bool {
 		return true
 	}
 	if sensitiveValueMatch(policyBearerHeaderPattern, text) || sensitiveValueMatch(policyTxnTokenPattern, text) {
+		return true
+	}
+	if cookieHeadersLookLikeSecret(text) {
 		return true
 	}
 	if sensitiveValueMatch(policySignedURLPattern, text) {
