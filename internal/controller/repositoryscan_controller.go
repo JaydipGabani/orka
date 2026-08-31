@@ -2123,14 +2123,19 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 	finding.ID = existing.ID
 	finding.Fingerprint = existing.Fingerprint
 	finding.CreatedAt = existing.CreatedAt
-	if existing.State != "" && existing.State != findingStateOpen && existing.State != findingStateFixed && existing.State != findingStateResolved {
+	reopened := existing.State == findingStateFixed || existing.State == findingStateResolved
+	if reopened {
+		finding.State = findingStateOpen
+	} else if existing.State != "" && existing.State != findingStateOpen {
 		finding.State = existing.State
 	}
-	if existing.PatchProposalID != "" {
-		finding.PatchProposalID = existing.PatchProposalID
+	if !reopened {
+		if existing.PatchProposalID != "" {
+			finding.PatchProposalID = existing.PatchProposalID
+		}
+		finding.PRNumber = existing.PRNumber
+		finding.PRURL = existing.PRURL
 	}
-	finding.PRNumber = existing.PRNumber
-	finding.PRURL = existing.PRURL
 	finding.CreatedAt = existing.CreatedAt
 	if existing.ValidationStatus == findingValidationStatusValidated ||
 		existing.ValidationStatus == findingValidationStatusPending {

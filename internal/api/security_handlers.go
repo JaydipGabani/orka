@@ -1314,9 +1314,13 @@ func (h *Handlers) CreateSecurityPullRequest(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list patch proposals: %v", err))
 	}
+	currentProposalID := strings.TrimSpace(finding.PatchProposalID)
+	if currentProposalID == "" {
+		return fiber.NewError(fiber.StatusConflict, "governed pull request receipt is not available yet")
+	}
 	var proposal *store.PatchProposal
 	for i := range proposals {
-		if proposals[i].Status == "pr_opened" && proposals[i].PRNumber != nil && proposals[i].PRURL != "" {
+		if proposals[i].ID == currentProposalID && proposals[i].Status == "pr_opened" && proposals[i].PRNumber != nil && proposals[i].PRURL != "" {
 			proposal = &proposals[i]
 			break
 		}

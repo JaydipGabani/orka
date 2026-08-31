@@ -667,11 +667,22 @@ func (s *Store) UpsertFinding(ctx context.Context, finding *store.Finding) error
 		     ELSE excluded.validation_json
 		   END,
 		   patch_proposal_id = CASE
+		     WHEN security_findings.state IN ('fixed', 'resolved')
+		       AND excluded.state = 'open'
+		       THEN excluded.patch_proposal_id
 		     WHEN excluded.patch_proposal_id IS NOT NULL AND excluded.patch_proposal_id != '' THEN excluded.patch_proposal_id
 		     ELSE security_findings.patch_proposal_id
 		   END,
-		   pr_number = COALESCE(excluded.pr_number, security_findings.pr_number),
+		   pr_number = CASE
+		     WHEN security_findings.state IN ('fixed', 'resolved')
+		       AND excluded.state = 'open'
+		       THEN excluded.pr_number
+		     ELSE COALESCE(excluded.pr_number, security_findings.pr_number)
+		   END,
 		   pr_url = CASE
+		     WHEN security_findings.state IN ('fixed', 'resolved')
+		       AND excluded.state = 'open'
+		       THEN excluded.pr_url
 		     WHEN excluded.pr_url IS NOT NULL AND excluded.pr_url != '' THEN excluded.pr_url
 		     ELSE security_findings.pr_url
 		   END,
@@ -898,6 +909,20 @@ func (s *Store) MarkFindingDuplicate(ctx context.Context, namespace, id, canonic
 	}
 	if sourceRepo != canonicalRepo || canonicalDuplicate != "" {
 		return store.ValidationErrorf("duplicate and canonical findings must share a repository scan and the canonical finding cannot be an alias")
+	}
+	if _, err := tx.ExecContext(ctx, `WITH RECURSIVE descendants(id) AS (
+		SELECT id FROM security_findings
+		 WHERE namespace = ? AND repository_scan = ? AND duplicate_of = ?
+		UNION
+		SELECT finding.id FROM security_findings finding
+		 JOIN descendants parent ON finding.duplicate_of = parent.id
+		 WHERE finding.namespace = ? AND finding.repository_scan = ?
+	)
+	UPDATE security_findings
+	 SET duplicate_of = ?, updated_at = CURRENT_TIMESTAMP
+	 WHERE namespace = ? AND repository_scan = ? AND id IN (SELECT id FROM descendants)`,
+		namespace, sourceRepo, id, namespace, sourceRepo, canonicalID, namespace, sourceRepo); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE security_findings SET duplicate_of = ?, updated_at = CURRENT_TIMESTAMP WHERE namespace = ? AND id = ?`, canonicalID, namespace, id); err != nil {
 		return err

@@ -1457,20 +1457,21 @@ func TestCreateSecurityPullRequestReturnsGovernedReceiptWithoutGitHubMutation(t 
 	prNumber := 99
 	prURL := server.URL + "/pull/99"
 	require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
-		ID:             "finding-1",
-		Namespace:      "demo",
-		RepositoryScan: "scan-1",
-		ScanRunID:      "scan-run-1",
-		Fingerprint:    "fp-1",
-		Title:          "Command injection",
-		Summary:        "Unsanitized user input reaches shell execution.",
-		Severity:       "critical",
-		Confidence:     "high",
-		State:          "pr_open",
-		RootCause:      "Shell command arguments are concatenated directly.",
-		Remediation:    "Use argument arrays and validate inputs.",
-		PRNumber:       &prNumber,
-		PRURL:          prURL,
+		ID:              "finding-1",
+		Namespace:       "demo",
+		RepositoryScan:  "scan-1",
+		ScanRunID:       "scan-run-1",
+		Fingerprint:     "fp-1",
+		Title:           "Command injection",
+		Summary:         "Unsanitized user input reaches shell execution.",
+		Severity:        "critical",
+		Confidence:      "high",
+		State:           "pr_open",
+		RootCause:       "Shell command arguments are concatenated directly.",
+		Remediation:     "Use argument arrays and validate inputs.",
+		PatchProposalID: "patch-1",
+		PRNumber:        &prNumber,
+		PRURL:           prURL,
 	}))
 	require.NoError(t, securityStore.CreatePatchProposal(ctx, &store.PatchProposal{
 		ID:             "patch-1",
@@ -1512,8 +1513,29 @@ func TestCreateSecurityPullRequestReturnsGovernedReceiptWithoutGitHubMutation(t 
 	finding, err := securityStore.GetFinding(ctx, "demo", "finding-1")
 	require.NoError(t, err)
 	require.Equal(t, "pr_open", finding.State)
+	require.Equal(t, "patch-1", finding.PatchProposalID)
 	require.Equal(t, prURL, finding.PRURL)
 	require.Equal(t, prNumber, *finding.PRNumber)
+
+	require.NoError(t, securityStore.UpdateFindingState(ctx, "demo", finding.ID, "resolved"))
+	reobserved, err := securityStore.GetFinding(ctx, "demo", finding.ID)
+	require.NoError(t, err)
+	reobserved.State = "open"
+	reobserved.PatchProposalID = ""
+	reobserved.PRNumber = nil
+	reobserved.PRURL = ""
+	require.NoError(t, securityStore.UpsertFinding(ctx, reobserved))
+
+	staleReq := httptest.NewRequest(http.MethodPost, "/security/findings/finding-1/pull-request?namespace=demo", nil)
+	staleResp, err := app.Test(staleReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusConflict, staleResp.StatusCode)
+	reopened, err := securityStore.GetFinding(ctx, "demo", finding.ID)
+	require.NoError(t, err)
+	require.Equal(t, "open", reopened.State)
+	require.Empty(t, reopened.PatchProposalID)
+	require.Nil(t, reopened.PRNumber)
+	require.Empty(t, reopened.PRURL)
 }
 
 func TestCreateSecurityPatchTaskRequestsGovernedPublication(t *testing.T) {

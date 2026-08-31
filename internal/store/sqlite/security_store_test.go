@@ -725,7 +725,7 @@ func TestMarkFindingDuplicateExcludesAliasFromListsAndCounts(t *testing.T) {
 	}
 }
 
-func TestListPatchProposalsFollowsFindingAliases(t *testing.T) {
+func TestListPatchProposalsFollowsFlattenedFindingAliases(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
 	newFinding := func(suffix string) *store.Finding {
@@ -733,19 +733,29 @@ func TestListPatchProposalsFollowsFindingAliases(t *testing.T) {
 	}
 	canonical := newFinding("canonical-proposal")
 	alias := newFinding("alias-proposal")
-	for _, finding := range []*store.Finding{canonical, alias} {
+	nestedAlias := newFinding("nested-alias-proposal")
+	for _, finding := range []*store.Finding{canonical, alias, nestedAlias} {
 		if err := s.UpsertFinding(ctx, finding); err != nil {
 			t.Fatalf("UpsertFinding(%s): %v", finding.ID, err)
 		}
 	}
-	proposal := &store.PatchProposal{ID: "patch-alias", Namespace: alias.Namespace, RepositoryScan: alias.RepositoryScan, FindingID: alias.ID, TaskName: "patch-task", Branch: "orka/security/alias", Status: "pending"}
+	proposal := &store.PatchProposal{ID: "patch-alias", Namespace: nestedAlias.Namespace, RepositoryScan: nestedAlias.RepositoryScan, FindingID: nestedAlias.ID, TaskName: "patch-task", Branch: "orka/security/alias", Status: "pending"}
 	if err := s.CreatePatchProposal(ctx, proposal); err != nil {
 		t.Fatalf("CreatePatchProposal: %v", err)
+	}
+	if err := s.MarkFindingDuplicate(ctx, nestedAlias.Namespace, nestedAlias.ID, alias.ID); err != nil {
+		t.Fatalf("MarkFindingDuplicate(nested alias): %v", err)
 	}
 	if err := s.MarkFindingDuplicate(ctx, alias.Namespace, alias.ID, canonical.ID); err != nil {
 		t.Fatalf("MarkFindingDuplicate: %v", err)
 	}
-	for _, findingID := range []string{canonical.ID, alias.ID} {
+	for _, findingID := range []string{alias.ID, nestedAlias.ID} {
+		finding, err := s.GetFinding(ctx, canonical.Namespace, findingID)
+		if err != nil || finding.DuplicateOf != canonical.ID {
+			t.Fatalf("GetFinding(%s) = %#v, err %v", findingID, finding, err)
+		}
+	}
+	for _, findingID := range []string{canonical.ID, alias.ID, nestedAlias.ID} {
 		proposals, err := s.ListPatchProposals(ctx, alias.Namespace, findingID)
 		if err != nil || len(proposals) != 1 || proposals[0].ID != proposal.ID {
 			t.Fatalf("ListPatchProposals(%s) = %#v, err %v", findingID, proposals, err)

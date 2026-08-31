@@ -3814,6 +3814,65 @@ func TestMergeExistingFindingCollapsesSemanticDuplicates(t *testing.T) {
 	}
 }
 
+func TestMergeExistingFindingReopensResolvedFindingWithoutRemediationProjection(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
+	scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}}
+	prNumber := 42
+	existing := &storepkg.Finding{
+		ID:               "fnd_recurrence",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_old",
+		Fingerprint:      "recurrence-fingerprint",
+		Title:            "Resolved command injection",
+		Category:         "command injection",
+		Summary:          "old occurrence",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusValidated,
+		State:            findingStateResolved,
+		FilePath:         "run.go",
+		Line:             40,
+		PatchProposalID:  "patch-old",
+		PRNumber:         &prNumber,
+		PRURL:            "https://github.com/example/kaset/pull/42",
+	}
+	if err := securityStore.UpsertFinding(ctx, existing); err != nil {
+		t.Fatalf("UpsertFinding(existing) error = %v", err)
+	}
+	incoming := &storepkg.Finding{
+		ID:               existing.ID,
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_current",
+		Fingerprint:      existing.Fingerprint,
+		Title:            "Command injection returned",
+		Category:         existing.Category,
+		Summary:          "new occurrence",
+		Severity:         "critical",
+		Confidence:       "high",
+		ValidationStatus: "unvalidated",
+		State:            findingStateOpen,
+		FilePath:         existing.FilePath,
+		Line:             existing.Line,
+	}
+	if err := reconciler.mergeExistingFinding(ctx, scan, incoming); err != nil {
+		t.Fatalf("mergeExistingFinding() error = %v", err)
+	}
+	if incoming.State != findingStateOpen || incoming.PatchProposalID != "" || incoming.PRNumber != nil || incoming.PRURL != "" {
+		t.Fatalf("incoming recurrence = %#v", incoming)
+	}
+	if err := securityStore.UpsertFinding(ctx, incoming); err != nil {
+		t.Fatalf("UpsertFinding(incoming) error = %v", err)
+	}
+	stored, err := securityStore.GetFinding(ctx, defaultNS, existing.ID)
+	if err != nil || stored.State != findingStateOpen || stored.PatchProposalID != "" || stored.PRNumber != nil || stored.PRURL != "" {
+		t.Fatalf("stored recurrence = %#v, err %v", stored, err)
+	}
+}
+
 func TestFindingIdentityMatchScoreRequiresCategoryAndStableLocation(t *testing.T) {
 	base := &storepkg.Finding{
 		Category: "path traversal",
