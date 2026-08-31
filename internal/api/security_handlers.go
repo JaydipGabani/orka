@@ -1054,6 +1054,10 @@ func (h *Handlers) DismissSecurityFinding(c fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get finding: %v", err))
 	}
+	finding, err = h.canonicalSecurityFinding(c.Context(), namespace, finding)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to resolve canonical finding: %v", err))
+	}
 	scan, err := h.fetchRepositoryScan(c.Context(), namespace, finding.RepositoryScan)
 	if err != nil {
 		return err
@@ -1061,7 +1065,7 @@ func (h *Handlers) DismissSecurityFinding(c fiber.Ctx) error {
 	if err := h.authorizeContextTokenSecurityScanTask(c, "dismissSecurityFinding", scan, scan.Spec.AnalysisAgentRef); err != nil {
 		return err
 	}
-	if err := h.securityStore.UpdateFindingState(c.Context(), namespace, c.Params("id"), "dismissed"); err != nil {
+	if err := h.securityStore.UpdateFindingState(c.Context(), namespace, finding.ID, "dismissed"); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "finding not found")
 		}
@@ -1089,6 +1093,10 @@ func (h *Handlers) ReopenSecurityFinding(c fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get finding: %v", err))
 	}
+	finding, err = h.canonicalSecurityFinding(c.Context(), namespace, finding)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to resolve canonical finding: %v", err))
+	}
 	scan, err := h.fetchRepositoryScan(c.Context(), namespace, finding.RepositoryScan)
 	if err != nil {
 		return err
@@ -1096,7 +1104,7 @@ func (h *Handlers) ReopenSecurityFinding(c fiber.Ctx) error {
 	if err := h.authorizeContextTokenSecurityScanTask(c, "reopenSecurityFinding", scan, scan.Spec.AnalysisAgentRef); err != nil {
 		return err
 	}
-	if err := h.securityStore.UpdateFindingState(c.Context(), namespace, c.Params("id"), "open"); err != nil {
+	if err := h.securityStore.UpdateFindingState(c.Context(), namespace, finding.ID, "open"); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "finding not found")
 		}
@@ -1123,6 +1131,10 @@ func (h *Handlers) ValidateSecurityFinding(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusNotFound, "finding not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get finding: %v", err))
+	}
+	finding, err = h.canonicalSecurityFinding(c.Context(), namespace, finding)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to resolve canonical finding: %v", err))
 	}
 	scan, err := h.fetchRepositoryScan(c.Context(), namespace, finding.RepositoryScan)
 	if err != nil {
@@ -1156,6 +1168,10 @@ func (h *Handlers) GenerateSecurityPatch(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusNotFound, "finding not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get finding: %v", err))
+	}
+	finding, err = h.canonicalSecurityFinding(c.Context(), namespace, finding)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to resolve canonical finding: %v", err))
 	}
 	scan, err := h.fetchRepositoryScan(c.Context(), namespace, finding.RepositoryScan)
 	if err != nil {

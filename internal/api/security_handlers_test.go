@@ -1207,6 +1207,135 @@ func TestSecurityFindingMutations_ContextTokenTransactionContextAuthorizationDen
 	}
 }
 
+func TestSecurityFindingMutationsResolveCanonicalAlias(t *testing.T) {
+	setup := func(t *testing.T, canonicalState, aliasState string) (*fiber.App, *Handlers) {
+		t.Helper()
+
+		scheme := runtime.NewScheme()
+		require.NoError(t, corev1alpha1.AddToScheme(scheme))
+		require.NoError(t, corev1.AddToScheme(scheme))
+		scan := &corev1alpha1.RepositoryScan{
+			ObjectMeta: metav1.ObjectMeta{Name: "scan-1", Namespace: "demo"},
+			Spec: corev1alpha1.RepositoryScanSpec{
+				RepoURL:                      securityTestRepoURL,
+				Branch:                       "main",
+				ReadCredentialRef:            &corev1.LocalObjectReference{Name: "source-read"},
+				PublicationReadCredentialRef: &corev1.LocalObjectReference{Name: "target-read"},
+				PublicationCredentialRef:     &corev1.LocalObjectReference{Name: "target-write"},
+				ForgeCredentialRef:           &corev1.LocalObjectReference{Name: "forge"},
+				AnalysisAgentRef:             corev1alpha1.AgentReference{Name: "analysis"},
+				PatchAgentRef:                &corev1alpha1.AgentReference{Name: "patch"},
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan).Build()
+		db, err := sqlite.NewDB(":memory:")
+		require.NoError(t, err)
+		securityStore := sqlite.NewStore(db, ":memory:")
+		handlers := NewHandlers(HandlersConfig{Client: fakeClient, SecurityStore: securityStore})
+
+		ctx := context.Background()
+		require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
+			ID:             "finding-1",
+			Namespace:      "demo",
+			RepositoryScan: "scan-1",
+			ScanRunID:      "scan-run-1",
+			Fingerprint:    "fp-1",
+			Title:          "Command injection",
+			Summary:        "Unsanitized user input reaches shell execution.",
+			Severity:       "critical",
+			Confidence:     "high",
+			State:          canonicalState,
+		}))
+		require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
+			ID:               "finding-alias",
+			Namespace:        "demo",
+			RepositoryScan:   "scan-1",
+			ScanRunID:        "scan-run-2",
+			Fingerprint:      "fp-alias",
+			Title:            "Command injection alias",
+			Summary:          "A duplicate observation of the command injection finding.",
+			Severity:         "critical",
+			Confidence:       "high",
+			State:            aliasState,
+			DuplicateOf:      "finding-1",
+			ValidationStatus: "failed",
+		}))
+
+		app := fiber.New()
+		app.Post("/security/findings/:id/dismiss", handlers.DismissSecurityFinding)
+		app.Post("/security/findings/:id/reopen", handlers.ReopenSecurityFinding)
+		app.Post("/security/findings/:id/validate", handlers.ValidateSecurityFinding)
+		app.Post("/security/findings/:id/patch", handlers.GenerateSecurityPatch)
+		return app, handlers
+	}
+
+	t.Run("dismiss", func(t *testing.T) {
+		app, handlers := setup(t, "open", "open")
+		resp, err := app.Test(httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/dismiss?namespace=demo", nil))
+		require.NoError(t, err)
+		require.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+		canonical, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-1")
+		require.NoError(t, err)
+		require.Equal(t, "dismissed", canonical.State)
+		alias, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-alias")
+		require.NoError(t, err)
+		require.Equal(t, "open", alias.State)
+	})
+
+	t.Run("reopen", func(t *testing.T) {
+		app, handlers := setup(t, "dismissed", "dismissed")
+		resp, err := app.Test(httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/reopen?namespace=demo", nil))
+		require.NoError(t, err)
+		require.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+		canonical, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-1")
+		require.NoError(t, err)
+		require.Equal(t, "open", canonical.State)
+		alias, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-alias")
+		require.NoError(t, err)
+		require.Equal(t, "dismissed", alias.State)
+	})
+
+	t.Run("validate", func(t *testing.T) {
+		app, handlers := setup(t, "open", "open")
+		resp, err := app.Test(httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/validate?namespace=demo", nil))
+		require.NoError(t, err)
+		require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+		canonical, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-1")
+		require.NoError(t, err)
+		require.Equal(t, "pending", canonical.ValidationStatus)
+		alias, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-alias")
+		require.NoError(t, err)
+		require.Equal(t, "failed", alias.ValidationStatus)
+		var tasks corev1alpha1.TaskList
+		require.NoError(t, handlers.client.List(context.Background(), &tasks, client.InNamespace("demo")))
+		require.Len(t, tasks.Items, 1)
+		require.Equal(t, "finding-1", tasks.Items[0].Labels[labels.LabelSecurityFindingID])
+	})
+
+	t.Run("generate patch", func(t *testing.T) {
+		app, handlers := setup(t, "validated", "open")
+		resp, err := app.Test(httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/patch?namespace=demo", nil))
+		require.NoError(t, err)
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+		canonical, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-1")
+		require.NoError(t, err)
+		require.Equal(t, "patch_pending", canonical.State)
+		require.NotEmpty(t, canonical.PatchProposalID)
+		alias, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-alias")
+		require.NoError(t, err)
+		require.Equal(t, "open", alias.State)
+		require.Empty(t, alias.PatchProposalID)
+		proposals, err := handlers.securityStore.ListPatchProposals(context.Background(), "demo", "finding-1")
+		require.NoError(t, err)
+		require.Len(t, proposals, 1)
+		require.Equal(t, "finding-1", proposals[0].FindingID)
+	})
+}
+
 func TestCreateSecurityPullRequest_ContextTokenTransactionContextAuthorizationDenied(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")
