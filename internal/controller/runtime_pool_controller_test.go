@@ -1363,20 +1363,97 @@ func TestRuntimePoolReconcilerKeepsSupersededPlainPoolAvailableForBoundDemand(t 
 	if replicas := ptr.Deref(deployment.Spec.Replicas, -1); replicas != 1 {
 		t.Fatalf("superseded deployment replicas = %d, want 1 while bound demand may remain", replicas)
 	}
-}
-
-func TestRuntimePoolReconcilerReportsSupersededScaleToZeroPoolStopped(t *testing.T) {
-	scheme := runtimePoolTestScheme(t)
-	pool := runtimePoolTestObject(0)
-	identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
-		"profileDigest": pool.Spec.Runtime.Profile.Digest,
-		"runtimeImage":  pool.Spec.Runtime.Image,
-	})
+	if meta.FindStatusCondition(got.Status.Conditions, acpRuntimePoolImageProvenanceCondition) != nil {
+		t.Fatal("test requires Deployment-backed historical image provenance")
+	}
+	newGeneration := got.DeepCopy()
+	newGeneration.Generation++
+	historicalConfig, err := r.runtimePoolConfigForDrain(newGeneration)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool.Name = acpRuntimePoolName(pool.Spec.Runtime.Profile.ProviderKind, harnessv2.ProfileDigest(identity))
-	pool.UID = types.UID(pool.Namespace + "-superseded-stopped-pool-uid")
+	authorized, err := r.historicalRuntimePoolImageAuthorized(context.Background(), newGeneration, historicalConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !authorized {
+		t.Fatal("Deployment provenance did not survive a controller-owned generation change")
+	}
+}
+
+func TestRuntimePoolReconcilerReportsSupersededScaleToZeroPoolStopped(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		configuredImage string
+	}{
+		{name: "rotated image", configuredImage: "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)},
+		{name: "provider image removed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtimePoolTestScheme(t)
+			pool := runtimePoolTestObject(0)
+			identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+				"profileDigest": pool.Spec.Runtime.Profile.Digest,
+				"runtimeImage":  pool.Spec.Runtime.Image,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pool.Name = acpRuntimePoolName(pool.Spec.Runtime.Profile.ProviderKind, harnessv2.ProfileDigest(identity))
+			pool.UID = types.UID(pool.Namespace + "-superseded-stopped-pool-uid")
+			meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+				Type:               acpRuntimePoolImageProvenanceCondition,
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: pool.Generation,
+				Reason:             acpRuntimePoolImageProvenanceReason,
+				Message:            "RuntimePool image and profile match a verified immutable Task execution plan",
+			})
+			pool.Generation++
+			r := runtimePoolTestReconciler(t, scheme, &fakeRuntimePoolSupervisorClient{}, pool)
+			r.AllowedImages.Codex = tc.configuredImage
+
+			runtimePoolReconcile(t, r, pool)
+			got := runtimePoolTestGetPool(t, r, pool)
+			condition := meta.FindStatusCondition(got.Status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+			if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopped ||
+				got.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
+				condition == nil || condition.Status != metav1.ConditionTrue {
+				t.Fatalf("historical scale-to-zero status = %s/%s condition=%#v, want Stopped/Closed with rollout ready", got.Status.Lifecycle, got.Status.AdmissionState, condition)
+			}
+		})
+	}
+}
+
+func TestHistoricalRuntimePoolImageRecoveryRequiresWorkspaceProvenance(t *testing.T) {
+	scheme := runtimePoolTestScheme(t)
+	pool := runtimePoolTestObject(1)
+	pool.Name = "acp-ws-codex-" + strings.Repeat("a", 16)
+	pool.UID = types.UID(pool.Namespace + "-historical-workspace-pool-uid")
+	pool.Spec.ExecutionWorkspace = &corev1alpha1.RuntimePoolExecutionWorkspaceSpec{
+		Provider:      corev1alpha1.WorkspaceProviderAgentSandbox,
+		BindingDigest: "sha256:" + strings.Repeat("7", 64),
+	}
+	pool.Spec.Capacity = &corev1alpha1.RuntimePoolCapacitySpec{MaxResidentSessions: 1, MaxRunningPrompts: 1}
+	r := runtimePoolTestReconciler(t, scheme, nil, pool)
+	r.AllowedImages.Codex = "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
+
+	if !acpRuntimePoolImageRequiresHistoricalRecovery(pool, r.AllowedImages) {
+		t.Fatal("workspace RuntimePool was excluded from historical image recovery")
+	}
+	if acpRuntimePoolImageSuperseded(pool, r.AllowedImages) {
+		t.Fatal("workspace RuntimePool was exposed to the plain-pool superseded reaper")
+	}
+	historicalConfig, err := r.runtimePoolConfigForDrain(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized, err := r.historicalRuntimePoolImageAuthorized(context.Background(), pool, historicalConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorized {
+		t.Fatal("unproven workspace RuntimePool was authorized for a historical image")
+	}
 	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
 		Type:               acpRuntimePoolImageProvenanceCondition,
 		Status:             metav1.ConditionTrue,
@@ -1384,16 +1461,13 @@ func TestRuntimePoolReconcilerReportsSupersededScaleToZeroPoolStopped(t *testing
 		Reason:             acpRuntimePoolImageProvenanceReason,
 		Message:            "RuntimePool image and profile match a verified immutable Task execution plan",
 	})
-	r := runtimePoolTestReconciler(t, scheme, &fakeRuntimePoolSupervisorClient{}, pool)
-	r.AllowedImages.Codex = "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
-
-	runtimePoolReconcile(t, r, pool)
-	got := runtimePoolTestGetPool(t, r, pool)
-	condition := meta.FindStatusCondition(got.Status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
-	if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopped ||
-		got.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
-		condition == nil || condition.Status != metav1.ConditionTrue {
-		t.Fatalf("superseded scale-to-zero status = %s/%s condition=%#v, want Stopped/Closed with rollout ready", got.Status.Lifecycle, got.Status.AdmissionState, condition)
+	pool.Generation++
+	authorized, err = r.historicalRuntimePoolImageAuthorized(context.Background(), pool, historicalConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !authorized {
+		t.Fatal("proven workspace RuntimePool was not authorized after an image rotation")
 	}
 }
 

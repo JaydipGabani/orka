@@ -412,7 +412,7 @@ func (r *RuntimePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	cfg, err := r.runtimePoolConfig(pool)
-	if err != nil && acpRuntimePoolImageSuperseded(pool, r.AllowedImages) {
+	if err != nil && acpRuntimePoolImageRequiresHistoricalRecovery(pool, r.AllowedImages) {
 		if historicalConfig, historicalErr := r.runtimePoolConfigForDrain(pool); historicalErr == nil {
 			authorized, authorizationErr := r.historicalRuntimePoolImageAuthorized(ctx, pool, historicalConfig)
 			if authorizationErr != nil {
@@ -582,7 +582,7 @@ func (r *RuntimePoolReconciler) runtimePoolConfig(pool *corev1alpha1.RuntimePool
 
 // runtimePoolConfigForDrain reconstructs the exact pool configuration without
 // applying the current-image allowlist. Callers outside deletion must first
-// prove that the historical image was authorized for this pool generation.
+// prove that the historical image was authorized for this exact pool object.
 func (r *RuntimePoolReconciler) runtimePoolConfigForDrain(pool *corev1alpha1.RuntimePool) (runtimePoolConfig, error) {
 	return r.runtimePoolConfigWithImageAdmission(pool, false)
 }
@@ -594,7 +594,12 @@ func (r *RuntimePoolReconciler) historicalRuntimePoolImageAuthorized(
 ) (bool, error) {
 	condition := meta.FindStatusCondition(pool.Status.Conditions, acpRuntimePoolImageProvenanceCondition)
 	if condition != nil && condition.Status == metav1.ConditionTrue &&
-		condition.ObservedGeneration == pool.Generation && condition.Reason == acpRuntimePoolImageProvenanceReason {
+		condition.ObservedGeneration > 0 && condition.ObservedGeneration <= pool.Generation &&
+		condition.Reason == acpRuntimePoolImageProvenanceReason {
+		// RuntimePool UID plus the CRD's immutable runtime image/profile,
+		// trust-domain, runtime-namespace, and workspace binding keep this proof
+		// attached to one exact workload identity. Controller-owned replica and
+		// capacity changes may advance generation without invalidating it.
 		return true, nil
 	}
 
@@ -623,7 +628,7 @@ func (r *RuntimePoolReconciler) historicalRuntimePoolImageAuthorized(
 	if err != nil {
 		return false, nil
 	}
-	return deployedPool.Generation == pool.Generation &&
+	return deployedPool.Generation <= pool.Generation &&
 		deployedPool.Spec.Runtime.Profile.Digest == pool.Spec.Runtime.Profile.Digest &&
 		reflect.DeepEqual(deployedConfig.profile, cfg.profile), nil
 }

@@ -191,22 +191,29 @@ func configuredACPRuntimeImage(provider string, images ACPRuntimeImages) (string
 	return strings.TrimSpace(image), nil
 }
 
-func acpRuntimePoolImageSuperseded(pool *corev1alpha1.RuntimePool, images ACPRuntimeImages) bool {
-	if pool == nil || pool.Spec.ExecutionWorkspace != nil || validateRuntimePoolImageReference(pool) != nil {
+func acpRuntimePoolImageRequiresHistoricalRecovery(pool *corev1alpha1.RuntimePool, images ACPRuntimeImages) bool {
+	if pool == nil || validateRuntimePoolImageReference(pool) != nil {
 		return false
 	}
-	identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
-		"profileDigest": pool.Spec.Runtime.Profile.Digest,
-		"runtimeImage":  strings.TrimSpace(pool.Spec.Runtime.Image),
-	})
-	if err != nil || pool.Name != acpRuntimePoolName(
-		pool.Spec.Runtime.Profile.ProviderKind,
-		harnessv2.ProfileDigest(identity),
-	) {
-		return false
+	if pool.Spec.ExecutionWorkspace == nil {
+		identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+			"profileDigest": pool.Spec.Runtime.Profile.Digest,
+			"runtimeImage":  strings.TrimSpace(pool.Spec.Runtime.Image),
+		})
+		if err != nil || pool.Name != acpRuntimePoolName(
+			pool.Spec.Runtime.Profile.ProviderKind,
+			harnessv2.ProfileDigest(identity),
+		) {
+			return false
+		}
 	}
 	approved, err := configuredACPRuntimeImage(pool.Spec.Runtime.Profile.ProviderKind, images)
-	return err == nil && ACPRuntimeImageAvailable(approved) && approved != strings.TrimSpace(pool.Spec.Runtime.Image)
+	return err == nil && approved != strings.TrimSpace(pool.Spec.Runtime.Image)
+}
+
+func acpRuntimePoolImageSuperseded(pool *corev1alpha1.RuntimePool, images ACPRuntimeImages) bool {
+	return pool != nil && pool.Spec.ExecutionWorkspace == nil &&
+		acpRuntimePoolImageRequiresHistoricalRecovery(pool, images)
 }
 
 func RuntimePoolProfileFromPlan(plan ACPRuntimePlan) corev1alpha1.RuntimePoolProfileSpec {
