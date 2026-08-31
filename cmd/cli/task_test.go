@@ -15,7 +15,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
 	"time"
+
+	"github.com/orka-agents/orka/internal/cli/client"
 )
 
 func TestFormatAge(t *testing.T) {
@@ -780,6 +783,21 @@ func TestNewTaskCreateCmdExplainsAmbiguousProviders(t *testing.T) {
 	err := root.Execute()
 	if err == nil || !strings.Contains(err.Error(), testProviderPrimary+", "+testProviderSecondary) || !strings.Contains(err.Error(), "--provider") {
 		t.Fatalf("Execute() error = %v, want the available Providers and a --provider hint", err)
+	}
+}
+
+// TestResolveDefaultProviderPrefersReadyDefault mirrors the server resolver:
+// a ready Provider named "default" wins even when another ready Provider
+// exists; otherwise a sole ready Provider is used.
+func TestResolveDefaultProviderPrefersReadyDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"items":[{"name":"openai","ready":true},{"name":"default","ready":true}]}`) //nolint:errcheck
+	}))
+	defer srv.Close()
+	c := client.NewWithNamespace(srv.URL, "", "default")
+	name, err := resolveDefaultProviderName(context.Background(), c)
+	if err != nil || name != "default" {
+		t.Fatalf("resolveDefaultProviderName() = %q, %v; want the ready Provider named default", name, err)
 	}
 }
 

@@ -276,6 +276,13 @@ func repositoryMonitorReviewContextFromFiles(owner, repository string, pr reposi
 func repositoryMonitorReviewContextMarkUnreviewableOmissions(reviewContext repositoryMonitorReviewContext) repositoryMonitorReviewContext {
 	for _, file := range reviewContext.Files {
 		if file.PatchOmitted == "" {
+			// A complete patch must agree with GitHub's own line counts; a
+			// short-served or otherwise inconsistent patch would hide part
+			// of the change while claiming completeness.
+			if file.Patch != "" && !patchMatchesLineCounts(file.Patch, file.Additions, file.Deletions) {
+				reviewContext.Truncated.Files = true
+				return reviewContext
+			}
 			continue
 		}
 		if (file.Status == repositoryMonitorReviewContextStatusAdded || file.Status == repositoryMonitorReviewContextStatusCopied) && file.Deletions == 0 {
@@ -426,6 +433,31 @@ func repositoryMonitorReviewContextDeletedLinesAltered(patch string) bool {
 		}
 	}
 	return false
+}
+
+// patchMatchesLineCounts verifies a hunk fragment's added/deleted line
+// totals against the counts GitHub reported for the file.
+func patchMatchesLineCounts(patch string, additions, deletions int) bool {
+	adds, dels := 0, 0
+	inHunk := false
+	for line := range strings.SplitSeq(patch, "\n") {
+		if strings.HasPrefix(line, "@@") {
+			inHunk = true
+			continue
+		}
+		// Anything before the first hunk marker is header material
+		// ("--- a/…", "+++ b/…"), not change content.
+		if !inHunk || len(line) == 0 {
+			continue
+		}
+		switch line[0] {
+		case '+':
+			adds++
+		case '-':
+			dels++
+		}
+	}
+	return adds == additions && dels == deletions
 }
 
 func repositoryMonitorReviewContextSanitize(value string) string {

@@ -173,7 +173,7 @@ func TestRepositoryMonitorReviewContextFromFilesCapsTotalBytes(t *testing.T) {
 	for i := range cap(files) {
 		// Added files: dropped patches on them do not gate completeness, so
 		// the test isolates the byte-budget mechanics.
-		files = append(files, repositoryMonitorPullRequestFileResponse{Filename: fmt.Sprintf("pkg/big%03d.go", i), Status: repositoryMonitorReviewContextTestAdded, Additions: 1, Patch: bigPatch})
+		files = append(files, repositoryMonitorPullRequestFileResponse{Filename: fmt.Sprintf("pkg/big%03d.go", i), Status: repositoryMonitorReviewContextTestAdded, Additions: 480, Patch: bigPatch})
 	}
 	got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), files)
 	encoded, err := json.MarshalIndent(got, "", repositoryMonitorReviewContextIndent)
@@ -622,7 +622,7 @@ func TestRepositoryMonitorReviewPromptStaysUnderBudgetWithMaximalContext(t *test
 	for i := range cap(files) {
 		// Added files: capped patches on them do not gate completeness, so
 		// this test isolates the prompt-budget mechanics.
-		files = append(files, repositoryMonitorPullRequestFileResponse{Filename: fmt.Sprintf("pkg/%03d/%s.go", i, strings.Repeat("n", 200)), Status: repositoryMonitorReviewContextTestAdded, Additions: 1, Patch: bigPatch})
+		files = append(files, repositoryMonitorPullRequestFileResponse{Filename: fmt.Sprintf("pkg/%03d/%s.go", i, strings.Repeat("n", 200)), Status: repositoryMonitorReviewContextTestAdded, Additions: 600, Patch: bigPatch})
 	}
 	pr := repositoryMonitorReviewContextTestPR()
 	prompt := buildRepositoryMonitorReviewPrompt(repositoryMonitorInventoryTestMonitor(), repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, pr, repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, pr, files))
@@ -815,7 +815,7 @@ func TestRepositoryMonitorReviewContextAlteredPathMarksChangeSetIncomplete(t *te
 			}
 		})
 	}
-	short := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{{Filename: repositoryMonitorReviewContextTestShort, Status: repositoryMonitorReviewContextTestStatus, Patch: repositoryMonitorReviewContextTestPatch}})
+	short := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{{Filename: repositoryMonitorReviewContextTestShort, Status: repositoryMonitorReviewContextTestStatus, Additions: 1, Patch: repositoryMonitorReviewContextTestPatch}})
 	if short.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=false for an in-bound path", short.Truncated)
 	}
@@ -918,5 +918,19 @@ func TestRepositoryMonitorReviewContextDeletedLineStartingWithDashesIsNotAHeader
 	patch := "@@ -1 +1 @@\n---api_key=0123456789abcdef0123\n+clean\n"
 	if !repositoryMonitorReviewContextDeletedLinesAltered(patch) {
 		t.Fatalf("deleted line beginning with dashes was skipped as a file header")
+	}
+}
+
+func TestRepositoryMonitorReviewContextInconsistentLineCountsMarkChangeSetIncomplete(t *testing.T) {
+	t.Parallel()
+	// A complete-looking patch whose line totals disagree with GitHub's
+	// reported counts is hiding part of the change; it must gate the verdict.
+	file := repositoryMonitorPullRequestFileResponse{
+		Filename: "pkg/short.go", Status: repositoryMonitorReviewContextTestStatus,
+		Additions: 5, Deletions: 2, Patch: "@@ -1 +1,2 @@\n package main\n+// change",
+	}
+	got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{file})
+	if !got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=true for a patch whose totals disagree with reported counts", got.Truncated)
 	}
 }

@@ -30,7 +30,10 @@ import (
 const (
 	// repositoryScanPublishedCommitMaxFiles bounds the files a remediation
 	// commit may touch; GitHub's commit endpoint returns at most 300 files.
-	repositoryScanPublishedCommitMaxFiles    = 300
+	repositoryScanPublishedCommitMaxFiles = 300
+	// repositoryScanPublishedCommitPageSize is GitHub's documented per_page
+	// maximum for the commit files listing.
+	repositoryScanPublishedCommitPageSize    = 100
 	repositoryScanForgeCredentialKey         = defaultACPWorkspaceCredentialKey
 	repositoryScanNonCanonicalTargetReason   = "repository scan publication target is not a canonical GitHub repository"
 	repositoryScanArtifactStoreNotConfigured = "artifact store is not configured"
@@ -315,49 +318,56 @@ func (r *RepositoryScanReconciler) fetchRepositoryScanPublishedCommit(ctx contex
 	if baseURL == "" {
 		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
 	}
-	// per_page pins the maximum file page; the commit endpoint otherwise
-	// returns a smaller default page and silently paginates the rest.
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/commits/%s?per_page=%d",
-		baseURL, url.PathEscape(owner), url.PathEscape(repository), url.PathEscape(sha), repositoryScanPublishedCommitMaxFiles)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, "", err
+	// The commit endpoint paginates its files array; per_page's documented
+	// maximum is 100, so pages are followed explicitly up to the supported
+	// file-count bound and anything beyond fails closed.
+	var files []repositoryScanCommitFileResponse
+	maxPages := repositoryScanPublishedCommitMaxFiles / repositoryScanPublishedCommitPageSize
+	for page := 1; ; page++ {
+		if page > maxPages {
+			return nil, "published patch commit exceeds the supported file count", nil
+		}
+		endpoint := fmt.Sprintf("%s/repos/%s/%s/commits/%s?per_page=%d&page=%d",
+			baseURL, url.PathEscape(owner), url.PathEscape(repository), url.PathEscape(sha), repositoryScanPublishedCommitPageSize, page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, "", err
+		}
+		repositoryMonitorSetGitHubHeaders(req, token)
+		resp, err := r.repositoryScanHTTPClient().Do(req)
+		if err != nil {
+			// The error text may carry the request URL; keep the persisted
+			// reason class-only.
+			return nil, "published patch commit could not be read from GitHub", nil
+		}
+		body, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, "published patch commit response exceeded the read limit", nil
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Sprintf("published patch commit could not be read from GitHub (HTTP %d)", resp.StatusCode), nil
+		}
+		var commit repositoryScanCommitResponse
+		if err := json.Unmarshal(body, &commit); err != nil {
+			return nil, "published patch commit response is not valid JSON", nil
+		}
+		// Every page must identify the same verified commit.
+		if !strings.EqualFold(strings.TrimSpace(commit.SHA), sha) {
+			return nil, "published patch commit response does not match the verified commit", nil
+		}
+		files = append(files, commit.Files...)
+		if len(files) > repositoryScanPublishedCommitMaxFiles {
+			return nil, "published patch commit exceeds the supported file count", nil
+		}
+		if !strings.Contains(resp.Header.Get("Link"), `rel="next"`) {
+			break
+		}
 	}
-	repositoryMonitorSetGitHubHeaders(req, token)
-	resp, err := r.repositoryScanHTTPClient().Do(req)
-	if err != nil {
-		// The error text may carry the request URL; keep the persisted
-		// reason class-only.
-		return nil, "published patch commit could not be read from GitHub", nil
-	}
-	defer resp.Body.Close() //nolint:errcheck
-	body, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
-	if err != nil {
-		return nil, "published patch commit response exceeded the read limit", nil
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Sprintf("published patch commit could not be read from GitHub (HTTP %d)", resp.StatusCode), nil
-	}
-	// A next page means the commit's file list is incomplete at the maximum
-	// page size; verifying a partial file set would let unreviewed changes
-	// through, so it fails closed like the explicit file-count bound below.
-	if strings.Contains(resp.Header.Get("Link"), `rel="next"`) {
-		return nil, "published patch commit exceeds the supported file count", nil
-	}
-	var commit repositoryScanCommitResponse
-	if err := json.Unmarshal(body, &commit); err != nil {
-		return nil, "published patch commit response is not valid JSON", nil
-	}
-	if !strings.EqualFold(strings.TrimSpace(commit.SHA), sha) {
-		return nil, "published patch commit response does not match the verified commit", nil
-	}
-	if len(commit.Files) == 0 {
+	if len(files) == 0 {
 		return nil, "published patch commit contains no files", nil
 	}
-	if len(commit.Files) > repositoryScanPublishedCommitMaxFiles {
-		return nil, "published patch commit exceeds the supported file count", nil
-	}
-	return commit.Files, "", nil
+	return files, "", nil
 }
 
 // repositoryScanDiffFromPublishedCommit renders the published commit's file

@@ -1065,6 +1065,7 @@ func validatePatchProposalPublicationBinding(proposal *store.PatchProposal) (str
 func samePatchProposalPublicationBinding(existing store.PatchProposal, desired *store.PatchProposal, existingEvidenceJSON, desiredEvidenceJSON string) bool {
 	if desired == nil || existing.Branch != desired.Branch || existing.DiffArtifact != desired.DiffArtifact ||
 		existing.SummaryArtifact != desired.SummaryArtifact || existing.Status != desired.Status ||
+		existing.Reason != desired.Reason ||
 		existing.PRURL != desired.PRURL || !reflect.DeepEqual(existing.PRNumber, desired.PRNumber) {
 		return false
 	}

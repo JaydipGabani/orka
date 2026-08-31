@@ -225,7 +225,7 @@ func newTaskCreateCmd() *cobra.Command {
 	cmd.Flags().StringArrayVar(&envVals, "env", nil, "Environment variable KEY=VALUE (repeatable)")
 	cmd.Flags().Int32Var(&priority, "priority", 0, "Task priority (0-1000)")
 	cmd.Flags().StringVar(&agent, "agent", "", "Agent reference name")
-	cmd.Flags().StringVar(&provider, "provider", "", "Provider reference name for ai tasks (default: the namespace's only ready Provider)")
+	cmd.Flags().StringVar(&provider, "provider", "", "Provider reference name for ai tasks (default: a ready Provider named \"default\", else the namespace's only ready Provider)")
 	cmd.Flags().StringVar(&model, "model", "", "Model name for AI tasks")
 	cmd.Flags().StringVar(&timeout, "timeout", "", "Task timeout (e.g., \"5m\", \"1h\")")
 	cmd.Flags().StringVar(&schedule, "schedule", "", "Cron schedule for recurring tasks")
@@ -684,6 +684,13 @@ func resolveDefaultProviderName(ctx context.Context, c *client.Client) (string, 
 		names = append(names, name)
 		if item.Ready || item.Status.Ready {
 			ready = append(ready, name)
+		}
+	}
+	// Mirror the server resolver's precedence: a ready Provider named
+	// "default" wins outright, then a sole ready Provider.
+	for _, name := range ready {
+		if name == "default" {
+			return name, nil
 		}
 	}
 	if len(ready) == 1 {

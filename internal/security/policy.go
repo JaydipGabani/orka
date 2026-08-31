@@ -71,7 +71,11 @@ var (
 	// is. The value alphabet is the RFC 6750 token68 grammar, which includes
 	// "~".
 	policyBearerHeaderPattern = regexp.MustCompile(`(?i)auth` + `orization\s*:\s*be` + `arer\s+([A-Za-z0-9_./+=~:-]{16,})`)
-	policyTxnTokenPattern     = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=~:-]{16,})`)
+	// Signed-URL query credentials (S3/GCS presigned URLs, SAS tokens) use
+	// the same parameter set internal/redact scrubs; a published URL with a
+	// live signature grants access just like a bearer token.
+	policySignedURLPattern = regexp.MustCompile(`(?i)[?&](?:sig|sign` + `ature|sas|x-amz-sign` + `ature|x-amz-sec` + `urity-token|x-amz-cred` + `ential|x-goog-sign` + `ature|x-goog-cred` + `ential)=([^&#\s"'<>,;()\[\]]{16,})`)
+	policyTxnTokenPattern  = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=~:-]{16,})`)
 )
 
 // placeholderFormPattern matches complete variable/template forms: a shell
@@ -119,8 +123,14 @@ var codeReferenceCredentialTail = regexp.MustCompile(`(?i)^(?:api[_-]?key|access
 // final segment names a credential field. Go/TS/Python that assigns apiKey
 // from configuration would otherwise make any file that touches credential
 // plumbing unpublishable, while arbitrary dotted literals stay flagged.
+// callableReferencePattern matches a bare or qualified identifier that can
+// legally precede a call: os.Getenv, readSecret. A literal credential
+// followed by "(" does not match (symbols and non-identifier dots break
+// the shape), so appending "(" to a secret cannot buy the exemption.
+var callableReferencePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$`)
+
 func secretValueIsCode(text string, value string, end int) bool {
-	if end < len(text) && text[end] == '(' {
+	if end < len(text) && text[end] == '(' && callableReferencePattern.MatchString(value) {
 		return true
 	}
 	if !codeReferencePattern.MatchString(value) {
@@ -164,6 +174,9 @@ func LooksLikeSecret(text string) bool {
 		return true
 	}
 	if sensitiveValueMatch(policyBearerHeaderPattern, text) || sensitiveValueMatch(policyTxnTokenPattern, text) {
+		return true
+	}
+	if sensitiveValueMatch(policySignedURLPattern, text) {
 		return true
 	}
 	return strings.Contains(strings.ToLower(text), "-----"+"begin ")
