@@ -136,11 +136,20 @@ func (r *RepositoryMonitorReconciler) processIssueInventoryRun(ctx context.Conte
 			skipReason = repositoryMonitorIssueCommandSkipReason(monitor.Spec, issue)
 		} else {
 			skipReason = repositoryMonitorIssueSkipReason(monitor.Spec, issue, selected, maxPerRun)
-			if skipReason == repositoryMonitorSkipReasonOverLimit && repositoryMonitorIssueWorkflowRetainedUnderRunLimit(existing) {
-				// The per-run cap bounds newly selected issues; it must not
-				// rewrite the recorded workflow (plan approval, an open PR)
-				// of an issue that is already past discovery as "blocked".
-				skipReason = ""
+			if skipReason == repositoryMonitorSkipReasonOverLimit &&
+				repositoryMonitorIssueWorkflowRetainedUnderRunLimit(existing) &&
+				existing.SnapshotDigest == item.SnapshotDigest {
+				// The per-run cap bounds newly selected issues; an unchanged
+				// issue already past discovery keeps its recorded workflow
+				// (plan approval, an open PR) and verdict bookkeeping, and
+				// does not consume a selection slot or count as selected.
+				if err := r.Store.UpsertMonitorItem(ctx, item); err != nil {
+					return selected, createdTasks, skipped, err
+				}
+				if err := r.createMonitorEvent(ctx, monitor, run.ID, repositoryMonitorIssueKind, issue.Number, item.SnapshotDigest, "item_retained", fmt.Sprintf("Issue #%d retained past the run limit with its workflow intact", issue.Number), nil); err != nil {
+					return selected, createdTasks, skipped, err
+				}
+				continue
 			}
 		}
 		if skipReason != "" {

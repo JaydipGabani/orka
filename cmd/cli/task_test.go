@@ -782,3 +782,56 @@ func TestNewTaskCreateCmdExplainsAmbiguousProviders(t *testing.T) {
 		t.Fatalf("Execute() error = %v, want the available Providers and a --provider hint", err)
 	}
 }
+
+// TestTaskCreateAgentTypeInference verifies --agent resolves the referenced
+// Agent before choosing the task type: a native AI Agent keeps the ai default
+// (the documented self-bootstrapping flow), a runtime Agent infers agent, and
+// an unreadable Agent conservatively falls back to ai.
+func TestTaskCreateAgentTypeInference(t *testing.T) {
+	cases := []struct {
+		name     string
+		agent    string
+		body     string
+		status   int
+		wantType string
+	}{
+		{name: "native ai agent", agent: "coordinator", body: `{"metadata":{"name":"coordinator"},"spec":{"providerRef":{"name":"p"}}}`, status: http.StatusOK, wantType: "ai"},
+		{name: "runtime agent", agent: "codex-agent", body: `{"metadata":{"name":"codex-agent"},"spec":{"runtime":{"type":"codex"}}}`, status: http.StatusOK, wantType: "agent"},
+		{name: "unreadable agent", agent: "missing", body: `{"error":"not found"}`, status: http.StatusNotFound, wantType: "ai"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			var created struct {
+				Type string `json:"type"`
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/agents/"+tc.agent:
+					w.WriteHeader(tc.status)
+					fmt.Fprint(w, tc.body) //nolint:errcheck
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/providers":
+					fmt.Fprint(w, `{"items":[{"name":"p","ready":true}]}`) //nolint:errcheck
+				case r.Method == http.MethodPost && r.URL.Path == "/api/v1/tasks":
+					if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+						t.Errorf("decode create request: %v", err)
+					}
+					fmt.Fprint(w, `{"metadata":{"name":"task-x"}}`) //nolint:errcheck
+				default:
+					w.WriteHeader(http.StatusOK)
+					fmt.Fprint(w, `{}`) //nolint:errcheck
+				}
+			}))
+			defer srv.Close()
+			root := newRootCmd()
+			root.SetArgs([]string{"task", "create", "--server", srv.URL, "--agent", tc.agent, "do stuff"})
+			if err := root.Execute(); err != nil {
+				t.Fatalf("Execute() error: %v", err)
+			}
+			if created.Type != tc.wantType {
+				t.Fatalf("created task type = %q, want %q", created.Type, tc.wantType)
+			}
+		})
+	}
+}

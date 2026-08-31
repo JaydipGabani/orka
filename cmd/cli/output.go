@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	sigsyaml "sigs.k8s.io/yaml"
@@ -107,7 +108,13 @@ func genericRowName(item map[string]any) string {
 		label := "#" + number
 		if title := strings.TrimSpace(firstString(item, "title")); title != "" {
 			if len(title) > genericRowTitleLimit {
-				title = strings.TrimSpace(title[:genericRowTitleLimit]) + "…"
+				// Cut on a rune boundary so a multibyte character crossing
+				// the limit cannot become invalid UTF-8 in the table.
+				cut := genericRowTitleLimit
+				for cut > 0 && !utf8.RuneStart(title[cut]) {
+					cut--
+				}
+				title = strings.TrimSpace(title[:cut]) + "…"
 			}
 			label += " " + title
 		}

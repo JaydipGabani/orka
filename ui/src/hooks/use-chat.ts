@@ -71,6 +71,14 @@ export function useSendMessage() {
       // it, after which nothing from this response may reach the store.
       const epoch = useChatStore.getState().turnEpoch
       const live = () => useChatStore.getState().turnEpoch === epoch
+      // Epoch checks keep orphaned output out of the store, but only an
+      // abort stops the server-side turn (which can still be running tools
+      // or creating Tasks); the subscription below cancels the request the
+      // moment a reset bumps the epoch.
+      const controller = new AbortController()
+      const unsubscribeAbort = useChatStore.subscribe((state) => {
+        if (state.turnEpoch !== epoch) controller.abort()
+      })
 
       function handleSSEEvent(event: string, data: string) {
         if (!live()) return
@@ -218,6 +226,7 @@ export function useSendMessage() {
             ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
           body: JSON.stringify(body),
+          signal: controller.signal,
         })
 
         if (!live()) {
@@ -226,6 +235,9 @@ export function useSendMessage() {
         }
         if (!response.ok) {
           const errText = await response.text().catch(() => 'Unknown error')
+          // Reading the error body yielded; a reset in the meantime means
+          // this error belongs to the orphaned turn, not the new transcript.
+          if (!live()) return
           addMessage({
             id: generateMessageId(),
             role: 'error',
@@ -253,11 +265,14 @@ export function useSendMessage() {
 
         while (true) {
           const { done, value } = await reader.read()
-          if (done) break
+          // The epoch is rechecked before acting on the result: a read that
+          // resolves after a reset — including the final done — must not
+          // flush this turn's remaining buffer into the new transcript.
           if (!live()) {
             await reader.cancel().catch(() => {})
             return
           }
+          if (done) break
 
           buffer += decoder.decode(value, { stream: true })
 
@@ -298,6 +313,7 @@ export function useSendMessage() {
           timestamp: new Date().toISOString(),
         })
       } finally {
+        unsubscribeAbort()
         // An orphaned turn's transcript was already reset; its streaming flag
         // was cleared with it and must not be touched again.
         if (live()) setStreaming(false)

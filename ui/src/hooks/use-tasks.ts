@@ -43,18 +43,23 @@ export function useTaskListAll(pageLimit = '100', refetchInterval: number | fals
   })
 }
 
-const isTerminalTaskError = (error: unknown) => isNotFoundError(error) || isForbiddenError(error)
-
 export function useTask(id: string, refetchInterval: number | false = 5000) {
   const namespace = useUIStore((s) => s.namespace)
   return useQuery({
     queryKey: ['task', id, namespace],
     queryFn: () => api.get<Task>(`/tasks/${id}`, { namespace }),
-    // A deleted task stays deleted and a forbidden one stays forbidden for
-    // this token; retrying or polling a 404/403 only spams the API and keeps
-    // the page on skeletons instead of showing the actionable error.
-    retry: (failureCount, error) => !isTerminalTaskError(error) && failureCount < 3,
-    refetchInterval: (query) => (isTerminalTaskError(query.state.error) ? false : refetchInterval),
+    // A forbidden task stays forbidden for this token, and a task that was
+    // loaded once and now 404s stays deleted; polling those only spams the
+    // API. A 404 before the task was ever seen is different: a just-created
+    // Task can transiently 404 while the detail read's cache catches up with
+    // the list, so polling continues until the task appears.
+    retry: (failureCount, error) =>
+      !isForbiddenError(error) && !isNotFoundError(error) && failureCount < 3,
+    refetchInterval: (query) => {
+      if (isForbiddenError(query.state.error)) return false
+      if (isNotFoundError(query.state.error) && query.state.data !== undefined) return false
+      return refetchInterval
+    },
   })
 }
 

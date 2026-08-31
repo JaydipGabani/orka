@@ -90,7 +90,9 @@ describe('useTask', () => {
 })
 
 describe('useTask on 404', () => {
-  it('stops polling and does not retry once the task is gone', async () => {
+  it('keeps polling a task that has never been seen, without burst retries', async () => {
+    // A just-created Task can transiently 404 while the detail read's cache
+    // catches up with the list; polling continues until the task appears.
     let calls = 0
     server.use(http.get('/api/v1/tasks/gone-task', () => {
       calls += 1
@@ -100,9 +102,28 @@ describe('useTask on 404', () => {
     const { result } = renderHook(() => useTask('gone-task', 20), { wrapper: createWrapper() })
     await waitFor(() => expect(result.current.isError).toBe(true))
     const seen = calls
-    await new Promise((resolve) => setTimeout(resolve, 120))
+    await waitFor(() => expect(calls).toBeGreaterThan(seen))
+  })
+
+  it('stops polling once a previously loaded task 404s', async () => {
+    let calls = 0
+    server.use(http.get('/api/v1/tasks/deleted-task', () => {
+      calls += 1
+      if (calls === 1) {
+        return HttpResponse.json({ metadata: { name: 'deleted-task' }, status: { phase: 'Running' } })
+      }
+      return HttpResponse.json({ error: { code: 404, message: 'task not found' } }, { status: 404 })
+    }))
+
+    const { result } = renderHook(() => useTask('deleted-task', 20), { wrapper: createWrapper() })
+    // The task loads once, then every refetch 404s; polling must settle
+    // instead of hammering the API forever.
+    await waitFor(() => expect(result.current.data).toBeTruthy())
+    await waitFor(() => expect(calls).toBeGreaterThanOrEqual(2))
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const seen = calls
+    await new Promise((resolve) => setTimeout(resolve, 200))
     expect(calls).toBe(seen)
-    expect(calls).toBe(1)
   })
 })
 

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -88,15 +89,17 @@ func newTaskCreateCmd() *cobra.Command {
 			}
 
 			prompt := strings.Join(args, " ")
-			// The default type is ai, but an explicit --image or --agent is
-			// an unambiguous request for a container or agent task; only an
-			// explicit --type overrides that inference.
+			// The default type is ai, but an explicit --image is an
+			// unambiguous request for a container task. --agent is not:
+			// it also names native AI Agents, so the referenced Agent's
+			// spec decides whether this is an agent task. Only an explicit
+			// --type overrides the inference.
 			if !cmd.Flags().Changed("type") {
 				switch {
 				case strings.TrimSpace(image) != "":
 					taskType = cliTaskTypeCont
 				case strings.TrimSpace(agent) != "":
-					taskType = cliTaskTypeAgent
+					taskType = resolveAgentTaskType(context.Background(), c, agent)
 				}
 			}
 			if taskType == "" {
@@ -598,32 +601,79 @@ const (
 	cliNamespaceQuery   = "namespace"
 )
 
+// resolveAgentTaskType decides whether --agent names an ACP runtime Agent
+// (task type "agent") or a native AI Agent (task type "ai") by reading the
+// Agent's spec. An unreadable Agent falls back to "ai", the CLI's historical
+// default, and the server-side contract validation reports the real problem.
+func resolveAgentTaskType(ctx context.Context, c *client.Client, agent string) string {
+	body, _, err := c.GetRaw(ctx, "/api/v1/agents/"+url.PathEscape(strings.TrimSpace(agent)), map[string]string{cliNamespaceQuery: c.Namespace})
+	if err != nil {
+		return cliTaskTypeAI
+	}
+	var object struct {
+		Spec struct {
+			Runtime json.RawMessage `json:"runtime"`
+		} `json:"spec"`
+	}
+	if json.Unmarshal(body, &object) != nil {
+		return cliTaskTypeAI
+	}
+	if len(object.Spec.Runtime) > 0 && string(object.Spec.Runtime) != "null" {
+		return cliTaskTypeAgent
+	}
+	return cliTaskTypeAI
+}
+
 // resolveDefaultProviderName selects the Provider for an ai task when none was
 // named: the namespace's only ready Provider is used; otherwise the error
-// lists what exists so the user can pass --provider.
+// lists what exists so the user can pass --provider. The list is paged through
+// completely so the decision never rests on a truncated first page.
 func resolveDefaultProviderName(ctx context.Context, c *client.Client) (string, error) {
-	body, _, err := c.GetRaw(ctx, cliProvidersAPIPath, map[string]string{cliNamespaceQuery: c.Namespace})
-	if err != nil {
-		return "", fmt.Errorf("no --provider given and Providers could not be listed: %w", err)
+	type providerItem struct {
+		Name     string `json:"name"`
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		Ready  bool `json:"ready"`
+		Status struct {
+			Ready bool `json:"ready"`
+		} `json:"status"`
 	}
-	var list struct {
-		Items []struct {
-			Name     string `json:"name"`
+	var items []providerItem
+	seenCursor := map[string]struct{}{}
+	continueToken := ""
+	for {
+		query := map[string]string{cliNamespaceQuery: c.Namespace}
+		if continueToken != "" {
+			query["continue"] = continueToken
+		}
+		body, _, err := c.GetRaw(ctx, cliProvidersAPIPath, query)
+		if err != nil {
+			return "", fmt.Errorf("no --provider given and Providers could not be listed: %w", err)
+		}
+		var list struct {
+			Items    []providerItem `json:"items"`
 			Metadata struct {
-				Name string `json:"name"`
+				Continue string `json:"continue"`
 			} `json:"metadata"`
-			Ready  bool `json:"ready"`
-			Status struct {
-				Ready bool `json:"ready"`
-			} `json:"status"`
-		} `json:"items"`
+		}
+		if err := json.Unmarshal(body, &list); err != nil {
+			return "", fmt.Errorf("no --provider given and the Provider list could not be parsed: %w", err)
+		}
+		items = append(items, list.Items...)
+		next := strings.TrimSpace(list.Metadata.Continue)
+		if next == "" {
+			break
+		}
+		if _, repeated := seenCursor[next]; repeated {
+			return "", fmt.Errorf("no --provider given and the Provider list repeated a continuation cursor")
+		}
+		seenCursor[next] = struct{}{}
+		continueToken = next
 	}
-	if err := json.Unmarshal(body, &list); err != nil {
-		return "", fmt.Errorf("no --provider given and the Provider list could not be parsed: %w", err)
-	}
-	names := make([]string, 0, len(list.Items))
-	ready := make([]string, 0, len(list.Items))
-	for _, item := range list.Items {
+	names := make([]string, 0, len(items))
+	ready := make([]string, 0, len(items))
+	for _, item := range items {
 		name := item.Name
 		if name == "" {
 			name = item.Metadata.Name
