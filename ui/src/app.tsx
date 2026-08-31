@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { RouterProvider, createRouter } from '@tanstack/react-router'
 import { routeTree } from './routeTree.gen'
 import { useAuthStore } from './stores/auth'
+import { useChatStore } from './stores/chat'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -12,15 +13,18 @@ const queryClient = new QueryClient({
   },
 })
 
-// Cached query data belongs to the token that fetched it. On any identity
-// change (logout, or signing in as someone else) the cache is cleared so a
-// new session can never read the previous token's data — for example Agent
-// names surfacing in a selector while the new token's list request 403s.
+// Cached state belongs to the token that fetched or created it. On any
+// identity change (logout, or signing in as someone else) the query cache is
+// cleared and the chat store is reset — transcript, session, provider/model
+// selections (including their localStorage persistence), and the turn epoch,
+// which also aborts any in-flight chat turn — so a new session can never
+// read or reuse the previous token's data.
 let lastToken = useAuthStore.getState().token
 useAuthStore.subscribe((state) => {
   if (state.token !== lastToken) {
     lastToken = state.token
     queryClient.clear()
+    useChatStore.getState().resetForIdentityChange()
   }
 })
 

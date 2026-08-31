@@ -74,18 +74,31 @@ var (
 	policyTxnTokenPattern     = regexp.MustCompile(`(?i)\btxn?-to` + `ken\s*:\s*([A-Za-z0-9_./+=~:-]{16,})`)
 )
 
+// placeholderFormPattern matches complete variable/template forms: a shell
+// or template variable reference, or a fully bracketed/braced example. A
+// prefix alone is not enough — "$tr0ng-password!" is a literal that merely
+// starts with '$', not a placeholder.
+var placeholderFormPattern = regexp.MustCompile(
+	`^(?:` +
+		`\$[A-Za-z_][A-Za-z0-9_]*` + // $VAR
+		`|\$\{[^}]*\}` + // ${VAR}, ${VAR:-default}
+		`|\{\{.*\}\}` + // {{ .Token }}, {{ secret }}
+		`|\{[^{}]*\}` + // {placeholder}
+		`|<[^<>]*>` + // <your-token>
+		`|\[[^\[\]]*\]` + // [REDACTED], [token]
+		`|%[^%]*%` + // %VAR% (Windows)
+		`|%\([^()]*\)[A-Za-z]` + // %(name)s (Python)
+		`)$`)
+
 // secretValuePlaceholder reports whether a credential-position value is an
-// obvious placeholder (a shell or template variable reference, or a
-// bracketed/braced example) rather than a literal secret.
+// obvious placeholder rather than a literal secret. Only complete recognized
+// forms are exempt; a value that merely begins with a placeholder character
+// stays flagged.
 func secretValuePlaceholder(value string) bool {
 	if value == "" {
 		return true
 	}
-	switch value[0] {
-	case '$', '<', '{', '%', '[':
-		return true
-	}
-	return false
+	return placeholderFormPattern.MatchString(value)
 }
 
 // codeReferencePattern matches a qualified identifier such as

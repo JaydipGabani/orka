@@ -26,6 +26,7 @@ interface ChatState {
   setSessionId: (id: string) => void
   setStreaming: (streaming: boolean) => void
   newSession: () => void
+  resetForIdentityChange: () => void
   setUsageOnLastAssistant: (usage: ChatUsage, tasksCreatedNames?: string[]) => void
 }
 
@@ -138,6 +139,21 @@ export const useChatStore = create<ChatState>()(
   setSessionId: (id) => set({ currentSessionId: id }),
   setStreaming: (streaming) => set({ isStreaming: streaming }),
   newSession: () => set((state) => ({ messages: [], currentSessionId: null, isStreaming: false, turnEpoch: state.turnEpoch + 1 })),
+
+  // Chat state belongs to the identity that created it. On a token change the
+  // transcript, session, provider/model choices, and their persisted
+  // per-namespace selections are all dropped, and the epoch bump orphans any
+  // in-flight turn (aborting its request via the turn's epoch subscription).
+  resetForIdentityChange: () =>
+    set((state) => ({
+      messages: [],
+      currentSessionId: null,
+      isStreaming: false,
+      provider: '',
+      model: '',
+      selections: {},
+      turnEpoch: state.turnEpoch + 1,
+    })),
 
   setUsageOnLastAssistant: (usage, tasksCreatedNames) =>
     set((state) => {

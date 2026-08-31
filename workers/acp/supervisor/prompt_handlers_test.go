@@ -39,6 +39,18 @@ func TestRedactedPromptErrorDetailStripsC1ControlsBeforeRedaction(t *testing.T) 
 	}
 }
 
+func TestRedactedPromptErrorDetailStripsFormatRunesBeforeRedaction(t *testing.T) {
+	t.Parallel()
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	// A zero-width space (U+200B, category Cf) inside the credential must
+	// not split the token past the redactor.
+	err := errors.New("upstream rejected api_key=" + key[:12] + "\u200b" + key[12:] + " for the model")
+	got := redactedPromptErrorDetail(err)
+	if strings.Contains(got, key[:12]) || strings.Contains(got, key[12:]) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("redactedPromptErrorDetail() = %q, want format-rune-split credential redacted", got)
+	}
+}
+
 func TestPromptStreamErrorDetailIsBoundedAndSingleLine(t *testing.T) {
 	if got := promptStreamErrorDetail(fmt.Errorf("first\nsecond\rthird")); got != "first second third" {
 		t.Fatalf("single-line detail = %q", got)
@@ -943,12 +955,14 @@ func newUpstreamFailureFixture(t *testing.T) upstreamFailureFixture {
 
 func (f upstreamFailureFixture) recordInference(t *testing.T, status int, detail string) {
 	t.Helper()
+	// The real handler begins in-flight accounting at route authorization
+	// and releases it when it returns.
+	f.proxy.beginInferenceRequest(providerRequestInference)
+	defer f.proxy.releaseInferenceRequest(providerRequestInference)
 	seq, err := f.proxy.consumeInferenceRequest(f.promptID, providerRequestInference, f.now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The real handler releases the in-flight accounting when it returns.
-	defer f.proxy.releaseInferenceRequest(providerRequestInference)
 	f.proxy.recordInferenceOutcome(f.promptID, providerRequestInference, seq, status, detail)
 }
 

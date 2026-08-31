@@ -560,15 +560,28 @@ func (s *providerProxySession) consumeInferenceRequest(promptID string, class pr
 	}
 	s.inferenceRequests++
 	s.issuedInference++
+	return s.issuedInference, nil
+}
+
+// beginInferenceRequest starts the in-flight accounting for one authorized
+// inference-route request. It runs at route authorization — before the body
+// is read or validated — so a child that settles while an inference POST is
+// still being read cannot slip past the settlement drain; metadata classes
+// are a no-op.
+func (s *providerProxySession) beginInferenceRequest(class providerRequestClass) {
+	if s == nil || class != providerRequestInference {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.inflightInference == 0 {
 		s.drainedInference = make(chan struct{})
 	}
 	s.inflightInference++
-	return s.issuedInference, nil
 }
 
-// releaseInferenceRequest ends the in-flight accounting for one admitted
-// inference request; metadata classes are a no-op.
+// releaseInferenceRequest ends the in-flight accounting for one authorized
+// inference-route request; metadata classes are a no-op.
 func (s *providerProxySession) releaseInferenceRequest(class providerRequestClass) {
 	if s == nil || class != providerRequestInference {
 		return
@@ -857,6 +870,11 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// Every rejection from here until the request is admitted upstream is a
 	// failed inference attempt when the route is an inference endpoint.
 	_, _, routeClass := providerRequestRoute(p.providerKind, suffix, r.Method)
+	// Begin in-flight accounting now, before the body is read: an inference
+	// request must participate in the settlement drain from the moment it
+	// is authorized, not only after body validation.
+	session.beginInferenceRequest(routeClass)
+	defer session.releaseInferenceRequest(routeClass)
 	reject := func(statusCode int, message string) {
 		session.recordRejectedInferenceRequest(authorization.promptID, routeClass, statusCode, message)
 		providerproxy.WriteError(w, statusCode, message)
@@ -945,7 +963,6 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	defer session.releaseInferenceRequest(requestClass)
 
 	requestContext = httptrace.WithClientTrace(requestContext, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
 		connectionMu.Lock()

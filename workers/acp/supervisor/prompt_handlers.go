@@ -429,6 +429,11 @@ func redactedPromptErrorDetail(err error) string {
 			return ' '
 		case unicode.IsControl(r):
 			return -1
+		// Unicode format runes (zero-width spaces, joiners, directional
+		// marks) are as invisible as controls and can split a credential
+		// past the redactor; drop them before redaction too.
+		case unicode.Is(unicode.Cf, r):
+			return -1
 		}
 		return r
 	}, strings.ToValidUTF8(err.Error(), ""))

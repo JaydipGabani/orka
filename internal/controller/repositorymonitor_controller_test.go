@@ -7853,3 +7853,14 @@ func TestRepositoryMonitorRepeatedImplementCommandDoesNotRestartPlanning(t *test
 		}
 	}
 }
+
+func TestRepositoryMonitorIssueStatusCommentRedactsCredentials(t *testing.T) {
+	t.Parallel()
+	// A research agent can echo a credential it found in the repository;
+	// the public status comment must carry the redaction, not the secret.
+	const secret = "ak-live-0123456789abcdef"
+	got := sanitizeRepositoryMonitorPublicCommentText("The bug: api_key=" + secret + " is hard-coded in config.py")
+	if strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("public comment text = %q, want the credential redacted", got)
+	}
+}

@@ -850,7 +850,13 @@ func repositoryMonitorPriorityRank(priority string) (int, bool) {
 }
 
 func sanitizeRepositoryMonitorReviewText(value string, maxRunes int) string {
-	return neutralizeRepositoryMonitorActiveText(neutralizeRepositoryMonitorMentions(boundedString(strings.TrimSpace(value), maxRunes)))
+	// Agent-produced text (research summaries, review verdicts, plan
+	// excerpts) is published on GitHub; strip control/format runes and
+	// redact credential shapes before bounding, so a secret an agent found
+	// in the repository never reaches a public comment — and bounding
+	// cannot split a token past the redactor.
+	value = repositoryMonitorReviewContextSanitize(strings.TrimSpace(value))
+	return neutralizeRepositoryMonitorActiveText(neutralizeRepositoryMonitorMentions(boundedString(value, maxRunes)))
 }
 
 func neutralizeRepositoryMonitorActiveText(value string) string {

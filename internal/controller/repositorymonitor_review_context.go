@@ -39,6 +39,8 @@ const (
 	repositoryMonitorReviewContextStatusRenamed    = "renamed"
 	repositoryMonitorReviewContextStatusModified   = "modified"
 	repositoryMonitorReviewContextStatusChanged    = "changed"
+	repositoryMonitorReviewContextStatusAdded      = "added"
+	repositoryMonitorReviewContextStatusCopied     = "copied"
 	repositoryMonitorReviewContextPatchUnavailable = "unavailable"
 	repositoryMonitorReviewContextPatchCapped      = "capped"
 	repositoryMonitorReviewContextBeginMarker      = "--- BEGIN orka.prReview.context.v1 ---"
@@ -263,14 +265,13 @@ func repositoryMonitorReviewContextFromFiles(owner, repository string, pr reposi
 
 // repositoryMonitorReviewContextMarkUnreviewableOmissions marks the change set
 // incomplete when an omitted patch (unavailable, truncated, or capped) hides
-// content the Git-free head checkout cannot show: a removed file, a renamed
-// file's previous contents, lines deleted from any changed file, or a binary
-// modification (no patch, no line counts). An omitted patch for a present
-// path whose change only adds lines stays reviewable, because the checkout
-// contains every added line. A pure rename (no patch, no counts) is treated
-// as fully represented by its new path; GitHub reports a content-changing
-// binary rename identically, which this gate cannot distinguish without the
-// base blob.
+// content the Git-free head checkout cannot show: a removed file, any
+// renamed file (a pure rename and a content-changing binary rename are
+// reported identically, so the pure case cannot be proven without the base
+// blob), lines deleted from any changed file, or any other patchless
+// zero-count change (binary or otherwise undiffable). The only patchless
+// entries that stay reviewable are added and copied files with no deletions:
+// their complete new content is positively present in the checkout.
 func repositoryMonitorReviewContextMarkUnreviewableOmissions(reviewContext repositoryMonitorReviewContext) repositoryMonitorReviewContext {
 	for _, file := range reviewContext.Files {
 		if file.PatchOmitted == "" {
@@ -280,21 +281,23 @@ func repositoryMonitorReviewContextMarkUnreviewableOmissions(reviewContext repos
 		case file.Status == repositoryMonitorReviewContextStatusRemoved:
 			reviewContext.Truncated.Files = true
 			return reviewContext
-		case file.Status == repositoryMonitorReviewContextStatusRenamed && file.PatchOmitted != repositoryMonitorReviewContextPatchUnavailable:
-			// A pure rename (no line changes) legitimately has no patch and
-			// is fully represented by the new path in the checkout; a rename
-			// whose patch was cut or capped hides what the previous file
-			// contained.
+		case file.Status == repositoryMonitorReviewContextStatusRenamed:
+			// GitHub reports a pure rename and a content-changing binary
+			// rename identically (no patch, zero counts); without the base
+			// blob the harmless case cannot be proven, so every patchless
+			// rename fails closed.
 			reviewContext.Truncated.Files = true
 			return reviewContext
 		case file.Deletions > 0:
-			// Deleted lines (a rename with content changes included) exist
-			// only in the omitted patch, so their removal cannot be reviewed
-			// from the checkout.
+			// Deleted lines exist only in the omitted patch, so their
+			// removal cannot be reviewed from the checkout.
 			reviewContext.Truncated.Files = true
 			return reviewContext
-		case (file.Status == repositoryMonitorReviewContextStatusModified || file.Status == repositoryMonitorReviewContextStatusChanged) && file.Additions+file.Deletions == 0:
-			// A modified file with no line counts and no patch is a binary
+		case file.Status == repositoryMonitorReviewContextStatusAdded || file.Status == repositoryMonitorReviewContextStatusCopied:
+			// The complete new content is in the checkout; nothing about
+			// the change is hidden by the missing patch.
+		case file.Additions+file.Deletions == 0:
+			// Any other patchless change with no line counts is a binary
 			// (or otherwise undiffable) change: the checkout holds only the
 			// new content, so what changed cannot be reviewed.
 			reviewContext.Truncated.Files = true

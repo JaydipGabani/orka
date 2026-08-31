@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ const (
 	// commit may touch; GitHub's commit endpoint returns at most 300 files.
 	repositoryScanPublishedCommitMaxFiles    = 300
 	repositoryScanForgeCredentialKey         = defaultACPWorkspaceCredentialKey
+	repositoryScanNonCanonicalTargetReason   = "repository scan publication target is not a canonical GitHub repository"
 	repositoryScanArtifactStoreNotConfigured = "artifact store is not configured"
 )
 
@@ -104,7 +106,7 @@ func (r *RepositoryScanReconciler) verifyPatchTaskEvidence(
 	}
 	owner, repository, err := security.ParseGitHubRepositoryURL(targetRepo)
 	if err != nil {
-		return patchVerificationResult{}, "repository scan publication target is not a canonical GitHub repository", nil
+		return patchVerificationResult{}, repositoryScanNonCanonicalTargetReason, nil
 	}
 	files, reason, err := r.fetchRepositoryScanPublishedCommit(ctx, owner, repository, publication.publication.ExpectedCommitSHA, token)
 	if err != nil || reason != "" {
@@ -171,13 +173,13 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 	}
 	owner, repository, err := security.ParseGitHubRepositoryURL(targetRepo)
 	if err != nil {
-		return "repository scan publication target is not a canonical GitHub repository", nil
+		return repositoryScanNonCanonicalTargetReason, nil
 	}
 	files, reason, err := r.fetchRepositoryScanPublishedCommit(ctx, owner, repository, publication.publication.ExpectedCommitSHA, token)
 	if err != nil || reason != "" {
 		return reason, err
 	}
-	_, commitPaths, reason := repositoryScanDiffFromPublishedCommit(files)
+	commitDiff, commitPaths, reason := repositoryScanDiffFromPublishedCommit(files)
 	if reason != "" {
 		return reason, nil
 	}
@@ -192,7 +194,55 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 	if !sameStringSet(artifactPaths, commitPaths) {
 		return "patch diff artifact does not match the published commit", nil
 	}
+	// Filenames alone are spoofable: an unrelated diff touching the same
+	// paths would pass the set check. Bind the content too — the added and
+	// deleted lines per file must be identical to the published commit's
+	// (context rendering and index/mode headers may differ between diff
+	// generators, but for the same commit the change content cannot).
+	if !samePatchChangedLines(string(diffData), commitDiff) {
+		return "patch diff artifact content does not match the published commit", nil
+	}
 	return "", nil
+}
+
+// patchChangedLinesByFile extracts each file's added and deleted line
+// content from a unified diff, ignoring headers, hunk markers, and context.
+func patchChangedLinesByFile(diff string) map[string][]string {
+	changed := map[string][]string{}
+	current := ""
+	inHunk := false
+	for line := range strings.SplitSeq(diff, "\n") {
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			inHunk = false
+			current = ""
+			fields := strings.Fields(line)
+			if len(fields) == 4 {
+				current = strings.TrimPrefix(fields[3], "b/")
+			}
+		case strings.HasPrefix(line, "@@"):
+			inHunk = true
+		case inHunk && current != "" && len(line) > 0 && (line[0] == '+' || line[0] == '-'):
+			if strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
+				continue
+			}
+			changed[current] = append(changed[current], line)
+		}
+	}
+	return changed
+}
+
+func samePatchChangedLines(a, b string) bool {
+	linesA, linesB := patchChangedLinesByFile(a), patchChangedLinesByFile(b)
+	if len(linesA) != len(linesB) {
+		return false
+	}
+	for path, lines := range linesA {
+		if !slices.Equal(lines, linesB[path]) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *RepositoryScanReconciler) patchArtifactsPresent(ctx context.Context, task *corev1alpha1.Task, names ...string) (bool, error) {

@@ -51,7 +51,7 @@ func TestRepositoryMonitorReviewContextFromFilesRendersBoundedPayload(t *testing
 	pr := repositoryMonitorReviewContextTestPR()
 	files := []repositoryMonitorPullRequestFileResponse{
 		{Filename: repositoryMonitorReviewContextTestPath, Status: repositoryMonitorReviewContextTestStatus, Additions: 1, Deletions: 0, Patch: repositoryMonitorReviewContextTestPatch},
-		{Filename: "docs/new.md", PreviousFilename: "docs/old.md", Status: repositoryMonitorReviewContextTestRenamed, Additions: 0, Deletions: 0},
+		{Filename: "docs/new.md", PreviousFilename: "docs/old.md", Status: repositoryMonitorReviewContextTestRenamed, Additions: 1, Deletions: 0, Patch: "@@ -1 +1,2 @@\n old\n+new"},
 		{Filename: "image.png", Status: repositoryMonitorReviewContextTestAdded, Additions: 0, Deletions: 0, Patch: ""},
 	}
 	got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, pr, files)
@@ -64,8 +64,8 @@ func TestRepositoryMonitorReviewContextFromFilesRendersBoundedPayload(t *testing
 	if got.Files[0].Patch != repositoryMonitorReviewContextTestPatch || got.Files[0].PatchOmitted != "" {
 		t.Fatalf("files[0] = %#v, want full patch", got.Files[0])
 	}
-	if got.Files[1].PreviousPath != "docs/old.md" || got.Files[1].PatchOmitted != repositoryMonitorReviewContextPatchUnavailable || got.Files[1].Patch != "" {
-		t.Fatalf("files[1] = %#v, want previousPath and unavailable patch marker", got.Files[1])
+	if got.Files[1].PreviousPath != "docs/old.md" || got.Files[1].PatchOmitted != "" || got.Files[1].Patch == "" {
+		t.Fatalf("files[1] = %#v, want previousPath with its rename patch present", got.Files[1])
 	}
 	if got.Files[2].PatchOmitted != repositoryMonitorReviewContextPatchUnavailable {
 		t.Fatalf("files[2] = %#v, want unavailable patch marker for binary file", got.Files[2])
@@ -828,8 +828,11 @@ func TestRepositoryMonitorReviewContextRemovedFileWithoutPatchMarksChangeSetInco
 	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "new.go", PreviousFilename: "old.go", Status: repositoryMonitorReviewContextStatusRenamed, Additions: 2, Deletions: 1}); !got.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=true for a renamed file with content changes whose patch is unavailable (previous contents are not in the checkout)", got.Truncated)
 	}
-	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "new.go", PreviousFilename: "old.go", Status: repositoryMonitorReviewContextStatusRenamed}); got.Truncated.Files {
-		t.Fatalf("truncated = %#v, want files=false for a pure rename (no patch, no line changes)", got.Truncated)
+	// A pure rename and a content-changing binary rename are reported
+	// identically by GitHub (no patch, zero counts); the harmless case
+	// cannot be proven without the base blob, so it fails closed.
+	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "new.go", PreviousFilename: "old.go", Status: repositoryMonitorReviewContextStatusRenamed}); !got.Truncated.Files {
+		t.Fatalf("truncated = %#v, want files=true for a patchless rename (indistinguishable from a binary content change)", got.Truncated)
 	}
 	if got := build(repositoryMonitorPullRequestFileResponse{Filename: "image.png", Status: repositoryMonitorReviewContextTestAdded, Additions: 0}); got.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=false for a present path without a patch (reviewed from the checkout)", got.Truncated)
@@ -891,7 +894,7 @@ func TestRepositoryMonitorReviewContextStripsFormatRunesBeforeRedacting(t *testi
 	t.Parallel()
 	// A zero-width space inside the token must not split it past the redactor.
 	const secret = "ak-live-0123456789abcdef"
-	split := "api_key=" + secret[:10] + "​" + secret[10:]
+	split := "api_key=" + secret[:10] + "\u200b" + secret[10:]
 	if got := repositoryMonitorReviewContextSanitize(split); strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
 		t.Fatalf("sanitize(%q) = %q, want the reassembled credential redacted", split, got)
 	}
