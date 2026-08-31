@@ -4194,3 +4194,35 @@ func TestPatchEvidenceRejectsTruncatedAndDuplicateCommitContent(t *testing.T) {
 		t.Fatal("duplicate file block was accepted as matching the commit")
 	}
 }
+
+func TestIngestPatchTaskSecondReconcileAcceptsSanitizedStoredDiff(t *testing.T) {
+	ctx := context.Background()
+	// The result-contract path persists the commit diff credential-redacted;
+	// a later reconcile enters the pre-existing-artifact branch and must not
+	// fail an already verified proposal because [REDACTED] differs from the
+	// removed secret.
+	const secret = "ak-live-0123456789abcdef"
+	commitPatch := "@@ -1 +1 @@\n-api_key=" + secret + "\n+api_key=vault://key"
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "sanitized-second-pass", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "config.env", Status: "modified", Additions: 1, Deletions: 1, Patch: commitPatch}}, &seenToken), true)
+	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+		Summary: "rotated credential", Files: []string{"config.env"}, PushBranch: fixture.proposal.Branch,
+	})
+	// First reconcile derives and persists the sanitized artifacts.
+	task := patchTaskForFixture(fixture, true)
+	envelope := `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"` + fixture.finding.ID + `","summary":"rotated credential","changedFiles":["config.env"],"risk":"low"}`
+	if err := fixture.store.SaveResult(ctx, task.Namespace, task.Name, []byte(envelope)); err != nil {
+		t.Fatalf("SaveResult() error = %v", err)
+	}
+	task.Status.ResultRef = &corev1alpha1.ResultReference{Available: true}
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, task); err != nil {
+		t.Fatalf("first ingest error = %v", err)
+	}
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
+	// Second reconcile takes the pre-existing-artifact path against the
+	// stored (redacted) diff and must stay verified.
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, task); err != nil {
+		t.Fatalf("second ingest error = %v", err)
+	}
+	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
+}

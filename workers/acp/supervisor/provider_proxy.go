@@ -1066,7 +1066,7 @@ func (p *providerProxy) relayUpstreamResponse(
 	// providers report terminal errors inside the SSE body. Scan the relayed
 	// stream for explicit error events so they are accounted as failures.
 	var streamScanner *sseTerminalErrorScanner
-	if !upstreamFailed && strings.Contains(response.Header.Get("Content-Type"), "text/event-stream") {
+	if !upstreamFailed && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
 		streamScanner = &sseTerminalErrorScanner{}
 		body = io.TeeReader(body, streamScanner)
 	}

@@ -805,6 +805,27 @@ func TestResolveDefaultProviderPrefersReadyDefault(t *testing.T) {
 // Agent before choosing the task type: a native AI Agent keeps the ai default
 // (the documented self-bootstrapping flow), a runtime Agent infers agent, and
 // an unreadable Agent conservatively falls back to ai.
+// TestTaskCreateRejectsAmbiguousImageAndAgent: --image and --agent imply
+// different task types; without an explicit --type the CLI must fail fast
+// instead of silently choosing container and carrying the agentRef along.
+func TestTaskCreateRejectsAmbiguousImageAndAgent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/tasks" {
+			t.Error("task was created from an ambiguous flag combination")
+		}
+		fmt.Fprint(w, `{}`) //nolint:errcheck
+	}))
+	defer srv.Close()
+	root := newRootCmd()
+	root.SetArgs([]string{"task", "create", "--server", srv.URL, "--image", "alpine", "--agent", "coordinator", "do stuff"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("Execute() error = %v, want ambiguous-flags rejection", err)
+	}
+}
+
 // TestTaskCreateAgentTypeSurfacesForbiddenLookup: a token without agents
 // read permission must not silently submit the wrong task type.
 func TestTaskCreateAgentTypeSurfacesForbiddenLookup(t *testing.T) {

@@ -595,6 +595,7 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"api_key=" + strings.Repeat("0123456789abcdef", 2) + "(",
 		"api_key=abcdefghijklmnopqrst(",
 		"PASSWORD=p@ssword&correct-horse-battery-staple",
+		"PASSWORD=short|correct-horse-battery-staple",
 	} {
 		if !LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = false, want true for a credential-shaped value", text)

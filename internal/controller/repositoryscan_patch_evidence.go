@@ -202,7 +202,16 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 	// line, however it is prefixed) must be identical to the published
 	// commit's. Only pre-hunk metadata (index/mode/---/+++ header lines),
 	// which legitimately varies between diff generators, is excluded.
-	if !samePatchHunks(string(diffData), commitDiff) {
+	// Stored artifacts come in two provenances: the result-contract path
+	// persists the commit diff credential-redacted, while legacy
+	// harness-written artifacts are raw — so the stored diff must match the
+	// fresh commit diff in either its raw or its sanitized form (both are
+	// exact commit-derived representations; the sanitizer is deterministic).
+	// Without the sanitized comparison, the second reconcile of an already
+	// verified proposal would fail solely because [REDACTED] differs from
+	// the credential the remediation removed.
+	if !samePatchHunks(string(diffData), commitDiff) &&
+		!samePatchHunks(string(diffData), repositoryMonitorReviewContextSanitize(commitDiff)) {
 		return "patch diff artifact content does not match the published commit", nil
 	}
 	return "", nil

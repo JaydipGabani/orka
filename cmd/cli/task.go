@@ -95,6 +95,9 @@ func newTaskCreateCmd() *cobra.Command {
 			// spec decides whether this is an agent task. Only an explicit
 			// --type overrides the inference.
 			if !cmd.Flags().Changed("type") {
+				if strings.TrimSpace(image) != "" && strings.TrimSpace(agent) != "" {
+					return fmt.Errorf("--image and --agent are ambiguous without --type: pass --type container or --type ai|agent explicitly")
+				}
 				switch {
 				case strings.TrimSpace(image) != "":
 					taskType = cliTaskTypeCont
