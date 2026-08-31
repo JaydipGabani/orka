@@ -1014,6 +1014,28 @@ func validateFrozenACPDispatchTarget(
 	return nil
 }
 
+func validateFrozenACPDispatchPlan(
+	task *corev1alpha1.Task,
+	target acpDispatchTarget,
+	bound *verifiedAgentExecution,
+	current ACPRuntimePlan,
+) error {
+	currentErr := validateFrozenACPDispatchTarget(task, target, bound, current)
+	if currentErr == nil {
+		return nil
+	}
+	if bound != nil {
+		// Queue reconciliation moves an unbound Reserved attempt to the current
+		// image only after the selected pool stops admitting it. If dispatch
+		// already claimed that exact serving pool, its frozen plan remains the
+		// authority for this attempt and avoids stranding it between rotations.
+		if frozenErr := validateFrozenACPDispatchTarget(task, target, bound, bound.plan); frozenErr == nil {
+			return nil
+		}
+	}
+	return currentErr
+}
+
 //nolint:gocyclo // The explicit state-machine branches are easier to audit together.
 func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alpha1.Task, target acpDispatchTarget) (retErr error) {
 	var promptTrace *acpSpan
@@ -1040,7 +1062,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	if err != nil {
 		return err
 	}
-	if err := validateFrozenACPDispatchTarget(task, target, bound, deliveryPlan); err != nil {
+	if err := validateFrozenACPDispatchPlan(task, target, bound, deliveryPlan); err != nil {
 		return err
 	}
 	if reservationLease != nil {

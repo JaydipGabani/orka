@@ -336,6 +336,43 @@ func assertWorkspaceRuntimePoolBootstrapEnvironment(
 	assertRuntimePoolEnvironment(t, r, pool, baseEnvironment)
 }
 
+func TestHistoricalRuntimePoolImageRecoveryUsesOwnedSandboxTemplate(t *testing.T) {
+	scheme := runtimePoolWorkspaceTestScheme(t)
+	pool := runtimePoolWorkspaceTestObject()
+	r := runtimePoolTestReconciler(t, scheme, nil, pool)
+	cfg, err := r.runtimePoolConfigForDrain(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := map[string]string{runtimePoolKeyLabel: cfg.labels[runtimePoolKeyLabel]}
+	deployed := r.runtimePoolPodTemplate(pool, cfg, selector, "legacy-auth", "legacy-provider")
+	deployed = runtimePoolWorkspaceBootstrapTemplate(deployed, "legacy-nonce", "legacy-public-key")
+	if err := r.createRuntimePoolSandboxTemplate(context.Background(), pool, cfg, deployed); err != nil {
+		t.Fatal(err)
+	}
+
+	authorized, err := r.historicalRuntimePoolImageAuthorized(context.Background(), pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !authorized {
+		t.Fatal("owned SandboxTemplate did not authorize the historical workspace image")
+	}
+
+	template, _, _ := runtimePoolWorkspaceTestChildren(t, r, pool)
+	template.Labels[runtimePoolUIDLabel] = "foreign-pool-uid"
+	if err := r.Update(context.Background(), template); err != nil {
+		t.Fatal(err)
+	}
+	authorized, err = r.historicalRuntimePoolImageAuthorized(context.Background(), pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorized {
+		t.Fatal("same-name SandboxTemplate without exact RuntimePool ownership authorized a historical image")
+	}
+}
+
 func TestWorkspaceRuntimePoolMaterializesProviderWorkload(t *testing.T) {
 	scheme := runtimePoolWorkspaceTestScheme(t)
 	pool := runtimePoolWorkspaceTestObject()

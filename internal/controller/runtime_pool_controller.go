@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -602,6 +603,9 @@ func (r *RuntimePoolReconciler) historicalRuntimePoolImageAuthorized(
 		// capacity changes may advance generation without invalidating it.
 		return true, nil
 	}
+	if pool.Spec.ExecutionWorkspace != nil {
+		return r.historicalWorkspaceRuntimePoolImageAuthorized(ctx, pool, cfg)
+	}
 
 	deployment := &appsv1.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: cfg.namespace, Name: cfg.baseName}, deployment); err != nil {
@@ -620,17 +624,81 @@ func (r *RuntimePoolReconciler) historicalRuntimePoolImageAuthorized(
 			return false, nil
 		}
 	}
-	if len(deployment.Spec.Template.Spec.Containers) != 1 ||
-		deployment.Spec.Template.Spec.Containers[0].Image != pool.Spec.Runtime.Image {
+	return historicalRuntimePoolTemplateMatches(pool, cfg, deployment.Spec.Template), nil
+}
+
+func (r *RuntimePoolReconciler) historicalWorkspaceRuntimePoolImageAuthorized(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+	cfg runtimePoolConfig,
+) (bool, error) {
+	binding := pool.Spec.ExecutionWorkspace
+	if binding == nil {
 		return false, nil
 	}
-	deployedPool, deployedConfig, err := runtimePoolDeploymentValidationTarget(pool, deployment)
-	if err != nil {
+	switch binding.Provider {
+	case corev1alpha1.WorkspaceProviderAgentSandbox:
+		template, err := r.getRuntimePoolSandboxTemplate(ctx, cfg)
+		if err != nil || template == nil {
+			return false, err
+		}
+		if !runtimePoolSandboxChildOwnedByPool(template, pool, cfg) {
+			return false, nil
+		}
+		if trustedRevision := strings.TrimSpace(pool.Annotations[runtimePoolSandboxTemplateRevisionAnnotation]); trustedRevision != "" {
+			observedRevision, revisionErr := runtimePoolSandboxTemplateObjectRevision(template)
+			if revisionErr != nil || observedRevision != trustedRevision {
+				return false, nil
+			}
+		}
+		return historicalRuntimePoolTemplateMatches(pool, cfg, sandboxTemplatePodTemplateSpec(template)), nil
+	case corev1alpha1.WorkspaceProviderSubstrate:
+		if binding.Substrate == nil {
+			return false, nil
+		}
+		templateNamespace := strings.TrimSpace(binding.Substrate.BaseTemplateNamespace)
+		templateName := runtimePoolSubstrateTemplateName(cfg.baseName)
+		template, err := r.getSubstrateActorTemplate(ctx, templateNamespace, templateName)
+		if err != nil || template == nil {
+			return false, err
+		}
+		expected := &unstructured.Unstructured{}
+		expected.SetNamespace(templateNamespace)
+		expected.SetName(templateName)
+		expected.SetLabels(cloneStringMap(cfg.labels))
+		if !substrateRuntimeTemplateOwnedByPool(template, expected) {
+			return false, nil
+		}
+		if _, integrityErr := substrateRuntimeTemplateIntegrity(template); integrityErr != nil {
+			return false, nil
+		}
+		deployedTemplate, err := substrateTemplatePodTemplateSpec(template)
+		if err != nil {
+			return false, nil
+		}
+		return historicalRuntimePoolTemplateMatches(pool, cfg, deployedTemplate), nil
+	default:
 		return false, nil
+	}
+}
+
+func historicalRuntimePoolTemplateMatches(
+	pool *corev1alpha1.RuntimePool,
+	cfg runtimePoolConfig,
+	template corev1.PodTemplateSpec,
+) bool {
+	if pool == nil || len(template.Spec.Containers) != 1 ||
+		template.Spec.Containers[0].Image != pool.Spec.Runtime.Image {
+		return false
+	}
+	deployedPool, deployedConfig, err := runtimePoolValidationTargetFromTemplate(pool, template)
+	if err != nil {
+		return false
 	}
 	return deployedPool.Generation <= pool.Generation &&
 		deployedPool.Spec.Runtime.Profile.Digest == pool.Spec.Runtime.Profile.Digest &&
-		reflect.DeepEqual(deployedConfig.profile, cfg.profile), nil
+		deployedConfig.protocol == cfg.protocol &&
+		reflect.DeepEqual(deployedConfig.profile, cfg.profile)
 }
 
 func (r *RuntimePoolReconciler) runtimePoolConfigWithImageAdmission(

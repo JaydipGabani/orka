@@ -101,6 +101,52 @@ type fakeSubstrateActorControl struct {
 	createRecoveryChecks                          int
 }
 
+func TestHistoricalRuntimePoolImageRecoveryUsesOwnedSubstrateTemplate(t *testing.T) {
+	r, pool := runtimePoolSubstrateTestReconciler(t, nil, &fakeSubstrateActorControl{})
+	cfg, err := r.runtimePoolConfigForDrain(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := r.renderSubstrateRuntimeTemplate(
+		pool,
+		cfg,
+		substrateTestBaseTemplate(),
+		pool.Spec.ExecutionWorkspace.Substrate.BaseTemplateNamespace,
+		runtimePoolSubstrateActorID(cfg.baseName),
+		"legacy-nonce",
+		"legacy-public-key",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.createSubstrateActorTemplate(context.Background(), pool, rendered.object); err != nil {
+		t.Fatal(err)
+	}
+
+	authorized, err := r.historicalRuntimePoolImageAuthorized(context.Background(), pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !authorized {
+		t.Fatal("owned derived ActorTemplate did not authorize the historical workspace image")
+	}
+
+	template := substrateTestDerivedTemplate(t, r, pool)
+	labels := cloneStringMap(template.GetLabels())
+	labels[runtimePoolUIDLabel] = "foreign-pool-uid"
+	template.SetLabels(labels)
+	if err := r.Update(context.Background(), template); err != nil {
+		t.Fatal(err)
+	}
+	authorized, err = r.historicalRuntimePoolImageAuthorized(context.Background(), pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorized {
+		t.Fatal("same-name ActorTemplate without exact RuntimePool ownership authorized a historical image")
+	}
+}
+
 type blockingSubstrateActorControl struct{}
 
 func (blockingSubstrateActorControl) wait(ctx context.Context) error {

@@ -1425,7 +1425,7 @@ func TestRuntimePoolReconcilerReportsSupersededScaleToZeroPoolStopped(t *testing
 }
 
 func TestHistoricalRuntimePoolImageRecoveryRequiresWorkspaceProvenance(t *testing.T) {
-	scheme := runtimePoolTestScheme(t)
+	scheme := runtimePoolWorkspaceTestScheme(t)
 	pool := runtimePoolTestObject(1)
 	pool.Name = "acp-ws-codex-" + strings.Repeat("a", 16)
 	pool.UID = types.UID(pool.Namespace + "-historical-workspace-pool-uid")

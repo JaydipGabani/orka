@@ -68,6 +68,54 @@ func TestValidateFrozenACPDispatchTargetKeepsBoundRetryOnOriginalPool(t *testing
 	}
 }
 
+func TestValidateFrozenACPDispatchPlanKeepsUnboundReservedAttemptOnSelectedPool(t *testing.T) {
+	profile := harnessProfileForTest()
+	profile.AdapterDigests = acp.BuiltInRuntimeAdapterDigests(profile.ProviderKind)
+	digest, err := harnessv2.CanonicalProfileDigest(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldImage := "docker.io/example/codex@sha256:" + strings.Repeat("a", 64)
+	identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+		"profileDigest": string(digest), "runtimeImage": oldImage,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozenPlan := ACPRuntimePlan{
+		PoolName: acpRuntimePoolName(profile.ProviderKind, harnessv2.ProfileDigest(identity)),
+		Image:    oldImage, Profile: profile, Digest: digest,
+	}
+	currentPlan, err := currentACPRuntimeDeliveryPlan(
+		frozenPlan,
+		ACPRuntimeImages{Codex: "docker.io/example/codex@sha256:" + strings.Repeat("b", 64)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := runtimePoolForImageRotationTest("default", types.UID("old-pool-uid"), frozenPlan)
+	task := &corev1alpha1.Task{
+		Status: corev1alpha1.TaskStatus{Execution: &corev1alpha1.TaskExecutionStatus{
+			State:           corev1alpha1.TaskExecutionStateReserved,
+			RuntimePoolName: pool.Name,
+			RuntimePoolUID:  string(pool.UID),
+		}},
+	}
+	bound := &verifiedAgentExecution{
+		binding: &corev1alpha1.AgentExecutionBinding{},
+		body:    agentExecutionSnapshotBody{ProfileDigest: string(frozenPlan.Digest)},
+		plan:    frozenPlan,
+	}
+
+	target := acpDispatchTarget{pool: pool}
+	if err := validateFrozenACPDispatchTarget(task, target, bound, currentPlan); err == nil {
+		t.Fatal("current-image plan unexpectedly matched the selected old-image pool")
+	}
+	if err := validateFrozenACPDispatchPlan(task, target, bound, currentPlan); err != nil {
+		t.Fatalf("validate reserved delivery plan: %v", err)
+	}
+}
+
 func TestValidateFrozenACPDispatchTargetAcceptsCompatiblePreSubmissionRebind(t *testing.T) {
 	profile := harnessProfileForTest()
 	profile.AdapterDigests = acp.BuiltInRuntimeAdapterDigests(profile.ProviderKind)
