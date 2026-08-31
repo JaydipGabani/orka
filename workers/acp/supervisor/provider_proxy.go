@@ -125,6 +125,12 @@ type providerProxySession struct {
 	turnPromptID      string
 	maxTurns          int32
 	inferenceRequests int32
+	// inflightInference counts inference requests between admission and
+	// handler completion, separately from the session-wide inflight counter:
+	// prompt settlement must only fail closed on an unresolved *inference*
+	// outcome, not on a stalled metadata read such as GET /models.
+	inflightInference int
+	drainedInference  chan struct{}
 	turnLimitExceeded bool
 	// Per-prompt upstream inference response accounting. ACP agents such as
 	// Codex and Copilot report provider errors as ordinary assistant text and
@@ -554,7 +560,50 @@ func (s *providerProxySession) consumeInferenceRequest(promptID string, class pr
 	}
 	s.inferenceRequests++
 	s.issuedInference++
+	if s.inflightInference == 0 {
+		s.drainedInference = make(chan struct{})
+	}
+	s.inflightInference++
 	return s.issuedInference, nil
+}
+
+// releaseInferenceRequest ends the in-flight accounting for one admitted
+// inference request; metadata classes are a no-op.
+func (s *providerProxySession) releaseInferenceRequest(class providerRequestClass) {
+	if s == nil || class != providerRequestInference {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflightInference <= 0 {
+		return
+	}
+	s.inflightInference--
+	if s.inflightInference == 0 {
+		close(s.drainedInference)
+	}
+}
+
+// waitInference waits for the in-flight inference requests to finish. Unlike
+// wait, it ignores metadata requests: their outcomes never feed prompt
+// classification, so they must not convert a completed prompt into a
+// provider failure.
+func (s *providerProxySession) waitInference(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	drained := s.drainedInference
+	s.mu.Unlock()
+	if drained == nil {
+		return nil
+	}
+	select {
+	case <-drained:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *providerProxySession) maxTurnsExceeded(promptID string) bool {
@@ -896,6 +945,7 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	defer session.releaseInferenceRequest(requestClass)
 
 	requestContext = httptrace.WithClientTrace(requestContext, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
 		connectionMu.Lock()

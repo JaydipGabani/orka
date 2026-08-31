@@ -947,6 +947,8 @@ func (f upstreamFailureFixture) recordInference(t *testing.T, status int, detail
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The real handler releases the in-flight accounting when it returns.
+	defer f.proxy.releaseInferenceRequest(providerRequestInference)
 	f.proxy.recordInferenceOutcome(f.promptID, providerRequestInference, seq, status, detail)
 }
 
@@ -969,8 +971,8 @@ func TestUndrainedInferenceRequestFailsCompletedSettlement(t *testing.T) {
 	// flight when the child settles and never resolves within the grace.
 	fixture.recordInference(t, http.StatusOK, "")
 	fixture.proxy.mu.Lock()
-	fixture.proxy.inflight++
-	fixture.proxy.drained = make(chan struct{})
+	fixture.proxy.inflightInference++
+	fixture.proxy.drainedInference = make(chan struct{})
 	fixture.proxy.mu.Unlock()
 	fixture.server.cfg.CancelGrace = 20 * time.Millisecond
 	fixture.server.waitProviderProxyDrained(fixture.state, fixture.prompt)
@@ -984,6 +986,27 @@ func TestUndrainedInferenceRequestFailsCompletedSettlement(t *testing.T) {
 	}
 	if settledResult.Outcome != acp.PromptOutcomeFailed || !settledResult.Accepted {
 		t.Fatalf("undrained settled result = %#v", settledResult)
+	}
+}
+
+func TestUndrainedMetadataRequestKeepsCompletedSettlement(t *testing.T) {
+	fixture := newUpstreamFailureFixture(t)
+	// The final inference resolved, but a metadata request (GET /models,
+	// count_tokens) is still in flight; its outcome never feeds prompt
+	// classification, so settlement must not fail closed on it.
+	fixture.recordInference(t, http.StatusOK, "")
+	fixture.proxy.mu.Lock()
+	fixture.proxy.inflight++
+	fixture.proxy.drained = make(chan struct{})
+	fixture.proxy.mu.Unlock()
+	fixture.server.cfg.CancelGrace = 20 * time.Millisecond
+	fixture.server.waitProviderProxyDrained(fixture.state, fixture.prompt)
+	if fixture.prompt.providerDrainTimedOut {
+		t.Fatal("a stalled metadata request was reported as an undrained inference")
+	}
+	terminal, _ := fixture.settleCompleted(t)
+	if terminal.Type != harnessv2.EventCompleted {
+		t.Fatalf("metadata-stall terminal event = %#v", terminal)
 	}
 }
 

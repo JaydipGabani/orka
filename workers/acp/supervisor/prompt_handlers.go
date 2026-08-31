@@ -2289,18 +2289,20 @@ func settlePromptLocked(prompt *promptState, settlement harnessv2.PromptSettleme
 }
 
 // waitProviderProxyDrained waits, bounded by the cancel grace, for the
-// session's in-flight provider requests to finish so their outcomes are
-// accounted before the terminal result is classified. A request that does
-// not finish in time leaves the accounting incomplete: the prompt is marked
-// so a child-reported Completed result settles fail-closed instead of
-// trusting evidence that never arrived.
+// session's in-flight *inference* requests to finish so their outcomes are
+// accounted before the terminal result is classified. An inference request
+// that does not finish in time leaves the accounting incomplete: the prompt
+// is marked so a child-reported Completed result settles fail-closed instead
+// of trusting evidence that never arrived. Metadata requests (model listings,
+// token counting) never feed classification and are not waited on: a stalled
+// GET /models must not convert a completed prompt into a provider failure.
 func (s *Server) waitProviderProxyDrained(state *sessionState, prompt *promptState) {
 	if state == nil || state.providerProxy == nil {
 		return
 	}
 	waitCtx, cancel := context.WithTimeout(context.Background(), defaultDuration(s.cfg.CancelGrace, acp.DefaultStopGrace))
 	defer cancel()
-	if err := state.providerProxy.wait(waitCtx); err != nil {
+	if err := state.providerProxy.waitInference(waitCtx); err != nil {
 		slog.Warn("ACP provider proxy did not drain before prompt settlement; settling fail-closed", "errorClass", promptStreamErrorClass(err))
 		if prompt != nil {
 			s.mu.Lock()
