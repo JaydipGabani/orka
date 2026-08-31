@@ -3,6 +3,7 @@ import { render, screen, waitFor, fireEvent } from '@/test/test-utils'
 import { act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
+import { focusManager } from '@tanstack/react-query'
 import { server } from '@/test/mocks/server'
 
 let useStateTypeOverride: string | null = null
@@ -294,6 +295,54 @@ describe('TaskCreateForm', () => {
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Task created'))
     expect(submitted).toMatchObject({ type: 'ai', agentRef: { name: 'native-agent' }, ai: { prompt: 'Summarize' } })
     expect((submitted?.ai as Record<string, unknown>).provider).toBeUndefined()
+  })
+
+  it('drops a selected Agent when the list refetch errors instead of silently submitting it', async () => {
+    useStateTypeOverride = 'ai'
+    let submitted: Record<string, unknown> | undefined
+    let agentCalls = 0
+    server.use(
+      http.get('/api/v1/agents', () => {
+        agentCalls += 1
+        if (agentCalls > 1) {
+          return HttpResponse.json({ error: { code: 403, message: 'forbidden' } }, { status: 403 })
+        }
+        return HttpResponse.json({
+          items: [
+            { metadata: { name: 'native-agent', namespace: 'default' }, spec: { providerRef: { name: 'anthropic' }, model: { provider: 'anthropic', name: 'claude' } } },
+          ],
+        })
+      }),
+      http.post('/api/v1/tasks', async ({ request }) => {
+        submitted = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ metadata: { name: 'ai-task', namespace: 'default' }, spec: { type: 'ai' } })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    const agentTrigger = await screen.findByRole('combobox', { name: 'AI agent' })
+    await waitFor(() => expect(agentTrigger).not.toBeDisabled())
+    fireEvent.pointerDown(agentTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: /native-agent/ }))
+    await waitFor(() => expect(screen.getByTestId('ai-agent-info-card')).toBeInTheDocument())
+
+    // A refocus refetch now 403s; the selection must not survive as a
+    // hidden agentRef while the selector renders empty.
+    await act(async () => {
+      focusManager.setFocused(false)
+      focusManager.setFocused(true)
+    })
+    await waitFor(() => expect(agentCalls).toBeGreaterThan(1))
+    await waitFor(() => expect(screen.queryByTestId('ai-agent-info-card')).not.toBeInTheDocument())
+
+    await user.type(screen.getByPlaceholderText('my-task'), 'ai-task')
+    await user.type(screen.getByPlaceholderText('Enter your prompt...'), 'Summarize')
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+    // With the stale selection dropped, submission demands the visible
+    // Agent/Provider choice instead of silently sending the hidden Agent.
+    expect(toast.error).toHaveBeenCalledWith('Select an Agent or a Provider for the AI task')
+    expect(submitted).toBeUndefined()
   })
 
   it('clears inline provider/model when an Agent is picked and only sends re-entered overrides', async () => {

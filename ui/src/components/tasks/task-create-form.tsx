@@ -104,11 +104,15 @@ export function TaskCreateForm() {
   // The selection only counts while it names a native Agent in the current
   // namespace's latest list: an Agent deleted (or turned into a runtime
   // Agent) after being picked must not be submitted as a stale agentRef. The
-  // pick survives while the list is still loading.
+  // pick survives only a genuine initial load — an errored list (agentsData
+  // deliberately suppressed above) drops it, so a hidden stale Agent is
+  // never silently submitted while the selector renders empty.
   const aiAgentRef =
     aiAgentSelection &&
     aiAgentSelection.namespace === namespace &&
-    (agentsData === undefined || inlineAgents.some((agent) => agent.metadata.name === aiAgentSelection.name))
+    (agentsData === undefined
+      ? agentsQuery.isPending
+      : inlineAgents.some((agent) => agent.metadata.name === aiAgentSelection.name))
       ? aiAgentSelection.name
       : ''
   const selectedAIAgent = useMemo(
