@@ -558,6 +558,11 @@ func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSumma
 		if file == "" || !SafeRepoPath(file) {
 			return nil, fmt.Errorf("patch changedFiles contains an unsafe path")
 		}
+		// Paths are agent-controlled and persist in artifacts, status, and
+		// PR bodies; a credential smuggled as a path segment must not.
+		if LooksLikeSecret(file) {
+			return nil, fmt.Errorf("patch changedFiles contains a credential-shaped path")
+		}
 		if _, duplicate := seen[file]; duplicate {
 			continue
 		}

@@ -191,9 +191,18 @@ export function useTaskEvents(
     retry: (failureCount, error) =>
       !(error instanceof ApiError && (error.status === 501 || error.status === 404 || error.status === 403)) &&
       failureCount < 3,
-    refetchInterval: (query) =>
-      query.state.error instanceof ApiError && query.state.error.status === 501
-        ? false
-        : refetchInterval,
+    refetchInterval: (query) => {
+      const error = query.state.error
+      if (!(error instanceof ApiError)) return refetchInterval
+      // 501 (feature off) and 403 (forbidden for this token) never change on
+      // their own; a 404 after events were seen means the task is gone.
+      // Consumers without the detail page's enabled-guard (the runtime
+      // canvas spotlight) must not poll those forever. A 404 before any
+      // events were seen keeps polling like the task-detail query: a fresh
+      // task can transiently 404 while caches catch up.
+      if (error.status === 501 || error.status === 403) return false
+      if (error.status === 404 && query.state.data !== undefined) return false
+      return refetchInterval
+    },
   })
 }

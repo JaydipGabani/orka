@@ -160,6 +160,11 @@ type providerProxyAuthorization struct {
 	upstreamBase *url.URL
 	gateContext  context.Context
 	promptID     string
+	// inferenceSeq is the issuance order assigned atomically at admission
+	// for inference-route requests (0 for metadata). Allocating it here —
+	// not after body validation — keeps "final request" meaning final by
+	// admission order even when concurrent bodies validate out of order.
+	inferenceSeq uint64
 	release      func()
 }
 
@@ -499,7 +504,11 @@ func (s *providerProxySession) wait(ctx context.Context) error {
 	}
 }
 
-func (s *providerProxySession) authorize(r *http.Request, now time.Time) (providerProxyAuthorization, bool) {
+// authorize admits one request and, atomically under the same lock, starts
+// the in-flight accounting the settlement drain depends on. The route class
+// is registered here — not after body validation — so there is no window in
+// which an authorized inference request exists that the drain cannot see.
+func (s *providerProxySession) authorize(r *http.Request, class providerRequestClass, now time.Time) (providerProxyAuthorization, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.activePromptID == "" || s.gateContext == nil || !now.Before(s.leaseExpiresAt) {
@@ -518,14 +527,27 @@ func (s *providerProxySession) authorize(r *http.Request, now time.Time) (provid
 		s.drained = make(chan struct{})
 	}
 	s.inflight++
+	var inferenceSeq uint64
+	if class == providerRequestInference {
+		if s.inflightInference == 0 {
+			s.drainedInference = make(chan struct{})
+		}
+		s.inflightInference++
+		s.issuedInference++
+		inferenceSeq = s.issuedInference
+	}
 	var releaseOnce sync.Once
 	target := *s.proxy.upstreamBase
 	return providerProxyAuthorization{
 		upstreamBase: &target,
 		gateContext:  s.gateContext,
 		promptID:     s.activePromptID,
+		inferenceSeq: inferenceSeq,
 		release: func() {
-			releaseOnce.Do(s.releaseRequest)
+			releaseOnce.Do(func() {
+				s.releaseRequest()
+				s.releaseInferenceRequest(class)
+			})
 		},
 	}, true
 }
@@ -543,24 +565,23 @@ func (s *providerProxySession) releaseRequest() {
 }
 
 // consumeInferenceRequest admits one inference request against the prompt's
-// turn budget and returns its issuance sequence, which orders the response
-// accounting. Metadata requests consume nothing and carry sequence 0.
-func (s *providerProxySession) consumeInferenceRequest(promptID string, class providerRequestClass, now time.Time) (uint64, error) {
+// turn budget. The issuance sequence is assigned earlier, atomically at
+// route admission in authorize; metadata requests consume nothing.
+func (s *providerProxySession) consumeInferenceRequest(promptID string, class providerRequestClass, now time.Time) error {
 	if class != providerRequestInference {
-		return 0, nil
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.activePromptID != promptID || s.gateContext == nil || !now.Before(s.leaseExpiresAt) {
-		return 0, context.Canceled
+		return context.Canceled
 	}
 	if s.inferenceRequests >= s.maxTurns {
 		s.turnLimitExceeded = true
-		return 0, errProviderTurnLimitExceeded
+		return errProviderTurnLimitExceeded
 	}
 	s.inferenceRequests++
-	s.issuedInference++
-	return s.issuedInference, nil
+	return nil
 }
 
 // beginInferenceRequest starts the in-flight accounting for one authorized
@@ -654,7 +675,7 @@ func (s *providerProxySession) recordInferenceOutcome(promptID string, class pro
 // render such a rejection as ordinary assistant text and end their turn, so
 // without this evidence the prompt would settle Completed even though its
 // final inference attempt never reached the provider.
-func (s *providerProxySession) recordRejectedInferenceRequest(promptID string, class providerRequestClass, statusCode int, detail string) {
+func (s *providerProxySession) recordRejectedInferenceRequest(promptID string, class providerRequestClass, seq uint64, statusCode int, detail string) {
 	if s == nil || class != providerRequestInference {
 		return
 	}
@@ -664,8 +685,13 @@ func (s *providerProxySession) recordRejectedInferenceRequest(promptID string, c
 	if promptID == "" || s.turnPromptID != promptID {
 		return
 	}
-	s.issuedInference++
-	s.recordInferenceOutcomeLocked(s.issuedInference, statusCode, detail)
+	if seq == 0 {
+		// A reject with no admission-allocated sequence (rejected before
+		// authorization completed) still gets ordered at issuance.
+		s.issuedInference++
+		seq = s.issuedInference
+	}
+	s.recordInferenceOutcomeLocked(seq, statusCode, detail)
 }
 
 func (s *providerProxySession) recordInferenceOutcomeLocked(seq uint64, statusCode int, detail string) {
@@ -861,22 +887,17 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	authorization, ok := session.authorize(r, time.Now().UTC())
+	// The route class (path + method) is known before authorization, so the
+	// drain accounting can start atomically with admission inside authorize.
+	_, _, routeClass := providerRequestRoute(p.providerKind, suffix, r.Method)
+	authorization, ok := session.authorize(r, routeClass, time.Now().UTC())
 	if !ok {
 		providerproxy.WriteError(w, http.StatusForbidden, "provider access is not active")
 		return
 	}
 	defer authorization.release()
-	// Every rejection from here until the request is admitted upstream is a
-	// failed inference attempt when the route is an inference endpoint.
-	_, _, routeClass := providerRequestRoute(p.providerKind, suffix, r.Method)
-	// Begin in-flight accounting now, before the body is read: an inference
-	// request must participate in the settlement drain from the moment it
-	// is authorized, not only after body validation.
-	session.beginInferenceRequest(routeClass)
-	defer session.releaseInferenceRequest(routeClass)
 	reject := func(statusCode int, message string) {
-		session.recordRejectedInferenceRequest(authorization.promptID, routeClass, statusCode, message)
+		session.recordRejectedInferenceRequest(authorization.promptID, routeClass, authorization.inferenceSeq, statusCode, message)
 		providerproxy.WriteError(w, statusCode, message)
 	}
 	if !providerproxy.TryAcquireSlot(session.requestSlots) {
@@ -953,10 +974,10 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	default:
 	}
-	inferenceSeq, err := session.consumeInferenceRequest(authorization.promptID, requestClass, time.Now().UTC())
-	if err != nil {
+	inferenceSeq := authorization.inferenceSeq
+	if err := session.consumeInferenceRequest(authorization.promptID, requestClass, time.Now().UTC()); err != nil {
 		if errors.Is(err, errProviderTurnLimitExceeded) {
-			session.recordRejectedInferenceRequest(authorization.promptID, requestClass, http.StatusTooManyRequests, "maximum provider inference requests reached for active prompt")
+			session.recordRejectedInferenceRequest(authorization.promptID, requestClass, inferenceSeq, http.StatusTooManyRequests, "maximum provider inference requests reached for active prompt")
 			writeProviderTurnLimitError(w, p.providerKind)
 		} else {
 			reject(http.StatusForbidden, "provider request is no longer active")
@@ -1041,6 +1062,14 @@ func (p *providerProxy) relayUpstreamResponse(
 		capture = &prefixCapture{limit: providerUpstreamDetailProbeBytes}
 		body = io.TeeReader(response.Body, capture)
 	}
+	// A 200 status line does not prove a streamed inference succeeded:
+	// providers report terminal errors inside the SSE body. Scan the relayed
+	// stream for explicit error events so they are accounted as failures.
+	var streamScanner *sseTerminalErrorScanner
+	if !upstreamFailed && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+		streamScanner = &sseTerminalErrorScanner{}
+		body = io.TeeReader(body, streamScanner)
+	}
 	providerproxy.CopyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
 	// Flushing after every chunk keeps streamed provider responses (SSE)
@@ -1048,6 +1077,10 @@ func (p *providerProxy) relayUpstreamResponse(
 	flusher, _ := w.(http.Flusher)
 	relayed := &countingWriter{w: w}
 	err := providerproxy.StreamBoundedResponse(relayed, body, p.maxResponseBytes, flusher)
+	streamFailed := func() bool { return streamScanner != nil && streamScanner.failed }
+	recordStreamFailure := func() {
+		session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider stream reported a terminal error: "+streamScanner.detail)
+	}
 	if upstreamFailed {
 		session.attachInferenceFailureDetail(promptID, requestClass, seq, providerUpstreamErrorDetail(capture.buffer))
 	}
@@ -1066,7 +1099,9 @@ func (p *providerProxy) relayUpstreamResponse(
 				// inference and is left unaccounted, so a later-issued
 				// abandoned request cannot mask an earlier failure the child
 				// settled on.
-				if relayed.n > 0 {
+				if streamFailed() {
+					recordStreamFailure()
+				} else if relayed.n > 0 {
 					session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
 				}
 			} else {
@@ -1081,9 +1116,75 @@ func (p *providerProxy) relayUpstreamResponse(
 		panic(http.ErrAbortHandler)
 	}
 	if !upstreamFailed {
+		if streamFailed() {
+			recordStreamFailure()
+			return
+		}
 		// A success is only accounted once the whole body reached the
 		// child; a chunked response is not known to be usable earlier.
 		session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
+	}
+}
+
+// sseTerminalErrorScanner watches a relayed text/event-stream body for an
+// explicit terminal error event. Providers can fail after a 200 status line:
+// Anthropic emits `event: error` mid-stream, and OpenAI-style streams emit
+// `response.failed` / top-level error payloads. Detection is marker-based on
+// raw stream lines: model-generated content cannot spoof the markers because
+// content deltas carry them only JSON-escaped (\" not "). Only explicit
+// error markers flip the result — unknown dialects change nothing — so this
+// strictly removes false successes without inventing false failures.
+type sseTerminalErrorScanner struct {
+	line   []byte
+	failed bool
+	detail string
+}
+
+const sseScannerMaxLineBytes = 1024
+
+// Markers are matched against a whitespace-stripped copy of each line, so
+// valid spaced JSON ({"type": "response.failed"}) and unspaced JSON match
+// identically. Content deltas still cannot spoof them: quotes inside model
+// text arrive JSON-escaped (\"), and stripping whitespace does not unescape.
+var sseTerminalErrorMarkers = []string{
+	"event:error",
+	"event:response.failed",
+	`"type":"error"`,
+	`"type":"response.failed"`,
+	`data:{"error"`,
+}
+
+func (c *sseTerminalErrorScanner) Write(p []byte) (int, error) {
+	if c.failed {
+		return len(p), nil
+	}
+	for _, b := range p {
+		if b == '\n' {
+			c.scanLine()
+			c.line = c.line[:0]
+			continue
+		}
+		if len(c.line) < sseScannerMaxLineBytes {
+			c.line = append(c.line, b)
+		}
+	}
+	return len(p), nil
+}
+
+func (c *sseTerminalErrorScanner) scanLine() {
+	line := strings.TrimRight(string(c.line), "\r")
+	compact := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, line)
+	for _, marker := range sseTerminalErrorMarkers {
+		if strings.Contains(compact, marker) {
+			c.failed = true
+			c.detail = providerUpstreamErrorDetail([]byte(line))
+			return
+		}
 	}
 }
 

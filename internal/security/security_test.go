@@ -564,6 +564,8 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"token: config.Providers.Default.AccessToken",
 		"password = readPasswordFromKeychain(ctx)",
 		"apiKey = cfg.Provider.APIKey",
+		"https://example.com/download?signature=$SIGNED_URL_TOKEN",
+		"token = os.Getenv(tokenEnv)",
 	} {
 		if LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = true, want false for a placeholder or bare keyword", text)
@@ -588,9 +590,34 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		`password="$tr0ng-passw0rd-2024!extra"`,
 		`api_key="<не-placeholder>` + "0123456789abcdef" + `"`,
 		`password="${UNSET:-correct-horse-battery-staple}"`,
+		"https://bucket.s3.amazonaws.com/artifact?X-Amz-Credential=AXXX%2F20260831&X-" + "Amz-Signature=" + strings.Repeat("f0e1d2c3", 8),
+		"curl 'https://acct.blob.core.windows.net/c/b?sig=" + strings.Repeat("Zx", 12) + "'",
+		"api_key=" + strings.Repeat("0123456789abcdef", 2) + "(",
+		"api_key=abcdefghijklmnopqrst(",
+		"PASSWORD=p@ssword&correct-horse-battery-staple",
+		"PASSWORD=short|correct-horse-battery-staple",
 	} {
 		if !LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = false, want true for a credential-shaped value", text)
 		}
+	}
+}
+
+func TestRemediationPullRequestBodyNeutralizesActiveText(t *testing.T) {
+	t.Parallel()
+	finding := &store.Finding{
+		ID:      "fnd_inject",
+		Title:   "Fix @maintainer <!-- hidden --> issue",
+		Summary: "Details:\n/landpr\n@oncall please merge\napi_key=" + strings.Repeat("k9j8", 6),
+	}
+	body := RemediationPullRequestBody(finding, nil)
+	for _, forbidden := range []string{"@maintainer", "@oncall", "<!--", "\n/landpr", strings.Repeat("k9j8", 6)} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("PR body carries active or credential text %q:\n%s", forbidden, body)
+		}
+	}
+	title := RemediationPullRequestTitle(finding)
+	if strings.Contains(title, "@maintainer") || strings.Contains(title, "<!--") {
+		t.Fatalf("PR title carries active text: %q", title)
 	}
 }

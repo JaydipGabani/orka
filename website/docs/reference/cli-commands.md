@@ -98,7 +98,7 @@ Flags:
       --agent string      Agent to use for the task
   -h, --help              help for run
       --model string      Model to use
-      --provider string   Provider to use
+      --provider string   Chat Provider to use (also selects the coordinator Provider for a runtime --agent)
       --session string    Resume a specific session
   -v, --verbose count     Verbosity level (-v, -vv)
 
@@ -469,7 +469,7 @@ Flags:
       --name string                              Task name (default: generated)
       --pr-base-branch string                    Pull request base branch
       --priority int32                           Task priority (0-1000)
-      --provider string                          Provider reference name (default "default")
+      --provider string                          Provider reference name for ai tasks (default: the namespace's only ready Provider)
       --publication-credential string            Secret name for publication write credentials
       --publication-credential-key string        Secret key for publication write credentials (default: token)
       --publication-git-repo string              Publication repository URL

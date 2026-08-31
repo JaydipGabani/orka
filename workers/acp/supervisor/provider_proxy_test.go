@@ -1082,27 +1082,28 @@ func TestRecordRejectedInferenceRequestCountsAsFinalFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer proxy.close()
-	seq, err := proxy.consumeInferenceRequest(promptID, providerRequestInference, now)
+	seq := testAllocateInferenceSeq(proxy)
+	err := proxy.consumeInferenceRequest(promptID, providerRequestInference, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	proxy.recordInferenceOutcome(promptID, providerRequestInference, seq, http.StatusOK, "")
 	// Metadata-route rejections carry no inference evidence.
-	proxy.recordRejectedInferenceRequest(promptID, providerRequestMetadata, http.StatusTooManyRequests, "capacity")
+	proxy.recordRejectedInferenceRequest(promptID, providerRequestMetadata, 0, http.StatusTooManyRequests, "capacity")
 	if failed, _, _ := proxy.upstreamFailureUnrecovered(promptID); failed {
 		t.Fatal("metadata rejection was accounted as an inference failure")
 	}
 	// A proxy-side capacity rejection of an inference request is the
 	// latest-issued outcome, so an end_turn settlement must not be trusted.
-	proxy.recordRejectedInferenceRequest(promptID, providerRequestInference, http.StatusTooManyRequests, "provider session request capacity is exhausted")
+	proxy.recordRejectedInferenceRequest(promptID, providerRequestInference, 0, http.StatusTooManyRequests, "provider session request capacity is exhausted")
 	failed, status, detail := proxy.upstreamFailureUnrecovered(promptID)
 	if !failed || status != http.StatusTooManyRequests || !strings.Contains(detail, "capacity") {
 		t.Fatalf("upstreamFailureUnrecovered() = (%v, %d, %q), want a 429 capacity failure", failed, status, detail)
 	}
 	// The rejection consumed no turn budget, and a later successful inference
 	// recovers the prompt.
-	seq, err = proxy.consumeInferenceRequest(promptID, providerRequestInference, now)
-	if err != nil {
+	seq = testAllocateInferenceSeq(proxy)
+	if err := proxy.consumeInferenceRequest(promptID, providerRequestInference, now); err != nil {
 		t.Fatal(err)
 	}
 	if seq != 3 {
@@ -1273,7 +1274,8 @@ func TestProviderProxyChildAbandonBeforeAnyByteIsUnaccounted(t *testing.T) {
 	// An earlier request failed; a later-issued request the child abandoned
 	// before receiving a single body byte must not mask that failure.
 	session.recordInferenceResponse(testPromptOneID, providerRequestInference, http.StatusTooManyRequests, "rate limit exceeded")
-	seq, err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+	seq := testAllocateInferenceSeq(session)
+	err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1316,7 +1318,8 @@ func TestProviderProxyChildDisconnectOnStreamedSuccessCountsAsSuccess(t *testing
 				t.Fatalf("relay panic = %v, want http.ErrAbortHandler", recovered)
 			}
 		}()
-		seq, err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+		seq := testAllocateInferenceSeq(session)
+		err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1541,11 +1544,13 @@ func TestProviderProxyInferenceAccountingOrdersByIssuance(t *testing.T) {
 		UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
 	})
 	defer session.close()
-	first, err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+	first := testAllocateInferenceSeq(session)
+	err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+	second := testAllocateInferenceSeq(session)
+	err = session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1556,8 +1561,10 @@ func TestProviderProxyInferenceAccountingOrdersByIssuance(t *testing.T) {
 		t.Fatalf("upstreamFailureUnrecovered = %v/%d/%q, want the later-issued failure to decide", failed, status, detail)
 	}
 	// A failure issued before a success that completes later is recovered.
-	third, _ := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
-	fourth, _ := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+	third := testAllocateInferenceSeq(session)
+	_ = session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
+	fourth := testAllocateInferenceSeq(session)
+	_ = session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now())
 	session.recordInferenceOutcome(testPromptOneID, providerRequestInference, fourth, http.StatusOK, "")
 	session.recordInferenceOutcome(testPromptOneID, providerRequestInference, third, http.StatusBadGateway, "late failure")
 	if failed, _, _ := session.upstreamFailureUnrecovered(testPromptOneID); failed {

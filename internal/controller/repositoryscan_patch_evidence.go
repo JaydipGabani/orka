@@ -30,7 +30,10 @@ import (
 const (
 	// repositoryScanPublishedCommitMaxFiles bounds the files a remediation
 	// commit may touch; GitHub's commit endpoint returns at most 300 files.
-	repositoryScanPublishedCommitMaxFiles    = 300
+	repositoryScanPublishedCommitMaxFiles = 300
+	// repositoryScanPublishedCommitPageSize is GitHub's documented per_page
+	// maximum for the commit files listing.
+	repositoryScanPublishedCommitPageSize    = 100
 	repositoryScanForgeCredentialKey         = defaultACPWorkspaceCredentialKey
 	repositoryScanNonCanonicalTargetReason   = "repository scan publication target is not a canonical GitHub repository"
 	repositoryScanArtifactStoreNotConfigured = "artifact store is not configured"
@@ -199,7 +202,16 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 	// line, however it is prefixed) must be identical to the published
 	// commit's. Only pre-hunk metadata (index/mode/---/+++ header lines),
 	// which legitimately varies between diff generators, is excluded.
-	if !samePatchHunks(string(diffData), commitDiff) {
+	// Stored artifacts come in two provenances: the result-contract path
+	// persists the commit diff credential-redacted, while legacy
+	// harness-written artifacts are raw — so the stored diff must match the
+	// fresh commit diff in either its raw or its sanitized form (both are
+	// exact commit-derived representations; the sanitizer is deterministic).
+	// Without the sanitized comparison, the second reconcile of an already
+	// verified proposal would fail solely because [REDACTED] differs from
+	// the credential the remediation removed.
+	if !samePatchHunks(string(diffData), commitDiff) &&
+		!samePatchHunks(string(diffData), repositoryMonitorReviewContextSanitize(commitDiff)) {
 		return "patch diff artifact content does not match the published commit", nil
 	}
 	return "", nil
@@ -207,13 +219,20 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 
 // patchHunksByFile extracts each file's verbatim hunk body — everything from
 // its first "@@" line to the next file header — from a unified diff.
-func patchHunksByFile(diff string) map[string]string {
+func patchHunksByFile(diff string) (map[string]string, bool) {
 	hunks := map[string]string{}
 	var body []string
 	current := ""
 	inHunk := false
+	duplicate := false
 	flush := func() {
 		if current != "" && len(body) > 0 {
+			// A repeated file block could hide arbitrary content behind a
+			// second block carrying the genuine hunks; it invalidates the
+			// whole diff rather than overwriting the earlier block.
+			if _, exists := hunks[current]; exists {
+				duplicate = true
+			}
 			hunks[current] = strings.TrimRight(strings.Join(body, "\n"), "\n")
 		}
 		body = nil
@@ -237,12 +256,13 @@ func patchHunksByFile(diff string) map[string]string {
 		}
 	}
 	flush()
-	return hunks
+	return hunks, !duplicate
 }
 
 func samePatchHunks(a, b string) bool {
-	hunksA, hunksB := patchHunksByFile(a), patchHunksByFile(b)
-	if len(hunksA) != len(hunksB) {
+	hunksA, okA := patchHunksByFile(a)
+	hunksB, okB := patchHunksByFile(b)
+	if !okA || !okB || len(hunksA) != len(hunksB) {
 		return false
 	}
 	for path, hunk := range hunksA {
@@ -300,6 +320,8 @@ type repositoryScanCommitFileResponse struct {
 	PreviousFilename string `json:"previous_filename"`
 	Status           string `json:"status"`
 	Patch            string `json:"patch"`
+	Additions        int    `json:"additions"`
+	Deletions        int    `json:"deletions"`
 }
 
 type repositoryScanCommitResponse struct {
@@ -315,49 +337,56 @@ func (r *RepositoryScanReconciler) fetchRepositoryScanPublishedCommit(ctx contex
 	if baseURL == "" {
 		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
 	}
-	// per_page pins the maximum file page; the commit endpoint otherwise
-	// returns a smaller default page and silently paginates the rest.
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/commits/%s?per_page=%d",
-		baseURL, url.PathEscape(owner), url.PathEscape(repository), url.PathEscape(sha), repositoryScanPublishedCommitMaxFiles)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, "", err
+	// The commit endpoint paginates its files array; per_page's documented
+	// maximum is 100, so pages are followed explicitly up to the supported
+	// file-count bound and anything beyond fails closed.
+	var files []repositoryScanCommitFileResponse
+	maxPages := repositoryScanPublishedCommitMaxFiles / repositoryScanPublishedCommitPageSize
+	for page := 1; ; page++ {
+		if page > maxPages {
+			return nil, "published patch commit exceeds the supported file count", nil
+		}
+		endpoint := fmt.Sprintf("%s/repos/%s/%s/commits/%s?per_page=%d&page=%d",
+			baseURL, url.PathEscape(owner), url.PathEscape(repository), url.PathEscape(sha), repositoryScanPublishedCommitPageSize, page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, "", err
+		}
+		repositoryMonitorSetGitHubHeaders(req, token)
+		resp, err := r.repositoryScanHTTPClient().Do(req)
+		if err != nil {
+			// The error text may carry the request URL; keep the persisted
+			// reason class-only.
+			return nil, "published patch commit could not be read from GitHub", nil
+		}
+		body, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, "published patch commit response exceeded the read limit", nil
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Sprintf("published patch commit could not be read from GitHub (HTTP %d)", resp.StatusCode), nil
+		}
+		var commit repositoryScanCommitResponse
+		if err := json.Unmarshal(body, &commit); err != nil {
+			return nil, "published patch commit response is not valid JSON", nil
+		}
+		// Every page must identify the same verified commit.
+		if !strings.EqualFold(strings.TrimSpace(commit.SHA), sha) {
+			return nil, "published patch commit response does not match the verified commit", nil
+		}
+		files = append(files, commit.Files...)
+		if len(files) > repositoryScanPublishedCommitMaxFiles {
+			return nil, "published patch commit exceeds the supported file count", nil
+		}
+		if !strings.Contains(resp.Header.Get("Link"), `rel="next"`) {
+			break
+		}
 	}
-	repositoryMonitorSetGitHubHeaders(req, token)
-	resp, err := r.repositoryScanHTTPClient().Do(req)
-	if err != nil {
-		// The error text may carry the request URL; keep the persisted
-		// reason class-only.
-		return nil, "published patch commit could not be read from GitHub", nil
-	}
-	defer resp.Body.Close() //nolint:errcheck
-	body, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
-	if err != nil {
-		return nil, "published patch commit response exceeded the read limit", nil
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Sprintf("published patch commit could not be read from GitHub (HTTP %d)", resp.StatusCode), nil
-	}
-	// A next page means the commit's file list is incomplete at the maximum
-	// page size; verifying a partial file set would let unreviewed changes
-	// through, so it fails closed like the explicit file-count bound below.
-	if strings.Contains(resp.Header.Get("Link"), `rel="next"`) {
-		return nil, "published patch commit exceeds the supported file count", nil
-	}
-	var commit repositoryScanCommitResponse
-	if err := json.Unmarshal(body, &commit); err != nil {
-		return nil, "published patch commit response is not valid JSON", nil
-	}
-	if !strings.EqualFold(strings.TrimSpace(commit.SHA), sha) {
-		return nil, "published patch commit response does not match the verified commit", nil
-	}
-	if len(commit.Files) == 0 {
+	if len(files) == 0 {
 		return nil, "published patch commit contains no files", nil
 	}
-	if len(commit.Files) > repositoryScanPublishedCommitMaxFiles {
-		return nil, "published patch commit exceeds the supported file count", nil
-	}
-	return commit.Files, "", nil
+	return files, "", nil
 }
 
 // repositoryScanDiffFromPublishedCommit renders the published commit's file
@@ -367,16 +396,27 @@ func (r *RepositoryScanReconciler) fetchRepositoryScanPublishedCommit(ctx contex
 func repositoryScanDiffFromPublishedCommit(files []repositoryScanCommitFileResponse) (string, []string, string) {
 	var diff strings.Builder
 	paths := make([]string, 0, len(files))
+	seen := make(map[string]struct{}, len(files))
 	for _, file := range files {
 		path := strings.TrimSpace(file.Filename)
 		if path == "" || !security.SafeRepoPath(path) || strings.ContainsAny(path, " \"\\\t\r\n") {
 			return "", nil, "published patch commit contains an unsafe file path"
 		}
+		if _, duplicate := seen[path]; duplicate {
+			return "", nil, "published patch commit repeats a file path: " + path
+		}
+		seen[path] = struct{}{}
 		if strings.TrimSpace(file.PreviousFilename) != "" && strings.TrimSpace(file.PreviousFilename) != path {
 			return "", nil, "published patch commit renames or copies a file, which security patches do not support"
 		}
 		if strings.TrimSpace(file.Patch) == "" {
 			return "", nil, "published patch commit contains a file without a text patch: " + path
+		}
+		// GitHub can serve a nonempty but truncated patch for a large
+		// change; a fragment whose line totals disagree with the reported
+		// counts would hide part of the actual commit from the evidence.
+		if !patchMatchesLineCounts(file.Patch, file.Additions, file.Deletions) {
+			return "", nil, "published patch commit contains an inconsistent file patch: " + path
 		}
 		fmt.Fprintf(&diff, "diff --git a/%s b/%s\n", path, path)
 		// Mode lines are intentionally omitted: the commit file listing does

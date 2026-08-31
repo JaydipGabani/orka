@@ -1983,8 +1983,12 @@ func (s *Server) terminalEvent(
 		effective = promptResultFromSettlement(*prompt.settlement)
 	} else {
 		effective = providerTurnLimitResult(state, prompt, effective)
-		effective = providerUpstreamFailureResult(state, prompt, effective)
+		// Drain-timeout is checked before recorded upstream failures: when a
+		// later-issued request never resolved, blaming an earlier recorded
+		// failure as "the final request" would be a false diagnosis — the
+		// actually-final request's outcome is unknown.
 		effective = providerDrainFailureResult(prompt, effective)
+		effective = providerUpstreamFailureResult(state, prompt, effective)
 		// The durable settlement is derived from the same result the Failed
 		// event is built from: a failed result that still carries the child's
 		// end_turn or cancelled stop reason would otherwise settle as

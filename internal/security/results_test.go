@@ -253,6 +253,7 @@ func TestParsePatchResultRejectsInvalidEnvelopes(t *testing.T) {
 		"empty":                   ``,
 		"credential summary":      `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"Removed api_key=0123456789abcdef0123 from config","changedFiles":["a.go"],"risk":"low"}`,
 		"credential test command": `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"testsRun":[{"command":"AUTH_TOKEN=0123456789abcdef0123 npm test","exitCode":0}],"risk":"low"}`,
+		"credential-shaped path":  `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["cfg/api_key=0123456789abcdef0123.txt"],"risk":"low"}`,
 	}
 	for name, payload := range cases {
 		t.Run(name, func(t *testing.T) {
