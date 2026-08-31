@@ -2401,27 +2401,24 @@ func absInt(value int) int {
 	return value
 }
 
-func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) error {
-	if r.SecurityStore == nil || scan == nil || run == nil || run.Phase != scanRunPhaseSucceeded || run.ReviewedSliceCount == 0 {
-		return nil
-	}
+func (r *RepositoryScanReconciler) repositoryScanInconclusiveFindingSlices(ctx context.Context, scan *corev1alpha1.RepositoryScan, runID string) (map[string]struct{}, bool, bool, error) {
 	inconclusiveSlices := map[string]struct{}{}
 	allSlicesInconclusive := false
-	droppedCursor := ""
+	cursor := ""
 	for {
 		dropped, next, err := r.SecurityStore.ListDroppedFindings(ctx, store.DroppedFindingFilter{
 			Namespace:      scan.Namespace,
 			RepositoryScan: scan.Name,
-			ScanRunID:      run.ID,
+			ScanRunID:      runID,
 			Limit:          200,
-			Cursor:         droppedCursor,
+			Cursor:         cursor,
 		})
 		if err != nil {
-			return err
+			return nil, false, false, err
 		}
 		for i := range dropped {
 			if dropped[i].Layer == "cap" {
-				return nil
+				return nil, false, true, nil
 			}
 			sliceID := strings.TrimSpace(dropped[i].SliceID)
 			if sliceID == "" {
@@ -2431,37 +2428,76 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 			inconclusiveSlices[sliceID] = struct{}{}
 		}
 		if next == "" {
-			break
+			return inconclusiveSlices, allSlicesInconclusive, false, nil
 		}
-		droppedCursor = next
+		cursor = next
+	}
+}
+
+func (r *RepositoryScanReconciler) repositoryScanReviewedSlicesForResolution(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) (map[string]struct{}, error) {
+	reviewedSlices := map[string]struct{}{}
+	if run.Mode != scanModeIncremental {
+		return reviewedSlices, nil
+	}
+	cursor := ""
+	for {
+		scanSlices, next, err := r.SecurityStore.ListReviewSlices(ctx, store.ReviewSliceFilter{
+			Namespace:      scan.Namespace,
+			RepositoryScan: scan.Name,
+			Status:         reviewSliceStatusReviewed,
+			LastScanRunID:  run.ID,
+			Limit:          200,
+			Cursor:         cursor,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for i := range scanSlices {
+			reviewedSlices[scanSlices[i].ID] = struct{}{}
+		}
+		if next == "" {
+			return reviewedSlices, nil
+		}
+		cursor = next
+	}
+}
+
+func findingEligibleForMergedResolution(finding *store.Finding, run *store.ScanRun, inconclusiveSlices, reviewedSlices map[string]struct{}, allSlicesInconclusive bool) bool {
+	if finding == nil || finding.ScanRunID == run.ID || finding.PRNumber == nil || *finding.PRNumber < 1 {
+		return false
+	}
+	sliceID := strings.TrimSpace(finding.SliceID)
+	if allSlicesInconclusive || (sliceID == "" && len(inconclusiveSlices) > 0) {
+		return false
+	}
+	if _, inconclusive := inconclusiveSlices[sliceID]; inconclusive {
+		return false
+	}
+	if run.Mode == scanModeIncremental {
+		_, reviewed := reviewedSlices[sliceID]
+		return reviewed
+	}
+	return true
+}
+
+func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) error {
+	if r.SecurityStore == nil || scan == nil || run == nil || run.Phase != scanRunPhaseSucceeded || run.ReviewedSliceCount == 0 {
+		return nil
+	}
+	inconclusiveSlices, allSlicesInconclusive, capped, err := r.repositoryScanInconclusiveFindingSlices(ctx, scan, run.ID)
+	if err != nil {
+		return err
+	}
+	if capped {
+		return nil
 	}
 
-	reviewedSlices := map[string]struct{}{}
-	if run.Mode == scanModeIncremental {
-		cursor := ""
-		for {
-			scanSlices, next, err := r.SecurityStore.ListReviewSlices(ctx, store.ReviewSliceFilter{
-				Namespace:      scan.Namespace,
-				RepositoryScan: scan.Name,
-				Status:         reviewSliceStatusReviewed,
-				LastScanRunID:  run.ID,
-				Limit:          200,
-				Cursor:         cursor,
-			})
-			if err != nil {
-				return err
-			}
-			for i := range scanSlices {
-				reviewedSlices[scanSlices[i].ID] = struct{}{}
-			}
-			if next == "" {
-				break
-			}
-			cursor = next
-		}
-		if len(reviewedSlices) == 0 {
-			return nil
-		}
+	reviewedSlices, err := r.repositoryScanReviewedSlicesForResolution(ctx, scan, run)
+	if err != nil {
+		return err
+	}
+	if run.Mode == scanModeIncremental && len(reviewedSlices) == 0 {
+		return nil
 	}
 
 	token, reason, tokenErr := r.repositoryScanForgeToken(ctx, scan)
@@ -2490,19 +2526,8 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 		}
 		for i := range findings {
 			finding := &findings[i]
-			if finding.ScanRunID == run.ID || finding.PRNumber == nil || *finding.PRNumber < 1 {
+			if !findingEligibleForMergedResolution(finding, run, inconclusiveSlices, reviewedSlices, allSlicesInconclusive) {
 				continue
-			}
-			if allSlicesInconclusive || (strings.TrimSpace(finding.SliceID) == "" && len(inconclusiveSlices) > 0) {
-				continue
-			}
-			if _, inconclusive := inconclusiveSlices[finding.SliceID]; inconclusive {
-				continue
-			}
-			if run.Mode == scanModeIncremental {
-				if _, reviewed := reviewedSlices[finding.SliceID]; !reviewed {
-					continue
-				}
 			}
 			prNumber := *finding.PRNumber
 			if _, verified := verifiedPRs[prNumber]; !verified {

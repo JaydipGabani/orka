@@ -30,6 +30,7 @@ const (
 	repositoryMonitorCommandIntentFix      = "fix"
 	repositoryMonitorUpdateBranchOperation = "update_branch"
 	repositoryMonitorUpdateBranchTimeout   = 2 * time.Minute
+	repositoryMonitorUpdateBranchFailure   = "update_branch_failed"
 	repositoryMonitorFieldBaseSHA          = "baseSHA"
 	repositoryMonitorFieldHeadSHA          = "headSHA"
 )
@@ -280,7 +281,7 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 			return true, 0, fmt.Errorf("update branch failed: %w; additionally failed to update mutation audit: %v", err, updateErr)
 		}
 		item.RepairState = repositoryMonitorRepairPhaseFailed
-		item.SkipReason = "update_branch_failed"
+		item.SkipReason = repositoryMonitorUpdateBranchFailure
 		if updateErr := r.Store.UpsertMonitorItem(ctx, item); updateErr != nil {
 			return true, 0, updateErr
 		}
@@ -429,7 +430,7 @@ func (r *RepositoryMonitorReconciler) failRepositoryMonitorUpdateBranch(ctx cont
 		return err
 	}
 	item.RepairState = repositoryMonitorRepairPhaseFailed
-	item.SkipReason = "update_branch_failed"
+	item.SkipReason = repositoryMonitorUpdateBranchFailure
 	if err := r.Store.UpsertMonitorItem(ctx, item); err != nil {
 		return err
 	}
@@ -456,7 +457,7 @@ func (r *RepositoryMonitorReconciler) terminalizeRepositoryMonitorUpdateBranch(c
 		return err
 	}
 	item.RepairState = repositoryMonitorRepairPhaseFailed
-	item.SkipReason = "update_branch_failed"
+	item.SkipReason = repositoryMonitorUpdateBranchFailure
 	return r.Store.UpsertMonitorItem(ctx, item)
 }
 
