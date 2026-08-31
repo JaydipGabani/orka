@@ -3665,12 +3665,19 @@ func (r *TaskReconciler) handleScheduled(ctx context.Context, task *corev1alpha1
 	if now.Sub(scheduledTime) > time.Duration(deadlineSeconds)*time.Second {
 		log.Info("Missed schedule beyond deadline, skipping", "scheduledTime", scheduledTime, "deadline", deadlineSeconds)
 		r.Recorder.Eventf(task, "Warning", "MissedSchedule", "Missed scheduled run at %s (deadline %ds exceeded)", scheduledTime.Format(time.RFC3339), deadlineSeconds)
-		// Advance to next schedule time
+		// Advance to next schedule time. Re-anchor LastScheduleTime to now so
+		// the next computation starts from the present instead of the stale
+		// pre-skip slot; otherwise a suspend (or any gap) longer than the
+		// starting deadline freezes the anchor and every later reconcile
+		// recomputes the same long-missed slot, advancing NextScheduleTime
+		// forever without ever running.
 		next := sched.Next(now)
 		nextSchedule := metav1.NewTime(next)
 		nextScheduleCopy := nextSchedule
+		reanchor := metav1.NewTime(now)
 		_ = r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
 			t.Status.NextScheduleTime = &nextScheduleCopy
+			t.Status.LastScheduleTime = &reanchor
 		})
 		return ctrl.Result{RequeueAfter: time.Until(next)}, nil
 	}
