@@ -206,6 +206,7 @@ type agentExecutionSnapshotSecretRef struct {
 type verifiedAgentExecution struct {
 	binding          *corev1alpha1.AgentExecutionBinding
 	snapshot         *store.AgentExecutionSnapshot
+	promptAttempt    *store.PromptAttempt
 	body             agentExecutionSnapshotBody
 	plan             ACPRuntimePlan
 	frozenTask       *corev1alpha1.Task

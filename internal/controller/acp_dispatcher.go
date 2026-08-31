@@ -988,6 +988,7 @@ func (d *ACPDispatcher) loadVerifiedACPDispatchExecution(
 		attempt.SnapshotDigest != bound.snapshot.Digest || attempt.ExecutionState != store.PromptExecutionReserved {
 		return nil, errors.New("reserved ACP PromptAttempt does not exactly match the immutable Task binding, snapshot, and request")
 	}
+	bound.promptAttempt = attempt
 	bound.frozenTask.Status = *task.Status.DeepCopy()
 	return bound, nil
 }
@@ -996,17 +997,18 @@ func validateFrozenACPDispatchTarget(
 	task *corev1alpha1.Task,
 	target acpDispatchTarget,
 	bound *verifiedAgentExecution,
+	deliveryPlan ACPRuntimePlan,
 ) error {
 	if task == nil || task.Status.Execution == nil || target.pool == nil || bound == nil || bound.binding == nil {
 		return errors.New("frozen ACP Task, RuntimePool target, and execution binding are required")
 	}
-	if target.pool.Name != bound.plan.PoolName || target.pool.Spec.Runtime.Image != bound.plan.Image ||
+	if target.pool.Name != deliveryPlan.PoolName || target.pool.Spec.Runtime.Image != deliveryPlan.Image ||
 		target.pool.Spec.Runtime.Profile.Digest != bound.body.ProfileDigest ||
 		task.Status.Execution.RuntimePoolName != target.pool.Name ||
 		task.Status.Execution.RuntimePoolUID != string(target.pool.UID) {
 		return errors.New("reserved RuntimePool does not exactly match the immutable execution snapshot")
 	}
-	if !acpRuntimePoolWorkspaceMatchesPlan(target.pool, bound.plan) {
+	if !acpRuntimePoolWorkspaceMatchesPlan(target.pool, deliveryPlan) {
 		return errors.New("reserved RuntimePool execution workspace binding does not exactly match the immutable execution snapshot")
 	}
 	return nil
@@ -1032,10 +1034,13 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		return err
 	}
 	task = bound.frozenTask
-	// Queue reconciliation owns safe pre-submission pool rebinding. Once this
-	// dispatcher holds an exact reservation, keep the frozen pool so a rotated
-	// image cannot split a runtime-bound retry from its existing RuntimeSession.
-	if err := validateFrozenACPDispatchTarget(task, target, bound); err != nil {
+	deliveryPlan, err := acpRuntimeDeliveryPlanForAttempt(
+		bound.plan, task.Status.Execution, bound.promptAttempt, d.ACPRuntimeImages,
+	)
+	if err != nil {
+		return err
+	}
+	if err := validateFrozenACPDispatchTarget(task, target, bound, deliveryPlan); err != nil {
 		return err
 	}
 	if reservationLease != nil {

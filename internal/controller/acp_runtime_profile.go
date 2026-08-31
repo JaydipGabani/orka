@@ -183,18 +183,6 @@ func currentACPRuntimeDeliveryPlan(plan ACPRuntimePlan, images ACPRuntimeImages)
 	return plan, nil
 }
 
-func acpRuntimePlanUsesRetainedImage(plan ACPRuntimePlan, images ACPRuntimeImages) bool {
-	if plan.Workspace != nil {
-		return false
-	}
-	adapterDigests, image, err := acpRuntimeArtifacts(
-		corev1alpha1.AgentRuntimeType(strings.TrimSpace(plan.Profile.ProviderKind)),
-		images,
-	)
-	return err == nil && ACPRuntimeImageAvailable(image) && strings.TrimSpace(image) != strings.TrimSpace(plan.Image) &&
-		!maps.Equal(adapterDigests, plan.Profile.AdapterDigests)
-}
-
 func configuredACPRuntimeImage(provider string, images ACPRuntimeImages) (string, error) {
 	_, image, err := acpRuntimeArtifacts(corev1alpha1.AgentRuntimeType(strings.TrimSpace(provider)), images)
 	if err != nil {

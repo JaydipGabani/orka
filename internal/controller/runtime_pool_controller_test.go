@@ -1377,6 +1377,13 @@ func TestRuntimePoolReconcilerReportsSupersededScaleToZeroPoolStopped(t *testing
 	}
 	pool.Name = acpRuntimePoolName(pool.Spec.Runtime.Profile.ProviderKind, harnessv2.ProfileDigest(identity))
 	pool.UID = types.UID(pool.Namespace + "-superseded-stopped-pool-uid")
+	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+		Type:               acpRuntimePoolImageProvenanceCondition,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: pool.Generation,
+		Reason:             acpRuntimePoolImageProvenanceReason,
+		Message:            "RuntimePool image and profile match a verified immutable Task execution plan",
+	})
 	r := runtimePoolTestReconciler(t, scheme, &fakeRuntimePoolSupervisorClient{}, pool)
 	r.AllowedImages.Codex = "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
 
@@ -1404,16 +1411,33 @@ func TestRuntimePoolReconcilerReportsBadImageAndScheduling(t *testing.T) {
 		}
 	})
 
-	t.Run("unapproved digest-pinned image is rejected", func(t *testing.T) {
+	t.Run("deterministic superseded pool without provenance is rejected", func(t *testing.T) {
 		scheme := runtimePoolTestScheme(t)
 		pool := runtimePoolTestObject(1)
 		pool.Spec.Runtime.Image = "docker.io/example/unapproved@sha256:" + strings.Repeat("9", 64)
+		identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+			"profileDigest": pool.Spec.Runtime.Profile.Digest,
+			"runtimeImage":  pool.Spec.Runtime.Image,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool.Name = acpRuntimePoolName(pool.Spec.Runtime.Profile.ProviderKind, harnessv2.ProfileDigest(identity))
+		pool.UID = types.UID(pool.Namespace + "-unproven-superseded-pool-uid")
 		r := runtimePoolTestReconciler(t, scheme, nil, pool)
 
 		runtimePoolReconcile(t, r, pool)
 		got := runtimePoolTestGetPool(t, r, pool)
 		if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDegraded || !strings.Contains(got.Status.Message, "controller-approved") {
 			t.Fatalf("unapproved-image status = %#v", got.Status)
+		}
+		var deployment appsv1.Deployment
+		err = r.Get(context.Background(), types.NamespacedName{
+			Namespace: pool.Namespace,
+			Name:      runtimePoolResourceName(pool.Namespace, pool.Name),
+		}, &deployment)
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("Deployment exists for unproven superseded image, err=%v", err)
 		}
 	})
 

@@ -26,17 +26,19 @@ import (
 )
 
 const (
-	acpRuntimePoolLabel                      = "orka.ai/acp-runtime-pool"
-	acpRuntimeTrustLabel                     = "orka.ai/acp-trust-domain"
-	acpRuntimeProfileLabel                   = "orka.ai/acp-profile"
-	acpRuntimeWorkspaceProviderLabel         = "orka.ai/acp-execution-workspace-provider"
-	acpRuntimeTaskPoolLabel                  = "orka.ai/runtime-pool"
-	acpRuntimeSessionCleanupAnnotation       = "orka.ai/runtime-session-cleanup"
-	acpExternalRuntimeTaskLabel              = "orka.ai/agent-runtime"
-	acpRuntimeLastDemandAnnotation           = "orka.ai/acp-last-demand-at"
-	acpRuntimeQueuedAtAnnotation             = "orka.ai/acp-queued-at"
-	defaultACPTaskPriority             int32 = 500
-	defaultACPQueueAgingStep           int32 = 25
+	acpRuntimePoolLabel                          = "orka.ai/acp-runtime-pool"
+	acpRuntimeTrustLabel                         = "orka.ai/acp-trust-domain"
+	acpRuntimeProfileLabel                       = "orka.ai/acp-profile"
+	acpRuntimeWorkspaceProviderLabel             = "orka.ai/acp-execution-workspace-provider"
+	acpRuntimeTaskPoolLabel                      = "orka.ai/runtime-pool"
+	acpRuntimeSessionCleanupAnnotation           = "orka.ai/runtime-session-cleanup"
+	acpExternalRuntimeTaskLabel                  = "orka.ai/agent-runtime"
+	acpRuntimeLastDemandAnnotation               = "orka.ai/acp-last-demand-at"
+	acpRuntimeQueuedAtAnnotation                 = "orka.ai/acp-queued-at"
+	acpRuntimePoolImageProvenanceCondition       = "ImageProvenance"
+	acpRuntimePoolImageProvenanceReason          = "VerifiedExecutionPlan"
+	defaultACPTaskPriority                 int32 = 500
+	defaultACPQueueAgingStep               int32 = 25
 )
 
 const (
@@ -54,11 +56,7 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 		return ctrl.Result{}, fmt.Errorf("verify immutable v2 execution before ACP queueing: %w", err)
 	}
 	frozenTask := bound.frozenTask
-	plan, err := currentACPRuntimeDeliveryPlan(bound.plan, r.ACPRuntimeImages)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("resolve current ACP runtime delivery plan: %w", err)
-	}
-	if reason := r.frozenWorkspaceDispatchDisabledReason(plan.Workspace); reason != "" {
+	if reason := r.frozenWorkspaceDispatchDisabledReason(bound.plan.Workspace); reason != "" {
 		// The single configuration gate for bound Tasks: ordinary planning
 		// AND bound-task recovery both flow through this chokepoint before
 		// any workspace or RuntimePool demand exists.
@@ -72,6 +70,16 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 	}
 	if handled, result, err := r.reconcileDurableACPPlanningFailure(ctx, task); handled || err != nil {
 		return result, err
+	}
+	attempt, err := r.queuedACPPromptAttempt(ctx, task)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	plan, err := acpRuntimeDeliveryPlanForAttempt(
+		bound.plan, task.Status.Execution, attempt, r.ACPRuntimeImages,
+	)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("resolve current ACP runtime delivery plan: %w", err)
 	}
 	if err := validateACPWorkspacePreflight(frozenTask); err != nil {
 		return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), err.Error())
@@ -95,27 +103,26 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 	if reader == nil {
 		reader = r.Client
 	}
-	var pool *corev1alpha1.RuntimePool
-	var poolPreexisting bool
-	if acpRuntimePlanUsesRetainedImage(bound.plan, r.ACPRuntimeImages) {
+	allowCreate := !taskExecutionHasRuntimeOrSessionBinding(task.Status.Execution) &&
+		!promptAttemptHasRuntimeOrSessionBinding(attempt)
+	var requiredUID types.UID
+	if !allowCreate {
 		execution := task.Status.Execution
 		if execution == nil || execution.RuntimePoolName != plan.PoolName || strings.TrimSpace(execution.RuntimePoolUID) == "" {
 			return r.failACPPlanningTask(
 				ctx,
 				task,
 				corev1alpha1.TaskExecutionReason("InvalidRuntimeProfile"),
-				"the frozen ACP runtime profile is incompatible with the current runtime image and has no already-bound RuntimePool; create a new Task for the upgraded runtime",
+				"the runtime-bound ACP attempt is missing its exact frozen RuntimePool identity",
 			)
 		}
-		pool, poolPreexisting, err = r.ensureACPRuntimePoolWithPolicy(
-			ctx, task.Namespace, plan, workspaceName,
-			task.Annotations[acpExecutionWorkspaceUIDAnnotation], string(task.UID),
-			false, types.UID(execution.RuntimePoolUID),
-		)
-	} else {
-		pool, poolPreexisting, err = r.ensureACPRuntimePool(ctx, task.Namespace, plan, workspaceName,
-			task.Annotations[acpExecutionWorkspaceUIDAnnotation], string(task.UID))
+		requiredUID = types.UID(execution.RuntimePoolUID)
 	}
+	pool, poolPreexisting, err := r.ensureACPRuntimePoolWithPolicy(
+		ctx, task.Namespace, plan, workspaceName,
+		task.Annotations[acpExecutionWorkspaceUIDAnnotation], string(task.UID),
+		allowCreate, requiredUID,
+	)
 	if err != nil {
 		if errors.Is(err, errACPRuntimeWorkspaceNamespace) {
 			return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), err.Error())
@@ -165,7 +172,7 @@ func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1al
 		}
 		return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("InvalidWorkspace"), credentialErr.Error())
 	}
-	attempt, err := r.DurableControlStore.CreatePromptAttempt(ctx, &store.PromptAttempt{
+	attempt, err = r.DurableControlStore.CreatePromptAttempt(ctx, &store.PromptAttempt{
 		ID: attemptID, Key: key, RequestDigest: requestDigest,
 		BindingDigest: bound.binding.BindingDigest, SnapshotDigest: bound.snapshot.Digest,
 		CredentialBindings: credentialBindings,
@@ -398,6 +405,41 @@ func taskExecutionHasRuntimeOrSessionBinding(status *corev1alpha1.TaskExecutionS
 		strings.TrimSpace(status.RuntimeSessionSupervisorBootID) != "" ||
 		strings.TrimSpace(status.RuntimeSessionProfileDigest) != "" || strings.TrimSpace(status.RuntimeSessionMCPDigest) != "" ||
 		strings.TrimSpace(status.RuntimeSessionWorkspaceDigest) != "" || status.RuntimeSessionRecreationPending)
+}
+
+func (r *TaskReconciler) queuedACPPromptAttempt(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+) (*store.PromptAttempt, error) {
+	if task == nil || task.Status.Execution == nil || task.Status.Execution.Attempt < 1 ||
+		(task.Status.Execution.State != corev1alpha1.TaskExecutionStateQueued &&
+			task.Status.Execution.State != corev1alpha1.TaskExecutionStateReserved) {
+		return nil, nil
+	}
+	attemptID, err := promptAttemptIDFromTask(task)
+	if err != nil {
+		return nil, err
+	}
+	attempt, err := r.DurableControlStore.GetPromptAttempt(ctx, attemptID)
+	if err != nil {
+		return nil, fmt.Errorf("load ACP PromptAttempt before delivery-plan selection: %w", err)
+	}
+	if !queuedPromptAttemptMatchesTask(attempt, task) {
+		return nil, fmt.Errorf("%w: ACP PromptAttempt does not match the queued Task", store.ErrConflict)
+	}
+	return attempt, nil
+}
+
+func acpRuntimeDeliveryPlanForAttempt(
+	plan ACPRuntimePlan,
+	execution *corev1alpha1.TaskExecutionStatus,
+	attempt *store.PromptAttempt,
+	images ACPRuntimeImages,
+) (ACPRuntimePlan, error) {
+	if taskExecutionHasRuntimeOrSessionBinding(execution) || promptAttemptHasRuntimeOrSessionBinding(attempt) {
+		return plan, nil
+	}
+	return currentACPRuntimeDeliveryPlan(plan, images)
 }
 
 func promptAttemptHasRuntimeOrSessionBinding(attempt *store.PromptAttempt) bool {
@@ -1160,6 +1202,7 @@ func (r *TaskReconciler) ensureACPRuntimePoolWithPolicy(
 ) (*corev1alpha1.RuntimePool, bool, error) {
 	pool := &corev1alpha1.RuntimePool{}
 	key := types.NamespacedName{Namespace: namespace, Name: plan.PoolName}
+	poolPreexisting := true
 	err := r.Get(ctx, key, pool)
 	if apierrors.IsNotFound(err) {
 		if !allowCreate {
@@ -1274,12 +1317,8 @@ func (r *TaskReconciler) ensureACPRuntimePoolWithPolicy(
 			// same-name winner.
 			err = nil
 		} else {
-			if handshakeErr := r.verifyACPWorkspaceReadyForPool(
-				ctx, pool, workspaceName, workspaceUID, workspaceTaskUID,
-			); handshakeErr != nil {
-				return nil, false, handshakeErr
-			}
-			return pool, false, nil
+			poolPreexisting = false
+			err = nil
 		}
 	}
 	if err != nil {
@@ -1349,7 +1388,49 @@ func (r *TaskReconciler) ensureACPRuntimePoolWithPolicy(
 	); handshakeErr != nil {
 		return nil, false, handshakeErr
 	}
-	return pool, true, nil
+	if err := r.recordACPRuntimePoolImageProvenance(ctx, pool); err != nil {
+		return nil, false, err
+	}
+	return pool, poolPreexisting, nil
+}
+
+func (r *TaskReconciler) recordACPRuntimePoolImageProvenance(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+) error {
+	if pool == nil {
+		return errors.New("RuntimePool is required for image provenance")
+	}
+	key := types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}
+	expectedUID := pool.UID
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		current := &corev1alpha1.RuntimePool{}
+		if err := r.Get(ctx, key, current); err != nil {
+			return err
+		}
+		if expectedUID != "" && current.UID != expectedUID {
+			return store.ValidationErrorf("RuntimePool %s was replaced before image provenance could be recorded", pool.Name)
+		}
+		condition := meta.FindStatusCondition(current.Status.Conditions, acpRuntimePoolImageProvenanceCondition)
+		if condition != nil && condition.Status == metav1.ConditionTrue &&
+			condition.ObservedGeneration == current.Generation && condition.Reason == acpRuntimePoolImageProvenanceReason {
+			*pool = *current.DeepCopy()
+			return nil
+		}
+		base := current.DeepCopy()
+		meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
+			Type:               acpRuntimePoolImageProvenanceCondition,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: current.Generation,
+			Reason:             acpRuntimePoolImageProvenanceReason,
+			Message:            "RuntimePool image and profile match a verified immutable Task execution plan",
+		})
+		if err := r.Status().Patch(ctx, current, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+		*pool = *current.DeepCopy()
+		return nil
+	})
 }
 
 // verifyACPWorkspaceReadyForPool repeats the complete workspace admission and

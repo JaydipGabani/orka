@@ -560,9 +560,6 @@ func TestCurrentACPRuntimeDeliveryPlanRequiresCompatibleAdapters(t *testing.T) {
 	if rotated.Image != newImage || rotated.PoolName == compatible.PoolName || rotated.Digest != compatible.Digest {
 		t.Fatalf("compatible image rotation = %#v, want new image/pool with frozen profile digest %q", rotated, compatible.Digest)
 	}
-	if acpRuntimePlanUsesRetainedImage(compatible, ACPRuntimeImages{Codex: newImage}) {
-		t.Fatal("compatible frozen profile was classified as requiring its old image")
-	}
 
 	incompatibleProfile := compatibleProfile
 	incompatibleProfile.AdapterDigests = cloneMap(compatibleProfile.AdapterDigests)
@@ -574,9 +571,6 @@ func TestCurrentACPRuntimeDeliveryPlanRequiresCompatibleAdapters(t *testing.T) {
 	}
 	if !reflect.DeepEqual(retained, incompatible) {
 		t.Fatalf("incompatible adapter rotation changed frozen delivery plan:\n got: %#v\nwant: %#v", retained, incompatible)
-	}
-	if !acpRuntimePlanUsesRetainedImage(incompatible, ACPRuntimeImages{Codex: newImage}) {
-		t.Fatal("incompatible frozen profile did not retain its original image")
 	}
 }
 

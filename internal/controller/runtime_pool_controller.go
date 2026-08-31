@@ -414,8 +414,14 @@ func (r *RuntimePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	cfg, err := r.runtimePoolConfig(pool)
 	if err != nil && acpRuntimePoolImageSuperseded(pool, r.AllowedImages) {
 		if historicalConfig, historicalErr := r.runtimePoolConfigForDrain(pool); historicalErr == nil {
-			cfg = historicalConfig
-			err = nil
+			authorized, authorizationErr := r.historicalRuntimePoolImageAuthorized(ctx, pool, historicalConfig)
+			if authorizationErr != nil {
+				return ctrl.Result{}, authorizationErr
+			}
+			if authorized {
+				cfg = historicalConfig
+				err = nil
+			}
 		}
 	}
 	if err != nil {
@@ -574,11 +580,52 @@ func (r *RuntimePoolReconciler) runtimePoolConfig(pool *corev1alpha1.RuntimePool
 	return r.runtimePoolConfigWithImageAdmission(pool, true)
 }
 
-// runtimePoolConfigForDrain reconstructs the deployed pool configuration for
-// authenticated deletion-time drain. The image must remain digest-pinned, but
-// an approved-image rotation must not strand the previously admitted workload.
+// runtimePoolConfigForDrain reconstructs the exact pool configuration without
+// applying the current-image allowlist. Callers outside deletion must first
+// prove that the historical image was authorized for this pool generation.
 func (r *RuntimePoolReconciler) runtimePoolConfigForDrain(pool *corev1alpha1.RuntimePool) (runtimePoolConfig, error) {
 	return r.runtimePoolConfigWithImageAdmission(pool, false)
+}
+
+func (r *RuntimePoolReconciler) historicalRuntimePoolImageAuthorized(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+	cfg runtimePoolConfig,
+) (bool, error) {
+	condition := meta.FindStatusCondition(pool.Status.Conditions, acpRuntimePoolImageProvenanceCondition)
+	if condition != nil && condition.Status == metav1.ConditionTrue &&
+		condition.ObservedGeneration == pool.Generation && condition.Reason == acpRuntimePoolImageProvenanceReason {
+		return true, nil
+	}
+
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: cfg.namespace, Name: cfg.baseName}, deployment); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for key, value := range map[string]string{
+		runtimePoolManagedByLabel: runtimePoolManagedByLabelValue,
+		runtimePoolUIDLabel:       string(pool.UID),
+		runtimePoolNameLabel:      pool.Name,
+		runtimePoolNamespaceLabel: pool.Namespace,
+	} {
+		if deployment.Labels[key] != value || deployment.Spec.Template.Labels[key] != value {
+			return false, nil
+		}
+	}
+	if len(deployment.Spec.Template.Spec.Containers) != 1 ||
+		deployment.Spec.Template.Spec.Containers[0].Image != pool.Spec.Runtime.Image {
+		return false, nil
+	}
+	deployedPool, deployedConfig, err := runtimePoolDeploymentValidationTarget(pool, deployment)
+	if err != nil {
+		return false, nil
+	}
+	return deployedPool.Generation == pool.Generation &&
+		deployedPool.Spec.Runtime.Profile.Digest == pool.Spec.Runtime.Profile.Digest &&
+		reflect.DeepEqual(deployedConfig.profile, cfg.profile), nil
 }
 
 func (r *RuntimePoolReconciler) runtimePoolConfigWithImageAdmission(
