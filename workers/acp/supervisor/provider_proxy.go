@@ -160,6 +160,11 @@ type providerProxyAuthorization struct {
 	upstreamBase *url.URL
 	gateContext  context.Context
 	promptID     string
+	// inferenceSeq is the issuance order assigned atomically at admission
+	// for inference-route requests (0 for metadata). Allocating it here —
+	// not after body validation — keeps "final request" meaning final by
+	// admission order even when concurrent bodies validate out of order.
+	inferenceSeq uint64
 	release      func()
 }
 
@@ -522,11 +527,14 @@ func (s *providerProxySession) authorize(r *http.Request, class providerRequestC
 		s.drained = make(chan struct{})
 	}
 	s.inflight++
+	var inferenceSeq uint64
 	if class == providerRequestInference {
 		if s.inflightInference == 0 {
 			s.drainedInference = make(chan struct{})
 		}
 		s.inflightInference++
+		s.issuedInference++
+		inferenceSeq = s.issuedInference
 	}
 	var releaseOnce sync.Once
 	target := *s.proxy.upstreamBase
@@ -534,6 +542,7 @@ func (s *providerProxySession) authorize(r *http.Request, class providerRequestC
 		upstreamBase: &target,
 		gateContext:  s.gateContext,
 		promptID:     s.activePromptID,
+		inferenceSeq: inferenceSeq,
 		release: func() {
 			releaseOnce.Do(func() {
 				s.releaseRequest()
@@ -556,24 +565,23 @@ func (s *providerProxySession) releaseRequest() {
 }
 
 // consumeInferenceRequest admits one inference request against the prompt's
-// turn budget and returns its issuance sequence, which orders the response
-// accounting. Metadata requests consume nothing and carry sequence 0.
-func (s *providerProxySession) consumeInferenceRequest(promptID string, class providerRequestClass, now time.Time) (uint64, error) {
+// turn budget. The issuance sequence is assigned earlier, atomically at
+// route admission in authorize; metadata requests consume nothing.
+func (s *providerProxySession) consumeInferenceRequest(promptID string, class providerRequestClass, now time.Time) error {
 	if class != providerRequestInference {
-		return 0, nil
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.activePromptID != promptID || s.gateContext == nil || !now.Before(s.leaseExpiresAt) {
-		return 0, context.Canceled
+		return context.Canceled
 	}
 	if s.inferenceRequests >= s.maxTurns {
 		s.turnLimitExceeded = true
-		return 0, errProviderTurnLimitExceeded
+		return errProviderTurnLimitExceeded
 	}
 	s.inferenceRequests++
-	s.issuedInference++
-	return s.issuedInference, nil
+	return nil
 }
 
 // beginInferenceRequest starts the in-flight accounting for one authorized
@@ -667,7 +675,7 @@ func (s *providerProxySession) recordInferenceOutcome(promptID string, class pro
 // render such a rejection as ordinary assistant text and end their turn, so
 // without this evidence the prompt would settle Completed even though its
 // final inference attempt never reached the provider.
-func (s *providerProxySession) recordRejectedInferenceRequest(promptID string, class providerRequestClass, statusCode int, detail string) {
+func (s *providerProxySession) recordRejectedInferenceRequest(promptID string, class providerRequestClass, seq uint64, statusCode int, detail string) {
 	if s == nil || class != providerRequestInference {
 		return
 	}
@@ -677,8 +685,13 @@ func (s *providerProxySession) recordRejectedInferenceRequest(promptID string, c
 	if promptID == "" || s.turnPromptID != promptID {
 		return
 	}
-	s.issuedInference++
-	s.recordInferenceOutcomeLocked(s.issuedInference, statusCode, detail)
+	if seq == 0 {
+		// A reject with no admission-allocated sequence (rejected before
+		// authorization completed) still gets ordered at issuance.
+		s.issuedInference++
+		seq = s.issuedInference
+	}
+	s.recordInferenceOutcomeLocked(seq, statusCode, detail)
 }
 
 func (s *providerProxySession) recordInferenceOutcomeLocked(seq uint64, statusCode int, detail string) {
@@ -884,7 +897,7 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer authorization.release()
 	reject := func(statusCode int, message string) {
-		session.recordRejectedInferenceRequest(authorization.promptID, routeClass, statusCode, message)
+		session.recordRejectedInferenceRequest(authorization.promptID, routeClass, authorization.inferenceSeq, statusCode, message)
 		providerproxy.WriteError(w, statusCode, message)
 	}
 	if !providerproxy.TryAcquireSlot(session.requestSlots) {
@@ -961,10 +974,10 @@ func (p *providerProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	default:
 	}
-	inferenceSeq, err := session.consumeInferenceRequest(authorization.promptID, requestClass, time.Now().UTC())
-	if err != nil {
+	inferenceSeq := authorization.inferenceSeq
+	if err := session.consumeInferenceRequest(authorization.promptID, requestClass, time.Now().UTC()); err != nil {
 		if errors.Is(err, errProviderTurnLimitExceeded) {
-			session.recordRejectedInferenceRequest(authorization.promptID, requestClass, http.StatusTooManyRequests, "maximum provider inference requests reached for active prompt")
+			session.recordRejectedInferenceRequest(authorization.promptID, requestClass, inferenceSeq, http.StatusTooManyRequests, "maximum provider inference requests reached for active prompt")
 			writeProviderTurnLimitError(w, p.providerKind)
 		} else {
 			reject(http.StatusForbidden, "provider request is no longer active")
@@ -1129,12 +1142,15 @@ type sseTerminalErrorScanner struct {
 
 const sseScannerMaxLineBytes = 1024
 
+// Markers are matched against a whitespace-stripped copy of each line, so
+// valid spaced JSON ({"type": "response.failed"}) and unspaced JSON match
+// identically. Content deltas still cannot spoof them: quotes inside model
+// text arrive JSON-escaped (\"), and stripping whitespace does not unescape.
 var sseTerminalErrorMarkers = []string{
-	"event: error",
-	"event: response.failed",
+	"event:error",
+	"event:response.failed",
 	`"type":"error"`,
 	`"type":"response.failed"`,
-	`data: {"error"`,
 	`data:{"error"`,
 }
 
@@ -1157,8 +1173,14 @@ func (c *sseTerminalErrorScanner) Write(p []byte) (int, error) {
 
 func (c *sseTerminalErrorScanner) scanLine() {
 	line := strings.TrimRight(string(c.line), "\r")
+	compact := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, line)
 	for _, marker := range sseTerminalErrorMarkers {
-		if strings.Contains(line, marker) {
+		if strings.Contains(compact, marker) {
 			c.failed = true
 			c.detail = providerUpstreamErrorDetail([]byte(line))
 			return

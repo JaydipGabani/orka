@@ -8,6 +8,8 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 		"event: message_start\ndata: {}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n",
 		"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{}}\n\n",
 		"data: {\"error\": {\"message\": \"rate limited\"}}\n\n",
+		"data: {\"type\": \"response.failed\", \"response\": {}}\n\n",
+		"data: { \"type\" : \"error\" , \"error\": {} }\n\n",
 	}
 	for _, stream := range failures {
 		scanner := &sseTerminalErrorScanner{}
@@ -35,4 +37,13 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 			t.Fatalf("scanner false-failed clean stream %q (detail %q)", stream[:40], scanner.detail)
 		}
 	}
+}
+
+// testAllocateInferenceSeq mirrors admission-time sequence allocation for
+// fixtures that record outcomes without an HTTP request.
+func testAllocateInferenceSeq(s *providerProxySession) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.issuedInference++
+	return s.issuedInference
 }

@@ -805,6 +805,31 @@ func TestResolveDefaultProviderPrefersReadyDefault(t *testing.T) {
 // Agent before choosing the task type: a native AI Agent keeps the ai default
 // (the documented self-bootstrapping flow), a runtime Agent infers agent, and
 // an unreadable Agent conservatively falls back to ai.
+// TestTaskCreateAgentTypeSurfacesForbiddenLookup: a token without agents
+// read permission must not silently submit the wrong task type.
+func TestTaskCreateAgentTypeSurfacesForbiddenLookup(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/agents/guarded" {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"error":"forbidden"}`) //nolint:errcheck
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/tasks" {
+			t.Error("task was created despite an undetermined type")
+		}
+		fmt.Fprint(w, `{}`) //nolint:errcheck
+	}))
+	defer srv.Close()
+	root := newRootCmd()
+	root.SetArgs([]string{"task", "create", "--server", srv.URL, "--agent", "guarded", "do stuff"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "pass --type") {
+		t.Fatalf("Execute() error = %v, want explicit --type guidance", err)
+	}
+}
+
 func TestTaskCreateAgentTypeInference(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -815,7 +840,7 @@ func TestTaskCreateAgentTypeInference(t *testing.T) {
 	}{
 		{name: "native ai agent", agent: "coordinator", body: `{"metadata":{"name":"coordinator"},"spec":{"providerRef":{"name":"p"}}}`, status: http.StatusOK, wantType: "ai"},
 		{name: "runtime agent", agent: "codex-agent", body: `{"metadata":{"name":"codex-agent"},"spec":{"runtime":{"type":"codex"}}}`, status: http.StatusOK, wantType: "agent"},
-		{name: "unreadable agent", agent: "missing", body: `{"error":"not found"}`, status: http.StatusNotFound, wantType: "ai"},
+		{name: "missing agent keeps ai default", agent: "missing", body: `{"error":"not found"}`, status: http.StatusNotFound, wantType: "ai"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

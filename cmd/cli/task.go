@@ -99,7 +99,11 @@ func newTaskCreateCmd() *cobra.Command {
 				case strings.TrimSpace(image) != "":
 					taskType = cliTaskTypeCont
 				case strings.TrimSpace(agent) != "":
-					taskType = resolveAgentTaskType(context.Background(), c, agent)
+					resolved, err := resolveAgentTaskType(context.Background(), c, agent)
+					if err != nil {
+						return err
+					}
+					taskType = resolved
 				}
 			}
 			if taskType == "" {
@@ -603,12 +607,18 @@ const (
 
 // resolveAgentTaskType decides whether --agent names an ACP runtime Agent
 // (task type "agent") or a native AI Agent (task type "ai") by reading the
-// Agent's spec. An unreadable Agent falls back to "ai", the CLI's historical
-// default, and the server-side contract validation reports the real problem.
-func resolveAgentTaskType(ctx context.Context, c *client.Client, agent string) string {
+// Agent's spec. A missing Agent (404) keeps the historical "ai" default —
+// creation surfaces the real problem server-side — but any other read
+// failure (for example a token without agents read permission) is surfaced
+// instead of silently guessing: a wrong guess would submit an AI Task for a
+// runtime Agent, or vice versa.
+func resolveAgentTaskType(ctx context.Context, c *client.Client, agent string) (string, error) {
 	body, _, err := c.GetRaw(ctx, "/api/v1/agents/"+url.PathEscape(strings.TrimSpace(agent)), map[string]string{cliNamespaceQuery: c.Namespace})
 	if err != nil {
-		return cliTaskTypeAI
+		if strings.Contains(err.Error(), "HTTP 404") {
+			return cliTaskTypeAI, nil
+		}
+		return "", fmt.Errorf("cannot infer the task type for --agent %q (%v); pass --type ai or --type agent explicitly", agent, err)
 	}
 	var object struct {
 		Spec struct {
@@ -616,12 +626,12 @@ func resolveAgentTaskType(ctx context.Context, c *client.Client, agent string) s
 		} `json:"spec"`
 	}
 	if json.Unmarshal(body, &object) != nil {
-		return cliTaskTypeAI
+		return cliTaskTypeAI, nil
 	}
 	if len(object.Spec.Runtime) > 0 && string(object.Spec.Runtime) != "null" {
-		return cliTaskTypeAgent
+		return cliTaskTypeAgent, nil
 	}
-	return cliTaskTypeAI
+	return cliTaskTypeAI, nil
 }
 
 // resolveDefaultProviderName selects the Provider for an ai task when none was

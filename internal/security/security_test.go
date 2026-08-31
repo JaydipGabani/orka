@@ -594,6 +594,7 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"curl 'https://acct.blob.core.windows.net/c/b?sig=" + strings.Repeat("Zx", 12) + "'",
 		"api_key=" + strings.Repeat("0123456789abcdef", 2) + "(",
 		"api_key=abcdefghijklmnopqrst(",
+		"PASSWORD=p@ssword&correct-horse-battery-staple",
 	} {
 		if !LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = false, want true for a credential-shaped value", text)
