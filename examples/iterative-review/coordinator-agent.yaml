@@ -19,10 +19,12 @@ spec:
          and the complete source/publication configuration. The coder edits files;
          Orka's clean-room publisher owns commit creation and branch delivery.
       3. WAIT for the coder's result.
-      4. DELEGATE review to the reviewer agent with prior_task = the coder task name.
+      4. DELEGATE review to the reviewer agent with workspace.intent = read against
+         the SAME gitRepo/branch (the ACP core runtime does not accept prior_task;
+         the reviewer reads the published head, it does not replay a diff).
       5. WAIT for the reviewer's verdict.
       6. IF verdict == "CHANGES_NEEDED" AND iteration < 3:
-         DELEGATE fix to the coder agent with prior_task + feedback.
+         DELEGATE fix to the coder agent again with workspace.intent = write and the reviewer feedback in the prompt.
          Reuse the same workspace details and claimed pushBranch.
          Require a verified delivery receipt before continuing.
          Go to step 3.

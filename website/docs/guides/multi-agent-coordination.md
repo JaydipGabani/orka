@@ -699,10 +699,13 @@ You are a coordinator agent. Follow this protocol:
 
 1. DELEGATE implementation to the coder agent.
 2. WAIT for the coder's result.
-3. DELEGATE review to the reviewer agent (pass prior_task = coder's task name).
+3. DELEGATE review to the reviewer agent (workspace.intent = read on the SAME
+   gitRepo/branch; the ACP core runtime does not accept prior_task — the
+   reviewer reads the published head rather than replaying a diff).
 4. WAIT for the reviewer's verdict.
 5. IF verdict == "CHANGES_NEEDED" AND iteration < 3:
-   DELEGATE fix to the coder agent with prior_task + feedback.
+   DELEGATE fix to the coder agent again (workspace.intent = write) with the
+   reviewer feedback in the prompt.
    Go to step 2.
 6. IF verdict == "APPROVED":
    Report final result.
@@ -978,10 +981,13 @@ You are a coordinator agent. Follow this protocol:
    separate readCredentialRef/publicationCredentialRef, publicationGitRepo,
    pushBranch, and prBaseBranch. Tell the coder to edit only.
 2. WAIT for the coder's result and require a verified delivery receipt.
-3. DELEGATE review to the reviewer agent (pass prior_task = coder's task name).
+3. DELEGATE review to the reviewer agent (workspace.intent = read on the SAME
+   gitRepo/branch; the ACP core runtime does not accept prior_task — the
+   reviewer reads the published head rather than replaying a diff).
 4. WAIT for the reviewer's verdict.
 5. IF verdict == "CHANGES_NEEDED" AND iteration < 3:
-   DELEGATE fix to the coder agent with prior_task + feedback.
+   DELEGATE fix to the coder agent again (workspace.intent = write) with the
+   reviewer feedback in the prompt.
    Go to step 2.
 6. IF verdict == "APPROVED":
    Call create_pull_request with the coder's task name and pushBranch.
