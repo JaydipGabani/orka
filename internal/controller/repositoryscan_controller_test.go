@@ -3242,7 +3242,8 @@ func assertPatchIngestState(t *testing.T, fixture patchIngestFixture, wantPropos
 
 func TestIngestPatchTaskMarksPROpenAfterExactPublicationReceipt(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPatchIngestFixture(t, "ready")
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "ready", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "app.py", Status: "modified", Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
 	diff := testPatchDiffHeader
 	savePatchStructuredResult(t, fixture, &common.StructuredResult{
 		Summary:    "patched successfully",
@@ -3274,7 +3275,8 @@ func TestIngestPatchTaskMarksPROpenAfterExactPublicationReceipt(t *testing.T) {
 
 func TestIngestPatchTaskAcceptsDiffArtifactWithDifferentIndexFormatting(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPatchIngestFixture(t, "diff-index-format")
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "diff-index-format", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "app.py", Status: "modified", Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
 	actualDiff := strings.Join([]string{
 		testPatchDiffHeader,
 		"index 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644",
@@ -3311,7 +3313,8 @@ func TestIngestPatchTaskAcceptsDiffArtifactWithDifferentIndexFormatting(t *testi
 
 func TestIngestPatchTaskAcceptsSubPathRelativeChangedFiles(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPatchIngestFixture(t, "subpath")
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "subpath", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "services/api/app.py", Status: "modified", Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
 	fixture.scan.Spec.SubPath = "services/api"
 	diff := "diff --git a/services/api/app.py b/services/api/app.py"
 	savePatchStructuredResult(t, fixture, &common.StructuredResult{
@@ -3330,7 +3333,8 @@ func TestIngestPatchTaskAcceptsSubPathRelativeChangedFiles(t *testing.T) {
 
 func TestIngestPatchTaskUsesDurablePublicationWhenTaskDeliveryReceiptIsMissing(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPatchIngestFixture(t, "task-receipt-missing")
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "task-receipt-missing", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "app.py", Status: "modified", Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
 	diff := testPatchDiffHeader
 	savePatchArtifacts(t, fixture, diff, []string{"app.py"})
 	task := patchTaskForFixture(fixture, true)
@@ -3340,6 +3344,28 @@ func TestIngestPatchTaskUsesDurablePublicationWhenTaskDeliveryReceiptIsMissing(t
 		t.Fatalf("ingestPatchTask() error = %v", err)
 	}
 	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStatePROpen)
+}
+
+func TestIngestPatchTaskRejectsArtifactsNotMatchingPublishedCommit(t *testing.T) {
+	ctx := context.Background()
+	// A stale or namespace-seeded diff/summary pair can be internally
+	// consistent; it must still be rejected unless it matches the exact
+	// published commit's file set.
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "artifact-commit-mismatch", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "evil.py", Status: "modified", Patch: "@@ -1 +1 @@\n-x\n+y"}}, &seenToken), true)
+	savePatchArtifacts(t, fixture, testPatchDiffHeader, []string{"app.py"})
+
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {
+		t.Fatalf("ingestPatchTask() error = %v", err)
+	}
+	assertPatchIngestState(t, fixture, scanRunPhaseFailed, findingStateOpen)
+	proposals, err := fixture.store.ListPatchProposals(ctx, fixture.proposal.Namespace, fixture.finding.ID)
+	if err != nil || len(proposals) != 1 {
+		t.Fatalf("ListPatchProposals() = %#v, %v", proposals, err)
+	}
+	if !strings.Contains(proposals[0].Reason, "does not match the published commit") {
+		t.Fatalf("proposal.Reason = %q, want published-commit mismatch", proposals[0].Reason)
+	}
 }
 
 func TestIngestPatchTaskRejectsMissingDurablePullRequestReceipt(t *testing.T) {
@@ -3451,7 +3477,8 @@ func TestIngestPatchTaskRejectsMissingDiffArtifactWhenEarlierDirectiveIsSpoofed(
 
 func TestIngestPatchTaskIgnoresLegacyStructuredResultDiff(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPatchIngestFixture(t, "stale-diff")
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "stale-diff", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "app.py", Status: "modified", Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
 	actualDiff := strings.Join([]string{
 		testPatchDiffHeader,
 		"--- a/app.py",
@@ -3522,7 +3549,8 @@ func TestIngestPatchTaskRejectsMismatchedChangedFiles(t *testing.T) {
 
 func TestIngestPatchTaskIgnoresLegacyStructuredResultPushError(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPatchIngestFixture(t, "failed")
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "failed", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "app.py", Status: "modified", Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
 	savePatchStructuredResult(t, fixture, &common.StructuredResult{
 		Summary:   "patch created but push failed",
 		Diff:      testPatchDiffHeader,
@@ -3538,7 +3566,8 @@ func TestIngestPatchTaskIgnoresLegacyStructuredResultPushError(t *testing.T) {
 
 func TestIngestPatchTaskIgnoresLegacyStructuredResultWithoutPushBranch(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPatchIngestFixture(t, "missing-push")
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "missing-push", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "app.py", Status: "modified", Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
 	savePatchStructuredResult(t, fixture, &common.StructuredResult{
 		Summary: "patch created without confirmed push",
 		Diff:    testPatchDiffHeader,
@@ -3553,7 +3582,8 @@ func TestIngestPatchTaskIgnoresLegacyStructuredResultWithoutPushBranch(t *testin
 
 func TestIngestPatchTaskDoesNotRequireLegacyResultReference(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPatchIngestFixture(t, "pending-ref")
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "pending-ref", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "app.py", Status: "modified", Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
 	savePatchArtifacts(t, fixture, testPatchDiffHeader, []string{"app.py"})
 
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, false)); err != nil {
@@ -3564,7 +3594,8 @@ func TestIngestPatchTaskDoesNotRequireLegacyResultReference(t *testing.T) {
 
 func TestIngestPatchTaskDoesNotRequireLegacyResultRecord(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPatchIngestFixture(t, "pending-result")
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "pending-result", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "app.py", Status: "modified", Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
 	savePatchArtifacts(t, fixture, testPatchDiffHeader, []string{"app.py"})
 
 	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, patchTaskForFixture(fixture, true)); err != nil {

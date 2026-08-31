@@ -343,7 +343,7 @@ func (b *JobBuilder) BuildWithOptions(ctx context.Context, task *corev1alpha1.Ta
 	if err := validateReadOnlyAgentRuntime(task, agent); err != nil {
 		return nil, err
 	}
-	if err := validateContainerDeliveredPromptSize(task, agent); err != nil {
+	if err := b.validateContainerDeliveredPromptSize(ctx, task, agent); err != nil {
 		return nil, err
 	}
 
@@ -2665,13 +2665,23 @@ func (b *JobBuilder) addSkillVolumes(ctx context.Context, job *batchv1.Job, task
 // message instead of a dead container.
 const maxContainerDeliveredPromptBytes = 110 * 1024
 
-func validateContainerDeliveredPromptSize(task *corev1alpha1.Task, agent *corev1alpha1.Agent) error {
-	if task == nil {
+func (b *JobBuilder) validateContainerDeliveredPromptSize(ctx context.Context, task *corev1alpha1.Task, agent *corev1alpha1.Agent) error {
+	if task == nil || task.Spec.Type != corev1alpha1.TaskTypeAI {
+		// Only AI Tasks export prompts through the process environment;
+		// a container Task's unused optional prompt fields must not make
+		// an otherwise runnable container fail this guard.
 		return nil
 	}
-	prompt := task.Spec.Prompt
-	if prompt == "" && task.Spec.AI != nil {
+	// Mirror resolveAIConfig's precedence exactly: spec.ai.prompt wins over
+	// spec.prompt, and a ConfigMap-backed Agent system prompt is resolved
+	// before export — the guard must measure the values that actually reach
+	// the environment.
+	prompt := ""
+	if task.Spec.AI != nil {
 		prompt = task.Spec.AI.Prompt
+	}
+	if prompt == "" {
+		prompt = task.Spec.Prompt
 	}
 	systemPrompt := ""
 	if task.Spec.AI != nil {
@@ -2679,6 +2689,9 @@ func validateContainerDeliveredPromptSize(task *corev1alpha1.Task, agent *corev1
 	}
 	if systemPrompt == "" && agent != nil && agent.Spec.SystemPrompt != nil {
 		systemPrompt = agent.Spec.SystemPrompt.Inline
+		if systemPrompt == "" && agent.Spec.SystemPrompt.ConfigMapRef != nil {
+			systemPrompt = b.resolveConfigMapValue(ctx, agent.Namespace, agent.Spec.SystemPrompt.ConfigMapRef)
+		}
 	}
 	for name, value := range map[string]string{"prompt": prompt, "system prompt": systemPrompt} {
 		if len(value) > maxContainerDeliveredPromptBytes {

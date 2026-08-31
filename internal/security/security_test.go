@@ -584,6 +584,7 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"client_secret='pass phrase with spaces!'",
 		"password=correct.horse.battery.staple",
 		"Authorization: Bearer ~" + strings.Repeat("a", 20),
+		"PASSWORD=p@ssword-correct-horse",
 	} {
 		if !LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = false, want true for a credential-shaped value", text)

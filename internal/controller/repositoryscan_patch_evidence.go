@@ -64,7 +64,20 @@ func (r *RepositoryScanReconciler) verifyPatchTaskEvidence(
 		return patchVerificationResult{}, "", err
 	}
 	if present {
-		return r.verifyPatchTaskArtifacts(ctx, scan, task, findingID)
+		verified, reason, err := r.verifyPatchTaskArtifacts(ctx, scan, task, findingID)
+		if err != nil || reason != "" {
+			return verified, reason, err
+		}
+		// Pre-existing artifacts are internally consistent but unproven:
+		// the namespace-scoped internal upload API (or a stale earlier
+		// attempt) could have seeded a mutually consistent diff/summary
+		// pair for unrelated content. Bind them to the exact published
+		// commit before accepting them as review evidence.
+		reason, err = r.verifyArtifactDiffMatchesPublishedCommit(ctx, scan, task, diffName, publication)
+		if err != nil || reason != "" {
+			return patchVerificationResult{}, reason, err
+		}
+		return verified, "", nil
 	}
 
 	result, validationProblem, err := r.loadAgentTaskResult(ctx, task)
@@ -133,6 +146,53 @@ func (r *RepositoryScanReconciler) repositoryScanHTTPClient() *http.Client {
 		return r.HTTPClient
 	}
 	return &http.Client{Timeout: 30 * time.Second}
+}
+
+// verifyArtifactDiffMatchesPublishedCommit fails closed unless the stored
+// diff artifact touches exactly the file set of the publication's verified
+// commit, fetched fresh with the forge credential.
+func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
+	ctx context.Context,
+	scan *corev1alpha1.RepositoryScan,
+	task *corev1alpha1.Task,
+	diffName string,
+	publication securityPatchPublicationReceipt,
+) (string, error) {
+	if publication.publication == nil || strings.TrimSpace(publication.publication.ExpectedCommitSHA) == "" {
+		return "verified patch publication commit is unavailable", nil
+	}
+	token, reason, err := r.repositoryScanForgeToken(ctx, scan)
+	if err != nil || reason != "" {
+		return reason, err
+	}
+	targetRepo := security.CanonicalRepositoryCloneURL(scan.Spec.ForkRepo)
+	if targetRepo == "" {
+		targetRepo = security.CanonicalRepositoryCloneURL(scan.Spec.RepoURL)
+	}
+	owner, repository, err := security.ParseGitHubRepositoryURL(targetRepo)
+	if err != nil {
+		return "repository scan publication target is not a canonical GitHub repository", nil
+	}
+	files, reason, err := r.fetchRepositoryScanPublishedCommit(ctx, owner, repository, publication.publication.ExpectedCommitSHA, token)
+	if err != nil || reason != "" {
+		return reason, err
+	}
+	_, commitPaths, reason := repositoryScanDiffFromPublishedCommit(files)
+	if reason != "" {
+		return reason, nil
+	}
+	diffData, _, err := r.ArtifactStore.GetArtifact(ctx, task.Namespace, task.Name, diffName)
+	if err != nil {
+		return "", err
+	}
+	artifactPaths, err := repositoryMonitorPathsFromPatch(string(diffData))
+	if err != nil {
+		return "patch diff artifact is not a canonical git diff: " + err.Error(), nil
+	}
+	if !sameStringSet(artifactPaths, commitPaths) {
+		return "patch diff artifact does not match the published commit", nil
+	}
+	return "", nil
 }
 
 func (r *RepositoryScanReconciler) patchArtifactsPresent(ctx context.Context, task *corev1alpha1.Task, names ...string) (bool, error) {

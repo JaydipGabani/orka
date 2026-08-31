@@ -3634,17 +3634,51 @@ func TestValidateReadOnlyAgentRuntimeRejectsExternalRuntimeRef(t *testing.T) {
 }
 
 func TestValidateContainerDeliveredPromptSize(t *testing.T) {
-	small := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Prompt: "hello"}}
-	if err := validateContainerDeliveredPromptSize(small, nil); err != nil {
+	ctx := context.Background()
+	oversized := strings.Repeat("x", maxContainerDeliveredPromptBytes+1)
+	builder := func(objects ...client.Object) *JobBuilder {
+		scheme := runtime.NewScheme()
+		if err := corev1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		return &JobBuilder{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()}
+	}
+	small := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI, Prompt: "hello"}}
+	if err := builder().validateContainerDeliveredPromptSize(ctx, small, nil); err != nil {
 		t.Fatalf("small prompt rejected: %v", err)
 	}
-	big := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI, AI: &corev1alpha1.AISpec{Prompt: strings.Repeat("x", maxContainerDeliveredPromptBytes+1)}}}
-	err := validateContainerDeliveredPromptSize(big, nil)
+	big := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI, AI: &corev1alpha1.AISpec{Prompt: oversized}}}
+	err := builder().validateContainerDeliveredPromptSize(ctx, big, nil)
 	if err == nil || !strings.Contains(err.Error(), "MAX_ARG_STRLEN") {
 		t.Fatalf("oversized prompt error = %v, want actionable env-limit message", err)
 	}
-	bigSystem := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI, AI: &corev1alpha1.AISpec{Prompt: "ok", SystemPrompt: strings.Repeat("s", maxContainerDeliveredPromptBytes+1)}}}
-	if err := validateContainerDeliveredPromptSize(bigSystem, nil); err == nil {
+	// spec.ai.prompt wins over spec.prompt (resolveAIConfig precedence): a
+	// short spec.prompt must not mask an oversized exported spec.ai.prompt.
+	masked := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI, Prompt: "short", AI: &corev1alpha1.AISpec{Prompt: oversized}}}
+	if err := builder().validateContainerDeliveredPromptSize(ctx, masked, nil); err == nil {
+		t.Fatal("oversized spec.ai.prompt was masked by a short spec.prompt")
+	}
+	bigSystem := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI, AI: &corev1alpha1.AISpec{Prompt: "ok", SystemPrompt: oversized}}}
+	if err := builder().validateContainerDeliveredPromptSize(ctx, bigSystem, nil); err == nil {
 		t.Fatal("oversized system prompt was accepted")
+	}
+	// A ConfigMap-backed Agent system prompt is resolved before export and
+	// must be measured after resolution.
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "sys", Namespace: "default"}, Data: map[string]string{"prompt": oversized}}
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default"},
+		Spec: corev1alpha1.AgentSpec{SystemPrompt: &corev1alpha1.PromptSource{
+			ConfigMapRef: &corev1alpha1.ConfigMapKeySelector{Name: "sys", Key: "prompt"},
+		}},
+	}
+	fromConfigMap := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Namespace: "default"}, Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI, Prompt: "ok"}}
+	if err := builder(cm).validateContainerDeliveredPromptSize(ctx, fromConfigMap, agent); err == nil {
+		t.Fatal("oversized ConfigMap-backed system prompt was accepted")
+	}
+	// Container Tasks never export these fields; unused optional prompts
+	// must not fail an otherwise runnable container.
+	containerTask := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeContainer, Image: "alpine", Prompt: oversized}}
+	if err := builder().validateContainerDeliveredPromptSize(ctx, containerTask, nil); err != nil {
+		t.Fatalf("container task rejected on unused prompt field: %v", err)
 	}
 }

@@ -204,7 +204,7 @@ spec:
 | `readCredentialRef` | LocalObjectReference | For patches | Source clone/read Secret. Required, together with the three publication roles below, before any patch proposal or remediation PR. |
 | `publicationReadCredentialRef` | LocalObjectReference | For patches | Target-repository read Secret used only for publication preflight and independent verification. |
 | `publicationCredentialRef` | LocalObjectReference | For patches | Target-repository write Secret used only for the exact compare-and-swap branch push. |
-| `forgeCredentialRef` | LocalObjectReference | For patches | Forge API Secret used only for remediation pull-request reconciliation. The four patch roles must reference pairwise-distinct Secrets. |
+| `forgeCredentialRef` | LocalObjectReference | For patches | Forge API Secret used for controller-side forge reads and PR upkeep: fetching the published remediation commit to derive and verify patch evidence, and reconciling/decorating the remediation pull request. Never mounted into any Task. The four patch roles must reference pairwise-distinct Secrets. |
 | `forkRepo` | string | No | Writable fork repository URL for patch proposal branches and remediation PRs. |
 | `prBaseBranch` | string | No | Pull request base branch for remediation. Defaults to `branch` when omitted. |
 | `schedule` | string | No | Cron expression for scheduled incremental scans. |

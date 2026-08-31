@@ -40,7 +40,11 @@ function optionalCredentialReference(name: string, key: string) {
 export function TaskCreateForm() {
   const navigate = useNavigate()
   const createTask = useCreateTask()
-  const { data: agentsData } = useAgentListAll()
+  // Suppress cached agent data whenever the current request errors (for
+  // example a 403 from a token that cannot list Agents): stale names from an
+  // earlier identity must not populate the selector.
+  const agentsQuery = useAgentListAll()
+  const agentsData = agentsQuery.error ? undefined : agentsQuery.data
   const namespace = useUIStore((s) => s.namespace)
 
   const [name, setName] = useState('')
