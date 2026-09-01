@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -908,16 +909,33 @@ func (h *Handlers) ListSessions(c fiber.Ctx) error {
 		return err
 	}
 
+	pagination, err := ParsePagination(c.Query("limit", ""), c.Query("continue", ""))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+
 	ctx := c.Context()
 	sessions, err := h.sessionStore.ListSessions(ctx, namespace)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list sessions: %v", err))
 	}
 
+	// The store returns rows unordered; a stable name order keeps the
+	// name-based continue cursor exact across pages.
+	sort.Slice(sessions, func(i, j int) bool { return sessions[i].Name < sessions[j].Name })
+
 	items := make([]fiber.Map, 0, len(sessions))
+	continueToken := ""
 	for _, s := range sessions {
 		if s.SessionType == store.SessionTypeGateway {
 			continue
+		}
+		if pagination.Continue != "" && s.Name <= pagination.Continue {
+			continue
+		}
+		if int64(len(items)) >= pagination.Limit {
+			continueToken = items[len(items)-1]["name"].(string)
+			break
 		}
 		items = append(items, fiber.Map{
 			"id":           s.Name,
@@ -935,7 +953,7 @@ func (h *Handlers) ListSessions(c fiber.Ctx) error {
 
 	response := ListResponse{
 		Items:    items,
-		Metadata: ListMeta{},
+		Metadata: ListMeta{Continue: continueToken},
 	}
 
 	return c.JSON(response)

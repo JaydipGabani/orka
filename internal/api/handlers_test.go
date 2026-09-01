@@ -2660,6 +2660,45 @@ func TestHandlers_ListSessions_HidesGatewaySessions(t *testing.T) {
 	require.Equal(t, "ordinary-session", item["name"])
 }
 
+func TestHandlers_ListSessions_HonorsLimitAndContinue(t *testing.T) {
+	handlers, app, ss := setupTestHandlersWithSessionManager()
+	ctx := context.Background()
+	for _, name := range []string{"session-a", "session-b", "session-c"} {
+		require.NoError(t, ss.CreateSession(ctx, &store.SessionRecord{
+			Namespace: "default", Name: name, SessionType: "task",
+		}))
+	}
+
+	app.Get("/sessions", handlers.ListSessions)
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/sessions?namespace=default&limit=2", nil))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var page1 ListResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&page1))
+	items, ok := page1.Items.([]any)
+	require.True(t, ok)
+	require.Len(t, items, 2)
+	require.Equal(t, "session-b", page1.Metadata.Continue)
+
+	resp, err = app.Test(httptest.NewRequest(http.MethodGet, "/sessions?namespace=default&limit=2&continue="+page1.Metadata.Continue, nil))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var page2 ListResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&page2))
+	items, ok = page2.Items.([]any)
+	require.True(t, ok)
+	require.Len(t, items, 1)
+	item, ok := items[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "session-c", item["name"])
+	require.Empty(t, page2.Metadata.Continue)
+
+	resp, err = app.Test(httptest.NewRequest(http.MethodGet, "/sessions?namespace=default&limit=bogus", nil))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 func TestHandlers_ListSessions_Empty(t *testing.T) {
 	handlers, app, _ := setupTestHandlersWithSessionManager()
 	app.Get("/sessions", handlers.ListSessions)
