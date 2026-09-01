@@ -229,9 +229,10 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			objects: []runtime.Object{openaiProvider, openaiSecret},
 			config:  DefaultChatConfig(),
 			opts: ResolveOpts{
-				ProviderName: openaiProviderName,
-				Model:        "gpt-4o",
-				Namespace:    ns,
+				ProviderName:            openaiProviderName,
+				Model:                   "gpt-4o",
+				Namespace:               ns,
+				RequireExplicitProvider: true,
 			},
 			wantModel: "gpt-4o",
 			wantPType: openaiProviderName,
@@ -252,8 +253,9 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			objects: []runtime.Object{anthropicProvider, anthropicSecret},
 			config:  DefaultChatConfig(),
 			opts: ResolveOpts{
-				ModelStr:  "anthropic/claude-sonnet-4-20250514",
-				Namespace: ns,
+				ModelStr:                "anthropic/claude-sonnet-4-20250514",
+				Namespace:               ns,
+				RequireExplicitProvider: true,
 			},
 			wantModel: "claude-sonnet-4-20250514",
 			wantPType: "anthropic",
@@ -305,8 +307,9 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			},
 			config: DefaultChatConfig(),
 			opts: ResolveOpts{
-				AgentRef:  "my-agent",
-				Namespace: ns,
+				AgentRef:                "my-agent",
+				Namespace:               ns,
+				RequireExplicitProvider: true,
 			},
 			wantModel: "gpt-4o",
 			wantPType: openaiProviderName,
@@ -596,13 +599,36 @@ func TestProviderResolverRequireExplicitProviderHasUniformFallbackError(t *testi
 	const want = "no provider selected and no default Provider is configured; pass an explicit provider"
 
 	provider := makeProvider("hidden", "default", corev1alpha1.ProviderTypeOpenAI, "hidden-secret", "gpt-4o")
-	for name, objects := range map[string][]runtime.Object{
-		"no Providers":        {},
-		"one ready Provider":  {readyProvider(provider)},
-		"two ready Providers": {readyProvider(provider), readyProvider(makeProvider("other", "default", corev1alpha1.ProviderTypeAnthropic, "other-secret", "claude"))},
+	for name, tc := range map[string]struct {
+		config  ChatConfig
+		objects []runtime.Object
+	}{
+		"no Providers": {
+			config: DefaultChatConfig(),
+		},
+		"one ready Provider": {
+			config:  DefaultChatConfig(),
+			objects: []runtime.Object{readyProvider(provider)},
+		},
+		"two ready Providers": {
+			config:  DefaultChatConfig(),
+			objects: []runtime.Object{readyProvider(provider), readyProvider(makeProvider("other", "default", corev1alpha1.ProviderTypeAnthropic, "other-secret", "claude"))},
+		},
+		"default-named Provider": {
+			config:  DefaultChatConfig(),
+			objects: []runtime.Object{makeProvider("default", "default", corev1alpha1.ProviderTypeOpenAI, "default-secret", "gpt-4o")},
+		},
+		"configured Provider": {
+			config: func() ChatConfig {
+				config := DefaultChatConfig()
+				config.Provider = "hidden"
+				return config
+			}(),
+			objects: []runtime.Object{provider},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			resolver := NewProviderResolver(fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(objects...).Build(), DefaultChatConfig())
+			resolver := NewProviderResolver(fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(tc.objects...).Build(), tc.config)
 			_, _, err := resolver.Resolve(context.Background(), ResolveOpts{Namespace: "default", RequireExplicitProvider: true})
 			require.EqualError(t, err, want)
 		})

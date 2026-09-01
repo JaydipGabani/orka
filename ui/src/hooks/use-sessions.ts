@@ -14,6 +14,7 @@ import type { Session, SessionListItem } from '@/schemas/session'
 interface ListResponse<T> {
   items: T[]
   metadata: { continue?: string; remainingItemCount?: number }
+  truncated?: boolean
 }
 
 export function useSessionList(limit = '25') {
@@ -29,7 +30,7 @@ export function useSessionList(limit = '25') {
 
 // The walk is bounded like the task-list walk (see maxListWalkPages there):
 // unbounded history on a polling interval grows without limit.
-const maxSessionWalkPages = 20
+export const maxSessionWalkPages = 20
 
 export function useSessionListAll(pageLimit = '100', refetchInterval: number | false = 15000) {
   const namespace = useUIStore((s) => s.namespace)
@@ -38,6 +39,7 @@ export function useSessionListAll(pageLimit = '100', refetchInterval: number | f
     queryFn: async () => {
       const items: SessionListItem[] = []
       const seen = new Set<string>()
+      let metadata: ListResponse<SessionListItem>['metadata'] = {}
       let continueToken: string | undefined
       let pages = 0
       do {
@@ -45,13 +47,14 @@ export function useSessionListAll(pageLimit = '100', refetchInterval: number | f
         if (continueToken) params.continue = continueToken
         const page = await api.get<ListResponse<SessionListItem>>('/sessions', params)
         items.push(...page.items)
-        const next = page.metadata?.continue
+        metadata = page.metadata ?? {}
+        const next = metadata.continue
         if (next && seen.has(next)) throw new Error('session list pagination repeated continuation cursor')
         if (next) seen.add(next)
         continueToken = next || undefined
         pages += 1
       } while (continueToken && pages < maxSessionWalkPages)
-      return { items, metadata: {} } as ListResponse<SessionListItem>
+      return { items, metadata, truncated: Boolean(continueToken) }
     },
     retry: retryUnlessClientError,
     refetchInterval: (query) => (isForbiddenError(query.state.error) ? false : refetchInterval),

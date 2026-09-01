@@ -1476,7 +1476,7 @@ func TestChatHandler_ContextTokenAuthorizationRejectsDisallowedModel(t *testing.
 			"allowedModels": []string{"gpt-3.5-turbo"},
 		},
 	})
-	body, _ := json.Marshal(ChatRequest{Message: "hello", Model: "gpt-4"})
+	body, _ := json.Marshal(ChatRequest{Message: "hello", Provider: "default", Model: "gpt-4"})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(body))
 	req.Header.Set(TransactionTokenHeaderName, token)
 	req.Header.Set("Content-Type", "application/json")

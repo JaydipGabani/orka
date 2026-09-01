@@ -414,13 +414,17 @@ func TestCollectAuthorizedPagesFillsAcrossFilteredPages(t *testing.T) {
 	require.Equal(t, "after-allowed-b", next)
 
 	// The page budget is the residual bound. It must not expose a raw storage
-	// cursor whose boundary was set by objects hidden from the caller.
+	// cursor whose boundary was set by objects hidden from the caller or claim
+	// that the collection ended while more raw pages remain.
 	calls = 0
 	items, next, err = collectAuthorizedPages(1, "", func(string, int64) ([]string, string, error) {
 		calls++
 		return nil, hiddenCursor, nil
 	})
-	require.NoError(t, err)
+	var fiberErr *fiber.Error
+	require.ErrorAs(t, err, &fiberErr)
+	require.Equal(t, fiber.StatusServiceUnavailable, fiberErr.Code)
+	require.Contains(t, fiberErr.Message, "authorized list scan exceeded")
 	require.Empty(t, items)
 	require.Empty(t, next)
 	require.Equal(t, maxAuthorizedListPages, calls)

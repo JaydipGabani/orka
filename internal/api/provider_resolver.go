@@ -38,12 +38,10 @@ type ResolveOpts struct {
 	AgentRef     string // agent reference for agent-based resolution (chat handler)
 	Namespace    string
 	RequireModel bool // return error if model is empty after resolution
-	// RequireExplicitProvider disables the implicit sole-ready fallback.
-	// Handlers set it for context-token requests: for a scoped caller the
-	// fallback's control flow (proceed on exactly one hidden ready Provider,
-	// error otherwise) would reveal hidden Provider existence before
-	// provider-use authorization runs. Every no-provider outcome must be
-	// indistinguishable for those callers.
+	// RequireExplicitProvider disables every implicit Provider selection,
+	// including configured, default-named, and sole-ready Providers. Handlers
+	// set it for context-token requests so every request without an explicit
+	// Provider or Agent-bound Provider has the same outcome.
 	RequireExplicitProvider bool
 	// AuthorizeProviderReference runs before an explicitly named Provider is
 	// looked up. This keeps missing and unauthorized Provider names
@@ -127,6 +125,9 @@ func (r *ProviderResolver) resolveFromExplicit(ctx context.Context, opts Resolve
 		}
 		providerCRD = p
 	}
+	if providerCRD == nil && opts.RequireExplicitProvider {
+		return nil, "", ProviderResolutionInfo{}, explicitProviderRequiredError()
+	}
 
 	if providerCRD == nil && r.config.Provider != "" {
 		p, err := r.LookupProvider(ctx, r.config.Provider, opts.Namespace)
@@ -204,6 +205,9 @@ func (r *ProviderResolver) resolveFromModelStr(ctx context.Context, opts Resolve
 		}
 		providerCRD = p
 	}
+	if providerCRD == nil && opts.RequireExplicitProvider {
+		return nil, "", ProviderResolutionInfo{}, explicitProviderRequiredError()
+	}
 
 	if providerCRD == nil && r.config.Provider != "" {
 		p := &corev1alpha1.Provider{}
@@ -265,6 +269,10 @@ func authorizeProviderUse(opts ResolveOpts, provider ProviderResolutionInfo, mod
 		return nil
 	}
 	return opts.AuthorizeProviderUse(provider, model)
+}
+
+func explicitProviderRequiredError() error {
+	return fmt.Errorf("no provider selected and no default Provider is configured; pass an explicit provider")
 }
 
 // providerResolutionInfo extracts stable metadata from a Provider CRD.
@@ -348,7 +356,7 @@ func (r *ProviderResolver) soleReadyProvider(ctx context.Context, namespace, req
 	if requireExplicitProvider {
 		// One uniform outcome for scoped callers, independent of how many
 		// Providers exist or are ready.
-		return nil, fmt.Errorf("no provider selected and no default Provider is configured; pass an explicit provider")
+		return nil, explicitProviderRequiredError()
 	}
 	prefix := "no provider selected"
 	if requestedName != "" {

@@ -87,6 +87,12 @@ describe('StatsCards', () => {
     expect(screen.getByText('100% of loaded finished tasks')).toBeInTheDocument()
   })
 
+  it('labels the session count as loaded when more session pages exist', () => {
+    render(<StatsCards tasks={[]} sessionCount={20} sessionsTruncated />)
+    expect(screen.getByText('Sessions loaded')).toBeInTheDocument()
+    expect(screen.queryByText('Sessions')).not.toBeInTheDocument()
+  })
+
   it('renders trend sparklines when there is more than one task', () => {
     const tasks = [
       { metadata: { name: 'a', namespace: 'default', uid: 'a', creationTimestamp: '2026-01-01T00:00:00Z' }, spec: { type: 'container' }, status: { phase: 'Succeeded' } },

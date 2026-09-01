@@ -127,7 +127,7 @@ func listPageError(what string, err error) error {
 
 // maxAuthorizedListPages bounds how many Kubernetes pages one filtered list
 // request may walk. A raw cursor is handed back only once the page is full;
-// reaching the scan budget before that suppresses the cursor because its
+// reaching the scan budget before that fails the request because the cursor's
 // storage boundary may name an object the caller was not authorized to see.
 const maxAuthorizedListPages = 200
 
@@ -156,7 +156,10 @@ func collectAuthorizedPages[T any](limit int64, start string, fetch func(continu
 			return items, next, nil
 		}
 		if page >= maxAuthorizedListPages {
-			return items, "", nil
+			return nil, "", fiber.NewError(
+				fiber.StatusServiceUnavailable,
+				fmt.Sprintf("authorized list scan exceeded the %d-page safety limit before a complete page could be assembled", maxAuthorizedListPages),
+			)
 		}
 		continueToken = next
 	}

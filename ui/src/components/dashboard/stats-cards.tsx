@@ -13,6 +13,8 @@ interface StatsCardsProps {
   /** Set when the tasks list failed with 403; the task cards show this instead of "0". */
   tasksForbiddenMessage?: string
   sessionCount?: number
+  /** True when the bounded session walk stopped with more pages available. */
+  sessionsTruncated?: boolean
   /** Set when the sessions list failed with 403; the card shows this instead of "0". */
   sessionsForbiddenMessage?: string
   agentCount?: number
@@ -82,6 +84,7 @@ export function StatsCards({
   tasksTruncated,
   tasksForbiddenMessage,
   sessionCount,
+  sessionsTruncated,
   sessionsForbiddenMessage,
   agentCount,
   agentsForbiddenMessage,
@@ -167,7 +170,7 @@ export function StatsCards({
       ))}
       <Card>
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-          <CardTitle className="text-sm font-medium">Sessions</CardTitle>
+          <CardTitle className="text-sm font-medium">{sessionsTruncated ? 'Sessions loaded' : 'Sessions'}</CardTitle>
           <MessageSquare className="h-4 w-4 text-muted-foreground" />
         </CardHeader>
         <CardContent>

@@ -263,8 +263,7 @@ func (h *AnthropicCompatHandler) HandleMessages(c fiber.Ctx) error {
 			return authorizeContextTokenProviderUse(c, h.contextTokenAuthorization, "anthropicMessages", namespace, provider, model)
 		},
 		RequireModel: true,
-		// Scoped context tokens get no implicit sole-ready fallback: its
-		// control flow would reveal hidden Provider existence pre-authorization.
+		// Scoped context tokens get no implicit Provider selection.
 		RequireExplicitProvider: requestUsesContextToken(c),
 	})
 	if err != nil {

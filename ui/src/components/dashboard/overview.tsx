@@ -31,6 +31,7 @@ export function Overview() {
 
   const tasks = tasksData?.items ?? []
   const tasksTruncated = tasksData?.truncated ?? Boolean(tasksData?.metadata?.continue)
+  const sessionsTruncated = sessionsData?.truncated ?? Boolean(sessionsData?.metadata?.continue)
   const distribution = PHASES.map((phase) => ({
     phase,
     count: tasks.filter((t) => (t.status?.phase ?? 'Pending') === phase).length,
@@ -49,6 +50,7 @@ export function Overview() {
         tasksTruncated={tasksTruncated}
         tasksForbiddenMessage={tasksForbiddenMessage}
         sessionCount={sessionsData?.items?.length}
+        sessionsTruncated={sessionsTruncated}
         sessionsForbiddenMessage={forbidden(sessionsError)}
         agentCount={agentsData?.items?.length}
         agentsForbiddenMessage={forbidden(agentsError)}
