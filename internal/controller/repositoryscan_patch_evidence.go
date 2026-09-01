@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -219,6 +220,8 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 
 // patchHunksByFile extracts each file's verbatim hunk body — everything from
 // its first "@@" line to the next file header — from a unified diff.
+var recognizedDiffMetadataPattern = regexp.MustCompile(`^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old|new|new file|deleted file) mode [0-7]{6}|(?:similarity|dissimilarity) index (?:100|[0-9]{1,2})%|(?:rename|copy) (?:from|to) .+|--- .+|\+\+\+ .+|Binary files .+ differ)$`)
+
 func patchHunksByFile(diff string) (map[string]string, bool) {
 	hunks := map[string]string{}
 	seenPaths := map[string]struct{}{}
@@ -233,6 +236,7 @@ func patchHunksByFile(diff string) (map[string]string, bool) {
 		body = nil
 		inHunk = false
 	}
+	unknownPrefix := false
 	for line := range strings.SplitSeq(diff, "\n") {
 		if strings.HasPrefix(line, "diff --git ") {
 			flush()
@@ -257,10 +261,26 @@ func patchHunksByFile(diff string) (map[string]string, bool) {
 		}
 		if inHunk {
 			body = append(body, line)
+			continue
+		}
+		// Outside hunks, only recognized diff metadata may appear: a
+		// fabricated reviewer-facing line smuggled before the first hunk
+		// would otherwise render in the artifact yet escape comparison.
+		if !recognizedDiffMetadataLine(line) {
+			unknownPrefix = true
 		}
 	}
 	flush()
-	return hunks, !duplicate
+	return hunks, !duplicate && !unknownPrefix
+}
+
+// recognizedDiffMetadataLine reports whether a pre-hunk line is standard git
+// diff metadata.
+func recognizedDiffMetadataLine(line string) bool {
+	if strings.TrimSpace(line) == "" {
+		return true
+	}
+	return recognizedDiffMetadataPattern.MatchString(line)
 }
 
 func samePatchHunks(a, b string) bool {

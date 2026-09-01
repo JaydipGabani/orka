@@ -9,7 +9,10 @@ package api
 import (
 	"context"
 	"fmt"
+
 	"strings"
+
+	fiber "github.com/gofiber/fiber/v3"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,6 +38,13 @@ type ResolveOpts struct {
 	AgentRef     string // agent reference for agent-based resolution (chat handler)
 	Namespace    string
 	RequireModel bool // return error if model is empty after resolution
+	// RequireExplicitProvider disables the implicit sole-ready fallback.
+	// Handlers set it for context-token requests: for a scoped caller the
+	// fallback's control flow (proceed on exactly one hidden ready Provider,
+	// error otherwise) would reveal hidden Provider existence before
+	// provider-use authorization runs. Every no-provider outcome must be
+	// indistinguishable for those callers.
+	RequireExplicitProvider bool
 }
 
 // ProviderResolutionInfo contains the Provider CRD metadata selected for a request.
@@ -123,7 +133,7 @@ func (r *ProviderResolver) resolveFromExplicit(ctx context.Context, opts Resolve
 			// Runtime Agents carry no providerRef; the coordinator still needs
 			// a chat Provider, so apply the same sole-ready fallback as the
 			// model-string path instead of demanding one named "default".
-			fallback, fallbackErr := r.soleReadyProvider(ctx, opts.Namespace, "")
+			fallback, fallbackErr := r.soleReadyProvider(ctx, opts.Namespace, "", opts.RequireExplicitProvider)
 			if fallbackErr != nil {
 				return nil, "", ProviderResolutionInfo{}, fallbackErr
 			}
@@ -193,7 +203,7 @@ func (r *ProviderResolver) resolveFromModelStr(ctx context.Context, opts Resolve
 		}
 	}
 	if providerCRD == nil {
-		fallback, err := r.soleReadyProvider(ctx, opts.Namespace, providerName)
+		fallback, err := r.soleReadyProvider(ctx, opts.Namespace, providerName, opts.RequireExplicitProvider)
 		if err != nil {
 			return nil, "", ProviderResolutionInfo{}, err
 		}
@@ -286,7 +296,7 @@ func (r *ProviderResolver) ResolveAPIKey(ctx context.Context, providerCRD *corev
 // friendlier than an error, and the caller's provider-use authorization still
 // applies to the selected Provider. With zero or several candidates the error
 // names what exists so the caller can choose.
-func (r *ProviderResolver) soleReadyProvider(ctx context.Context, namespace, requestedName string) (*corev1alpha1.Provider, error) {
+func (r *ProviderResolver) soleReadyProvider(ctx context.Context, namespace, requestedName string, requireExplicitProvider bool) (*corev1alpha1.Provider, error) {
 	list := &corev1alpha1.ProviderList{}
 	if err := r.client.List(ctx, list, client.InNamespace(namespace)); err != nil {
 		return nil, fmt.Errorf("no provider %q found and no default Provider is configured (listing Providers failed: %w)", requestedName, err)
@@ -298,8 +308,13 @@ func (r *ProviderResolver) soleReadyProvider(ctx context.Context, namespace, req
 			ready = append(ready, item)
 		}
 	}
-	if len(ready) == 1 {
+	if len(ready) == 1 && !requireExplicitProvider {
 		return ready[0], nil
+	}
+	if requireExplicitProvider {
+		// One uniform outcome for scoped callers, independent of how many
+		// Providers exist or are ready.
+		return nil, fmt.Errorf("no provider selected and no default Provider is configured; pass an explicit provider")
 	}
 	prefix := "no provider selected"
 	if requestedName != "" {
@@ -314,4 +329,11 @@ func (r *ProviderResolver) soleReadyProvider(ctx context.Context, namespace, req
 	// about Providers outside its scopes from this message. The
 	// authorization-aware list endpoints are the enumeration surface.
 	return nil, fmt.Errorf("%s and no default Provider is configured; list the Providers you can use with the providers API and pass one, create a Provider named \"default\", or configure the chat default provider", prefix)
+}
+
+// requestUsesContextToken reports whether the request authenticated with a
+// transaction context token, whose Provider visibility is scope-limited.
+func requestUsesContextToken(c fiber.Ctx) bool {
+	ui := GetUserInfo(c)
+	return ui != nil && ui.AuthType == AuthTypeContextToken && ui.ContextToken != nil
 }

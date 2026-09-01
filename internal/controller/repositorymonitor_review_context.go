@@ -476,6 +476,26 @@ func repositoryMonitorReviewContextSanitize(value string) string {
 		}
 		return r
 	}, strings.ToValidUTF8(value, ""))
+	// Newlines and tabs survive the strip because they carry diff and code
+	// structure — but a tab can split a credential past the redactor within
+	// one line. Detect per line on a tab-joined shadow; when a credential is
+	// still recoverable that way, replace the line with its redacted shadow.
+	if strings.ContainsRune(stripped, '\t') {
+		lines := strings.Split(stripped, "\n")
+		for i, line := range lines {
+			if !strings.ContainsRune(line, '\t') {
+				lines[i] = redact.SensitiveText(line)
+				continue
+			}
+			shadow := strings.ReplaceAll(line, "\t", "")
+			if redacted := redact.SensitiveText(shadow); redacted != shadow {
+				lines[i] = redacted
+			} else {
+				lines[i] = redact.SensitiveText(line)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
 	return redact.SensitiveText(stripped)
 }
 

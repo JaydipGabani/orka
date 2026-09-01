@@ -934,3 +934,18 @@ func TestRepositoryMonitorReviewContextInconsistentLineCountsMarkChangeSetIncomp
 		t.Fatalf("truncated = %#v, want files=true for a patch whose totals disagree with reported counts", got.Truncated)
 	}
 }
+
+func TestRepositoryMonitorReviewContextRedactsTabSplitCredential(t *testing.T) {
+	t.Parallel()
+	const secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	split := "+\tconst k = \"" + secret[:11] + "\t" + secret[11:] + "\""
+	got := repositoryMonitorReviewContextSanitize(split)
+	if strings.Contains(got, secret[11:]) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("sanitize(%q) = %q, want tab-split credential redacted", split, got)
+	}
+	// Ordinary tab-indented code lines keep their tabs.
+	plain := "+\tif err != nil {"
+	if got := repositoryMonitorReviewContextSanitize(plain); got != plain {
+		t.Fatalf("sanitize(%q) = %q, want tabs preserved on credential-free lines", plain, got)
+	}
+}

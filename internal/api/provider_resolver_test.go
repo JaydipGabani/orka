@@ -521,3 +521,21 @@ func readyProvider(provider *corev1alpha1.Provider) *corev1alpha1.Provider {
 	ready.Status.Ready = true
 	return ready
 }
+
+func TestProviderResolverRequireExplicitProviderHasUniformFallbackError(t *testing.T) {
+	t.Parallel()
+	const want = "no provider selected and no default Provider is configured; pass an explicit provider"
+
+	provider := makeProvider("hidden", "default", corev1alpha1.ProviderTypeOpenAI, "hidden-secret", "gpt-4o")
+	for name, objects := range map[string][]runtime.Object{
+		"no Providers":        {},
+		"one ready Provider":  {readyProvider(provider)},
+		"two ready Providers": {readyProvider(provider), readyProvider(makeProvider("other", "default", corev1alpha1.ProviderTypeAnthropic, "other-secret", "claude"))},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resolver := NewProviderResolver(fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(objects...).Build(), DefaultChatConfig())
+			_, _, err := resolver.Resolve(context.Background(), ResolveOpts{Namespace: "default", RequireExplicitProvider: true})
+			require.EqualError(t, err, want)
+		})
+	}
+}

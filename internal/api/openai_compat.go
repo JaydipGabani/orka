@@ -253,6 +253,9 @@ func (h *OpenAICompatHandler) HandleChatCompletions(c fiber.Ctx) error {
 		ModelStr:     req.Model,
 		Namespace:    namespace,
 		RequireModel: true,
+		// Scoped context tokens get no implicit sole-ready fallback: its
+		// control flow would reveal hidden Provider existence pre-authorization.
+		RequireExplicitProvider: requestUsesContextToken(c),
 	})
 	if err != nil {
 		oaiLog.Error(err, "failed to resolve provider", "model", req.Model)

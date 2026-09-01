@@ -271,6 +271,9 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 		Model:        req.Model,
 		AgentRef:     req.AgentRef,
 		Namespace:    namespace,
+		// Scoped context tokens get no implicit sole-ready fallback: its
+		// control flow would reveal hidden Provider existence pre-authorization.
+		RequireExplicitProvider: requestUsesContextToken(c),
 	})
 	if err != nil {
 		chatLog.Error(err, "failed to resolve provider")

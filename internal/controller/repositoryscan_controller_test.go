@@ -4162,7 +4162,7 @@ func TestPatchHunkBindingRejectsRelocatedAndPrefixAmbiguousContent(t *testing.T)
 		t.Fatal("identical diffs did not match")
 	}
 	// Index-line formatting differences outside hunks stay tolerated.
-	withIndex := "diff --git a/app.py b/app.py\nindex 111..222 100644\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n"
+	withIndex := "diff --git a/app.py b/app.py\nindex 1111111..2222222 100644\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n"
 	if !samePatchHunks(withIndex, commit) {
 		t.Fatal("index-line formatting difference was not tolerated")
 	}
@@ -4205,6 +4205,12 @@ func TestPatchEvidenceRejectsTruncatedAndDuplicateCommitContent(t *testing.T) {
 	hunkless := genuine + "diff --git a/a.go b/a.go\narbitrary smuggled line\n"
 	if samePatchHunks(hunkless, genuine) {
 		t.Fatal("hunkless duplicate file block was accepted as matching the commit")
+	}
+	// A fabricated reviewer-facing line before the first hunk of a single
+	// block must invalidate the diff too.
+	prefixSmuggle := "diff --git a/a.go b/a.go\n+fake line reviewers will see\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-a\n+b\n"
+	if samePatchHunks(prefixSmuggle, genuine) {
+		t.Fatal("unknown pre-hunk content was accepted as matching the commit")
 	}
 }
 
