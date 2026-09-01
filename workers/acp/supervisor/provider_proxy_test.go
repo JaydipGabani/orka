@@ -885,49 +885,53 @@ func TestProviderProxyUpstreamFailureAccountingPassesErrorThrough(t *testing.T) 
 	}
 }
 
-func TestProviderProxyUpstreamFailureAccountingClearsAfterStreamedSuccess(t *testing.T) {
-	var calls atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) == 1 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusPaymentRequired)
-			_, _ = io.WriteString(w, `{"error":{"message":"You have exceeded your monthly quota"}}`)
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher := w.(http.Flusher)
-		for _, chunk := range []string{"event: response.created\ndata: {}\n\n", "event: response.completed\ndata: {}\n\n"} {
-			_, _ = io.WriteString(w, chunk)
-			flusher.Flush()
-		}
-	}))
-	defer upstream.Close()
+func TestProviderProxyUpstreamFailureAccountingClearsAfterTerminalStream(t *testing.T) {
+	for _, terminalEvent := range []string{"response.completed", "response.incomplete"} {
+		t.Run(terminalEvent, func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if calls.Add(1) == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusPaymentRequired)
+					_, _ = io.WriteString(w, `{"error":{"message":"You have exceeded your monthly quota"}}`)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				flusher := w.(http.Flusher)
+				for _, chunk := range []string{"event: response.created\ndata: {}\n\n", "event: " + terminalEvent + "\ndata: {}\n\n"} {
+					_, _ = io.WriteString(w, chunk)
+					flusher.Flush()
+				}
+			}))
+			defer upstream.Close()
 
-	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
-		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
-	})
-	defer session.close()
+			_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+				UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+			})
+			defer session.close()
 
-	assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusPaymentRequired)
-	if failed, _, _ := session.upstreamFailureUnrecovered(testPromptOneID); !failed {
-		t.Fatal("first failed inference response was not accounted")
-	}
+			assertProviderProxyStatus(t, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential, http.StatusPaymentRequired)
+			if failed, _, _ := session.upstreamFailureUnrecovered(testPromptOneID); !failed {
+				t.Fatal("first failed inference response was not accounted")
+			}
 
-	response := doProviderProxyRequest(
-		t, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential,
-		[]byte(`{"model":"test-model","stream":true}`), nil,
-	)
-	defer func() { _ = response.Body.Close() }()
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "response.completed") {
-		t.Fatalf("streamed success = %d %s", response.StatusCode, body)
-	}
-	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed || status != 0 || detail != "" {
-		t.Fatalf("upstreamFailureUnrecovered after success = %v/%d/%q, want false", failed, status, detail)
+			response := doProviderProxyRequest(
+				t, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential,
+				[]byte(`{"model":"test-model","stream":true}`), nil,
+			)
+			defer func() { _ = response.Body.Close() }()
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusOK || !strings.Contains(string(body), terminalEvent) {
+				t.Fatalf("terminal stream = %d %s", response.StatusCode, body)
+			}
+			if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed || status != 0 || detail != "" {
+				t.Fatalf("upstreamFailureUnrecovered after %s = %v/%d/%q, want false", terminalEvent, failed, status, detail)
+			}
+		})
 	}
 }
 

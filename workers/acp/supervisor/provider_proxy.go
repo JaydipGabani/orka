@@ -1203,11 +1203,13 @@ var sseTerminalErrorPayloadMarkers = [][]byte{
 var sseTerminalSuccessEventMarkers = [][]byte{
 	[]byte("event:message_stop"),
 	[]byte("event:response.completed"),
+	[]byte("event:response.incomplete"),
 }
 
 var sseTerminalSuccessPayloadMarkers = [][]byte{
 	[]byte(`"type":"message_stop"`),
 	[]byte(`"type":"response.completed"`),
+	[]byte(`"type":"response.incomplete"`),
 }
 
 var sseDoneMarker = []byte("data:[DONE]")

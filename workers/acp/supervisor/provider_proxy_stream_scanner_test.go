@@ -35,6 +35,7 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 		"event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
 		"data: {\"choices\":[{\"delta\":{\"content\":\"discussing event: response.failed and \\\"type\\\":\\\"error\\\" handling\"}}]}\n\ndata: [DONE]\n\n",
 		"data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+		"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n",
 	}
 	for _, stream := range clean {
 		scanner := &sseTerminalErrorScanner{}

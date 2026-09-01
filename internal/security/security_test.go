@@ -618,6 +618,7 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		`"password": correct horse battery staple`,
 		"password: |\n  correct-horse-\n  battery-staple",
 		"password: >-\n  correct horse battery staple",
+		"password: |-\n  correct(horse)battery-staple",
 		"api_key: |\n    " + strings.Repeat("0a1b2c3d", 3),
 		"password: |2-\n  correct-horse-battery-staple",
 		"SECRET=correct-horse-battery-staple",

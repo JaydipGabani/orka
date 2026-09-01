@@ -308,19 +308,10 @@ func yamlBlockScalarAssignmentsLookLikeSecret(text string) bool {
 			value.WriteString(strings.TrimLeft(contentLine, " \t"))
 		}
 		candidate := strings.TrimSpace(value.String())
-		if len(candidate) < 16 || secretValuePlaceholder(candidate) || secretValueIsCode(candidate, candidate, len(candidate)) {
+		if len(candidate) < 16 || secretValuePlaceholder(candidate) {
 			continue
 		}
-		credentialShaped := true
-		for part := range strings.FieldsSeq(candidate) {
-			if !policyYAMLPlainScalarPartPattern.MatchString(part) {
-				credentialShaped = false
-				break
-			}
-		}
-		if credentialShaped {
-			return true
-		}
+		return true
 	}
 	return false
 }
