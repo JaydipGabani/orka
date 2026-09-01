@@ -277,9 +277,9 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 		AuthorizeProviderUse: func(provider ProviderResolutionInfo, model string) error {
 			return authorizeContextTokenProviderUse(c, ch.contextTokenAuthorization, "chat", namespace, provider, model)
 		},
-		// Scoped context tokens get no implicit Provider selection; callers must
-		// name one directly or use an Agent bound to one.
-		RequireExplicitProvider: requestUsesContextToken(c),
+		// Enforced scoped context tokens get no implicit Provider selection;
+		// callers must name one directly or use an Agent bound to one.
+		RequireExplicitProvider: requestRequiresExplicitProvider(c, ch.contextTokenAuthorization),
 	})
 	if err != nil {
 		if ferr, ok := err.(*fiber.Error); ok && ferr.Code == fiber.StatusForbidden {

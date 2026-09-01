@@ -259,8 +259,8 @@ func (h *OpenAICompatHandler) HandleChatCompletions(c fiber.Ctx) error {
 			return authorizeContextTokenProviderUse(c, h.contextTokenAuthorization, "openAIChatCompletions", namespace, provider, model)
 		},
 		RequireModel: true,
-		// Scoped context tokens get no implicit Provider selection.
-		RequireExplicitProvider: requestUsesContextToken(c),
+		// Enforced scoped context tokens get no implicit Provider selection.
+		RequireExplicitProvider: requestRequiresExplicitProvider(c, h.contextTokenAuthorization),
 	})
 	if err != nil {
 		if ferr, ok := err.(*fiber.Error); ok && ferr.Code == fiber.StatusForbidden {

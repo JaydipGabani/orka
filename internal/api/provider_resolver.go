@@ -379,3 +379,7 @@ func requestUsesContextToken(c fiber.Ctx) bool {
 	ui := GetUserInfo(c)
 	return ui != nil && ui.AuthType == AuthTypeContextToken && ui.ContextToken != nil
 }
+
+func requestRequiresExplicitProvider(c fiber.Ctx, authorization ContextTokenAuthorizationConfig) bool {
+	return authorization.enforcing() && requestUsesContextToken(c)
+}

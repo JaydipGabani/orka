@@ -9,8 +9,11 @@ package api
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -631,6 +634,45 @@ func TestProviderResolverRequireExplicitProviderHasUniformFallbackError(t *testi
 			resolver := NewProviderResolver(fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(tc.objects...).Build(), tc.config)
 			_, _, err := resolver.Resolve(context.Background(), ResolveOpts{Namespace: "default", RequireExplicitProvider: true})
 			require.EqualError(t, err, want)
+		})
+	}
+}
+
+func TestRequestRequiresExplicitProviderHonorsAuthorizationMode(t *testing.T) {
+	tests := []struct {
+		name         string
+		mode         string
+		contextToken bool
+		want         bool
+	}{
+		{name: "off allows implicit provider", mode: ContextTokenAuthorizationModeOff, contextToken: true},
+		{name: "audit allows implicit provider", mode: ContextTokenAuthorizationModeAudit, contextToken: true},
+		{name: "enforce requires explicit provider", mode: ContextTokenAuthorizationModeEnforce, contextToken: true, want: true},
+		{name: "enforce does not affect other authentication", mode: ContextTokenAuthorizationModeEnforce},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authorization, err := NewContextTokenAuthorizationConfig(ContextTokenAuthorizationConfigOptions{Mode: tt.mode})
+			require.NoError(t, err)
+
+			var got bool
+			app := fiber.New()
+			app.Get("/", func(c fiber.Ctx) error {
+				if tt.contextToken {
+					c.Locals(UserInfoContextKey, &UserInfo{
+						AuthType:     AuthTypeContextToken,
+						ContextToken: &ContextToken{},
+					})
+				}
+				got = requestRequiresExplicitProvider(c, authorization)
+				return c.SendStatus(http.StatusNoContent)
+			})
+
+			resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/", nil))
+			require.NoError(t, err)
+			require.Equal(t, http.StatusNoContent, resp.StatusCode)
+			require.Equal(t, tt.want, got)
 		})
 	}
 }
