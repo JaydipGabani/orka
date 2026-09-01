@@ -155,6 +155,19 @@ func genericRowStatus(item map[string]any) string {
 	if status == "" {
 		status = nestedString(item, "status", "phase")
 	}
+	if status == "" {
+		// Resources such as Providers expose readiness as status.ready
+		// instead of a phase.
+		if statusMap, ok := item["status"].(map[string]any); ok {
+			if ready, ok := statusMap["ready"].(bool); ok {
+				if ready {
+					status = "Ready"
+				} else {
+					status = "NotReady"
+				}
+			}
+		}
+	}
 	if workflow := firstString(item, "workflowPhase"); workflow != "" && workflow != status {
 		if status == "" {
 			return workflow

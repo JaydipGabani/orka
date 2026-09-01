@@ -35,6 +35,27 @@ const (
 	tableTestStateKey = "state"
 )
 
+func TestPrintGenericTableRendersStatusReadyBool(t *testing.T) {
+	for _, tc := range []struct {
+		ready bool
+		want  string
+	}{{true, "Ready"}, {false, "NotReady"}} {
+		cmd := &cobra.Command{}
+		var out strings.Builder
+		cmd.SetOut(&out)
+		value := map[string]any{tableTestItemsKey: []any{map[string]any{
+			"metadata": map[string]any{"name": "openai-vekil", "namespace": "orka-system"},
+			"status":   map[string]any{"ready": tc.ready},
+		}}}
+		if err := printGenericTable(cmd, value); err != nil {
+			t.Fatalf("printGenericTable() error = %v", err)
+		}
+		if !strings.Contains(out.String(), tc.want) {
+			t.Fatalf("table output %q lacks %q", out.String(), tc.want)
+		}
+	}
+}
+
 func TestPrintGenericTableLabelsForgeRecordsByNumber(t *testing.T) {
 	cmd := &cobra.Command{}
 	var out strings.Builder
