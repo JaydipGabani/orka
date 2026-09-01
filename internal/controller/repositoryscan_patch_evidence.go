@@ -199,10 +199,10 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 	}
 	// Filenames alone are spoofable: an unrelated diff touching the same
 	// paths would pass the set check. Bind the content too — each file's
-	// complete hunk body (headers, positions, context, and every changed
+	// complete hunk body (path headers, positions, context, and every changed
 	// line, however it is prefixed) must be identical to the published
-	// commit's. Only index and path headers, which legitimately vary between
-	// diff generators without changing the represented patch, are excluded.
+	// commit's. Index headers, which legitimately vary between diff generators
+	// without changing the represented patch, are excluded.
 	// Mode, rename, copy, similarity, and binary metadata is rejected because
 	// the commit-files response does not provide enough data to verify it.
 	// Stored artifacts come in two provenances: the result-contract path
@@ -220,22 +220,38 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 	return "", nil
 }
 
-// patchHunksByFile extracts each file's verbatim hunk body — everything from
-// its first "@@" line to the next file header — from a unified diff.
+// patchHunksByFile binds each file's canonical old/new path headers to its
+// verbatim hunk body, from the first "@@" line to the next file header.
 var recognizedDiffMetadataPattern = regexp.MustCompile(`^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|--- .+|\+\+\+ .+)$`)
 
 func patchHunksByFile(diff string) (map[string]string, bool) {
+	const nullPath = "/dev/null"
+
 	hunks := map[string]string{}
 	seenPaths := map[string]struct{}{}
 	var body []string
 	current := ""
+	oldHeader := ""
+	newHeader := ""
 	inHunk := false
 	duplicate := false
+	invalidBlock := false
 	flush := func() {
-		if current != "" && len(body) > 0 {
-			hunks[current] = strings.TrimRight(strings.Join(body, "\n"), "\n")
+		if current != "" {
+			wantOld := "a/" + current
+			wantNew := "b/" + current
+			headersValid := (oldHeader == wantOld && newHeader == wantNew) ||
+				(oldHeader == nullPath && newHeader == wantNew) ||
+				(oldHeader == wantOld && newHeader == nullPath)
+			if !headersValid || len(body) == 0 {
+				invalidBlock = true
+			} else {
+				hunks[current] = oldHeader + "\n" + newHeader + "\n" + strings.TrimRight(strings.Join(body, "\n"), "\n")
+			}
 		}
 		body = nil
+		oldHeader = ""
+		newHeader = ""
 		inHunk = false
 	}
 	unknownPrefix := false
@@ -244,8 +260,15 @@ func patchHunksByFile(diff string) (map[string]string, bool) {
 			flush()
 			current = ""
 			fields := strings.Fields(line)
-			if len(fields) == 4 {
-				current = strings.TrimPrefix(fields[3], "b/")
+			if len(fields) == 4 && strings.HasPrefix(fields[2], "a/") && strings.HasPrefix(fields[3], "b/") {
+				candidate := strings.TrimPrefix(fields[3], "b/")
+				if candidate != "" && fields[2] == "a/"+candidate {
+					current = candidate
+				} else {
+					invalidBlock = true
+				}
+			} else {
+				invalidBlock = true
 			}
 			// Any repeated file block — hunkless or not — invalidates the
 			// diff: a second header for the same path could hide arbitrary
@@ -258,11 +281,27 @@ func patchHunksByFile(diff string) (map[string]string, bool) {
 			}
 			continue
 		}
-		if !inHunk && strings.HasPrefix(line, "@@") {
-			inHunk = true
-		}
 		if inHunk {
 			body = append(body, line)
+			continue
+		}
+		if strings.HasPrefix(line, "@@") {
+			inHunk = true
+			body = append(body, line)
+			continue
+		}
+		if strings.HasPrefix(line, "--- ") {
+			if oldHeader != "" || newHeader != "" {
+				invalidBlock = true
+			}
+			oldHeader = strings.TrimPrefix(line, "--- ")
+			continue
+		}
+		if strings.HasPrefix(line, "+++ ") {
+			if oldHeader == "" || newHeader != "" {
+				invalidBlock = true
+			}
+			newHeader = strings.TrimPrefix(line, "+++ ")
 			continue
 		}
 		// Outside hunks, only recognized diff metadata may appear: a
@@ -273,7 +312,7 @@ func patchHunksByFile(diff string) (map[string]string, bool) {
 		}
 	}
 	flush()
-	return hunks, !duplicate && !unknownPrefix
+	return hunks, !duplicate && !unknownPrefix && !invalidBlock
 }
 
 // recognizedDiffMetadataLine reports whether a pre-hunk line is standard git

@@ -4185,6 +4185,21 @@ func TestPatchHunkBindingRejectsUnverifiableMetadata(t *testing.T) {
 	}
 }
 
+func TestPatchHunkBindingRejectsMismatchedPathHeaders(t *testing.T) {
+	t.Parallel()
+	genuine := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-a\n+b\n" +
+		"diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n-c\n+d\n"
+	swapped := "diff --git a/a.go b/a.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n-a\n+b\n" +
+		"diff --git a/b.go b/b.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-c\n+d\n"
+	if samePatchHunks(swapped, genuine) {
+		t.Fatal("path headers swapped between file blocks were accepted")
+	}
+	wrongChangeKind := strings.Replace(genuine, "--- a/a.go", "--- /dev/null", 1)
+	if samePatchHunks(wrongChangeKind, genuine) {
+		t.Fatal("path headers that changed a modified file into an addition were accepted")
+	}
+}
+
 func TestPatchEvidenceRejectsTruncatedAndDuplicateCommitContent(t *testing.T) {
 	t.Parallel()
 	// A nonempty patch whose totals disagree with the reported counts is a

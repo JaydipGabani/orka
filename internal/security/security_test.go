@@ -631,6 +631,11 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"PASSWORD: short`correct-horse-battery-staple",
 		"PASSWORD: short correct-horse-battery-staple",
 		"PASSWORD: short correct-horse-battery-staple # rotated credential",
+		`password: correct(horse)battery-staple`,
+		`password="{correct-horse-battery-staple}"`,
+		`password="[correct-horse-battery-staple]"`,
+		`password="<correct-horse-battery-staple>"`,
+		`password="%correct-horse-battery-staple%"`,
 		"PASSWORD=short\u200bcorrect-horse-battery-staple",
 		"Cookie: sessionid=correct-horse-battery-staple",
 		"Cookie: theme=dark; sessionid=correct-horse-battery-staple",
@@ -638,6 +643,34 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 	} {
 		if !LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = false, want true for a credential-shaped value", text)
+		}
+	}
+}
+
+func TestSecretValuePlaceholderRequiresRecognizedForms(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{
+		"$TOKEN",
+		"${TOKEN}",
+		"{{ .Token }}",
+		"{placeholder}",
+		"<your-token>",
+		"[REDACTED]",
+		"%PASSWORD%",
+		"%(password)s",
+	} {
+		if !secretValuePlaceholder(value) {
+			t.Fatalf("secretValuePlaceholder(%q) = false, want true", value)
+		}
+	}
+	for _, value := range []string{
+		"{correct-horse-battery-staple}",
+		"[correct-horse-battery-staple]",
+		"<correct-horse-battery-staple>",
+		"%correct-horse-battery-staple%",
+	} {
+		if secretValuePlaceholder(value) {
+			t.Fatalf("secretValuePlaceholder(%q) = true, want false for a wrapped literal", value)
 		}
 	}
 }

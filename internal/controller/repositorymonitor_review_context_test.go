@@ -977,3 +977,13 @@ func TestRepositoryMonitorReviewContextRedactsTabSplitCredential(t *testing.T) {
 		t.Fatalf("sanitize(%q) = %q, want tabs preserved on credential-free lines", plain, got)
 	}
 }
+
+func TestRepositoryMonitorReviewContextWithholdsTabJoinedSecretDetectedByPolicy(t *testing.T) {
+	t.Parallel()
+	const secret = "AK" + "IA" + "ABCDEFGHIJ" + "KLMNOP"
+	split := "+const accessKey = \"" + secret[:14] + "\t" + secret[14:] + "\""
+	got := repositoryMonitorReviewContextSanitize(split)
+	if got != "+[REDACTED]" {
+		t.Fatalf("sanitize(%q) = %q, want the policy-detected line withheld", split, got)
+	}
+}

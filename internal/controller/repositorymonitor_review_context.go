@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/orka-agents/orka/internal/redact"
+	"github.com/orka-agents/orka/internal/security"
 )
 
 // Review context bounds. The encoded orka.prReview.context.v1 payload is
@@ -496,6 +497,12 @@ func repositoryMonitorReviewContextSanitize(value string) string {
 			shadow := strings.ReplaceAll(line, "\t", "")
 			if redacted := redact.SensitiveText(shadow); redacted != shadow {
 				lines[i] = redacted
+			} else if security.LooksLikeSecret(shadow) {
+				prefix := ""
+				if len(line) > 0 && (line[0] == '+' || line[0] == '-' || line[0] == ' ') {
+					prefix = line[:1]
+				}
+				lines[i] = prefix + "[REDACTED]"
 			} else {
 				lines[i] = redact.SensitiveText(line)
 			}

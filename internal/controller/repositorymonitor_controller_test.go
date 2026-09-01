@@ -6850,6 +6850,32 @@ func TestRepositoryMonitorIssueInventoryPreservesStatusCommentIdentity(t *testin
 	}
 }
 
+func TestRepositoryMonitorIssueRunLimitRefreshRetainsActiveWorkflowAcrossSnapshotChanges(t *testing.T) {
+	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+	existing := &store.MonitorItem{
+		SnapshotDigest:     "sha256:old",
+		WorkflowPhase:      repositoryMonitorIssuePhasePROpened,
+		LastActionID:       "action-44",
+		LastActionKind:     repositoryMonitorIssueActionImplementation,
+		LastActionTaskName: "implement-44",
+		LastVerdict:        repositoryMonitorIssueVerdictReady,
+		LinkedPRNumber:     144,
+	}
+	issue := repositoryMonitorIssue{Number: 44, Title: "Updated title", Body: "Updated body", State: "open"}
+	got := repositoryMonitorItemFromIssue(monitor, issue, existing)
+	if got.SnapshotDigest == existing.SnapshotDigest {
+		t.Fatal("inventory refresh did not record the changed issue snapshot")
+	}
+	if !repositoryMonitorIssueRetainWorkflowUnderRunLimit(got, existing) {
+		t.Fatal("active workflow was not eligible for retention under the run limit")
+	}
+	if got.WorkflowPhase != existing.WorkflowPhase || got.LastActionID != existing.LastActionID ||
+		got.LastActionKind != existing.LastActionKind || got.LastActionTaskName != existing.LastActionTaskName ||
+		got.LastVerdict != existing.LastVerdict || got.LinkedPRNumber != existing.LinkedPRNumber {
+		t.Fatalf("inventory refresh lost active workflow state: %#v", got)
+	}
+}
+
 func TestRepositoryMonitorIssueRunLimitRetainsActiveWorkflow(t *testing.T) {
 	for _, phase := range []string{repositoryMonitorIssuePhaseApprovalRequired, repositoryMonitorIssuePhaseImplementationQueued, repositoryMonitorIssuePhasePROpened, repositoryMonitorIssuePhaseComplete} {
 		if !repositoryMonitorIssueWorkflowRetainedUnderRunLimit(&store.MonitorItem{WorkflowPhase: phase}) {

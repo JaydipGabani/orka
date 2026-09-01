@@ -77,7 +77,6 @@ var (
 	// the credential-bearing header here; yamlBlockScalarAssignmentsLookLikeSecret
 	// reconstructs all content lines before evaluating the value.
 	policySensitiveYAMLBlockHeaderPattern = regexp.MustCompile(`(?i)^[\t ]*(?:-\s*)?["']?(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|secr` + `et|cred` + `entials?|priv` + `ate[_-]?key)["']?\s*:\s*[|>](?:[+-][1-9]?|[1-9][+-]?)?[ \t]*(?:#[^\r\n]*)?$`)
-	policyYAMLPlainScalarPartPattern      = regexp.MustCompile("^[A-Za-z0-9_./+=~:@#$%^&*!?|,;\\\\`-]+$")
 	policyJWTPattern                      = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])ey` + `J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}([^A-Za-z0-9_-]|$)`)
 	// Header-carried credentials are flagged only when a credential-shaped
 	// value follows: "Authorization: Bearer $TOKEN" in documentation is not
@@ -97,31 +96,50 @@ var (
 	policyCookieValuePattern = regexp.MustCompile("^[A-Za-z0-9_./+=~:@#$%^&*!?|,'\\\\`-]{16,}$")
 )
 
-// placeholderFormPattern matches complete variable/template forms: a shell
-// or template variable reference, or a fully bracketed/braced example. A
-// prefix alone is not enough — "$tr0ng-password!" is a literal that merely
-// starts with '$', not a placeholder.
-var placeholderFormPattern = regexp.MustCompile(
-	`^(?:` +
-		`\$[A-Za-z_][A-Za-z0-9_]*` + // $VAR
-		`|\$\{[A-Za-z_][A-Za-z0-9_]*\}` + // ${VAR} — variable-only; ${VAR:-fallback} can embed a literal secret and stays flagged
-		`|\{\{.*\}\}` + // {{ .Token }}, {{ secret }}
-		`|\{[^{}]*\}` + // {placeholder}
-		`|<[^<>]*>` + // <your-token>
-		`|\[[^\[\]]*\]` + // [REDACTED], [token]
-		`|%[^%]*%` + // %VAR% (Windows)
-		`|%\([^()]*\)[A-Za-z]` + // %(name)s (Python)
-		`)$`)
+var (
+	// These forms have syntax that unambiguously refers to a variable or
+	// formatter rather than a literal value.
+	directPlaceholderPattern = regexp.MustCompile(
+		`^(?:` +
+			`\$[A-Za-z_][A-Za-z0-9_]*` + // $VAR
+			`|\$\{[A-Za-z_][A-Za-z0-9_]*\}` + // ${VAR}; fallbacks can contain literals and stay flagged
+			`|%\([A-Za-z_][A-Za-z0-9_]*\)[A-Za-z]` + // %(name)s (Python)
+			`)$`)
+	windowsEnvironmentPlaceholderPattern = regexp.MustCompile(`^%[A-Z_][A-Z0-9_]*%$`)
+	templateFieldPlaceholderPattern      = regexp.MustCompile(`^\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$`)
+	// Brackets alone do not make a value a placeholder. Only established
+	// marker words and credential-field examples receive that exemption.
+	placeholderMarkerPattern = regexp.MustCompile(`(?i)^(?:redacted|masked|placeholder|example|sample|dummy|changeme|(?:your[-_ ]*)?(?:api[-_ ]?key|access[-_ ]?token|auth[-_ ]?token|id[-_ ]?token|refresh[-_ ]?token|transaction[-_ ]?token|token|password|passwd|secret|credential|private[-_ ]?key)(?:[-_ ]*(?:here|value|placeholder|redacted))?)$`)
+)
 
 // secretValuePlaceholder reports whether a credential-position value is an
 // obvious placeholder rather than a literal secret. Only complete recognized
 // forms are exempt; a value that merely begins with a placeholder character
 // stays flagged.
 func secretValuePlaceholder(value string) bool {
+	value = strings.TrimSpace(value)
 	if value == "" {
 		return true
 	}
-	return placeholderFormPattern.MatchString(value)
+	if directPlaceholderPattern.MatchString(value) || windowsEnvironmentPlaceholderPattern.MatchString(value) {
+		return true
+	}
+	if strings.HasPrefix(value, "{{") && strings.HasSuffix(value, "}}") {
+		inner := strings.TrimSpace(value[2 : len(value)-2])
+		return templateFieldPlaceholderPattern.MatchString(inner) || placeholderMarkerPattern.MatchString(inner)
+	}
+	if len(value) < 2 {
+		return false
+	}
+	switch {
+	case value[0] == '{' && value[len(value)-1] == '}',
+		value[0] == '<' && value[len(value)-1] == '>',
+		value[0] == '[' && value[len(value)-1] == ']',
+		value[0] == '%' && value[len(value)-1] == '%':
+		return placeholderMarkerPattern.MatchString(strings.TrimSpace(value[1 : len(value)-1]))
+	default:
+		return false
+	}
 }
 
 // codeReferencePattern matches a qualified identifier such as
@@ -268,21 +286,16 @@ func trimYAMLPlainScalarComment(value string) string {
 func yamlPlainScalarAssignmentsLookLikeSecret(text string) bool {
 	for _, match := range policySensitiveYAMLAssignmentPattern.FindAllStringSubmatch(text, -1) {
 		value := trimYAMLPlainScalarComment(match[1])
+		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
+			value = strings.TrimSpace(value[1 : len(value)-1])
+		}
 		if len(value) < 16 {
 			continue
 		}
-		parts := strings.Fields(value)
-		if len(parts) < 2 {
-			continue
-		}
-		credentialShaped := true
-		for _, part := range parts {
-			if !policyYAMLPlainScalarPartPattern.MatchString(part) {
-				credentialShaped = false
-				break
-			}
-		}
-		if credentialShaped && !secretValuePlaceholder(value) {
+		// A sufficiently long scalar under an explicit credential key is
+		// sensitive regardless of punctuation or whitespace. The only safe
+		// exception is a recognized placeholder form.
+		if !secretValuePlaceholder(value) {
 			return true
 		}
 	}
