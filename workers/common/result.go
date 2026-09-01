@@ -21,7 +21,12 @@ import (
 )
 
 const (
-	maxRetries      = 5
+	// maxRetries and maxBackoff size the submission window (~4 minutes of
+	// backoff) so a finished worker's result survives a routine single-replica
+	// controller restart (Recreate strategy: image pull, leader election, and
+	// PVC reattach commonly take 1-3 minutes of API downtime).
+	maxRetries      = 9
+	maxBackoff      = 60 * time.Second
 	saTokenPath     = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	saNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
@@ -35,7 +40,9 @@ var resultStdoutMarkerPath = agentSandboxResultMarkerExecPath
 
 // SubmitResult sends the task result to the controller via HTTP POST.
 // It reads ORKA_RESULT_ENDPOINT or constructs the URL from ORKA_CONTROLLER_URL.
-// Retries up to 5 times with exponential backoff (2s, 4s, 8s, 16s) on failure.
+// Retries with exponential backoff capped at maxBackoff (2s, 4s, 8s, 16s,
+// 32s, then 60s steps — ~4 minutes in total) so a controller restart does not
+// discard a completed worker's result.
 func SubmitResult(result []byte) error {
 	if len(bytes.TrimSpace(result)) == 0 {
 		return fmt.Errorf("result must not be blank")
@@ -65,6 +72,9 @@ func SubmitResult(result []byte) error {
 	for attempt := range maxRetries {
 		if attempt > 0 {
 			backoff := time.Duration(1<<uint(attempt)) * time.Second
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 			time.Sleep(backoff)
 		}
 
