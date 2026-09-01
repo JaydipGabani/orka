@@ -395,7 +395,13 @@ func repositoryMonitorReviewContextPathAltered(file repositoryMonitorPullRequest
 }
 
 func repositoryMonitorReviewContextBoundedField(value string, maxBytes int) string {
-	value = strings.TrimSpace(repositoryMonitorReviewContextSanitize(value))
+	shadow := strings.NewReplacer("\n", "", "\t", "").Replace(value)
+	if sanitizedShadow := repositoryMonitorReviewContextSanitize(shadow); sanitizedShadow != shadow {
+		value = sanitizedShadow
+	} else {
+		value = repositoryMonitorReviewContextSanitize(value)
+	}
+	value = strings.TrimSpace(value)
 	value = strings.ReplaceAll(strings.ReplaceAll(value, "\n", " "), "\t", " ")
 	if len(value) <= maxBytes {
 		return value

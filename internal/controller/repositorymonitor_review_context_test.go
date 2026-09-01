@@ -280,6 +280,34 @@ func TestRepositoryMonitorReviewContextRedactsCredentialsSplitByControlCharacter
 	}
 }
 
+func TestRepositoryMonitorReviewContextRedactsCredentialsSplitByPathSeparators(t *testing.T) {
+	t.Parallel()
+	const secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	for _, tc := range []struct {
+		name      string
+		separator string
+	}{
+		{name: "newline", separator: "\n"},
+		{name: "tab", separator: "\t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			split := secret[:11] + tc.separator + secret[11:]
+			files := []repositoryMonitorPullRequestFileResponse{{
+				Filename: "config/" + split + ".env",
+				Status:   repositoryMonitorReviewContextTestAdded,
+			}}
+			got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), files)
+			if len(got.Files) != 1 || !got.Truncated.Files {
+				t.Fatalf("context = %#v, want one altered path marked incomplete", got)
+			}
+			path := got.Files[0].Path
+			if strings.Contains(strings.ReplaceAll(path, " ", ""), secret) || !strings.Contains(path, "[REDACTED]") {
+				t.Fatalf("path = %q, want separator-joined credential redacted", path)
+			}
+		})
+	}
+}
+
 func TestRepositoryMonitorReviewContextRedactedDeletedLineMarksChangeSetIncomplete(t *testing.T) {
 	t.Parallel()
 	const secret = "ak-live-0123456789abcdef"
