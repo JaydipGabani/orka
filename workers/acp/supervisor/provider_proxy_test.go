@@ -1330,7 +1330,7 @@ func TestProviderProxyChildAbandonBeforeAnyByteIsUnaccounted(t *testing.T) {
 	}
 }
 
-func TestProviderProxyChildDisconnectOnStreamedSuccessCountsAsSuccess(t *testing.T) {
+func TestProviderProxyChildDisconnectOnIncompleteStreamCountsAsFailure(t *testing.T) {
 	proxy, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
 		UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
 	})
@@ -1355,8 +1355,40 @@ func TestProviderProxyChildDisconnectOnStreamedSuccessCountsAsSuccess(t *testing
 		}
 		proxy.relayUpstreamResponse(context.Background(), &childDisconnectedWriter{header: http.Header{}}, session, testPromptOneID, providerRequestInference, seq, response)
 	}()
+	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); !failed || status != http.StatusBadGateway || detail != "provider stream ended before a terminal success event" {
+		t.Fatalf("upstreamFailureUnrecovered after child disconnect on incomplete stream = %v/%d/%q, want terminal-marker failure", failed, status, detail)
+	}
+	if successes, failures := session.inferenceSuccesses, session.inferenceFailures; successes != 0 || failures != 2 {
+		t.Fatalf("inference accounting = %d successes / %d failures, want 0/2", successes, failures)
+	}
+}
+
+func TestProviderProxyChildDisconnectOnNonStreamedResponseCountsAsSuccess(t *testing.T) {
+	proxy, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+	session.recordInferenceResponse(testPromptOneID, providerRequestInference, http.StatusTooManyRequests, "rate limit exceeded")
+
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"id":"response-1"}`)),
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != http.ErrAbortHandler {
+				t.Fatalf("relay panic = %v, want http.ErrAbortHandler", recovered)
+			}
+		}()
+		seq := testAllocateInferenceSeq(session)
+		if err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		proxy.relayUpstreamResponse(context.Background(), &childDisconnectedWriter{header: http.Header{}}, session, testPromptOneID, providerRequestInference, seq, response)
+	}()
 	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed || status != 0 || detail != "" {
-		t.Fatalf("upstreamFailureUnrecovered after child disconnect on 2xx = %v/%d/%q, want the earlier failure recovered", failed, status, detail)
+		t.Fatalf("upstreamFailureUnrecovered after child disconnect on non-streamed 2xx = %v/%d/%q, want the earlier failure recovered", failed, status, detail)
 	}
 	if successes, failures := session.inferenceSuccesses, session.inferenceFailures; successes != 1 || failures != 1 {
 		t.Fatalf("inference accounting = %d successes / %d failures, want 1/1", successes, failures)

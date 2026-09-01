@@ -1099,22 +1099,19 @@ func (p *providerProxy) relayUpstreamResponse(
 	if err != nil {
 		if !upstreamFailed {
 			if errors.Is(err, providerproxy.ErrDestinationWrite) || ctx.Err() != nil {
-				// The upstream delivered a healthy 2xx; the ACP child closed
-				// its side of the relay (Codex drops an SSE stream once it
-				// has read what it needs), which surfaces either as a
-				// destination write error or, because the upstream request
-				// context is derived from the child's request, as a
-				// cancelled upstream read. Neither is upstream evidence of
-				// failure. It is accounted as a success only when response
-				// bytes actually reached the child; a relay abandoned before
-				// any body byte was delivered proves nothing about the
-				// inference and is left unaccounted, so a later-issued
-				// abandoned request cannot mask an earlier failure the child
-				// settled on.
+				// A child disconnect is not upstream evidence by itself. A
+				// partially delivered SSE response still needs a terminal
+				// marker, while a zero-byte relay remains unaccounted and a
+				// partially delivered non-SSE response keeps its existing
+				// success behavior.
 				if streamFailed() {
 					recordStreamFailure()
 				} else if relayed.n > 0 {
-					session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
+					if streamScanner != nil && !streamScanner.completed {
+						recordIncompleteStream()
+					} else {
+						session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
+					}
 				}
 			} else {
 				// A 2xx whose body overran the response limit or broke
