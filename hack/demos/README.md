@@ -34,7 +34,7 @@ Set these before running the scenarios:
 # Optional override for upstream demo-magic. Usually unnecessary because a fallback is vendored.
 # export DEMO_MAGIC_PATH="$HOME/src/demo-magic/demo-magic.sh"
 export ORKA_API_BASE="http://127.0.0.1:8080"
-export DEMO_NAMESPACE="demo-magic"
+export DEMO_NAMESPACE="orka-system"   # must be the controller's --watch-namespace
 
 # Must match metadata.name from: kubectl get provider -n "$DEMO_NAMESPACE"
 export DEMO_PROVIDER_REF="<existing-provider-name>"
