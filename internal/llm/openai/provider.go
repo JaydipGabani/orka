@@ -652,6 +652,45 @@ func (t *responseFuncCallTracker) emit(fc *responseFuncCallState, send streamSen
 	return true
 }
 
+func (t *responseFuncCallTracker) hasUnemittedFunctionCall(output []responses.ResponseOutputItemUnion) bool {
+	seen := make(map[*responseFuncCallState]struct{})
+	pending := func(fc *responseFuncCallState) bool {
+		if fc == nil {
+			return false
+		}
+		if _, ok := seen[fc]; ok {
+			return false
+		}
+		seen[fc] = struct{}{}
+		return !fc.emitted
+	}
+	for _, fc := range t.byItemID {
+		if pending(fc) {
+			return true
+		}
+	}
+	for _, fc := range t.byCallID {
+		if pending(fc) {
+			return true
+		}
+	}
+	for _, fc := range t.byOutputIndex {
+		if pending(fc) {
+			return true
+		}
+	}
+	for i, item := range output {
+		if item.Type != eventTypeFunctionCall {
+			continue
+		}
+		fc := t.get(item.ID, int64(i), true, item.CallID)
+		if !fc.emitted {
+			return true
+		}
+	}
+	return false
+}
+
 func streamResponsesEvents(stream responseStream, providerName string, send streamSender) {
 	tracker := newResponseFuncCallTracker()
 	for stream.Next() {
@@ -680,8 +719,15 @@ func handleResponsesStreamEvent(evt responses.ResponseStreamEventUnion, tracker 
 		return handleResponseOutputItem(evt, tracker, send, true)
 	case "response.completed":
 		return handleResponseCompleted(evt, tracker, providerName, send)
-	case "response.failed", eventTypeResponseIncomplete:
+	case "response.failed":
 		stopReason := normalizeResponsesIncompleteStopReason(evt.Type, evt.Response.IncompleteDetails.Reason)
+		send(llm.StreamChunk{Done: true, StopReason: stopReason})
+		return false
+	case eventTypeResponseIncomplete:
+		stopReason := normalizeResponsesIncompleteStopReason(evt.Type, evt.Response.IncompleteDetails.Reason)
+		if tracker.hasUnemittedFunctionCall(evt.Response.Output) {
+			stopReason = eventTypeResponseIncomplete
+		}
 		send(llm.StreamChunk{Done: true, StopReason: stopReason})
 		return false
 	case "error":

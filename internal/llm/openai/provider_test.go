@@ -2090,6 +2090,73 @@ func TestStream_ResponsesAPI_MaxOutputTokens(t *testing.T) {
 	}
 }
 
+func TestStream_ResponsesAPI_MaxOutputTokensPreservesUnfinishedToolCall(t *testing.T) {
+	tests := []struct {
+		name           string
+		functionEvents string
+		terminalOutput string
+	}{
+		{
+			name: "tracked partial function call",
+			functionEvents: "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"fc_item\",\"type\":\"function_call\",\"call_id\":\"call_123\",\"name\":\"search\"}}\n\n" +
+				"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_item\",\"output_index\":1,\"delta\":\"{\\\"q\\\":\"}\n\n",
+			terminalOutput: "[]",
+		},
+		{
+			name:           "terminal output-only function call",
+			terminalOutput: "[{\"id\":\"fc_item\",\"type\":\"function_call\",\"call_id\":\"call_123\",\"name\":\"search\",\"arguments\":\"{\\\"q\\\":\"}]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				flusher, _ := w.(http.Flusher)
+				fmt.Fprint(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\",\"item_id\":\"i1\",\"output_index\":0,\"content_index\":0}\n\n") //nolint:errcheck
+				flusher.Flush()
+				fmt.Fprint(w, tt.functionEvents) //nolint:errcheck
+				flusher.Flush()
+				fmt.Fprintf(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_limit\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"model\":\"gpt-4\",\"output\":%s,\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n", tt.terminalOutput) //nolint:errcheck
+				flusher.Flush()
+			}))
+			defer server.Close()
+
+			provider, err := NewProvider(llm.ProviderConfig{APIKey: "test-key", BaseURL: server.URL})
+			if err != nil {
+				t.Fatalf("NewProvider() error = %v", err)
+			}
+			provider.mode.Store(int32(apiModeResponses))
+
+			ch, err := provider.Stream(context.Background(), &llm.CompletionRequest{
+				Model:    "gpt-4",
+				Messages: []llm.Message{{Role: "user", Content: "hi"}},
+			})
+			if err != nil {
+				t.Fatalf("Stream() error = %v", err)
+			}
+
+			var content, stopReason string
+			var toolCalls int
+			for chunk := range ch {
+				if chunk.Error != nil {
+					t.Fatalf("unexpected error: %v", chunk.Error)
+				}
+				content += chunk.Content
+				if chunk.ToolCall != nil {
+					toolCalls++
+				}
+				if chunk.Done {
+					stopReason = chunk.StopReason
+				}
+			}
+			if content != "partial" || stopReason != eventTypeResponseIncomplete || toolCalls != 0 {
+				t.Fatalf("stream = content %q, stop reason %q, tool calls %d; want partial content with an incomplete terminal and no emitted call", content, stopReason, toolCalls)
+			}
+		})
+	}
+}
+
 func TestStream_ResponsesAPI_Error(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
