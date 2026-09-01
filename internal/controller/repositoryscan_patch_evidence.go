@@ -403,6 +403,11 @@ func repositoryScanDiffFromPublishedCommit(files []repositoryScanCommitFileRespo
 	seen := make(map[string]struct{}, len(files))
 	for _, file := range files {
 		path := strings.TrimSpace(file.Filename)
+		// Trimming must not rewrite identity: a legal filename with leading
+		// or trailing whitespace would otherwise verify as a different path.
+		if path != file.Filename {
+			return "", nil, "published patch commit contains a whitespace-altered file path"
+		}
 		if path == "" || !security.SafeRepoPath(path) || strings.ContainsAny(path, " \"\\\t\r\n") {
 			return "", nil, "published patch commit contains an unsafe file path"
 		}

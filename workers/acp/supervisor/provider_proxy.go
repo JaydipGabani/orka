@@ -763,8 +763,9 @@ func sanitizeProviderUpstreamDetail(detail string) string {
 	var printable strings.Builder
 	for _, r := range detail {
 		switch {
-		case r == '\n' || r == '\r' || r == '\t':
-			printable.WriteRune(' ')
+		// Separators are dropped, not spaced: a credential wrapped across a
+		// line break or tab must reassemble into one contiguous token for
+		// the redactor, matching the other ACP sanitizers.
 		case r == utf8.RuneError || !unicode.IsPrint(r):
 			continue
 		default:

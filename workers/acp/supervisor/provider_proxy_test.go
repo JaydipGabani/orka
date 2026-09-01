@@ -1153,7 +1153,9 @@ func TestSanitizeProviderUpstreamDetailIsBounded(t *testing.T) {
 	if got := sanitizeProviderUpstreamDetail(long); len(got) > providerUpstreamDetailMaxBytes {
 		t.Fatalf("sanitized detail length = %d, want <= %d", len(got), providerUpstreamDetailMaxBytes)
 	}
-	if got := sanitizeProviderUpstreamDetail("quota\tex\x1bceeded\n"); got != "quota exceeded" {
+	// Separators are dropped, not spaced (a wrapped credential must
+	// reassemble for the redactor), so prose joins across them.
+	if got := sanitizeProviderUpstreamDetail("quota\tex\x1bceeded\n"); got != "quotaexceeded" {
 		t.Fatalf("sanitized control characters = %q", got)
 	}
 	if got := providerUpstreamErrorDetail([]byte(`{"error":"plain string error"}`)); got != "plain string error" {

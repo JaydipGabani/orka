@@ -65,3 +65,12 @@ func testAllocateInferenceSeq(s *providerProxySession) uint64 {
 	s.issuedInference++
 	return s.issuedInference
 }
+
+func TestSanitizeProviderUpstreamDetailReassemblesWrappedCredential(t *testing.T) {
+	t.Parallel()
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	got := sanitizeProviderUpstreamDetail("quota error for " + key[:11] + "\n" + key[11:] + " on model")
+	if strings.Contains(got, key[:11]) || strings.Contains(got, key[11:]) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("sanitizeProviderUpstreamDetail() = %q, want line-wrapped credential redacted", got)
+	}
+}

@@ -4186,6 +4186,13 @@ func TestPatchEvidenceRejectsTruncatedAndDuplicateCommitContent(t *testing.T) {
 	if !strings.Contains(reason, "repeats a file path") {
 		t.Fatalf("reason = %q, want duplicate-path rejection", reason)
 	}
+	// Normalization must not silently change the identity of a legal Git path.
+	_, _, reason = repositoryScanDiffFromPublishedCommit([]repositoryScanCommitFileResponse{
+		{Filename: " fix.go", Status: "modified", Additions: 1, Deletions: 1, Patch: "@@ -1 +1 @@\n-a\n+b"},
+	})
+	if !strings.Contains(reason, "whitespace-altered file path") {
+		t.Fatalf("reason = %q, want whitespace-path rejection", reason)
+	}
 	// An artifact repeating a diff --git block cannot hide extra hunks
 	// behind a second block that matches the commit.
 	genuine := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-a\n+b\n"

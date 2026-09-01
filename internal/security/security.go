@@ -829,6 +829,19 @@ func stripUnsafeTextRunes(value string) string {
 func neutralizePublishedText(value string) string {
 	stripped := stripUnsafeTextRunes(value)
 	stripped = redact.SensitiveText(stripped)
+	// Markdown keeps its newlines and tabs, so a credential wrapped across a
+	// line break could evade the in-place redaction above. Detect on a
+	// separator-joined shadow copy; if a credential is still recoverable by
+	// joining lines, withhold the whole field rather than publish it.
+	shadow := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return -1
+		}
+		return r
+	}, stripped)
+	if redact.SensitiveText(shadow) != shadow || LooksLikeSecret(shadow) {
+		return "[content withheld: credential-shaped value detected]"
+	}
 	stripped = strings.ReplaceAll(stripped, "<!--", "<\u200b!--")
 	stripped = strings.ReplaceAll(stripped, "-->", "--\u200b>")
 	var b strings.Builder

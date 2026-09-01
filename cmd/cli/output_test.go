@@ -61,3 +61,24 @@ func TestPrintGenericTableLabelsForgeRecordsByNumber(t *testing.T) {
 		t.Fatalf("table output %q rendered a dash name or an untruncated title", got)
 	}
 }
+
+func TestPrintGenericTableStripsTerminalControlsFromForgeTitles(t *testing.T) {
+	cmd := &cobra.Command{}
+	var out strings.Builder
+	cmd.SetOut(&out)
+	value := map[string]any{tableTestItemsKey: []any{map[string]any{
+		"number":          float64(7),
+		"title":           "safe\x1b]8;;https://example.invalid\a link\x1b]8;;\a\u202Ehidden",
+		tableTestStateKey: "open",
+	}}}
+	if err := printGenericTable(cmd, value); err != nil {
+		t.Fatalf("printGenericTable() error = %v", err)
+	}
+	got := out.String()
+	if strings.ContainsAny(got, "\x1b\a") || strings.ContainsRune(got, '\u202e') {
+		t.Fatalf("table output retains terminal control text: %q", got)
+	}
+	if !strings.Contains(got, "#7 safe]8;;https://example.invalid link]8;;hidden") {
+		t.Fatalf("table output lost visible title text: %q", got)
+	}
+}

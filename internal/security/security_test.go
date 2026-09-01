@@ -571,6 +571,7 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"Cookie: session=$TOKEN",
 		"Set-Cookie: theme=dark; Path=/; HttpOnly",
 		"password: $PASSWORD # injected at runtime",
+		"password: |-\n  ${PASSWORD}",
 	} {
 		if LooksLikeSecret(text) {
 			t.Fatalf("LooksLikeSecret(%q) = true, want false for a placeholder or bare keyword", text)
@@ -606,6 +607,10 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"PASSWORD=short,correct-horse-battery-staple",
 		"PASSWORD=short;correct-horse-battery-staple",
 		`PASSWORD=short\correct-horse-battery-staple`,
+		"password: >-\n  correct-horse-battery-staple",
+		"password: |\n  correct-horse-\n  battery-staple",
+		"password: >-\n  correct horse battery staple",
+		"api_key: |\n    " + strings.Repeat("0a1b2c3d", 3),
 		"PASSWORD: short`correct-horse-battery-staple",
 		"PASSWORD: short correct-horse-battery-staple",
 		"PASSWORD: short correct-horse-battery-staple # rotated credential",
@@ -636,5 +641,18 @@ func TestRemediationPullRequestBodyNeutralizesActiveText(t *testing.T) {
 	title := RemediationPullRequestTitle(finding)
 	if strings.Contains(title, "@maintainer") || strings.Contains(title, "<!--") {
 		t.Fatalf("PR title carries active text: %q", title)
+	}
+}
+
+func TestRemediationPullRequestBodyWithholdsLineWrappedCredential(t *testing.T) {
+	t.Parallel()
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	finding := &store.Finding{ID: "fnd_wrap", Title: "wrap", Summary: "found " + key[:11] + "\n" + key[11:] + " in config"}
+	body := RemediationPullRequestBody(finding, nil)
+	if strings.Contains(body, key[:11]) || strings.Contains(body, key[11:]) {
+		t.Fatalf("PR body carries wrapped credential fragments:\n%s", body)
+	}
+	if !strings.Contains(body, "content withheld") {
+		t.Fatalf("PR body did not withhold the wrapped-credential section:\n%s", body)
 	}
 }

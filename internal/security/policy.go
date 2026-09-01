@@ -73,8 +73,12 @@ var (
 	// token-part filter below keeps call expressions and other source syntax
 	// out of this YAML-specific fallback.
 	policySensitiveYAMLAssignmentPattern = regexp.MustCompile(`(?im)^[\t ]*(?:-\s*)?(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|priv` + `ate[_-]?key)\s*:\s+([^\r\n]+)$`)
-	policyYAMLPlainScalarPartPattern     = regexp.MustCompile("^[A-Za-z0-9_./+=~:@#$%^&*!?|,;\\\\`-]+$")
-	policyJWTPattern                     = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])ey` + `J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}([^A-Za-z0-9_-]|$)`)
+	// YAML block scalars put their value on following indented lines. Match
+	// the credential-bearing header here; yamlBlockScalarAssignmentsLookLikeSecret
+	// reconstructs all content lines before evaluating the value.
+	policySensitiveYAMLBlockHeaderPattern = regexp.MustCompile(`(?i)^[\t ]*(?:-\s*)?(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|priv` + `ate[_-]?key)\s*:\s*[|>][+-]?[1-9]?[ \t]*(?:#[^\r\n]*)?$`)
+	policyYAMLPlainScalarPartPattern      = regexp.MustCompile("^[A-Za-z0-9_./+=~:@#$%^&*!?|,;\\\\`-]+$")
+	policyJWTPattern                      = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])ey` + `J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}([^A-Za-z0-9_-]|$)`)
 	// Header-carried credentials are flagged only when a credential-shaped
 	// value follows: "Authorization: Bearer $TOKEN" in documentation is not
 	// a secret, "Authorization: Bearer eyJ…" or a 16+ character opaque token
@@ -260,6 +264,42 @@ func yamlPlainScalarAssignmentsLookLikeSecret(text string) bool {
 	return false
 }
 
+func yamlBlockScalarAssignmentsLookLikeSecret(text string) bool {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	for i, line := range lines {
+		if !policySensitiveYAMLBlockHeaderPattern.MatchString(line) {
+			continue
+		}
+		baseIndent := len(line) - len(strings.TrimLeft(line, " \t"))
+		var value strings.Builder
+		for _, contentLine := range lines[i+1:] {
+			if strings.TrimSpace(contentLine) == "" {
+				continue
+			}
+			indent := len(contentLine) - len(strings.TrimLeft(contentLine, " \t"))
+			if indent <= baseIndent {
+				break
+			}
+			value.WriteString(strings.TrimLeft(contentLine, " \t"))
+		}
+		candidate := strings.TrimSpace(value.String())
+		if len(candidate) < 16 || secretValuePlaceholder(candidate) || secretValueIsCode(candidate, candidate, len(candidate)) {
+			continue
+		}
+		credentialShaped := true
+		for part := range strings.FieldsSeq(candidate) {
+			if !policyYAMLPlainScalarPartPattern.MatchString(part) {
+				credentialShaped = false
+				break
+			}
+		}
+		if credentialShaped {
+			return true
+		}
+	}
+	return false
+}
+
 func cookieHeadersLookLikeSecret(text string) bool {
 	for _, match := range policyCookiePattern.FindAllStringSubmatch(text, -1) {
 		parts := strings.Split(match[2], ";")
@@ -309,6 +349,9 @@ func LooksLikeSecret(text string) bool {
 		return true
 	}
 	if sensitiveValueMatch(policySignedURLPattern, text) {
+		return true
+	}
+	if yamlBlockScalarAssignmentsLookLikeSecret(text) {
 		return true
 	}
 	return strings.Contains(strings.ToLower(text), "-----"+"begin ")

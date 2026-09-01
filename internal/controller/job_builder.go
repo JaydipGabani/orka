@@ -2666,25 +2666,28 @@ func (b *JobBuilder) addSkillVolumes(ctx context.Context, job *batchv1.Job, task
 const maxContainerDeliveredPromptBytes = 110 * 1024
 
 func (b *JobBuilder) validateContainerDeliveredPromptSize(ctx context.Context, task *corev1alpha1.Task, agent *corev1alpha1.Agent) error {
-	if task == nil || task.Spec.Type != corev1alpha1.TaskTypeAI {
-		// Only AI Tasks export prompts through the process environment;
-		// a container Task's unused optional prompt fields must not make
-		// an otherwise runnable container fail this guard.
+	if task == nil || (task.Spec.Type != corev1alpha1.TaskTypeAI && task.Spec.Type != corev1alpha1.TaskTypeAgent) {
+		// Only AI and Agent worker Jobs export prompts through the process
+		// environment; a container Task's unused optional prompt fields must
+		// not make an otherwise runnable container fail this guard.
 		return nil
 	}
-	// Mirror resolveAIConfig's precedence exactly: spec.ai.prompt wins over
-	// spec.prompt, and a ConfigMap-backed Agent system prompt is resolved
-	// before export — the guard must measure the values that actually reach
-	// the environment.
+	// Mirror each builder's precedence exactly — resolveAIConfig prefers
+	// spec.ai.prompt over spec.prompt, addAgentEnvVars the reverse — and
+	// resolve a ConfigMap-backed Agent system prompt before measuring: the
+	// guard must see the values that actually reach the environment.
 	prompt := ""
 	if task.Spec.AI != nil {
 		prompt = task.Spec.AI.Prompt
+	}
+	if task.Spec.Type == corev1alpha1.TaskTypeAgent && task.Spec.Prompt != "" {
+		prompt = task.Spec.Prompt
 	}
 	if prompt == "" {
 		prompt = task.Spec.Prompt
 	}
 	systemPrompt := ""
-	if task.Spec.AI != nil {
+	if task.Spec.Type == corev1alpha1.TaskTypeAI && task.Spec.AI != nil {
 		systemPrompt = task.Spec.AI.SystemPrompt
 	}
 	if systemPrompt == "" && agent != nil && agent.Spec.SystemPrompt != nil {

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -93,6 +94,18 @@ func printGenericTable(cmd *cobra.Command, value any) error {
 
 const genericRowTitleLimit = 60
 
+// sanitizeTerminalText strips control and format runes from forge-supplied
+// text before it reaches the terminal: an untrusted issue or PR title must
+// not carry ANSI/OSC escapes into an operator's display.
+func sanitizeTerminalText(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, value)
+}
+
 // genericRowName labels a row by its resource name, falling back to the
 // "#number title" form used by forge-backed records (monitor items,
 // commands, work actions) that carry no name of their own.
@@ -106,7 +119,7 @@ func genericRowName(item map[string]any) string {
 	}
 	if number := firstString(item, "number"); number != "" {
 		label := "#" + number
-		if title := strings.TrimSpace(firstString(item, "title")); title != "" {
+		if title := strings.TrimSpace(sanitizeTerminalText(firstString(item, "title"))); title != "" {
 			if len(title) > genericRowTitleLimit {
 				// Cut on a rune boundary so a multibyte character crossing
 				// the limit cannot become invalid UTF-8 in the table.

@@ -343,7 +343,7 @@ func TestProviderResolver_Resolve(t *testing.T) {
 				ProviderName: "anthropic",
 				Namespace:    ns,
 			},
-			wantErr: "agent \"bound-agent\" is bound to provider \"openai\"",
+			wantErr: "agent \"bound-agent\" is bound to a different provider",
 		},
 		{
 			name:    "no provider configured falls back to the sole ready Provider",

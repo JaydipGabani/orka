@@ -94,7 +94,11 @@ func (r *ProviderResolver) resolveFromExplicit(ctx context.Context, opts Resolve
 
 	if opts.ProviderName != "" {
 		if providerCRD != nil && providerCRD.Name != opts.ProviderName {
-			return nil, "", ProviderResolutionInfo{}, fmt.Errorf("agent %q is bound to provider %q; omit the provider or choose an agent without a providerRef", opts.AgentRef, providerCRD.Name)
+			// The bound Provider's name is withheld: this error can reach a
+			// context token before provider-use authorization runs, and it
+			// must not become an enumeration path around the
+			// authorization-aware Providers API.
+			return nil, "", ProviderResolutionInfo{}, fmt.Errorf("agent %q is bound to a different provider; omit the provider or choose an agent without a providerRef", opts.AgentRef)
 		}
 		if providerCRD == nil {
 			p, err := r.LookupProvider(ctx, opts.ProviderName, opts.Namespace)
