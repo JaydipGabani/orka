@@ -2617,11 +2617,13 @@ func matchingReviewRetryTask(existing, desired *corev1alpha1.Task) bool {
 	// matches and ingestion for the whole scan wedges.
 	// Both sides are normalised: the API server stamps defaults on the stored
 	// Task, while a fake client (tests) stores the spec verbatim. The prompt
-	// stays part of the identity: within one run it is deterministic (the
-	// review context digest and policy digest are verified when the Task is
-	// built and the slice metadata embedded in it is the immutable
-	// projection), and the retry Task name already binds the run ID, so a
-	// retry from another prompt generation is never adopted.
+	// stays part of the identity so a Task-creating principal cannot
+	// substitute its own retry: within one run the prompt is deterministic
+	// (the review context digest and policy digest are verified when the Task
+	// is built and the slice metadata embedded in it is the immutable
+	// projection), and the retry Task name already binds the run ID. A retry
+	// rendered by an older controller build with a different prompt format
+	// therefore conflicts after an upgrade; the operator re-runs the scan.
 	return apiequality.Semantic.DeepEqual(taskSpecWithServerDefaults(existing.Spec), taskSpecWithServerDefaults(desired.Spec))
 }
 
