@@ -75,10 +75,7 @@ func SubmitResult(result []byte) error {
 	var lastErr error
 	for attempt := range maxRetries {
 		if attempt > 0 {
-			backoff := time.Duration(1<<uint(attempt)) * time.Second
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
+			backoff := min(time.Duration(1<<uint(attempt))*time.Second, maxBackoff)
 			retrySleep(backoff)
 		}
 
