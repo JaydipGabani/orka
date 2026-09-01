@@ -952,6 +952,7 @@ func TestProviderProxyIncompleteStreamIsAccountedAsFailure(t *testing.T) {
 	if _, err := io.ReadAll(response.Body); err != nil {
 		t.Fatal(err)
 	}
+	waitProviderProxyIdle(t, session)
 	failure, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
 	if !failure || status != http.StatusBadGateway || detail != "provider stream ended before a terminal success event" {
 		t.Fatalf("incomplete stream accounting = %v/%d/%q, want terminal-marker failure", failure, status, detail)
