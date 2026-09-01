@@ -271,17 +271,22 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 		Model:        req.Model,
 		AgentRef:     req.AgentRef,
 		Namespace:    namespace,
+		AuthorizeProviderReference: func(provider ProviderResolutionInfo) error {
+			return authorizeContextTokenProviderReference(c, ch.contextTokenAuthorization, "chatProviderReference", namespace, provider)
+		},
+		AuthorizeProviderUse: func(provider ProviderResolutionInfo, model string) error {
+			return authorizeContextTokenProviderUse(c, ch.contextTokenAuthorization, "chat", namespace, provider, model)
+		},
 		// Scoped context tokens get no implicit sole-ready fallback: its
 		// control flow would reveal hidden Provider existence pre-authorization.
 		RequireExplicitProvider: requestUsesContextToken(c),
 	})
 	if err != nil {
+		if ferr, ok := err.(*fiber.Error); ok && ferr.Code == fiber.StatusForbidden {
+			return err
+		}
 		chatLog.Error(err, "failed to resolve provider")
 		return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("failed to resolve provider: %v", err))
-	}
-
-	if err := authorizeContextTokenProviderUse(c, ch.contextTokenAuthorization, "chat", namespace, providerInfo, model); err != nil {
-		return err
 	}
 
 	// Wrap provider with retry and fallback
@@ -1227,6 +1232,9 @@ func (ch *ChatHandler) wrapWithRetryAndFallback(ctx context.Context, c fiber.Ctx
 
 	fallbacks := make([]llm.FallbackEntry, 0, len(agent.Spec.Model.Fallbacks))
 	for _, fb := range agent.Spec.Model.Fallbacks {
+		if err := authorizeContextTokenProviderReference(c, ch.contextTokenAuthorization, "chatFallbackProviderReference", namespace, ProviderResolutionInfo{Name: fb.ProviderRef, Namespace: namespace}); err != nil {
+			return resultProvider, err
+		}
 		fbProviderCRD, err := ch.resolver.LookupProvider(ctx, fb.ProviderRef, namespace)
 		if err != nil {
 			continue

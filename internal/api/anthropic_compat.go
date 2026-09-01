@@ -254,21 +254,27 @@ func (h *AnthropicCompatHandler) HandleMessages(c fiber.Ctx) error {
 	}
 
 	provider, model, providerInfo, err := h.resolver.ResolveWithInfo(ctx, ResolveOpts{
-		ModelStr:     req.Model,
-		Namespace:    namespace,
+		ModelStr:  req.Model,
+		Namespace: namespace,
+		AuthorizeProviderReference: func(provider ProviderResolutionInfo) error {
+			return authorizeContextTokenProviderReference(c, h.contextTokenAuthorization, "anthropicMessagesProviderReference", namespace, provider)
+		},
+		AuthorizeProviderUse: func(provider ProviderResolutionInfo, model string) error {
+			return authorizeContextTokenProviderUse(c, h.contextTokenAuthorization, "anthropicMessages", namespace, provider, model)
+		},
 		RequireModel: true,
 		// Scoped context tokens get no implicit sole-ready fallback: its
 		// control flow would reveal hidden Provider existence pre-authorization.
 		RequireExplicitProvider: requestUsesContextToken(c),
 	})
 	if err != nil {
+		if ferr, ok := err.(*fiber.Error); ok && ferr.Code == fiber.StatusForbidden {
+			return anthropicContextTokenAuthorizationError(c, err)
+		}
 		anthropicLog.Error(err, "failed to resolve provider", "model", req.Model)
 		return anthropicError(c, 400, "invalid_request_error", "failed to resolve provider: "+err.Error())
 	}
 
-	if err := authorizeContextTokenProviderUse(c, h.contextTokenAuthorization, "anthropicMessages", namespace, providerInfo, model); err != nil {
-		return anthropicContextTokenAuthorizationError(c, err)
-	}
 	provider = llm.NewTracingProvider(provider)
 
 	messages, err := convertAnthropicMessages(req.Messages)

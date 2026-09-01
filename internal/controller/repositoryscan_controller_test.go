@@ -4168,6 +4168,23 @@ func TestPatchHunkBindingRejectsRelocatedAndPrefixAmbiguousContent(t *testing.T)
 	}
 }
 
+func TestPatchHunkBindingRejectsUnverifiableMetadata(t *testing.T) {
+	t.Parallel()
+	genuine := "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n"
+	for name, metadata := range map[string]string{
+		"mode change": "old mode 100644\nnew mode 100755\n",
+		"rename":      "similarity index 100%\nrename from old.py\nrename to app.py\n",
+		"binary":      "Binary files a/app.py and b/app.py differ\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			artifact := "diff --git a/app.py b/app.py\n" + metadata + "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n"
+			if samePatchHunks(artifact, genuine) {
+				t.Fatalf("patch with %s metadata was accepted without commit evidence", name)
+			}
+		})
+	}
+}
+
 func TestPatchEvidenceRejectsTruncatedAndDuplicateCommitContent(t *testing.T) {
 	t.Parallel()
 	// A nonempty patch whose totals disagree with the reported counts is a

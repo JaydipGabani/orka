@@ -376,6 +376,43 @@ func TestCollectAuthorizedPagesFillsAcrossFilteredPages(t *testing.T) {
 	require.Equal(t, "after-late", next)
 	require.Equal(t, 40, calls)
 
+	// A full authorized page cannot return a cursor bounded by a hidden raw
+	// object. Each raw fetch is capped at the remaining authorized capacity,
+	// so after filtering a hidden boundary leaves the result short and forces
+	// another fetch. The cursor returned when the result fills is therefore
+	// bounded by the authorized object that filled it.
+	type rawItem struct {
+		name    string
+		allowed bool
+	}
+	raw := []rawItem{
+		{name: "allowed-a", allowed: true},
+		{name: "hidden-a"},
+		{name: "hidden-b"},
+		{name: "allowed-b", allowed: true},
+		{name: "hidden-tail"},
+	}
+	offsets := map[string]int{"": 0}
+	items, next, err = collectAuthorizedPages(2, "", func(cursor string, pageLimit int64) ([]string, string, error) {
+		start := offsets[cursor]
+		end := min(start+int(pageLimit), len(raw))
+		page := make([]string, 0, end-start)
+		for _, item := range raw[start:end] {
+			if item.allowed {
+				page = append(page, item.name)
+			}
+		}
+		if end == len(raw) {
+			return page, "", nil
+		}
+		next := "after-" + raw[end-1].name
+		offsets[next] = end
+		return page, next, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"allowed-a", "allowed-b"}, items)
+	require.Equal(t, "after-allowed-b", next)
+
 	// The page budget is the residual bound. It must not expose a raw storage
 	// cursor whose boundary was set by objects hidden from the caller.
 	calls = 0

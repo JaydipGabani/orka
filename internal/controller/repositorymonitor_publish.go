@@ -855,7 +855,18 @@ func sanitizeRepositoryMonitorReviewText(value string, maxRunes int) string {
 	// redact credential shapes before bounding, so a secret an agent found
 	// in the repository never reaches a public comment — and bounding
 	// cannot split a token past the redactor.
-	value = repositoryMonitorReviewContextSanitize(strings.TrimSpace(value))
+	value = strings.TrimSpace(value)
+	// A model can wrap one credential across lines. Check a joined shadow
+	// before preserving the original formatting; if the joined value is
+	// credential-shaped, withhold the field because line-by-line redaction
+	// cannot safely reconstruct which fragments belong to the secret.
+	sanitized := repositoryMonitorReviewContextSanitize(value)
+	joined := strings.NewReplacer("\r", "", "\n", "").Replace(sanitized)
+	if security.LooksLikeSecret(joined) {
+		value = "[REDACTED]"
+	} else {
+		value = sanitized
+	}
 	return neutralizeRepositoryMonitorActiveText(neutralizeRepositoryMonitorMentions(boundedString(value, maxRunes)))
 }
 

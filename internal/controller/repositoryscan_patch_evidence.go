@@ -201,8 +201,10 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 	// paths would pass the set check. Bind the content too — each file's
 	// complete hunk body (headers, positions, context, and every changed
 	// line, however it is prefixed) must be identical to the published
-	// commit's. Only pre-hunk metadata (index/mode/---/+++ header lines),
-	// which legitimately varies between diff generators, is excluded.
+	// commit's. Only index and path headers, which legitimately vary between
+	// diff generators without changing the represented patch, are excluded.
+	// Mode, rename, copy, similarity, and binary metadata is rejected because
+	// the commit-files response does not provide enough data to verify it.
 	// Stored artifacts come in two provenances: the result-contract path
 	// persists the commit diff credential-redacted, while legacy
 	// harness-written artifacts are raw — so the stored diff must match the
@@ -220,7 +222,7 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 
 // patchHunksByFile extracts each file's verbatim hunk body — everything from
 // its first "@@" line to the next file header — from a unified diff.
-var recognizedDiffMetadataPattern = regexp.MustCompile(`^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old|new|new file|deleted file) mode [0-7]{6}|(?:similarity|dissimilarity) index (?:100|[0-9]{1,2})%|(?:rename|copy) (?:from|to) .+|--- .+|\+\+\+ .+|Binary files .+ differ)$`)
+var recognizedDiffMetadataPattern = regexp.MustCompile(`^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|--- .+|\+\+\+ .+)$`)
 
 func patchHunksByFile(diff string) (map[string]string, bool) {
 	hunks := map[string]string{}

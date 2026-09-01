@@ -12,6 +12,7 @@ import { useUIStore } from '@/stores/ui'
 import {
   useTaskList,
   useTaskListAll,
+  maxListWalkPages,
   useTask,
   useTaskResult,
   useCreateTask,
@@ -69,6 +70,24 @@ describe('useTaskListAll', () => {
     const { result } = renderHook(() => useTaskListAll('100', false), { wrapper: createWrapper() })
     await waitFor(() => expect(result.current.isError).toBe(true))
     expect(result.current.error).toEqual(new Error('task list pagination repeated continuation cursor'))
+  })
+
+  it('reports when the bounded list walk stops before the collection ends', async () => {
+    let calls = 0
+    server.use(http.get('/api/v1/tasks', () => {
+      calls += 1
+      return HttpResponse.json({
+        items: [{ metadata: { name: `task-${calls}`, namespace: 'default', uid: `uid-${calls}` }, spec: { type: 'agent' } }],
+        metadata: { continue: `page-${calls}` },
+      })
+    }))
+
+    const { result } = renderHook(() => useTaskListAll('100', false), { wrapper: createWrapper() })
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(calls).toBe(maxListWalkPages)
+    expect(result.current.data?.items).toHaveLength(maxListWalkPages)
+    expect(result.current.data?.truncated).toBe(true)
+    expect(result.current.data?.metadata.continue).toBe(`page-${maxListWalkPages}`)
   })
 })
 

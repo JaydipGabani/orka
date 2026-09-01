@@ -136,7 +136,9 @@ const maxAuthorizedListPages = 200
 // is spent, and returns the items with the continuation cursor of the last
 // page read. Each fetch is asked for only the remaining authorized capacity,
 // so a response never exceeds the requested page size and no item is trimmed
-// past its cursor.
+// past its cursor. Kubernetes Limit is a maximum raw item count, so filling
+// the remaining authorized capacity also proves every raw item in the final
+// page was authorized; its cursor cannot be bounded by a hidden object.
 func collectAuthorizedPages[T any](limit int64, start string, fetch func(continueToken string, pageLimit int64) ([]T, string, error)) ([]T, string, error) {
 	if limit <= 0 {
 		// An unlimited request is served as one complete page.

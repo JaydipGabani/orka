@@ -45,6 +45,13 @@ type ResolveOpts struct {
 	// provider-use authorization runs. Every no-provider outcome must be
 	// indistinguishable for those callers.
 	RequireExplicitProvider bool
+	// AuthorizeProviderReference runs before an explicitly named Provider is
+	// looked up. This keeps missing and unauthorized Provider names
+	// indistinguishable to scoped callers.
+	AuthorizeProviderReference func(ProviderResolutionInfo) error
+	// AuthorizeProviderUse runs after the effective model is known but before
+	// the Provider credential is read.
+	AuthorizeProviderUse func(ProviderResolutionInfo, string) error
 }
 
 // ProviderResolutionInfo contains the Provider CRD metadata selected for a request.
@@ -84,6 +91,7 @@ func (r *ProviderResolver) ResolveWithInfo(ctx context.Context, opts ResolveOpts
 func (r *ProviderResolver) resolveFromExplicit(ctx context.Context, opts ResolveOpts) (llm.Provider, string, ProviderResolutionInfo, error) {
 	var model string
 	var providerCRD *corev1alpha1.Provider
+	var providerName string
 
 	if opts.AgentRef != "" {
 		agent := &corev1alpha1.Agent{}
@@ -94,29 +102,30 @@ func (r *ProviderResolver) resolveFromExplicit(ctx context.Context, opts Resolve
 			model = agent.Spec.Model.Name
 		}
 		if agent.Spec.ProviderRef != nil {
-			p, err := r.LookupProvider(ctx, agent.Spec.ProviderRef.Name, opts.Namespace)
-			if err != nil {
-				return nil, "", ProviderResolutionInfo{}, err
-			}
-			providerCRD = p
+			providerName = agent.Spec.ProviderRef.Name
 		}
 	}
 
 	if opts.ProviderName != "" {
-		if providerCRD != nil && providerCRD.Name != opts.ProviderName {
+		if providerName != "" && providerName != opts.ProviderName {
 			// The bound Provider's name is withheld: this error can reach a
 			// context token before provider-use authorization runs, and it
 			// must not become an enumeration path around the
 			// authorization-aware Providers API.
 			return nil, "", ProviderResolutionInfo{}, fmt.Errorf("agent %q is bound to a different provider; omit the provider or choose an agent without a providerRef", opts.AgentRef)
 		}
-		if providerCRD == nil {
-			p, err := r.LookupProvider(ctx, opts.ProviderName, opts.Namespace)
-			if err != nil {
-				return nil, "", ProviderResolutionInfo{}, err
-			}
-			providerCRD = p
+		providerName = opts.ProviderName
+	}
+
+	if providerName != "" {
+		if err := authorizeProviderReference(opts, providerName); err != nil {
+			return nil, "", ProviderResolutionInfo{}, err
 		}
+		p, err := r.LookupProvider(ctx, providerName, opts.Namespace)
+		if err != nil {
+			return nil, "", ProviderResolutionInfo{}, err
+		}
+		providerCRD = p
 	}
 
 	if providerCRD == nil && r.config.Provider != "" {
@@ -142,11 +151,6 @@ func (r *ProviderResolver) resolveFromExplicit(ctx context.Context, opts Resolve
 		providerCRD = p
 	}
 
-	apiKey, err := r.ResolveAPIKey(ctx, providerCRD)
-	if err != nil {
-		return nil, "", ProviderResolutionInfo{}, err
-	}
-
 	// Model resolution priority: opts.Model > agent model > provider default > config model
 	if opts.Model != "" {
 		model = opts.Model
@@ -157,13 +161,22 @@ func (r *ProviderResolver) resolveFromExplicit(ctx context.Context, opts Resolve
 	if model == "" {
 		model = r.config.Model
 	}
+	providerInfo := providerResolutionInfo(providerCRD)
+	if err := authorizeProviderUse(opts, providerInfo, model); err != nil {
+		return nil, "", ProviderResolutionInfo{}, err
+	}
+
+	apiKey, err := r.ResolveAPIKey(ctx, providerCRD)
+	if err != nil {
+		return nil, "", ProviderResolutionInfo{}, err
+	}
 
 	provider, resolvedModel, err := r.buildProvider(providerCRD, apiKey, model)
 	if err != nil {
 		return nil, "", ProviderResolutionInfo{}, err
 	}
 
-	return provider, resolvedModel, providerResolutionInfo(providerCRD), nil
+	return provider, resolvedModel, providerInfo, nil
 }
 
 // resolveFromModelStr handles the compat handler path with "provider/model"
@@ -182,6 +195,9 @@ func (r *ProviderResolver) resolveFromModelStr(ctx context.Context, opts Resolve
 	var providerCRD *corev1alpha1.Provider
 
 	if providerName != "" {
+		if err := authorizeProviderReference(opts, providerName); err != nil {
+			return nil, "", ProviderResolutionInfo{}, err
+		}
 		p, err := r.LookupProvider(ctx, providerName, opts.Namespace)
 		if err != nil {
 			return nil, "", ProviderResolutionInfo{}, err
@@ -210,11 +226,6 @@ func (r *ProviderResolver) resolveFromModelStr(ctx context.Context, opts Resolve
 		providerCRD = fallback
 	}
 
-	apiKey, err := r.ResolveAPIKey(ctx, providerCRD)
-	if err != nil {
-		return nil, "", ProviderResolutionInfo{}, err
-	}
-
 	if model == "" {
 		model = providerCRD.Spec.DefaultModel
 	}
@@ -224,13 +235,36 @@ func (r *ProviderResolver) resolveFromModelStr(ctx context.Context, opts Resolve
 	if opts.RequireModel && model == "" {
 		return nil, "", ProviderResolutionInfo{}, fmt.Errorf("no model specified and no default model configured")
 	}
+	providerInfo := providerResolutionInfo(providerCRD)
+	if err := authorizeProviderUse(opts, providerInfo, model); err != nil {
+		return nil, "", ProviderResolutionInfo{}, err
+	}
+
+	apiKey, err := r.ResolveAPIKey(ctx, providerCRD)
+	if err != nil {
+		return nil, "", ProviderResolutionInfo{}, err
+	}
 
 	provider, resolvedModel, err := r.buildProvider(providerCRD, apiKey, model)
 	if err != nil {
 		return nil, "", ProviderResolutionInfo{}, err
 	}
 
-	return provider, resolvedModel, providerResolutionInfo(providerCRD), nil
+	return provider, resolvedModel, providerInfo, nil
+}
+
+func authorizeProviderReference(opts ResolveOpts, providerName string) error {
+	if opts.AuthorizeProviderReference == nil {
+		return nil
+	}
+	return opts.AuthorizeProviderReference(ProviderResolutionInfo{Name: providerName, Namespace: opts.Namespace})
+}
+
+func authorizeProviderUse(opts ResolveOpts, provider ProviderResolutionInfo, model string) error {
+	if opts.AuthorizeProviderUse == nil {
+		return nil
+	}
+	return opts.AuthorizeProviderUse(provider, model)
 }
 
 // providerResolutionInfo extracts stable metadata from a Provider CRD.

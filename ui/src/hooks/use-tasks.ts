@@ -26,8 +26,8 @@ export function useTaskList(limit = '25', refetchInterval: number | false = 1000
 // maxListWalkPages bounds every full-list walk: terminal objects accumulate
 // without limit, and an unbounded walk on a polling interval would grow into
 // an ever-larger request burst against the API server (and browser memory).
-// Views built on these walks are summaries; beyond the cap they see the most
-// recent pages rather than complete history.
+// Views built on these walks are summaries. Beyond the cap they receive a
+// partial resource-key-ordered sample and must surface that truncation.
 export const maxListWalkPages = 20
 
 export function useTaskListAll(pageLimit = '100', refetchInterval: number | false = 10000) {
@@ -50,7 +50,7 @@ export function useTaskListAll(pageLimit = '100', refetchInterval: number | fals
         continueToken = next
         pages += 1
       } while (continueToken && pages < maxListWalkPages)
-      return { items, metadata }
+      return { items, metadata, truncated: Boolean(continueToken) }
     },
     refetchInterval,
   })

@@ -6808,6 +6808,14 @@ func TestRepositoryMonitorIssueStatusCommentNeutralizesActiveText(t *testing.T) 
 	}
 }
 
+func TestRepositoryMonitorReviewTextWithholdsWrappedCredentials(t *testing.T) {
+	credential := "sk-proj-abc\ndefghijklmnopqrstuvwxyz0123456789"
+	got := sanitizeRepositoryMonitorReviewText("Do not publish "+credential, repositoryMonitorReviewTextMaxRunes)
+	if got != "[REDACTED]" {
+		t.Fatalf("sanitizeRepositoryMonitorReviewText() = %q, want wrapped credential withheld", got)
+	}
+}
+
 func TestRepositoryMonitorIssueCommandBlocksInvalidPhaseTransition(t *testing.T) {
 	ctx := context.Background()
 	monitorStore := setupControllerSQLiteStore(t)

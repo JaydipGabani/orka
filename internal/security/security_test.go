@@ -610,6 +610,11 @@ func TestLooksLikeSecretIgnoresPlaceholdersAndBareKeywords(t *testing.T) {
 		"PASSWORD=short;correct-horse-battery-staple",
 		`PASSWORD=short\correct-horse-battery-staple`,
 		"password: >-\n  correct-horse-battery-staple",
+		`"password": >-
+  correct-horse-battery-staple`,
+		`'client_secret': |
+  correct-horse-battery-staple`,
+		`"password": correct horse battery staple`,
 		"password: |\n  correct-horse-\n  battery-staple",
 		"password: >-\n  correct horse battery staple",
 		"api_key: |\n    " + strings.Repeat("0a1b2c3d", 3),

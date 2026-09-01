@@ -8,6 +8,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,10 +16,27 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 )
+
+type providerReadTrackingClient struct {
+	client.Client
+	providerReads int
+	secretReads   int
+}
+
+func (c *providerReadTrackingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	switch obj.(type) {
+	case *corev1alpha1.Provider:
+		c.providerReads++
+	case *corev1.Secret:
+		c.secretReads++
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
 
 // helpers
 
@@ -130,6 +148,57 @@ func TestProviderResolver_ResolveAPIKey(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), `has no key "api-key"`)
 	})
+}
+
+func TestProviderResolverRejectsDisallowedExplicitNamesBeforeLookup(t *testing.T) {
+	denied := errors.New("provider reference denied")
+	provider := makeProvider("hidden", "default", corev1alpha1.ProviderTypeOpenAI, "hidden-secret", "gpt-4o")
+	secret := makeSecret("hidden-secret", "default", "api-key", "test-key")
+
+	for _, tc := range []struct {
+		name    string
+		objects []runtime.Object
+	}{
+		{name: "existing provider", objects: []runtime.Object{provider, secret}},
+		{name: "missing provider"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(tc.objects...).Build()
+			tracked := &providerReadTrackingClient{Client: base}
+			resolver := NewProviderResolver(tracked, DefaultChatConfig())
+
+			_, _, err := resolver.Resolve(context.Background(), ResolveOpts{
+				ModelStr:  "hidden/gpt-4o",
+				Namespace: "default",
+				AuthorizeProviderReference: func(ProviderResolutionInfo) error {
+					return denied
+				},
+			})
+			require.ErrorIs(t, err, denied)
+			require.Zero(t, tracked.providerReads)
+			require.Zero(t, tracked.secretReads)
+		})
+	}
+}
+
+func TestProviderResolverAuthorizesUseBeforeReadingCredential(t *testing.T) {
+	denied := errors.New("provider use denied")
+	provider := makeProvider("hidden", "default", corev1alpha1.ProviderTypeOpenAI, "hidden-secret", "gpt-4o")
+	secret := makeSecret("hidden-secret", "default", "api-key", "test-key")
+	base := fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(provider, secret).Build()
+	tracked := &providerReadTrackingClient{Client: base}
+	resolver := NewProviderResolver(tracked, DefaultChatConfig())
+
+	_, _, err := resolver.Resolve(context.Background(), ResolveOpts{
+		ModelStr:  "hidden/gpt-4o",
+		Namespace: "default",
+		AuthorizeProviderUse: func(ProviderResolutionInfo, string) error {
+			return denied
+		},
+	})
+	require.ErrorIs(t, err, denied)
+	require.Equal(t, 1, tracked.providerReads)
+	require.Zero(t, tracked.secretReads)
 }
 
 func TestProviderResolver_Resolve(t *testing.T) {
