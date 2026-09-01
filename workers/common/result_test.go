@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/orka-agents/orka/internal/workerenv"
 )
@@ -122,6 +123,10 @@ func TestSubmitResult_RetryOnFailure(t *testing.T) {
 }
 
 func TestSubmitResult_AllRetriesFail(t *testing.T) {
+	var slept []time.Duration
+	retrySleep = func(d time.Duration) { slept = append(slept, d) }
+	t.Cleanup(func() { retrySleep = time.Sleep })
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte("always fails")) //nolint:errcheck
@@ -129,6 +134,20 @@ func TestSubmitResult_AllRetriesFail(t *testing.T) {
 	defer srv.Close()
 
 	t.Setenv("ORKA_RESULT_ENDPOINT", srv.URL)
+	defer func() {
+		// The backoff schedule must outlast a routine controller restart:
+		// exponential up to the 60s cap, ~4 minutes in total.
+		var total time.Duration
+		for _, d := range slept {
+			if d > maxBackoff {
+				t.Fatalf("backoff %v exceeds cap %v", d, maxBackoff)
+			}
+			total += d
+		}
+		if total < 3*time.Minute {
+			t.Fatalf("total backoff %v is shorter than a controller restart window", total)
+		}
+	}()
 
 	err := SubmitResult([]byte("failing result"))
 	if err == nil {

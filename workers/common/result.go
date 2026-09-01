@@ -38,6 +38,10 @@ const (
 
 var resultStdoutMarkerPath = agentSandboxResultMarkerExecPath
 
+// retrySleep is stubbed by tests so retry-exhaustion cases do not spend the
+// full multi-minute backoff window.
+var retrySleep = time.Sleep
+
 // SubmitResult sends the task result to the controller via HTTP POST.
 // It reads ORKA_RESULT_ENDPOINT or constructs the URL from ORKA_CONTROLLER_URL.
 // Retries with exponential backoff capped at maxBackoff (2s, 4s, 8s, 16s,
@@ -75,7 +79,7 @@ func SubmitResult(result []byte) error {
 			if backoff > maxBackoff {
 				backoff = maxBackoff
 			}
-			time.Sleep(backoff)
+			retrySleep(backoff)
 		}
 
 		lastErr = doPost(endpoint, result, saToken)
