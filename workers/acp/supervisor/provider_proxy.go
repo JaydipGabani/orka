@@ -828,6 +828,22 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// deliveredSSEWriter scans only the prefix accepted by the downstream
+// client. A ResponseWriter may return both n > 0 and an error, so
+// io.MultiWriter cannot preserve this delivery boundary.
+type deliveredSSEWriter struct {
+	w       io.Writer
+	scanner *sseTerminalErrorScanner
+}
+
+func (w *deliveredSSEWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if n > 0 {
+		_, _ = w.scanner.Write(p[:n])
+	}
+	return n, err
+}
+
 // prefixCapture retains the first limit bytes written through it so an
 // upstream error body can be relayed to the ACP child as it arrives while a
 // bounded prefix is kept for the failure detail.
@@ -1069,7 +1085,9 @@ func (p *providerProxy) relayUpstreamResponse(
 	var streamScanner *sseTerminalErrorScanner
 	if !upstreamFailed && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
 		streamScanner = &sseTerminalErrorScanner{}
-		body = io.TeeReader(body, streamScanner)
+		// The scanner attaches on the WRITE side below, so it sees only
+		// bytes the child actually received. A marker read upstream but
+		// never delivered must not count as delivered.
 	}
 	providerproxy.CopyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
@@ -1077,7 +1095,11 @@ func (p *providerProxy) relayUpstreamResponse(
 	// flowing to the ACP child without buffering delays.
 	flusher, _ := w.(http.Flusher)
 	relayed := &countingWriter{w: w}
-	err := providerproxy.StreamBoundedResponse(relayed, body, p.maxResponseBytes, flusher)
+	var destination io.Writer = relayed
+	if streamScanner != nil {
+		destination = &deliveredSSEWriter{w: relayed, scanner: streamScanner}
+	}
+	err := providerproxy.StreamBoundedResponse(destination, body, p.maxResponseBytes, flusher)
 	streamFailed := func() bool {
 		if streamScanner == nil {
 			return false
@@ -1102,17 +1124,20 @@ func (p *providerProxy) relayUpstreamResponse(
 				// A child disconnect is not upstream evidence by itself. A
 				// partially delivered SSE response still needs a terminal
 				// marker, while a zero-byte relay remains unaccounted and a
-				// partially delivered non-SSE response keeps its existing
-				// success behavior.
+				// partially delivered non-SSE response stays unaccounted.
 				if streamFailed() {
 					recordStreamFailure()
-				} else if relayed.n > 0 {
-					if streamScanner != nil && !streamScanner.completed {
+				} else if relayed.n > 0 && streamScanner != nil {
+					if !streamScanner.completed {
 						recordIncompleteStream()
 					} else {
 						session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
 					}
 				}
+				// A partially delivered non-SSE body is left unaccounted:
+				// it proves nothing about the inference outcome, and an
+				// unaccounted request can neither mask an earlier failure
+				// nor certify success.
 			} else {
 				// A 2xx whose body overran the response limit or broke
 				// mid-stream on the upstream side never delivered a usable

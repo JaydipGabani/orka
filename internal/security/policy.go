@@ -85,6 +85,9 @@ var (
 	// is. The value alphabet is the RFC 6750 token68 grammar, which includes
 	// "~".
 	policyBearerHeaderPattern = regexp.MustCompile(`(?i)auth` + `orization\s*:\s*be` + `arer\s+([A-Za-z0-9_./+=~:-]{16,})`)
+	// Basic credentials are base64(user:password); the same length floor and
+	// placeholder exemptions apply.
+	policyBasicHeaderPattern = regexp.MustCompile(`(?i)auth` + `orization\s*:\s*ba` + `sic\s+([A-Za-z0-9+/=_-]{16,})`)
 	// Signed-URL query credentials (S3/GCS presigned URLs, SAS tokens) use
 	// the same parameter set internal/redact scrubs; a published URL with a
 	// live signature grants access just like a bearer token.
@@ -198,6 +201,12 @@ func hasCompleteCallSuffix(text string, start int) bool {
 }
 
 func secretValueIsCode(text string, value string, end int) bool {
+	// Code-reference exemptions apply only to source-code assignments ('=').
+	// In a credential-keyed YAML/config scalar (':'), a dotted identifier or
+	// call-shaped value is still an attacker-controlled literal.
+	if assignmentSeparatorBefore(text, end-len(value)) != '=' {
+		return false
+	}
 	if callableReferenceShape(value) && hasCompleteCallSuffix(text, end) {
 		return true
 	}
@@ -206,6 +215,22 @@ func secretValueIsCode(text string, value string, end int) bool {
 	}
 	tail := value[strings.LastIndexByte(value, '.')+1:]
 	return codeReferenceCredentialTail.MatchString(tail)
+}
+
+// assignmentSeparatorBefore finds the ':' or '=' that introduced the value
+// starting at start, skipping spaces and an optional opening quote.
+func assignmentSeparatorBefore(text string, start int) byte {
+	for i := start - 1; i >= 0; i-- {
+		switch text[i] {
+		case ' ', '\t', '"', '\'':
+			continue
+		case ':', '=':
+			return text[i]
+		default:
+			return 0
+		}
+	}
+	return 0
 }
 
 func sensitiveValueMatch(pattern *regexp.Regexp, text string) bool {
@@ -342,7 +367,7 @@ func LooksLikeSecret(text string) bool {
 	if policyJWTPattern.MatchString(text) {
 		return true
 	}
-	if sensitiveValueMatch(policyBearerHeaderPattern, text) || sensitiveValueMatch(policyTxnTokenPattern, text) {
+	if sensitiveValueMatch(policyBearerHeaderPattern, text) || sensitiveValueMatch(policyBasicHeaderPattern, text) || sensitiveValueMatch(policyTxnTokenPattern, text) {
 		return true
 	}
 	if cookieHeadersLookLikeSecret(text) {

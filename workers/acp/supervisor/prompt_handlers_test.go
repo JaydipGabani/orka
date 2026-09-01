@@ -1356,8 +1356,9 @@ func TestWorkspaceDeltaPathAllowedRecursiveGlobs(t *testing.T) {
 }
 
 func TestWorkspaceDeltaRejectsSessionCredentials(t *testing.T) {
+	providerCredential := []byte("provider-session-secret")
 	state := &sessionState{
-		providerProxy: &providerProxySession{credential: []byte("provider-session-secret")},
+		providerProxy: &providerProxySession{credential: providerCredential},
 		mcpProxy:      &mcpProxySession{credential: []byte("mcp-session-secret")},
 	}
 	if !workspaceDeltaContainsSessionCredential([]byte("prefix provider-session-secret suffix"), state) {
@@ -1368,6 +1369,13 @@ func TestWorkspaceDeltaRejectsSessionCredentials(t *testing.T) {
 	}
 	if workspaceDeltaContainsSessionCredential([]byte("safe workspace content"), state) {
 		t.Fatal("safe artifact was rejected")
+	}
+	artifact := tarBytes(t, tarEntry{
+		name: "files/dir/" + string(providerCredential) + ".bin",
+		body: []byte{'a', 0, 'b'},
+	})
+	if !workspaceDeltaContainsSessionCredential(artifact, state) {
+		t.Fatal("provider credential in a binary file path was not detected")
 	}
 }
 

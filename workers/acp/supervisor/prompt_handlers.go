@@ -1770,6 +1770,13 @@ func (s *Server) handleWorkspaceDelta(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta path looks secret-like", nil, false)
 		return
 	}
+	// Check exact prompt-scoped credentials before content policy builds a
+	// diagnostic containing an agent-controlled file path.
+	if workspaceDeltaContainsSessionCredential(result.Artifact, state) {
+		s.poisonSession(state, "workspace delta contains a session credential")
+		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta contains a session credential", nil, false)
+		return
+	}
 	if violation, policyErr := workspaceDeltaContentPolicyViolationContext(r.Context(), result.Artifact, request.Limits); policyErr != nil {
 		s.poisonSession(state, "workspace delta content policy could not be verified")
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta content policy could not be verified", nil, false)
@@ -1777,11 +1784,6 @@ func (s *Server) handleWorkspaceDelta(w http.ResponseWriter, r *http.Request) {
 	} else if violation != "" {
 		s.poisonSession(state, violation)
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, violation, nil, false)
-		return
-	}
-	if workspaceDeltaContainsSessionCredential(result.Artifact, state) {
-		s.poisonSession(state, "workspace delta contains a session credential")
-		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta contains a session credential", nil, false)
 		return
 	}
 	if entryCount > int(request.Limits.MaxEntries) || int64(len(result.Artifact)) > request.Limits.MaxBytes {

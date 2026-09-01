@@ -1296,6 +1296,22 @@ func (w *zeroByteDisconnectedWriter) Write([]byte) (int, error) {
 	return 0, errors.New("write: broken pipe")
 }
 
+// prefixDisconnectedWriter accepts a fixed prefix from one response write,
+// then reports the child disconnect. This exercises Writer's valid n > 0,
+// err != nil result without claiming the unwritten suffix was delivered.
+type prefixDisconnectedWriter struct {
+	header http.Header
+	limit  int
+}
+
+func (w *prefixDisconnectedWriter) Header() http.Header { return w.header }
+func (w *prefixDisconnectedWriter) WriteHeader(int)     {}
+func (w *prefixDisconnectedWriter) Write(p []byte) (int, error) {
+	n := min(w.limit, len(p))
+	w.limit -= n
+	return n, errors.New("write: broken pipe")
+}
+
 func TestProviderProxyChildAbandonBeforeAnyByteIsUnaccounted(t *testing.T) {
 	proxy, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
 		UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
@@ -1363,7 +1379,74 @@ func TestProviderProxyChildDisconnectOnIncompleteStreamCountsAsFailure(t *testin
 	}
 }
 
-func TestProviderProxyChildDisconnectOnNonStreamedResponseCountsAsSuccess(t *testing.T) {
+func TestProviderProxyChildDisconnectAccountsOnlyDeliveredStreamBytes(t *testing.T) {
+	tests := []struct {
+		name          string
+		delivered     string
+		undelivered   string
+		wantFailure   bool
+		wantSuccesses int32
+		wantFailures  int32
+	}{
+		{
+			name:          "terminal marker is not delivered",
+			delivered:     "data: {\"type\":\"response.created\"}\n\n",
+			undelivered:   "event: response.completed\n\n",
+			wantFailure:   true,
+			wantSuccesses: 0,
+			wantFailures:  2,
+		},
+		{
+			name:          "terminal marker is delivered before disconnect",
+			delivered:     "event: response.completed\n\n",
+			undelivered:   "data: trailing\n\n",
+			wantFailure:   false,
+			wantSuccesses: 1,
+			wantFailures:  1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
+				UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
+			})
+			defer session.close()
+			session.recordInferenceResponse(testPromptOneID, providerRequestInference, http.StatusTooManyRequests, "rate limit exceeded")
+			seq := testAllocateInferenceSeq(session)
+			if err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			response := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(tt.delivered + tt.undelivered)),
+			}
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != http.ErrAbortHandler {
+						t.Fatalf("relay panic = %v, want http.ErrAbortHandler", recovered)
+					}
+				}()
+				proxy.relayUpstreamResponse(context.Background(), &prefixDisconnectedWriter{
+					header: http.Header{},
+					limit:  len(tt.delivered),
+				}, session, testPromptOneID, providerRequestInference, seq, response)
+			}()
+			failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
+			if failed != tt.wantFailure {
+				t.Fatalf("upstreamFailureUnrecovered = %v/%d/%q, want failed=%v", failed, status, detail, tt.wantFailure)
+			}
+			if tt.wantFailure && (status != http.StatusBadGateway || detail != "provider stream ended before a terminal success event") {
+				t.Fatalf("stream failure = %d/%q, want incomplete-stream failure", status, detail)
+			}
+			if successes, failures := session.inferenceSuccesses, session.inferenceFailures; successes != tt.wantSuccesses || failures != tt.wantFailures {
+				t.Fatalf("inference accounting = %d successes / %d failures, want %d/%d", successes, failures, tt.wantSuccesses, tt.wantFailures)
+			}
+		})
+	}
+}
+
+func TestProviderProxyChildDisconnectOnNonStreamedResponseStaysUnaccounted(t *testing.T) {
 	proxy, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
 		UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
 	})
@@ -1387,11 +1470,14 @@ func TestProviderProxyChildDisconnectOnNonStreamedResponseCountsAsSuccess(t *tes
 		}
 		proxy.relayUpstreamResponse(context.Background(), &childDisconnectedWriter{header: http.Header{}}, session, testPromptOneID, providerRequestInference, seq, response)
 	}()
-	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); failed || status != 0 || detail != "" {
-		t.Fatalf("upstreamFailureUnrecovered after child disconnect on non-streamed 2xx = %v/%d/%q, want the earlier failure recovered", failed, status, detail)
+	// A partially delivered JSON body proves nothing about the inference:
+	// it must stay unaccounted, leaving the earlier recorded failure as the
+	// unrecovered final outcome instead of masking it as a success.
+	if failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID); !failed || status != http.StatusTooManyRequests || !strings.Contains(detail, "rate limit") {
+		t.Fatalf("upstreamFailureUnrecovered after child disconnect on partial non-streamed 2xx = %v/%d/%q, want the earlier 429 unrecovered", failed, status, detail)
 	}
-	if successes, failures := session.inferenceSuccesses, session.inferenceFailures; successes != 1 || failures != 1 {
-		t.Fatalf("inference accounting = %d successes / %d failures, want 1/1", successes, failures)
+	if successes, failures := session.inferenceSuccesses, session.inferenceFailures; successes != 0 || failures != 1 {
+		t.Fatalf("inference accounting = %d successes / %d failures, want 0/1 (partial delivery unaccounted)", successes, failures)
 	}
 }
 
