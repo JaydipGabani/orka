@@ -1406,6 +1406,34 @@ func TestWorkspaceDeltaRepositoryControlAndContentPolicies(t *testing.T) {
 	}
 }
 
+func TestWorkspaceDeltaSecretPolicyExemptsBaselineFlaggedFiles(t *testing.T) {
+	secretLike := []byte("password = 'SuperSecretPassword-0123456789'")
+	limits := harnessv2.WorkspaceDeltaLimits{MaxBytes: 1 << 20, RejectSecretLikeContent: true}
+
+	// A file that already carried secret-like content in the trusted
+	// pre-prompt baseline stays publishable.
+	artifact := tarBytes(t, tarEntry{name: "files/mongoose-db.js", body: secretLike})
+	baselineFlagged := func(path string) bool { return path == "mongoose-db.js" }
+	violation, err := workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits, baselineFlagged)
+	if err != nil || violation != "" {
+		t.Fatalf("baseline-flagged file was rejected: %q, %v", violation, err)
+	}
+
+	// A newly secret-like file is still rejected.
+	artifact = tarBytes(t, tarEntry{name: "files/new-config.js", body: secretLike})
+	violation, err = workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits, baselineFlagged)
+	if err != nil || !strings.Contains(violation, "new-config.js") {
+		t.Fatalf("newly secret-like file was not rejected: %q, %v", violation, err)
+	}
+
+	// The symlink manifest is never exempt, whatever the lookup reports.
+	artifact = tarBytes(t, tarEntry{name: "meta/symlinks.json", body: []byte(`{"symlinks":[{"path":"link","target":"api_key=0123456789abcdef"}]}`)})
+	violation, err = workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits, func(string) bool { return true })
+	if err != nil || !strings.Contains(violation, "secret-like") {
+		t.Fatalf("symlink manifest exemption leaked: %q, %v", violation, err)
+	}
+}
+
 func TestProviderUpstreamFailureTerminalEventRedactsCredentials(t *testing.T) {
 	fixture := newUpstreamFailureFixture(t)
 	fixture.recordInference(t, http.StatusBadRequest, providerUpstreamErrorDetail([]byte(credentialShapedUpstreamErrorBody)))

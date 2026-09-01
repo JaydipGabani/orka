@@ -467,3 +467,45 @@ func readTestArchive(t *testing.T, artifact []byte) (map[string]archivedEntry, [
 	}
 	return entries, order
 }
+
+func TestCaptureContentFlaggerMarksBaselinePaths(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "flagged.js"), []byte("secret marker content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nested", "plain.js"), []byte("ordinary content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := Capture(root, Options{ContentFlagger: func(content []byte) bool {
+		return bytes.Contains(content, []byte("secret marker"))
+	}})
+	if err != nil {
+		t.Fatalf("Capture() error = %v", err)
+	}
+	if !snapshot.BaselineContentFlagged("flagged.js") {
+		t.Fatal("flagged.js was not marked")
+	}
+	if snapshot.BaselineContentFlagged("nested/plain.js") {
+		t.Fatal("nested/plain.js was wrongly marked")
+	}
+	if snapshot.BaselineContentFlagged("absent.js") {
+		t.Fatal("unknown path reported flagged")
+	}
+	var nilSnapshot *Snapshot
+	if nilSnapshot.BaselineContentFlagged("flagged.js") {
+		t.Fatal("nil snapshot reported flagged")
+	}
+
+	// Without a flagger nothing is marked.
+	snapshot, err = Capture(root, Options{})
+	if err != nil {
+		t.Fatalf("Capture() error = %v", err)
+	}
+	if snapshot.BaselineContentFlagged("flagged.js") {
+		t.Fatal("flagger-less capture marked a path")
+	}
+}

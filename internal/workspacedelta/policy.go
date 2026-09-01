@@ -70,14 +70,22 @@ type Options struct {
 	Limits                  Limits
 	AdditionalExcludedNames []string
 	AdditionalReservedNames []string
+	// ContentFlagger, when set, is evaluated against each regular file's
+	// content during Capture. Flagged paths are queryable through
+	// Snapshot.BaselineContentFlagged, letting callers distinguish content
+	// that was already present in the trusted pre-prompt baseline from
+	// content introduced afterwards. It never alters the manifest or the
+	// options digest.
+	ContentFlagger func(content []byte) bool
 }
 
 type normalizedOptions struct {
-	limits        Limits
-	excludedNames []string
-	reservedNames []string
-	excludedSet   map[string]struct{}
-	reservedSet   map[string]struct{}
+	limits         Limits
+	excludedNames  []string
+	reservedNames  []string
+	excludedSet    map[string]struct{}
+	reservedSet    map[string]struct{}
+	contentFlagger func(content []byte) bool
 }
 
 // DefaultLimits returns the package's bounded first-release defaults.
@@ -120,6 +128,7 @@ func normalizeOptions(options Options) (normalizedOptions, error) {
 	return normalizedOptions{
 		limits: limits, excludedNames: excluded, reservedNames: reserved,
 		excludedSet: excludedSet, reservedSet: reservedSet,
+		contentFlagger: options.ContentFlagger,
 	}, nil
 }
 
