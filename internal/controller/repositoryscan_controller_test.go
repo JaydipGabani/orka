@@ -4373,6 +4373,30 @@ func TestFindingIdentityMatchScoreRejectsConflictingPrimarySymbolsWithSharedSupp
 	}
 }
 
+func TestFindingIdentityMatchScoreRejectsDistinctPrimaryLocationsWithSharedSupport(t *testing.T) {
+	left := &storepkg.Finding{
+		Category: "path traversal",
+		FilePath: "archive.go",
+		Line:     100,
+		Evidence: []storepkg.FindingEvidenceRef{
+			{Path: "archive.go", StartLine: 100, EndLine: 108, Symbol: "extractArchive"},
+			{Path: "archive.go", StartLine: 250, EndLine: 255, Symbol: "sanitizePath"},
+		},
+	}
+	right := &storepkg.Finding{
+		Category: "CWE-22 path traversal",
+		FilePath: "archive.go",
+		Line:     180,
+		Evidence: []storepkg.FindingEvidenceRef{
+			{Path: "archive.go", StartLine: 180, EndLine: 188, Symbol: "extractArchive"},
+			{Path: "archive.go", StartLine: 250, EndLine: 255, Symbol: "sanitizePath"},
+		},
+	}
+	if score := findingIdentityMatchScore(left, right); score != 0 {
+		t.Fatalf("findingIdentityMatchScore() = %d, want distinct primary locations rejected", score)
+	}
+}
+
 func TestMergeFindingValidationStateRanksFailedAboveSkipped(t *testing.T) {
 	failed := &storepkg.Finding{ID: "finding", ValidationStatus: findingValidationStatusFailed, ValidationJSON: `{"status":"failed"}`}
 	skipped := &storepkg.Finding{ID: "finding", ValidationStatus: findingValidationStatusSkipped, ValidationJSON: `{"status":"skipped"}`}

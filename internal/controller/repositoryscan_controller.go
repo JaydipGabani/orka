@@ -2334,7 +2334,7 @@ func findingIdentityMatchScore(left, right *store.Finding) int {
 	if left == nil || right == nil || !findingCategoryMatches(left.Category, right.Category) || strings.TrimSpace(left.FilePath) == "" || left.FilePath != right.FilePath {
 		return 0
 	}
-	if findingPrimaryEvidenceSymbolsConflict(left, right) {
+	if !findingPrimaryEvidenceLocationsAgree(left, right) || findingPrimaryEvidenceSymbolsConflict(left, right) {
 		return 0
 	}
 	best := 0
@@ -2373,6 +2373,25 @@ func findingIdentityMatchScore(left, right *store.Finding) int {
 	return best
 }
 
+func findingPrimaryEvidenceLocationsAgree(left, right *store.Finding) bool {
+	leftRefs := findingPrimaryEvidenceRefs(left)
+	rightRefs := findingPrimaryEvidenceRefs(right)
+	if len(leftRefs) == 0 || len(rightRefs) == 0 {
+		return left.Line <= 0 || right.Line <= 0 || absInt(left.Line-right.Line) <= 5
+	}
+	for _, leftRef := range leftRefs {
+		for _, rightRef := range rightRefs {
+			if leftRef.Path != rightRef.Path {
+				continue
+			}
+			if findingRangesOverlap(leftRef.StartLine, leftRef.EndLine, rightRef.StartLine, rightRef.EndLine) || absInt(leftRef.StartLine-rightRef.StartLine) <= 5 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func findingPrimaryEvidenceSymbolsConflict(left, right *store.Finding) bool {
 	leftSymbols := findingPrimaryEvidenceSymbols(left)
 	rightSymbols := findingPrimaryEvidenceSymbols(right)
@@ -2389,22 +2408,29 @@ func findingPrimaryEvidenceSymbolsConflict(left, right *store.Finding) bool {
 
 func findingPrimaryEvidenceSymbols(finding *store.Finding) map[string]struct{} {
 	symbols := map[string]struct{}{}
-	if finding == nil || finding.Line <= 0 {
-		return symbols
-	}
-	for _, ref := range finding.Evidence {
-		if ref.Path != finding.FilePath || ref.StartLine <= 0 {
-			continue
-		}
-		endLine := max(ref.StartLine, ref.EndLine)
-		if finding.Line < ref.StartLine || finding.Line > endLine {
-			continue
-		}
+	for _, ref := range findingPrimaryEvidenceRefs(finding) {
 		if symbol := normalizeFindingIdentityText(ref.Symbol); symbol != "" {
 			symbols[symbol] = struct{}{}
 		}
 	}
 	return symbols
+}
+
+func findingPrimaryEvidenceRefs(finding *store.Finding) []store.FindingEvidenceRef {
+	if finding == nil || finding.Line <= 0 {
+		return nil
+	}
+	refs := make([]store.FindingEvidenceRef, 0, len(finding.Evidence))
+	for _, ref := range finding.Evidence {
+		if ref.Path != finding.FilePath || ref.StartLine <= 0 {
+			continue
+		}
+		endLine := max(ref.StartLine, ref.EndLine)
+		if finding.Line >= ref.StartLine && finding.Line <= endLine {
+			refs = append(refs, ref)
+		}
+	}
+	return refs
 }
 
 func findingCategoryMatches(left, right string) bool {
