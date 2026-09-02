@@ -151,11 +151,6 @@ func (c *assistantMessageCompactor) stopTimer() {
 	c.timer = nil
 }
 
-func assistantMessageText(event acp.PromptEvent) (string, bool) {
-	chunk, ok := decodeAssistantMessageChunk(event)
-	return chunk.Content.Text, ok
-}
-
 type assistantMessageChunk struct {
 	SessionUpdate string `json:"sessionUpdate"`
 	MessageID     string `json:"messageId,omitempty"`
