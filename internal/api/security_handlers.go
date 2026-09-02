@@ -410,7 +410,7 @@ func (h *Handlers) createSecurityPatchTask(ctx context.Context, ui *UserInfo, sc
 
 	agentRef := securityPatchAgentRef(scan)
 
-	taskName := security.PatchTaskName(scan.Name, finding.ID)
+	taskName := security.PatchTaskName(scan.Name, finding.ID, finding.ScanRunID)
 	proposalID := security.PatchProposalID(taskName)
 	branch := security.PatchBranch(finding.ID, taskName)
 	timeout := metav1.Duration{Duration: 2 * time.Hour}

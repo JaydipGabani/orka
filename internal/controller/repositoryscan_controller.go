@@ -913,17 +913,17 @@ func (r *RepositoryScanReconciler) repositoryScanWithFrozenRunTarget(ctx context
 	return repositoryScanWithFrozenWorkspaceTarget(scan, task.Spec.Workspace)
 }
 
-func trustedFindingsRepositoryForRunTask(scan *corev1alpha1.RepositoryScan, run *store.ScanRun, task *corev1alpha1.Task) (security.FindingsV2Repository, string, string) {
+func trustedFindingsRepositoryForRunTask(scan *corev1alpha1.RepositoryScan, run *store.ScanRun, task *corev1alpha1.Task) (security.FindingsV2Repository, string) {
 	taskScan, err := repositoryScanWithFrozenWorkspaceTarget(scan, task.Spec.Workspace)
 	if err != nil {
-		return security.FindingsV2Repository{}, "", err.Error()
+		return security.FindingsV2Repository{}, err.Error()
 	}
-	return trustedFindingsRepository(taskScan, run), legacyFindingsFingerprintBranch(taskScan), ""
+	return trustedFindingsRepository(taskScan, run), ""
 }
 
-func frozenScanTargetFromTasks(scan *corev1alpha1.RepositoryScan, run *store.ScanRun, tasks []corev1alpha1.Task) (security.FindingsV2Repository, string, bool) {
+func frozenScanTargetFromTasks(scan *corev1alpha1.RepositoryScan, run *store.ScanRun, tasks []corev1alpha1.Task) (security.FindingsV2Repository, bool) {
 	if scan == nil || run == nil || strings.TrimSpace(run.TaskName) == "" {
-		return security.FindingsV2Repository{}, "", false
+		return security.FindingsV2Repository{}, false
 	}
 	for i := range tasks {
 		task := &tasks[i]
@@ -932,11 +932,11 @@ func frozenScanTargetFromTasks(scan *corev1alpha1.RepositoryScan, run *store.Sca
 		}
 		frozen, err := repositoryScanWithFrozenWorkspaceTarget(scan, task.Spec.Workspace)
 		if err != nil {
-			return security.FindingsV2Repository{}, "", false
+			return security.FindingsV2Repository{}, false
 		}
-		return trustedFindingsRepository(frozen, run), legacyFindingsFingerprintBranch(frozen), true
+		return trustedFindingsRepository(frozen, run), true
 	}
-	return security.FindingsV2Repository{}, "", false
+	return security.FindingsV2Repository{}, false
 }
 
 func trustedFindingsBranch(scan *corev1alpha1.RepositoryScan) string {
@@ -945,18 +945,6 @@ func trustedFindingsBranch(scan *corev1alpha1.RepositoryScan) string {
 	}
 	if branch := strings.TrimSpace(scan.Spec.Branch); branch != "" {
 		return branch
-	}
-	return security.EffectiveBranch(scan)
-}
-
-// legacyFindingsFingerprintBranch reproduces the branch/ref precedence used
-// before findings stored an explicit target key.
-func legacyFindingsFingerprintBranch(scan *corev1alpha1.RepositoryScan) string {
-	if branch := strings.TrimSpace(scan.Spec.Branch); branch != "" {
-		return branch
-	}
-	if ref := security.EffectiveRef(scan); ref != "" {
-		return "ref:" + ref
 	}
 	return security.EffectiveBranch(scan)
 }
@@ -1885,8 +1873,8 @@ func (r *RepositoryScanReconciler) refreshScanRunStatus(
 		return err
 	}
 	if previousPhase != scanRunPhaseSucceeded && run.Phase == scanRunPhaseSucceeded {
-		if target, legacyBranch, ok := frozenScanTargetFromTasks(scan, run, tasks.Items); ok {
-			if err := r.resolveMergedFindingsNotObserved(ctx, scan, run, target, legacyBranch); err != nil {
+		if target, ok := frozenScanTargetFromTasks(scan, run, tasks.Items); ok {
+			if err := r.resolveMergedFindingsNotObserved(ctx, scan, run, target); err != nil {
 				return err
 			}
 		}
@@ -2177,10 +2165,10 @@ func evidenceRefKey(ref store.FindingEvidenceRef) string {
 }
 
 func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding) error {
-	return r.mergeExistingFindingForTarget(ctx, scan, trustedFindingsRepository(scan, nil), finding, legacyFindingsFingerprintBranch(scan))
+	return r.mergeExistingFindingForTarget(ctx, scan, trustedFindingsRepository(scan, nil), finding)
 }
 
-func (r *RepositoryScanReconciler) mergeExistingFindingForTarget(ctx context.Context, scan *corev1alpha1.RepositoryScan, target security.FindingsV2Repository, finding *store.Finding, legacyBranches ...string) error {
+func (r *RepositoryScanReconciler) mergeExistingFindingForTarget(ctx context.Context, scan *corev1alpha1.RepositoryScan, target security.FindingsV2Repository, finding *store.Finding) error {
 	existing, err := r.SecurityStore.GetFinding(ctx, scan.Namespace, finding.ID)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
@@ -2207,7 +2195,7 @@ func (r *RepositoryScanReconciler) mergeExistingFindingForTarget(ctx context.Con
 		matchTarget = &matchTargetCopy
 		excludedIDs = []string{exactFindingID, existing.ID}
 	}
-	matches, matchErr := r.semanticFindingMatches(ctx, scan, target, legacyBranches, matchTarget, excludedIDs...)
+	matches, matchErr := r.semanticFindingMatches(ctx, scan, target, matchTarget, excludedIDs...)
 	if matchErr != nil {
 		return matchErr
 	}
@@ -2272,7 +2260,7 @@ func (r *RepositoryScanReconciler) mergeExistingFindingForTarget(ctx context.Con
 	return nil
 }
 
-func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, scan *corev1alpha1.RepositoryScan, target security.FindingsV2Repository, legacyBranches []string, finding *store.Finding, excludedIDs ...string) ([]store.Finding, error) {
+func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, scan *corev1alpha1.RepositoryScan, target security.FindingsV2Repository, finding *store.Finding, excludedIDs ...string) ([]store.Finding, error) {
 	if finding == nil || strings.TrimSpace(finding.FilePath) == "" || strings.TrimSpace(finding.Category) == "" {
 		return nil, nil
 	}
@@ -2284,6 +2272,7 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 	}
 	matchesByID := map[string]store.Finding{}
 	targetKey := strings.TrimSpace(finding.TargetKey)
+	targetKeysByRun := map[string]findingRunTargetKey{}
 	cursor := ""
 	for {
 		candidates, next, err := r.SecurityStore.ListFindings(ctx, store.FindingFilter{
@@ -2302,7 +2291,11 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 			if _, skip := excluded[candidate.ID]; skip {
 				continue
 			}
-			if !findingTargetKeyMatches(target, targetKey, &candidate, legacyBranches...) {
+			targetMatches, err := r.findingTargetKeyMatches(ctx, scan, target, targetKey, &candidate, targetKeysByRun)
+			if err != nil {
+				return nil, err
+			}
+			if !targetMatches {
 				continue
 			}
 			if findingIdentityMatchScore(finding, &candidate) < 2 {
@@ -2310,7 +2303,6 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 			}
 			family := []store.Finding{candidate}
 			seenAliases := map[string]struct{}{}
-			targetMatches := true
 			for strings.TrimSpace(candidate.DuplicateOf) != "" {
 				if _, seen := seenAliases[candidate.ID]; seen {
 					return nil, fmt.Errorf("finding duplicate chain contains a cycle at %s", candidate.ID)
@@ -2323,7 +2315,11 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 				if canonical.RepositoryScan != scan.Name {
 					return nil, fmt.Errorf("finding duplicate %s points outside repository scan %s", candidate.ID, scan.Name)
 				}
-				if !findingTargetKeyMatches(target, targetKey, canonical, legacyBranches...) {
+				canonicalTargetMatches, err := r.findingTargetKeyMatches(ctx, scan, target, targetKey, canonical, targetKeysByRun)
+				if err != nil {
+					return nil, err
+				}
+				if !canonicalTargetMatches {
 					targetMatches = false
 					break
 				}
@@ -2358,49 +2354,91 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 	return matches, nil
 }
 
-func findingTargetKeyMatches(target security.FindingsV2Repository, targetKey string, candidate *store.Finding, legacyBranches ...string) bool {
+type findingRunTargetKey struct {
+	key   string
+	found bool
+}
+
+func (r *RepositoryScanReconciler) findingTargetKeyMatches(
+	ctx context.Context,
+	scan *corev1alpha1.RepositoryScan,
+	target security.FindingsV2Repository,
+	targetKey string,
+	candidate *store.Finding,
+	targetKeysByRun map[string]findingRunTargetKey,
+) (bool, error) {
 	if candidate == nil {
-		return false
+		return false, nil
 	}
 	targetKey = strings.TrimSpace(targetKey)
 	if targetKey == "" {
-		return true
+		return true, nil
 	}
 	if candidateTargetKey := strings.TrimSpace(candidate.TargetKey); candidateTargetKey != "" {
-		return candidateTargetKey == targetKey
+		return candidateTargetKey == targetKey, nil
 	}
-
 	if security.FindingV2TargetKey(target.RepoURL, target.Branch, target.SubPath) != targetKey {
-		return false
+		return false, nil
 	}
-	evidence := make([]security.FindingsV2EvidenceRef, 0, len(candidate.Evidence))
-	for _, storedRef := range candidate.Evidence {
-		ref := security.FindingsV2EvidenceRef{
-			Path:      storedRef.Path,
-			StartLine: storedRef.StartLine,
-			EndLine:   storedRef.EndLine,
-		}
-		if symbol := strings.TrimSpace(storedRef.Symbol); symbol != "" {
-			ref.Symbol = &symbol
-		}
-		evidence = append(evidence, ref)
+	candidateTargetKey, found, err := r.findingRunTargetKey(ctx, scan, candidate, targetKeysByRun)
+	if err != nil || !found {
+		return false, err
 	}
-	branches := append([]string{target.Branch}, legacyBranches...)
-	for _, branch := range branches {
-		legacyFingerprint := security.FindingV2Fingerprint(
-			candidate.Namespace,
-			candidate.RepositoryScan,
-			target.RepoURL,
-			branch,
-			target.SubPath,
-			candidate.SliceID,
-			security.FindingsV2Finding{Title: candidate.Title, Category: candidate.Category, Evidence: evidence},
-		)
-		if candidate.Fingerprint == legacyFingerprint {
-			return true
-		}
+	return candidateTargetKey == targetKey, nil
+}
+
+func (r *RepositoryScanReconciler) findingRunTargetKey(
+	ctx context.Context,
+	scan *corev1alpha1.RepositoryScan,
+	finding *store.Finding,
+	targetKeysByRun map[string]findingRunTargetKey,
+) (string, bool, error) {
+	if r.Client == nil || r.SecurityStore == nil || scan == nil || finding == nil {
+		return "", false, nil
 	}
-	return false
+	runID := strings.TrimSpace(finding.ScanRunID)
+	if runID == "" {
+		return "", false, nil
+	}
+	if cached, ok := targetKeysByRun[runID]; ok {
+		return cached.key, cached.found, nil
+	}
+	cache := func(key string, found bool) (string, bool, error) {
+		targetKeysByRun[runID] = findingRunTargetKey{key: key, found: found}
+		return key, found, nil
+	}
+	run, err := r.SecurityStore.GetScanRun(ctx, scan.Namespace, runID)
+	if errors.Is(err, store.ErrNotFound) {
+		return cache("", false)
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if run.RepositoryScan != scan.Name || strings.TrimSpace(run.TaskName) == "" {
+		return cache("", false)
+	}
+	task := &corev1alpha1.Task{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: scan.Namespace, Name: run.TaskName}, task); err != nil {
+		if apierrors.IsNotFound(err) {
+			return cache("", false)
+		}
+		return "", false, err
+	}
+	if scanTaskRunID(task) != run.ID || task.Labels[labels.LabelSecurityTarget] != labels.SelectorValue(scan.Name) || !isScanPipelineStage(taskSecurityStage(task)) {
+		return cache("", false)
+	}
+	workspace := task.Spec.Workspace
+	if workspace == nil || strings.TrimSpace(workspace.GitRepo) == "" {
+		return cache("", false)
+	}
+	branch := strings.TrimSpace(workspace.Branch)
+	if ref := strings.TrimSpace(workspace.Ref); ref != "" {
+		branch = "ref:" + ref
+	}
+	if branch == "" {
+		return cache("", false)
+	}
+	return cache(security.FindingV2TargetKey(workspace.GitRepo, branch, workspace.SubPath), true)
 }
 
 func canonicalFinding(matches []store.Finding) *store.Finding {
@@ -2814,11 +2852,8 @@ func (r *RepositoryScanReconciler) repositoryScanReviewedSlicesForResolution(ctx
 	}
 }
 
-func findingEligibleForMergedResolution(target security.FindingsV2Repository, finding *store.Finding, run *store.ScanRun, targetKey string, inconclusiveSlices, reviewedSlices map[string]struct{}, allSlicesInconclusive bool, legacyBranches ...string) bool {
+func findingEligibleForMergedResolution(finding *store.Finding, run *store.ScanRun, inconclusiveSlices, reviewedSlices map[string]struct{}, allSlicesInconclusive bool) bool {
 	if finding == nil || finding.ScanRunID == run.ID || finding.PRNumber == nil || *finding.PRNumber < 1 {
-		return false
-	}
-	if !findingTargetKeyMatches(target, targetKey, finding, legacyBranches...) {
 		return false
 	}
 	sliceID := strings.TrimSpace(finding.SliceID)
@@ -2854,7 +2889,7 @@ func (r *RepositoryScanReconciler) repositoryScanOpenFindingsForResolution(ctx c
 	}
 }
 
-func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun, target security.FindingsV2Repository, legacyBranches ...string) error {
+func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun, target security.FindingsV2Repository) error {
 	if r.SecurityStore == nil || scan == nil || run == nil || run.Phase != scanRunPhaseSucceeded || run.ReviewedSliceCount == 0 {
 		return nil
 	}
@@ -2874,12 +2909,34 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 		return nil
 	}
 
+	findings, err := r.repositoryScanOpenFindingsForResolution(ctx, scan)
+	if err != nil {
+		return err
+	}
+	targetKey := security.FindingV2TargetKey(target.RepoURL, target.Branch, target.SubPath)
+	targetKeysByRun := map[string]findingRunTargetKey{}
+	eligible := make([]*store.Finding, 0, len(findings))
+	for i := range findings {
+		finding := &findings[i]
+		targetMatches, err := r.findingTargetKeyMatches(ctx, scan, target, targetKey, finding, targetKeysByRun)
+		if err != nil {
+			return err
+		}
+		if !targetMatches || !findingEligibleForMergedResolution(finding, run, inconclusiveSlices, reviewedSlices, allSlicesInconclusive) {
+			continue
+		}
+		eligible = append(eligible, finding)
+	}
+	if len(eligible) == 0 {
+		return nil
+	}
+
 	token, reason, tokenErr := r.repositoryScanForgeToken(ctx, scan)
 	if tokenErr != nil {
 		return tokenErr
 	}
 	if reason != "" {
-		return nil
+		return fmt.Errorf("merged-finding resolution is waiting for forge credentials: %s", reason)
 	}
 	targetRepo := security.CanonicalRepositoryCloneURL(scan.Spec.RepoURL)
 	owner, repository, err := security.ParseGitHubRepositoryURL(targetRepo)
@@ -2889,16 +2946,7 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 
 	mergeStateByPR := map[int]bool{}
 	verifiedPRs := map[int]struct{}{}
-	findings, err := r.repositoryScanOpenFindingsForResolution(ctx, scan)
-	if err != nil {
-		return err
-	}
-	targetKey := security.FindingV2TargetKey(target.RepoURL, target.Branch, target.SubPath)
-	for i := range findings {
-		finding := &findings[i]
-		if !findingEligibleForMergedResolution(target, finding, run, targetKey, inconclusiveSlices, reviewedSlices, allSlicesInconclusive, legacyBranches...) {
-			continue
-		}
+	for _, finding := range eligible {
 		prNumber := *finding.PRNumber
 		if _, verified := verifiedPRs[prNumber]; !verified {
 			merged, err := r.repositoryScanPullRequestMerged(ctx, owner, repository, token, prNumber, target.Branch, run.HeadCommit)
@@ -3123,7 +3171,7 @@ func (r *RepositoryScanReconciler) ingestReviewTask(ctx context.Context, scan *c
 		return r.failReviewTask(ctx, scan, run, sliceID, r.pipelineTaskFailureSummary(ctx, task))
 	}
 
-	trustedRepository, legacyBranch, targetProblem := trustedFindingsRepositoryForRunTask(scan, run, task)
+	trustedRepository, targetProblem := trustedFindingsRepositoryForRunTask(scan, run, task)
 	if targetProblem != "" {
 		return r.failReviewTask(ctx, scan, run, sliceID, targetProblem)
 	}
@@ -3188,7 +3236,7 @@ func (r *RepositoryScanReconciler) ingestReviewTask(ctx context.Context, scan *c
 	}
 	upserted := make([]*store.Finding, 0, len(partition.Accepted))
 	for _, finding := range partition.Accepted {
-		if err := r.mergeExistingFindingForTarget(ctx, scan, trustedRepository, finding, legacyBranch); err != nil {
+		if err := r.mergeExistingFindingForTarget(ctx, scan, trustedRepository, finding); err != nil {
 			return err
 		}
 		if err := r.SecurityStore.UpsertObservedFinding(ctx, finding); err != nil {

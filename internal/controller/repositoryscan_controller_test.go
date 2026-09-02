@@ -289,28 +289,24 @@ func TestTrustedFindingsRepositoryScopesCheckoutTarget(t *testing.T) {
 		HeadCommit: "head",
 	}
 	tests := []struct {
-		name       string
-		spec       corev1alpha1.RepositoryScanSpec
-		want       string
-		wantLegacy string
+		name string
+		spec corev1alpha1.RepositoryScanSpec
+		want string
 	}{
 		{
-			name:       "implicit main",
-			spec:       corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo"},
-			want:       "main",
-			wantLegacy: "main",
+			name: "implicit main",
+			spec: corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo"},
+			want: "main",
 		},
 		{
-			name:       "explicit ref wins over branch",
-			spec:       corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", Branch: "release", Ref: "v1.2.3"},
-			want:       "ref:v1.2.3",
-			wantLegacy: "release",
+			name: "explicit ref wins over branch",
+			spec: corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", Branch: "release", Ref: "v1.2.3"},
+			want: "ref:v1.2.3",
 		},
 		{
-			name:       "ref-only scan is ref scoped",
-			spec:       corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", Ref: "refs/tags/v1.2.3"},
-			want:       "ref:refs/tags/v1.2.3",
-			wantLegacy: "ref:refs/tags/v1.2.3",
+			name: "ref-only scan is ref scoped",
+			spec: corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", Ref: "refs/tags/v1.2.3"},
+			want: "ref:refs/tags/v1.2.3",
 		},
 	}
 	for _, tt := range tests {
@@ -321,9 +317,6 @@ func TestTrustedFindingsRepositoryScopesCheckoutTarget(t *testing.T) {
 
 			if got.Branch != tt.want {
 				t.Fatalf("trustedFindingsRepository().Branch = %q, want %q", got.Branch, tt.want)
-			}
-			if gotLegacy := legacyFindingsFingerprintBranch(scan); gotLegacy != tt.wantLegacy {
-				t.Fatalf("legacyFindingsFingerprintBranch() = %q, want %q", gotLegacy, tt.wantLegacy)
 			}
 			if got.BaseSHA != "base" || got.HeadSHA != "head" {
 				t.Fatalf("trustedFindingsRepository() SHAs = %q/%q, want base/head", got.BaseSHA, got.HeadSHA)
@@ -4168,7 +4161,7 @@ func TestMergeExistingFindingKeepsDifferentScanTargetsIndependent(t *testing.T) 
 	}
 }
 
-func TestMergeExistingFindingReconcilesLegacyTargetKeyFromV2Fingerprint(t *testing.T) {
+func TestMergeExistingFindingReconcilesLegacyTargetKeyFromFrozenRunTarget(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		currentBranch string
@@ -4180,10 +4173,21 @@ func TestMergeExistingFindingReconcilesLegacyTargetKeyFromV2Fingerprint(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			securityStore := setupControllerSQLiteStore(t)
-			reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
 			scan := &corev1alpha1.RepositoryScan{
 				ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
 				Spec:       corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/kaset", Branch: tc.currentBranch},
+			}
+			legacyScan := scan.DeepCopy()
+			legacyScan.Spec.Branch = "main"
+			legacyTask := newSucceededSecurityTask("legacy-target-review", "scan_legacy", security.StageReview, metav1.Now())
+			legacyTask.Spec.Workspace = repositoryScanTaskWorkspace(legacyScan, corev1alpha1.WorkspaceIntentRead)
+			scheme := runtime.NewScheme()
+			if err := corev1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme() error = %v", err)
+			}
+			reconciler := &RepositoryScanReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(legacyTask).Build(), SecurityStore: securityStore}
+			if err := securityStore.CreateScanRun(ctx, &storepkg.ScanRun{ID: "scan_legacy", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: legacyTask.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, StartedAt: time.Now()}); err != nil {
+				t.Fatalf("CreateScanRun(legacy) error = %v", err)
 			}
 			symbol := "extractArchive"
 			legacyRepo := security.FindingsV2Repository{RepoURL: scan.Spec.RepoURL, Branch: "main"}
@@ -4193,6 +4197,7 @@ func TestMergeExistingFindingReconcilesLegacyTargetKeyFromV2Fingerprint(t *testi
 				Evidence: []security.FindingsV2EvidenceRef{{Path: "archive.go", StartLine: 100, EndLine: 108, Symbol: &symbol}},
 			})
 			legacy.TargetKey = ""
+			legacy.Evidence = append(legacy.Evidence, storepkg.FindingEvidenceRef{Path: "archive.go", StartLine: 200, EndLine: 204, Symbol: "validateArchive"})
 			if err := securityStore.UpsertFinding(ctx, legacy); err != nil {
 				t.Fatalf("UpsertFinding(legacy) error = %v", err)
 			}
@@ -4231,10 +4236,9 @@ func TestMergeExistingFindingReconcilesLegacyTargetKeyFromV2Fingerprint(t *testi
 	}
 }
 
-func TestMergeExistingFindingReconcilesLegacyBranchFingerprintWhenRefConfigured(t *testing.T) {
+func TestMergeExistingFindingReconcilesLegacyRunTargetWhenRefConfigured(t *testing.T) {
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)
-	reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
 	scan := &corev1alpha1.RepositoryScan{
 		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
 		Spec: corev1alpha1.RepositoryScanSpec{
@@ -4242,6 +4246,16 @@ func TestMergeExistingFindingReconcilesLegacyBranchFingerprintWhenRefConfigured(
 			Branch:  "release",
 			Ref:     "v1.2.3",
 		},
+	}
+	legacyTask := newSucceededSecurityTask("legacy-ref-review", "scan_legacy", security.StageReview, metav1.Now())
+	legacyTask.Spec.Workspace = repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	reconciler := &RepositoryScanReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(legacyTask).Build(), SecurityStore: securityStore}
+	if err := securityStore.CreateScanRun(ctx, &storepkg.ScanRun{ID: "scan_legacy", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: legacyTask.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, StartedAt: time.Now()}); err != nil {
+		t.Fatalf("CreateScanRun(legacy) error = %v", err)
 	}
 	symbol := "extractArchive"
 	legacyRepo := security.FindingsV2Repository{RepoURL: scan.Spec.RepoURL, Branch: scan.Spec.Branch}
@@ -5198,6 +5212,80 @@ func TestRefreshScanRunStatusRetriesMergedPRLookup(t *testing.T) {
 	}
 }
 
+func TestRefreshScanRunStatusRetriesMergedResolutionAfterForgeCredentialReturns(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	pullRequests := 0
+	compareRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/example/kaset/pulls/42":
+			pullRequests++
+			_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)
+		case "/repos/example/kaset/compare/" + testRepositoryScanMergeSHA + "..." + testRepositoryScanHeadSHA:
+			compareRequests++
+			_, _ = w.Write([]byte(`{"status":"ahead"}`))
+		default:
+			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:            "https://github.com/example/kaset",
+			ForgeCredentialRef: &corev1.LocalObjectReference{Name: testPatchForgeSecretName},
+		},
+	}
+	completed := metav1.Now()
+	threatTask := newSucceededSecurityTask("kaset-credential-retry-threat", "scan_credential_retry", security.StageThreatModel, completed)
+	threatTask.Spec.Workspace = repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead)
+	mapperTask := newSucceededSecurityTask("kaset-credential-retry-mapper", "scan_credential_retry", security.StageMapper, completed)
+	reviewTask := newSucceededSecurityTask("kaset-credential-retry-review", "scan_credential_retry", security.StageReview, completed)
+	reviewTask.Labels[labels.LabelSecuritySliceID] = "slice_api"
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(threatTask, mapperTask, reviewTask).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
+	run := &storepkg.ScanRun{ID: "scan_credential_retry", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: threatTask.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, HeadCommit: testRepositoryScanHeadSHA, StartedAt: time.Now()}
+	if err := securityStore.CreateScanRun(ctx, run); err != nil {
+		t.Fatalf("CreateScanRun() error = %v", err)
+	}
+	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_api", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
+		t.Fatalf("UpsertReviewSlice() error = %v", err)
+	}
+	prNumber := 42
+	finding := &storepkg.Finding{ID: "fnd_credential_retry", Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: "slice_api", Fingerprint: "fnd_credential_retry", TargetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, trustedFindingsBranch(scan), scan.Spec.SubPath), Title: "finding", Summary: "finding", Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, FilePath: "api.go", PRNumber: &prNumber}
+	if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+		t.Fatalf("UpsertFinding() error = %v", err)
+	}
+
+	if err := reconciler.refreshScanRunStatus(ctx, scan, run, run.ID, false); err == nil || !strings.Contains(err.Error(), "waiting for forge credentials") {
+		t.Fatalf("refreshScanRunStatus(without credential) error = %v, want retryable credential wait", err)
+	}
+	persistedRun, err := securityStore.GetScanRun(ctx, defaultNS, run.ID)
+	if err != nil || persistedRun.Phase != scanRunPhaseRunning || pullRequests != 0 {
+		t.Fatalf("run without credential = %#v, pull requests = %d, err %v", persistedRun, pullRequests, err)
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
+	if err := cl.Create(ctx, secret); err != nil {
+		t.Fatalf("Create(forge secret) error = %v", err)
+	}
+	if err := reconciler.refreshScanRunStatus(ctx, scan, persistedRun, persistedRun.ID, false); err != nil {
+		t.Fatalf("refreshScanRunStatus(with credential) error = %v", err)
+	}
+	resolved, err := securityStore.GetFinding(ctx, defaultNS, finding.ID)
+	if err != nil || resolved.State != findingStateResolved || pullRequests != 1 || compareRequests != 1 {
+		t.Fatalf("finding = %#v, pull requests = %d, comparisons = %d, err %v", resolved, pullRequests, compareRequests, err)
+	}
+}
+
 type failingRepositoryScanReader struct {
 	client.Reader
 	err error
@@ -5221,6 +5309,10 @@ func TestResolveMergedFindingsRetriesForgeCredentialReadErrors(t *testing.T) {
 	securityStore := setupControllerSQLiteStore(t)
 	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_api", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
+	}
+	prNumber := 42
+	if err := securityStore.UpsertFinding(ctx, &storepkg.Finding{ID: "fnd_retry_secret", Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: "slice_api", Fingerprint: "fnd_retry_secret", TargetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, trustedFindingsBranch(scan), scan.Spec.SubPath), Title: "finding", Summary: "finding", Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, PRNumber: &prNumber}); err != nil {
+		t.Fatalf("UpsertFinding() error = %v", err)
 	}
 	reconciler := &RepositoryScanReconciler{
 		APIReader:     failingRepositoryScanReader{err: transientErr},
@@ -5261,14 +5353,22 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 	}))
 	t.Cleanup(server.Close)
 	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1alpha1.AddToScheme() error = %v", err)
+	}
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("corev1.AddToScheme() error = %v", err)
 	}
 	scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}, Spec: corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/kaset", ForgeCredentialRef: &corev1.LocalObjectReference{Name: testPatchForgeSecretName}}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	legacyTask := newSucceededSecurityTask("legacy-resolution-review", "scan_old", security.StageReview, metav1.Now())
+	legacyTask.Spec.Workspace = repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, legacyTask).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
 	run := &storepkg.ScanRun{ID: "scan_scoped", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: mode, Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 1, HeadCommit: testRepositoryScanHeadSHA}
+	if err := securityStore.CreateScanRun(ctx, &storepkg.ScanRun{ID: "scan_old", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: legacyTask.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, StartedAt: time.Now()}); err != nil {
+		t.Fatalf("CreateScanRun(legacy) error = %v", err)
+	}
 	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_reviewed", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
 	}
@@ -5306,6 +5406,8 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 		PRNumber:         &legacyPRNumber,
 	}
 	legacyRepo := trustedFindingsRepository(scan, nil)
+	legacySymbol := "legacyHandler"
+	legacy.Evidence = []storepkg.FindingEvidenceRef{{Path: "legacy.go", StartLine: 10, EndLine: 15, Symbol: legacySymbol}}
 	legacy.Fingerprint = security.FindingV2Fingerprint(
 		legacy.Namespace,
 		legacy.RepositoryScan,
@@ -5313,8 +5415,9 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 		legacyRepo.Branch,
 		legacyRepo.SubPath,
 		legacy.SliceID,
-		security.FindingsV2Finding{Title: legacy.Title, Category: legacy.Category},
+		security.FindingsV2Finding{Title: legacy.Title, Category: legacy.Category, Evidence: []security.FindingsV2EvidenceRef{{Path: "legacy.go", StartLine: 10, EndLine: 15, Symbol: &legacySymbol}}},
 	)
+	legacy.Evidence = append(legacy.Evidence, storepkg.FindingEvidenceRef{Path: "legacy.go", StartLine: 30, EndLine: 34, Symbol: "newEvidence"})
 	if err := securityStore.UpsertFinding(ctx, legacy); err != nil {
 		t.Fatalf("UpsertFinding(%s) error = %v", legacy.ID, err)
 	}

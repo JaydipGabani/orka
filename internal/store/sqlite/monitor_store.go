@@ -1075,12 +1075,12 @@ func (s *Store) CreateRepairJob(ctx context.Context, job *store.RepairJob) error
 	job.UpdatedAt = now
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO repair_jobs
-		 (id, monitor_namespace, monitor_name, repo, pr_number, intent, source, head_sha, base_sha,
+		 (id, monitor_namespace, monitor_name, repo, pr_number, intent, source, head_sha, base_sha, base_branch,
 		  phase, repair_count_pr, repair_count_head, validation_attempts, review_fix_attempts,
 		  task_name, branch, pushed_sha, last_error, created_at, updated_at, completed_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		job.ID, job.MonitorNamespace, job.MonitorName, job.Repo, job.PRNumber, job.Intent, job.Source,
-		job.HeadSHA, job.BaseSHA, job.Phase, job.RepairCountPR, job.RepairCountHead,
+		job.HeadSHA, job.BaseSHA, job.BaseBranch, job.Phase, job.RepairCountPR, job.RepairCountHead,
 		job.ValidationAttempts, job.ReviewFixAttempts, job.TaskName, job.Branch, job.PushedSHA,
 		job.LastError, job.CreatedAt, job.UpdatedAt, job.CompletedAt,
 	)
@@ -1092,11 +1092,11 @@ func (s *Store) UpdateRepairJob(ctx context.Context, job *store.RepairJob) error
 	job.UpdatedAt = time.Now()
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE repair_jobs
-		 SET repo = ?, pr_number = ?, intent = ?, source = ?, head_sha = ?, base_sha = ?, phase = ?,
+		 SET repo = ?, pr_number = ?, intent = ?, source = ?, head_sha = ?, base_sha = ?, base_branch = ?, phase = ?,
 		     repair_count_pr = ?, repair_count_head = ?, validation_attempts = ?, review_fix_attempts = ?,
 		     task_name = ?, branch = ?, pushed_sha = ?, last_error = ?, updated_at = ?, completed_at = ?
 		 WHERE monitor_namespace = ? AND id = ?`,
-		job.Repo, job.PRNumber, job.Intent, job.Source, job.HeadSHA, job.BaseSHA, job.Phase,
+		job.Repo, job.PRNumber, job.Intent, job.Source, job.HeadSHA, job.BaseSHA, job.BaseBranch, job.Phase,
 		job.RepairCountPR, job.RepairCountHead, job.ValidationAttempts, job.ReviewFixAttempts,
 		job.TaskName, job.Branch, job.PushedSHA, job.LastError, job.UpdatedAt, job.CompletedAt,
 		job.MonitorNamespace, job.ID,
@@ -1124,14 +1124,14 @@ func (s *Store) GetRepairJob(ctx context.Context, namespace, id string) (*store.
 
 func repairJobSelectSQL() string {
 	return `SELECT id, monitor_namespace, monitor_name, repo, pr_number, intent, source, head_sha,
-	        base_sha, phase, repair_count_pr, repair_count_head, validation_attempts, review_fix_attempts,
+	        base_sha, base_branch, phase, repair_count_pr, repair_count_head, validation_attempts, review_fix_attempts,
 	        task_name, branch, pushed_sha, last_error, created_at, updated_at, completed_at FROM repair_jobs`
 }
 
 func repairJobScanDest(job *store.RepairJob, completedAt *sql.NullTime) []any {
 	return []any{
 		&job.ID, &job.MonitorNamespace, &job.MonitorName, &job.Repo, &job.PRNumber, &job.Intent,
-		&job.Source, &job.HeadSHA, &job.BaseSHA, &job.Phase, &job.RepairCountPR, &job.RepairCountHead,
+		&job.Source, &job.HeadSHA, &job.BaseSHA, &job.BaseBranch, &job.Phase, &job.RepairCountPR, &job.RepairCountHead,
 		&job.ValidationAttempts, &job.ReviewFixAttempts, &job.TaskName, &job.Branch, &job.PushedSHA,
 		&job.LastError, &job.CreatedAt, &job.UpdatedAt, completedAt,
 	}

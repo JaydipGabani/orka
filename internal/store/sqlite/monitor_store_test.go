@@ -176,6 +176,7 @@ func TestMonitorStoreRunsItemsReviewsRepairsAndEvents(t *testing.T) {
 		Repo:             "orka-agents/orka",
 		PRNumber:         42,
 		Intent:           "fix_ci",
+		BaseBranch:       "main",
 		Phase:            "queued",
 	}); err != nil {
 		t.Fatalf("CreateRepairJob() error = %v", err)
@@ -184,7 +185,7 @@ func TestMonitorStoreRunsItemsReviewsRepairsAndEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRepairJobs() error = %v", err)
 	}
-	if len(repairs) != 1 || repairs[0].ID != "repair-1" {
+	if len(repairs) != 1 || repairs[0].ID != "repair-1" || repairs[0].BaseBranch != "main" {
 		t.Fatalf("repairs = %#v, want repair-1", repairs)
 	}
 

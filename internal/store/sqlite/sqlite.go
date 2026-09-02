@@ -718,6 +718,7 @@ func migrate(db *sql.DB) error {
 			source              TEXT NOT NULL DEFAULT '',
 			head_sha            TEXT NOT NULL DEFAULT '',
 			base_sha            TEXT NOT NULL DEFAULT '',
+			base_branch         TEXT NOT NULL DEFAULT '',
 			phase               TEXT NOT NULL DEFAULT '',
 			repair_count_pr     INTEGER NOT NULL DEFAULT 0,
 			repair_count_head   INTEGER NOT NULL DEFAULT 0,
@@ -875,6 +876,11 @@ func migrate(db *sql.DB) error {
 
 	if err := ensureSQLiteColumns(db, "github_mutation_records", []sqliteColumnMigration{
 		{Name: "pending_at", Definition: "pending_at TIMESTAMP"},
+	}); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumns(db, "repair_jobs", []sqliteColumnMigration{
+		{Name: "base_branch", Definition: "base_branch TEXT NOT NULL DEFAULT ''"},
 	}); err != nil {
 		return err
 	}

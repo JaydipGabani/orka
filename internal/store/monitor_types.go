@@ -398,6 +398,7 @@ type RepairJob struct {
 	Source             string     `json:"source,omitempty"`
 	HeadSHA            string     `json:"headSHA,omitempty"`
 	BaseSHA            string     `json:"baseSHA,omitempty"`
+	BaseBranch         string     `json:"baseBranch,omitempty"`
 	Phase              string     `json:"phase,omitempty"`
 	RepairCountPR      int        `json:"repairCountPR"`
 	RepairCountHead    int        `json:"repairCountHead"`

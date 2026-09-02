@@ -5647,7 +5647,7 @@ func TestRepositoryMonitorPullRequestFixCommandQueuesRepairTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRepairJobs() error = %v", err)
 	}
-	if len(jobs) != 1 || jobs[0].TaskName == "" {
+	if len(jobs) != 1 || jobs[0].TaskName == "" || jobs[0].BaseBranch != "main" {
 		t.Fatalf("jobs = %#v, want one repair job with task", jobs)
 	}
 	var task corev1alpha1.Task
@@ -7085,8 +7085,8 @@ func TestRepositoryMonitorSubmittingUpdateBranchIgnoresCommandRetryBudgetUntilDe
 func TestRepositoryMonitorAcceptedUpdateBranchStopsAtMutationDeadline(t *testing.T) {
 	ctx := context.Background()
 	monitorStore := setupControllerSQLiteStore(t)
-	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "update-branch-pending-timeout", Namespace: defaultNS}}
-	command := store.CommandEvent{ID: "cmd-update-branch-pending-timeout", MonitorNamespace: defaultNS, MonitorName: monitor.Name, Kind: repositoryMonitorPullRequestKind, Number: 8, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "head-8"}
+	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "update-branch-pending-timeout", Namespace: defaultNS}, Spec: corev1alpha1.RepositoryMonitorSpec{RepoURL: "https://github.com/orka-agents/orka"}}
+	command := store.CommandEvent{ID: "cmd-update-branch-pending-timeout", MonitorNamespace: defaultNS, MonitorName: monitor.Name, Repo: "orka-agents/orka", Kind: repositoryMonitorPullRequestKind, Number: 8, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "head-8"}
 	runID := repositoryMonitorCommandRunIDFromCommand(command.ID)
 	completedAt := time.Now()
 	if err := monitorStore.CreateMonitorRun(ctx, &store.MonitorRun{ID: runID, MonitorNamespace: defaultNS, MonitorName: monitor.Name, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, CommandEventID: command.ID, Phase: repositoryMonitorRunPhaseFailed, StartedAt: completedAt.Add(-time.Minute), CompletedAt: &completedAt, Error: "[retry_scheduled] compare unavailable"}); err != nil {
@@ -7961,7 +7961,7 @@ func TestRepositoryMonitorIssueStatusCommentRecreatesDeletedComment(t *testing.T
 	}
 }
 
-func TestRepositoryMonitorUpdateBranchNoChangeUsesLiveBaseTip(t *testing.T) {
+func TestRepositoryMonitorUpdateBranchNoChangeUsesFrozenBaseBranchTip(t *testing.T) {
 	ctx := context.Background()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
@@ -7982,11 +7982,76 @@ func TestRepositoryMonitorUpdateBranchNoChangeUsesLiveBaseTip(t *testing.T) {
 	_ = corev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	monitor, secret := repositoryMonitorInventoryTestObjects("update-branch-no-change")
+	monitor.Spec.Branch = "release"
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(monitor, secret).Build()
 	reconciler := &RepositoryMonitorReconciler{Client: client, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
-	ok, err := reconciler.repositoryMonitorHeadContainsBase(ctx, monitor, &store.RepairJob{Repo: "orka-agents/orka", BaseSHA: "stale-base-sha", HeadSHA: "head-sha"})
+	ok, err := reconciler.repositoryMonitorHeadContainsBase(ctx, monitor, &store.RepairJob{Repo: "orka-agents/orka", BaseSHA: "stale-base-sha", BaseBranch: "main", HeadSHA: "head-sha"})
 	if err != nil || ok {
 		t.Fatalf("repositoryMonitorHeadContainsBase() = %v, %v, want false against live base", ok, err)
+	}
+}
+
+func TestRepositoryMonitorUpdateBranchRejectsMonitorRepositoryChange(t *testing.T) {
+	ctx := context.Background()
+	monitorStore := setupControllerSQLiteStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected GitHub request after repository change: %s %s", r.Method, r.URL.Path)
+	}))
+	t.Cleanup(server.Close)
+
+	scheme := runtime.NewScheme()
+	_ = corev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	monitor, secret := repositoryMonitorInventoryTestObjects("update-branch-repository-change")
+	monitor.Spec.RepoURL = "https://github.com/other/repository"
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(monitor, secret).Build()
+	reconciler := &RepositoryMonitorReconciler{Client: client, Store: monitorStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
+	command := &store.CommandEvent{ID: "cmd-update-repository-change", MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Repo: "orka-agents/orka", Kind: repositoryMonitorPullRequestKind, Number: 42, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "old-head-sha", Status: "accepted", CreatedAt: time.Now()}
+	run := &store.MonitorRun{ID: "run-update-repository-change", MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, CommandEventID: command.ID, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA}
+	pr := repositoryMonitorPullRequest{Number: command.Number, State: repositoryMonitorItemStateOpen, BaseBranch: "main", BaseSHA: "live-base-sha", HeadBranch: "feature", HeadRepo: "other/repository", HeadSHA: command.HeadSHA}
+	item := repositoryMonitorItemFromPullRequest(monitor, pr, nil)
+	pendingAt := time.Now()
+	mutationID := repositoryMonitorUpdateBranchMutationID(command.ID)
+	if err := monitorStore.CreateGitHubMutationRecord(ctx, &store.GitHubMutationRecord{ID: mutationID, MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, RunID: run.ID, CommandEventID: command.ID, Operation: repositoryMonitorUpdateBranchOperation, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, Reason: command.Intent, GitHubURL: pr.BaseBranch, ExternalID: pr.BaseSHA, Status: repositoryMonitorAutomergeStatePending, PendingAt: &pendingAt, CreatedAt: pendingAt}); err != nil {
+		t.Fatalf("CreateGitHubMutationRecord() error = %v", err)
+	}
+
+	handled, created, err := reconciler.tryProcessPullRequestUpdateBranchCommand(ctx, monitor, run, command, "other", "repository", pr, item)
+	if err != nil || !handled || created != 0 {
+		t.Fatalf("tryProcessPullRequestUpdateBranchCommand() = handled %v, created %d, err %v", handled, created, err)
+	}
+	mutation, err := monitorStore.GetGitHubMutationRecord(ctx, monitor.Namespace, mutationID)
+	if err != nil || mutation.Status != repositoryMonitorRunPhaseFailed || !strings.Contains(mutation.Error, "repository does not match") {
+		t.Fatalf("mutation = %#v, err %v, want repository-bound failure", mutation, err)
+	}
+}
+
+func TestRepositoryMonitorUpdateBranchTerminalProjectionRejectsMonitorRepositoryChange(t *testing.T) {
+	ctx := context.Background()
+	monitorStore := setupControllerSQLiteStore(t)
+	monitor, _ := repositoryMonitorInventoryTestObjects("update-branch-terminal-repository-change")
+	monitor.Spec.RepoURL = "https://github.com/other/repository"
+	command := store.CommandEvent{ID: "cmd-update-terminal-repository-change", MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Repo: "orka-agents/orka", Kind: repositoryMonitorPullRequestKind, Number: 42, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "old-head-sha"}
+	mutationID := repositoryMonitorUpdateBranchMutationID(command.ID)
+	if err := monitorStore.CreateGitHubMutationRecord(ctx, &store.GitHubMutationRecord{ID: mutationID, MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, CommandEventID: command.ID, Operation: repositoryMonitorUpdateBranchOperation, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, Status: repositoryMonitorRunPhaseSucceeded, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("CreateGitHubMutationRecord() error = %v", err)
+	}
+	item := &store.MonitorItem{MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Kind: command.Kind, ItemKey: "42", Number: command.Number, RepairState: repositoryMonitorRepairPhaseQueued}
+	if err := monitorStore.UpsertMonitorItem(ctx, item); err != nil {
+		t.Fatalf("UpsertMonitorItem() error = %v", err)
+	}
+
+	preserveSuccess, err := (&RepositoryMonitorReconciler{Store: monitorStore}).terminalizeRepositoryMonitorUpdateBranch(ctx, monitor, command, "stale command")
+	if err != nil || preserveSuccess {
+		t.Fatalf("terminalizeRepositoryMonitorUpdateBranch() = preserve %v, err %v", preserveSuccess, err)
+	}
+	mutation, err := monitorStore.GetGitHubMutationRecord(ctx, monitor.Namespace, mutationID)
+	if err != nil || mutation.Status != repositoryMonitorRunPhaseFailed || !strings.Contains(mutation.Error, "repository does not match") {
+		t.Fatalf("mutation = %#v, err %v, want repository-bound failure", mutation, err)
+	}
+	storedItem, err := monitorStore.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, command.Kind, "42")
+	if err != nil || storedItem.RepairState != repositoryMonitorRepairPhaseQueued {
+		t.Fatalf("item = %#v, err %v, want current-repository item untouched", storedItem, err)
 	}
 }
 

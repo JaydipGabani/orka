@@ -252,7 +252,7 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 	} else if err != nil {
 		return true, 0, err
 	}
-	if reason := repositoryMonitorUpdateBranchMutationMismatch(mutation, command, pr); reason != "" {
+	if reason := repositoryMonitorUpdateBranchMutationMismatch(mutation, command, owner+"/"+repository, pr); reason != "" {
 		return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, reason)
 	}
 	if mutation.Status == repositoryMonitorRunPhaseSucceeded {
@@ -420,9 +420,12 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorUpdateBranchRequiresRecon
 	return mutation.Status == repositoryMonitorUpdateBranchSubmitting || mutation.Status == repositoryMonitorAutomergeStatePending || mutation.Status == repositoryMonitorRunPhaseSucceeded, nil
 }
 
-func repositoryMonitorUpdateBranchMutationMismatch(mutation *store.GitHubMutationRecord, command *store.CommandEvent, pr repositoryMonitorPullRequest) string {
+func repositoryMonitorUpdateBranchMutationMismatch(mutation *store.GitHubMutationRecord, command *store.CommandEvent, repository string, pr repositoryMonitorPullRequest) string {
 	if mutation == nil || command == nil {
 		return "update-branch mutation identity is missing"
+	}
+	if reason := repositoryMonitorCommandRepositoryMismatch(command, repository); reason != "" {
+		return reason
 	}
 	if mutation.CommandEventID != command.ID || mutation.Operation != repositoryMonitorUpdateBranchOperation || mutation.TargetKind != repositoryMonitorPullRequestKind || mutation.TargetNumber != pr.Number {
 		return "update-branch mutation identity does not match the command"
@@ -435,6 +438,13 @@ func repositoryMonitorUpdateBranchMutationMismatch(mutation *store.GitHubMutatio
 	}
 	if mutation.GitHubURL != pr.BaseBranch {
 		return "pull request base branch changed during update"
+	}
+	return ""
+}
+
+func repositoryMonitorCommandRepositoryMismatch(command *store.CommandEvent, repository string) string {
+	if command == nil || strings.TrimSpace(command.Repo) == "" || !strings.EqualFold(strings.TrimSpace(command.Repo), strings.TrimSpace(repository)) {
+		return "update-branch command repository does not match the current monitor repository"
 	}
 	return ""
 }
@@ -464,7 +474,11 @@ func (r *RepositoryMonitorReconciler) reconcileRepositoryMonitorCompletedUpdateB
 	if current == nil {
 		return false, nil
 	}
-	if reason := repositoryMonitorUpdateBranchMutationMismatch(mutation, command, *current); reason != "" {
+	owner, repository, err := repositoryMonitorOwnerRepository(monitor)
+	if err != nil {
+		return true, err
+	}
+	if reason := repositoryMonitorUpdateBranchMutationMismatch(mutation, command, owner+"/"+repository, *current); reason != "" {
 		item, itemErr := r.Store.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, repositoryMonitorPullRequestKind, fmt.Sprintf("%d", current.Number))
 		if itemErr != nil {
 			return false, itemErr
@@ -480,10 +494,6 @@ func (r *RepositoryMonitorReconciler) reconcileRepositoryMonitorCompletedUpdateB
 		projectedPR.BaseSHA = mutation.ExternalID
 		item := repositoryMonitorItemFromPullRequest(monitor, projectedPR, existing)
 		return true, r.completeRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, projectedPR)
-	}
-	owner, repository, err := repositoryMonitorOwnerRepository(monitor)
-	if err != nil {
-		return true, err
 	}
 	verificationBaseSHA := current.BaseSHA
 	if current.Merged {
@@ -579,6 +589,20 @@ func (r *RepositoryMonitorReconciler) terminalizeRepositoryMonitorUpdateBranch(c
 	mutation, err := r.Store.GetGitHubMutationRecord(ctx, monitor.Namespace, repositoryMonitorUpdateBranchMutationID(command.ID))
 	if err != nil && !errorsIsStoreNotFound(err) {
 		return false, err
+	}
+	owner, repository, repositoryErr := repositoryMonitorOwnerRepository(monitor)
+	if repositoryErr != nil {
+		return false, repositoryErr
+	}
+	if repositoryReason := repositoryMonitorCommandRepositoryMismatch(&command, owner+"/"+repository); repositoryReason != "" {
+		if mutation != nil {
+			mutation.Status = repositoryMonitorRunPhaseFailed
+			mutation.Error = repositoryReason
+			if err := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
 	}
 	if mutation != nil && mutation.Status == repositoryMonitorRunPhaseSucceeded {
 		item, itemErr := r.Store.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, repositoryMonitorPullRequestKind, fmt.Sprintf("%d", command.Number))
@@ -735,6 +759,7 @@ func (r *RepositoryMonitorReconciler) createRepositoryMonitorRepairTask(ctx cont
 		Source:           command.Source,
 		HeadSHA:          pr.HeadSHA,
 		BaseSHA:          pr.BaseSHA,
+		BaseBranch:       pr.BaseBranch,
 		Phase:            repositoryMonitorRepairPhaseQueued,
 		RepairCountPR:    repairCountPR,
 		RepairCountHead:  repairCountHead,
@@ -872,7 +897,11 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorHeadContainsBase(
 	if err != nil {
 		return false, err
 	}
-	baseSHA, err := r.fetchRepositoryMonitorBranchHead(ctx, owner, repository, token, effectiveRepositoryMonitorBranch(monitor))
+	baseBranch := strings.TrimSpace(job.BaseBranch)
+	if baseBranch == "" {
+		return false, fmt.Errorf("repair base branch is missing")
+	}
+	baseSHA, err := r.fetchRepositoryMonitorBranchHead(ctx, owner, repository, token, baseBranch)
 	if err != nil {
 		return false, err
 	}
