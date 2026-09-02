@@ -826,6 +826,33 @@ func TestUpdateRepositoryScan_ContextTokenAuthorizesExistingScanBeforeRequestBod
 	require.Equal(t, "https://github.com/sozercan/other", got.Spec.RepoURL)
 }
 
+func TestUpdateRepositoryScanRejectsRepositoryChange(t *testing.T) {
+	provider := newTestOIDCProvider(t)
+	ctxTokenConfig := testContextTokenConfig(t, provider, "")
+	existing := securityAuthzTestRepositoryScan("scan-1", securityTestRepoURL)
+	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeOff, existing)
+
+	bodyBytes, err := json.Marshal(UpdateRepositoryScanRequest{
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:          "https://github.com/sozercan/other",
+			Branch:           "main",
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	})
+	require.NoError(t, err)
+	token := issueTestContextToken(t, provider, nil, map[string]any{"scope": ContextTokenScopeSecurityWrite})
+	req := httptest.NewRequest(http.MethodPut, "/security/repositories/scan-1?namespace=demo", strings.NewReader(string(bodyBytes)))
+	req.Header.Set(TransactionTokenHeaderName, token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusConflict, resp.StatusCode)
+
+	var got corev1alpha1.RepositoryScan
+	require.NoError(t, handlers.client.Get(context.Background(), clientObjectKey("scan-1"), &got))
+	require.Equal(t, securityTestRepoURL, got.Spec.RepoURL)
+}
+
 func TestListRepositoryScans_ContextTokenFiltersMismatchedScansInEnforceMode(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")

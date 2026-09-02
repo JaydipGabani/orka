@@ -647,6 +647,9 @@ func (h *Handlers) UpdateRepositoryScan(c fiber.Ctx) error {
 	if req.Spec.AnalysisAgentRef.Name == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "spec.analysisAgentRef.name is required")
 	}
+	if req.Spec.RepoURL != scan.Spec.RepoURL {
+		return fiber.NewError(fiber.StatusConflict, "spec.repoURL is immutable; create a new repository scan for a different repository")
+	}
 
 	h.normalizeRepositoryScanSpec(&req.Spec)
 	if err := h.authorizeContextTokenRepositoryScanPolicyRefs(c, "updateRepositoryScanPolicy", namespace, req.Spec); err != nil {
