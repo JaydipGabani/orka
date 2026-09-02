@@ -4952,6 +4952,7 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 	securityStore := setupControllerSQLiteStore(t)
 	pullRequests := map[int]int{}
 	compareRequests := map[string]int{}
+	var concurrentDecisionErr error
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer forge-token-value" {
 			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
@@ -4975,11 +4976,7 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		pullRequests[prNumber]++
 		switch prNumber {
 		case 42:
-			_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)
-		case 47:
-			if err := securityStore.UpdateFindingState(ctx, defaultNS, "fnd_concurrent_decision", "dismissed"); err != nil {
-				t.Fatalf("UpdateFindingState(concurrent decision) error = %v", err)
-			}
+			concurrentDecisionErr = securityStore.UpdateFindingState(ctx, defaultNS, "fnd_concurrent_decision", "dismissed")
 			_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)
 		case 43:
 			_, _ = w.Write([]byte(`{"merged":false,"merged_at":null,"base":{"ref":"main"}}`))
@@ -5033,7 +5030,7 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		newFinding("fnd_observed", run.ID, 44),
 		newFinding("fnd_wrong_base", "scan_old", 45),
 		newFinding("fnd_merge_after_scan", "scan_old", 46),
-		newFinding("fnd_concurrent_decision", "scan_old", 47),
+		newFinding("fnd_concurrent_decision", "scan_old", 42),
 	} {
 		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
 			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
@@ -5048,13 +5045,12 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		if err != nil || finding.State != want {
 			t.Fatalf("finding %s = %#v, err %v, want state %s", id, finding, err, want)
 		}
-		if id == "fnd_concurrent_decision" && finding.DecisionAt.IsZero() {
-			t.Fatalf("finding %s decision timestamp was cleared", id)
-		}
 	}
-	if pullRequests[42] != 1 || pullRequests[43] != 1 || pullRequests[44] != 0 || pullRequests[45] != 1 || pullRequests[46] != 1 || pullRequests[47] != 1 ||
-		compareRequests[testRepositoryScanMergeSHA+"..."+testRepositoryScanHeadSHA] != 2 || compareRequests[testRepositoryScanLateMerge+"..."+testRepositoryScanHeadSHA] != 1 {
-		t.Fatalf("pull request reads = %#v, comparisons = %#v", pullRequests, compareRequests)
+	concurrentFinding, concurrentFindingErr := securityStore.GetFinding(ctx, defaultNS, "fnd_concurrent_decision")
+	if pullRequests[42] != 1 || pullRequests[43] != 1 || pullRequests[44] != 0 || pullRequests[45] != 1 || pullRequests[46] != 1 ||
+		compareRequests[testRepositoryScanMergeSHA+"..."+testRepositoryScanHeadSHA] != 1 || compareRequests[testRepositoryScanLateMerge+"..."+testRepositoryScanHeadSHA] != 1 ||
+		concurrentDecisionErr != nil || concurrentFindingErr != nil || concurrentFinding.DecisionAt.IsZero() {
+		t.Fatalf("pull request reads = %#v, comparisons = %#v, concurrent decision error = %v, concurrent finding = %#v, finding error = %v", pullRequests, compareRequests, concurrentDecisionErr, concurrentFinding, concurrentFindingErr)
 	}
 }
 
