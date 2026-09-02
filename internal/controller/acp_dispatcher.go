@@ -1412,9 +1412,12 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 				// workspace capability) after an earlier send. Adopt the session
 				// the earlier send created when the runtime still reports it
 				// admissible instead of failing a usable attempt.
+				// The earlier send is allowed the full creation budget, so the
+				// adoption window matches it: a session still creating past it
+				// is as failed as a create call that timed out would be.
 				adopted, adoptErr := reconcileRuntimeSessionCreateDigestConflict(
-					context.WithoutCancel(ctx), runtimeClient, createRequest.RuntimeSessionID,
-					runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, runtimeSessionCreateAdoptionTimeout,
+					runtimeCtx, runtimeClient, createRequest.RuntimeSessionID,
+					runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, runtimeSessionCreateTimeout(target),
 				)
 				if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
 					return deadlineErr
@@ -1428,7 +1431,8 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 					logf.FromContext(ctx).Info(
 						"ACP RuntimeSession adoption after create digest conflict failed",
 						"namespace", task.Namespace, "task", task.Name,
-						"runtimeSessionGeneration", runtimeFence.RuntimeSessionGeneration, "diagnostic", adoptErr.Error(),
+						"runtimeSessionGeneration", runtimeFence.RuntimeSessionGeneration,
+						"inconclusive", errors.Is(adoptErr, errRuntimeSessionAdoptionInconclusive), "diagnostic", adoptErr.Error(),
 					)
 				}
 				if adopted {
@@ -1440,8 +1444,10 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 					created = true
 				} else {
 					// The runtime holds a record for this create identity but no
-					// admissible session: the record is a deletion tombstone or
-					// the session settled in an unusable state.
+					// admissible session: the record is a deletion tombstone, the
+					// session settled in an unusable state, or it never became
+					// admissible within its own creation budget. The deferred
+					// task-scoped cleanup retires whatever is resident.
 					retrying, handleErr := d.handlePrePromptClientError(ctx, task, attemptID, fence, err)
 					if !retrying {
 						endSessionTrace(err)
@@ -1453,14 +1459,15 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 				var reconcileErr error
 				if digestConflict {
 					admitted, reconcileErr = reconcileRuntimeSessionCreateDigestConflict(
-						context.WithoutCancel(ctx), runtimeClient, createRequest.RuntimeSessionID,
-						runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, runtimeSessionCreateAdoptionTimeout,
+						runtimeCtx, runtimeClient, createRequest.RuntimeSessionID,
+						runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, runtimeSessionCreateTimeout(target),
 					)
 					if reconcileErr == nil && !admitted {
 						// The record is a deletion tombstone: this generation can
 						// never be recreated, and planned-session reconciliation
 						// only advances the generation for reused sessions, so a
-						// requeue would rebuild the same conflict forever.
+						// requeue would rebuild the same conflict forever. An
+						// inconclusive window is an error and requeues below.
 						retrying, handleErr := d.handlePrePromptClientError(ctx, task, attemptID, fence, err)
 						if !retrying {
 							endSessionTrace(err)
@@ -2534,10 +2541,11 @@ func waitForRuntimeSessionAdmission(
 	return waitForRuntimeSessionAdmissionState(ctx, runtimeClient, sessionID, sessionUID, generation, timeout, false)
 }
 
-// runtimeSessionCreateAdoptionTimeout bounds how long a digest-conflicted
-// create waits for the runtime to finish creating the session an earlier send
-// of the same attempt started.
-const runtimeSessionCreateAdoptionTimeout = 10 * time.Second
+// errRuntimeSessionAdoptionInconclusive reports that the runtime did not
+// confirm, within the adoption window, whether the session an earlier send
+// created is admissible: status stayed unavailable or the session was still
+// creating when the window closed. Callers must not read it as absence.
+var errRuntimeSessionAdoptionInconclusive = errors.New("RuntimeSession adoption is inconclusive")
 
 // reconcileRuntimeSessionCreateDigestConflict resolves a digest_conflict answer
 // to create-session. The runtime already holds an operation record for this
@@ -2545,7 +2553,9 @@ const runtimeSessionCreateAdoptionTimeout = 10 * time.Second
 // there: the session is adopted when the runtime reports the exact generation
 // admissible, waited for while it is still creating, and reported absent
 // without polling when the record is a deletion tombstone, because a
-// tombstoned generation can never reappear.
+// tombstoned generation can never reappear. (false, nil) therefore means
+// confirmed absence; an unfinished window returns
+// errRuntimeSessionAdoptionInconclusive.
 func reconcileRuntimeSessionCreateDigestConflict(
 	ctx context.Context,
 	runtimeClient *harnessv2.Client,
@@ -2578,6 +2588,9 @@ func waitForRuntimeSessionAdmissionState(
 		} else if observed == nil && absentIsFinal {
 			return false, nil
 		} else if observed != nil {
+			if absentIsFinal {
+				lastStatusErr = nil
+			}
 			if observed.RuntimeSessionID != sessionID || observed.Generation != generation {
 				return false, fmt.Errorf("%w: RuntimeSession status resolved to a different generation", store.ErrConflict)
 			}
@@ -2588,6 +2601,9 @@ func waitForRuntimeSessionAdmissionState(
 				lastStatusErr = nil
 				select {
 				case <-waitCtx.Done():
+					if absentIsFinal {
+						return false, fmt.Errorf("%w: RuntimeSession was still creating when the adoption window closed", errRuntimeSessionAdoptionInconclusive)
+					}
 					return false, nil
 				case <-ticker.C:
 					continue
@@ -2597,6 +2613,12 @@ func waitForRuntimeSessionAdmissionState(
 		}
 		select {
 		case <-waitCtx.Done():
+			if absentIsFinal {
+				if lastStatusErr != nil {
+					return false, fmt.Errorf("%w: %w", errRuntimeSessionAdoptionInconclusive, lastStatusErr)
+				}
+				return false, fmt.Errorf("%w: RuntimeSession status was not observed before the adoption window closed", errRuntimeSessionAdoptionInconclusive)
+			}
 			if lastStatusErr != nil {
 				return false, lastStatusErr
 			}

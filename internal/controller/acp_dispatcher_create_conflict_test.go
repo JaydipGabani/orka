@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -130,6 +131,30 @@ func TestReconcileRuntimeSessionCreateDigestConflict(t *testing.T) {
 		adopted, err := reconcileRuntimeSessionCreateDigestConflict(ctx, newClient(t, descriptor(harnessv2.RuntimeSessionStateIdle, 3)), sessionID, sessionUID, 2, 5*time.Second)
 		if adopted || err == nil {
 			t.Fatalf("adopted=%v err=%v, want generation conflict", adopted, err)
+		}
+	})
+	t.Run("reports a session still creating at window close as inconclusive", func(t *testing.T) {
+		adopted, err := reconcileRuntimeSessionCreateDigestConflict(ctx, newClient(t, descriptor(harnessv2.RuntimeSessionStateCreating, 2)), sessionID, sessionUID, 2, 600*time.Millisecond)
+		if adopted || !errors.Is(err, errRuntimeSessionAdoptionInconclusive) {
+			t.Fatalf("adopted=%v err=%v, want inconclusive", adopted, err)
+		}
+	})
+	t.Run("reports unavailable status as inconclusive instead of absent", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(server.Close)
+		runtimeClient, err := harnessv2.NewClient(
+			server.URL, harnessv2.WithControllerBearerToken(strings.Repeat("t", 32)),
+			harnessv2.WithOperationCapabilitySecret([]byte(strings.Repeat("s", 32))),
+			harnessv2.WithStatusCapabilityBinding(harnessv2.StatusCapabilityBinding{RuntimeProfileDigest: digest, RuntimeInstanceID: "pod-uid.boot-id"}),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adopted, err := reconcileRuntimeSessionCreateDigestConflict(ctx, runtimeClient, sessionID, sessionUID, 2, 600*time.Millisecond)
+		if adopted || !errors.Is(err, errRuntimeSessionAdoptionInconclusive) {
+			t.Fatalf("adopted=%v err=%v, want inconclusive", adopted, err)
 		}
 	})
 	t.Run("rejects a session settled in a non-admissible state", func(t *testing.T) {
