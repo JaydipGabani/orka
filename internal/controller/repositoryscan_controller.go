@@ -2134,7 +2134,7 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 	finding.ID = existing.ID
 	finding.Fingerprint = existing.Fingerprint
 	finding.CreatedAt = existing.CreatedAt
-	reopened := existing.State == findingStateFixed || existing.State == findingStateResolved
+	reopened := findingRemediationTerminalState(existing.State)
 	if reopened {
 		finding.State = findingStateOpen
 	} else if existing.State != "" && existing.State != findingStateOpen {
@@ -2279,7 +2279,10 @@ func mergeFindingEvidenceAndRemediation(target, candidate *store.Finding) {
 	if candidate.DuplicateOf != "" {
 		return
 	}
-	if target.PatchProposalID == "" || findingWorkflowStateRank(candidate.State) > findingWorkflowStateRank(target.State) {
+	targetWorkflowRank := findingWorkflowStateRank(target.State)
+	candidateWorkflowRank := findingWorkflowStateRank(candidate.State)
+	terminalProjectionOntoActiveFinding := findingRemediationTerminalState(candidate.State) && targetWorkflowRank > 0
+	if !terminalProjectionOntoActiveFinding && (target.PatchProposalID == "" || candidateWorkflowRank > targetWorkflowRank) {
 		target.PatchProposalID = candidate.PatchProposalID
 		target.PRNumber = candidate.PRNumber
 		target.PRURL = candidate.PRURL
@@ -2292,6 +2295,15 @@ func mergeFindingEvidenceAndRemediation(target, candidate *store.Finding) {
 		target.State = candidate.State
 	}
 	mergeFindingValidationState(target, candidate)
+}
+
+func findingRemediationTerminalState(state string) bool {
+	switch strings.TrimSpace(state) {
+	case findingStateFixed, findingStateResolved:
+		return true
+	default:
+		return false
+	}
 }
 
 func findingUserFinalState(state string) bool {

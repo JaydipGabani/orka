@@ -4153,6 +4153,95 @@ func TestMergeExistingFindingReopensResolvedFindingWithoutRemediationProjection(
 	}
 }
 
+func TestMergeExistingFindingDoesNotProjectTerminalDuplicateRemediationOntoActiveCanonical(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
+	scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}}
+	created := mustParseTime(t, "2026-08-01T00:00:00Z")
+	prNumber := 42
+	canonical := &storepkg.Finding{
+		ID:               "fnd_active_canonical",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_old",
+		Fingerprint:      "active-canonical",
+		Title:            "Archive extraction permits traversal",
+		Category:         "path traversal",
+		Summary:          "active occurrence",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusValidated,
+		State:            findingStateOpen,
+		FilePath:         "archive.go",
+		Line:             100,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 100, EndLine: 108, Symbol: "extractArchive"}},
+		CreatedAt:        created,
+	}
+	resolved := &storepkg.Finding{
+		ID:               "fnd_resolved_duplicate",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_middle",
+		Fingerprint:      "resolved-duplicate",
+		Title:            "ZIP entries can escape the destination",
+		Category:         "CWE-22 path traversal",
+		Summary:          "resolved occurrence",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusValidated,
+		State:            findingStateResolved,
+		FilePath:         "archive.go",
+		Line:             103,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 103, EndLine: 111, Symbol: "extractArchive"}},
+		PatchProposalID:  "patch-old",
+		PRNumber:         &prNumber,
+		PRURL:            "https://github.com/example/kaset/pull/42",
+		CreatedAt:        created.Add(time.Hour),
+	}
+	for _, finding := range []*storepkg.Finding{canonical, resolved} {
+		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
+		}
+	}
+
+	incoming := &storepkg.Finding{
+		ID:               "fnd_current_observation",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_current",
+		Fingerprint:      "current-observation",
+		Title:            "Untrusted ZIP paths escape the extraction root",
+		Category:         "ZIP path traversal",
+		Summary:          "current occurrence",
+		Severity:         "critical",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusValidated,
+		State:            findingStateOpen,
+		FilePath:         "archive.go",
+		Line:             105,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 105, EndLine: 113, Symbol: "extractArchive"}},
+	}
+	if err := reconciler.mergeExistingFinding(ctx, scan, incoming); err != nil {
+		t.Fatalf("mergeExistingFinding() error = %v", err)
+	}
+	if incoming.ID != canonical.ID || incoming.State != findingStateOpen || incoming.PatchProposalID != "" || incoming.PRNumber != nil || incoming.PRURL != "" {
+		t.Fatalf("incoming finding = %#v, want active canonical without terminal remediation", incoming)
+	}
+	if err := securityStore.UpsertObservedFinding(ctx, incoming); err != nil {
+		t.Fatalf("UpsertObservedFinding(incoming) error = %v", err)
+	}
+
+	stored, err := securityStore.GetFinding(ctx, defaultNS, canonical.ID)
+	if err != nil || stored.State != findingStateOpen || stored.PatchProposalID != "" || stored.PRNumber != nil || stored.PRURL != "" {
+		t.Fatalf("stored canonical = %#v, err %v", stored, err)
+	}
+	alias, err := securityStore.GetFinding(ctx, defaultNS, resolved.ID)
+	if err != nil || alias.DuplicateOf != canonical.ID {
+		t.Fatalf("resolved alias = %#v, err %v", alias, err)
+	}
+}
+
 func TestMergeExistingFindingPreservesTerminalValidationFromSemanticMatch(t *testing.T) {
 	for _, validationStatus := range []string{findingValidationStatusFailed, findingValidationStatusSkipped} {
 		t.Run(validationStatus, func(t *testing.T) {
