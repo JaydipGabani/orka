@@ -2580,6 +2580,25 @@ func TestRuntimePoolReconcilerRetiredImageDrainsAndStops(t *testing.T) {
 		}
 	})
 
+	t.Run("leftover Pods without a Deployment withhold Stopped", func(t *testing.T) {
+		scheme := runtimePoolTestScheme(t)
+		pool := runtimePoolTestObject(1)
+		orphan := runtimePoolReadyPod(pool, pool.Namespace, "orphan-pod", "orphan-pod-uid", "10.0.0.95")
+		r := runtimePoolTestReconciler(t, scheme, &fakeRuntimePoolSupervisorClient{}, pool, &orphan)
+		r.AllowedImages.Codex = "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
+		runtimePoolReconcile(t, r, pool)
+		status := runtimePoolTestGetPool(t, r, pool).Status
+		if status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopping || status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
+			status.ActiveInstance != nil || status.CurrentReplicas != 1 || !strings.Contains(status.Message, "without a Deployment") {
+			t.Fatalf("orphaned-Pod status = %#v, want Stopping/Closed while the leftover Pod lives", status)
+		}
+		if err := r.Delete(context.Background(), &orphan); err != nil {
+			t.Fatalf("delete leftover runtime Pod: %v", err)
+		}
+		runtimePoolReconcile(t, r, pool)
+		runtimePoolTestAssertRetiredStopped(t, r, pool, retiredMessage)
+	})
+
 	t.Run("pool without a workload reports Stopped immediately", func(t *testing.T) {
 		scheme := runtimePoolTestScheme(t)
 		pool := runtimePoolTestObject(1)

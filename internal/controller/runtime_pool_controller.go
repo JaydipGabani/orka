@@ -561,11 +561,22 @@ func (r *RuntimePoolReconciler) reconcileRetiredImageRuntimePool(
 	status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
 	r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionAdmissionReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonAdmissionClosed, message)
 
-	if deployment == nil || (ptr.Deref(deployment.Spec.Replicas, 0) == 0 && len(pods) == 0) {
+	if len(pods) == 0 && (deployment == nil || ptr.Deref(deployment.Spec.Replicas, 0) == 0) {
 		status.ActiveInstance = nil
 		status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopped
 		status.Message = message + "; the retired runtime workload is stopped"
 		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionSchedulingReady, metav1.ConditionUnknown, "ScaledToZero", status.Message)
+		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonRolloutFailed, status.Message)
+		return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
+	}
+	if deployment == nil {
+		// Owned Pods outlive a background-deleted Deployment briefly, and an
+		// orphaned ReplicaSet can keep them indefinitely. Neither proves the
+		// retired workload is gone, so Stopped is withheld until they are.
+		status.ActiveInstance = nil
+		status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopping
+		status.Message = fmt.Sprintf("%s; waiting for %d retired runtime Pods without a Deployment to terminate", message, len(pods))
+		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionSchedulingReady, metav1.ConditionUnknown, runtimePoolSchedulingReasonPodNotReady, status.Message)
 		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonRolloutFailed, status.Message)
 		return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
 	}
