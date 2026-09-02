@@ -8104,6 +8104,45 @@ func TestRepositoryMonitorUpdateBranchRequeuesAcceptedMutationAfterCancellation(
 	}
 }
 
+func TestRepositoryMonitorUpdateBranchRequeuesSucceededMutationAfterCancellation(t *testing.T) {
+	ctx := context.Background()
+	monitorStore := setupControllerSQLiteStore(t)
+	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "update-branch-cancelled-succeeded", Namespace: defaultNS}}
+	command := &store.CommandEvent{ID: "cmd-update-cancelled-succeeded", MonitorNamespace: defaultNS, MonitorName: monitor.Name, Kind: repositoryMonitorPullRequestKind, Number: 42, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "old-head-sha", Status: "accepted", CreatedAt: time.Now()}
+	if err := monitorStore.CreateCommandEvent(ctx, command); err != nil {
+		t.Fatalf("CreateCommandEvent() error = %v", err)
+	}
+	completedAt := time.Now()
+	runID := repositoryMonitorCommandRunIDFromCommand(command.ID)
+	if err := monitorStore.CreateMonitorRun(ctx, &store.MonitorRun{ID: runID, MonitorNamespace: defaultNS, MonitorName: monitor.Name, CommandEventID: command.ID, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, Phase: repositoryMonitorRunPhaseSucceeded, StartedAt: completedAt.Add(-time.Minute), CompletedAt: &completedAt}); err != nil {
+		t.Fatalf("CreateMonitorRun() error = %v", err)
+	}
+	if err := monitorStore.UpsertMonitorItem(ctx, &store.MonitorItem{MonitorNamespace: defaultNS, MonitorName: monitor.Name, Kind: command.Kind, ItemKey: "42", Number: command.Number, HeadSHA: command.HeadSHA, RepairState: repositoryMonitorRepairPhaseQueued}); err != nil {
+		t.Fatalf("UpsertMonitorItem() error = %v", err)
+	}
+	if err := monitorStore.CreateGitHubMutationRecord(ctx, &store.GitHubMutationRecord{ID: repositoryMonitorUpdateBranchMutationID(command.ID), MonitorNamespace: defaultNS, MonitorName: monitor.Name, RunID: runID, CommandEventID: command.ID, Operation: repositoryMonitorUpdateBranchOperation, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, Status: repositoryMonitorRunPhaseSucceeded, CreatedAt: completedAt}); err != nil {
+		t.Fatalf("CreateGitHubMutationRecord() error = %v", err)
+	}
+	actionID := store.RepositoryMonitorWorkActionID(command.ID, command.Intent)
+	if err := monitorStore.CreateWorkAction(ctx, &store.WorkAction{ID: actionID, MonitorNamespace: defaultNS, MonitorName: monitor.Name, RunID: runID, CommandEventID: command.ID, DesiredAction: command.Intent, Status: repositoryMonitorWorkActionStatusCancelled, Phase: repositoryMonitorWorkActionStatusCancelled, CreatedAt: command.CreatedAt, CompletedAt: &completedAt}); err != nil {
+		t.Fatalf("CreateWorkAction() error = %v", err)
+	}
+
+	reconciler := &RepositoryMonitorReconciler{Store: monitorStore}
+	handled, reset, err := reconciler.ensureNoExistingCommandRunBlocksQueue(ctx, monitor, *command, runID)
+	if err != nil || !handled || !reset {
+		t.Fatalf("ensureNoExistingCommandRunBlocksQueue() = handled %v, reset %v, err %v", handled, reset, err)
+	}
+	storedRun, err := monitorStore.GetMonitorRun(ctx, defaultNS, runID)
+	if err != nil || storedRun.Phase != repositoryMonitorRunPhaseQueued || storedRun.CompletedAt != nil {
+		t.Fatalf("stored run = %#v, err %v, want queued for success projection", storedRun, err)
+	}
+	storedCommand, err := monitorStore.GetCommandEvent(ctx, defaultNS, command.ID)
+	if err != nil || storedCommand.Status != "accepted" || storedCommand.ProcessedAt != nil {
+		t.Fatalf("stored command = %#v, err %v, want accepted until success is projected", storedCommand, err)
+	}
+}
+
 func TestRepositoryMonitorUpdateBranchReconcilesAcceptedMutationBeforeBlockedLabel(t *testing.T) {
 	ctx := context.Background()
 	monitorStore := setupControllerSQLiteStore(t)

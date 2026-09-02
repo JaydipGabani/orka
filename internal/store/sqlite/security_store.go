@@ -585,14 +585,15 @@ func (s *Store) upsertFinding(ctx context.Context, finding *store.Finding, obser
 
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO security_findings
-		 (id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, title, category, summary, severity, confidence, triage,
+		 (id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, target_key, title, category, summary, severity, confidence, triage,
 			  validation_status, state, decision_at, duplicate_of, file_path, line, commit_sha, root_cause, reproduction, remediation, suggested_action,
 		  why_tests_do_not_cover, suggested_regression_test, minimum_fix_scope, evidence_json, validation_json, patch_proposal_id,
 		  pr_number, pr_url, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(namespace, repository_scan, fingerprint) DO UPDATE SET
 		   scan_run_id = excluded.scan_run_id,
 		   slice_id = excluded.slice_id,
+		   target_key = CASE WHEN excluded.target_key != '' THEN excluded.target_key ELSE security_findings.target_key END,
 		   title = excluded.title,
 		   category = excluded.category,
 		   summary = excluded.summary,
@@ -730,7 +731,7 @@ func (s *Store) upsertFinding(ctx context.Context, finding *store.Finding, obser
 		     ELSE security_findings.pr_url
 		   END,
 		   updated_at = excluded.updated_at`,
-		finding.ID, finding.Namespace, finding.RepositoryScan, finding.ScanRunID, finding.SliceID, finding.Fingerprint,
+		finding.ID, finding.Namespace, finding.RepositoryScan, finding.ScanRunID, finding.SliceID, finding.Fingerprint, finding.TargetKey,
 		finding.Title, finding.Category, finding.Summary, finding.Severity, finding.Confidence, finding.Triage,
 		finding.ValidationStatus, finding.State, nullableTime(&finding.DecisionAt), finding.DuplicateOf, finding.FilePath, finding.Line, finding.CommitSHA, finding.RootCause,
 		finding.Reproduction, finding.Remediation, finding.SuggestedAction, finding.WhyTestsDoNotAlreadyCoverThis,
@@ -749,7 +750,7 @@ func scanFinding(scanner interface {
 		decisionAtSQL sql.NullTime
 	)
 	err := scanner.Scan(
-		&finding.ID, &finding.Namespace, &finding.RepositoryScan, &finding.ScanRunID, &finding.SliceID, &finding.Fingerprint,
+		&finding.ID, &finding.Namespace, &finding.RepositoryScan, &finding.ScanRunID, &finding.SliceID, &finding.Fingerprint, &finding.TargetKey,
 		&finding.Title, &finding.Category, &finding.Summary, &finding.Severity, &finding.Confidence, &finding.Triage,
 		&finding.ValidationStatus, &finding.State, &decisionAtSQL, &finding.DuplicateOf, &finding.FilePath, &finding.Line, &finding.CommitSHA, &finding.RootCause,
 		&finding.Reproduction, &finding.Remediation, &finding.SuggestedAction, &finding.WhyTestsDoNotAlreadyCoverThis,
@@ -772,7 +773,7 @@ func scanFinding(scanner interface {
 // GetFinding returns a finding by ID.
 func (s *Store) GetFinding(ctx context.Context, namespace, id string) (*store.Finding, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, title, category, summary, severity,
+		`SELECT id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, target_key, title, category, summary, severity,
 		        confidence, triage, validation_status, state, decision_at, duplicate_of, file_path, line, commit_sha, root_cause, reproduction,
 		        remediation, suggested_action, why_tests_do_not_cover, suggested_regression_test, minimum_fix_scope,
 		        evidence_json, validation_json, patch_proposal_id, pr_number, pr_url, created_at, updated_at
@@ -801,7 +802,7 @@ func (s *Store) ListFindings(ctx context.Context, filter store.FindingFilter) ([
 	}
 
 	query := strings.Builder{}
-	query.WriteString(`SELECT id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, title, category, summary, severity,
+	query.WriteString(`SELECT id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, target_key, title, category, summary, severity,
 		confidence, triage, validation_status, state, decision_at, duplicate_of, file_path, line, commit_sha, root_cause, reproduction,
 		remediation, suggested_action, why_tests_do_not_cover, suggested_regression_test, minimum_fix_scope,
 		evidence_json, validation_json, patch_proposal_id, pr_number, pr_url, created_at, updated_at

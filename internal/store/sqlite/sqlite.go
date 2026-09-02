@@ -330,6 +330,7 @@ func migrate(db *sql.DB) error {
 			scan_run_id       TEXT NOT NULL,
 			slice_id          TEXT NOT NULL DEFAULT '',
 			fingerprint       TEXT NOT NULL,
+			target_key        TEXT NOT NULL DEFAULT '',
 			title             TEXT NOT NULL,
 			category          TEXT NOT NULL DEFAULT '',
 			summary           TEXT NOT NULL,
@@ -1065,6 +1066,7 @@ func migrate(db *sql.DB) error {
 	}
 	if err := ensureSQLiteColumns(db, "security_findings", []sqliteColumnMigration{
 		{Name: "slice_id", Definition: "slice_id TEXT NOT NULL DEFAULT ''"},
+		{Name: "target_key", Definition: "target_key TEXT NOT NULL DEFAULT ''"},
 		{Name: "category", Definition: "category TEXT NOT NULL DEFAULT ''"},
 		{Name: "triage", Definition: "triage TEXT NOT NULL DEFAULT ''"},
 		{Name: "reproduction", Definition: "reproduction TEXT NOT NULL DEFAULT ''"},

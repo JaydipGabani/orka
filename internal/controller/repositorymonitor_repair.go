@@ -151,11 +151,11 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestCommandRun(ctx contex
 		}
 		return true, 0, nil
 	case repositoryMonitorCommandIntentUpdateBranch:
-		accepted, err := r.repositoryMonitorUpdateBranchAccepted(ctx, monitor, command.ID)
+		reconcile, err := r.repositoryMonitorUpdateBranchRequiresReconciliation(ctx, monitor, command.ID)
 		if err != nil {
 			return true, 0, err
 		}
-		if !accepted {
+		if !reconcile {
 			if blockedLabel := repositoryMonitorBlockedLabel(monitor.Spec, pr.Labels); blockedLabel != "" {
 				item.RepairState = repositoryMonitorRepairPhaseFailed
 				item.SkipReason = repositoryMonitorSkipReasonBlockedLabel
@@ -343,7 +343,7 @@ func repositoryMonitorUpdateBranchMutationID(commandID string) string {
 	return "ghmut-" + repositoryMonitorShortHash(commandID+"-update-branch")
 }
 
-func (r *RepositoryMonitorReconciler) repositoryMonitorUpdateBranchAccepted(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, commandID string) (bool, error) {
+func (r *RepositoryMonitorReconciler) repositoryMonitorUpdateBranchRequiresReconciliation(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, commandID string) (bool, error) {
 	mutation, err := r.Store.GetGitHubMutationRecord(ctx, monitor.Namespace, repositoryMonitorUpdateBranchMutationID(commandID))
 	if errorsIsStoreNotFound(err) {
 		return false, nil
@@ -351,7 +351,7 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorUpdateBranchAccepted(ctx 
 	if err != nil {
 		return false, err
 	}
-	return mutation.Status == repositoryMonitorAutomergeStatePending, nil
+	return mutation.Status == repositoryMonitorAutomergeStatePending || mutation.Status == repositoryMonitorRunPhaseSucceeded, nil
 }
 
 func repositoryMonitorUpdateBranchMutationMismatch(mutation *store.GitHubMutationRecord, command *store.CommandEvent, pr repositoryMonitorPullRequest) string {

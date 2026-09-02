@@ -61,6 +61,7 @@ type Finding struct {
 	ScanTaskName                  string               `json:"scanTaskName,omitempty"`
 	SliceID                       string               `json:"sliceID,omitempty"`
 	Fingerprint                   string               `json:"fingerprint"`
+	TargetKey                     string               `json:"-"`
 	Title                         string               `json:"title"`
 	Category                      string               `json:"category,omitempty"`
 	Summary                       string               `json:"summary"`

@@ -472,6 +472,36 @@ func TestUpsertFindingPreservesMostAdvancedStateAndPRMetadata(t *testing.T) {
 	}
 }
 
+func TestFindingTargetKeyRoundTrips(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	finding := &store.Finding{
+		ID:               "fnd-target-key",
+		Namespace:        "ns1",
+		RepositoryScan:   "repo1",
+		ScanRunID:        "scan-1",
+		Fingerprint:      "fingerprint-target-key",
+		TargetKey:        "v1:target-key",
+		Title:            "Branch-specific finding",
+		Summary:          "summary",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: "validated",
+		State:            testStateOpen,
+	}
+	if err := s.UpsertFinding(ctx, finding); err != nil {
+		t.Fatalf("UpsertFinding() error = %v", err)
+	}
+
+	got, err := s.GetFinding(ctx, finding.Namespace, finding.ID)
+	if err != nil {
+		t.Fatalf("GetFinding() error = %v", err)
+	}
+	if got.TargetKey != finding.TargetKey {
+		t.Fatalf("TargetKey = %q, want %q", got.TargetKey, finding.TargetKey)
+	}
+}
+
 func TestUpsertFindingAllowsPendingValidationToBecomeTerminal(t *testing.T) {
 	for _, tc := range []struct {
 		status         string

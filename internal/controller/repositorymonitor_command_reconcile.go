@@ -213,8 +213,8 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorCommandWorkActionTerminal
 		return false, err
 	}
 	if action.Status == repositoryMonitorWorkActionStatusCancelled && command.Intent == repositoryMonitorCommandIntentUpdateBranch {
-		accepted, err := r.repositoryMonitorUpdateBranchAccepted(ctx, monitor, command.ID)
-		if err != nil || accepted {
+		reconcile, err := r.repositoryMonitorUpdateBranchRequiresReconciliation(ctx, monitor, command.ID)
+		if err != nil || reconcile {
 			return false, err
 		}
 	}

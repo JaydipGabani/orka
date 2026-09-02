@@ -2107,7 +2107,11 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 	matchTarget := finding
 	excludedIDs := []string(nil)
 	if existing != nil {
-		matchTarget = existing
+		matchTargetCopy := *existing
+		if strings.TrimSpace(finding.TargetKey) != "" {
+			matchTargetCopy.TargetKey = finding.TargetKey
+		}
+		matchTarget = &matchTargetCopy
 		excludedIDs = []string{exactFindingID, existing.ID}
 	}
 	matches, matchErr := r.semanticFindingMatches(ctx, scan, matchTarget, excludedIDs...)
@@ -2184,6 +2188,7 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 		}
 	}
 	matchesByID := map[string]store.Finding{}
+	targetKey := strings.TrimSpace(finding.TargetKey)
 	cursor := ""
 	for {
 		candidates, next, err := r.SecurityStore.ListFindings(ctx, store.FindingFilter{
@@ -2202,11 +2207,15 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 			if _, skip := excluded[candidate.ID]; skip {
 				continue
 			}
+			if !findingTargetKeyMatches(targetKey, candidate.TargetKey) {
+				continue
+			}
 			if findingIdentityMatchScore(finding, &candidate) < 2 {
 				continue
 			}
 			family := []store.Finding{candidate}
 			seenAliases := map[string]struct{}{}
+			targetMatches := true
 			for strings.TrimSpace(candidate.DuplicateOf) != "" {
 				if _, seen := seenAliases[candidate.ID]; seen {
 					return nil, fmt.Errorf("finding duplicate chain contains a cycle at %s", candidate.ID)
@@ -2219,8 +2228,15 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 				if canonical.RepositoryScan != scan.Name {
 					return nil, fmt.Errorf("finding duplicate %s points outside repository scan %s", candidate.ID, scan.Name)
 				}
+				if !findingTargetKeyMatches(targetKey, canonical.TargetKey) {
+					targetMatches = false
+					break
+				}
 				candidate = *canonical
 				family = append(family, candidate)
+			}
+			if !targetMatches {
+				continue
 			}
 			if findingIdentityMatchScore(finding, &candidate) < 2 {
 				continue
@@ -2245,6 +2261,10 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 		return strings.Compare(a.ID, b.ID)
 	})
 	return matches, nil
+}
+
+func findingTargetKeyMatches(targetKey, candidateTargetKey string) bool {
+	return targetKey == "" || strings.TrimSpace(candidateTargetKey) == targetKey
 }
 
 func canonicalFinding(matches []store.Finding) *store.Finding {

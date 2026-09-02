@@ -3957,6 +3957,68 @@ func TestMergeExistingFindingCollapsesSemanticDuplicatesForExistingFingerprint(t
 	}
 }
 
+func TestMergeExistingFindingKeepsDifferentScanTargetsIndependent(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
+	scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}}
+	mainTarget := security.FindingV2TargetKey("https://github.com/example/kaset", "main", "")
+	releaseTarget := security.FindingV2TargetKey("https://github.com/example/kaset", "release", "")
+	existing := &storepkg.Finding{
+		ID:               "fnd_main_branch",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_main",
+		Fingerprint:      "main-fingerprint",
+		TargetKey:        mainTarget,
+		Title:            "Archive extraction permits traversal",
+		Category:         "path traversal",
+		Summary:          "main branch occurrence",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusValidated,
+		State:            findingStateOpen,
+		FilePath:         "archive.go",
+		Line:             100,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 100, EndLine: 108, Symbol: "extractArchive"}},
+	}
+	if err := securityStore.UpsertFinding(ctx, existing); err != nil {
+		t.Fatalf("UpsertFinding(existing) error = %v", err)
+	}
+
+	incoming := &storepkg.Finding{
+		ID:               "fnd_release_branch",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_release",
+		Fingerprint:      "release-fingerprint",
+		TargetKey:        releaseTarget,
+		Title:            "ZIP entries can escape the destination",
+		Category:         "CWE-22 path traversal",
+		Summary:          "release branch occurrence",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusValidated,
+		State:            findingStateOpen,
+		FilePath:         "archive.go",
+		Line:             103,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 103, EndLine: 111, Symbol: "extractArchive"}},
+	}
+	if err := reconciler.mergeExistingFinding(ctx, scan, incoming); err != nil {
+		t.Fatalf("mergeExistingFinding() error = %v", err)
+	}
+	if incoming.ID != "fnd_release_branch" {
+		t.Fatalf("incoming.ID = %q, want branch-specific identity preserved", incoming.ID)
+	}
+	if err := securityStore.UpsertObservedFinding(ctx, incoming); err != nil {
+		t.Fatalf("UpsertObservedFinding(incoming) error = %v", err)
+	}
+	listed, _, err := securityStore.ListFindings(ctx, storepkg.FindingFilter{Namespace: defaultNS, RepositoryScan: scan.Name, Limit: 10})
+	if err != nil || len(listed) != 2 {
+		t.Fatalf("findings = %#v, err %v, want one finding per branch", listed, err)
+	}
+}
+
 type failingObservedFindingStore struct {
 	storepkg.SecurityStore
 }

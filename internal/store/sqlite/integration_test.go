@@ -905,7 +905,7 @@ func TestIntegration_MigrateSecurityScanLegacySchema(t *testing.T) {
 	if _, err := secStore.GetReviewSlice(context.Background(), "ns1", "repo1", "slice_api"); err != nil {
 		t.Fatalf("GetReviewSlice() after migration error = %v", err)
 	}
-	for _, column := range []string{"slice_id", "category", "triage", "reproduction", "minimum_fix_scope", "duplicate_of", "decision_at"} {
+	for _, column := range []string{"slice_id", "target_key", "category", "triage", "reproduction", "minimum_fix_scope", "duplicate_of", "decision_at"} {
 		if !sqliteTableHasColumn(t, db, "security_findings", column) {
 			t.Fatalf("security_findings missing migrated column %q", column)
 		}
