@@ -29,6 +29,7 @@ const (
 	repositoryMonitorRepairTaskCreateError     = "repair_task_create_failed"
 	repositoryMonitorCommandIntentFix          = "fix"
 	repositoryMonitorUpdateBranchOperation     = "update_branch"
+	repositoryMonitorUpdateBranchSubmitting    = "submitting"
 	repositoryMonitorUpdateBranchTimeout       = 2 * time.Minute
 	repositoryMonitorUpdateBranchTimeoutReason = "timed out waiting for GitHub to update the PR branch"
 	repositoryMonitorUpdateBranchFailure       = "update_branch_failed"
@@ -266,19 +267,38 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 	case repositoryMonitorRunPhaseFailed:
 		return true, 0, r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusFailed, repositoryMonitorRepairPhaseFailed, "", mutation.Error)
 	case repositoryMonitorAutomergeStatePending:
+		return r.waitForRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, pr, repositoryMonitorAutomergeStatePending)
+	case repositoryMonitorUpdateBranchSubmitting:
 		if repositoryMonitorUpdateBranchTimedOut(mutation) {
 			return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, repositoryMonitorUpdateBranchTimeoutReason)
 		}
-		item.RepairState = repositoryMonitorRepairPhaseQueued
-		item.SkipReason = ""
-		if err := r.Store.UpsertMonitorItem(ctx, item); err != nil {
-			return true, 0, pendingMutationProjectionError("monitor item", err)
+		cancelled, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
+		if err != nil {
+			return true, 0, err
 		}
-		if err := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusRunning, repositoryMonitorAutomergeStatePending, "", ""); err != nil {
-			return true, 0, pendingMutationProjectionError("work action", err)
+		if cancelled {
+			return r.waitForRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, pr, repositoryMonitorUpdateBranchSubmitting)
 		}
-		return true, 0, nil
 	case repositoryMonitorAutomergeStateStarted:
+		cancelled, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
+		if err != nil || cancelled {
+			return true, 0, err
+		}
+		submittingAt := time.Now()
+		mutation.Status = repositoryMonitorUpdateBranchSubmitting
+		mutation.PendingAt = &submittingAt
+		mutation.GitHubRequestID = ""
+		mutation.Error = ""
+		if err := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); err != nil {
+			return true, 0, pendingMutationProjectionError("mutation submission", err)
+		}
+		cancelled, err = r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
+		if err != nil {
+			return true, 0, err
+		}
+		if cancelled {
+			return r.waitForRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, pr, repositoryMonitorUpdateBranchSubmitting)
+		}
 	default:
 		return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "update-branch mutation has an invalid state")
 	}
@@ -288,6 +308,8 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 		failureState := repositoryMonitorRunFailureState(err)
 		if repositoryMonitorFailedCommandRunRetryable("[" + failureState + "]") {
 			mutation.Status = repositoryMonitorAutomergeStateStarted
+			mutation.PendingAt = nil
+			mutation.GitHubRequestID = ""
 			mutation.Error = err.Error()
 			if updateErr := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); updateErr != nil {
 				return true, 0, fmt.Errorf("update branch retry failed: %w; additionally failed to update mutation audit: %v", err, updateErr)
@@ -339,6 +361,30 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 	return true, 0, nil
 }
 
+func (r *RepositoryMonitorReconciler) waitForRepositoryMonitorUpdateBranch(
+	ctx context.Context,
+	monitor *corev1alpha1.RepositoryMonitor,
+	run *store.MonitorRun,
+	command *store.CommandEvent,
+	item *store.MonitorItem,
+	mutation *store.GitHubMutationRecord,
+	pr repositoryMonitorPullRequest,
+	phase string,
+) (bool, int, error) {
+	if repositoryMonitorUpdateBranchTimedOut(mutation) {
+		return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, repositoryMonitorUpdateBranchTimeoutReason)
+	}
+	item.RepairState = repositoryMonitorRepairPhaseQueued
+	item.SkipReason = ""
+	if err := r.Store.UpsertMonitorItem(ctx, item); err != nil {
+		return true, 0, pendingMutationProjectionError("monitor item", err)
+	}
+	if err := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusRunning, phase, "", ""); err != nil {
+		return true, 0, pendingMutationProjectionError("work action", err)
+	}
+	return true, 0, nil
+}
+
 func repositoryMonitorUpdateBranchMutationID(commandID string) string {
 	return "ghmut-" + repositoryMonitorShortHash(commandID+"-update-branch")
 }
@@ -351,7 +397,7 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorUpdateBranchRequiresRecon
 	if err != nil {
 		return false, err
 	}
-	return mutation.Status == repositoryMonitorAutomergeStateStarted || mutation.Status == repositoryMonitorAutomergeStatePending || mutation.Status == repositoryMonitorRunPhaseSucceeded, nil
+	return mutation.Status == repositoryMonitorUpdateBranchSubmitting || mutation.Status == repositoryMonitorAutomergeStatePending || mutation.Status == repositoryMonitorRunPhaseSucceeded, nil
 }
 
 func repositoryMonitorUpdateBranchMutationMismatch(mutation *store.GitHubMutationRecord, command *store.CommandEvent, pr repositoryMonitorPullRequest) string {
@@ -441,7 +487,7 @@ func (r *RepositoryMonitorReconciler) reconcileRepositoryMonitorCompletedUpdateB
 }
 
 func repositoryMonitorUpdateBranchDeadline(mutation *store.GitHubMutationRecord) time.Time {
-	if mutation == nil || mutation.Status != repositoryMonitorAutomergeStatePending {
+	if mutation == nil || (mutation.Status != repositoryMonitorUpdateBranchSubmitting && mutation.Status != repositoryMonitorAutomergeStatePending) {
 		return time.Time{}
 	}
 	pendingSince := mutation.CreatedAt

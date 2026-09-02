@@ -280,7 +280,7 @@ func TestRepositoryScanReconcileTreatsCancelledPipelineTasksAsTerminalFailures(t
 	}
 }
 
-func TestTrustedFindingsRepositoryScopesRefOnlyScan(t *testing.T) {
+func TestTrustedFindingsRepositoryScopesCheckoutTarget(t *testing.T) {
 	run := &storepkg.ScanRun{
 		BaseCommit: "base",
 		HeadCommit: "head",
@@ -296,9 +296,9 @@ func TestTrustedFindingsRepositoryScopesRefOnlyScan(t *testing.T) {
 			want: "main",
 		},
 		{
-			name: "explicit branch wins",
+			name: "explicit ref wins over branch",
 			spec: corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", Branch: "release", Ref: "v1.2.3"},
-			want: "release",
+			want: "ref:v1.2.3",
 		},
 		{
 			name: "ref-only scan is ref scoped",
@@ -4692,6 +4692,7 @@ func TestFindingCategoryMatchesRequiresSpecificSharedIdentity(t *testing.T) {
 		{name: "two shared terms", left: "sensitive information disclosure", right: "information disclosure", want: true},
 		{name: "same class with different qualifiers", left: "SQL injection via untrusted input", right: "SQL injection through user input", want: true},
 		{name: "different classes with shared qualifiers", left: "SQL injection via untrusted user input", right: "command injection via untrusted user input", want: false},
+		{name: "different classes with shared location", left: "SQL injection in query builder", right: "command injection in query builder", want: false},
 		{name: "generic injection term", left: "command injection", right: "SQL injection", want: false},
 		{name: "single generic subset", left: "injection", right: "NoSQL injection", want: false},
 	}

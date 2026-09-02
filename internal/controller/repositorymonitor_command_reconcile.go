@@ -105,7 +105,7 @@ func (r *RepositoryMonitorReconciler) ensureNoExistingCommandRunBlocksQueue(ctx 
 		if mutationErr != nil && !errors.Is(mutationErr, store.ErrNotFound) {
 			return false, false, mutationErr
 		}
-		if mutation != nil && mutation.Status == repositoryMonitorAutomergeStatePending {
+		if mutation != nil && (mutation.Status == repositoryMonitorUpdateBranchSubmitting || mutation.Status == repositoryMonitorAutomergeStatePending) {
 			now := time.Now()
 			deadline := repositoryMonitorUpdateBranchDeadline(mutation)
 			if !deadline.IsZero() && !now.Before(deadline) {

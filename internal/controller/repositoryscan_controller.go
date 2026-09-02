@@ -877,11 +877,11 @@ func trustedFindingsRepository(scan *corev1alpha1.RepositoryScan, run *store.Sca
 }
 
 func trustedFindingsBranch(scan *corev1alpha1.RepositoryScan) string {
-	if branch := strings.TrimSpace(scan.Spec.Branch); branch != "" {
-		return branch
-	}
 	if ref := security.EffectiveRef(scan); ref != "" {
 		return "ref:" + ref
+	}
+	if branch := strings.TrimSpace(scan.Spec.Branch); branch != "" {
+		return branch
 	}
 	return security.EffectiveBranch(scan)
 }
@@ -2562,17 +2562,22 @@ func findingCategoryMatches(left, right string) bool {
 	if len(leftTokens) == 0 || len(rightTokens) == 0 {
 		return false
 	}
+	if len(leftTokens) > len(rightTokens) {
+		leftTokens, rightTokens = rightTokens, leftTokens
+	}
+	if len(leftTokens) < 2 {
+		return false
+	}
 	rightSet := make(map[string]struct{}, len(rightTokens))
 	for _, token := range rightTokens {
 		rightSet[token] = struct{}{}
 	}
-	shared := 0
 	for _, token := range leftTokens {
-		if _, ok := rightSet[token]; ok {
-			shared++
+		if _, ok := rightSet[token]; !ok {
+			return false
 		}
 	}
-	return shared >= 2 && shared*2 >= max(len(leftTokens), len(rightTokens))
+	return true
 }
 
 func findingCategoryCWEIDs(tokens []string) map[string]struct{} {
