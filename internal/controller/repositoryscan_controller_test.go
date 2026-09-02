@@ -2841,7 +2841,7 @@ func TestIngestValidationTaskRedirectsDuplicateResultToCanonicalFinding(t *testi
 		ID:               "fnd_validation_canonical",
 		Namespace:        defaultNS,
 		RepositoryScan:   scan.Name,
-		ScanRunID:        "scan_original",
+		ScanRunID:        "scan_shared",
 		Fingerprint:      "validation-canonical",
 		Title:            "Canonical validation target",
 		Summary:          "canonical candidate",
@@ -2857,7 +2857,7 @@ func TestIngestValidationTaskRedirectsDuplicateResultToCanonicalFinding(t *testi
 		ID:               "fnd_validation_alias",
 		Namespace:        defaultNS,
 		RepositoryScan:   scan.Name,
-		ScanRunID:        "scan_alias",
+		ScanRunID:        canonical.ScanRunID,
 		Fingerprint:      "validation-alias",
 		Title:            "Aliased validation target",
 		Summary:          "aliased candidate",
@@ -2924,6 +2924,67 @@ func TestIngestValidationTaskRedirectsDuplicateResultToCanonicalFinding(t *testi
 	updatedAlias, err := securityStore.GetFinding(ctx, defaultNS, alias.ID)
 	if err != nil || updatedAlias.ValidationStatus != findingValidationStatusValidated || updatedAlias.DuplicateOf != canonical.ID {
 		t.Fatalf("alias validation = %#v, err %v", updatedAlias, err)
+	}
+}
+
+func TestIngestValidationTaskDoesNotRedirectPriorAliasOccurrenceToCanonical(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
+	scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}}
+	canonical := &storepkg.Finding{
+		ID:               "fnd_reopened_canonical",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_current",
+		Fingerprint:      "reopened-canonical",
+		Title:            "Reopened canonical finding",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: "unvalidated",
+		State:            findingStateOpen,
+	}
+	alias := &storepkg.Finding{
+		ID:               "fnd_prior_alias",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_old",
+		Fingerprint:      "prior-alias",
+		Title:            "Prior alias finding",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusPending,
+		State:            findingStateOpen,
+		DuplicateOf:      canonical.ID,
+	}
+	for _, finding := range []*storepkg.Finding{canonical, alias} {
+		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
+		}
+	}
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kaset-validation-prior-alias",
+			Namespace: defaultNS,
+			Labels: map[string]string{
+				labels.LabelSecurityScanID:    alias.ScanRunID,
+				labels.LabelSecurityFindingID: alias.ID,
+				labels.LabelSecurityStage:     security.StageValidation,
+			},
+		},
+		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseFailed},
+	}
+
+	if err := reconciler.ingestValidationTask(ctx, scan, task); err != nil {
+		t.Fatalf("ingestValidationTask() error = %v", err)
+	}
+	updatedCanonical, err := securityStore.GetFinding(ctx, defaultNS, canonical.ID)
+	if err != nil || updatedCanonical.ValidationStatus != "unvalidated" || updatedCanonical.ValidationJSON != "" {
+		t.Fatalf("canonical validation = %#v, err %v, want current occurrence unchanged", updatedCanonical, err)
+	}
+	updatedAlias, err := securityStore.GetFinding(ctx, defaultNS, alias.ID)
+	if err != nil || updatedAlias.ValidationStatus != findingValidationStatusPending {
+		t.Fatalf("alias validation = %#v, err %v, want stale result ignored", updatedAlias, err)
 	}
 }
 
@@ -5325,6 +5386,79 @@ func TestShouldAutoValidateFindingHonorsModeAndThresholds(t *testing.T) {
 	finding.Confidence = "medium"
 	if !reconciler.shouldAutoValidateFinding(scan, finding, 99) {
 		t.Fatal("shouldAutoValidateFinding() = false, want true for full mode above thresholds regardless of per-task cap")
+	}
+}
+
+func TestEnqueueAutoValidationTasksScopesActiveTaskToFindingOccurrence(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta:   metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:          "https://github.com/example/repo",
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "scan-reviewer"},
+			ValidationMode:   validationModeFull,
+		},
+	}
+	priorTask := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "prior-validation",
+			Namespace: defaultNS,
+			Labels: map[string]string{
+				labels.LabelSecurityTarget:    labels.SelectorValue(scan.Name),
+				labels.LabelSecurityStage:     security.StageValidation,
+				labels.LabelSecurityScanID:    "scan_old",
+				labels.LabelSecurityFindingID: "fnd_reopened",
+			},
+		},
+		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseRunning},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, priorTask).Build()
+	securityStore := setupControllerSQLiteStore(t)
+	finding := &storepkg.Finding{
+		ID:               "fnd_reopened",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_current",
+		Fingerprint:      "reopened-finding",
+		Title:            "Reopened finding",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: "unvalidated",
+		State:            findingStateOpen,
+	}
+	if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+		t.Fatalf("UpsertFinding() error = %v", err)
+	}
+	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore}
+
+	if err := reconciler.enqueueAutoValidationTasks(ctx, scan, []*storepkg.Finding{finding}); err != nil {
+		t.Fatalf("enqueueAutoValidationTasks() error = %v", err)
+	}
+	var tasks corev1alpha1.TaskList
+	if err := cl.List(ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
+		t.Fatalf("List(Task) error = %v", err)
+	}
+	if len(tasks.Items) != 2 {
+		t.Fatalf("validation tasks = %d, want prior and current occurrences", len(tasks.Items))
+	}
+	var currentTask *corev1alpha1.Task
+	for i := range tasks.Items {
+		if tasks.Items[i].Labels[labels.LabelSecurityScanID] == finding.ScanRunID {
+			currentTask = &tasks.Items[i]
+			break
+		}
+	}
+	if currentTask == nil {
+		t.Fatal("current validation task was not created")
+	}
+	stored, err := securityStore.GetFinding(ctx, defaultNS, finding.ID)
+	if err != nil || stored.ValidationStatus != findingValidationStatusPending {
+		t.Fatalf("finding = %#v, err %v, want current validation pending", stored, err)
 	}
 }
 

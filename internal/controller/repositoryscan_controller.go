@@ -1942,18 +1942,22 @@ func (r *RepositoryScanReconciler) shouldAutoValidateFinding(scan *corev1alpha1.
 	}
 }
 
-func (r *RepositoryScanReconciler) hasActiveValidationTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, findingID string) (bool, error) {
+func (r *RepositoryScanReconciler) hasActiveValidationTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, findingID, scanRunID string) (bool, error) {
 	if r.Client == nil {
 		return false, nil
+	}
+	selector := map[string]string{
+		labels.LabelSecurityTarget:    labels.SelectorValue(scan.Name),
+		labels.LabelSecurityFindingID: findingID,
+		labels.LabelSecurityStage:     security.StageValidation,
+	}
+	if scanRunID = strings.TrimSpace(scanRunID); scanRunID != "" {
+		selector[labels.LabelSecurityScanID] = scanRunID
 	}
 	var tasks corev1alpha1.TaskList
 	if err := r.List(ctx, &tasks,
 		client.InNamespace(scan.Namespace),
-		client.MatchingLabels(map[string]string{
-			labels.LabelSecurityTarget:    labels.SelectorValue(scan.Name),
-			labels.LabelSecurityFindingID: findingID,
-			labels.LabelSecurityStage:     security.StageValidation,
-		}),
+		client.MatchingLabels(selector),
 	); err != nil {
 		return false, err
 	}
@@ -1994,7 +1998,11 @@ func (r *RepositoryScanReconciler) createValidationTask(ctx context.Context, sca
 	}
 	timeout := metav1.Duration{Duration: 90 * time.Minute}
 	priority := int32(725)
-	taskName := security.ScanStageTaskName(scan.Name, "validation", security.StageValidation, finding.ID)
+	taskScope := finding.ID
+	if scanRunID := strings.TrimSpace(finding.ScanRunID); scanRunID != "" {
+		taskScope += "-" + scanRunID
+	}
+	taskName := security.ScanStageTaskName(scan.Name, "validation", security.StageValidation, taskScope)
 	resultBinding := security.AgentResultBinding{
 		RepositoryScan: scan.Name,
 		ScanID:         finding.ScanRunID,
@@ -2903,7 +2911,7 @@ func (r *RepositoryScanReconciler) enqueueAutoValidationTasks(ctx context.Contex
 			finding.ValidationStatus == findingValidationStatusPending {
 			continue
 		}
-		active, err := r.hasActiveValidationTask(ctx, scan, finding.ID)
+		active, err := r.hasActiveValidationTask(ctx, scan, finding.ID, finding.ScanRunID)
 		if err != nil {
 			return err
 		}
@@ -3504,6 +3512,16 @@ func (r *RepositoryScanReconciler) ingestValidationTask(ctx context.Context, sca
 	if taskScanRunID != "" && taskScanRunID != strings.TrimSpace(finding.ScanRunID) {
 		return nil
 	}
+	var canonical *store.Finding
+	if finding.DuplicateOf != "" {
+		canonical, err = r.canonicalFindingForUpdate(ctx, scan, finding)
+		if err != nil {
+			return err
+		}
+		if taskScanRunID == "" || taskScanRunID != strings.TrimSpace(canonical.ScanRunID) {
+			return nil
+		}
+	}
 
 	if task.Status.Phase == corev1alpha1.TaskPhaseSucceeded {
 		validationProblem := ""
@@ -3567,10 +3585,6 @@ func (r *RepositoryScanReconciler) ingestValidationTask(ctx context.Context, sca
 
 	if finding.DuplicateOf == "" {
 		return r.SecurityStore.UpsertFinding(ctx, finding)
-	}
-	canonical, err := r.canonicalFindingForUpdate(ctx, scan, finding)
-	if err != nil {
-		return err
 	}
 	if err := r.SecurityStore.UpsertFinding(ctx, finding); err != nil {
 		return err
