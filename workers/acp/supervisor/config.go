@@ -53,8 +53,13 @@ type ProviderSessionProjection struct {
 // provider proxy began relaying the prompt's first non-error inference
 // response. Model output can only be derived from those bytes, while the CLI
 // emits its startup diagnostics ahead of its first inference request.
+//
+// The recognizer returns a summary the supervisor may log. Chunk text is
+// child-controlled and the child holds session credentials, so the summary
+// must be built only from values the supervisor already knows (such as the
+// session's own exclusion list), never from the chunk itself.
 type AgentDiagnosticFilter struct {
-	Startup func(text string) bool
+	Startup func(text string) (summary string, ok bool)
 }
 
 type ArtifactUploader interface {

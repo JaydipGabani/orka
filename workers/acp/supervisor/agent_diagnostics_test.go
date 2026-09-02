@@ -1,6 +1,8 @@
 package supervisor
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -30,20 +32,32 @@ func TestCopilotStartupDiagnosticRecognizesPinnedCLIDiagnostics(t *testing.T) {
 		"skill", "sql", "task", "write_agent", "bash", "list_bash",
 	})
 	for _, text := range copilotObservedStartupDiagnostics {
-		if !recognize(text) {
+		if _, ok := recognize(text); !ok {
 			t.Fatalf("observed CLI diagnostic was not recognized: %q", text)
 		}
 	}
-	withheld := []string{
+	withheld := map[string]string{
 		// A restricted session's line names policy exclusions and tools the
 		// CLI disabled on its own (web_search under a BYOK provider).
-		"Info: Disabled tools: bash, list_bash, skill, web_search",
-		"Info: Disabled tools: github-mcp-server-search_code, sql",
+		"Info: Disabled tools: bash, list_bash, skill, web_search":     "disabled tools: bash, list_bash, skill (+1 not in the session exclusion list)",
+		"Info: Disabled tools: github-mcp-server-search_code, sql":     "disabled tools: sql (+1 not in the session exclusion list)",
+		`Info: Unknown tool name in the tool excludedlist: "ask_user"`: `unknown excluded tool "ask_user"`,
 	}
-	for _, text := range withheld {
-		if !recognize(text) {
+	for text, wantSummary := range withheld {
+		summary, ok := recognize(text)
+		if !ok {
 			t.Fatalf("diagnostic naming a session exclusion was not recognized: %q", text)
 		}
+		if summary != wantSummary {
+			t.Fatalf("summary for %q = %q, want %q", text, summary, wantSummary)
+		}
+	}
+	// The chunk is child-controlled: a name-shaped entry such as the session
+	// proxy bearer must never reach the summary, only its count.
+	const credential = "c2Vzc2lvbi1wcm94eS1iZWFyZXItdG9rZW4tdmFsdWU_-x"
+	summary, ok := recognize("Info: Disabled tools: skill, " + credential)
+	if !ok || strings.Contains(summary, credential) || summary != "disabled tools: skill (+1 not in the session exclusion list)" {
+		t.Fatalf("credential-shaped entry leaked into the summary: ok=%v summary=%q", ok, summary)
 	}
 	forwarded := []string{
 		"PONG",
@@ -62,7 +76,7 @@ func TestCopilotStartupDiagnosticRecognizesPinnedCLIDiagnostics(t *testing.T) {
 		"The disabled tools are: skill",
 	}
 	for _, text := range forwarded {
-		if recognize(text) {
+		if _, ok := recognize(text); ok {
 			t.Fatalf("assistant text was recognized as a startup diagnostic: %q", text)
 		}
 	}
@@ -182,10 +196,10 @@ func TestCopilotProjectionDeclaresDiagnosticFilterForSessionExclusions(t *testin
 	if unrestricted.AgentDiagnosticFilter == nil || unrestricted.AgentDiagnosticFilter.Startup == nil {
 		t.Fatal("unrestricted Copilot projection declared no diagnostic filter")
 	}
-	if !unrestricted.AgentDiagnosticFilter.Startup(copilotObservedStartupDiagnostics[0]) {
+	if _, ok := unrestricted.AgentDiagnosticFilter.Startup(copilotObservedStartupDiagnostics[0]); !ok {
 		t.Fatalf("unrestricted projection did not recognize %q", copilotObservedStartupDiagnostics[0])
 	}
-	if unrestricted.AgentDiagnosticFilter.Startup("Info: Disabled tools: bash, list_bash") {
+	if _, ok := unrestricted.AgentDiagnosticFilter.Startup("Info: Disabled tools: bash, list_bash"); ok {
 		t.Fatal("unrestricted projection recognized a diagnostic about tools it did not exclude")
 	}
 
@@ -195,10 +209,10 @@ func TestCopilotProjectionDeclaresDiagnosticFilterForSessionExclusions(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !restricted.AgentDiagnosticFilter.Startup("Info: Disabled tools: bash, list_bash, read_bash, stop_bash, write_bash, skill") {
+	if _, ok := restricted.AgentDiagnosticFilter.Startup("Info: Disabled tools: bash, list_bash, read_bash, stop_bash, write_bash, skill"); !ok {
 		t.Fatal("restricted projection did not recognize the policy exclusion diagnostic")
 	}
-	if restricted.AgentDiagnosticFilter.Startup("Info: Disabled tools: view, grep") {
+	if _, ok := restricted.AgentDiagnosticFilter.Startup("Info: Disabled tools: view, grep"); ok {
 		t.Fatal("restricted projection recognized a diagnostic about authorized tools")
 	}
 }
@@ -211,5 +225,28 @@ func TestCopilotAlwaysExcludedToolIDsMatchPinnedCLICatalog(t *testing.T) {
 	want := "list_agents,read_agent,skill,sql,task,write_agent"
 	if got := strings.Join(copilotAlwaysExcludedToolIDs, ","); got != want {
 		t.Fatalf("copilotAlwaysExcludedToolIDs = %s, want %s (verified against Copilot CLI 1.0.77)", got, want)
+	}
+}
+
+// The supervisor log carries only the recognizer's summary: chunk text is
+// child-controlled and could smuggle a session credential.
+func TestWithholdAgentDiagnosticLogsOnlyTheSummary(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	const credential = "c2Vzc2lvbi1wcm94eS1iZWFyZXItdG9rZW4tdmFsdWU_-x"
+	state := &sessionState{
+		id:                    "session-1",
+		agentDiagnosticFilter: &AgentDiagnosticFilter{Startup: copilotStartupDiagnostic(copilotAlwaysExcludedToolIDs)},
+		providerProxy:         &providerProxySession{turnPromptID: "prompt-1"},
+	}
+	event := testAssistantMessagePromptEvent(t, 1, time.Now().UTC(), "Info: Disabled tools: skill, "+credential)
+	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), event) {
+		t.Fatal("crafted disabled-tools line was not withheld")
+	}
+	if logged := logs.String(); strings.Contains(logged, credential) || !strings.Contains(logged, "disabled tools: skill (+1 not in the session exclusion list)") {
+		t.Fatalf("supervisor log = %q", logged)
 	}
 }

@@ -43,39 +43,55 @@ const (
 // without a messageId, so the supervisor additionally withholds startup
 // diagnostics only when they were received before the provider proxy began
 // relaying the prompt's first inference response.
-func copilotStartupDiagnostic(excludedTools []string) func(string) bool {
+//
+// The returned summary names only tools from the session's exclusion list
+// and counts the rest: the chunk is child-controlled and a name-shaped entry
+// could carry a session credential, so no chunk text reaches the log.
+func copilotStartupDiagnostic(excludedTools []string) func(string) (string, bool) {
 	excluded := make(map[string]struct{}, len(excludedTools))
 	for _, name := range excludedTools {
 		excluded[name] = struct{}{}
 	}
-	return func(text string) bool {
+	return func(text string) (string, bool) {
 		if list, ok := strings.CutPrefix(text, copilotDisabledToolsDiagnosticPrefix); ok {
-			return copilotDisabledToolsListNamesExcluded(list, excluded)
+			return copilotDisabledToolsSummary(list, excluded)
 		}
 		if quoted, ok := strings.CutPrefix(text, copilotUnknownExcludedToolDiagnosticPrefix); ok {
 			name, err := strconv.Unquote(quoted)
 			if err != nil {
-				return false
+				return "", false
 			}
-			_, excludedName := excluded[name]
-			return excludedName
+			if _, excludedName := excluded[name]; !excludedName {
+				return "", false
+			}
+			return "unknown excluded tool " + strconv.Quote(name), true
 		}
-		return false
+		return "", false
 	}
 }
 
-func copilotDisabledToolsListNamesExcluded(list string, excluded map[string]struct{}) bool {
-	namesExcluded := false
+func copilotDisabledToolsSummary(list string, excluded map[string]struct{}) (string, bool) {
+	var known []string
+	others := 0
 	for entry := range strings.SplitSeq(list, ",") {
 		name := strings.TrimSpace(entry)
 		if !copilotToolIdentifier(name) {
-			return false
+			return "", false
 		}
 		if _, ok := excluded[name]; ok {
-			namesExcluded = true
+			known = append(known, name)
+		} else {
+			others++
 		}
 	}
-	return namesExcluded
+	if len(known) == 0 {
+		return "", false
+	}
+	summary := "disabled tools: " + strings.Join(known, ", ")
+	if others > 0 {
+		summary += " (+" + strconv.Itoa(others) + " not in the session exclusion list)"
+	}
+	return summary, true
 }
 
 // copilotToolIdentifier reports whether name is shaped like a Copilot tool
@@ -99,16 +115,19 @@ func copilotToolIdentifier(name string) bool {
 // session's provider projection recognizes as a CLI startup diagnostic under
 // the anchoring rule documented on AgentDiagnosticFilter. A withheld chunk is
 // logged and never reaches compaction, the harness event stream, or the
-// terminal assistant text. The logged text is bounded by construction: each
-// recognized shape is a fixed CLI sentence whose only variable parts are tool
-// identifiers.
+// terminal assistant text. Only the recognizer's summary is logged: the chunk
+// text is child-controlled and may carry session credentials.
 func withholdAgentDiagnostic(state *sessionState, prompt *promptState, event acp.PromptEvent) bool {
 	filter := state.agentDiagnosticFilter
 	if filter == nil || filter.Startup == nil {
 		return false
 	}
 	text, ok := assistantMessageText(event)
-	if !ok || text == "" || !filter.Startup(text) {
+	if !ok || text == "" {
+		return false
+	}
+	summary, recognized := filter.Startup(text)
+	if !recognized {
 		return false
 	}
 	// The receipt time is stamped when the session received the chunk from
@@ -120,7 +139,7 @@ func withholdAgentDiagnostic(state *sessionState, prompt *promptState, event acp
 	}
 	slog.Info(
 		"ACP provider CLI startup diagnostic withheld from the agent message stream",
-		"runtimeSession", state.id, "promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
+		"runtimeSession", state.id, "promptID", promptID, "sequence", event.Sequence, "diagnostic", summary,
 	)
 	return true
 }
