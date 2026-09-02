@@ -942,14 +942,14 @@ func (s *Store) UpdateFindingState(ctx context.Context, namespace, id, state str
 	return nil
 }
 
-// ResolveFindingIfCurrent resolves only the pr_open occurrence selected by the caller.
-func (s *Store) ResolveFindingIfCurrent(ctx context.Context, namespace, id, scanRunID string) (bool, error) {
+// ResolveFindingIfCurrent resolves only the pr_open occurrence and PR selected by the caller.
+func (s *Store) ResolveFindingIfCurrent(ctx context.Context, namespace, id, scanRunID string, prNumber int) (bool, error) {
 	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE security_findings
 		 SET state = 'resolved', decision_at = NULL, updated_at = ?
-		 WHERE namespace = ? AND id = ? AND scan_run_id = ? AND state = 'pr_open' AND duplicate_of = ''`,
-		now, namespace, id, scanRunID,
+		 WHERE namespace = ? AND id = ? AND scan_run_id = ? AND pr_number = ? AND state = 'pr_open' AND duplicate_of = ''`,
+		now, namespace, id, scanRunID, prNumber,
 	)
 	if err != nil {
 		return false, err

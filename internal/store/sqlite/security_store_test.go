@@ -795,6 +795,7 @@ func TestResolveFindingIfCurrentRequiresMatchingOccurrenceAndState(t *testing.T)
 	s := setupTestStore(t)
 	ctx := context.Background()
 	newFinding := func(id, scanRunID string) *store.Finding {
+		prNumber := 42
 		return &store.Finding{
 			ID:               id,
 			Namespace:        "ns1",
@@ -807,6 +808,7 @@ func TestResolveFindingIfCurrentRequiresMatchingOccurrenceAndState(t *testing.T)
 			Confidence:       "medium",
 			ValidationStatus: "validated",
 			State:            "pr_open",
+			PRNumber:         &prNumber,
 		}
 	}
 
@@ -814,13 +816,26 @@ func TestResolveFindingIfCurrentRequiresMatchingOccurrenceAndState(t *testing.T)
 	if err := s.UpsertFinding(ctx, current); err != nil {
 		t.Fatalf("UpsertFinding(current): %v", err)
 	}
-	updated, err := s.ResolveFindingIfCurrent(ctx, current.Namespace, current.ID, "scan-1")
+	updated, err := s.ResolveFindingIfCurrent(ctx, current.Namespace, current.ID, "scan-1", 42)
 	if err != nil || updated {
 		t.Fatalf("ResolveFindingIfCurrent(stale occurrence) = %v, %v, want false", updated, err)
 	}
 	stored, err := s.GetFinding(ctx, current.Namespace, current.ID)
 	if err != nil || stored.State != "pr_open" {
 		t.Fatalf("stale occurrence finding = %#v, err %v", stored, err)
+	}
+	replacementPR := 43
+	current.PRNumber = &replacementPR
+	if err := s.UpsertFinding(ctx, current); err != nil {
+		t.Fatalf("UpsertFinding(replacement PR): %v", err)
+	}
+	updated, err = s.ResolveFindingIfCurrent(ctx, current.Namespace, current.ID, current.ScanRunID, 42)
+	if err != nil || updated {
+		t.Fatalf("ResolveFindingIfCurrent(stale PR) = %v, %v, want false", updated, err)
+	}
+	stored, err = s.GetFinding(ctx, current.Namespace, current.ID)
+	if err != nil || stored.State != "pr_open" || stored.PRNumber == nil || *stored.PRNumber != replacementPR {
+		t.Fatalf("replacement PR finding = %#v, err %v", stored, err)
 	}
 
 	decided := newFinding("fnd-decided", "scan-2")
@@ -835,7 +850,7 @@ func TestResolveFindingIfCurrentRequiresMatchingOccurrenceAndState(t *testing.T)
 		t.Fatalf("GetFinding(dismissed): %v", err)
 	}
 	decisionAt := stored.DecisionAt
-	updated, err = s.ResolveFindingIfCurrent(ctx, decided.Namespace, decided.ID, decided.ScanRunID)
+	updated, err = s.ResolveFindingIfCurrent(ctx, decided.Namespace, decided.ID, decided.ScanRunID, 42)
 	if err != nil || updated {
 		t.Fatalf("ResolveFindingIfCurrent(decided) = %v, %v, want false", updated, err)
 	}
@@ -844,7 +859,7 @@ func TestResolveFindingIfCurrentRequiresMatchingOccurrenceAndState(t *testing.T)
 		t.Fatalf("decided finding = %#v, err %v", stored, err)
 	}
 
-	updated, err = s.ResolveFindingIfCurrent(ctx, current.Namespace, current.ID, current.ScanRunID)
+	updated, err = s.ResolveFindingIfCurrent(ctx, current.Namespace, current.ID, current.ScanRunID, replacementPR)
 	if err != nil || !updated {
 		t.Fatalf("ResolveFindingIfCurrent(current) = %v, %v, want true", updated, err)
 	}
