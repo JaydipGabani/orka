@@ -1117,10 +1117,20 @@ func (d *ACPDispatcher) markTaskScopedRuntimeSessionCleanupComplete(
 				return fmt.Errorf("%w: restored Task source identity changed during RuntimeSession cleanup receipt", store.ErrConflict)
 			}
 		}
-		if latest.Status.Execution.RuntimeSessionCleanupDigest == digest {
+		retiredGeneration := latest.Status.Execution.RuntimeSessionRetiredGeneration
+		if task.Spec.SessionRef == nil {
+			// A retired task-scoped generation stays tombstoned on the runtime
+			// and its create identity is bound to this attempt, so the next
+			// task-scoped RuntimeSession of a re-admitted attempt must advance
+			// past it.
+			retiredGeneration = max(retiredGeneration, runtimeSessionGeneration)
+		}
+		if latest.Status.Execution.RuntimeSessionCleanupDigest == digest &&
+			latest.Status.Execution.RuntimeSessionRetiredGeneration == retiredGeneration {
 			return nil
 		}
 		latest.Status.Execution.RuntimeSessionCleanupDigest = digest
+		latest.Status.Execution.RuntimeSessionRetiredGeneration = retiredGeneration
 		return d.Client.Status().Update(ctx, latest)
 	})
 }

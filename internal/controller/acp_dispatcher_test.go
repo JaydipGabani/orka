@@ -616,6 +616,8 @@ func TestRuntimeSessionCreationMayHaveApplied(t *testing.T) {
 		{name: "zero bytes", err: &harnessv2.ClientError{WriteEvidence: harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteZeroBytes}}, want: false},
 		{name: "definitive HTTP rejection", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorHTTP, StatusCode: http.StatusUnprocessableEntity, WriteEvidence: harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteComplete}}, want: false},
 		{name: "ambiguous server failure", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorHTTP, StatusCode: http.StatusInternalServerError, WriteEvidence: harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteComplete}}, want: true},
+		{name: "create digest conflict records an earlier send", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorHTTP, StatusCode: http.StatusConflict, Code: harnessv2.ErrorCodeDigestConflict, WriteEvidence: harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteComplete}}, want: true},
+		{name: "other conflict rejection", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorHTTP, StatusCode: http.StatusConflict, Code: harnessv2.ErrorCodeInvalidRequest, WriteEvidence: harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteComplete}}, want: false},
 		{name: "protocol failure after write", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorProtocol, StatusCode: http.StatusOK, WriteEvidence: harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteComplete}}, want: true},
 		{name: "non client error", err: errors.New("transport setup failed"), want: true},
 	}
@@ -3200,6 +3202,29 @@ func newDispatcherRuntimeServerWithTerminalEvents(
 	onCreate ...func(harnessv2.CreateRuntimeSessionRequest),
 ) *httptest.Server {
 	t.Helper()
+	return newDispatcherRuntimeServerWithOptions(t, profile, digest, dispatcherRuntimeServerOptions{terminalEvents: terminalEvents}, onCreate...)
+}
+
+type dispatcherRuntimeServerOptions struct {
+	terminalEvents map[harnessv2.PromptID]harnessv2.EventType
+	// rejectCreate answers a create request with the returned error response
+	// and status instead of creating the session when the response is non-nil.
+	// resident makes the runtime keep reporting the exact requested session as
+	// Idle, as a supervisor does after an earlier send of the same create
+	// already created it.
+	rejectCreate func(request harnessv2.CreateRuntimeSessionRequest) (status int, response *harnessv2.ErrorResponse, resident bool)
+	onDelete     func(harnessv2.DeleteRuntimeSessionRequest)
+}
+
+func newDispatcherRuntimeServerWithOptions(
+	t *testing.T,
+	profile harnessv2.RuntimeProfile,
+	digest harnessv2.ProfileDigest,
+	options dispatcherRuntimeServerOptions,
+	onCreate ...func(harnessv2.CreateRuntimeSessionRequest),
+) *httptest.Server {
+	t.Helper()
+	terminalEvents := options.terminalEvents
 	mux := http.NewServeMux()
 	limits := harnessv2.DefaultProtocolLimits()
 	var descriptorMu sync.Mutex
@@ -3240,6 +3265,17 @@ func newDispatcherRuntimeServerWithTerminalEvents(
 			SupervisorBootID: request.Metadata.Fence.SupervisorBootID, RuntimeProfileDigest: request.Metadata.Fence.RuntimeProfileDigest,
 			State: harnessv2.RuntimeSessionStateIdle, ProviderSessionID: "provider-session", WorkspaceBaseline: request.Workspace.Baseline,
 			CreatedAt: now, LastTransitionAt: now,
+		}
+		if options.rejectCreate != nil {
+			if status, response, resident := options.rejectCreate(request); response != nil {
+				if resident {
+					descriptorMu.Lock()
+					descriptor = created
+					descriptorMu.Unlock()
+				}
+				writeDispatcherJSONStatus(w, status, *response)
+				return
+			}
 		}
 		descriptorMu.Lock()
 		descriptor = created
@@ -3348,6 +3384,9 @@ func newDispatcherRuntimeServerWithTerminalEvents(
 	mux.HandleFunc("DELETE /v2/runtime-sessions/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
 		var request harnessv2.DeleteRuntimeSessionRequest
 		_ = json.NewDecoder(r.Body).Decode(&request)
+		if options.onDelete != nil {
+			options.onDelete(request)
+		}
 		descriptorMu.Lock()
 		descriptor = harnessv2.RuntimeSessionDescriptor{}
 		descriptorMu.Unlock()

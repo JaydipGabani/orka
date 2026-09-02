@@ -1147,7 +1147,8 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		leaseGeneration = sessionExecution.LeaseGeneration
 	} else {
 		runtimeFence.RuntimeSessionUID = harnessv2.RuntimeSessionUID(taskRuntimeSessionUID(task))
-		runtimeFence.RuntimeSessionGeneration = 1
+		runtimeFence.RuntimeSessionGeneration = nextTaskScopedRuntimeSessionGeneration(task)
+		leaseGeneration = int64(runtimeFence.RuntimeSessionGeneration)
 	}
 	sessionTrace.setRuntimeSession(string(runtimeFence.RuntimeSessionUID), runtimeFence.RuntimeSessionGeneration)
 	if err := d.transitionAttempt(ctx, attemptID, fence, store.PromptExecutionReserved, store.PromptExecutionSessionStarting, "session-starting", nil); err != nil {
@@ -1404,11 +1405,74 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 			if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
 				return deadlineErr
 			}
-			if sessionExecution != nil && runtimeSessionCreationMayHaveApplied(err) {
-				admitted, reconcileErr := waitForRuntimeSessionAdmission(
+			digestConflict := runtimeSessionCreateDigestConflict(err)
+			if sessionExecution == nil && digestConflict {
+				// The runtime already processed a create for this exact attempt
+				// identity: this reconcile rebuilt the request (fresh expiry and
+				// workspace capability) after an earlier send. Adopt the session
+				// the earlier send created when the runtime still reports it
+				// admissible instead of failing a usable attempt.
+				adopted, adoptErr := reconcileRuntimeSessionCreateDigestConflict(
 					context.WithoutCancel(ctx), runtimeClient, createRequest.RuntimeSessionID,
-					runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, 10*time.Second,
+					runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, runtimeSessionCreateAdoptionTimeout,
 				)
+				if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
+					return deadlineErr
+				}
+				if runtimeContextError(runtimeCtx) != nil {
+					return d.settlePreSubmissionCancellation(
+						ctx, task, attemptID, fence, "cancelled-before-submission", "Cancelled", "task cancelled before prompt submission",
+					)
+				}
+				if adoptErr != nil {
+					logf.FromContext(ctx).Info(
+						"ACP RuntimeSession adoption after create digest conflict failed",
+						"namespace", task.Namespace, "task", task.Name,
+						"runtimeSessionGeneration", runtimeFence.RuntimeSessionGeneration, "diagnostic", adoptErr.Error(),
+					)
+				}
+				if adopted {
+					logf.FromContext(ctx).Info(
+						"ACP RuntimeSession adopted after create digest conflict",
+						"namespace", task.Namespace, "task", task.Name,
+						"runtimeSessionGeneration", runtimeFence.RuntimeSessionGeneration,
+					)
+					created = true
+				} else {
+					// The runtime holds a record for this create identity but no
+					// admissible session: the record is a deletion tombstone or
+					// the session settled in an unusable state.
+					retrying, handleErr := d.handlePrePromptClientError(ctx, task, attemptID, fence, err)
+					if !retrying {
+						endSessionTrace(err)
+					}
+					return handleErr
+				}
+			} else if sessionExecution != nil && runtimeSessionCreationMayHaveApplied(err) {
+				var admitted bool
+				var reconcileErr error
+				if digestConflict {
+					admitted, reconcileErr = reconcileRuntimeSessionCreateDigestConflict(
+						context.WithoutCancel(ctx), runtimeClient, createRequest.RuntimeSessionID,
+						runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, runtimeSessionCreateAdoptionTimeout,
+					)
+					if reconcileErr == nil && !admitted {
+						// The record is a deletion tombstone: this generation can
+						// never be recreated, and planned-session reconciliation
+						// only advances the generation for reused sessions, so a
+						// requeue would rebuild the same conflict forever.
+						retrying, handleErr := d.handlePrePromptClientError(ctx, task, attemptID, fence, err)
+						if !retrying {
+							endSessionTrace(err)
+						}
+						return handleErr
+					}
+				} else {
+					admitted, reconcileErr = waitForRuntimeSessionAdmission(
+						context.WithoutCancel(ctx), runtimeClient, createRequest.RuntimeSessionID,
+						runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, 10*time.Second,
+					)
+				}
 				if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
 					return deadlineErr
 				}
@@ -2456,6 +2520,9 @@ func runtimeSessionStatusForUID(
 	return status, nil, nil
 }
 
+// waitForRuntimeSessionAdmission resolves an ambiguous create-session write:
+// the request may still be in flight at the runtime, so an absent session is
+// polled for until the timeout.
 func waitForRuntimeSessionAdmission(
 	ctx context.Context,
 	runtimeClient *harnessv2.Client,
@@ -2463,6 +2530,41 @@ func waitForRuntimeSessionAdmission(
 	sessionUID harnessv2.RuntimeSessionUID,
 	generation uint64,
 	timeout time.Duration,
+) (bool, error) {
+	return waitForRuntimeSessionAdmissionState(ctx, runtimeClient, sessionID, sessionUID, generation, timeout, false)
+}
+
+// runtimeSessionCreateAdoptionTimeout bounds how long a digest-conflicted
+// create waits for the runtime to finish creating the session an earlier send
+// of the same attempt started.
+const runtimeSessionCreateAdoptionTimeout = 10 * time.Second
+
+// reconcileRuntimeSessionCreateDigestConflict resolves a digest_conflict answer
+// to create-session. The runtime already holds an operation record for this
+// exact create identity, so an earlier send of the same attempt was processed
+// there: the session is adopted when the runtime reports the exact generation
+// admissible, waited for while it is still creating, and reported absent
+// without polling when the record is a deletion tombstone, because a
+// tombstoned generation can never reappear.
+func reconcileRuntimeSessionCreateDigestConflict(
+	ctx context.Context,
+	runtimeClient *harnessv2.Client,
+	sessionID harnessv2.RuntimeSessionID,
+	sessionUID harnessv2.RuntimeSessionUID,
+	generation uint64,
+	timeout time.Duration,
+) (bool, error) {
+	return waitForRuntimeSessionAdmissionState(ctx, runtimeClient, sessionID, sessionUID, generation, timeout, true)
+}
+
+func waitForRuntimeSessionAdmissionState(
+	ctx context.Context,
+	runtimeClient *harnessv2.Client,
+	sessionID harnessv2.RuntimeSessionID,
+	sessionUID harnessv2.RuntimeSessionUID,
+	generation uint64,
+	timeout time.Duration,
+	absentIsFinal bool,
 ) (bool, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -2473,6 +2575,8 @@ func waitForRuntimeSessionAdmission(
 		_, observed, err := runtimeSessionStatusForUID(waitCtx, runtimeClient, sessionUID)
 		if err != nil {
 			lastStatusErr = err
+		} else if observed == nil && absentIsFinal {
+			return false, nil
 		} else if observed != nil {
 			if observed.RuntimeSessionID != sessionID || observed.Generation != generation {
 				return false, fmt.Errorf("%w: RuntimeSession status resolved to a different generation", store.ErrConflict)
@@ -4574,10 +4678,41 @@ func stripACPControlRunes(value string) string {
 	}, strings.ToValidUTF8(value, ""))
 }
 
+// runtimeSessionCreateDigestConflict reports whether the runtime rejected a
+// create-session mutation because it already holds an operation record for the
+// same create identity under a different request digest. The controller
+// rebuilds the create request (fresh expiry, fresh workspace capability) on
+// every reconcile of one attempt, so a re-admitted attempt whose earlier send
+// was processed by the runtime is answered exactly this way.
+func runtimeSessionCreateDigestConflict(err error) bool {
+	clientErr, ok := errors.AsType[*harnessv2.ClientError](err)
+	return ok && clientErr != nil && clientErr.Kind == harnessv2.ClientErrorHTTP &&
+		clientErr.StatusCode == http.StatusConflict && clientErr.Code == harnessv2.ErrorCodeDigestConflict
+}
+
+// nextTaskScopedRuntimeSessionGeneration returns the generation for the next
+// task-scoped RuntimeSession of the current attempt: one past the highest
+// generation the controller already retired at the runtime. A retired
+// generation stays tombstoned there and its create operation identity is bound
+// to this attempt's prompt, so rebuilding the create request under the same
+// generation could only be classified as a digest conflict.
+func nextTaskScopedRuntimeSessionGeneration(task *corev1alpha1.Task) uint64 {
+	if task == nil || task.Status.Execution == nil || task.Status.Execution.RuntimeSessionRetiredGeneration <= 0 {
+		return 1
+	}
+	return uint64(task.Status.Execution.RuntimeSessionRetiredGeneration) + 1
+}
+
 func runtimeSessionCreationMayHaveApplied(err error) bool {
 	var clientErr *harnessv2.ClientError
 	if !errors.As(err, &clientErr) {
 		return err != nil
+	}
+	if runtimeSessionCreateDigestConflict(err) {
+		// The runtime holds an operation record for this exact create identity:
+		// an earlier send of the same attempt was processed, so the session it
+		// created may be resident and must be retired with the attempt.
+		return true
 	}
 	switch clientErr.Kind {
 	case harnessv2.ClientErrorConfiguration, harnessv2.ClientErrorValidation:
