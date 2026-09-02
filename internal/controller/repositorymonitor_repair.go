@@ -22,17 +22,18 @@ import (
 )
 
 const (
-	repositoryMonitorRepairPhaseQueued     = "queued"
-	repositoryMonitorRepairPhaseSucceeded  = "succeeded"
-	repositoryMonitorRepairPhaseFailed     = "failed"
-	repositoryMonitorRepairPRBudgetReason  = "repair_pr_budget_exhausted"
-	repositoryMonitorRepairTaskCreateError = "repair_task_create_failed"
-	repositoryMonitorCommandIntentFix      = "fix"
-	repositoryMonitorUpdateBranchOperation = "update_branch"
-	repositoryMonitorUpdateBranchTimeout   = 2 * time.Minute
-	repositoryMonitorUpdateBranchFailure   = "update_branch_failed"
-	repositoryMonitorFieldBaseSHA          = "baseSHA"
-	repositoryMonitorFieldHeadSHA          = "headSHA"
+	repositoryMonitorRepairPhaseQueued         = "queued"
+	repositoryMonitorRepairPhaseSucceeded      = "succeeded"
+	repositoryMonitorRepairPhaseFailed         = "failed"
+	repositoryMonitorRepairPRBudgetReason      = "repair_pr_budget_exhausted"
+	repositoryMonitorRepairTaskCreateError     = "repair_task_create_failed"
+	repositoryMonitorCommandIntentFix          = "fix"
+	repositoryMonitorUpdateBranchOperation     = "update_branch"
+	repositoryMonitorUpdateBranchTimeout       = 2 * time.Minute
+	repositoryMonitorUpdateBranchTimeoutReason = "timed out waiting for GitHub to update the PR branch"
+	repositoryMonitorUpdateBranchFailure       = "update_branch_failed"
+	repositoryMonitorFieldBaseSHA              = "baseSHA"
+	repositoryMonitorFieldHeadSHA              = "headSHA"
 )
 
 type repositoryMonitorPendingMutationProjectionError struct {
@@ -266,7 +267,7 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 		return true, 0, r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusFailed, repositoryMonitorRepairPhaseFailed, "", mutation.Error)
 	case repositoryMonitorAutomergeStatePending:
 		if repositoryMonitorUpdateBranchTimedOut(mutation) {
-			return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "timed out waiting for GitHub to update the PR branch")
+			return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, repositoryMonitorUpdateBranchTimeoutReason)
 		}
 		item.RepairState = repositoryMonitorRepairPhaseQueued
 		item.SkipReason = ""
@@ -434,20 +435,28 @@ func (r *RepositoryMonitorReconciler) reconcileRepositoryMonitorCompletedUpdateB
 		return true, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "updated PR head does not contain the live base revision")
 	}
 	if repositoryMonitorUpdateBranchTimedOut(mutation) {
-		return true, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "timed out waiting for GitHub to update the PR branch")
+		return true, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, repositoryMonitorUpdateBranchTimeoutReason)
 	}
 	return false, nil
 }
 
-func repositoryMonitorUpdateBranchTimedOut(mutation *store.GitHubMutationRecord) bool {
+func repositoryMonitorUpdateBranchDeadline(mutation *store.GitHubMutationRecord) time.Time {
 	if mutation == nil || mutation.Status != repositoryMonitorAutomergeStatePending {
-		return false
+		return time.Time{}
 	}
 	pendingSince := mutation.CreatedAt
 	if mutation.PendingAt != nil && !mutation.PendingAt.IsZero() {
 		pendingSince = *mutation.PendingAt
 	}
-	return !pendingSince.IsZero() && time.Since(pendingSince) >= repositoryMonitorUpdateBranchTimeout
+	if pendingSince.IsZero() {
+		return time.Time{}
+	}
+	return pendingSince.Add(repositoryMonitorUpdateBranchTimeout)
+}
+
+func repositoryMonitorUpdateBranchTimedOut(mutation *store.GitHubMutationRecord) bool {
+	deadline := repositoryMonitorUpdateBranchDeadline(mutation)
+	return !deadline.IsZero() && !time.Now().Before(deadline)
 }
 
 func (r *RepositoryMonitorReconciler) completeRepositoryMonitorUpdateBranch(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, run *store.MonitorRun, command *store.CommandEvent, item *store.MonitorItem, mutation *store.GitHubMutationRecord, pr repositoryMonitorPullRequest) error {

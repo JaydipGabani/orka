@@ -7027,6 +7027,106 @@ func TestRepositoryMonitorTransientCommandRunStopsAfterRetryBudget(t *testing.T)
 	}
 }
 
+func TestRepositoryMonitorAcceptedUpdateBranchIgnoresCommandRetryBudgetUntilDeadline(t *testing.T) {
+	ctx := context.Background()
+	monitorStore := setupControllerSQLiteStore(t)
+	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "update-branch-pending-retry", Namespace: defaultNS}}
+	command := store.CommandEvent{ID: "cmd-update-branch-pending-retry", MonitorNamespace: defaultNS, MonitorName: monitor.Name, Kind: repositoryMonitorPullRequestKind, Number: 8, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "head-8"}
+	runID := repositoryMonitorCommandRunIDFromCommand(command.ID)
+	completedAt := time.Now()
+	if err := monitorStore.CreateMonitorRun(ctx, &store.MonitorRun{ID: runID, MonitorNamespace: defaultNS, MonitorName: monitor.Name, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, CommandEventID: command.ID, Phase: repositoryMonitorRunPhaseFailed, StartedAt: completedAt.Add(-time.Minute), CompletedAt: &completedAt, Error: "[retry_scheduled] compare unavailable"}); err != nil {
+		t.Fatalf("CreateMonitorRun() error = %v", err)
+	}
+	if err := monitorStore.UpsertMonitorItem(ctx, &store.MonitorItem{MonitorNamespace: defaultNS, MonitorName: monitor.Name, Kind: command.Kind, ItemKey: "8", Number: command.Number, HeadSHA: command.HeadSHA, RepairState: repositoryMonitorRepairPhaseQueued}); err != nil {
+		t.Fatalf("UpsertMonitorItem() error = %v", err)
+	}
+	pendingAt := time.Now()
+	mutationID := repositoryMonitorUpdateBranchMutationID(command.ID)
+	if err := monitorStore.CreateGitHubMutationRecord(ctx, &store.GitHubMutationRecord{ID: mutationID, MonitorNamespace: defaultNS, MonitorName: monitor.Name, RunID: runID, CommandEventID: command.ID, Operation: repositoryMonitorUpdateBranchOperation, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, Status: repositoryMonitorAutomergeStatePending, PendingAt: &pendingAt, CreatedAt: pendingAt}); err != nil {
+		t.Fatalf("CreateGitHubMutationRecord() error = %v", err)
+	}
+	actionID := store.RepositoryMonitorWorkActionID(command.ID, command.Intent)
+	if err := monitorStore.CreateWorkAction(ctx, &store.WorkAction{ID: actionID, MonitorNamespace: defaultNS, MonitorName: monitor.Name, RunID: runID, CommandEventID: command.ID, DesiredAction: command.Intent, Status: repositoryMonitorWorkActionStatusRunning, CreatedAt: pendingAt}); err != nil {
+		t.Fatalf("CreateWorkAction() error = %v", err)
+	}
+	for i := range repositoryMonitorCommandMaxRetries {
+		if err := monitorStore.CreateMonitorEvent(ctx, &store.MonitorEvent{ID: fmt.Sprintf("evt-update-branch-pending-retry-%d", i), MonitorNamespace: defaultNS, MonitorName: monitor.Name, RunID: runID, EventType: "run_failed", CreatedAt: time.Now()}); err != nil {
+			t.Fatalf("CreateMonitorEvent(%d) error = %v", i, err)
+		}
+	}
+
+	reconciler := &RepositoryMonitorReconciler{Store: monitorStore}
+	handled, reset, err := reconciler.ensureNoExistingCommandRunBlocksQueue(ctx, monitor, command, runID)
+	if err != nil || !handled || !reset {
+		t.Fatalf("ensureNoExistingCommandRunBlocksQueue() = handled=%v reset=%v err=%v", handled, reset, err)
+	}
+	run, err := monitorStore.GetMonitorRun(ctx, defaultNS, runID)
+	if err != nil {
+		t.Fatalf("GetMonitorRun() error = %v", err)
+	}
+	mutation, err := monitorStore.GetGitHubMutationRecord(ctx, defaultNS, mutationID)
+	if err != nil {
+		t.Fatalf("GetGitHubMutationRecord() error = %v", err)
+	}
+	deadline := repositoryMonitorUpdateBranchDeadline(mutation)
+	if run.Phase != repositoryMonitorRunPhaseQueued || run.CompletedAt != nil || run.Error != "" || !run.StartedAt.After(time.Now()) || run.StartedAt.After(deadline) {
+		t.Fatalf("pending update run = %#v, deadline %s", run, deadline)
+	}
+	if mutation.Status != repositoryMonitorAutomergeStatePending {
+		t.Fatalf("mutation status = %q, want pending", mutation.Status)
+	}
+	action, err := monitorStore.GetWorkAction(ctx, defaultNS, actionID)
+	if err != nil || action.Status != repositoryMonitorWorkActionStatusRunning {
+		t.Fatalf("work action = %#v, err %v, want running", action, err)
+	}
+}
+
+func TestRepositoryMonitorAcceptedUpdateBranchStopsAtMutationDeadline(t *testing.T) {
+	ctx := context.Background()
+	monitorStore := setupControllerSQLiteStore(t)
+	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "update-branch-pending-timeout", Namespace: defaultNS}}
+	command := store.CommandEvent{ID: "cmd-update-branch-pending-timeout", MonitorNamespace: defaultNS, MonitorName: monitor.Name, Kind: repositoryMonitorPullRequestKind, Number: 8, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "head-8"}
+	runID := repositoryMonitorCommandRunIDFromCommand(command.ID)
+	completedAt := time.Now()
+	if err := monitorStore.CreateMonitorRun(ctx, &store.MonitorRun{ID: runID, MonitorNamespace: defaultNS, MonitorName: monitor.Name, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, CommandEventID: command.ID, Phase: repositoryMonitorRunPhaseFailed, StartedAt: completedAt.Add(-time.Minute), CompletedAt: &completedAt, Error: "[retry_scheduled] compare unavailable"}); err != nil {
+		t.Fatalf("CreateMonitorRun() error = %v", err)
+	}
+	if err := monitorStore.UpsertMonitorItem(ctx, &store.MonitorItem{MonitorNamespace: defaultNS, MonitorName: monitor.Name, Kind: command.Kind, ItemKey: "8", Number: command.Number, HeadSHA: command.HeadSHA, RepairState: repositoryMonitorRepairPhaseQueued}); err != nil {
+		t.Fatalf("UpsertMonitorItem() error = %v", err)
+	}
+	pendingAt := time.Now().Add(-repositoryMonitorUpdateBranchTimeout)
+	mutationID := repositoryMonitorUpdateBranchMutationID(command.ID)
+	if err := monitorStore.CreateGitHubMutationRecord(ctx, &store.GitHubMutationRecord{ID: mutationID, MonitorNamespace: defaultNS, MonitorName: monitor.Name, RunID: runID, CommandEventID: command.ID, Operation: repositoryMonitorUpdateBranchOperation, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA, Status: repositoryMonitorAutomergeStatePending, PendingAt: &pendingAt, CreatedAt: pendingAt}); err != nil {
+		t.Fatalf("CreateGitHubMutationRecord() error = %v", err)
+	}
+	actionID := store.RepositoryMonitorWorkActionID(command.ID, command.Intent)
+	if err := monitorStore.CreateWorkAction(ctx, &store.WorkAction{ID: actionID, MonitorNamespace: defaultNS, MonitorName: monitor.Name, RunID: runID, CommandEventID: command.ID, DesiredAction: command.Intent, Status: repositoryMonitorWorkActionStatusRunning, CreatedAt: pendingAt}); err != nil {
+		t.Fatalf("CreateWorkAction() error = %v", err)
+	}
+
+	reconciler := &RepositoryMonitorReconciler{Store: monitorStore}
+	handled, reset, err := reconciler.ensureNoExistingCommandRunBlocksQueue(ctx, monitor, command, runID)
+	if err != nil || !handled || reset {
+		t.Fatalf("ensureNoExistingCommandRunBlocksQueue() = handled=%v reset=%v err=%v", handled, reset, err)
+	}
+	run, err := monitorStore.GetMonitorRun(ctx, defaultNS, runID)
+	if err != nil || run.Phase != repositoryMonitorRunPhaseFailed || run.Error != "[run_failed] "+repositoryMonitorUpdateBranchTimeoutReason {
+		t.Fatalf("timed-out run = %#v, err %v", run, err)
+	}
+	mutation, err := monitorStore.GetGitHubMutationRecord(ctx, defaultNS, mutationID)
+	if err != nil || mutation.Status != repositoryMonitorRunPhaseFailed || mutation.Error != repositoryMonitorUpdateBranchTimeoutReason {
+		t.Fatalf("timed-out mutation = %#v, err %v", mutation, err)
+	}
+	item, err := monitorStore.GetMonitorItem(ctx, defaultNS, monitor.Name, command.Kind, "8")
+	if err != nil || item.RepairState != repositoryMonitorRepairPhaseFailed || item.SkipReason != repositoryMonitorUpdateBranchFailure {
+		t.Fatalf("timed-out item = %#v, err %v", item, err)
+	}
+	action, err := monitorStore.GetWorkAction(ctx, defaultNS, actionID)
+	if err != nil || action.Status != repositoryMonitorWorkActionStatusFailed || action.Error != repositoryMonitorUpdateBranchTimeoutReason {
+		t.Fatalf("timed-out action = %#v, err %v", action, err)
+	}
+}
+
 func TestRepositoryMonitorTransientAutomergeRunFinalizesAfterRetryBudget(t *testing.T) {
 	ctx := context.Background()
 	monitorStore := setupControllerSQLiteStore(t)

@@ -100,6 +100,34 @@ func (r *RepositoryMonitorReconciler) ensureNoExistingCommandRunBlocksQueue(ctx 
 	if run.Phase != repositoryMonitorRunPhaseFailed {
 		return true, false, nil
 	}
+	if command.Intent == repositoryMonitorCommandIntentUpdateBranch {
+		mutation, mutationErr := r.Store.GetGitHubMutationRecord(ctx, monitor.Namespace, repositoryMonitorUpdateBranchMutationID(command.ID))
+		if mutationErr != nil && !errors.Is(mutationErr, store.ErrNotFound) {
+			return false, false, mutationErr
+		}
+		if mutation != nil && mutation.Status == repositoryMonitorAutomergeStatePending {
+			now := time.Now()
+			deadline := repositoryMonitorUpdateBranchDeadline(mutation)
+			if !deadline.IsZero() && !now.Before(deadline) {
+				run.Error = "[run_failed] " + repositoryMonitorUpdateBranchTimeoutReason
+				if err := r.Store.UpdateMonitorRun(ctx, run); err != nil {
+					return false, false, err
+				}
+				return true, false, r.terminalizeRepositoryMonitorFailedCommand(ctx, monitor, command, run, repositoryMonitorUpdateBranchTimeoutReason)
+			}
+			run.Phase = repositoryMonitorRunPhaseQueued
+			run.StartedAt = now.Add(repositoryMonitorCommandRetryDelay)
+			if !deadline.IsZero() && deadline.Before(run.StartedAt) {
+				run.StartedAt = deadline
+			}
+			run.CompletedAt = nil
+			run.Error = ""
+			if err := r.Store.UpdateMonitorRun(ctx, run); err != nil {
+				return false, false, err
+			}
+			return true, true, nil
+		}
+	}
 	if strings.Contains(run.Error, "failed to signal repository monitor run") {
 		now := time.Now()
 		run.Phase = repositoryMonitorRunPhaseQueued
