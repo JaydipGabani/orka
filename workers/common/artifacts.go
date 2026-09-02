@@ -399,7 +399,13 @@ func doPostWithContentType(endpoint string, data []byte, saToken, contentType st
 			return nil
 		}
 
-		lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+		lastErr = &httpStatusError{Status: resp.StatusCode}
+		if permanentSubmissionError(lastErr) {
+			// The same classification as result submission: an oversized
+			// artifact, rejected credentials, or disabled storage does not
+			// change on retry.
+			return fmt.Errorf("artifact upload rejected permanently: %w", lastErr)
+		}
 		fmt.Fprintf(os.Stderr, "artifact upload attempt %d/%d failed: %v\n", attempt+1, artifactMaxRetries, lastErr)
 	}
 
