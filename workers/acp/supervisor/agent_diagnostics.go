@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/orka-agents/orka/internal/acp"
 )
@@ -120,11 +121,11 @@ func withholdAgentDiagnostic(state *sessionState, prompt *promptState, event acp
 	}
 	promptID := prompt.request.Metadata.PromptID
 	switch {
-	// The event timestamp is stamped when the supervisor received the
-	// chunk from the child, so a startup diagnostic queued behind a slow
-	// consumer keeps the phase it was emitted in.
+	// The receipt time is stamped when the session received the chunk from
+	// the child, before any buffering, so a startup diagnostic queued behind
+	// prompt acceptance or a slow consumer keeps the phase it was emitted in.
 	case filter.Startup != nil && filter.Startup(text) &&
-		!state.providerProxy.modelOutputPossibleAt(string(promptID), event.Timestamp):
+		!state.providerProxy.modelOutputPossibleAt(string(promptID), promptEventReceivedAt(event)):
 		slog.Info(
 			"ACP provider CLI startup diagnostic withheld from the agent message stream",
 			"runtimeSession", state.id, "promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
@@ -140,4 +141,14 @@ func withholdAgentDiagnostic(state *sessionState, prompt *promptState, event acp
 		return true
 	}
 	return false
+}
+
+// promptEventReceivedAt is the instant the session received event from the
+// child; the enqueue timestamp stands in for events that carry no receipt
+// time.
+func promptEventReceivedAt(event acp.PromptEvent) time.Time {
+	if !event.ReceivedAt.IsZero() {
+		return event.ReceivedAt
+	}
+	return event.Timestamp
 }

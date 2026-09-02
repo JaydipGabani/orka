@@ -158,6 +158,13 @@ func TestWithholdAgentDiagnosticAnchorsOnProviderProxyState(t *testing.T) {
 	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
 		t.Fatal("startup diagnostic text received after an inference response started was withheld")
 	}
+	// An event buffered before prompt acceptance is enqueued (and
+	// timestamped) later than it was received; the receipt time decides.
+	bufferedStartup := startup
+	bufferedStartup.ReceivedAt = now.Add(-2 * time.Millisecond)
+	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), bufferedStartup) {
+		t.Fatal("startup diagnostic received before the first inference response was forwarded because it was enqueued late")
+	}
 	state.providerProxy = &providerProxySession{turnPromptID: "other-prompt", firstInferenceResponseStartedAt: now.Add(-time.Millisecond)}
 	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
 		t.Fatal("another prompt's inference response unblocked a startup diagnostic")
