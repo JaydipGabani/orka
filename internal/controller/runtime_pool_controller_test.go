@@ -2580,6 +2580,10 @@ func TestRuntimePoolReconcilerRetiredImageDrainsAndStops(t *testing.T) {
 		}
 	})
 
+}
+
+func TestRuntimePoolReconcilerRetiredImageWithoutLiveWorkload(t *testing.T) {
+	retiredMessage := "spec.runtime.image is not the controller-approved image"
 	t.Run("leftover Pods without a Deployment withhold Stopped", func(t *testing.T) {
 		scheme := runtimePoolTestScheme(t)
 		pool := runtimePoolTestObject(1)
