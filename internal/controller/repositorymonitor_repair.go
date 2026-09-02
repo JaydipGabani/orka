@@ -305,39 +305,7 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 
 	requestID, err := r.updateRepositoryMonitorPullRequestBranch(ctx, owner, repository, token, pr.Number, command.HeadSHA)
 	if err != nil {
-		failureState := repositoryMonitorRunFailureState(err)
-		if repositoryMonitorFailedCommandRunRetryable("[" + failureState + "]") {
-			mutation.Status = repositoryMonitorAutomergeStateStarted
-			mutation.PendingAt = nil
-			mutation.GitHubRequestID = ""
-			mutation.Error = err.Error()
-			if updateErr := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); updateErr != nil {
-				return true, 0, fmt.Errorf("update branch retry failed: %w; additionally failed to update mutation audit: %v", err, updateErr)
-			}
-			item.RepairState = repositoryMonitorRepairPhaseQueued
-			item.SkipReason = failureState
-			if updateErr := r.Store.UpsertMonitorItem(ctx, item); updateErr != nil {
-				return true, 0, updateErr
-			}
-			if actionErr := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusRunning, failureState, "", err.Error()); actionErr != nil {
-				return true, 0, actionErr
-			}
-			return true, 0, err
-		}
-		mutation.Status = repositoryMonitorRunPhaseFailed
-		mutation.Error = err.Error()
-		if updateErr := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); updateErr != nil {
-			return true, 0, fmt.Errorf("update branch failed: %w; additionally failed to update mutation audit: %v", err, updateErr)
-		}
-		item.RepairState = repositoryMonitorRepairPhaseFailed
-		item.SkipReason = repositoryMonitorUpdateBranchFailure
-		if updateErr := r.Store.UpsertMonitorItem(ctx, item); updateErr != nil {
-			return true, 0, updateErr
-		}
-		if actionErr := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusFailed, repositoryMonitorRepairPhaseFailed, "", err.Error()); actionErr != nil {
-			return true, 0, actionErr
-		}
-		return true, 0, err
+		return r.recordRepositoryMonitorUpdateBranchSubmissionError(ctx, monitor, run, command, item, mutation, pr, err)
 	}
 	mutation.Status = repositoryMonitorAutomergeStatePending
 	pendingAt := time.Now()
@@ -359,6 +327,51 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 		return true, 0, pendingMutationProjectionError("event", err)
 	}
 	return true, 0, nil
+}
+
+func (r *RepositoryMonitorReconciler) recordRepositoryMonitorUpdateBranchSubmissionError(
+	ctx context.Context,
+	monitor *corev1alpha1.RepositoryMonitor,
+	run *store.MonitorRun,
+	command *store.CommandEvent,
+	item *store.MonitorItem,
+	mutation *store.GitHubMutationRecord,
+	pr repositoryMonitorPullRequest,
+	submissionErr error,
+) (bool, int, error) {
+	failureState := repositoryMonitorRunFailureState(submissionErr)
+	if repositoryMonitorFailedCommandRunRetryable("[" + failureState + "]") {
+		mutation.Status = repositoryMonitorAutomergeStateStarted
+		mutation.PendingAt = nil
+		mutation.GitHubRequestID = ""
+		mutation.Error = submissionErr.Error()
+		if updateErr := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); updateErr != nil {
+			return true, 0, fmt.Errorf("update branch retry failed: %w; additionally failed to update mutation audit: %v", submissionErr, updateErr)
+		}
+		item.RepairState = repositoryMonitorRepairPhaseQueued
+		item.SkipReason = failureState
+		if updateErr := r.Store.UpsertMonitorItem(ctx, item); updateErr != nil {
+			return true, 0, updateErr
+		}
+		if actionErr := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusRunning, failureState, "", submissionErr.Error()); actionErr != nil {
+			return true, 0, actionErr
+		}
+		return true, 0, submissionErr
+	}
+	mutation.Status = repositoryMonitorRunPhaseFailed
+	mutation.Error = submissionErr.Error()
+	if updateErr := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); updateErr != nil {
+		return true, 0, fmt.Errorf("update branch failed: %w; additionally failed to update mutation audit: %v", submissionErr, updateErr)
+	}
+	item.RepairState = repositoryMonitorRepairPhaseFailed
+	item.SkipReason = repositoryMonitorUpdateBranchFailure
+	if updateErr := r.Store.UpsertMonitorItem(ctx, item); updateErr != nil {
+		return true, 0, updateErr
+	}
+	if actionErr := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusFailed, repositoryMonitorRepairPhaseFailed, "", submissionErr.Error()); actionErr != nil {
+		return true, 0, actionErr
+	}
+	return true, 0, submissionErr
 }
 
 func (r *RepositoryMonitorReconciler) waitForRepositoryMonitorUpdateBranch(
