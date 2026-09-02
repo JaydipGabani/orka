@@ -2901,7 +2901,7 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 		}
 		prNumber := *finding.PRNumber
 		if _, verified := verifiedPRs[prNumber]; !verified {
-			merged, err := r.repositoryScanPullRequestMerged(ctx, owner, repository, token, prNumber, target.Branch)
+			merged, err := r.repositoryScanPullRequestMerged(ctx, owner, repository, token, prNumber, target.Branch, run.HeadCommit)
 			if err != nil {
 				return err
 			}

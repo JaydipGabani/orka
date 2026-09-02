@@ -39,8 +39,11 @@ import (
 )
 
 const (
-	readyReasonScanFailed = "ScanFailed"
-	testPatchDiffHeader   = "diff --git a/app.py b/app.py"
+	readyReasonScanFailed       = "ScanFailed"
+	testPatchDiffHeader         = "diff --git a/app.py b/app.py"
+	testRepositoryScanHeadSHA   = "2222222222222222222222222222222222222222"
+	testRepositoryScanMergeSHA  = "1111111111111111111111111111111111111111"
+	testRepositoryScanLateMerge = "3333333333333333333333333333333333333333"
 	// testPatchFullDiff carries the same change content as the app.py commit
 	// stub served by newPatchCommitServer; artifact evidence must match the
 	// published commit's content, not just its file names.
@@ -4933,23 +4936,38 @@ func TestMergeFindingEvidenceAndRemediationPreservesUserDecisionAndIgnoresAliasW
 func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *testing.T) {
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)
-	requests := map[int]int{}
+	pullRequests := map[int]int{}
+	compareRequests := map[string]int{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer forge-token-value" {
 			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		if comparison, ok := strings.CutPrefix(r.URL.Path, "/repos/example/kaset/compare/"); ok {
+			compareRequests[comparison]++
+			switch comparison {
+			case testRepositoryScanMergeSHA + "..." + testRepositoryScanHeadSHA:
+				_, _ = w.Write([]byte(`{"status":"ahead"}`))
+			case testRepositoryScanLateMerge + "..." + testRepositoryScanHeadSHA:
+				_, _ = w.Write([]byte(`{"status":"behind"}`))
+			default:
+				t.Fatalf("unexpected comparison %s", comparison)
+			}
+			return
 		}
 		var prNumber int
 		if _, err := fmt.Sscanf(r.URL.Path, "/repos/example/kaset/pulls/%d", &prNumber); err != nil {
 			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
 		}
-		requests[prNumber]++
+		pullRequests[prNumber]++
 		switch prNumber {
 		case 42:
-			_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"main"}}`))
+			_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)
 		case 43:
 			_, _ = w.Write([]byte(`{"merged":false,"merged_at":null,"base":{"ref":"main"}}`))
 		case 45:
-			_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"release"}}`))
+			_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"release"}}`, testRepositoryScanMergeSHA)
+		case 46:
+			_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanLateMerge)
 		default:
 			t.Fatalf("unexpected pull request %d", prNumber)
 		}
@@ -4979,7 +4997,7 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, secret, threatTask, mapperTask, reviewTask).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
-	run := &storepkg.ScanRun{ID: "scan_current", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: threatTask.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, StartedAt: time.Now()}
+	run := &storepkg.ScanRun{ID: "scan_current", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: threatTask.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, HeadCommit: testRepositoryScanHeadSHA, StartedAt: time.Now()}
 	if err := securityStore.CreateScanRun(ctx, run); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
@@ -4995,6 +5013,7 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		newFinding("fnd_open_pr", "scan_old", 43),
 		newFinding("fnd_observed", run.ID, 44),
 		newFinding("fnd_wrong_base", "scan_old", 45),
+		newFinding("fnd_merge_after_scan", "scan_old", 46),
 	} {
 		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
 			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
@@ -5004,14 +5023,15 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		t.Fatalf("refreshScanRunStatus() error = %v", err)
 	}
 
-	for id, want := range map[string]string{"fnd_merged": findingStateResolved, "fnd_open_pr": findingStatePROpen, "fnd_observed": findingStatePROpen, "fnd_wrong_base": findingStatePROpen} {
+	for id, want := range map[string]string{"fnd_merged": findingStateResolved, "fnd_open_pr": findingStatePROpen, "fnd_observed": findingStatePROpen, "fnd_wrong_base": findingStatePROpen, "fnd_merge_after_scan": findingStatePROpen} {
 		finding, err := securityStore.GetFinding(ctx, defaultNS, id)
 		if err != nil || finding.State != want {
 			t.Fatalf("finding %s = %#v, err %v, want state %s", id, finding, err, want)
 		}
 	}
-	if requests[42] != 1 || requests[43] != 1 || requests[44] != 0 || requests[45] != 1 {
-		t.Fatalf("pull request reads = %#v", requests)
+	if pullRequests[42] != 1 || pullRequests[43] != 1 || pullRequests[44] != 0 || pullRequests[45] != 1 || pullRequests[46] != 1 ||
+		compareRequests[testRepositoryScanMergeSHA+"..."+testRepositoryScanHeadSHA] != 1 || compareRequests[testRepositoryScanLateMerge+"..."+testRepositoryScanHeadSHA] != 1 {
+		t.Fatalf("pull request reads = %#v, comparisons = %#v", pullRequests, compareRequests)
 	}
 }
 
@@ -5019,7 +5039,13 @@ func TestRefreshScanRunStatusUsesFrozenTaskTargetAfterSpecChanges(t *testing.T) 
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)
 	requests := map[int]int{}
+	compareRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/example/kaset/compare/"+testRepositoryScanMergeSHA+"..."+testRepositoryScanHeadSHA {
+			compareRequests++
+			_, _ = w.Write([]byte(`{"status":"ahead"}`))
+			return
+		}
 		var prNumber int
 		if _, err := fmt.Sscanf(r.URL.Path, "/repos/example/kaset/pulls/%d", &prNumber); err != nil {
 			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
@@ -5029,7 +5055,7 @@ func TestRefreshScanRunStatusUsesFrozenTaskTargetAfterSpecChanges(t *testing.T) 
 		if prNumber == 43 {
 			base = "release"
 		}
-		_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":%q}}`, base)
+		_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":%q}}`, testRepositoryScanMergeSHA, base)
 	}))
 	t.Cleanup(server.Close)
 
@@ -5061,7 +5087,7 @@ func TestRefreshScanRunStatusUsesFrozenTaskTargetAfterSpecChanges(t *testing.T) 
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, secret, threatTask, mapperTask, reviewTask).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
-	run := &storepkg.ScanRun{ID: "scan_frozen", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: threatTask.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, StartedAt: time.Now()}
+	run := &storepkg.ScanRun{ID: "scan_frozen", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: threatTask.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, HeadCommit: testRepositoryScanHeadSHA, StartedAt: time.Now()}
 	if err := securityStore.CreateScanRun(ctx, run); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
@@ -5088,29 +5114,35 @@ func TestRefreshScanRunStatusUsesFrozenTaskTargetAfterSpecChanges(t *testing.T) 
 	}
 	frozenFinding, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_frozen_target")
 	currentFinding, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_current_spec")
-	if frozenFinding.State != findingStateResolved || currentFinding.State != findingStatePROpen || requests[42] != 1 || requests[43] != 0 {
-		t.Fatalf("frozen = %#v, current = %#v, requests = %#v", frozenFinding, currentFinding, requests)
+	if frozenFinding.State != findingStateResolved || currentFinding.State != findingStatePROpen || requests[42] != 1 || requests[43] != 0 || compareRequests != 1 {
+		t.Fatalf("frozen = %#v, current = %#v, requests = %#v, comparisons = %d", frozenFinding, currentFinding, requests, compareRequests)
 	}
 }
 
 func TestRefreshScanRunStatusRetriesMergedPRLookup(t *testing.T) {
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)
-	attempts := 0
+	pullAttempts := 0
+	compareAttempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/example/kaset/compare/"+testRepositoryScanMergeSHA+"..."+testRepositoryScanHeadSHA {
+			compareAttempts++
+			_, _ = w.Write([]byte(`{"status":"ahead"}`))
+			return
+		}
 		if r.URL.Path != "/repos/example/kaset/pulls/42" {
 			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
 		}
 		if r.Header.Get("Authorization") != "Bearer forge-token-value" {
 			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
 		}
-		attempts++
-		if attempts == 1 {
+		pullAttempts++
+		if pullAttempts == 1 {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`{"message":"try again"}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"main"}}`))
+		_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)
 	}))
 	t.Cleanup(server.Close)
 
@@ -5137,7 +5169,7 @@ func TestRefreshScanRunStatusRetriesMergedPRLookup(t *testing.T) {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, threatTask, mapperTask, reviewTask).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
-	run := &storepkg.ScanRun{ID: "scan_retry", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: threatTask.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, StartedAt: time.Now()}
+	run := &storepkg.ScanRun{ID: "scan_retry", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: threatTask.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, HeadCommit: testRepositoryScanHeadSHA, StartedAt: time.Now()}
 	if err := securityStore.CreateScanRun(ctx, run); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
@@ -5161,8 +5193,8 @@ func TestRefreshScanRunStatusRetriesMergedPRLookup(t *testing.T) {
 		t.Fatalf("refreshScanRunStatus(retry) error = %v", err)
 	}
 	got, err := securityStore.GetFinding(ctx, defaultNS, finding.ID)
-	if err != nil || got.State != findingStateResolved || attempts != 2 {
-		t.Fatalf("finding = %#v, attempts = %d, err %v", got, attempts, err)
+	if err != nil || got.State != findingStateResolved || pullAttempts != 2 || compareAttempts != 1 {
+		t.Fatalf("finding = %#v, pull attempts = %d, compare attempts = %d, err %v", got, pullAttempts, compareAttempts, err)
 	}
 }
 
@@ -5213,13 +5245,19 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)
 	requests := map[int]int{}
+	compareRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/example/kaset/compare/"+testRepositoryScanMergeSHA+"..."+testRepositoryScanHeadSHA {
+			compareRequests++
+			_, _ = w.Write([]byte(`{"status":"ahead"}`))
+			return
+		}
 		var prNumber int
 		if _, err := fmt.Sscanf(r.URL.Path, "/repos/example/kaset/pulls/%d", &prNumber); err != nil {
 			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
 		}
 		requests[prNumber]++
-		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"main"}}`))
+		_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)
 	}))
 	t.Cleanup(server.Close)
 	scheme := runtime.NewScheme()
@@ -5230,7 +5268,7 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
-	run := &storepkg.ScanRun{ID: "scan_scoped", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: mode, Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 1}
+	run := &storepkg.ScanRun{ID: "scan_scoped", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: mode, Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 1, HeadCommit: testRepositoryScanHeadSHA}
 	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_reviewed", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
 	}
@@ -5287,24 +5325,30 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 	unreviewed, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_unreviewed")
 	oldTarget, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_old_target")
 	legacyTarget, _ := securityStore.GetFinding(ctx, defaultNS, legacy.ID)
-	if reviewed.State != findingStateResolved || unreviewed.State != findingStatePROpen || oldTarget.State != findingStatePROpen || legacyTarget.State != findingStateResolved || requests[42] != 1 || requests[43] != 0 || requests[44] != 0 || requests[45] != 1 {
-		t.Fatalf("reviewed = %#v, unreviewed = %#v, old target = %#v, legacy target = %#v, requests = %#v", reviewed, unreviewed, oldTarget, legacyTarget, requests)
+	if reviewed.State != findingStateResolved || unreviewed.State != findingStatePROpen || oldTarget.State != findingStatePROpen || legacyTarget.State != findingStateResolved || requests[42] != 1 || requests[43] != 0 || requests[44] != 0 || requests[45] != 1 || compareRequests != 2 {
+		t.Fatalf("reviewed = %#v, unreviewed = %#v, old target = %#v, legacy target = %#v, requests = %#v, comparisons = %d", reviewed, unreviewed, oldTarget, legacyTarget, requests, compareRequests)
 	}
 }
 
 func TestResolveMergedFindingsCollectsAllPagesBeforeMutation(t *testing.T) {
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)
-	requests := 0
+	pullRequests := 0
+	compareRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/example/kaset/compare/"+testRepositoryScanMergeSHA+"..."+testRepositoryScanHeadSHA {
+			compareRequests++
+			_, _ = w.Write([]byte(`{"status":"ahead"}`))
+			return
+		}
 		if r.URL.Path != "/repos/example/kaset/pulls/42" {
 			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
 		}
 		if r.Header.Get("Authorization") != "Bearer forge-token-value" {
 			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
 		}
-		requests++
-		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"main"}}`))
+		pullRequests++
+		_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)
 	}))
 	t.Cleanup(server.Close)
 
@@ -5322,7 +5366,7 @@ func TestResolveMergedFindingsCollectsAllPagesBeforeMutation(t *testing.T) {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	reconciler := &RepositoryScanReconciler{Client: kubeClient, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
-	run := &storepkg.ScanRun{ID: "scan_current", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 1}
+	run := &storepkg.ScanRun{ID: "scan_current", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 1, HeadCommit: testRepositoryScanHeadSHA}
 	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_all", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
 	}
@@ -5354,8 +5398,8 @@ func TestResolveMergedFindingsCollectsAllPagesBeforeMutation(t *testing.T) {
 		t.Fatalf("resolveMergedFindingsNotObserved() error = %v", err)
 	}
 	remaining, _, err := securityStore.ListFindings(ctx, storepkg.FindingFilter{Namespace: defaultNS, RepositoryScan: scan.Name, State: findingStatePROpen, Limit: 500})
-	if err != nil || len(remaining) != 0 || requests != 1 {
-		t.Fatalf("remaining = %d, requests = %d, err %v", len(remaining), requests, err)
+	if err != nil || len(remaining) != 0 || pullRequests != 1 || compareRequests != 1 {
+		t.Fatalf("remaining = %d, pull requests = %d, comparisons = %d, err %v", len(remaining), pullRequests, compareRequests, err)
 	}
 }
 
@@ -5386,13 +5430,19 @@ func TestResolveMergedFindingsSkipsSlicesWithDroppedResults(t *testing.T) {
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)
 	requests := map[int]int{}
+	compareRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/example/kaset/compare/"+testRepositoryScanMergeSHA+"..."+testRepositoryScanHeadSHA {
+			compareRequests++
+			_, _ = w.Write([]byte(`{"status":"ahead"}`))
+			return
+		}
 		var prNumber int
 		if _, err := fmt.Sscanf(r.URL.Path, "/repos/example/kaset/pulls/%d", &prNumber); err != nil {
 			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
 		}
 		requests[prNumber]++
-		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"main"}}`))
+		_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)
 	}))
 	t.Cleanup(server.Close)
 
@@ -5404,7 +5454,7 @@ func TestResolveMergedFindingsSkipsSlicesWithDroppedResults(t *testing.T) {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
-	run := &storepkg.ScanRun{ID: "scan_dropped", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 2}
+	run := &storepkg.ScanRun{ID: "scan_dropped", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 2, HeadCommit: testRepositoryScanHeadSHA}
 	for _, sliceID := range []string{"slice_dropped", "slice_clean"} {
 		if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: sliceID, Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
 			t.Fatalf("UpsertReviewSlice(%s) error = %v", sliceID, err)
@@ -5432,8 +5482,8 @@ func TestResolveMergedFindingsSkipsSlicesWithDroppedResults(t *testing.T) {
 	}
 	droppedSlice, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_dropped_slice")
 	cleanSlice, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_clean_slice")
-	if droppedSlice.State != findingStatePROpen || cleanSlice.State != findingStateResolved || requests[42] != 0 || requests[43] != 1 {
-		t.Fatalf("dropped = %#v, clean = %#v, requests = %#v", droppedSlice, cleanSlice, requests)
+	if droppedSlice.State != findingStatePROpen || cleanSlice.State != findingStateResolved || requests[42] != 0 || requests[43] != 1 || compareRequests != 1 {
+		t.Fatalf("dropped = %#v, clean = %#v, requests = %#v, comparisons = %d", droppedSlice, cleanSlice, requests, compareRequests)
 	}
 }
 
