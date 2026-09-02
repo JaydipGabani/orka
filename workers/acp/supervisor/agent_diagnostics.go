@@ -13,7 +13,7 @@ import (
 // the ACP agent message stream instead of their own log. Left alone, those
 // chunks are compacted together with the model's text and reach Task results,
 // chat, and monitor reviews as if the model had said them. A provider
-// projection declares recognizers for the exact chunks its CLI emits
+// projection declares a recognizer for the exact chunks its CLI emits
 // (AgentDiagnosticFilter); the prompt stream withholds them before compaction,
 // anchored on prompt state the supervisor can prove, and logs them so the
 // CLI's report still reaches operators.
@@ -21,7 +21,6 @@ import (
 const (
 	copilotDisabledToolsDiagnosticPrefix       = "Info: Disabled tools: "
 	copilotUnknownExcludedToolDiagnosticPrefix = "Info: Unknown tool name in the tool excludedlist: "
-	copilotInferenceRetryDiagnostic            = "Info: Response was interrupted due to a server error. Retrying..."
 )
 
 // copilotStartupDiagnostic recognizes the tool-exclusion report GitHub Copilot
@@ -65,13 +64,6 @@ func copilotStartupDiagnostic(excludedTools []string) func(string) bool {
 	}
 }
 
-// copilotInferenceRetryNotice recognizes the notice the CLI writes into the
-// agent message stream after an inference request fails and before it
-// retries; the provider proxy already accounts for the failed request.
-func copilotInferenceRetryNotice(text string) bool {
-	return text == copilotInferenceRetryDiagnostic
-}
-
 func copilotDisabledToolsListNamesExcluded(list string, excluded map[string]struct{}) bool {
 	namesExcluded := false
 	for entry := range strings.SplitSeq(list, ",") {
@@ -104,43 +96,33 @@ func copilotToolIdentifier(name string) bool {
 }
 
 // withholdAgentDiagnostic reports whether event is an assistant text chunk the
-// session's provider projection recognizes as a CLI diagnostic under the
-// anchoring rules documented on AgentDiagnosticFilter. A withheld chunk is
+// session's provider projection recognizes as a CLI startup diagnostic under
+// the anchoring rule documented on AgentDiagnosticFilter. A withheld chunk is
 // logged and never reaches compaction, the harness event stream, or the
 // terminal assistant text. The logged text is bounded by construction: each
 // recognized shape is a fixed CLI sentence whose only variable parts are tool
-// identifiers. Only the prompt stream goroutine touches the prompt counters.
+// identifiers.
 func withholdAgentDiagnostic(state *sessionState, prompt *promptState, event acp.PromptEvent) bool {
 	filter := state.agentDiagnosticFilter
-	if filter == nil {
+	if filter == nil || filter.Startup == nil {
 		return false
 	}
 	text, ok := assistantMessageText(event)
-	if !ok || text == "" {
+	if !ok || text == "" || !filter.Startup(text) {
 		return false
 	}
-	promptID := prompt.request.Metadata.PromptID
-	switch {
 	// The receipt time is stamped when the session received the chunk from
 	// the child, before any buffering, so a startup diagnostic queued behind
 	// prompt acceptance or a slow consumer keeps the phase it was emitted in.
-	case filter.Startup != nil && filter.Startup(text) &&
-		!state.providerProxy.modelOutputPossibleAt(string(promptID), promptEventReceivedAt(event)):
-		slog.Info(
-			"ACP provider CLI startup diagnostic withheld from the agent message stream",
-			"runtimeSession", state.id, "promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
-		)
-		return true
-	case filter.InferenceRetry != nil && filter.InferenceRetry(text) &&
-		prompt.withheldRetryNotices < state.providerProxy.inferenceFailureCount(string(promptID)):
-		prompt.withheldRetryNotices++
-		slog.Info(
-			"ACP provider CLI inference retry notice withheld from the agent message stream",
-			"runtimeSession", state.id, "promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
-		)
-		return true
+	promptID := prompt.request.Metadata.PromptID
+	if state.providerProxy.modelOutputPossibleAt(string(promptID), promptEventReceivedAt(event)) {
+		return false
 	}
-	return false
+	slog.Info(
+		"ACP provider CLI startup diagnostic withheld from the agent message stream",
+		"runtimeSession", state.id, "promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
+	)
+	return true
 }
 
 // promptEventReceivedAt is the instant the session received event from the

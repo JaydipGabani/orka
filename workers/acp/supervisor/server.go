@@ -253,9 +253,6 @@ type promptState struct {
 	finalAnswerOverflow bool
 	settlement          *harnessv2.PromptSettlement
 	settlementDigest    string
-	// withheldRetryNotices counts provider CLI inference retry notices already
-	// withheld for this prompt, bounded by the proxy's recorded failures.
-	withheldRetryNotices int
 	// providerDrainTimedOut records that an admitted inference request was
 	// still in flight when the child settled and did not finish within the
 	// cancel grace, so the prompt's inference accounting is incomplete.

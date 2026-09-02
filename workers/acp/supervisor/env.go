@@ -537,11 +537,8 @@ func copilotSessionProjection(
 	// The CLI reports the exclusion list back as "Info:" agent message chunks
 	// at prompt start; the filter withholds exactly those chunks.
 	return ProviderSessionProjection{
-		AdditionalArgs: []string{"--excluded-tools=" + strings.Join(excluded, ",")},
-		AgentDiagnosticFilter: &AgentDiagnosticFilter{
-			Startup:        copilotStartupDiagnostic(excluded),
-			InferenceRetry: copilotInferenceRetryNotice,
-		},
+		AdditionalArgs:        []string{"--excluded-tools=" + strings.Join(excluded, ",")},
+		AgentDiagnosticFilter: &AgentDiagnosticFilter{Startup: copilotStartupDiagnostic(excluded)},
 	}, nil
 }
 

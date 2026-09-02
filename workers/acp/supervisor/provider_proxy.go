@@ -741,23 +741,6 @@ func (s *providerProxySession) attachInferenceFailureDetail(promptID string, cla
 // end_turn, which must not become a successful Task. Completion order is
 // irrelevant: a later-issued failure stays unrecovered even if an
 // earlier-issued request succeeds afterwards.
-// inferenceFailureCount reports how many inference requests the active
-// prompt has issued that failed (upstream error status, transport failure,
-// proxy rejection, or an in-stream terminal error). Every failure is
-// accounted before the bytes that reveal it to the child are relayed, so a
-// child reaction to a failure can never precede its accounting.
-func (s *providerProxySession) inferenceFailureCount(promptID string) int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.turnPromptID != strings.TrimSpace(promptID) {
-		return 0
-	}
-	return int(s.inferenceFailures)
-}
-
 // markInferenceResponseStarted records that a non-error inference response
 // for the active prompt is about to be relayed to the child; only the first
 // one per prompt is timestamped.
@@ -900,43 +883,9 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 type deliveredSSEWriter struct {
 	w       io.Writer
 	scanner *sseTerminalErrorScanner
-	// probe looks ahead over each chunk before it is written. When it
-	// latches a terminal error, the chunk is written in two parts around the
-	// byte that completes the error line (an SSE client cannot dispatch the
-	// event without it), and onFailure runs in between with the probe's
-	// detail: after every earlier byte was accepted downstream, before the
-	// completing byte can be observed. A short first part means the line
-	// was not delivered, so nothing is reported and the stream-end verdicts
-	// decide. The scanner still sees only delivered bytes.
-	probe           *sseTerminalErrorScanner
-	onFailure       func(detail string)
-	failureReported bool
 }
 
 func (w *deliveredSSEWriter) Write(p []byte) (int, error) {
-	if w.probe != nil && w.onFailure != nil && !w.failureReported && !w.probe.failed {
-		_, _ = w.probe.Write(p)
-		if w.probe.failed {
-			head := w.probe.latchOffset - 1
-			n, err := w.w.Write(p[:head])
-			if n > 0 {
-				_, _ = w.scanner.Write(p[:n])
-			}
-			if err != nil {
-				return n, err
-			}
-			if n < head {
-				return n, io.ErrShortWrite
-			}
-			w.failureReported = true
-			w.onFailure(w.probe.detail)
-			m, err := w.w.Write(p[head:])
-			if m > 0 {
-				_, _ = w.scanner.Write(p[head : head+m])
-			}
-			return head + m, err
-		}
-	}
 	n, err := w.w.Write(p)
 	if n > 0 {
 		_, _ = w.scanner.Write(p[:n])
@@ -1183,10 +1132,6 @@ func (p *providerProxy) relayUpstreamResponse(
 	// providers report terminal errors inside the SSE body. Scan the relayed
 	// stream for explicit error events so they are accounted as failures.
 	var streamScanner *sseTerminalErrorScanner
-	// terminalErrorAccounted is set once an in-stream terminal error was
-	// recorded from delivered bytes ahead of their flush; the verdicts below
-	// must not account the same sequence again.
-	terminalErrorAccounted := false
 	if !upstreamFailed && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
 		streamScanner = &sseTerminalErrorScanner{}
 		// The scanner attaches on the WRITE side below, so it sees only
@@ -1204,19 +1149,7 @@ func (p *providerProxy) relayUpstreamResponse(
 	relayed := &countingWriter{w: w}
 	var destination io.Writer = relayed
 	if streamScanner != nil {
-		// An in-stream terminal error is accounted before the byte that
-		// completes its line can reach the child, without waiting for the
-		// upstream to close the stream: ACP agents react to a delivered
-		// error event (for example with a retry notice in the agent message
-		// stream) faster than upstreams end their streams, and the
-		// supervisor must be able to trust the failure count at that moment.
-		// The writer splits the chunk at that byte so the accounting is
-		// still tied to delivered bytes: a short write before the split
-		// leaves the stream-end verdicts below in charge.
-		destination = &deliveredSSEWriter{w: relayed, scanner: streamScanner, probe: &sseTerminalErrorScanner{}, onFailure: func(detail string) {
-			terminalErrorAccounted = true
-			session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider stream reported a terminal error: "+detail)
-		}}
+		destination = &deliveredSSEWriter{w: relayed, scanner: streamScanner}
 	}
 	err := providerproxy.StreamBoundedResponse(destination, body, p.maxResponseBytes, flusher)
 	streamFailed := func() bool {
@@ -1238,7 +1171,7 @@ func (p *providerProxy) relayUpstreamResponse(
 		session.attachInferenceFailureDetail(promptID, requestClass, seq, providerUpstreamErrorDetail(capture.buffer))
 	}
 	if err != nil {
-		if !upstreamFailed && !terminalErrorAccounted {
+		if !upstreamFailed {
 			if errors.Is(err, providerproxy.ErrDestinationWrite) || ctx.Err() != nil {
 				// A child disconnect is not upstream evidence by itself. A
 				// partially delivered SSE response still needs a terminal
@@ -1268,7 +1201,7 @@ func (p *providerProxy) relayUpstreamResponse(
 		}
 		panic(http.ErrAbortHandler)
 	}
-	if !upstreamFailed && !terminalErrorAccounted {
+	if !upstreamFailed {
 		if streamFailed() {
 			recordStreamFailure()
 			return
@@ -1307,10 +1240,6 @@ type sseTerminalErrorScanner struct {
 	eventMarker       []byte
 	completed         bool
 	detail            string
-	// latchOffset is the number of bytes of the most recent Write consumed
-	// when the failure latched, i.e. the index just past the newline that
-	// completed the terminal-error line.
-	latchOffset int
 }
 
 const (
@@ -1354,11 +1283,10 @@ func (c *sseTerminalErrorScanner) Write(p []byte) (int, error) {
 	if c.failed {
 		return len(p), nil
 	}
-	for i, b := range p {
+	for _, b := range p {
 		if b == '\n' {
 			c.finishLine()
 			if c.failed {
-				c.latchOffset = i + 1
 				return len(p), nil
 			}
 			c.resetLine()

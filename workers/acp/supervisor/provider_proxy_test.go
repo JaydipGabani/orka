@@ -1,7 +1,6 @@
 package supervisor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -936,32 +935,23 @@ func TestProviderProxyUpstreamFailureAccountingClearsAfterTerminalStream(t *test
 	}
 }
 
-// A streamed terminal error must be accounted before the child can read the
-// line that reveals it: the supervisor's diagnostic filter trusts the failure
-// count the moment the child reacts, which can be long before the upstream
-// closes the stream.
-func TestProviderProxyStreamTerminalErrorIsAccountedBeforeDelivery(t *testing.T) {
+// Model output can only be derived from a non-error inference response, so
+// the proxy records when the prompt's first such response begins relaying.
+func TestProviderProxyModelOutputPossibleAfterFirstResponseStarts(t *testing.T) {
 	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		flusher := w.(http.Flusher)
-		for _, chunk := range []string{
-			"event: response.created\ndata: {}\n\n",
-			"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstream overloaded\"}}}\n\n",
-		} {
-			_, _ = io.WriteString(w, chunk)
-			flusher.Flush()
-		}
-		// Keep the stream open: the failure must not wait for EOF.
+		_, _ = io.WriteString(w, "event: response.created\ndata: {}\n\n")
+		flusher.Flush()
 		select {
 		case <-release:
 		case <-r.Context().Done():
 		}
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {}\n\n")
 	}))
 	defer upstream.Close()
-	// The handler also returns when the child's request context ends, so a
-	// failing assertion cannot leave it blocked.
 
 	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
 		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
@@ -970,6 +960,7 @@ func TestProviderProxyStreamTerminalErrorIsAccountedBeforeDelivery(t *testing.T)
 	if session.modelOutputPossibleAt(testPromptOneID, time.Now().UTC()) {
 		t.Fatal("model output reported as possible before any request")
 	}
+	before := time.Now().UTC()
 
 	response := doProviderProxyRequest(
 		t, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential,
@@ -982,94 +973,16 @@ func TestProviderProxyStreamTerminalErrorIsAccountedBeforeDelivery(t *testing.T)
 	if !session.modelOutputPossibleAt(testPromptOneID, time.Now().UTC()) {
 		t.Fatal("model output not reported as possible once headers were relayed")
 	}
-	reader := bufio.NewReader(response.Body)
-	var delivered strings.Builder
-	for !strings.Contains(delivered.String(), "response.failed") {
-		line, err := reader.ReadString('\n')
-		delivered.WriteString(line)
-		if err != nil {
-			t.Fatalf("stream ended before the terminal error was delivered: %v (%q)", err, delivered.String())
-		}
+	if session.modelOutputPossibleAt(testPromptOneID, before) {
+		t.Fatal("model output reported as possible for an instant before the response started")
 	}
-	// The child holds the terminal error line while the upstream stream is
-	// still open; the failure is already accounted.
-	if failures := session.inferenceFailureCount(testPromptOneID); failures != 1 {
-		t.Fatalf("inference failures while the stream is open = %d, want 1", failures)
+	if session.modelOutputPossibleAt("other-prompt", time.Now().UTC()) {
+		t.Fatal("another prompt's response start leaked")
 	}
-	failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
-	if !failed || status != http.StatusBadGateway || !strings.Contains(detail, "upstream overloaded") {
-		t.Fatalf("upstreamFailureUnrecovered while the stream is open = %v/%d/%q", failed, status, detail)
-	}
-
 	close(release)
-	if _, err := io.Copy(io.Discard, reader); err != nil {
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
 		t.Fatalf("drain stream: %v", err)
 	}
-	if failures := session.inferenceFailureCount(testPromptOneID); failures != 1 {
-		t.Fatalf("inference failures after stream end = %d, want exactly 1 (no double accounting)", failures)
-	}
-	if successes := session.inferenceSuccesses; successes != 0 {
-		t.Fatalf("inference successes after a terminal error = %d, want 0", successes)
-	}
-}
-
-// The failure must be accounted before the byte that completes the terminal
-// error line is written: an SSE client cannot dispatch the event without it,
-// so nothing the child can observe precedes the accounting, even when the
-// downstream writer exposes bytes before the explicit flush.
-func TestProviderProxyStreamTerminalErrorIsAccountedBeforeItsLineCompletes(t *testing.T) {
-	proxy, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
-		UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
-	})
-	defer session.close()
-	seq := testAllocateInferenceSeq(session)
-	if err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	const head = "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\",\"error\":\"quota\"}"
-	const tail = "\n\ndata: trailing\n\n"
-	writer := &accountingObserverWriter{header: http.Header{}, session: session}
-	proxy.relayUpstreamResponse(context.Background(), writer, session, testPromptOneID, providerRequestInference, seq, &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(strings.NewReader(head + tail)),
-	})
-	if len(writer.writes) != 2 {
-		t.Fatalf("downstream writes = %d, want the chunk split around the completing newline: %+v", len(writer.writes), writer.writes)
-	}
-	if writer.writes[0].bytes != head || writer.writes[0].failures != 0 {
-		t.Fatalf("first write = %q with %d failures already accounted, want the bytes before the completing newline and 0", writer.writes[0].bytes, writer.writes[0].failures)
-	}
-	if writer.writes[1].bytes != tail || writer.writes[1].failures != 1 {
-		t.Fatalf("second write = %q with %d failures accounted, want the remainder and 1", writer.writes[1].bytes, writer.writes[1].failures)
-	}
-	if failures := session.inferenceFailureCount(testPromptOneID); failures != 1 {
-		t.Fatalf("inference failures after the stream = %d, want exactly 1", failures)
-	}
-	if _, _, detail := session.upstreamFailureUnrecovered(testPromptOneID); detail != "provider stream reported a terminal error: quota" {
-		t.Fatalf("terminal error detail = %q", detail)
-	}
-}
-
-type observedWrite struct {
-	bytes    string
-	failures int
-}
-
-// accountingObserverWriter records, for every downstream write, how many
-// inference failures the session had accounted at the moment the bytes were
-// handed over.
-type accountingObserverWriter struct {
-	header  http.Header
-	session *providerProxySession
-	writes  []observedWrite
-}
-
-func (w *accountingObserverWriter) Header() http.Header { return w.header }
-func (w *accountingObserverWriter) WriteHeader(int)     {}
-func (w *accountingObserverWriter) Write(p []byte) (int, error) {
-	w.writes = append(w.writes, observedWrite{bytes: string(p), failures: w.session.inferenceFailureCount(testPromptOneID)})
-	return len(p), nil
 }
 
 func TestProviderProxyIncompleteStreamIsAccountedAsFailure(t *testing.T) {

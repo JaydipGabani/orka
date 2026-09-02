@@ -20,6 +20,8 @@ var copilotObservedStartupDiagnostics = []string{
 	`Info: Unknown tool name in the tool excludedlist: "report_intent"`,
 }
 
+// The CLI routes its inference retry notice through the same channel; it is
+// deliberately not recognized here (tracked separately in #473).
 const copilotObservedRetryNotice = "Info: Response was interrupted due to a server error. Retrying..."
 
 func TestCopilotStartupDiagnosticRecognizesPinnedCLIDiagnostics(t *testing.T) {
@@ -64,16 +66,10 @@ func TestCopilotStartupDiagnosticRecognizesPinnedCLIDiagnostics(t *testing.T) {
 			t.Fatalf("assistant text was recognized as a startup diagnostic: %q", text)
 		}
 	}
-	if !copilotInferenceRetryNotice(copilotObservedRetryNotice) || copilotInferenceRetryNotice(copilotObservedRetryNotice+" PONG") {
-		t.Fatal("inference retry notice recognition is not exact")
-	}
 }
 
 func TestWithholdAgentDiagnosticKeepsModelTextIntact(t *testing.T) {
-	filter := &AgentDiagnosticFilter{
-		Startup:        copilotStartupDiagnostic(copilotAlwaysExcludedToolIDs),
-		InferenceRetry: copilotInferenceRetryNotice,
-	}
+	filter := &AgentDiagnosticFilter{Startup: copilotStartupDiagnostic(copilotAlwaysExcludedToolIDs)}
 	compactor := newAssistantMessageCompactor()
 	compactor.flushInterval = time.Hour
 	t.Cleanup(compactor.close)
@@ -95,18 +91,16 @@ func TestWithholdAgentDiagnosticKeepsModelTextIntact(t *testing.T) {
 			texts = append(texts, ready)
 		}
 	}
-	// The CLI reports exclusions before its first inference request; that
-	// request fails in-stream and is retried; the retried response then
-	// streams a model answer that repeats both diagnostic sentences
-	// verbatim, the first of them as the very first delta.
+	// The CLI reports exclusions before its first inference request, then
+	// the response streams a model answer that repeats the diagnostic
+	// sentence verbatim as its very first delta and also echoes the CLI's
+	// retry notice, which is not a recognized diagnostic.
 	push(copilotObservedStartupDiagnostics[0], now)
 	proxy.firstInferenceResponseStartedAt = now.Add(time.Millisecond)
-	proxy.inferenceFailures = 1
-	push(copilotObservedRetryNotice, now.Add(2*time.Millisecond))
-	push(copilotObservedStartupDiagnostics[0], now.Add(3*time.Millisecond))
-	push("PO", now.Add(4*time.Millisecond))
-	push("NG", now.Add(5*time.Millisecond))
-	push(copilotObservedRetryNotice, now.Add(6*time.Millisecond))
+	push(copilotObservedStartupDiagnostics[0], now.Add(2*time.Millisecond))
+	push("PO", now.Add(3*time.Millisecond))
+	push("NG", now.Add(4*time.Millisecond))
+	push(copilotObservedRetryNotice, now.Add(5*time.Millisecond))
 	for _, ready := range compactor.flushPending() {
 		text, _ := assistantMessageText(ready)
 		texts = append(texts, text)
@@ -115,17 +109,11 @@ func TestWithholdAgentDiagnosticKeepsModelTextIntact(t *testing.T) {
 	if got := strings.Join(texts, ""); got != want {
 		t.Fatalf("assistant text after withholding = %q, want %q", got, want)
 	}
-	if prompt.withheldRetryNotices != 1 {
-		t.Fatalf("withheld retry notices = %d, want 1", prompt.withheldRetryNotices)
-	}
 }
 
 func TestWithholdAgentDiagnosticAnchorsOnProviderProxyState(t *testing.T) {
 	now := time.Now().UTC()
-	filter := &AgentDiagnosticFilter{
-		Startup:        copilotStartupDiagnostic(copilotAlwaysExcludedToolIDs),
-		InferenceRetry: copilotInferenceRetryNotice,
-	}
+	filter := &AgentDiagnosticFilter{Startup: copilotStartupDiagnostic(copilotAlwaysExcludedToolIDs)}
 	startup := testAssistantMessagePromptEvent(t, 1, now, copilotObservedStartupDiagnostics[0])
 	retry := testAssistantMessagePromptEvent(t, 2, now, copilotObservedRetryNotice)
 	toolCall := acp.PromptEvent{Type: acp.PromptEventUpdate, Sequence: 3, Timestamp: now, Update: &acp.SessionNotification{
@@ -141,14 +129,17 @@ func TestWithholdAgentDiagnosticAnchorsOnProviderProxyState(t *testing.T) {
 	// A startup diagnostic is withheld when it was received before the
 	// prompt's first non-error inference response began relaying, even if
 	// it is consumed only after the proxy moved on; an identical chunk
-	// received after that instant is model output. Non-text updates are
-	// never withheld.
+	// received after that instant is model output. Non-text updates and
+	// unrecognized CLI text are never withheld.
 	state := &sessionState{id: "session-1", agentDiagnosticFilter: filter, providerProxy: &providerProxySession{turnPromptID: "prompt-1"}}
 	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
 		t.Fatal("startup diagnostic was forwarded before any inference response")
 	}
 	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), toolCall) {
 		t.Fatal("tool_call update was withheld as a diagnostic")
+	}
+	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), retry) {
+		t.Fatal("inference retry notice was withheld; it is not a recognized diagnostic")
 	}
 	state.providerProxy = &providerProxySession{turnPromptID: "prompt-1", firstInferenceResponseStartedAt: now.Add(time.Millisecond)}
 	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
@@ -169,27 +160,6 @@ func TestWithholdAgentDiagnosticAnchorsOnProviderProxyState(t *testing.T) {
 	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
 		t.Fatal("another prompt's inference response unblocked a startup diagnostic")
 	}
-
-	// A retry notice is withheld only while the proxy recorded more failures
-	// than notices already withheld.
-	state.providerProxy = &providerProxySession{turnPromptID: "prompt-1"}
-	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), retry) {
-		t.Fatal("retry notice withheld without a recorded failure")
-	}
-	state.providerProxy = &providerProxySession{turnPromptID: "prompt-1", inferenceFailures: 2}
-	prompt := testDiagnosticPromptState()
-	for i := range 2 {
-		if !withholdAgentDiagnostic(state, prompt, retry) {
-			t.Fatalf("retry notice %d was not withheld with two recorded failures", i+1)
-		}
-	}
-	if withholdAgentDiagnostic(state, prompt, retry) {
-		t.Fatal("third retry notice withheld with only two recorded failures")
-	}
-	state.providerProxy = &providerProxySession{turnPromptID: "other-prompt", inferenceFailures: 5}
-	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), retry) {
-		t.Fatal("retry notice withheld against another prompt's failures")
-	}
 }
 
 func testDiagnosticPromptState() *promptState {
@@ -209,7 +179,7 @@ func TestCopilotProjectionDeclaresDiagnosticFilterForSessionExclusions(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if unrestricted.AgentDiagnosticFilter == nil || unrestricted.AgentDiagnosticFilter.Startup == nil || unrestricted.AgentDiagnosticFilter.InferenceRetry == nil {
+	if unrestricted.AgentDiagnosticFilter == nil || unrestricted.AgentDiagnosticFilter.Startup == nil {
 		t.Fatal("unrestricted Copilot projection declared no diagnostic filter")
 	}
 	if !unrestricted.AgentDiagnosticFilter.Startup(copilotObservedStartupDiagnostics[0]) {
@@ -217,9 +187,6 @@ func TestCopilotProjectionDeclaresDiagnosticFilterForSessionExclusions(t *testin
 	}
 	if unrestricted.AgentDiagnosticFilter.Startup("Info: Disabled tools: bash, list_bash") {
 		t.Fatal("unrestricted projection recognized a diagnostic about tools it did not exclude")
-	}
-	if !unrestricted.AgentDiagnosticFilter.InferenceRetry(copilotObservedRetryNotice) {
-		t.Fatal("unrestricted projection did not recognize the inference retry notice")
 	}
 
 	restricted, err := copilot.ProjectSession(
