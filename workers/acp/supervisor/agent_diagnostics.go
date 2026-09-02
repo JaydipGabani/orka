@@ -1,7 +1,6 @@
 package supervisor
 
 import (
-	"encoding/json"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -42,7 +41,8 @@ const (
 // Anchoring on the session's own exclusion list means a chunk about some
 // other tool is never recognized. The CLI forwards model deltas verbatim and
 // without a messageId, so the supervisor additionally withholds startup
-// diagnostics only before any model output has been observed for the prompt.
+// diagnostics only until the provider proxy has begun relaying the prompt's
+// first inference response.
 func copilotStartupDiagnostic(excludedTools []string) func(string) bool {
 	excluded := make(map[string]struct{}, len(excludedTools))
 	for _, name := range excludedTools {
@@ -106,57 +106,34 @@ func copilotToolIdentifier(name string) bool {
 // session's provider projection recognizes as a CLI diagnostic under the
 // anchoring rules documented on AgentDiagnosticFilter. A withheld chunk is
 // logged and never reaches compaction, the harness event stream, or the
-// terminal assistant text. Every forwarded event advances the prompt's
-// model-output anchor. The logged text is bounded by construction: each
+// terminal assistant text. The logged text is bounded by construction: each
 // recognized shape is a fixed CLI sentence whose only variable parts are tool
-// identifiers. Only the prompt stream goroutine touches the anchors.
+// identifiers. Only the prompt stream goroutine touches the prompt counters.
 func withholdAgentDiagnostic(state *sessionState, prompt *promptState, event acp.PromptEvent) bool {
-	text, isText := assistantMessageText(event)
 	filter := state.agentDiagnosticFilter
-	if filter != nil && isText && text != "" {
-		promptID := prompt.request.Metadata.PromptID
-		switch {
-		case filter.Startup != nil && !prompt.modelOutputSeen && filter.Startup(text):
-			slog.Info(
-				"ACP provider CLI startup diagnostic withheld from the agent message stream",
-				"promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
-			)
-			return true
-		case filter.InferenceRetry != nil && filter.InferenceRetry(text) &&
-			prompt.withheldRetryNotices < state.providerProxy.inferenceFailureCount(string(promptID)):
-			prompt.withheldRetryNotices++
-			slog.Info(
-				"ACP provider CLI inference retry notice withheld from the agent message stream",
-				"promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
-			)
-			return true
-		}
+	if filter == nil {
+		return false
 	}
-	if (isText && text != "") || modelOutputEvent(event) {
-		prompt.modelOutputSeen = true
+	text, ok := assistantMessageText(event)
+	if !ok || text == "" {
+		return false
 	}
-	return false
-}
-
-// modelOutputEvent reports whether event carries model output other than
-// assistant text: a thought, a tool call, or a permission request. Session
-// configuration updates (config options, available commands, mode changes) do
-// not count; the CLI emits those before its startup diagnostics.
-func modelOutputEvent(event acp.PromptEvent) bool {
-	if event.Type == acp.PromptEventPermissionRequested {
+	promptID := prompt.request.Metadata.PromptID
+	switch {
+	case filter.Startup != nil && filter.Startup(text) &&
+		!state.providerProxy.inferenceResponseStarted(string(promptID)):
+		slog.Info(
+			"ACP provider CLI startup diagnostic withheld from the agent message stream",
+			"promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
+		)
 		return true
-	}
-	if event.Type != acp.PromptEventUpdate || event.Update == nil {
-		return false
-	}
-	var envelope struct {
-		SessionUpdate string `json:"sessionUpdate"`
-	}
-	if json.Unmarshal(event.Update.Update, &envelope) != nil {
-		return false
-	}
-	switch envelope.SessionUpdate {
-	case "agent_thought_chunk", acpUpdateToolCall, acpUpdateToolCallUpdate:
+	case filter.InferenceRetry != nil && filter.InferenceRetry(text) &&
+		prompt.withheldRetryNotices < state.providerProxy.inferenceFailureCount(string(promptID)):
+		prompt.withheldRetryNotices++
+		slog.Info(
+			"ACP provider CLI inference retry notice withheld from the agent message stream",
+			"promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
+		)
 		return true
 	}
 	return false

@@ -49,14 +49,14 @@ type ProviderSessionProjection struct {
 // supervisor anchors it on prompt state it can prove, so a model chunk that
 // merely repeats a diagnostic sentence is forwarded:
 //
-//   - Startup diagnostics are withheld only before any model output
-//     (assistant text, thought, tool call, or permission request) has been
-//     observed for the prompt. The CLI emits them on the same ordered stream
-//     ahead of its first inference request.
+//   - Startup diagnostics are withheld only until the provider proxy has
+//     begun relaying the prompt's first non-error inference response. Model
+//     output can only be derived from those bytes, while the CLI emits its
+//     startup diagnostics ahead of its first inference request.
 //   - InferenceRetry notices are withheld only while the provider proxy has
 //     recorded more failed inference requests for the prompt than notices
-//     already withheld; the proxy records a failure before relaying it, so
-//     the notice for a failure can never precede its accounting.
+//     already withheld. The proxy accounts every failure before relaying
+//     the bytes that reveal it, so a notice can never precede its failure.
 type AgentDiagnosticFilter struct {
 	Startup        func(text string) bool
 	InferenceRetry func(text string) bool

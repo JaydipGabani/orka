@@ -143,10 +143,15 @@ type providerProxySession struct {
 	inferenceSuccesses int32
 	inferenceFailures  int32
 	issuedInference    uint64
-	lastSuccessSeq     uint64
-	lastFailureSeq     uint64
-	lastUpstreamStatus int
-	lastUpstreamDetail string
+	// inferenceResponsesStarted counts inference responses whose relay to
+	// the child has begun with a non-error status: model output can only be
+	// derived from those bytes, so before the first one no assistant text
+	// can be model output.
+	inferenceResponsesStarted int32
+	lastSuccessSeq            uint64
+	lastFailureSeq            uint64
+	lastUpstreamStatus        int
+	lastUpstreamDetail        string
 	// admissionClosed rejects new requests for the active prompt once the
 	// ACP child has settled its turn, while in-flight relays keep their
 	// gate context and drain normally.
@@ -369,6 +374,7 @@ func (s *providerProxySession) activateWithMaxTurns(promptID string, maxTurns in
 	s.inferenceSuccesses = 0
 	s.inferenceFailures = 0
 	s.issuedInference = 0
+	s.inferenceResponsesStarted = 0
 	s.lastSuccessSeq = 0
 	s.lastFailureSeq = 0
 	s.lastUpstreamStatus = 0
@@ -736,8 +742,10 @@ func (s *providerProxySession) attachInferenceFailureDetail(promptID string, cla
 // irrelevant: a later-issued failure stays unrecovered even if an
 // earlier-issued request succeeds afterwards.
 // inferenceFailureCount reports how many inference requests the active
-// prompt has issued that failed (upstream error, transport failure, or proxy
-// rejection); each failure is recorded before it is relayed to the child.
+// prompt has issued that failed (upstream error status, transport failure,
+// proxy rejection, or an in-stream terminal error). Every failure is
+// accounted before the bytes that reveal it to the child are relayed, so a
+// child reaction to a failure can never precede its accounting.
 func (s *providerProxySession) inferenceFailureCount(promptID string) int {
 	if s == nil {
 		return 0
@@ -748,6 +756,32 @@ func (s *providerProxySession) inferenceFailureCount(promptID string) int {
 		return 0
 	}
 	return int(s.inferenceFailures)
+}
+
+// markInferenceResponseStarted records that a non-error inference response
+// for the active prompt is about to be relayed to the child.
+func (s *providerProxySession) markInferenceResponseStarted(promptID string, class providerRequestClass) {
+	if s == nil || class != providerRequestInference {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnPromptID != strings.TrimSpace(promptID) {
+		return
+	}
+	s.inferenceResponsesStarted++
+}
+
+// inferenceResponseStarted reports whether any non-error inference response
+// has begun relaying to the child for the active prompt. Until then no
+// assistant text the child emits can be model output.
+func (s *providerProxySession) inferenceResponseStarted(promptID string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turnPromptID == strings.TrimSpace(promptID) && s.inferenceResponsesStarted > 0
 }
 
 func (s *providerProxySession) upstreamFailureUnrecovered(promptID string) (bool, int, string) {
@@ -861,9 +895,15 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 type deliveredSSEWriter struct {
 	w       io.Writer
 	scanner *sseTerminalErrorScanner
+	// beforeWrite, when set, observes each chunk before any of it can reach
+	// the child.
+	beforeWrite func([]byte)
 }
 
 func (w *deliveredSSEWriter) Write(p []byte) (int, error) {
+	if w.beforeWrite != nil {
+		w.beforeWrite(p)
+	}
 	n, err := w.w.Write(p)
 	if n > 0 {
 		_, _ = w.scanner.Write(p[:n])
@@ -1110,11 +1150,18 @@ func (p *providerProxy) relayUpstreamResponse(
 	// providers report terminal errors inside the SSE body. Scan the relayed
 	// stream for explicit error events so they are accounted as failures.
 	var streamScanner *sseTerminalErrorScanner
+	// terminalErrorAccounted is set once an in-stream terminal error was
+	// recorded ahead of its delivery; the verdicts below must not account
+	// the same sequence again.
+	terminalErrorAccounted := false
 	if !upstreamFailed && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
 		streamScanner = &sseTerminalErrorScanner{}
 		// The scanner attaches on the WRITE side below, so it sees only
 		// bytes the child actually received. A marker read upstream but
 		// never delivered must not count as delivered.
+	}
+	if !upstreamFailed {
+		session.markInferenceResponseStarted(promptID, requestClass)
 	}
 	providerproxy.CopyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
@@ -1124,7 +1171,24 @@ func (p *providerProxy) relayUpstreamResponse(
 	relayed := &countingWriter{w: w}
 	var destination io.Writer = relayed
 	if streamScanner != nil {
-		destination = &deliveredSSEWriter{w: relayed, scanner: streamScanner}
+		// A lookahead probe scans each chunk BEFORE it is written so an
+		// in-stream terminal error is accounted before the child can read
+		// the line that reveals it: ACP agents react to a delivered error
+		// event (for example with a retry notice in the agent message
+		// stream) faster than the upstream closes the stream, and the
+		// supervisor must be able to trust the failure count at that
+		// moment. The verdict scanner still sees only delivered bytes.
+		probe := &sseTerminalErrorScanner{}
+		destination = &deliveredSSEWriter{w: relayed, scanner: streamScanner, beforeWrite: func(chunk []byte) {
+			if terminalErrorAccounted {
+				return
+			}
+			_, _ = probe.Write(chunk)
+			if probe.failed {
+				terminalErrorAccounted = true
+				session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider stream reported a terminal error: "+probe.detail)
+			}
+		}}
 	}
 	err := providerproxy.StreamBoundedResponse(destination, body, p.maxResponseBytes, flusher)
 	streamFailed := func() bool {
@@ -1146,7 +1210,7 @@ func (p *providerProxy) relayUpstreamResponse(
 		session.attachInferenceFailureDetail(promptID, requestClass, seq, providerUpstreamErrorDetail(capture.buffer))
 	}
 	if err != nil {
-		if !upstreamFailed {
+		if !upstreamFailed && !terminalErrorAccounted {
 			if errors.Is(err, providerproxy.ErrDestinationWrite) || ctx.Err() != nil {
 				// A child disconnect is not upstream evidence by itself. A
 				// partially delivered SSE response still needs a terminal
@@ -1176,7 +1240,7 @@ func (p *providerProxy) relayUpstreamResponse(
 		}
 		panic(http.ErrAbortHandler)
 	}
-	if !upstreamFailed {
+	if !upstreamFailed && !terminalErrorAccounted {
 		if streamFailed() {
 			recordStreamFailure()
 			return

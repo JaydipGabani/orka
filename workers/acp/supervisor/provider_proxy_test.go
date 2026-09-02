@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -932,6 +933,83 @@ func TestProviderProxyUpstreamFailureAccountingClearsAfterTerminalStream(t *test
 				t.Fatalf("upstreamFailureUnrecovered after %s = %v/%d/%q, want false", terminalEvent, failed, status, detail)
 			}
 		})
+	}
+}
+
+// A streamed terminal error must be accounted before the child can read the
+// line that reveals it: the supervisor's diagnostic filter trusts the failure
+// count the moment the child reacts, which can be long before the upstream
+// closes the stream.
+func TestProviderProxyStreamTerminalErrorIsAccountedBeforeDelivery(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for _, chunk := range []string{
+			"event: response.created\ndata: {}\n\n",
+			"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstream overloaded\"}}}\n\n",
+		} {
+			_, _ = io.WriteString(w, chunk)
+			flusher.Flush()
+		}
+		// Keep the stream open: the failure must not wait for EOF.
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+	// The handler also returns when the child's request context ends, so a
+	// failing assertion cannot leave it blocked.
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+	if session.inferenceResponseStarted(testPromptOneID) {
+		t.Fatal("inference response reported as started before any request")
+	}
+
+	response := doProviderProxyRequest(
+		t, http.MethodPost, binding.BaseURL+providerOpenAIResponsesV1Path, binding.Credential,
+		[]byte(`{"model":"test-model","stream":true}`), nil,
+	)
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d", response.StatusCode)
+	}
+	if !session.inferenceResponseStarted(testPromptOneID) {
+		t.Fatal("inference response not reported as started once headers were relayed")
+	}
+	reader := bufio.NewReader(response.Body)
+	var delivered strings.Builder
+	for !strings.Contains(delivered.String(), "response.failed") {
+		line, err := reader.ReadString('\n')
+		delivered.WriteString(line)
+		if err != nil {
+			t.Fatalf("stream ended before the terminal error was delivered: %v (%q)", err, delivered.String())
+		}
+	}
+	// The child holds the terminal error line while the upstream stream is
+	// still open; the failure is already accounted.
+	if failures := session.inferenceFailureCount(testPromptOneID); failures != 1 {
+		t.Fatalf("inference failures while the stream is open = %d, want 1", failures)
+	}
+	failed, status, detail := session.upstreamFailureUnrecovered(testPromptOneID)
+	if !failed || status != http.StatusBadGateway || !strings.Contains(detail, "upstream overloaded") {
+		t.Fatalf("upstreamFailureUnrecovered while the stream is open = %v/%d/%q", failed, status, detail)
+	}
+
+	close(release)
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatalf("drain stream: %v", err)
+	}
+	if failures := session.inferenceFailureCount(testPromptOneID); failures != 1 {
+		t.Fatalf("inference failures after stream end = %d, want exactly 1 (no double accounting)", failures)
+	}
+	if successes := session.inferenceSuccesses; successes != 0 {
+		t.Fatalf("inference successes after a terminal error = %d, want 0", successes)
 	}
 }
 

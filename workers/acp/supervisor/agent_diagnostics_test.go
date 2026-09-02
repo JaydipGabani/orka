@@ -78,7 +78,7 @@ func TestWithholdAgentDiagnosticKeepsModelTextIntact(t *testing.T) {
 	compactor.flushInterval = time.Hour
 	t.Cleanup(compactor.close)
 	now := time.Now().UTC()
-	proxy := &providerProxySession{turnPromptID: "prompt-1", inferenceFailures: 1}
+	proxy := &providerProxySession{turnPromptID: "prompt-1"}
 	state := &sessionState{agentDiagnosticFilter: filter, providerProxy: proxy}
 	prompt := testDiagnosticPromptState()
 
@@ -95,28 +95,33 @@ func TestWithholdAgentDiagnosticKeepsModelTextIntact(t *testing.T) {
 			texts = append(texts, ready)
 		}
 	}
-	// The CLI reports exclusions, one failed inference is retried, then the
-	// model answers and repeats both diagnostic sentences verbatim.
+	// The CLI reports exclusions before its first inference request; that
+	// request fails in-stream and is retried; the retried response then
+	// streams a model answer that repeats both diagnostic sentences
+	// verbatim, the first of them as the very first delta.
 	push(copilotObservedStartupDiagnostics[0])
+	proxy.inferenceResponsesStarted = 1
+	proxy.inferenceFailures = 1
 	push(copilotObservedRetryNotice)
+	proxy.inferenceResponsesStarted = 2
+	push(copilotObservedStartupDiagnostics[0])
 	push("PO")
 	push("NG")
-	push(copilotObservedStartupDiagnostics[0])
 	push(copilotObservedRetryNotice)
 	for _, ready := range compactor.flushPending() {
 		text, _ := assistantMessageText(ready)
 		texts = append(texts, text)
 	}
-	want := "PONG" + copilotObservedStartupDiagnostics[0] + copilotObservedRetryNotice
+	want := copilotObservedStartupDiagnostics[0] + "PONG" + copilotObservedRetryNotice
 	if got := strings.Join(texts, ""); got != want {
 		t.Fatalf("assistant text after withholding = %q, want %q", got, want)
 	}
-	if prompt.withheldRetryNotices != 1 || !prompt.modelOutputSeen {
-		t.Fatalf("prompt anchors = %+v", prompt)
+	if prompt.withheldRetryNotices != 1 {
+		t.Fatalf("withheld retry notices = %d, want 1", prompt.withheldRetryNotices)
 	}
 }
 
-func TestWithholdAgentDiagnosticAnchorsOnPromptState(t *testing.T) {
+func TestWithholdAgentDiagnosticAnchorsOnProviderProxyState(t *testing.T) {
 	now := time.Now().UTC()
 	filter := &AgentDiagnosticFilter{
 		Startup:        copilotStartupDiagnostic(copilotAlwaysExcludedToolIDs),
@@ -128,36 +133,39 @@ func TestWithholdAgentDiagnosticAnchorsOnPromptState(t *testing.T) {
 		SessionID: "s",
 		Update:    []byte(`{"sessionUpdate":"tool_call","toolCallId":"t","title":"` + copilotObservedStartupDiagnostics[0] + `"}`),
 	}}
-	configUpdate := acp.PromptEvent{Type: acp.PromptEventUpdate, Sequence: 4, Timestamp: now, Update: &acp.SessionNotification{
-		SessionID: "s", Update: []byte(`{"sessionUpdate":"config_option_update","configOptions":[]}`),
-	}}
 
 	// Sessions without a projection filter forward every chunk.
 	if withholdAgentDiagnostic(&sessionState{}, testDiagnosticPromptState(), startup) {
 		t.Fatal("session without a diagnostic filter withheld a chunk")
 	}
 
-	// A startup diagnostic is withheld only before model output.
-	state := &sessionState{agentDiagnosticFilter: filter}
-	prompt := testDiagnosticPromptState()
-	if withholdAgentDiagnostic(state, prompt, configUpdate) || prompt.modelOutputSeen {
-		t.Fatal("session configuration update counted as model output")
+	// A startup diagnostic is withheld until the prompt's first non-error
+	// inference response begins relaying; after that an identical chunk is
+	// model output. Non-text updates are never withheld.
+	state := &sessionState{agentDiagnosticFilter: filter, providerProxy: &providerProxySession{turnPromptID: "prompt-1"}}
+	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
+		t.Fatal("startup diagnostic was forwarded before any inference response")
 	}
-	if withholdAgentDiagnostic(state, prompt, toolCall) || !prompt.modelOutputSeen {
-		t.Fatal("tool_call update was withheld or did not count as model output")
+	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), toolCall) {
+		t.Fatal("tool_call update was withheld as a diagnostic")
 	}
-	if withholdAgentDiagnostic(state, prompt, startup) {
-		t.Fatal("startup diagnostic text was withheld after model output")
+	state.providerProxy = &providerProxySession{turnPromptID: "prompt-1", inferenceResponsesStarted: 1}
+	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
+		t.Fatal("startup diagnostic text was withheld after an inference response started")
+	}
+	state.providerProxy = &providerProxySession{turnPromptID: "other-prompt", inferenceResponsesStarted: 1}
+	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
+		t.Fatal("another prompt's inference response unblocked a startup diagnostic")
 	}
 
 	// A retry notice is withheld only while the proxy recorded more failures
-	// than notices already withheld; without a proxy nothing is withheld.
-	prompt = testDiagnosticPromptState()
-	if withholdAgentDiagnostic(state, prompt, retry) {
-		t.Fatal("retry notice withheld without a provider proxy")
+	// than notices already withheld.
+	state.providerProxy = &providerProxySession{turnPromptID: "prompt-1"}
+	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), retry) {
+		t.Fatal("retry notice withheld without a recorded failure")
 	}
 	state.providerProxy = &providerProxySession{turnPromptID: "prompt-1", inferenceFailures: 2}
-	prompt = testDiagnosticPromptState()
+	prompt := testDiagnosticPromptState()
 	for i := range 2 {
 		if !withholdAgentDiagnostic(state, prompt, retry) {
 			t.Fatalf("retry notice %d was not withheld with two recorded failures", i+1)

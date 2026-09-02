@@ -253,10 +253,6 @@ type promptState struct {
 	finalAnswerOverflow bool
 	settlement          *harnessv2.PromptSettlement
 	settlementDigest    string
-	// modelOutputSeen records that assistant text, a thought, a tool call, or
-	// a permission request has been observed for this prompt; provider CLI
-	// startup diagnostics are withheld only before that point.
-	modelOutputSeen bool
 	// withheldRetryNotices counts provider CLI inference retry notices already
 	// withheld for this prompt, bounded by the proxy's recorded failures.
 	withheldRetryNotices int
