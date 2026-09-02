@@ -36,6 +36,12 @@ type ProviderSessionProjection struct {
 	AdditionalArgs []string
 	Environment    map[string]string
 	NewSessionMeta acp.Meta
+	// AgentDiagnosticFilter reports whether an assistant text chunk is a
+	// provider CLI diagnostic that the adapter wrote into the ACP agent
+	// message stream instead of its own log. Matching chunks are withheld
+	// from the harness event stream and the terminal assistant text and are
+	// logged by the supervisor instead. Nil forwards every chunk.
+	AgentDiagnosticFilter func(text string) bool
 }
 
 type ArtifactUploader interface {
