@@ -51,6 +51,10 @@ export function useTaskListPages(limit = '25', refetchInterval: number | false =
 // partial resource-key-ordered sample and must surface that truncation.
 export const maxListWalkPages = 20
 
+function isPaginationProtocolError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('repeated continuation cursor')
+}
+
 export function useTaskListAll(pageLimit = '100', refetchInterval: number | false = 10000) {
   const namespace = useUIStore((s) => s.namespace)
   const token = useAuthStore((s) => s.token)
@@ -75,7 +79,13 @@ export function useTaskListAll(pageLimit = '100', refetchInterval: number | fals
       } while (continueToken && pages < maxListWalkPages)
       return { items, metadata, truncated: Boolean(continueToken) }
     },
-    refetchInterval,
+    // A 403 is permanent for this identity, and a repeated continuation
+    // cursor is a server-side protocol fault: neither improves on retry, so
+    // stop retrying (and, for 403, polling) instead of generating denied or
+    // looping requests and audit noise.
+    retry: (failureCount, error) =>
+      !isForbiddenError(error) && !isPaginationProtocolError(error) && failureCount < 3,
+    refetchInterval: (query) => (isForbiddenError(query.state.error) ? false : refetchInterval),
   })
 }
 

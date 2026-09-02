@@ -146,3 +146,12 @@ func TestPrintGenericTableOmitsEmptyColumns(t *testing.T) {
 		t.Fatalf("expected dash placeholders for the row missing values, got %q", lines[2])
 	}
 }
+
+func TestGenericRowStatusReadsFlatReadiness(t *testing.T) {
+	if got := genericRowStatus(map[string]any{"name": "p", "ready": true}); got != "Ready" {
+		t.Fatalf("flat ready = %q, want Ready", got)
+	}
+	if got := genericRowStatus(map[string]any{"name": "p", "ready": false}); got != "NotReady" {
+		t.Fatalf("flat not ready = %q, want NotReady", got)
+	}
+}

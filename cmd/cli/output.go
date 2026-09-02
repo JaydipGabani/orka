@@ -203,6 +203,17 @@ func genericRowStatus(item map[string]any) string {
 		status = nestedString(item, "status", "phase")
 	}
 	if status == "" {
+		// The restricted flat projection served to context-token callers
+		// carries readiness at the top level.
+		if ready, ok := item["ready"].(bool); ok {
+			if ready {
+				status = "Ready"
+			} else {
+				status = "NotReady"
+			}
+		}
+	}
+	if status == "" {
 		// Resources such as Providers expose readiness as status.ready
 		// instead of a phase.
 		if statusMap, ok := item["status"].(map[string]any); ok {

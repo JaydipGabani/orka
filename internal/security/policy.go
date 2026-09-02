@@ -66,7 +66,7 @@ var (
 	// call-syntax exemptions — swallowing them would break the code-plumbing
 	// negatives (apiKey = strings.TrimSpace(cfg.APIKey)). Placeholder ($VAR, <example>, {{ .Token }}) and
 	// code-reference exemptions run on the captured value either way.
-	policySensitiveAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|secr` + `et|cred` + `entials?|priv` + `ate[_-]?key)\s*[:=]\s*(?:"([^"\r\n]{16,})"|'([^'\r\n]{16,})'|([A-Za-z0-9_./+=~:@#$%^&*!?|,;\\` + "`" + `-]{16,}))`)
+	policySensitiveAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|secr` + `et|cred` + `entials?|priv` + `ate[_-]?key)\s*[:=]\s*(?:"([^"\r\n]{16,})"|'([^'\r\n]{16,})'|([A-Za-z0-9_./+=~:@#$%^&*!?|,;{}\\` + "`" + `-]{16,}))`)
 	// YAML plain scalars may contain spaces without quoting. Scan the complete
 	// line value so a short first word cannot hide a long credential value.
 	// Requiring whitespace after ':' excludes Go's ':=' assignments; the
@@ -209,11 +209,122 @@ func hasCompleteCallSuffix(text string, start int) bool {
 		case ')':
 			depth--
 			if depth == 0 {
-				return true
+				// The call must be the whole value: anything but trailing
+				// whitespace, statement terminators, or a comment (for
+				// example `+ "literal"`) reintroduces attacker-controlled text.
+				return onlyStatementTrailer(text[i+1:])
 			}
 		case '\r', '\n':
 			return false
 		}
+	}
+	return false
+}
+
+// onlyStatementTrailer reports whether rest, up to the end of its line, is
+// empty apart from whitespace, statement terminators, closing brackets, or a
+// line comment.
+func onlyStatementTrailer(rest string) bool {
+	if i := strings.IndexAny(rest, "\r\n"); i >= 0 {
+		// A following line that opens with an infix operator continues the
+		// assignment (`call()\n  + "literal"`), so the call is not the whole
+		// value.
+		if nextLineContinuesExpression(rest[i:]) {
+			return false
+		}
+		rest = rest[:i]
+	}
+	for {
+		rest = strings.TrimLeft(rest, " \t;,)]}")
+		switch {
+		case rest == "":
+			return true
+		case strings.HasPrefix(rest, "//"), strings.HasPrefix(rest, "#"):
+			// `//` is floor division in Python and `#` is not universally a
+			// comment; accept them as comments only when no string literal
+			// (the only way to smuggle a credential) follows.
+			return !strings.ContainsAny(rest, "\"'`")
+		case strings.HasPrefix(rest, "/*"):
+			// A block comment is only a trailer when it closes on this line
+			// and nothing but another trailer follows it. An unterminated
+			// comment could hide a continuation on a later line, so it is
+			// not a trailer (fail closed).
+			end := strings.Index(rest[2:], "*/")
+			if end < 0 {
+				return false
+			}
+			rest = rest[2+end+2:]
+		default:
+			return false
+		}
+	}
+}
+
+// nextLineContinuesExpression reports whether the text after a line break
+// starts (past whitespace, blank lines, and comment-only lines) with a token
+// that continues the previous expression.
+func nextLineContinuesExpression(text string) bool {
+	for _, line := range splitLines(text)[1:] {
+		trimmed := strings.TrimSpace(line)
+		// Strip closed block comments that lead the line; an unterminated
+		// one may hide a continuation on a later line, so fail closed.
+		for strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*/") {
+			if strings.HasPrefix(trimmed, "*/") {
+				trimmed = strings.TrimSpace(trimmed[2:])
+				continue
+			}
+			end := strings.Index(trimmed[2:], "*/")
+			if end < 0 {
+				return true
+			}
+			trimmed = strings.TrimSpace(trimmed[2+end+2:])
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		// Fail closed: only a line that starts like a new statement ends the
+		// expression; any punctuation-led line (`+`, `.`, `[`, `(`, `?`, `*`
+		// outside a block comment, …) is treated as a continuation.
+		return !startsStatement(trimmed)
+	}
+	return false
+}
+
+// continuationWords are word-form binary operators that can only continue
+// an expression. Control-flow keywords (`if`, `while`, `else`, …) are not
+// listed: they start ordinary statements far more often than they act as
+// postfix modifiers, and flagging them would reject common credential-loading
+// code such as `password = read(ctx)\nif password == "" {`.
+var continuationWords = map[string]bool{
+	"and": true, "or": true, "not": true, "xor": true, "in": true, "is": true, "div": true, "mod": true,
+	"as": true, "like": true, "between": true,
+}
+
+// startsStatement reports whether a trimmed code line begins the way a new
+// statement does (identifier, keyword, closing brace, decorator, digit) rather
+// than continuing the previous expression with punctuation.
+func startsStatement(trimmed string) bool {
+	if trimmed == "" {
+		return false
+	}
+	// Word-form operators and postfix modifiers (Lua/Python/Ruby/SQL) continue
+	// the previous expression even though they start with a letter.
+	word := strings.ToLower(trimmed)
+	if i := strings.IndexFunc(word, func(r rune) bool { return r < 'a' || r > 'z' }); i >= 0 {
+		word = word[:i]
+	}
+	if continuationWords[word] {
+		return false
+	}
+	r := rune(trimmed[0])
+	switch {
+	case r == '_', r == '$', r == '}', r == '@', r == ';':
+		return true
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	case r >= 0x80:
+		// Non-ASCII identifiers start statements; punctuation is ASCII.
+		return true
 	}
 	return false
 }
@@ -524,4 +635,145 @@ func ScanRunIdempotencyKey(namespace, repositoryScan, mode, baseSHA, headSHA, su
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return "scanidem:" + hex.EncodeToString(sum[:])
+}
+
+// SecretLikeLineDigests returns one SHA-256 hex digest for every line of text
+// that LooksLikeSecret flags on its own. Each digest covers the flagged
+// line's code block together with the previous and the next code block and
+// everything in between (blank and comment-only lines), so a caller that
+// recognises a pre-existing secret-like line (a demo credential a
+// repository already ships) also proves nothing was inserted, appended, or
+// continued anywhere an expression could still reach it. Digests may repeat
+// when identical windows occur more than once; callers compare them as
+// multisets. No content is retained.
+func SecretLikeLineDigests(text string) []string {
+	lines := splitLines(text)
+	var windows *lineWindows
+	var digests []string
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" || !LooksLikeSecret(line) {
+			continue
+		}
+		if windows == nil {
+			windows = newLineWindows(lines)
+		}
+		digests = append(digests, windows.digest(i))
+	}
+	return digests
+}
+
+// StripLinesByDigest removes every secret-like line whose window digest (see
+// SecretLikeLineDigests) is in known and returns the remaining text, so the
+// caller can re-check that nothing secret-like remains once the recognised
+// lines are taken out. Only secret-like lines can carry a known digest, so
+// only they are hashed.
+func StripLinesByDigest(text string, known map[string]struct{}) string {
+	if len(known) == 0 {
+		return text
+	}
+	lines := splitLines(text)
+	var windows *lineWindows
+	kept := make([]string, 0, len(lines))
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "" && LooksLikeSecret(line) {
+			if windows == nil {
+				windows = newLineWindows(lines)
+			}
+			if _, ok := known[windows.digest(i)]; ok {
+				continue
+			}
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+func splitLines(text string) []string {
+	return strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+}
+
+// lineWindows precomputes each line's code-block bounds so window digests
+// (previous code block through next code block, gap lines included) cost
+// O(window) and are cached per distinct window instead of being recomputed
+// per flagged line.
+type lineWindows struct {
+	lines  []string
+	before []int
+	after  []int
+	cache  map[[2]int]string
+}
+
+func newLineWindows(lines []string) *lineWindows {
+	w := &lineWindows{lines: lines, before: make([]int, len(lines)), after: make([]int, len(lines)), cache: map[[2]int]string{}}
+	// paragraphStart[i]/paragraphEnd[i] bound the code block containing line
+	// i. Blank and comment-only lines are gap lines: they never end an
+	// expression, so a block made only of them merges into the surrounding
+	// gap and the window keeps extending to the next real code block.
+	blank := func(i int) bool { return !isCodeLine(lines[i]) }
+	start := 0
+	for i := range lines {
+		if i > 0 && blank(i-1) && !blank(i) {
+			start = i
+		}
+		w.before[i] = start
+	}
+	end := len(lines) - 1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if i+1 < len(lines) && blank(i+1) && !blank(i) {
+			end = i
+		}
+		w.after[i] = end
+	}
+	// Extend to the neighbouring paragraphs: walk back over the gap to the
+	// previous block's start, and forward over the gap to the next block's end.
+	prevStart := make([]int, len(lines))
+	nextEnd := make([]int, len(lines))
+	for i := range lines {
+		j := w.before[i] - 1
+		for j >= 0 && blank(j) {
+			j--
+		}
+		if j >= 0 {
+			prevStart[i] = w.before[j]
+		} else {
+			prevStart[i] = w.before[i]
+		}
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		j := w.after[i] + 1
+		for j < len(lines) && blank(j) {
+			j++
+		}
+		if j < len(lines) {
+			nextEnd[i] = w.after[j]
+		} else {
+			nextEnd[i] = w.after[i]
+		}
+	}
+	w.before, w.after = prevStart, nextEnd
+	return w
+}
+
+func isCodeLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	for _, prefix := range []string{"//", "#", "/*", "*"} {
+		if strings.HasPrefix(trimmed, prefix) {
+			return false
+		}
+	}
+	return true
+}
+
+func (w *lineWindows) digest(i int) string {
+	bounds := [2]int{w.before[i], w.after[i]}
+	if cached, ok := w.cache[bounds]; ok {
+		return cached
+	}
+	digest := sha256.Sum256([]byte(strings.Join(w.lines[bounds[0]:bounds[1]+1], "\n")))
+	encoded := hex.EncodeToString(digest[:])
+	w.cache[bounds] = encoded
+	return encoded
 }

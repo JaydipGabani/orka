@@ -79,7 +79,9 @@ export function ChatPage() {
   const noProviderSelected = !provider && config !== undefined && !hasServerDefault
   const providersErrorMessage = providersError
     ? providersForbidden
-      ? `Not authorized to list Providers in ${namespace}; only the server default is available.`
+      ? hasServerDefault
+        ? `Not authorized to list Providers in ${namespace}; only the server default is available.`
+        : `Not authorized to list Providers in ${namespace}; an explicit Provider is required to send.`
       : `Providers unavailable: ${providersError instanceof Error ? providersError.message : 'unknown error'}`
     : undefined
   const serverDefaultLabel = config?.provider

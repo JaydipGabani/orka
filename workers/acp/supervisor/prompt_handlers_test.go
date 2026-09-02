@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -1407,28 +1409,108 @@ func TestWorkspaceDeltaRepositoryControlAndContentPolicies(t *testing.T) {
 }
 
 func TestWorkspaceDeltaSecretPolicyExemptsBaselineFlaggedFiles(t *testing.T) {
-	secretLike := []byte("password = 'SuperSecretPassword-0123456789'")
+	secretLine := "password = 'SuperSecretPassword-0123456789'"
+	baselineContent := "const mongoose = require('mongoose')\n\n" + secretLine + "\n\nmodule.exports = mongoose\n\nfunction helper() {}\n"
 	limits := harnessv2.WorkspaceDeltaLimits{MaxBytes: 1 << 20, RejectSecretLikeContent: true}
 
-	// A file that already carried secret-like content in the trusted
-	// pre-prompt baseline stays publishable.
-	artifact := tarBytes(t, tarEntry{name: "files/mongoose-db.js", body: secretLike})
-	baselineFlagged := func(path string) bool { return path == "mongoose-db.js" }
-	violation, err := workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits, baselineFlagged)
-	if err != nil || violation != "" {
-		t.Fatalf("baseline-flagged file was rejected: %q, %v", violation, err)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "mongoose-db.js"), []byte(baselineContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := workspacedelta.Capture(root, (&Server{}).baselineCaptureOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exempts := func(path string, content []byte) bool { return workspaceDeltaBaselineExempts(baseline, path, content) }
+	check := func(name string, body string) (string, error) {
+		return workspaceDeltaContentPolicyViolationContext(context.Background(), tarBytes(t, tarEntry{name: name, body: []byte(body)}), limits, exempts)
 	}
 
+	// Unchanged pre-existing secret-like content stays publishable, also
+	// when lines outside the credential's neighbouring paragraphs change.
+	if violation, err := check("files/mongoose-db.js", baselineContent); err != nil || violation != "" {
+		t.Fatalf("baseline-flagged file was rejected: %q, %v", violation, err)
+	}
+	if violation, err := check("files/mongoose-db.js", baselineContent+"\nfunction added() { return helper() }\n"); err != nil || violation != "" {
+		t.Fatalf("baseline-flagged file with a distant edit was rejected: %q, %v", violation, err)
+	}
+	// A code edit in the block right next to the credential fails closed:
+	// that is where an expression continuation could reach it. A comment
+	// added before that block is outside the window and stays allowed.
+	if violation, err := check("files/mongoose-db.js", "const edited = true\n"+baselineContent); err != nil || !strings.Contains(violation, "mongoose-db.js") {
+		t.Fatalf("adjacent code edit was not rejected: %q, %v", violation, err)
+	}
+	if violation, err := check("files/mongoose-db.js", "// edited\n"+baselineContent); err != nil || violation != "" {
+		t.Fatalf("leading comment was rejected: %q, %v", violation, err)
+	}
+
+	// Appending a new credential to a baseline-flagged file is rejected.
+	if violation, err := check("files/mongoose-db.js", baselineContent+"api_key = '"+strings.Repeat("zq9", 8)+"'\n"); err != nil || !strings.Contains(violation, "mongoose-db.js") {
+		t.Fatalf("appended credential was not rejected: %q, %v", violation, err)
+	}
+	// Replacing the original value with a live one is rejected.
+	replaced := strings.Replace(baselineContent, secretLine, "password = '"+strings.Repeat("live", 6)+"'", 1)
+	if violation, err := check("files/mongoose-db.js", replaced); err != nil || !strings.Contains(violation, "mongoose-db.js") {
+		t.Fatalf("replaced credential was not rejected: %q, %v", violation, err)
+	}
+	// Extending the known line on an adjacent line is rejected even though
+	// the known line itself is unchanged: a JS continuation, a continuation
+	// hidden behind a block comment, and a YAML-style indented continuation.
+	for _, continuation := range []string{
+		"  + '" + strings.Repeat("live", 6) + "'\n",
+		"  /* note */ + '" + strings.Repeat("live", 6) + "'\n",
+		"    " + strings.Repeat("live", 6) + "\n",
+		"\n  + '" + strings.Repeat("live", 6) + "'\n",
+		"// note\n  + '" + strings.Repeat("live", 6) + "'\n",
+		"/*\n*/\n  + '" + strings.Repeat("live", 6) + "'\n",
+		"  or '" + strings.Repeat("live", 6) + "'\n",
+		"\n// first note\n\n// second note\n+ '" + strings.Repeat("live", 6) + "'\n",
+	} {
+		continued := strings.Replace(baselineContent, secretLine+"\n", secretLine+"\n"+continuation, 1)
+		if violation, err := check("files/mongoose-db.js", continued); err != nil || !strings.Contains(violation, "mongoose-db.js") {
+			t.Fatalf("continued credential %q was not rejected: %q, %v", continuation, violation, err)
+		}
+	}
+	// Copying the known block to a second place in the file is rejected: the
+	// digest repeats but the baseline held only one occurrence.
+	if violation, err := check("files/mongoose-db.js", baselineContent+"\n"+baselineContent); err != nil || !strings.Contains(violation, "mongoose-db.js") {
+		t.Fatalf("relocated credential copy was not rejected: %q, %v", violation, err)
+	}
+	// A continuation appended after a multi-line known expression is
+	// rejected: the fingerprint window runs to the next statement start.
+	multiline := "const mongoose = require('mongoose')\n" + secretLine + " + build(\n)\nmodule.exports = mongoose\n"
+	if err := os.WriteFile(filepath.Join(root, "multi.js"), []byte(multiline), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err = workspacedelta.Capture(root, (&Server{}).baselineCaptureOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if violation, err := check("files/multi.js", multiline); err != nil || violation != "" {
+		t.Fatalf("multi-line known expression was rejected: %q, %v", violation, err)
+	}
+	extended := strings.Replace(multiline, ")\nmodule.exports", ")\n.concat('"+strings.Repeat("live", 6)+"')\nmodule.exports", 1)
+	inserted := strings.Replace(multiline, " + build(\n)", " +\n  String(\n  '"+strings.Repeat("live", 6)+"'\n  )", 1)
+	if violation, err := check("files/multi.js", inserted); err != nil || !strings.Contains(violation, "multi.js") {
+		t.Fatalf("literal inserted inside a known expression was not rejected: %q, %v", violation, err)
+	}
+	if violation, err := check("files/multi.js", extended); err != nil || !strings.Contains(violation, "multi.js") {
+		t.Fatalf("extended multi-line credential was not rejected: %q, %v", violation, err)
+	}
+	// A new expression ending in an operator right before the known line is
+	// rejected as well.
+	prefixed := strings.Replace(baselineContent, secretLine+"\n", "const combined = "+"'"+strings.Repeat("live", 6)+"' +\n"+secretLine+"\n", 1)
+	if violation, err := check("files/mongoose-db.js", prefixed); err != nil || !strings.Contains(violation, "mongoose-db.js") {
+		t.Fatalf("prefixed credential was not rejected: %q, %v", violation, err)
+	}
 	// A newly secret-like file is still rejected.
-	artifact = tarBytes(t, tarEntry{name: "files/new-config.js", body: secretLike})
-	violation, err = workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits, baselineFlagged)
-	if err != nil || !strings.Contains(violation, "new-config.js") {
+	if violation, err := check("files/new-config.js", baselineContent); err != nil || !strings.Contains(violation, "new-config.js") {
 		t.Fatalf("newly secret-like file was not rejected: %q, %v", violation, err)
 	}
 
 	// The symlink manifest is never exempt, whatever the lookup reports.
-	artifact = tarBytes(t, tarEntry{name: "meta/symlinks.json", body: []byte(`{"symlinks":[{"path":"link","target":"api_key=0123456789abcdef"}]}`)})
-	violation, err = workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits, func(string) bool { return true })
+	artifact := tarBytes(t, tarEntry{name: "meta/symlinks.json", body: []byte(`{"symlinks":[{"path":"link","target":"api_key=0123456789abcdef"}]}`)})
+	violation, err := workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits, func(string, []byte) bool { return true })
 	if err != nil || !strings.Contains(violation, "secret-like") {
 		t.Fatalf("symlink manifest exemption leaked: %q, %v", violation, err)
 	}

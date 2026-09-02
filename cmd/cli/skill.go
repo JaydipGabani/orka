@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -251,7 +252,11 @@ func newSkillImportCmd() *cobra.Command {
 // SKILL.md: the H1 heading when present, otherwise the parent directory when
 // the file itself is the conventional SKILL.md, otherwise the file name.
 func deriveSkillImportName(filePath string, data []byte) string {
-	if heading := skillMarkdownHeading(data); heading != "" {
+	frontmatter, body := splitSkillFrontmatter(data)
+	if name := sanitizeSkillName(frontmatter["name"]); name != "" {
+		return name
+	}
+	if heading := skillMarkdownHeading(body); heading != "" {
 		if name := sanitizeSkillName(heading); name != "" {
 			return name
 		}
@@ -273,7 +278,11 @@ func deriveSkillImportName(filePath string, data []byte) string {
 // "## Description" heading, or the first non-heading paragraph when the file
 // has no description section.
 func deriveSkillImportDescription(data []byte) string {
-	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	frontmatter, body := splitSkillFrontmatter(data)
+	if description := truncateSkillDescription(frontmatter["description"]); description != "" {
+		return description
+	}
+	lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
 	inDescription := false
 	firstParagraph := ""
 	for _, raw := range lines {
@@ -340,7 +349,46 @@ func truncateSkillDescription(value string) string {
 	if len(value) <= maxLen {
 		return value
 	}
-	return strings.TrimSpace(value[:maxLen])
+	// Cut on a rune boundary so a multibyte character crossing the limit
+	// cannot become invalid UTF-8 in the stored description.
+	cut := maxLen
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(value[:cut])
+}
+
+// splitSkillFrontmatter separates a leading YAML frontmatter block
+// (---\nkey: value\n---) from the Markdown body. Only simple scalar
+// `key: value` lines are read; quoted values are unquoted.
+func splitSkillFrontmatter(data []byte) (map[string]string, []byte) {
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	fields := map[string]string{}
+	if !strings.HasPrefix(text, "---\n") {
+		return fields, data
+	}
+	rest := text[len("---\n"):]
+	before, after, ok := strings.Cut(rest, "\n---")
+	if !ok {
+		return fields, data
+	}
+	for line := range strings.SplitSeq(before, "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') && value[len(value)-1] == value[0] {
+			value = value[1 : len(value)-1]
+		}
+		if key != "" && value != "" {
+			fields[key] = value
+		}
+	}
+	body := after
+	body = strings.TrimPrefix(body, "\n")
+	return fields, []byte(body)
 }
 
 func newSkillUpdateCmd() *cobra.Command {

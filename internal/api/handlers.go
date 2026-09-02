@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 	"time"
 
@@ -915,28 +914,19 @@ func (h *Handlers) ListSessions(c fiber.Ctx) error {
 	}
 
 	ctx := c.Context()
-	sessions, err := h.sessionStore.ListSessions(ctx, namespace)
+	// The store applies the name cursor, gateway exclusion, ordering, and
+	// limit itself, so each page reads only its own rows.
+	sessions, more, err := h.sessionStore.ListSessionsPage(ctx, namespace, pagination.Continue, int(pagination.Limit), store.SessionTypeGateway)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list sessions: %v", err))
 	}
 
-	// The store returns rows unordered; a stable name order keeps the
-	// name-based continue cursor exact across pages.
-	sort.Slice(sessions, func(i, j int) bool { return sessions[i].Name < sessions[j].Name })
-
 	items := make([]fiber.Map, 0, len(sessions))
 	continueToken := ""
+	if more && len(sessions) > 0 {
+		continueToken = sessions[len(sessions)-1].Name
+	}
 	for _, s := range sessions {
-		if s.SessionType == store.SessionTypeGateway {
-			continue
-		}
-		if pagination.Continue != "" && s.Name <= pagination.Continue {
-			continue
-		}
-		if int64(len(items)) >= pagination.Limit {
-			continueToken = items[len(items)-1]["name"].(string)
-			break
-		}
 		items = append(items, fiber.Map{
 			"id":           s.Name,
 			"name":         s.Name,

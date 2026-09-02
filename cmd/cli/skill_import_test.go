@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
 
 func TestDeriveSkillImportName(t *testing.T) {
 	tests := []struct {
@@ -16,6 +20,7 @@ func TestDeriveSkillImportName(t *testing.T) {
 		{"other filename", "notes/My Skill.md", "text\n", "my-skill"},
 		{"heading with symbols", "SKILL.md", "#   Deploy: v2 (beta)!\n", "deploy-v2-beta"},
 		{"empty heading falls through", "skills/alpha/SKILL.md", "# \n", "alpha"},
+		{"frontmatter name wins", "skills/beta/SKILL.md", "---\nname: Ship It\ndescription: d\n---\n# Other\n", "ship-it"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -37,6 +42,8 @@ func TestDeriveSkillImportDescription(t *testing.T) {
 		{"no description section uses first paragraph", "# n\n\nFirst paragraph here.\n\n## Instructions\n\n- step\n", "First paragraph here."},
 		{"only headings", "# n\n\n## Description\n\n## Instructions\n", ""},
 		{"crlf", "# n\r\n\r\n## Description\r\n\r\nWindows line.\r\n", "Windows line."},
+		{"frontmatter description", "---\nname: x\ndescription: \"Frontmatter wins.\"\n---\n# n\n\nBody prose.\n", "Frontmatter wins."},
+		{"frontmatter without description skips the block", "---\nname: x\n---\n# n\n\nBody prose.\n", "Body prose."},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -57,5 +64,16 @@ func TestSanitizeSkillNameBounds(t *testing.T) {
 	}
 	if got := sanitizeSkillName("---"); got != "" {
 		t.Fatalf("expected empty name for dashes only, got %q", got)
+	}
+}
+
+func TestTruncateSkillDescriptionKeepsValidUTF8(t *testing.T) {
+	value := strings.Repeat("a", 255) + "é" + strings.Repeat("b", 10)
+	got := truncateSkillDescription(value)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated description is not valid UTF-8: %q", got)
+	}
+	if len(got) > 256 || strings.ContainsRune(got, 'b') {
+		t.Fatalf("truncation kept too much: len %d", len(got))
 	}
 }
