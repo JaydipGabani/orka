@@ -2827,8 +2827,8 @@ func (r *RepositoryScanReconciler) repositoryScanInconclusiveFindingSlices(ctx c
 	}
 }
 
-func (r *RepositoryScanReconciler) repositoryScanReviewedSlicesForResolution(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) (map[string]map[string]struct{}, error) {
-	reviewedSlices := map[string]map[string]struct{}{}
+func (r *RepositoryScanReconciler) repositoryScanReviewedSlicesForResolution(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) (map[string]map[string][]security.ReviewContextLineRange, error) {
+	reviewedSlices := map[string]map[string][]security.ReviewContextLineRange{}
 	cursor := ""
 	for {
 		scanSlices, next, err := r.SecurityStore.ListReviewSlices(ctx, store.ReviewSliceFilter{
@@ -2854,14 +2854,14 @@ func (r *RepositoryScanReconciler) repositoryScanReviewedSlicesForResolution(ctx
 			if strings.TrimSpace(manifest.SliceID) != reviewSlice.ID {
 				return nil, fmt.Errorf("review slice %s trusted context has slice ID %s", reviewSlice.ID, manifest.SliceID)
 			}
-			includedPaths := map[string]struct{}{}
+			includedRanges := map[string][]security.ReviewContextLineRange{}
 			for _, file := range manifest.IncludedFiles {
 				path := normalizeRepoPath(file.Path)
-				if file.Readable && len(file.IncludedLineRanges) > 0 && security.SafeRepoPath(path) {
-					includedPaths[path] = struct{}{}
+				if file.Readable && security.SafeRepoPath(path) {
+					includedRanges[path] = append(includedRanges[path], file.IncludedLineRanges...)
 				}
 			}
-			reviewedSlices[reviewSlice.ID] = includedPaths
+			reviewedSlices[reviewSlice.ID] = includedRanges
 		}
 		if next == "" {
 			return reviewedSlices, nil
@@ -2870,7 +2870,7 @@ func (r *RepositoryScanReconciler) repositoryScanReviewedSlicesForResolution(ctx
 	}
 }
 
-func findingEligibleForMergedResolution(finding *store.Finding, run *store.ScanRun, inconclusiveSlices map[string]struct{}, reviewedSlices map[string]map[string]struct{}, allSlicesInconclusive bool) bool {
+func findingEligibleForMergedResolution(finding *store.Finding, run *store.ScanRun, inconclusiveSlices map[string]struct{}, reviewedSlices map[string]map[string][]security.ReviewContextLineRange, allSlicesInconclusive bool) bool {
 	if finding == nil || finding.ScanRunID == run.ID || finding.PRNumber == nil || *finding.PRNumber < 1 {
 		return false
 	}
@@ -2881,16 +2881,20 @@ func findingEligibleForMergedResolution(finding *store.Finding, run *store.ScanR
 	if _, inconclusive := inconclusiveSlices[sliceID]; inconclusive {
 		return false
 	}
-	includedPaths, reviewed := reviewedSlices[sliceID]
+	includedRanges, reviewed := reviewedSlices[sliceID]
 	if !reviewed {
 		return false
 	}
 	filePath := normalizeRepoPath(finding.FilePath)
-	if !security.SafeRepoPath(filePath) {
+	if !security.SafeRepoPath(filePath) || finding.Line <= 0 {
 		return false
 	}
-	_, covered := includedPaths[filePath]
-	return covered
+	for _, lineRange := range includedRanges[filePath] {
+		if finding.Line >= lineRange.StartLine && finding.Line <= lineRange.EndLine {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *RepositoryScanReconciler) repositoryScanOpenFindingsForResolution(ctx context.Context, scan *corev1alpha1.RepositoryScan) ([]store.Finding, error) {
