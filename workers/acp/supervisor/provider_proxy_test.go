@@ -1462,11 +1462,13 @@ func TestProviderProxyChildDisconnectOnIncompleteStreamCountsAsFailure(t *testin
 }
 
 func TestProviderProxyChildDisconnectAccountsOnlyDeliveredStreamBytes(t *testing.T) {
+	const incompleteStreamDetail = "provider stream ended before a terminal success event"
 	tests := []struct {
 		name          string
 		delivered     string
 		undelivered   string
 		wantFailure   bool
+		wantDetail    string
 		wantSuccesses int32
 		wantFailures  int32
 	}{
@@ -1475,6 +1477,7 @@ func TestProviderProxyChildDisconnectAccountsOnlyDeliveredStreamBytes(t *testing
 			delivered:     "data: {\"type\":\"response.created\"}\n\n",
 			undelivered:   "event: response.completed\n\n",
 			wantFailure:   true,
+			wantDetail:    incompleteStreamDetail,
 			wantSuccesses: 0,
 			wantFailures:  2,
 		},
@@ -1485,6 +1488,27 @@ func TestProviderProxyChildDisconnectAccountsOnlyDeliveredStreamBytes(t *testing
 			wantFailure:   false,
 			wantSuccesses: 1,
 			wantFailures:  1,
+		},
+		{
+			// The error marker sits in the unwritten tail of the short write:
+			// it is not upstream evidence the child received, so the stream
+			// is accounted as incomplete, exactly once.
+			name:          "terminal error is not delivered",
+			delivered:     "data: {\"type\":\"response.created\"}\n\n",
+			undelivered:   "data: {\"type\":\"response.failed\"}\n\n",
+			wantFailure:   true,
+			wantDetail:    incompleteStreamDetail,
+			wantSuccesses: 0,
+			wantFailures:  2,
+		},
+		{
+			name:          "terminal error is delivered before disconnect",
+			delivered:     "data: {\"type\":\"response.failed\",\"error\":\"quota\"}\n\n",
+			undelivered:   "data: trailing\n\n",
+			wantFailure:   true,
+			wantDetail:    "provider stream reported a terminal error: quota",
+			wantSuccesses: 0,
+			wantFailures:  2,
 		},
 	}
 	for _, tt := range tests {
@@ -1518,8 +1542,8 @@ func TestProviderProxyChildDisconnectAccountsOnlyDeliveredStreamBytes(t *testing
 			if failed != tt.wantFailure {
 				t.Fatalf("upstreamFailureUnrecovered = %v/%d/%q, want failed=%v", failed, status, detail, tt.wantFailure)
 			}
-			if tt.wantFailure && (status != http.StatusBadGateway || detail != "provider stream ended before a terminal success event") {
-				t.Fatalf("stream failure = %d/%q, want incomplete-stream failure", status, detail)
+			if tt.wantFailure && (status != http.StatusBadGateway || detail != tt.wantDetail) {
+				t.Fatalf("stream failure = %d/%q, want %d/%q", status, detail, http.StatusBadGateway, tt.wantDetail)
 			}
 			if successes, failures := session.inferenceSuccesses, session.inferenceFailures; successes != tt.wantSuccesses || failures != tt.wantFailures {
 				t.Fatalf("inference accounting = %d successes / %d failures, want %d/%d", successes, failures, tt.wantSuccesses, tt.wantFailures)

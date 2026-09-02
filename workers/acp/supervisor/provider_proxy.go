@@ -895,18 +895,22 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 type deliveredSSEWriter struct {
 	w       io.Writer
 	scanner *sseTerminalErrorScanner
-	// beforeWrite, when set, observes each chunk before any of it can reach
-	// the child.
-	beforeWrite func([]byte)
+	// onFailure, when set, runs once, inside the Write whose accepted bytes
+	// latched the scanner's terminal-error verdict: after the downstream
+	// writer reported how many bytes it took, before the flush that follows
+	// the Write delivers them.
+	onFailure       func()
+	failureReported bool
 }
 
 func (w *deliveredSSEWriter) Write(p []byte) (int, error) {
-	if w.beforeWrite != nil {
-		w.beforeWrite(p)
-	}
 	n, err := w.w.Write(p)
 	if n > 0 {
 		_, _ = w.scanner.Write(p[:n])
+		if w.scanner.failed && !w.failureReported && w.onFailure != nil {
+			w.failureReported = true
+			w.onFailure()
+		}
 	}
 	return n, err
 }
@@ -1151,8 +1155,8 @@ func (p *providerProxy) relayUpstreamResponse(
 	// stream for explicit error events so they are accounted as failures.
 	var streamScanner *sseTerminalErrorScanner
 	// terminalErrorAccounted is set once an in-stream terminal error was
-	// recorded ahead of its delivery; the verdicts below must not account
-	// the same sequence again.
+	// recorded from delivered bytes ahead of their flush; the verdicts below
+	// must not account the same sequence again.
 	terminalErrorAccounted := false
 	if !upstreamFailed && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
 		streamScanner = &sseTerminalErrorScanner{}
@@ -1171,23 +1175,18 @@ func (p *providerProxy) relayUpstreamResponse(
 	relayed := &countingWriter{w: w}
 	var destination io.Writer = relayed
 	if streamScanner != nil {
-		// A lookahead probe scans each chunk BEFORE it is written so an
-		// in-stream terminal error is accounted before the child can read
-		// the line that reveals it: ACP agents react to a delivered error
-		// event (for example with a retry notice in the agent message
-		// stream) faster than the upstream closes the stream, and the
-		// supervisor must be able to trust the failure count at that
-		// moment. The verdict scanner still sees only delivered bytes.
-		probe := &sseTerminalErrorScanner{}
-		destination = &deliveredSSEWriter{w: relayed, scanner: streamScanner, beforeWrite: func(chunk []byte) {
-			if terminalErrorAccounted {
-				return
-			}
-			_, _ = probe.Write(chunk)
-			if probe.failed {
-				terminalErrorAccounted = true
-				session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider stream reported a terminal error: "+probe.detail)
-			}
+		// An in-stream terminal error is accounted as soon as the delivered
+		// bytes latch it, before the flush that hands the child the line
+		// revealing it and without waiting for the upstream to close the
+		// stream: ACP agents react to a delivered error event (for example
+		// with a retry notice in the agent message stream) faster than
+		// upstreams end their streams, and the supervisor must be able to
+		// trust the failure count at that moment. Only accepted bytes are
+		// scanned, so a marker in the unwritten tail of a short write is not
+		// accounted here; the verdicts below handle that stream end.
+		destination = &deliveredSSEWriter{w: relayed, scanner: streamScanner, onFailure: func() {
+			terminalErrorAccounted = true
+			session.recordInferenceOutcome(promptID, requestClass, seq, http.StatusBadGateway, "provider stream reported a terminal error: "+streamScanner.detail)
 		}}
 	}
 	err := providerproxy.StreamBoundedResponse(destination, body, p.maxResponseBytes, flusher)
