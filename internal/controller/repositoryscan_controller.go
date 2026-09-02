@@ -2173,7 +2173,9 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 	if len(existing.Evidence) > 0 {
 		finding.Evidence = mergeEvidenceRefs(existing.Evidence, finding.Evidence...)
 	}
-	mergeFindingValidationState(finding, existing)
+	if !reopened {
+		mergeFindingValidationState(finding, existing)
+	}
 	return nil
 }
 
@@ -2714,11 +2716,11 @@ func (r *RepositoryScanReconciler) repositoryScanReviewedSlicesForResolution(ctx
 	}
 }
 
-func findingEligibleForMergedResolution(finding *store.Finding, run *store.ScanRun, targetKey string, inconclusiveSlices, reviewedSlices map[string]struct{}, allSlicesInconclusive bool) bool {
+func findingEligibleForMergedResolution(scan *corev1alpha1.RepositoryScan, finding *store.Finding, run *store.ScanRun, targetKey string, inconclusiveSlices, reviewedSlices map[string]struct{}, allSlicesInconclusive bool) bool {
 	if finding == nil || finding.ScanRunID == run.ID || finding.PRNumber == nil || *finding.PRNumber < 1 {
 		return false
 	}
-	if strings.TrimSpace(finding.TargetKey) != strings.TrimSpace(targetKey) {
+	if !findingTargetKeyMatches(scan, targetKey, finding) {
 		return false
 	}
 	sliceID := strings.TrimSpace(finding.SliceID)
@@ -2797,7 +2799,7 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 	targetKey := security.FindingV2TargetKey(currentTarget.RepoURL, currentTarget.Branch, currentTarget.SubPath)
 	for i := range findings {
 		finding := &findings[i]
-		if !findingEligibleForMergedResolution(finding, run, targetKey, inconclusiveSlices, reviewedSlices, allSlicesInconclusive) {
+		if !findingEligibleForMergedResolution(scan, finding, run, targetKey, inconclusiveSlices, reviewedSlices, allSlicesInconclusive) {
 			continue
 		}
 		prNumber := *finding.PRNumber

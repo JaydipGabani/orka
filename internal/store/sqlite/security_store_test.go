@@ -806,7 +806,8 @@ func TestUpsertObservedFindingReopensRemediatedStatesWhenObservedAgain(t *testin
 				Summary:          "remediated state",
 				Severity:         "high",
 				Confidence:       "medium",
-				ValidationStatus: "validated",
+				ValidationStatus: "pending",
+				ValidationJSON:   `{"status":"pending","summary":"prior occurrence"}`,
 				State:            remediatedState,
 			}
 			if err := s.UpsertFinding(ctx, initial); err != nil {
@@ -814,6 +815,8 @@ func TestUpsertObservedFindingReopensRemediatedStatesWhenObservedAgain(t *testin
 			}
 			reopened := *initial
 			reopened.ScanRunID = testScanRunID2
+			reopened.ValidationStatus = "unvalidated"
+			reopened.ValidationJSON = ""
 			reopened.State = testStateOpen
 			if err := s.UpsertObservedFinding(ctx, &reopened); err != nil {
 				t.Fatalf("UpsertObservedFinding(reopened): %v", err)
@@ -822,7 +825,7 @@ func TestUpsertObservedFindingReopensRemediatedStatesWhenObservedAgain(t *testin
 			if err != nil {
 				t.Fatalf("GetFinding: %v", err)
 			}
-			if got.State != testStateOpen || got.ScanRunID != testScanRunID2 {
+			if got.State != testStateOpen || got.ScanRunID != testScanRunID2 || got.ValidationStatus != "unvalidated" || got.ValidationJSON != "" {
 				t.Fatalf("finding = %#v, want reopened in latest run", got)
 			}
 		})

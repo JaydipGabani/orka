@@ -4399,7 +4399,8 @@ func TestMergeExistingFindingReopensResolvedFindingWithoutRemediationProjection(
 		Summary:          "old occurrence",
 		Severity:         "high",
 		Confidence:       "high",
-		ValidationStatus: findingValidationStatusValidated,
+		ValidationStatus: findingValidationStatusPending,
+		ValidationJSON:   `{"status":"pending","summary":"prior occurrence"}`,
 		State:            findingStateResolved,
 		FilePath:         "run.go",
 		Line:             40,
@@ -4429,14 +4430,14 @@ func TestMergeExistingFindingReopensResolvedFindingWithoutRemediationProjection(
 	if err := reconciler.mergeExistingFinding(ctx, scan, incoming); err != nil {
 		t.Fatalf("mergeExistingFinding() error = %v", err)
 	}
-	if incoming.State != findingStateOpen || incoming.PatchProposalID != "" || incoming.PRNumber != nil || incoming.PRURL != "" {
+	if incoming.State != findingStateOpen || incoming.ValidationStatus != "unvalidated" || incoming.ValidationJSON != "" || incoming.PatchProposalID != "" || incoming.PRNumber != nil || incoming.PRURL != "" {
 		t.Fatalf("incoming recurrence = %#v", incoming)
 	}
 	if err := securityStore.UpsertObservedFinding(ctx, incoming); err != nil {
 		t.Fatalf("UpsertObservedFinding(incoming) error = %v", err)
 	}
 	stored, err := securityStore.GetFinding(ctx, defaultNS, existing.ID)
-	if err != nil || stored.State != findingStateOpen || stored.PatchProposalID != "" || stored.PRNumber != nil || stored.PRURL != "" {
+	if err != nil || stored.State != findingStateOpen || stored.ValidationStatus != "unvalidated" || stored.ValidationJSON != "" || stored.PatchProposalID != "" || stored.PRNumber != nil || stored.PRURL != "" {
 		t.Fatalf("stored recurrence = %#v, err %v", stored, err)
 	}
 }
@@ -5015,14 +5016,44 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
 		}
 	}
+	legacyPRNumber := 45
+	legacy := &storepkg.Finding{
+		ID:               "fnd_legacy_target",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_old",
+		SliceID:          "slice_reviewed",
+		Title:            "legacy finding",
+		Category:         "legacy category",
+		Summary:          "legacy finding",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusValidated,
+		State:            findingStatePROpen,
+		PRNumber:         &legacyPRNumber,
+	}
+	legacyRepo := trustedFindingsRepository(scan, nil)
+	legacy.Fingerprint = security.FindingV2Fingerprint(
+		legacy.Namespace,
+		legacy.RepositoryScan,
+		legacyRepo.RepoURL,
+		legacyRepo.Branch,
+		legacyRepo.SubPath,
+		legacy.SliceID,
+		security.FindingsV2Finding{Title: legacy.Title, Category: legacy.Category},
+	)
+	if err := securityStore.UpsertFinding(ctx, legacy); err != nil {
+		t.Fatalf("UpsertFinding(%s) error = %v", legacy.ID, err)
+	}
 	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run); err != nil {
 		t.Fatalf("resolveMergedFindingsNotObserved() error = %v", err)
 	}
 	reviewed, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_reviewed")
 	unreviewed, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_unreviewed")
 	oldTarget, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_old_target")
-	if reviewed.State != findingStateResolved || unreviewed.State != findingStatePROpen || oldTarget.State != findingStatePROpen || requests[42] != 1 || requests[43] != 0 || requests[44] != 0 {
-		t.Fatalf("reviewed = %#v, unreviewed = %#v, old target = %#v, requests = %#v", reviewed, unreviewed, oldTarget, requests)
+	legacyTarget, _ := securityStore.GetFinding(ctx, defaultNS, legacy.ID)
+	if reviewed.State != findingStateResolved || unreviewed.State != findingStatePROpen || oldTarget.State != findingStatePROpen || legacyTarget.State != findingStateResolved || requests[42] != 1 || requests[43] != 0 || requests[44] != 0 || requests[45] != 1 {
+		t.Fatalf("reviewed = %#v, unreviewed = %#v, old target = %#v, legacy target = %#v, requests = %#v", reviewed, unreviewed, oldTarget, legacyTarget, requests)
 	}
 }
 

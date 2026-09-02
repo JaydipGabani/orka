@@ -276,11 +276,13 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 		if repositoryMonitorUpdateBranchTimedOut(mutation) {
 			return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, repositoryMonitorUpdateBranchTimeoutReason)
 		}
-		_, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
+		cancelled, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
 		if err != nil {
 			return true, 0, err
 		}
-		return r.waitForRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, pr, repositoryMonitorUpdateBranchSubmitting)
+		if cancelled || strings.TrimSpace(mutation.Error) != "" || pr.HeadSHA != mutation.TargetSHA {
+			return r.waitForRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, pr, repositoryMonitorUpdateBranchSubmitting)
+		}
 	case repositoryMonitorAutomergeStateStarted:
 		cancelled, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
 		if err != nil || cancelled {

@@ -601,6 +601,9 @@ func (s *Store) upsertFinding(ctx context.Context, finding *store.Finding, obser
 		   confidence = excluded.confidence,
 		   triage = excluded.triage,
 		   validation_status = CASE
+		     WHEN ? AND security_findings.state IN ('fixed', 'resolved')
+		       AND excluded.state = 'open'
+		       THEN excluded.validation_status
 		     WHEN security_findings.validation_status = 'validated'
 		       AND excluded.validation_status != 'validated'
 		       THEN security_findings.validation_status
@@ -688,6 +691,9 @@ func (s *Store) upsertFinding(ctx context.Context, finding *store.Finding, obser
 		   minimum_fix_scope = excluded.minimum_fix_scope,
 		   evidence_json = excluded.evidence_json,
 		   validation_json = CASE
+		     WHEN ? AND security_findings.state IN ('fixed', 'resolved')
+		       AND excluded.state = 'open'
+		       THEN excluded.validation_json
 		     WHEN security_findings.validation_status = 'validated'
 		       AND excluded.validation_status != 'validated'
 		       THEN security_findings.validation_json
@@ -736,7 +742,7 @@ func (s *Store) upsertFinding(ctx context.Context, finding *store.Finding, obser
 		finding.ValidationStatus, finding.State, nullableTime(&finding.DecisionAt), finding.DuplicateOf, finding.FilePath, finding.Line, finding.CommitSHA, finding.RootCause,
 		finding.Reproduction, finding.Remediation, finding.SuggestedAction, finding.WhyTestsDoNotAlreadyCoverThis,
 		finding.SuggestedRegressionTest, finding.MinimumFixScope, evidenceJSON, finding.ValidationJSON, finding.PatchProposalID,
-		finding.PRNumber, finding.PRURL, finding.CreatedAt, finding.UpdatedAt, decisionAtProvided, observed, decisionAtProvided, observed, observed, observed,
+		finding.PRNumber, finding.PRURL, finding.CreatedAt, finding.UpdatedAt, observed, decisionAtProvided, observed, decisionAtProvided, observed, observed, observed, observed,
 	)
 	return err
 }
