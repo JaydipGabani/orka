@@ -1076,6 +1076,13 @@ func migrate(db *sql.DB) error {
 	}); err != nil {
 		return err
 	}
+	if _, err := db.Exec(`UPDATE security_findings
+		SET decision_at = updated_at
+		WHERE decision_at IS NULL
+		  AND updated_at IS NOT NULL
+		  AND state IN ('dismissed', 'suppressed', 'false_positive')`); err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
 	if err := ensureSQLiteColumns(db, "security_review_slices", []sqliteColumnMigration{
 		{Name: "changed_files_json", Definition: "changed_files_json TEXT NOT NULL DEFAULT '[]'"},
 		{Name: "changed_line_ranges_json", Definition: "changed_line_ranges_json TEXT NOT NULL DEFAULT '[]'"},

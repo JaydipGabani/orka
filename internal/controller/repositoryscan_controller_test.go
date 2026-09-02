@@ -3840,6 +3840,78 @@ func TestMergeExistingFindingCollapsesSemanticDuplicates(t *testing.T) {
 	}
 }
 
+func TestMergeExistingFindingCollapsesSemanticDuplicatesForExistingFingerprint(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
+	scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}}
+	created := mustParseTime(t, "2026-08-01T00:00:00Z")
+	canonical := &storepkg.Finding{
+		ID:               "fnd_existing_canonical",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_old",
+		Fingerprint:      "existing-canonical-fingerprint",
+		Title:            "Archive extraction permits traversal",
+		Category:         "path traversal",
+		Summary:          "old wording",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusValidated,
+		State:            findingStateOpen,
+		FilePath:         "archive.go",
+		Line:             100,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 100, EndLine: 108, Symbol: "extractArchive"}},
+		CreatedAt:        created,
+	}
+	duplicate := &storepkg.Finding{
+		ID:               "fnd_existing_duplicate",
+		Namespace:        defaultNS,
+		RepositoryScan:   scan.Name,
+		ScanRunID:        "scan_middle",
+		Fingerprint:      "existing-duplicate-fingerprint",
+		Title:            "ZIP entries can escape the destination",
+		Category:         "CWE-22 path traversal",
+		Summary:          "different wording",
+		Severity:         "high",
+		Confidence:       "high",
+		ValidationStatus: findingValidationStatusValidated,
+		State:            findingStateOpen,
+		FilePath:         "archive.go",
+		Line:             103,
+		Evidence:         []storepkg.FindingEvidenceRef{{Path: "archive.go", StartLine: 103, EndLine: 111, Symbol: "extractArchive"}},
+		CreatedAt:        created.Add(time.Hour),
+	}
+	for _, finding := range []*storepkg.Finding{canonical, duplicate} {
+		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
+		}
+	}
+
+	incoming := *duplicate
+	incoming.ScanRunID = "scan_current"
+	incoming.Title = "Untrusted ZIP paths write outside the extraction root"
+	incoming.Summary = "current wording"
+	if err := reconciler.mergeExistingFinding(ctx, scan, &incoming); err != nil {
+		t.Fatalf("mergeExistingFinding() error = %v", err)
+	}
+	if incoming.ID != canonical.ID || incoming.Fingerprint != canonical.Fingerprint {
+		t.Fatalf("incoming identity = %q/%q, want canonical %q/%q", incoming.ID, incoming.Fingerprint, canonical.ID, canonical.Fingerprint)
+	}
+	if err := securityStore.UpsertObservedFinding(ctx, &incoming); err != nil {
+		t.Fatalf("UpsertObservedFinding(incoming) error = %v", err)
+	}
+
+	listed, _, err := securityStore.ListFindings(ctx, storepkg.FindingFilter{Namespace: defaultNS, RepositoryScan: scan.Name, Limit: 10})
+	if err != nil || len(listed) != 1 || listed[0].ID != canonical.ID {
+		t.Fatalf("canonical findings = %#v, err %v", listed, err)
+	}
+	alias, err := securityStore.GetFinding(ctx, defaultNS, duplicate.ID)
+	if err != nil || alias.DuplicateOf != canonical.ID {
+		t.Fatalf("duplicate alias = %#v, err %v", alias, err)
+	}
+}
+
 type failingObservedFindingStore struct {
 	storepkg.SecurityStore
 }
@@ -4394,6 +4466,30 @@ func TestFindingIdentityMatchScoreRejectsDistinctPrimaryLocationsWithSharedSuppo
 	}
 	if score := findingIdentityMatchScore(left, right); score != 0 {
 		t.Fatalf("findingIdentityMatchScore() = %d, want distinct primary locations rejected", score)
+	}
+}
+
+func TestFindingIdentityMatchScoreRejectsSharedEnclosingRangeWithDistinctSinks(t *testing.T) {
+	left := &storepkg.Finding{
+		Category: "command injection",
+		FilePath: "handler.go",
+		Line:     100,
+		Evidence: []storepkg.FindingEvidenceRef{
+			{Path: "handler.go", StartLine: 100, EndLine: 220, Symbol: "handleRequest"},
+			{Path: "handler.go", StartLine: 140, EndLine: 142, Symbol: "runImport"},
+		},
+	}
+	right := &storepkg.Finding{
+		Category: "CWE-78 command injection",
+		FilePath: "handler.go",
+		Line:     100,
+		Evidence: []storepkg.FindingEvidenceRef{
+			{Path: "handler.go", StartLine: 100, EndLine: 220, Symbol: "handleRequest"},
+			{Path: "handler.go", StartLine: 180, EndLine: 182, Symbol: "runExport"},
+		},
+	}
+	if score := findingIdentityMatchScore(left, right); score != 0 {
+		t.Fatalf("findingIdentityMatchScore() = %d, want enclosing primary range rejected", score)
 	}
 }
 

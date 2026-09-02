@@ -2089,40 +2089,12 @@ func evidenceRefKey(ref store.FindingEvidenceRef) string {
 
 func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding) error {
 	existing, err := r.SecurityStore.GetFinding(ctx, scan.Namespace, finding.ID)
-	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			return err
-		}
-		matches, matchErr := r.semanticFindingMatches(ctx, scan, finding)
-		if matchErr != nil {
-			return matchErr
-		}
-		if len(matches) == 0 {
-			return nil
-		}
-		matches = compatibleFindingMatches(matches)
-		existing = canonicalFinding(matches)
-		for i := range matches {
-			mergeFindingEvidenceAndRemediation(existing, &matches[i])
-		}
-		aliases := make([]string, 0, len(matches)-1)
-		for i := range matches {
-			candidate := &matches[i]
-			if candidate.ID == existing.ID || candidate.DuplicateOf == existing.ID {
-				continue
-			}
-			aliases = append(aliases, candidate.ID)
-		}
-		if len(aliases) > 0 {
-			if err := r.SecurityStore.UpsertFinding(ctx, existing); err != nil {
-				return err
-			}
-			for _, aliasID := range aliases {
-				if err := r.SecurityStore.MarkFindingDuplicate(ctx, scan.Namespace, aliasID, existing.ID); err != nil {
-					return err
-				}
-			}
-		}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	exactFindingID := finding.ID
+	if errors.Is(err, store.ErrNotFound) {
+		existing = nil
 	} else if existing.DuplicateOf != "" {
 		canonical, canonicalErr := r.SecurityStore.GetFinding(ctx, scan.Namespace, existing.DuplicateOf)
 		if canonicalErr != nil {
@@ -2131,6 +2103,47 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 		mergeFindingEvidenceAndRemediation(canonical, existing)
 		existing = canonical
 	}
+
+	matchTarget := finding
+	excludedIDs := []string(nil)
+	if existing != nil {
+		matchTarget = existing
+		excludedIDs = []string{exactFindingID, existing.ID}
+	}
+	matches, matchErr := r.semanticFindingMatches(ctx, scan, matchTarget, excludedIDs...)
+	if matchErr != nil {
+		return matchErr
+	}
+	if existing != nil {
+		matches = append(matches, *existing)
+	}
+	if len(matches) == 0 {
+		return nil
+	}
+	matches = compatibleFindingMatches(matches)
+	existing = canonicalFinding(matches)
+	for i := range matches {
+		mergeFindingEvidenceAndRemediation(existing, &matches[i])
+	}
+	aliases := make([]string, 0, len(matches)-1)
+	for i := range matches {
+		candidate := &matches[i]
+		if candidate.ID == existing.ID || candidate.DuplicateOf == existing.ID {
+			continue
+		}
+		aliases = append(aliases, candidate.ID)
+	}
+	if len(aliases) > 0 {
+		if err := r.SecurityStore.UpsertFinding(ctx, existing); err != nil {
+			return err
+		}
+		for _, aliasID := range aliases {
+			if err := r.SecurityStore.MarkFindingDuplicate(ctx, scan.Namespace, aliasID, existing.ID); err != nil {
+				return err
+			}
+		}
+	}
+
 	finding.ID = existing.ID
 	finding.Fingerprint = existing.Fingerprint
 	finding.CreatedAt = existing.CreatedAt
@@ -2160,9 +2173,15 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 	return nil
 }
 
-func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding) ([]store.Finding, error) {
+func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding, excludedIDs ...string) ([]store.Finding, error) {
 	if finding == nil || strings.TrimSpace(finding.FilePath) == "" || strings.TrimSpace(finding.Category) == "" {
 		return nil, nil
+	}
+	excluded := make(map[string]struct{}, len(excludedIDs))
+	for _, id := range excludedIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			excluded[id] = struct{}{}
+		}
 	}
 	matchesByID := map[string]store.Finding{}
 	cursor := ""
@@ -2180,6 +2199,9 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 		}
 		for i := range candidates {
 			candidate := candidates[i]
+			if _, skip := excluded[candidate.ID]; skip {
+				continue
+			}
 			if findingIdentityMatchScore(finding, &candidate) < 2 {
 				continue
 			}
@@ -2204,6 +2226,9 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 				continue
 			}
 			for _, member := range family {
+				if _, skip := excluded[member.ID]; skip {
+					continue
+				}
 				matchesByID[member.ID] = member
 			}
 		}
@@ -2334,6 +2359,9 @@ func findingIdentityMatchScore(left, right *store.Finding) int {
 	if left == nil || right == nil || !findingCategoryMatches(left.Category, right.Category) || strings.TrimSpace(left.FilePath) == "" || left.FilePath != right.FilePath {
 		return 0
 	}
+	if findingHasEnclosingPrimaryEvidence(left) || findingHasEnclosingPrimaryEvidence(right) {
+		return 0
+	}
 	if !findingPrimaryEvidenceLocationsAgree(left, right) || findingPrimaryEvidenceSymbolsConflict(left, right) {
 		return 0
 	}
@@ -2371,6 +2399,26 @@ func findingIdentityMatchScore(left, right *store.Finding) int {
 		best = 2
 	}
 	return best
+}
+
+func findingHasEnclosingPrimaryEvidence(finding *store.Finding) bool {
+	if finding == nil || finding.Line <= 0 {
+		return false
+	}
+	for i, ref := range finding.Evidence {
+		if ref.Path != finding.FilePath || ref.StartLine <= 0 || ref.EndLine < ref.StartLine || finding.Line < ref.StartLine || finding.Line > ref.EndLine {
+			continue
+		}
+		for j, nested := range finding.Evidence {
+			if i == j || nested.Path != ref.Path || nested.StartLine <= 0 || nested.EndLine < nested.StartLine {
+				continue
+			}
+			if ref.StartLine <= nested.StartLine && ref.EndLine >= nested.EndLine && (ref.StartLine < nested.StartLine || ref.EndLine > nested.EndLine) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func findingPrimaryEvidenceLocationsAgree(left, right *store.Finding) bool {

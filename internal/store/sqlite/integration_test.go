@@ -881,10 +881,11 @@ func TestIntegration_MigrateSecurityScanLegacySchema(t *testing.T) {
 		VALUES ('slice_api', 'ns1', 'repo1', 'legacy', 'Legacy API slice');
 		INSERT INTO security_findings (
 			id, namespace, repository_scan, scan_run_id, fingerprint, title, summary,
-			severity, confidence, validation_status, state
+			severity, confidence, validation_status, state, created_at, updated_at
 		) VALUES (
 			'fnd_legacy_dismissed', 'ns1', 'repo1', 'scan_legacy', 'legacy-fingerprint',
-			'Legacy dismissed finding', 'Legacy summary', 'high', 'high', 'validated', 'dismissed'
+			'Legacy dismissed finding', 'Legacy summary', 'high', 'high', 'validated', 'dismissed',
+			'2026-08-01T00:00:00Z', '2026-08-03T00:00:00Z'
 		);
 	`); err != nil {
 		_ = legacyDB.Close()
@@ -913,8 +914,12 @@ func TestIntegration_MigrateSecurityScanLegacySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetFinding() migrated legacy decision error = %v", err)
 	}
-	if !migratedFinding.DecisionAt.IsZero() {
-		t.Fatalf("migrated decisionAt = %v, want unknown legacy decision time", migratedFinding.DecisionAt)
+	wantDecisionAt, err := time.Parse(time.RFC3339, "2026-08-03T00:00:00Z")
+	if err != nil {
+		t.Fatalf("time.Parse() error = %v", err)
+	}
+	if !migratedFinding.DecisionAt.Equal(wantDecisionAt) {
+		t.Fatalf("migrated decisionAt = %v, want legacy updatedAt %v", migratedFinding.DecisionAt, wantDecisionAt)
 	}
 
 	ctx := context.Background()
