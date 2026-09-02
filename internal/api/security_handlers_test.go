@@ -1340,6 +1340,20 @@ func TestSecurityFindingMutationsResolveCanonicalAlias(t *testing.T) {
 		require.NoError(t, handlers.client.List(context.Background(), &tasks, client.InNamespace("demo")))
 		require.Len(t, tasks.Items, 1)
 		require.Equal(t, "finding-1", tasks.Items[0].Labels[labels.LabelSecurityFindingID])
+
+		canonical.ScanRunID = "scan-run-3"
+		require.NoError(t, handlers.securityStore.UpsertFinding(context.Background(), canonical))
+		resp, err = app.Test(httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/validate?namespace=demo", nil))
+		require.NoError(t, err)
+		require.Equal(t, http.StatusAccepted, resp.StatusCode)
+		require.NoError(t, handlers.client.List(context.Background(), &tasks, client.InNamespace("demo")))
+		require.Len(t, tasks.Items, 2)
+		names := map[string]bool{}
+		for i := range tasks.Items {
+			names[tasks.Items[i].Name] = true
+		}
+		require.True(t, names[security.ScanStageTaskName("scan-1", "validation", security.StageValidation, "finding-1-scan-run-1")])
+		require.True(t, names[security.ScanStageTaskName("scan-1", "validation", security.StageValidation, "finding-1-scan-run-3")])
 	})
 
 	t.Run("generate patch", func(t *testing.T) {

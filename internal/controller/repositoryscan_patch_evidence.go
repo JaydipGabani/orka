@@ -552,6 +552,16 @@ type repositoryScanCompareResponse struct {
 	Status string `json:"status"`
 }
 
+func repositoryScanMergedResolutionRetryable(failure *repositoryMonitorGitHubAPIError) bool {
+	if failure == nil {
+		return false
+	}
+	if failure.StatusCode == http.StatusUnauthorized || failure.StatusCode == http.StatusForbidden {
+		return true
+	}
+	return repositoryMonitorFailedCommandRunRetryable("[" + repositoryMonitorRunFailureState(failure) + "]")
+}
+
 func (r *RepositoryScanReconciler) repositoryScanPullRequestMerged(ctx context.Context, owner, repository, token string, prNumber int, targetBranch, scanHeadCommit string) (bool, error) {
 	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
 	if baseURL == "" {
@@ -574,7 +584,7 @@ func (r *RepositoryScanReconciler) repositoryScanPullRequestMerged(ctx context.C
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		failure := &repositoryMonitorGitHubAPIError{Operation: "read remediation pull request", StatusCode: resp.StatusCode, Body: string(body)}
-		if repositoryMonitorFailedCommandRunRetryable("[" + repositoryMonitorRunFailureState(failure) + "]") {
+		if repositoryScanMergedResolutionRetryable(failure) {
 			return false, failure
 		}
 		return false, nil
@@ -616,7 +626,7 @@ func (r *RepositoryScanReconciler) repositoryScanHeadContainsCommit(ctx context.
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		failure := &repositoryMonitorGitHubAPIError{Operation: "compare remediation merge commit to scan head", StatusCode: resp.StatusCode, Body: string(body)}
-		if repositoryMonitorFailedCommandRunRetryable("[" + repositoryMonitorRunFailureState(failure) + "]") {
+		if repositoryScanMergedResolutionRetryable(failure) {
 			return false, failure
 		}
 		return false, nil

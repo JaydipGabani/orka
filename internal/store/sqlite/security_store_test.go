@@ -791,6 +791,69 @@ func TestUpdateFindingStateTracksUserDecisionTime(t *testing.T) {
 	}
 }
 
+func TestResolveFindingIfCurrentRequiresMatchingOccurrenceAndState(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	newFinding := func(id, scanRunID string) *store.Finding {
+		return &store.Finding{
+			ID:               id,
+			Namespace:        "ns1",
+			RepositoryScan:   "repo1",
+			ScanRunID:        scanRunID,
+			Fingerprint:      "repo1:file.go:" + id,
+			Title:            "Finding",
+			Summary:          "open remediation pull request",
+			Severity:         "high",
+			Confidence:       "medium",
+			ValidationStatus: "validated",
+			State:            "pr_open",
+		}
+	}
+
+	current := newFinding("fnd-current", "scan-2")
+	if err := s.UpsertFinding(ctx, current); err != nil {
+		t.Fatalf("UpsertFinding(current): %v", err)
+	}
+	updated, err := s.ResolveFindingIfCurrent(ctx, current.Namespace, current.ID, "scan-1")
+	if err != nil || updated {
+		t.Fatalf("ResolveFindingIfCurrent(stale occurrence) = %v, %v, want false", updated, err)
+	}
+	stored, err := s.GetFinding(ctx, current.Namespace, current.ID)
+	if err != nil || stored.State != "pr_open" {
+		t.Fatalf("stale occurrence finding = %#v, err %v", stored, err)
+	}
+
+	decided := newFinding("fnd-decided", "scan-2")
+	if err := s.UpsertFinding(ctx, decided); err != nil {
+		t.Fatalf("UpsertFinding(decided): %v", err)
+	}
+	if err := s.UpdateFindingState(ctx, decided.Namespace, decided.ID, "dismissed"); err != nil {
+		t.Fatalf("UpdateFindingState(dismissed): %v", err)
+	}
+	stored, err = s.GetFinding(ctx, decided.Namespace, decided.ID)
+	if err != nil {
+		t.Fatalf("GetFinding(dismissed): %v", err)
+	}
+	decisionAt := stored.DecisionAt
+	updated, err = s.ResolveFindingIfCurrent(ctx, decided.Namespace, decided.ID, decided.ScanRunID)
+	if err != nil || updated {
+		t.Fatalf("ResolveFindingIfCurrent(decided) = %v, %v, want false", updated, err)
+	}
+	stored, err = s.GetFinding(ctx, decided.Namespace, decided.ID)
+	if err != nil || stored.State != "dismissed" || !stored.DecisionAt.Equal(decisionAt) {
+		t.Fatalf("decided finding = %#v, err %v", stored, err)
+	}
+
+	updated, err = s.ResolveFindingIfCurrent(ctx, current.Namespace, current.ID, current.ScanRunID)
+	if err != nil || !updated {
+		t.Fatalf("ResolveFindingIfCurrent(current) = %v, %v, want true", updated, err)
+	}
+	stored, err = s.GetFinding(ctx, current.Namespace, current.ID)
+	if err != nil || stored.State != "resolved" || !stored.DecisionAt.IsZero() {
+		t.Fatalf("resolved finding = %#v, err %v", stored, err)
+	}
+}
+
 func TestUpsertObservedFindingReopensRemediatedStatesWhenObservedAgain(t *testing.T) {
 	for _, remediatedState := range []string{"fixed", "resolved"} {
 		t.Run(remediatedState, func(t *testing.T) {

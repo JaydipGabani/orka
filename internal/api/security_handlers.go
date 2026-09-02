@@ -338,7 +338,11 @@ func (h *Handlers) createSecurityValidationTask(ctx context.Context, ui *UserInf
 	}
 	timeout := metav1.Duration{Duration: 90 * time.Minute}
 	priority := int32(725)
-	taskName := security.ScanStageTaskName(scan.Name, "validation", security.StageValidation, finding.ID)
+	taskScope := finding.ID
+	if scanRunID := strings.TrimSpace(finding.ScanRunID); scanRunID != "" {
+		taskScope += "-" + scanRunID
+	}
+	taskName := security.ScanStageTaskName(scan.Name, "validation", security.StageValidation, taskScope)
 	resultBinding := security.AgentResultBinding{
 		RepositoryScan: scan.Name,
 		ScanID:         finding.ScanRunID,

@@ -2957,7 +2957,7 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 			mergeStateByPR[prNumber] = merged
 		}
 		if mergeStateByPR[prNumber] {
-			if err := r.SecurityStore.UpdateFindingState(ctx, scan.Namespace, finding.ID, findingStateResolved); err != nil {
+			if _, err := r.SecurityStore.ResolveFindingIfCurrent(ctx, scan.Namespace, finding.ID, finding.ScanRunID); err != nil {
 				return err
 			}
 		}

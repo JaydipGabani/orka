@@ -4976,6 +4976,11 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		switch prNumber {
 		case 42:
 			_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)
+		case 47:
+			if err := securityStore.UpdateFindingState(ctx, defaultNS, "fnd_concurrent_decision", "dismissed"); err != nil {
+				t.Fatalf("UpdateFindingState(concurrent decision) error = %v", err)
+			}
+			_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)
 		case 43:
 			_, _ = w.Write([]byte(`{"merged":false,"merged_at":null,"base":{"ref":"main"}}`))
 		case 45:
@@ -5028,6 +5033,7 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		newFinding("fnd_observed", run.ID, 44),
 		newFinding("fnd_wrong_base", "scan_old", 45),
 		newFinding("fnd_merge_after_scan", "scan_old", 46),
+		newFinding("fnd_concurrent_decision", "scan_old", 47),
 	} {
 		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
 			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
@@ -5037,14 +5043,17 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		t.Fatalf("refreshScanRunStatus() error = %v", err)
 	}
 
-	for id, want := range map[string]string{"fnd_merged": findingStateResolved, "fnd_open_pr": findingStatePROpen, "fnd_observed": findingStatePROpen, "fnd_wrong_base": findingStatePROpen, "fnd_merge_after_scan": findingStatePROpen} {
+	for id, want := range map[string]string{"fnd_merged": findingStateResolved, "fnd_open_pr": findingStatePROpen, "fnd_observed": findingStatePROpen, "fnd_wrong_base": findingStatePROpen, "fnd_merge_after_scan": findingStatePROpen, "fnd_concurrent_decision": "dismissed"} {
 		finding, err := securityStore.GetFinding(ctx, defaultNS, id)
 		if err != nil || finding.State != want {
 			t.Fatalf("finding %s = %#v, err %v, want state %s", id, finding, err, want)
 		}
+		if id == "fnd_concurrent_decision" && finding.DecisionAt.IsZero() {
+			t.Fatalf("finding %s decision timestamp was cleared", id)
+		}
 	}
-	if pullRequests[42] != 1 || pullRequests[43] != 1 || pullRequests[44] != 0 || pullRequests[45] != 1 || pullRequests[46] != 1 ||
-		compareRequests[testRepositoryScanMergeSHA+"..."+testRepositoryScanHeadSHA] != 1 || compareRequests[testRepositoryScanLateMerge+"..."+testRepositoryScanHeadSHA] != 1 {
+	if pullRequests[42] != 1 || pullRequests[43] != 1 || pullRequests[44] != 0 || pullRequests[45] != 1 || pullRequests[46] != 1 || pullRequests[47] != 1 ||
+		compareRequests[testRepositoryScanMergeSHA+"..."+testRepositoryScanHeadSHA] != 2 || compareRequests[testRepositoryScanLateMerge+"..."+testRepositoryScanHeadSHA] != 1 {
 		t.Fatalf("pull request reads = %#v, comparisons = %#v", pullRequests, compareRequests)
 	}
 }
@@ -5152,8 +5161,8 @@ func TestRefreshScanRunStatusRetriesMergedPRLookup(t *testing.T) {
 		}
 		pullAttempts++
 		if pullAttempts == 1 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"message":"try again"}`))
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"bad credentials"}`))
 			return
 		}
 		_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","merge_commit_sha":%q,"base":{"ref":"main"}}`, testRepositoryScanMergeSHA)

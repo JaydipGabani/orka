@@ -204,6 +204,7 @@ type SecurityStore interface {
 	ListFindings(ctx context.Context, filter FindingFilter) ([]Finding, string, error)
 	GetFindingCounts(ctx context.Context, namespace, repositoryScan string) (FindingCounts, error)
 	UpdateFindingState(ctx context.Context, namespace, id, state string) error
+	ResolveFindingIfCurrent(ctx context.Context, namespace, id, scanRunID string) (bool, error)
 	MarkFindingDuplicate(ctx context.Context, namespace, id, canonicalID string) error
 
 	CreatePatchProposal(ctx context.Context, proposal *PatchProposal) error

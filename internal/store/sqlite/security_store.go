@@ -942,6 +942,25 @@ func (s *Store) UpdateFindingState(ctx context.Context, namespace, id, state str
 	return nil
 }
 
+// ResolveFindingIfCurrent resolves only the pr_open occurrence selected by the caller.
+func (s *Store) ResolveFindingIfCurrent(ctx context.Context, namespace, id, scanRunID string) (bool, error) {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE security_findings
+		 SET state = 'resolved', decision_at = NULL, updated_at = ?
+		 WHERE namespace = ? AND id = ? AND scan_run_id = ? AND state = 'pr_open' AND duplicate_of = ''`,
+		now, namespace, id, scanRunID,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
 func findingUserFinalState(state string) bool {
 	switch strings.TrimSpace(state) {
 	case "dismissed", "suppressed", "false_positive":
