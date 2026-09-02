@@ -936,6 +936,14 @@ rules:
   - list
   - watch
 - apiGroups:
+  - core.orka.ai
+  resources:
+  - sessions
+  verbs:
+  - delete
+  - get
+  - list
+- apiGroups:
   - discovery.k8s.io
   resources:
   - endpointslices
