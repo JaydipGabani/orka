@@ -893,17 +893,20 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorHeadContainsBase(
 	if !ok || owner == "" || repository == "" || strings.Contains(repository, "/") {
 		return false, fmt.Errorf("repair repository identity is invalid")
 	}
-	token, err := r.repositoryMonitorGitHubToken(ctx, monitor)
-	if err != nil {
-		return false, err
-	}
+	baseSHA := strings.TrimSpace(job.BaseSHA)
 	baseBranch := strings.TrimSpace(job.BaseBranch)
-	if baseBranch == "" {
-		return false, fmt.Errorf("repair base branch is missing")
+	if baseBranch != "" {
+		token, err := r.repositoryMonitorGitHubToken(ctx, monitor)
+		if err != nil {
+			return false, err
+		}
+		baseSHA, err = r.fetchRepositoryMonitorBranchHead(ctx, owner, repository, token, baseBranch)
+		if err != nil {
+			return false, err
+		}
 	}
-	baseSHA, err := r.fetchRepositoryMonitorBranchHead(ctx, owner, repository, token, baseBranch)
-	if err != nil {
-		return false, err
+	if baseSHA == "" {
+		return false, fmt.Errorf("repair base branch and base SHA are missing")
 	}
 	return r.repositoryMonitorRepoHeadContainsBase(ctx, monitor, job.Repo, baseSHA, job.HeadSHA)
 }

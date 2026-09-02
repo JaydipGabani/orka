@@ -7991,6 +7991,31 @@ func TestRepositoryMonitorUpdateBranchNoChangeUsesFrozenBaseBranchTip(t *testing
 	}
 }
 
+func TestRepositoryMonitorUpdateBranchNoChangeLegacyJobUsesCapturedBaseSHA(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			t.Fatal("missing GitHub authorization")
+		}
+		if r.URL.Path != "/repos/orka-agents/orka/compare/captured-base-sha...head-sha" {
+			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"status":"identical"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	scheme := runtime.NewScheme()
+	_ = corev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	monitor, secret := repositoryMonitorInventoryTestObjects("update-branch-no-change-legacy")
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(monitor, secret).Build()
+	reconciler := &RepositoryMonitorReconciler{Client: client, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
+	ok, err := reconciler.repositoryMonitorHeadContainsBase(ctx, monitor, &store.RepairJob{Repo: "orka-agents/orka", BaseSHA: "captured-base-sha", HeadSHA: "head-sha"})
+	if err != nil || !ok {
+		t.Fatalf("repositoryMonitorHeadContainsBase() = %v, %v, want true against captured base for legacy job", ok, err)
+	}
+}
+
 func TestRepositoryMonitorUpdateBranchRejectsMonitorRepositoryChange(t *testing.T) {
 	ctx := context.Background()
 	monitorStore := setupControllerSQLiteStore(t)
