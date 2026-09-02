@@ -30,7 +30,10 @@ export interface WalkAllPagesOptions {
   subject: string
   /** Optional request path appended to the repeated-cursor error. */
   path?: string
-  /** Page cap; defaults to maxListWalkPages. */
+  /**
+   * Page cap. Defaults to unbounded so selectors and inventories stay
+   * exhaustive; summary views pass maxListWalkPages.
+   */
   maxPages?: number
 }
 
@@ -41,7 +44,7 @@ export interface WalkAllPagesOptions {
  */
 export async function walkAllPages<T>(
   fetchPage: (continueToken: string | undefined) => Promise<ListResponse<T>>,
-  { subject, path, maxPages = maxListWalkPages }: WalkAllPagesOptions,
+  { subject, path, maxPages = Number.POSITIVE_INFINITY }: WalkAllPagesOptions,
 ): Promise<ListWalkResult<T>> {
   const items: T[] = []
   const seen = new Set<string>()

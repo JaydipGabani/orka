@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ApiError, api } from '@/lib/api-client'
-import { pageParams, pollUnlessForbidden, walkAllPages, type ListResponse } from '@/lib/list-api'
+import { pageParams, pollUnlessForbidden, maxListWalkPages, walkAllPages, type ListResponse } from '@/lib/list-api'
 import { useAuthStore } from '@/stores/auth'
 import { useUIStore } from '@/stores/ui'
 import type { Session, SessionListItem } from '@/schemas/session'
@@ -39,7 +39,7 @@ export function useSessionListAll(pageLimit = '100', refetchInterval: number | f
     // on a polling interval grows without limit.
     queryFn: () => walkAllPages(
       (continueToken) => api.get<ListResponse<SessionListItem>>('/sessions', pageParams({ namespace, limit: pageLimit }, continueToken)),
-      { subject: 'session list' },
+      { subject: 'session list', maxPages: maxListWalkPages },
     ),
     retry: retryUnlessClientError,
     refetchInterval: pollUnlessForbidden(refetchInterval),

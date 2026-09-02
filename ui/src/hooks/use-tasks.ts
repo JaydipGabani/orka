@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ApiError, api, isForbiddenError, isNotFoundError } from '@/lib/api-client'
-import { isPaginationProtocolError, pageParams, pollUnlessForbidden, retryUnlessForbidden, walkAllPages, type ListResponse } from '@/lib/list-api'
+import { isPaginationProtocolError, pageParams, pollUnlessForbidden, retryUnlessForbidden, maxListWalkPages, walkAllPages, type ListResponse } from '@/lib/list-api'
 import { useAuthStore } from '@/stores/auth'
 import { useUIStore } from '@/stores/ui'
 import type { ExecutionEvent, Task, TaskEventsResponse } from '@/schemas/task'
@@ -48,7 +48,7 @@ export function useTaskListAll(pageLimit = '100', refetchInterval: number | fals
     // must surface `truncated`.
     queryFn: () => walkAllPages(
       (continueToken) => fetchTaskListPage(namespace, pageLimit, continueToken),
-      { subject: 'task list' },
+      { subject: 'task list', maxPages: maxListWalkPages },
     ),
     // A 403 is permanent for this identity, and a repeated continuation
     // cursor is a server-side protocol fault: neither improves on retry, so

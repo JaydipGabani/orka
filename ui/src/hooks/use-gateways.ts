@@ -19,15 +19,10 @@ interface GatewayLedgerPaginationState {
   pageIndex: number
 }
 
-// Gateway inventory (Gateways, GatewayBindings) is small per object and is
-// listed whole at 500 per page, so its walk gets a higher page cap than the
-// default summary walks.
-const gatewayListMaxPages = 50
-
 function listAllPages<T>(path: string, params: Record<string, string>) {
   return walkAllPages<T>(
     (continueToken) => api.get<ListResponse<T>>(path, pageParams({ ...params, limit: '500' }, continueToken)),
-    { subject: 'Gateway list', path, maxPages: gatewayListMaxPages },
+    { subject: 'Gateway list', path },
   )
 }
 

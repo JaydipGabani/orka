@@ -32,6 +32,14 @@ const (
 	substratePoolActorLeaseToolNSAnno     = "orka.ai/substrate-pool-tool-namespace"
 	substratePoolActorLeaseToolNameAnno   = "orka.ai/substrate-pool-tool-name"
 	substratePoolActorLeaseToolUIDAnno    = "orka.ai/substrate-pool-tool-uid"
+
+	// Legacy Task-held lease annotations written by controllers that still ran
+	// the removed per-Task workspace path. No current code writes them; they are
+	// recognized only so pre-upgrade leases can be reclaimed once the Task that
+	// held them is gone or terminal.
+	legacySubstratePoolActorLeaseTaskNSAnno   = "orka.ai/substrate-pool-task-namespace"
+	legacySubstratePoolActorLeaseTaskNameAnno = "orka.ai/substrate-pool-task-name"
+	legacySubstratePoolActorLeaseTaskUIDAnno  = "orka.ai/substrate-pool-task-uid"
 )
 
 func deterministicSubstratePoolActorPrefix(namespace, name string) string {
@@ -164,8 +172,44 @@ func substratePoolActorLeaseHasActiveHolder(ctx context.Context, reader client.R
 	if toolNamespace != "" && toolName != "" {
 		return substratePoolActorLeaseHasActiveToolHolder(ctx, reader, toolNamespace, toolName, lease.Annotations[substratePoolActorLeaseToolUIDAnno])
 	}
+	taskNamespace := strings.TrimSpace(lease.Annotations[legacySubstratePoolActorLeaseTaskNSAnno])
+	taskName := strings.TrimSpace(lease.Annotations[legacySubstratePoolActorLeaseTaskNameAnno])
+	taskUID := strings.TrimSpace(lease.Annotations[legacySubstratePoolActorLeaseTaskUIDAnno])
+	if taskNamespace != "" && taskName != "" && taskUID != "" {
+		return legacySubstratePoolActorLeaseHasActiveTaskHolder(ctx, reader, taskNamespace, taskName, taskUID)
+	}
 	// Leases without a recognized holder fail closed as busy.
 	return true, nil
+}
+
+// legacySubstratePoolActorLeaseHasActiveTaskHolder reports whether a
+// pre-upgrade Task-held lease still has a live holder. The removed per-Task
+// workspace path released these leases when the Task finished; the current
+// controller never will, so a lease whose Task is gone, replaced, or terminal
+// is reclaimable instead of busy forever.
+func legacySubstratePoolActorLeaseHasActiveTaskHolder(
+	ctx context.Context,
+	reader client.Reader,
+	taskNamespace string,
+	taskName string,
+	taskUID string,
+) (bool, error) {
+	task := &corev1alpha1.Task{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: taskNamespace, Name: taskName}, task); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return true, err
+	}
+	if string(task.UID) != taskUID {
+		return false, nil
+	}
+	switch task.Status.Phase {
+	case corev1alpha1.TaskPhaseSucceeded, corev1alpha1.TaskPhaseFailed, corev1alpha1.TaskPhaseCancelled:
+		return false, nil
+	default:
+		return true, nil
+	}
 }
 
 func substratePoolActorLeaseHasActiveToolHolder(
