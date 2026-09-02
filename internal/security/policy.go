@@ -69,15 +69,20 @@ var (
 	policySensitiveAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|secr` + `et|cred` + `entials?|priv` + `ate[_-]?key)\s*[:=]\s*(?:"([^"\r\n]{16,})"|'([^'\r\n]{16,})'|([A-Za-z0-9_./+=~:@#$%^&*!?|,;{}\\` + "`" + `-]{16,}))`)
 	// YAML plain scalars may contain spaces without quoting. Scan the complete
 	// line value so a short first word cannot hide a long credential value.
-	// Requiring whitespace after ':' excludes Go's ':=' assignments; the
+	// Requiring same-line whitespace after ':' excludes Go's ':=' assignments
+	// (a value on the following line is reconstructed by
+	// yamlMultilineScalarAssignmentsLookLikeSecret); the
 	// token-part filter below keeps call expressions and other source syntax
 	// out of this YAML-specific fallback.
-	policySensitiveYAMLAssignmentPattern = regexp.MustCompile(`(?im)^[\t ]*(?:-\s*)?["']?(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|secr` + `et|cred` + `entials?|priv` + `ate[_-]?key)["']?\s*:\s+([^\r\n]+)$`)
+	policySensitiveYAMLAssignmentPattern = regexp.MustCompile(`(?im)^[\t ]*(?:-\s*)?["']?(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|secr` + `et|cred` + `entials?|priv` + `ate[_-]?key)["']?\s*:[ \t]+([^\r\n]+)$`)
 	// YAML block scalars put their value on following indented lines. Match
 	// the credential-bearing header here; yamlBlockScalarAssignmentsLookLikeSecret
 	// reconstructs all content lines before evaluating the value.
 	policySensitiveYAMLBlockHeaderPattern = regexp.MustCompile(`(?i)^[\t ]*(?:-\s*)?["']?(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|secr` + `et|cred` + `entials?|priv` + `ate[_-]?key)["']?\s*:\s*[|>](?:[+-][1-9]?|[1-9][+-]?)?[ \t]*(?:#[^\r\n]*)?$`)
-	policyJWTPattern                      = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])ey` + `J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}([^A-Za-z0-9_-]|$)`)
+	// A credential key with no value on its line; the scalar (if any) sits
+	// on the following indented lines.
+	policySensitiveYAMLEmptyValuePattern = regexp.MustCompile(`(?i)^[\t ]*(?:-\s*)?["']?(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?` + `token|refresh[_-]?` + `token|id[_-]?` + `token|auth[_-]?` + `token|to` + `ken|pass` + `word|clien` + `t[_-]?secret|secr` + `et|cred` + `entials?|priv` + `ate[_-]?key)["']?\s*:\s*(?:#[^\r\n]*)?$`)
+	policyJWTPattern                     = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])ey` + `J[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}([^A-Za-z0-9_-]|$)`)
 	// Header-carried credentials are flagged only when a credential-shaped
 	// value follows: "Authorization: Bearer $TOKEN" in documentation is not
 	// a secret, "Authorization: Bearer eyJ…" or a 16+ character opaque token
@@ -413,6 +418,206 @@ func yamlPlainScalarAssignmentsLookLikeSecret(text string) bool {
 	return false
 }
 
+// yamlMultilineScalarAssignmentsLookLikeSecret reconstructs credential-keyed
+// YAML scalars that span physical lines — a double- or single-quoted scalar
+// whose closing quote sits on a later line (optionally with `\` escaped line
+// breaks), a plain scalar folded across more-indented continuation lines, or
+// a scalar that starts on the line after its key — and evaluates the joined
+// value, which the single-line pattern cannot see.
+func yamlMultilineScalarAssignmentsLookLikeSecret(text string) bool {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	for i := range lines {
+		first, ok := yamlMultilineScalarStart(lines, i)
+		if !ok {
+			continue
+		}
+		candidate, quoted, closed, ok := yamlJoinScalarContinuation(lines, i, first)
+		if !ok {
+			continue
+		}
+		if !closed {
+			// Fail closed: a quoted scalar still open at the cap cannot be
+			// judged, so treat it as secret-like rather than unscanned.
+			return true
+		}
+		// An unquoted multi-line reconstruction of an open source expression
+		// (`password: normalize(\n  input,\n)`) is code, not a YAML scalar.
+		// Quoted scalars are data whatever punctuation they carry.
+		if !quoted && looksLikeOpenSourceExpression(candidate) {
+			continue
+		}
+		if len(candidate) >= 16 && !secretValuePlaceholder(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeOpenSourceExpression reports whether an unquoted reconstructed
+// value carries unbalanced brackets or a trailing operator, which a YAML
+// plain scalar never does but a multi-line call or object literal does.
+func looksLikeOpenSourceExpression(candidate string) bool {
+	depth := 0
+	for _, r := range candidate {
+		switch r {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		}
+	}
+	if depth != 0 {
+		return true
+	}
+	trimmed := strings.TrimSpace(candidate)
+	return strings.HasSuffix(trimmed, ",") || strings.HasSuffix(trimmed, "+") || strings.HasSuffix(trimmed, "(")
+}
+
+// yamlMultilineScalarStart reports whether lines[i] is a credential-keyed
+// line whose scalar continues on later lines, returning the first fragment
+// (empty when the scalar starts on the next line). Block scalars are handled
+// by yamlBlockScalarAssignmentsLookLikeSecret, quoted scalars closed on the
+// same line by the single-line check, and nested collections are not scalars.
+func yamlMultilineScalarStart(lines []string, i int) (string, bool) {
+	line := lines[i]
+	first := ""
+	if match := policySensitiveYAMLAssignmentPattern.FindStringSubmatch(line); match != nil {
+		first = trimYAMLPlainScalarComment(match[1])
+	} else if !policySensitiveYAMLEmptyValuePattern.MatchString(line) {
+		return "", false
+	}
+	if first != "" {
+		if first[0] == '|' || first[0] == '>' {
+			return "", false
+		}
+		if (first[0] == '"' || first[0] == '\'') && yamlClosingQuoteIndex(first[1:], first[0]) >= 0 {
+			return "", false
+		}
+		return first, true
+	}
+	for _, next := range lines[i+1:] {
+		trimmed := strings.TrimSpace(next)
+		if trimmed == "" {
+			continue
+		}
+		// A quoted next line is the scalar itself (a colon inside the quotes
+		// is data); a bare `- item`, comment, or `key: value` is a collection.
+		if trimmed[0] == '"' || trimmed[0] == '\'' {
+			if end := yamlClosingQuoteIndex(trimmed[1:], trimmed[0]); end >= 0 && strings.HasPrefix(strings.TrimSpace(trimmed[end+2:]), ":") {
+				return "", false // quoted mapping key
+			}
+			return "", true
+		}
+		if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "#") || strings.Contains(trimmed, ": ") || strings.HasSuffix(trimmed, ":") {
+			return "", false
+		}
+		return "", true
+	}
+	return "", false
+}
+
+// yamlJoinScalarContinuation joins the scalar that starts with first on
+// lines[i] across its continuation lines. It returns the reconstructed value,
+// whether the scalar was quoted, whether a quoted scalar was closed, and
+// whether any continuation existed.
+func yamlJoinScalarContinuation(lines []string, i int, first string) (candidate string, quoted, closed, ok bool) {
+	const maxContinuationLines = 64
+	var quote byte
+	if first != "" && (first[0] == '"' || first[0] == '\'') {
+		quote = first[0]
+	}
+	if first == "" {
+		// The scalar starts on the next non-blank line; adopt its quoting.
+		for _, next := range lines[i+1:] {
+			trimmed := strings.TrimSpace(next)
+			if trimmed == "" {
+				continue
+			}
+			if trimmed[0] == '"' || trimmed[0] == '\'' {
+				quote = trimmed[0]
+			}
+			break
+		}
+	}
+	baseIndent := len(lines[i]) - len(strings.TrimLeft(lines[i], " \t"))
+	var value strings.Builder
+	// An escaped double-quoted line break joins fragments directly; every
+	// other line break folds to a single space.
+	escapedBreak := quote == '"' && strings.HasSuffix(first, "\\")
+	value.WriteString(strings.TrimSuffix(first, "\\"))
+	joined := 0
+	closed = quote == 0
+	for _, next := range lines[i+1:] {
+		if joined >= maxContinuationLines {
+			break
+		}
+		trimmed := strings.TrimSpace(next)
+		if trimmed == "" {
+			// Blank lines never end a scalar; only a dedent or the closing
+			// quote does.
+			continue
+		}
+		indent := len(next) - len(strings.TrimLeft(next, " \t"))
+		if quote == 0 {
+			if indent <= baseIndent || strings.Contains(trimmed, ": ") || strings.HasSuffix(trimmed, ":") {
+				break
+			}
+			// Comment-only lines are not scalar content, and an inline
+			// comment ends the plain scalar fragment.
+			if strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			if trimmed = trimYAMLPlainScalarComment(trimmed); trimmed == "" {
+				continue
+			}
+		}
+		joined++
+		if !escapedBreak && value.Len() > 0 {
+			value.WriteByte(' ')
+		}
+		if quote != 0 && value.Len() == 0 && trimmed[0] == quote {
+			trimmed = trimmed[1:] // opening quote of a next-line scalar
+		}
+		if quote != 0 {
+			if end := yamlClosingQuoteIndex(trimmed, quote); end >= 0 {
+				value.WriteString(trimmed[:end])
+				closed = true
+				break
+			}
+		}
+		escapedBreak = quote == '"' && strings.HasSuffix(trimmed, "\\")
+		value.WriteString(strings.TrimSuffix(trimmed, "\\"))
+	}
+	if joined == 0 {
+		return "", quote != 0, closed, false
+	}
+	candidate = value.String()
+	if quote != 0 {
+		candidate = strings.TrimPrefix(candidate, string(quote))
+	}
+	return strings.TrimSpace(candidate), quote != 0, closed, true
+}
+
+// yamlClosingQuoteIndex returns the index of the first unescaped closing
+// quote in line (a doubled single quote or a backslash-escaped double quote
+// does not close the scalar), or -1 when the scalar stays open. Anything after
+// the closing quote (an inline `# comment`) is ignored by the caller.
+func yamlClosingQuoteIndex(line string, quote byte) int {
+	for i := 0; i < len(line); i++ {
+		switch {
+		case quote == '"' && line[i] == '\\':
+			i++
+		case line[i] == quote:
+			if quote == '\'' && i+1 < len(line) && line[i+1] == '\'' {
+				i++
+				continue
+			}
+			return i
+		}
+	}
+	return -1
+}
+
 func yamlBlockScalarAssignmentsLookLikeSecret(text string) bool {
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	for i, line := range lines {
@@ -492,6 +697,9 @@ func LooksLikeSecret(text string) bool {
 		return true
 	}
 	if yamlBlockScalarAssignmentsLookLikeSecret(text) {
+		return true
+	}
+	if yamlMultilineScalarAssignmentsLookLikeSecret(text) {
 		return true
 	}
 	return strings.Contains(strings.ToLower(text), "-----"+"begin ")

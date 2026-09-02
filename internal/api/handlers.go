@@ -916,7 +916,8 @@ func (h *Handlers) ListSessions(c fiber.Ctx) error {
 	ctx := c.Context()
 	// The store applies the name cursor, gateway exclusion, ordering, and
 	// limit itself, so each page reads only its own rows.
-	sessions, more, err := h.sessionStore.ListSessionsPage(ctx, namespace, pagination.Continue, int(pagination.Limit), store.SessionTypeGateway)
+	pageLimit := int(min(pagination.Limit, MaxLimit)) // ParsePagination caps Limit at MaxLimit; re-bounded here for the narrowing
+	sessions, more, err := h.sessionStore.ListSessionsPage(ctx, namespace, pagination.Continue, pageLimit, store.SessionTypeGateway)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list sessions: %v", err))
 	}
