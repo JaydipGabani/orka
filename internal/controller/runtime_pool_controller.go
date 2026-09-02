@@ -1411,11 +1411,30 @@ func runtimePoolRolloutInstanceIsRecyclable(controllerCapacity corev1alpha1.Runt
 	for i := range status.Sessions {
 		session := status.Sessions[i]
 		if session.ActivePromptID != "" || session.PendingPermissionCount != 0 ||
-			session.LiveDescendantCount != 0 || session.ReservedForFinalization {
+			session.LiveDescendantCount != 0 || session.ReservedForFinalization ||
+			!runtimePoolStrandedSessionStateIsRecyclable(session.State) {
 			return false
 		}
 	}
 	return true
+}
+
+// runtimePoolStrandedSessionStateIsRecyclable allowlists the session states a
+// timed-out rollout may abandon. Idle, poisoned, and publication_prepared
+// sessions are exactly what the supervisor retires on drain, so their
+// survival past the deadline means retirement itself is stuck; validating is
+// the failed-workspace-validation park. Every other state (creating, running,
+// cancelling, and all publication or finalization stages) carries runtime
+// state the controller still needs to establish an outcome, and is never
+// inferred safe from prompt, permission, or descendant counters alone.
+func runtimePoolStrandedSessionStateIsRecyclable(state harnessv2.RuntimeSessionState) bool {
+	switch state {
+	case harnessv2.RuntimeSessionStateIdle, harnessv2.RuntimeSessionStateValidating,
+		harnessv2.RuntimeSessionStatePoisoned, harnessv2.RuntimeSessionStatePublicationPrepared:
+		return true
+	default:
+		return false
+	}
 }
 
 func runtimePoolRolloutStrandedSessionCount(status harnessv2.StatusResponse) int {

@@ -2484,6 +2484,13 @@ func TestRuntimePoolRolloutInstanceIsRecyclable(t *testing.T) {
 	if !runtimePoolRolloutInstanceIsRecyclable(quiescentCapacity, base()) {
 		t.Fatal("stranded resident sessions without prompt work must be recyclable")
 	}
+	for _, state := range []harnessv2.RuntimeSessionState{harnessv2.RuntimeSessionStatePoisoned, harnessv2.RuntimeSessionStatePublicationPrepared} {
+		status := base()
+		status.Sessions[1].State = state
+		if !runtimePoolRolloutInstanceIsRecyclable(quiescentCapacity, status) {
+			t.Fatalf("session state %q is retired by the supervisor drain and must stay recyclable when stranded", state)
+		}
+	}
 	tests := []struct {
 		name     string
 		capacity corev1alpha1.RuntimePoolCapacityStatus
@@ -2499,6 +2506,14 @@ func TestRuntimePoolRolloutInstanceIsRecyclable(t *testing.T) {
 		{name: "session active prompt", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[0].ActivePromptID = "p" }},
 		{name: "session finalization reservation", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].ReservedForFinalization = true }},
 		{name: "session live descendants", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].LiveDescendantCount = 1 }},
+		{name: "session preparing publication", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) {
+			s.Sessions[1].State = harnessv2.RuntimeSessionStatePreparingPublication
+		}},
+		{name: "session publishing", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].State = harnessv2.RuntimeSessionStatePublishing }},
+		{name: "session verifying", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].State = harnessv2.RuntimeSessionStateVerifying }},
+		{name: "session cancelling", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].State = harnessv2.RuntimeSessionStateCancelling }},
+		{name: "session creating", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].State = harnessv2.RuntimeSessionStateCreating }},
+		{name: "session deleting", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].State = harnessv2.RuntimeSessionStateDeleting }},
 		{name: "controller reservation", capacity: corev1alpha1.RuntimePoolCapacityStatus{ReservedPrompts: 1}, mutate: func(*harnessv2.StatusResponse) {}},
 		{name: "controller finalization", capacity: corev1alpha1.RuntimePoolCapacityStatus{FinalizingSessions: 1}, mutate: func(*harnessv2.StatusResponse) {}},
 	}
