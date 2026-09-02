@@ -2,13 +2,9 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { api } from '@/lib/api-client'
+import { pageParams, walkAllPages, type ListResponse } from '@/lib/list-api'
 import { useUIStore } from '@/stores/ui'
 import type { Gateway, GatewayBinding, GatewayDelivery, GatewayEvent } from '@/schemas/gateway'
-
-interface ListResponse<T> {
-  items: T[]
-  metadata?: { continue?: string; remainingItemCount?: number }
-}
 
 interface GatewayLedgerFilters {
   gateway?: string
@@ -23,20 +19,16 @@ interface GatewayLedgerPaginationState {
   pageIndex: number
 }
 
+// Gateway inventory (Gateways, GatewayBindings) is small per object and is
+// listed whole at 500 per page, so its walk gets a higher page cap than the
+// default summary walks.
+const gatewayListMaxPages = 50
 
-async function listAllPages<T>(path: string, params: Record<string, string>): Promise<ListResponse<T>> {
-  const items: T[] = []
-  let cursor = ''
-  const seen = new Set<string>()
-  while (true) {
-    const response = await api.get<ListResponse<T>>(path, { ...params, limit: '500', continue: cursor })
-    items.push(...response.items)
-    const next = response.metadata?.continue ?? ''
-    if (!next) return { items, metadata: {} }
-    if (seen.has(next)) throw new Error(`Gateway list pagination repeated continuation cursor for ${path}`)
-    seen.add(next)
-    cursor = next
-  }
+function listAllPages<T>(path: string, params: Record<string, string>) {
+  return walkAllPages<T>(
+    (continueToken) => api.get<ListResponse<T>>(path, pageParams({ ...params, limit: '500' }, continueToken)),
+    { subject: 'Gateway list', path, maxPages: gatewayListMaxPages },
+  )
 }
 
 export function useGatewayLedgerPagination(resetKey: string) {
