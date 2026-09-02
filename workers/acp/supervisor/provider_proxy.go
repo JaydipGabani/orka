@@ -735,6 +735,21 @@ func (s *providerProxySession) attachInferenceFailureDetail(promptID string, cla
 // end_turn, which must not become a successful Task. Completion order is
 // irrelevant: a later-issued failure stays unrecovered even if an
 // earlier-issued request succeeds afterwards.
+// inferenceFailureCount reports how many inference requests the active
+// prompt has issued that failed (upstream error, transport failure, or proxy
+// rejection); each failure is recorded before it is relayed to the child.
+func (s *providerProxySession) inferenceFailureCount(promptID string) int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnPromptID != strings.TrimSpace(promptID) {
+		return 0
+	}
+	return int(s.inferenceFailures)
+}
+
 func (s *providerProxySession) upstreamFailureUnrecovered(promptID string) (bool, int, string) {
 	if s == nil {
 		return false, 0, ""

@@ -233,7 +233,7 @@ type sessionState struct {
 	mcpProxy                *mcpProxySession
 	profile                 harnessv2.RuntimeProfile
 	agentConfiguration      harnessv2.AgentSessionConfiguration
-	agentDiagnosticFilter   func(string) bool
+	agentDiagnosticFilter   *AgentDiagnosticFilter
 	creating                bool
 	drainCleanupScheduled   bool
 	publicationFinalization *harnessv2.PublicationFinalizationReceipt
@@ -253,6 +253,13 @@ type promptState struct {
 	finalAnswerOverflow bool
 	settlement          *harnessv2.PromptSettlement
 	settlementDigest    string
+	// modelOutputSeen records that assistant text, a thought, a tool call, or
+	// a permission request has been observed for this prompt; provider CLI
+	// startup diagnostics are withheld only before that point.
+	modelOutputSeen bool
+	// withheldRetryNotices counts provider CLI inference retry notices already
+	// withheld for this prompt, bounded by the proxy's recorded failures.
+	withheldRetryNotices int
 	// providerDrainTimedOut records that an admitted inference request was
 	// still in flight when the child settled and did not finish within the
 	// cancel grace, so the prompt's inference accounting is incomplete.
@@ -850,7 +857,7 @@ func (s *Server) createSession(
 	now time.Time,
 	uid int,
 	gid int,
-) (*acp.RuntimeSession, harnessv2.RuntimeSessionDescriptor, acp.SessionPaths, *workspacedelta.Snapshot, *providerProxySession, *mcpProxySession, func(string) bool, error) {
+) (*acp.RuntimeSession, harnessv2.RuntimeSessionDescriptor, acp.SessionPaths, *workspacedelta.Snapshot, *providerProxySession, *mcpProxySession, *AgentDiagnosticFilter, error) {
 	pathID := sessionPathID(request.Metadata.Fence.RuntimeSessionUID, request.Metadata.Fence.RuntimeSessionGeneration)
 	paths, err := acp.PrepareSessionPaths(s.cfg.SessionBaseDir, pathID)
 	if err != nil {

@@ -36,12 +36,30 @@ type ProviderSessionProjection struct {
 	AdditionalArgs []string
 	Environment    map[string]string
 	NewSessionMeta acp.Meta
-	// AgentDiagnosticFilter reports whether an assistant text chunk is a
-	// provider CLI diagnostic that the adapter wrote into the ACP agent
-	// message stream instead of its own log. Matching chunks are withheld
-	// from the harness event stream and the terminal assistant text and are
-	// logged by the supervisor instead. Nil forwards every chunk.
-	AgentDiagnosticFilter func(text string) bool
+	// AgentDiagnosticFilter recognizes provider CLI diagnostics the adapter
+	// wrote into the ACP agent message stream instead of its own log. Nil
+	// forwards every chunk.
+	AgentDiagnosticFilter *AgentDiagnosticFilter
+}
+
+// AgentDiagnosticFilter recognizes assistant text chunks that are provider
+// CLI diagnostics rather than model output. Recognized chunks are withheld
+// from the harness event stream and the terminal assistant text and logged by
+// the supervisor instead. Each recognizer sees only the chunk text; the
+// supervisor anchors it on prompt state it can prove, so a model chunk that
+// merely repeats a diagnostic sentence is forwarded:
+//
+//   - Startup diagnostics are withheld only before any model output
+//     (assistant text, thought, tool call, or permission request) has been
+//     observed for the prompt. The CLI emits them on the same ordered stream
+//     ahead of its first inference request.
+//   - InferenceRetry notices are withheld only while the provider proxy has
+//     recorded more failed inference requests for the prompt than notices
+//     already withheld; the proxy records a failure before relaying it, so
+//     the notice for a failure can never precede its accounting.
+type AgentDiagnosticFilter struct {
+	Startup        func(text string) bool
+	InferenceRetry func(text string) bool
 }
 
 type ArtifactUploader interface {

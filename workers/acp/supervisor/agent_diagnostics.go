@@ -1,22 +1,22 @@
 package supervisor
 
 import (
+	"encoding/json"
 	"log/slog"
 	"strconv"
 	"strings"
 
 	"github.com/orka-agents/orka/internal/acp"
-	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 )
 
 // Built-in provider CLIs occasionally write operator-facing diagnostics into
 // the ACP agent message stream instead of their own log. Left alone, those
 // chunks are compacted together with the model's text and reach Task results,
 // chat, and monitor reviews as if the model had said them. A provider
-// projection declares which exact chunks are CLI diagnostics
-// (ProviderSessionProjection.AgentDiagnosticFilter); the prompt stream
-// withholds them before compaction and logs them so the CLI's report still
-// reaches operators.
+// projection declares recognizers for the exact chunks its CLI emits
+// (AgentDiagnosticFilter); the prompt stream withholds them before compaction,
+// anchored on prompt state the supervisor can prove, and logs them so the
+// CLI's report still reaches operators.
 
 const (
 	copilotDisabledToolsDiagnosticPrefix       = "Info: Disabled tools: "
@@ -24,33 +24,31 @@ const (
 	copilotInferenceRetryDiagnostic            = "Info: Response was interrupted due to a server error. Retrying..."
 )
 
-// copilotAgentDiagnosticFilter recognizes the diagnostics GitHub Copilot CLI
-// 1.0.77 emits as agent_message_chunk updates in --acp mode; --log-level none
-// does not silence them. Each arrives as its own chunk without a messageId, so
-// a chunk is withheld only when its entire text is one of:
+// copilotStartupDiagnostic recognizes the tool-exclusion report GitHub Copilot
+// CLI 1.0.77 emits as agent_message_chunk updates at the start of a prompt in
+// --acp mode; --log-level none does not silence it. Each line arrives as its
+// own chunk, ahead of the CLI's first inference request, so a chunk is
+// recognized only when its entire text is one of:
 //
-//   - "Info: Disabled tools: a, b" at the start of the first prompt. The CLI
-//     lists every tool it removed from the model's catalog, folding tools it
-//     disabled for its own reasons into the same line, so the line is
-//     recognized when it is a comma-separated list of tool identifiers that
-//     names at least one tool this session excluded.
+//   - "Info: Disabled tools: a, b". The CLI lists every tool it removed from
+//     the model's catalog, folding tools it disabled for its own reasons into
+//     the same line, so the line is recognized when it is a comma-separated
+//     list of tool identifiers that names at least one tool this session
+//     excluded.
 //   - "Info: Unknown tool name in the tool excludedlist: \"a\"" for exactly a
 //     name this session passed in --excluded-tools that the CLI's catalog does
 //     not contain.
-//   - The retry notice the CLI prints when an inference request fails and is
-//     retried; the provider proxy already accounts for that request.
 //
-// Anchoring on the session's own exclusion list means a model chunk can never
-// be withheld for merely resembling a diagnostic about some other tool.
-func copilotAgentDiagnosticFilter(excludedTools []string) func(string) bool {
+// Anchoring on the session's own exclusion list means a chunk about some
+// other tool is never recognized. The CLI forwards model deltas verbatim and
+// without a messageId, so the supervisor additionally withholds startup
+// diagnostics only before any model output has been observed for the prompt.
+func copilotStartupDiagnostic(excludedTools []string) func(string) bool {
 	excluded := make(map[string]struct{}, len(excludedTools))
 	for _, name := range excludedTools {
 		excluded[name] = struct{}{}
 	}
 	return func(text string) bool {
-		if text == copilotInferenceRetryDiagnostic {
-			return true
-		}
 		if list, ok := strings.CutPrefix(text, copilotDisabledToolsDiagnosticPrefix); ok {
 			return copilotDisabledToolsListNamesExcluded(list, excluded)
 		}
@@ -64,6 +62,13 @@ func copilotAgentDiagnosticFilter(excludedTools []string) func(string) bool {
 		}
 		return false
 	}
+}
+
+// copilotInferenceRetryNotice recognizes the notice the CLI writes into the
+// agent message stream after an inference request fails and before it
+// retries; the provider proxy already accounts for the failed request.
+func copilotInferenceRetryNotice(text string) bool {
+	return text == copilotInferenceRetryDiagnostic
 }
 
 func copilotDisabledToolsListNamesExcluded(list string, excluded map[string]struct{}) bool {
@@ -98,25 +103,61 @@ func copilotToolIdentifier(name string) bool {
 }
 
 // withholdAgentDiagnostic reports whether event is an assistant text chunk the
-// session's provider projection recognizes as a CLI diagnostic. A withheld
-// chunk is logged and never reaches compaction, the harness event stream, or
-// the terminal assistant text. The logged text is bounded by construction:
-// every recognized shape is a fixed CLI sentence whose only variable parts are
-// tool identifiers.
-func withholdAgentDiagnostic(state *sessionState, promptID harnessv2.PromptID, event acp.PromptEvent) bool {
+// session's provider projection recognizes as a CLI diagnostic under the
+// anchoring rules documented on AgentDiagnosticFilter. A withheld chunk is
+// logged and never reaches compaction, the harness event stream, or the
+// terminal assistant text. Every forwarded event advances the prompt's
+// model-output anchor. The logged text is bounded by construction: each
+// recognized shape is a fixed CLI sentence whose only variable parts are tool
+// identifiers. Only the prompt stream goroutine touches the anchors.
+func withholdAgentDiagnostic(state *sessionState, prompt *promptState, event acp.PromptEvent) bool {
+	text, isText := assistantMessageText(event)
 	filter := state.agentDiagnosticFilter
-	if filter == nil {
+	if filter != nil && isText && text != "" {
+		promptID := prompt.request.Metadata.PromptID
+		switch {
+		case filter.Startup != nil && !prompt.modelOutputSeen && filter.Startup(text):
+			slog.Info(
+				"ACP provider CLI startup diagnostic withheld from the agent message stream",
+				"promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
+			)
+			return true
+		case filter.InferenceRetry != nil && filter.InferenceRetry(text) &&
+			prompt.withheldRetryNotices < state.providerProxy.inferenceFailureCount(string(promptID)):
+			prompt.withheldRetryNotices++
+			slog.Info(
+				"ACP provider CLI inference retry notice withheld from the agent message stream",
+				"promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
+			)
+			return true
+		}
+	}
+	if (isText && text != "") || modelOutputEvent(event) {
+		prompt.modelOutputSeen = true
+	}
+	return false
+}
+
+// modelOutputEvent reports whether event carries model output other than
+// assistant text: a thought, a tool call, or a permission request. Session
+// configuration updates (config options, available commands, mode changes) do
+// not count; the CLI emits those before its startup diagnostics.
+func modelOutputEvent(event acp.PromptEvent) bool {
+	if event.Type == acp.PromptEventPermissionRequested {
+		return true
+	}
+	if event.Type != acp.PromptEventUpdate || event.Update == nil {
 		return false
 	}
-	text, ok := assistantMessageText(event)
-	if !ok || !filter(text) {
+	var envelope struct {
+		SessionUpdate string `json:"sessionUpdate"`
+	}
+	if json.Unmarshal(event.Update.Update, &envelope) != nil {
 		return false
 	}
-	slog.Info(
-		"ACP provider CLI diagnostic withheld from the agent message stream",
-		"promptID", promptID,
-		"sequence", event.Sequence,
-		"diagnostic", text,
-	)
-	return true
+	switch envelope.SessionUpdate {
+	case "agent_thought_chunk", acpUpdateToolCall, acpUpdateToolCallUpdate:
+		return true
+	}
+	return false
 }
