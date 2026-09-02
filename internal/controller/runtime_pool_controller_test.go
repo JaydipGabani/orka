@@ -2391,12 +2391,13 @@ func TestRuntimePoolReconcilerRolloutTimeoutRecyclesStrandedSessions(t *testing.
 	runtimePoolReconcile(t, r, pool)
 	// The supervisor drained everything it could, but one session is parked
 	// in validating and can never retire on its own.
+	strandedSince := now
 	strandedProbe := func() RuntimePoolProbeResult {
 		probe := runtimePoolValidProbe(pool, &pod, "stranded-boot", true)
 		probe.Status.Pressure.ResidentSessions = 1
 		probe.Status.Sessions = []harnessv2.RuntimeSessionStatus{{
 			RuntimeSessionID: "rs-stranded", RuntimeSessionUID: "rs-stranded-uid", Generation: 1,
-			State: harnessv2.RuntimeSessionStateValidating, LastTransitionAt: now,
+			State: harnessv2.RuntimeSessionStateValidating, LastTransitionAt: strandedSince,
 		}}
 		return probe
 	}
@@ -2437,7 +2438,19 @@ func TestRuntimePoolReconcilerRolloutTimeoutRecyclesStrandedSessions(t *testing.
 		t.Fatalf("replicas while a prompt runs = %d, want 1", got)
 	}
 
-	// Once only the stranded session remains, the persisted timeout recycles the old Pod.
+	// A session that only just entered validating is being validated right now, not stranded.
+	supervisor.probe = strandedProbe()
+	supervisor.probe.Status.Sessions[0].LastTransitionAt = now
+	runtimePoolReconcile(t, r, pool)
+	status = runtimePoolTestGetPool(t, r, pool).Status
+	if status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDegraded {
+		t.Fatalf("fresh validating session lifecycle = %s, want Degraded (preserved)", status.Lifecycle)
+	}
+	if got := ptr.Deref(runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name).Spec.Replicas, -1); got != 1 {
+		t.Fatalf("replicas while a fresh validating session exists = %d, want 1", got)
+	}
+
+	// Once only the long-stranded session remains, the persisted timeout recycles the old Pod.
 	supervisor.probe = strandedProbe()
 	runtimePoolReconcile(t, r, pool)
 	status = runtimePoolTestGetPool(t, r, pool).Status
@@ -2470,24 +2483,29 @@ func TestRuntimePoolReconcilerRolloutTimeoutRecyclesStrandedSessions(t *testing.
 
 func TestRuntimePoolRolloutInstanceIsRecyclable(t *testing.T) {
 	quiescentCapacity := corev1alpha1.RuntimePoolCapacityStatus{}
+	now := runtimePoolTestNow
+	grace := 2 * time.Minute
 	base := func() harnessv2.StatusResponse {
 		return harnessv2.StatusResponse{
 			Lifecycle: harnessv2.SupervisorLifecycleDraining,
 			Drain:     harnessv2.DrainStatus{Requested: true},
 			Pressure:  harnessv2.PressureMetadata{ResidentSessions: 2},
 			Sessions: []harnessv2.RuntimeSessionStatus{
-				{RuntimeSessionUID: "a", State: harnessv2.RuntimeSessionStateValidating},
-				{RuntimeSessionUID: "b", State: harnessv2.RuntimeSessionStateIdle},
+				{RuntimeSessionUID: "a", State: harnessv2.RuntimeSessionStateValidating, LastTransitionAt: now.Add(-grace)},
+				{RuntimeSessionUID: "b", State: harnessv2.RuntimeSessionStateIdle, LastTransitionAt: now.Add(-time.Hour)},
 			},
 		}
 	}
-	if !runtimePoolRolloutInstanceIsRecyclable(quiescentCapacity, base()) {
+	recyclable := func(capacity corev1alpha1.RuntimePoolCapacityStatus, status harnessv2.StatusResponse) bool {
+		return runtimePoolRolloutInstanceIsRecyclable(capacity, status, now, grace)
+	}
+	if !recyclable(quiescentCapacity, base()) {
 		t.Fatal("stranded resident sessions without prompt work must be recyclable")
 	}
 	for _, state := range []harnessv2.RuntimeSessionState{harnessv2.RuntimeSessionStatePoisoned, harnessv2.RuntimeSessionStatePublicationPrepared} {
 		status := base()
 		status.Sessions[1].State = state
-		if !runtimePoolRolloutInstanceIsRecyclable(quiescentCapacity, status) {
+		if !recyclable(quiescentCapacity, status) {
 			t.Fatalf("session state %q is retired by the supervisor drain and must stay recyclable when stranded", state)
 		}
 	}
@@ -2514,6 +2532,9 @@ func TestRuntimePoolRolloutInstanceIsRecyclable(t *testing.T) {
 		{name: "session cancelling", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].State = harnessv2.RuntimeSessionStateCancelling }},
 		{name: "session creating", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].State = harnessv2.RuntimeSessionStateCreating }},
 		{name: "session deleting", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].State = harnessv2.RuntimeSessionStateDeleting }},
+		{name: "validating session younger than the grace", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[0].LastTransitionAt = now.Add(-grace + time.Second) }},
+		{name: "idle session younger than the grace", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].LastTransitionAt = now }},
+		{name: "session without a transition timestamp", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[0].LastTransitionAt = time.Time{} }},
 		{name: "controller reservation", capacity: corev1alpha1.RuntimePoolCapacityStatus{ReservedPrompts: 1}, mutate: func(*harnessv2.StatusResponse) {}},
 		{name: "controller finalization", capacity: corev1alpha1.RuntimePoolCapacityStatus{FinalizingSessions: 1}, mutate: func(*harnessv2.StatusResponse) {}},
 	}
@@ -2521,7 +2542,7 @@ func TestRuntimePoolRolloutInstanceIsRecyclable(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			status := base()
 			tt.mutate(&status)
-			if runtimePoolRolloutInstanceIsRecyclable(tt.capacity, status) {
+			if recyclable(tt.capacity, status) {
 				t.Fatal("in-flight work must keep the timed-out instance preserved")
 			}
 		})
@@ -2649,5 +2670,16 @@ func runtimePoolTestAssertRetiredStopped(t *testing.T, r *RuntimePoolReconciler,
 	}
 	if !strings.Contains(status.Message, retiredMessage) {
 		t.Fatalf("status message = %q, want the retired-image reason", status.Message)
+	}
+}
+
+func TestRuntimePoolRolloutStrandedGrace(t *testing.T) {
+	if got := runtimePoolRolloutStrandedGrace(nil); got != time.Duration(corev1alpha1.DefaultRuntimePoolColdStartTimeoutSeconds)*time.Second {
+		t.Fatalf("nil pool grace = %s, want the default cold-start timeout", got)
+	}
+	pool := runtimePoolTestObject(1)
+	pool.Spec.ColdStartTimeoutSeconds = 45
+	if got := runtimePoolRolloutStrandedGrace(pool); got != 45*time.Second {
+		t.Fatalf("configured grace = %s, want 45s", got)
 	}
 }

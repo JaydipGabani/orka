@@ -1334,7 +1334,7 @@ func (r *RuntimePoolReconciler) reconcileReadyRuntimePoolRollout(
 
 	if !runtimePoolRolloutProbeIsQuiescent(status.Capacity, probe.Status) {
 		if r.runtimePoolRolloutTimedOut(pool) {
-			if runtimePoolRolloutTimeoutPersisted(pool) && runtimePoolRolloutInstanceIsRecyclable(status.Capacity, probe.Status) {
+			if runtimePoolRolloutTimeoutPersisted(pool) && runtimePoolRolloutInstanceIsRecyclable(status.Capacity, probe.Status, r.now(), runtimePoolRolloutStrandedGrace(pool)) {
 				if err := r.stopRuntimePoolDeployment(ctx, deployment); err != nil {
 					return ctrl.Result{}, err
 				}
@@ -1346,7 +1346,7 @@ func (r *RuntimePoolReconciler) reconcileReadyRuntimePoolRollout(
 			}
 			status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDegraded
 			status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
-			status.Message = runtimePoolRolloutTimedOutMessage(status.Capacity, probe.Status, "old runtime Pod")
+			status.Message = runtimePoolRolloutTimedOutMessage(status.Capacity, probe.Status, r.now(), runtimePoolRolloutStrandedGrace(pool), "old runtime Pod")
 			r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, runtimePoolRolloutReasonTimedOut, status.Message)
 			return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
 		}
@@ -1396,7 +1396,12 @@ func runtimePoolRolloutTimeoutPersisted(pool *corev1alpha1.RuntimePool) bool {
 // such stranded resident sessions may remain: no running prompt, queued
 // admission, pending permission, live descendant, finalization reservation, or
 // controller reservation is allowed to be lost by replacing the instance.
-func runtimePoolRolloutInstanceIsRecyclable(controllerCapacity corev1alpha1.RuntimePoolCapacityStatus, status harnessv2.StatusResponse) bool {
+func runtimePoolRolloutInstanceIsRecyclable(
+	controllerCapacity corev1alpha1.RuntimePoolCapacityStatus,
+	status harnessv2.StatusResponse,
+	now time.Time,
+	strandedGrace time.Duration,
+) bool {
 	if !runtimePoolRolloutControllerWorkIsQuiescent(controllerCapacity) {
 		return false
 	}
@@ -1412,11 +1417,36 @@ func runtimePoolRolloutInstanceIsRecyclable(controllerCapacity corev1alpha1.Runt
 		session := status.Sessions[i]
 		if session.ActivePromptID != "" || session.PendingPermissionCount != 0 ||
 			session.LiveDescendantCount != 0 || session.ReservedForFinalization ||
-			!runtimePoolStrandedSessionStateIsRecyclable(session.State) {
+			!runtimePoolStrandedSessionStateIsRecyclable(session.State) ||
+			!runtimePoolStrandedSessionAged(session, now, strandedGrace) {
 			return false
 		}
 	}
 	return true
+}
+
+// runtimePoolStrandedSessionAged requires a session to have sat in its safe
+// state for at least the stranded grace before it counts as abandoned. A
+// session that just entered validating after a completed prompt is being
+// validated by the controller right now (CreateWorkspaceDelta and delivery
+// settlement run before any Task-derived finalization count is projected),
+// and a session the supervisor is about to retire is only seconds old; a
+// session parked for longer than a whole rollout timeout is not.
+func runtimePoolStrandedSessionAged(session harnessv2.RuntimeSessionStatus, now time.Time, strandedGrace time.Duration) bool {
+	if session.LastTransitionAt.IsZero() {
+		return false
+	}
+	return !now.Before(session.LastTransitionAt.Add(strandedGrace))
+}
+
+// runtimePoolRolloutStrandedGrace is how long a resident session must stay in
+// a safe state before a timed-out rollout may abandon it: the same bound the
+// rollout drain itself waited before timing out.
+func runtimePoolRolloutStrandedGrace(pool *corev1alpha1.RuntimePool) time.Duration {
+	if pool != nil && pool.Spec.ColdStartTimeoutSeconds > 0 {
+		return time.Duration(pool.Spec.ColdStartTimeoutSeconds) * time.Second
+	}
+	return time.Duration(corev1alpha1.DefaultRuntimePoolColdStartTimeoutSeconds) * time.Second
 }
 
 // runtimePoolStrandedSessionStateIsRecyclable allowlists the session states a
@@ -1451,9 +1481,11 @@ func runtimePoolRolloutRecycleMessage(status harnessv2.StatusResponse, instance 
 func runtimePoolRolloutTimedOutMessage(
 	controllerCapacity corev1alpha1.RuntimePoolCapacityStatus,
 	status harnessv2.StatusResponse,
+	now time.Time,
+	strandedGrace time.Duration,
 	instance string,
 ) string {
-	if runtimePoolRolloutInstanceIsRecyclable(controllerCapacity, status) {
+	if runtimePoolRolloutInstanceIsRecyclable(controllerCapacity, status, now, strandedGrace) {
 		return fmt.Sprintf(
 			"timed out waiting for authenticated rollout drain barriers; %d stranded resident sessions remain and the %s will be recycled",
 			runtimePoolRolloutStrandedSessionCount(status), instance,

@@ -72,7 +72,8 @@ within `coldStartTimeoutSeconds`, the pool reports `RolloutTimedOut` and keeps
 the old instance while running prompts, pending permissions, live descendants,
 finalization reservations, or controller reservations remain. Once only
 stranded resident sessions are left (sessions the supervisor could not retire,
-such as one parked in `validating`), the next observation recycles the old
+such as one parked in `validating`, that have sat in that state for at least
+another `coldStartTimeoutSeconds`), the next observation recycles the old
 instance so the new template can start; a pool never parks forever behind a
 timed-out drain. The active instance records the pool generation it was
 admitted with (`status.activeInstance.runtimePoolGeneration`), so a planned

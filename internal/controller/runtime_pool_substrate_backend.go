@@ -2775,7 +2775,7 @@ func (r *RuntimePoolReconciler) reconcileSubstrateRuntimePoolRollout(
 
 	if !runtimePoolRolloutProbeIsQuiescent(status.Capacity, probe.Status) {
 		if r.runtimePoolRolloutTimedOut(pool) {
-			if runtimePoolRolloutTimeoutPersisted(pool) && runtimePoolRolloutInstanceIsRecyclable(status.Capacity, probe.Status) {
+			if runtimePoolRolloutTimeoutPersisted(pool) && runtimePoolRolloutInstanceIsRecyclable(status.Capacity, probe.Status, r.now(), runtimePoolRolloutStrandedGrace(pool)) {
 				if err := r.recycleSubstrateActor(ctx, pool, control, actorID); err != nil {
 					return ctrl.Result{}, err
 				}
@@ -2787,7 +2787,7 @@ func (r *RuntimePoolReconciler) reconcileSubstrateRuntimePoolRollout(
 			}
 			status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDegraded
 			status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
-			status.Message = runtimePoolRolloutTimedOutMessage(status.Capacity, probe.Status, "old provider actor")
+			status.Message = runtimePoolRolloutTimedOutMessage(status.Capacity, probe.Status, r.now(), runtimePoolRolloutStrandedGrace(pool), "old provider actor")
 			r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, runtimePoolRolloutReasonTimedOut, status.Message)
 			return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
 		}
