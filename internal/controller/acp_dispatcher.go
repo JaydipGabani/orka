@@ -2588,9 +2588,6 @@ func waitForRuntimeSessionAdmissionState(
 		} else if observed == nil && absentIsFinal {
 			return false, nil
 		} else if observed != nil {
-			if absentIsFinal {
-				lastStatusErr = nil
-			}
 			if observed.RuntimeSessionID != sessionID || observed.Generation != generation {
 				return false, fmt.Errorf("%w: RuntimeSession status resolved to a different generation", store.ErrConflict)
 			}
