@@ -54,6 +54,7 @@ const (
 
 	repositoryMonitorRunningRunTimeout = 30 * time.Minute
 	repositoryMonitorValidationRetry   = time.Minute
+	repositoryMonitorStaleRunError     = "[retry_scheduled] repository monitor run did not complete within "
 
 	repositoryMonitorReasonReviewerCredentialsInvalid = "ReviewerCredentialsInvalid"
 	repositoryMonitorReasonGitSecretInvalid           = "GitSecretInvalid"
@@ -830,7 +831,7 @@ func (r *RepositoryMonitorReconciler) failStaleRunningMonitorRun(ctx context.Con
 
 	run.Phase = repositoryMonitorRunPhaseFailed
 	run.CompletedAt = &now
-	run.Error = fmt.Sprintf("[retry_scheduled] repository monitor run did not complete within %s and was marked failed", repositoryMonitorRunningRunTimeout)
+	run.Error = fmt.Sprintf("%s%s and was marked failed", repositoryMonitorStaleRunError, repositoryMonitorRunningRunTimeout)
 	if err := r.Store.UpdateMonitorRun(ctx, &run); err != nil {
 		return nil, 0, err
 	}

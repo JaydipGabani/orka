@@ -222,7 +222,7 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 	pr repositoryMonitorPullRequest,
 	item *store.MonitorItem,
 ) (bool, int, error) {
-	token, err := r.repositoryMonitorGitHubToken(ctx, monitor)
+	token, err := r.repositoryMonitorForgeToken(ctx, monitor)
 	if err != nil {
 		return true, 0, err
 	}

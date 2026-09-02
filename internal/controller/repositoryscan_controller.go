@@ -648,6 +648,10 @@ func (r *RepositoryScanReconciler) createMapperTask(ctx context.Context, scan *c
 		}
 		return err
 	}
+	targetScan, err := r.repositoryScanWithFrozenRunTarget(ctx, scan, run)
+	if err != nil {
+		return err
+	}
 	timeout := metav1.Duration{Duration: 30 * time.Minute}
 	priority := int32(690)
 	taskName := security.ScanStageTaskName(scan.Name, run.Mode, security.StageMapper, "")
@@ -679,7 +683,7 @@ func (r *RepositoryScanReconciler) createMapperTask(ctx context.Context, scan *c
 				{Name: security.EnvScanBaseCommit, Value: run.BaseCommit},
 				{Name: security.EnvScanHeadCommit, Value: run.HeadCommit},
 			},
-			Workspace: repositoryScanTaskWorkspace(scan, ""),
+			Workspace: repositoryScanTaskWorkspace(targetScan, ""),
 		},
 	}
 	if err := controllerutil.SetControllerReference(scan, task, r.Scheme); err != nil {
@@ -876,6 +880,65 @@ func trustedFindingsRepository(scan *corev1alpha1.RepositoryScan, run *store.Sca
 	return repo
 }
 
+func repositoryScanWithFrozenWorkspaceTarget(scan *corev1alpha1.RepositoryScan, workspace *corev1alpha1.WorkspaceConfig) (*corev1alpha1.RepositoryScan, error) {
+	if scan == nil || workspace == nil {
+		return nil, fmt.Errorf("scan run workspace target is missing")
+	}
+	if security.CanonicalRepositoryCloneURL(workspace.GitRepo) != security.CanonicalRepositoryCloneURL(scan.Spec.RepoURL) {
+		return nil, fmt.Errorf("scan run workspace repository does not match the repository scan")
+	}
+	branch := strings.TrimSpace(workspace.Branch)
+	ref := strings.TrimSpace(workspace.Ref)
+	if branch == "" && ref == "" {
+		return nil, fmt.Errorf("scan run workspace branch or ref is missing")
+	}
+	frozen := scan.DeepCopy()
+	frozen.Spec.Branch = branch
+	frozen.Spec.Ref = ref
+	frozen.Spec.SubPath = strings.Trim(strings.TrimSpace(workspace.SubPath), "/")
+	return frozen, nil
+}
+
+func (r *RepositoryScanReconciler) repositoryScanWithFrozenRunTarget(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) (*corev1alpha1.RepositoryScan, error) {
+	if r.Client == nil || scan == nil || run == nil || strings.TrimSpace(run.TaskName) == "" {
+		return nil, fmt.Errorf("scan run target task is missing")
+	}
+	task := &corev1alpha1.Task{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: scan.Namespace, Name: run.TaskName}, task); err != nil {
+		return nil, err
+	}
+	if scanTaskRunID(task) != run.ID || task.Labels[labels.LabelSecurityTarget] != labels.SelectorValue(scan.Name) || !isScanPipelineStage(taskSecurityStage(task)) {
+		return nil, fmt.Errorf("scan run target task identity does not match the scan run")
+	}
+	return repositoryScanWithFrozenWorkspaceTarget(scan, task.Spec.Workspace)
+}
+
+func trustedFindingsRepositoryForRunTask(scan *corev1alpha1.RepositoryScan, run *store.ScanRun, task *corev1alpha1.Task) (security.FindingsV2Repository, string) {
+	taskScan, err := repositoryScanWithFrozenWorkspaceTarget(scan, task.Spec.Workspace)
+	if err != nil {
+		return security.FindingsV2Repository{}, err.Error()
+	}
+	return trustedFindingsRepository(taskScan, run), ""
+}
+
+func frozenScanTargetFromTasks(scan *corev1alpha1.RepositoryScan, run *store.ScanRun, tasks []corev1alpha1.Task) (security.FindingsV2Repository, bool) {
+	if scan == nil || run == nil || strings.TrimSpace(run.TaskName) == "" {
+		return security.FindingsV2Repository{}, false
+	}
+	for i := range tasks {
+		task := &tasks[i]
+		if task.Name != run.TaskName || scanTaskRunID(task) != run.ID || task.Labels[labels.LabelSecurityTarget] != labels.SelectorValue(scan.Name) || !isScanPipelineStage(taskSecurityStage(task)) {
+			continue
+		}
+		frozen, err := repositoryScanWithFrozenWorkspaceTarget(scan, task.Spec.Workspace)
+		if err != nil {
+			return security.FindingsV2Repository{}, false
+		}
+		return trustedFindingsRepository(frozen, run), true
+	}
+	return security.FindingsV2Repository{}, false
+}
+
 func trustedFindingsBranch(scan *corev1alpha1.RepositoryScan) string {
 	if ref := security.EffectiveRef(scan); ref != "" {
 		return "ref:" + ref
@@ -900,8 +963,12 @@ func (r *RepositoryScanReconciler) createReviewTasks(ctx context.Context, scan *
 		}
 		return err
 	}
+	targetScan, err := r.repositoryScanWithFrozenRunTarget(ctx, scan, run)
+	if err != nil {
+		return err
+	}
 	for _, reviewSlice := range reviewSlices {
-		task, err := r.buildReviewTask(scan, run, threatModel, reviewSlice, policy, securityReviewInitialAttempt)
+		task, err := r.buildReviewTask(targetScan, run, threatModel, reviewSlice, policy, securityReviewInitialAttempt)
 		if err != nil {
 			return err
 		}
@@ -1806,8 +1873,10 @@ func (r *RepositoryScanReconciler) refreshScanRunStatus(
 		return err
 	}
 	if previousPhase != scanRunPhaseSucceeded && run.Phase == scanRunPhaseSucceeded {
-		if err := r.resolveMergedFindingsNotObserved(ctx, scan, run); err != nil {
-			return err
+		if target, ok := frozenScanTargetFromTasks(scan, run, tasks.Items); ok {
+			if err := r.resolveMergedFindingsNotObserved(ctx, scan, run, target); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -2096,6 +2165,10 @@ func evidenceRefKey(ref store.FindingEvidenceRef) string {
 }
 
 func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding) error {
+	return r.mergeExistingFindingForTarget(ctx, scan, trustedFindingsRepository(scan, nil), finding)
+}
+
+func (r *RepositoryScanReconciler) mergeExistingFindingForTarget(ctx context.Context, scan *corev1alpha1.RepositoryScan, target security.FindingsV2Repository, finding *store.Finding) error {
 	existing, err := r.SecurityStore.GetFinding(ctx, scan.Namespace, finding.ID)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
@@ -2122,7 +2195,7 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 		matchTarget = &matchTargetCopy
 		excludedIDs = []string{exactFindingID, existing.ID}
 	}
-	matches, matchErr := r.semanticFindingMatches(ctx, scan, matchTarget, excludedIDs...)
+	matches, matchErr := r.semanticFindingMatches(ctx, scan, target, matchTarget, excludedIDs...)
 	if matchErr != nil {
 		return matchErr
 	}
@@ -2187,7 +2260,7 @@ func (r *RepositoryScanReconciler) mergeExistingFinding(ctx context.Context, sca
 	return nil
 }
 
-func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding, excludedIDs ...string) ([]store.Finding, error) {
+func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, scan *corev1alpha1.RepositoryScan, target security.FindingsV2Repository, finding *store.Finding, excludedIDs ...string) ([]store.Finding, error) {
 	if finding == nil || strings.TrimSpace(finding.FilePath) == "" || strings.TrimSpace(finding.Category) == "" {
 		return nil, nil
 	}
@@ -2217,7 +2290,7 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 			if _, skip := excluded[candidate.ID]; skip {
 				continue
 			}
-			if !findingTargetKeyMatches(scan, targetKey, &candidate) {
+			if !findingTargetKeyMatches(target, targetKey, &candidate) {
 				continue
 			}
 			if findingIdentityMatchScore(finding, &candidate) < 2 {
@@ -2238,7 +2311,7 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 				if canonical.RepositoryScan != scan.Name {
 					return nil, fmt.Errorf("finding duplicate %s points outside repository scan %s", candidate.ID, scan.Name)
 				}
-				if !findingTargetKeyMatches(scan, targetKey, canonical) {
+				if !findingTargetKeyMatches(target, targetKey, canonical) {
 					targetMatches = false
 					break
 				}
@@ -2273,7 +2346,7 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 	return matches, nil
 }
 
-func findingTargetKeyMatches(scan *corev1alpha1.RepositoryScan, targetKey string, candidate *store.Finding) bool {
+func findingTargetKeyMatches(target security.FindingsV2Repository, targetKey string, candidate *store.Finding) bool {
 	if candidate == nil {
 		return false
 	}
@@ -2285,8 +2358,7 @@ func findingTargetKeyMatches(scan *corev1alpha1.RepositoryScan, targetKey string
 		return candidateTargetKey == targetKey
 	}
 
-	repo := trustedFindingsRepository(scan, nil)
-	if security.FindingV2TargetKey(repo.RepoURL, repo.Branch, repo.SubPath) != targetKey {
+	if security.FindingV2TargetKey(target.RepoURL, target.Branch, target.SubPath) != targetKey {
 		return false
 	}
 	evidence := make([]security.FindingsV2EvidenceRef, 0, len(candidate.Evidence))
@@ -2304,9 +2376,9 @@ func findingTargetKeyMatches(scan *corev1alpha1.RepositoryScan, targetKey string
 	legacyFingerprint := security.FindingV2Fingerprint(
 		candidate.Namespace,
 		candidate.RepositoryScan,
-		repo.RepoURL,
-		repo.Branch,
-		repo.SubPath,
+		target.RepoURL,
+		target.Branch,
+		target.SubPath,
 		candidate.SliceID,
 		security.FindingsV2Finding{Title: candidate.Title, Category: candidate.Category, Evidence: evidence},
 	)
@@ -2724,11 +2796,11 @@ func (r *RepositoryScanReconciler) repositoryScanReviewedSlicesForResolution(ctx
 	}
 }
 
-func findingEligibleForMergedResolution(scan *corev1alpha1.RepositoryScan, finding *store.Finding, run *store.ScanRun, targetKey string, inconclusiveSlices, reviewedSlices map[string]struct{}, allSlicesInconclusive bool) bool {
+func findingEligibleForMergedResolution(target security.FindingsV2Repository, finding *store.Finding, run *store.ScanRun, targetKey string, inconclusiveSlices, reviewedSlices map[string]struct{}, allSlicesInconclusive bool) bool {
 	if finding == nil || finding.ScanRunID == run.ID || finding.PRNumber == nil || *finding.PRNumber < 1 {
 		return false
 	}
-	if !findingTargetKeyMatches(scan, targetKey, finding) {
+	if !findingTargetKeyMatches(target, targetKey, finding) {
 		return false
 	}
 	sliceID := strings.TrimSpace(finding.SliceID)
@@ -2764,7 +2836,7 @@ func (r *RepositoryScanReconciler) repositoryScanOpenFindingsForResolution(ctx c
 	}
 }
 
-func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun) error {
+func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.Context, scan *corev1alpha1.RepositoryScan, run *store.ScanRun, target security.FindingsV2Repository) error {
 	if r.SecurityStore == nil || scan == nil || run == nil || run.Phase != scanRunPhaseSucceeded || run.ReviewedSliceCount == 0 {
 		return nil
 	}
@@ -2803,16 +2875,15 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 	if err != nil {
 		return err
 	}
-	currentTarget := trustedFindingsRepository(scan, run)
-	targetKey := security.FindingV2TargetKey(currentTarget.RepoURL, currentTarget.Branch, currentTarget.SubPath)
+	targetKey := security.FindingV2TargetKey(target.RepoURL, target.Branch, target.SubPath)
 	for i := range findings {
 		finding := &findings[i]
-		if !findingEligibleForMergedResolution(scan, finding, run, targetKey, inconclusiveSlices, reviewedSlices, allSlicesInconclusive) {
+		if !findingEligibleForMergedResolution(target, finding, run, targetKey, inconclusiveSlices, reviewedSlices, allSlicesInconclusive) {
 			continue
 		}
 		prNumber := *finding.PRNumber
 		if _, verified := verifiedPRs[prNumber]; !verified {
-			merged, err := r.repositoryScanPullRequestMerged(ctx, owner, repository, token, prNumber)
+			merged, err := r.repositoryScanPullRequestMerged(ctx, owner, repository, token, prNumber, target.Branch)
 			if err != nil {
 				return err
 			}
@@ -3034,7 +3105,11 @@ func (r *RepositoryScanReconciler) ingestReviewTask(ctx context.Context, scan *c
 		return r.failReviewTask(ctx, scan, run, sliceID, r.pipelineTaskFailureSummary(ctx, task))
 	}
 
-	manifest, findingsV2, validationProblem, retryableResult, err := r.validateReviewTaskResult(ctx, scan, task, run, reviewSlice, sliceID)
+	trustedRepository, targetProblem := trustedFindingsRepositoryForRunTask(scan, run, task)
+	if targetProblem != "" {
+		return r.failReviewTask(ctx, scan, run, sliceID, targetProblem)
+	}
+	manifest, findingsV2, validationProblem, retryableResult, err := r.validateReviewTaskResult(ctx, scan, task, run, reviewSlice, sliceID, trustedRepository)
 	if err != nil {
 		return err
 	}
@@ -3065,7 +3140,7 @@ func (r *RepositoryScanReconciler) ingestReviewTask(ctx context.Context, scan *c
 		RepositoryScan:       scan.Name,
 		ScanRunID:            run.ID,
 		TaskName:             task.Name,
-		TrustedRepository:    trustedFindingsRepository(scan, run),
+		TrustedRepository:    trustedRepository,
 		UseTrustedRepository: true,
 	})
 	if err := r.ensureActiveScanRunPolicyCurrent(ctx, scan, run); err != nil {
@@ -3095,7 +3170,7 @@ func (r *RepositoryScanReconciler) ingestReviewTask(ctx context.Context, scan *c
 	}
 	upserted := make([]*store.Finding, 0, len(partition.Accepted))
 	for _, finding := range partition.Accepted {
-		if err := r.mergeExistingFinding(ctx, scan, finding); err != nil {
+		if err := r.mergeExistingFindingForTarget(ctx, scan, trustedRepository, finding); err != nil {
 			return err
 		}
 		if err := r.SecurityStore.UpsertObservedFinding(ctx, finding); err != nil {
@@ -3137,6 +3212,7 @@ func (r *RepositoryScanReconciler) validateReviewTaskResult(
 	run *store.ScanRun,
 	reviewSlice *store.ReviewSlice,
 	sliceID string,
+	trustedRepository security.FindingsV2Repository,
 ) (*security.ReviewContextManifest, *security.FindingsV2Artifact, string, bool, error) {
 	if reviewSlice == nil {
 		return nil, nil, "trusted review slice was not found", false, nil
@@ -3179,7 +3255,7 @@ func (r *RepositoryScanReconciler) validateReviewTaskResult(
 		},
 		SliceID:    sliceID,
 		Mode:       run.Mode,
-		Repository: trustedFindingsRepository(scan, run),
+		Repository: trustedRepository,
 	})
 	if err != nil {
 		return nil, nil, err.Error(), true, nil
@@ -3218,8 +3294,12 @@ func (r *RepositoryScanReconciler) ensureReviewResultRetry(
 	default:
 		return false, err
 	}
+	targetScan, err := repositoryScanWithFrozenWorkspaceTarget(scan, sourceTask.Spec.Workspace)
+	if err != nil {
+		return false, err
+	}
 
-	desired, err := r.buildReviewTask(scan, run, threatModel, *reviewSlice, policy, securityReviewRetryAttempt)
+	desired, err := r.buildReviewTask(targetScan, run, threatModel, *reviewSlice, policy, securityReviewRetryAttempt)
 	if err != nil {
 		return false, err
 	}

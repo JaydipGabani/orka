@@ -494,6 +494,21 @@ func saveFindingsTaskResult(
 	findings security.FindingsV2Artifact,
 ) {
 	t.Helper()
+	if task.Spec.Workspace == nil {
+		branch := strings.TrimSpace(findings.Repository.Branch)
+		ref := ""
+		if after, ok := strings.CutPrefix(branch, "ref:"); ok {
+			ref = after
+			branch = ""
+		}
+		task.Spec.Workspace = &corev1alpha1.WorkspaceConfig{
+			Intent:  corev1alpha1.WorkspaceIntentRead,
+			GitRepo: findings.Repository.RepoURL,
+			Branch:  branch,
+			Ref:     ref,
+			SubPath: findings.Repository.SubPath,
+		}
+	}
 	result := security.FindingsResultEnvelope{
 		SchemaVersion:  security.AgentResultSchemaVersion,
 		Kind:           security.AgentResultKindFindings,
@@ -606,9 +621,10 @@ func newReviewResultRetryFixture(t *testing.T) *reviewResultRetryFixture {
 			Annotations: map[string]string{labels.AnnotationSecurityReviewAttempt: "0"},
 		},
 		Spec: corev1alpha1.TaskSpec{
-			Type:     corev1alpha1.TaskTypeAgent,
-			AgentRef: &corev1alpha1.AgentReference{Name: "poison-source-agent"},
-			Prompt:   "POISON SOURCE PROMPT MUST NOT BE COPIED",
+			Type:      corev1alpha1.TaskTypeAgent,
+			AgentRef:  &corev1alpha1.AgentReference{Name: "poison-source-agent"},
+			Prompt:    "POISON SOURCE PROMPT MUST NOT BE COPIED",
+			Workspace: repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead),
 		},
 		Status: corev1alpha1.TaskStatus{
 			Phase:     corev1alpha1.TaskPhaseSucceeded,
@@ -1325,9 +1341,13 @@ func TestRepositoryScanCustomPolicyIncludedInReviewPrompt(t *testing.T) {
 			"fp":   "Suppress intentionally public demo endpoint noise.",
 		},
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, policyConfig).Build()
+	targetTask := newSucceededSecurityTask("kaset-policy-target", "scan_policy", security.StageThreatModel, metav1.Now())
+	targetTask.Spec.Workspace = repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead)
+	scan.Spec.Branch = "release"
+	scan.Spec.SubPath = "services/new"
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, policyConfig, targetTask).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: store}
-	run := &storepkg.ScanRun{ID: "scan_policy", Namespace: defaultNS, RepositoryScan: "kaset", Mode: "initial", Phase: scanRunPhaseRunning}
+	run := &storepkg.ScanRun{ID: "scan_policy", Namespace: defaultNS, RepositoryScan: "kaset", TaskName: targetTask.Name, Mode: "initial", Phase: scanRunPhaseRunning}
 	reviewSlice := storepkg.ReviewSlice{ID: "slice_api", RepositoryScan: "kaset", Source: "deterministic", Title: "API", Kind: "package", Status: reviewSliceStatusPending}
 	manifest := bindReviewSliceContext(t, &reviewSlice)
 	if err := reconciler.createReviewTasks(ctx, scan, run, "", []storepkg.ReviewSlice{reviewSlice}); err != nil {
@@ -1337,10 +1357,20 @@ func TestRepositoryScanCustomPolicyIncludedInReviewPrompt(t *testing.T) {
 	if err := cl.List(ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
 		t.Fatalf("List(Task) error = %v", err)
 	}
-	if len(tasks.Items) != 1 {
-		t.Fatalf("len(tasks) = %d, want 1", len(tasks.Items))
+	var reviewTask *corev1alpha1.Task
+	for i := range tasks.Items {
+		if taskSecurityStage(&tasks.Items[i]) == security.StageReview {
+			reviewTask = &tasks.Items[i]
+			break
+		}
 	}
-	prompt := tasks.Items[0].Spec.Prompt
+	if reviewTask == nil {
+		t.Fatalf("review task not found in %#v", tasks.Items)
+	}
+	if reviewTask.Spec.Workspace == nil || reviewTask.Spec.Workspace.Branch != "main" || reviewTask.Spec.Workspace.SubPath != "" {
+		t.Fatalf("review workspace = %#v, want frozen initial target", reviewTask.Spec.Workspace)
+	}
+	prompt := reviewTask.Spec.Prompt
 	for _, want := range []string{"Focus on operator RBAC drift", "public demo endpoint", "Default Orka security policy"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("review prompt missing %q:\n%s", want, prompt)
@@ -1544,6 +1574,7 @@ func TestProgressLatestScanRunStartsReviewTasksForPendingSlices(t *testing.T) {
 		Status: corev1alpha1.RepositoryScanStatus{LastScanID: "scan_review"},
 	}
 	threatTask := newSucceededSecurityTask("kaset-initial-threat", "scan_review", security.StageThreatModel, metav1.Now())
+	threatTask.Spec.Workspace = repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead)
 	mapperTask := newSucceededSecurityTask("kaset-initial-mapper", "scan_review", security.StageMapper, metav1.Now())
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -1723,6 +1754,7 @@ func TestProgressLatestScanRunRetriesPendingSlicesWithoutTasks(t *testing.T) {
 	}
 	const sliceAPI = "slice_api"
 	threatTask := newSucceededSecurityTask("kaset-partial-threat", "scan_partial_review", security.StageThreatModel, metav1.Now())
+	threatTask.Spec.Workspace = repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead)
 	mapperTask := newSucceededSecurityTask("kaset-partial-mapper", "scan_partial_review", security.StageMapper, metav1.Now())
 	reviewTask := newSucceededSecurityTask("kaset-review-slice-api", "scan_partial_review", security.StageReview, metav1.Now())
 	reviewTask.Labels[labels.LabelSecuritySliceID] = sliceAPI
@@ -4854,9 +4886,11 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		requests[prNumber]++
 		switch prNumber {
 		case 42:
-			_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z"}`))
+			_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"main"}}`))
 		case 43:
-			_, _ = w.Write([]byte(`{"merged":false,"merged_at":null}`))
+			_, _ = w.Write([]byte(`{"merged":false,"merged_at":null,"base":{"ref":"main"}}`))
+		case 45:
+			_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"release"}}`))
 		default:
 			t.Fatalf("unexpected pull request %d", prNumber)
 		}
@@ -4881,11 +4915,12 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 	threatTask := newSucceededSecurityTask("kaset-resolve-threat", "scan_current", security.StageThreatModel, completed)
 	mapperTask := newSucceededSecurityTask("kaset-resolve-mapper", "scan_current", security.StageMapper, completed)
 	reviewTask := newSucceededSecurityTask("kaset-resolve-review", "scan_current", security.StageReview, completed)
+	threatTask.Spec.Workspace = repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead)
 	reviewTask.Labels[labels.LabelSecuritySliceID] = "slice_api"
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, secret, threatTask, mapperTask, reviewTask).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
-	run := &storepkg.ScanRun{ID: "scan_current", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, StartedAt: time.Now()}
+	run := &storepkg.ScanRun{ID: "scan_current", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: threatTask.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, StartedAt: time.Now()}
 	if err := securityStore.CreateScanRun(ctx, run); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
@@ -4900,6 +4935,7 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		newFinding("fnd_merged", "scan_old", 42),
 		newFinding("fnd_open_pr", "scan_old", 43),
 		newFinding("fnd_observed", run.ID, 44),
+		newFinding("fnd_wrong_base", "scan_old", 45),
 	} {
 		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
 			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
@@ -4909,14 +4945,92 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 		t.Fatalf("refreshScanRunStatus() error = %v", err)
 	}
 
-	for id, want := range map[string]string{"fnd_merged": findingStateResolved, "fnd_open_pr": findingStatePROpen, "fnd_observed": findingStatePROpen} {
+	for id, want := range map[string]string{"fnd_merged": findingStateResolved, "fnd_open_pr": findingStatePROpen, "fnd_observed": findingStatePROpen, "fnd_wrong_base": findingStatePROpen} {
 		finding, err := securityStore.GetFinding(ctx, defaultNS, id)
 		if err != nil || finding.State != want {
 			t.Fatalf("finding %s = %#v, err %v, want state %s", id, finding, err, want)
 		}
 	}
-	if requests[42] != 1 || requests[43] != 1 || requests[44] != 0 {
+	if requests[42] != 1 || requests[43] != 1 || requests[44] != 0 || requests[45] != 1 {
 		t.Fatalf("pull request reads = %#v", requests)
+	}
+}
+
+func TestRefreshScanRunStatusUsesFrozenTaskTargetAfterSpecChanges(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	requests := map[int]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var prNumber int
+		if _, err := fmt.Sscanf(r.URL.Path, "/repos/example/kaset/pulls/%d", &prNumber); err != nil {
+			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
+		}
+		requests[prNumber]++
+		base := "main"
+		if prNumber == 43 {
+			base = "release"
+		}
+		_, _ = fmt.Fprintf(w, `{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":%q}}`, base)
+	}))
+	t.Cleanup(server.Close)
+
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:            "https://github.com/example/kaset",
+			Branch:             "release",
+			SubPath:            "services/new",
+			ForgeCredentialRef: &corev1.LocalObjectReference{Name: testPatchForgeSecretName},
+		},
+	}
+	frozenScan := scan.DeepCopy()
+	frozenScan.Spec.Branch = "main"
+	frozenScan.Spec.SubPath = "services/old"
+	completed := metav1.Now()
+	threatTask := newSucceededSecurityTask("kaset-frozen-threat", "scan_frozen", security.StageThreatModel, completed)
+	threatTask.Spec.Workspace = repositoryScanTaskWorkspace(frozenScan, corev1alpha1.WorkspaceIntentRead)
+	mapperTask := newSucceededSecurityTask("kaset-frozen-mapper", "scan_frozen", security.StageMapper, completed)
+	reviewTask := newSucceededSecurityTask("kaset-frozen-review", "scan_frozen", security.StageReview, completed)
+	reviewTask.Labels[labels.LabelSecuritySliceID] = "slice_api"
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, secret, threatTask, mapperTask, reviewTask).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
+	run := &storepkg.ScanRun{ID: "scan_frozen", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: threatTask.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, StartedAt: time.Now()}
+	if err := securityStore.CreateScanRun(ctx, run); err != nil {
+		t.Fatalf("CreateScanRun() error = %v", err)
+	}
+	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_api", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
+		t.Fatalf("UpsertReviewSlice() error = %v", err)
+	}
+	for _, candidate := range []struct {
+		id        string
+		pr        int
+		targetKey string
+	}{
+		{id: "fnd_frozen_target", pr: 42, targetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, "main", "services/old")},
+		{id: "fnd_current_spec", pr: 43, targetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, "release", "services/new")},
+	} {
+		prNumber := candidate.pr
+		finding := &storepkg.Finding{ID: candidate.id, Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: "slice_api", Fingerprint: candidate.id, TargetKey: candidate.targetKey, Title: candidate.id, Summary: candidate.id, Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, PRNumber: &prNumber}
+		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+			t.Fatalf("UpsertFinding(%s) error = %v", candidate.id, err)
+		}
+	}
+
+	if err := reconciler.refreshScanRunStatus(ctx, scan, run, run.ID, false); err != nil {
+		t.Fatalf("refreshScanRunStatus() error = %v", err)
+	}
+	frozenFinding, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_frozen_target")
+	currentFinding, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_current_spec")
+	if frozenFinding.State != findingStateResolved || currentFinding.State != findingStatePROpen || requests[42] != 1 || requests[43] != 0 {
+		t.Fatalf("frozen = %#v, current = %#v, requests = %#v", frozenFinding, currentFinding, requests)
 	}
 }
 
@@ -4937,7 +5051,7 @@ func TestRefreshScanRunStatusRetriesMergedPRLookup(t *testing.T) {
 			_, _ = w.Write([]byte(`{"message":"try again"}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"main"}}`))
 	}))
 	t.Cleanup(server.Close)
 
@@ -4959,11 +5073,12 @@ func TestRefreshScanRunStatusRetriesMergedPRLookup(t *testing.T) {
 	threatTask := newSucceededSecurityTask("kaset-retry-threat", "scan_retry", security.StageThreatModel, completed)
 	mapperTask := newSucceededSecurityTask("kaset-retry-mapper", "scan_retry", security.StageMapper, completed)
 	reviewTask := newSucceededSecurityTask("kaset-retry-review", "scan_retry", security.StageReview, completed)
+	threatTask.Spec.Workspace = repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead)
 	reviewTask.Labels[labels.LabelSecuritySliceID] = "slice_api"
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testPatchForgeSecretName, Namespace: defaultNS}, Data: map[string][]byte{defaultACPWorkspaceCredentialKey: []byte("forge-token-value")}}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, threatTask, mapperTask, reviewTask).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
-	run := &storepkg.ScanRun{ID: "scan_retry", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, StartedAt: time.Now()}
+	run := &storepkg.ScanRun{ID: "scan_retry", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: threatTask.Name, Mode: "initial", Phase: scanRunPhaseRunning, ReviewedSliceCount: 1, StartedAt: time.Now()}
 	if err := securityStore.CreateScanRun(ctx, run); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
@@ -5021,7 +5136,7 @@ func TestResolveMergedFindingsRetriesForgeCredentialReadErrors(t *testing.T) {
 		SecurityStore: securityStore,
 	}
 
-	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run); !errors.Is(err, transientErr) {
+	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run, trustedFindingsRepository(scan, run)); !errors.Is(err, transientErr) {
 		t.Fatalf("resolveMergedFindingsNotObserved() error = %v, want %v", err, transientErr)
 	}
 }
@@ -5045,7 +5160,7 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
 		}
 		requests[prNumber]++
-		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"main"}}`))
 	}))
 	t.Cleanup(server.Close)
 	scheme := runtime.NewScheme()
@@ -5106,7 +5221,7 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 	if err := securityStore.UpsertFinding(ctx, legacy); err != nil {
 		t.Fatalf("UpsertFinding(%s) error = %v", legacy.ID, err)
 	}
-	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run); err != nil {
+	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run, trustedFindingsRepository(scan, run)); err != nil {
 		t.Fatalf("resolveMergedFindingsNotObserved() error = %v", err)
 	}
 	reviewed, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_reviewed")
@@ -5130,7 +5245,7 @@ func TestResolveMergedFindingsCollectsAllPagesBeforeMutation(t *testing.T) {
 			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
 		}
 		requests++
-		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"main"}}`))
 	}))
 	t.Cleanup(server.Close)
 
@@ -5176,7 +5291,7 @@ func TestResolveMergedFindingsCollectsAllPagesBeforeMutation(t *testing.T) {
 		}
 	}
 
-	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run); err != nil {
+	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run, trustedFindingsRepository(scan, run)); err != nil {
 		t.Fatalf("resolveMergedFindingsNotObserved() error = %v", err)
 	}
 	remaining, _, err := securityStore.ListFindings(ctx, storepkg.FindingFilter{Namespace: defaultNS, RepositoryScan: scan.Name, State: findingStatePROpen, Limit: 500})
@@ -5199,7 +5314,7 @@ func TestResolveMergedFindingsSkipsRunWithCappedOutput(t *testing.T) {
 		t.Fatalf("CreateDroppedFinding() error = %v", err)
 	}
 	reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
-	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run); err != nil {
+	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run, trustedFindingsRepository(scan, run)); err != nil {
 		t.Fatalf("resolveMergedFindingsNotObserved() error = %v", err)
 	}
 	got, err := securityStore.GetFinding(ctx, defaultNS, finding.ID)
@@ -5218,7 +5333,7 @@ func TestResolveMergedFindingsSkipsSlicesWithDroppedResults(t *testing.T) {
 			t.Fatalf("unexpected GitHub path %s", r.URL.Path)
 		}
 		requests[prNumber]++
-		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"merged":true,"merged_at":"2026-08-30T12:00:00Z","base":{"ref":"main"}}`))
 	}))
 	t.Cleanup(server.Close)
 
@@ -5253,7 +5368,7 @@ func TestResolveMergedFindingsSkipsSlicesWithDroppedResults(t *testing.T) {
 	if err := securityStore.CreateDroppedFinding(ctx, &storepkg.DroppedFinding{ID: "drop_validation", Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: run.ID, TaskName: "review", SliceID: "slice_dropped", Reason: "evidence quote does not match cited file range", Layer: "validation"}); err != nil {
 		t.Fatalf("CreateDroppedFinding() error = %v", err)
 	}
-	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run); err != nil {
+	if err := reconciler.resolveMergedFindingsNotObserved(ctx, scan, run, trustedFindingsRepository(scan, run)); err != nil {
 		t.Fatalf("resolveMergedFindingsNotObserved() error = %v", err)
 	}
 	droppedSlice, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_dropped_slice")

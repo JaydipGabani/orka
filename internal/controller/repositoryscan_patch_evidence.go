@@ -542,9 +542,12 @@ type repositoryScanPullRequestResponse struct {
 	Body     string     `json:"body"`
 	Merged   bool       `json:"merged"`
 	MergedAt *time.Time `json:"merged_at"`
+	Base     struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
 }
 
-func (r *RepositoryScanReconciler) repositoryScanPullRequestMerged(ctx context.Context, owner, repository, token string, prNumber int) (bool, error) {
+func (r *RepositoryScanReconciler) repositoryScanPullRequestMerged(ctx context.Context, owner, repository, token string, prNumber int, targetBranch string) (bool, error) {
 	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
 	if baseURL == "" {
 		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
@@ -575,7 +578,9 @@ func (r *RepositoryScanReconciler) repositoryScanPullRequestMerged(ctx context.C
 	if err := json.Unmarshal(body, &current); err != nil {
 		return false, fmt.Errorf("decode remediation pull request: %w", err)
 	}
-	return current.Merged || current.MergedAt != nil, nil
+	targetBranch = strings.TrimPrefix(strings.TrimSpace(targetBranch), "refs/heads/")
+	baseBranch := strings.TrimPrefix(strings.TrimSpace(current.Base.Ref), "refs/heads/")
+	return targetBranch != "" && !strings.HasPrefix(targetBranch, "ref:") && baseBranch == targetBranch && (current.Merged || current.MergedAt != nil), nil
 }
 
 func (r *RepositoryScanReconciler) readRemediationPullRequest(ctx context.Context, client *http.Client, endpoint, token string, logger logr.Logger) (repositoryScanPullRequestResponse, bool) {
