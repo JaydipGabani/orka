@@ -286,24 +286,28 @@ func TestTrustedFindingsRepositoryScopesCheckoutTarget(t *testing.T) {
 		HeadCommit: "head",
 	}
 	tests := []struct {
-		name string
-		spec corev1alpha1.RepositoryScanSpec
-		want string
+		name       string
+		spec       corev1alpha1.RepositoryScanSpec
+		want       string
+		wantLegacy string
 	}{
 		{
-			name: "implicit main",
-			spec: corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo"},
-			want: "main",
+			name:       "implicit main",
+			spec:       corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo"},
+			want:       "main",
+			wantLegacy: "main",
 		},
 		{
-			name: "explicit ref wins over branch",
-			spec: corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", Branch: "release", Ref: "v1.2.3"},
-			want: "ref:v1.2.3",
+			name:       "explicit ref wins over branch",
+			spec:       corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", Branch: "release", Ref: "v1.2.3"},
+			want:       "ref:v1.2.3",
+			wantLegacy: "release",
 		},
 		{
-			name: "ref-only scan is ref scoped",
-			spec: corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", Ref: "refs/tags/v1.2.3"},
-			want: "ref:refs/tags/v1.2.3",
+			name:       "ref-only scan is ref scoped",
+			spec:       corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/repo", Ref: "refs/tags/v1.2.3"},
+			want:       "ref:refs/tags/v1.2.3",
+			wantLegacy: "ref:refs/tags/v1.2.3",
 		},
 	}
 	for _, tt := range tests {
@@ -314,6 +318,9 @@ func TestTrustedFindingsRepositoryScopesCheckoutTarget(t *testing.T) {
 
 			if got.Branch != tt.want {
 				t.Fatalf("trustedFindingsRepository().Branch = %q, want %q", got.Branch, tt.want)
+			}
+			if gotLegacy := legacyFindingsFingerprintBranch(scan); gotLegacy != tt.wantLegacy {
+				t.Fatalf("legacyFindingsFingerprintBranch() = %q, want %q", gotLegacy, tt.wantLegacy)
 			}
 			if got.BaseSHA != "base" || got.HeadSHA != "head" {
 				t.Fatalf("trustedFindingsRepository() SHAs = %q/%q, want base/head", got.BaseSHA, got.HeadSHA)
@@ -4218,6 +4225,58 @@ func TestMergeExistingFindingReconcilesLegacyTargetKeyFromV2Fingerprint(t *testi
 				t.Fatalf("TargetKey = %q, want adopted current target key", listed[0].TargetKey)
 			}
 		})
+	}
+}
+
+func TestMergeExistingFindingReconcilesLegacyBranchFingerprintWhenRefConfigured(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL: "https://github.com/example/kaset",
+			Branch:  "release",
+			Ref:     "v1.2.3",
+		},
+	}
+	symbol := "extractArchive"
+	legacyRepo := security.FindingsV2Repository{RepoURL: scan.Spec.RepoURL, Branch: scan.Spec.Branch}
+	legacy := security.ToFindingV2(defaultNS, scan.Name, "scan_legacy", "legacy-review", legacyRepo, security.FindingsV2Scan{SliceID: "slice_archive"}, security.FindingsV2Finding{
+		Title:    "Archive extraction permits traversal",
+		Category: "path traversal",
+		Evidence: []security.FindingsV2EvidenceRef{{Path: "archive.go", StartLine: 100, EndLine: 108, Symbol: &symbol}},
+	})
+	legacy.TargetKey = ""
+	if err := securityStore.UpsertFinding(ctx, legacy); err != nil {
+		t.Fatalf("UpsertFinding(legacy) error = %v", err)
+	}
+
+	currentRepo := trustedFindingsRepository(scan, nil)
+	incoming := security.ToFindingV2(defaultNS, scan.Name, "scan_current", "current-review", currentRepo, security.FindingsV2Scan{SliceID: "slice_archive"}, security.FindingsV2Finding{
+		Title:    "ZIP entries can escape the extraction root",
+		Category: "CWE-22 path traversal",
+		Evidence: []security.FindingsV2EvidenceRef{{Path: "archive.go", StartLine: 103, EndLine: 111, Symbol: &symbol}},
+	})
+	if incoming.ID == legacy.ID {
+		t.Fatal("test requires the changed observation to have a different exact fingerprint")
+	}
+	if err := reconciler.mergeExistingFinding(ctx, scan, incoming); err != nil {
+		t.Fatalf("mergeExistingFinding() error = %v", err)
+	}
+	if incoming.ID != legacy.ID {
+		t.Fatalf("incoming.ID = %q, want legacy canonical %q", incoming.ID, legacy.ID)
+	}
+	if err := securityStore.UpsertObservedFinding(ctx, incoming); err != nil {
+		t.Fatalf("UpsertObservedFinding(incoming) error = %v", err)
+	}
+	listed, _, err := securityStore.ListFindings(ctx, storepkg.FindingFilter{Namespace: defaultNS, RepositoryScan: scan.Name, Limit: 10})
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("findings = %#v, err %v, want one canonical finding", listed, err)
+	}
+	wantTargetKey := security.FindingV2TargetKey(currentRepo.RepoURL, currentRepo.Branch, currentRepo.SubPath)
+	if listed[0].TargetKey != wantTargetKey {
+		t.Fatalf("TargetKey = %q, want %q", listed[0].TargetKey, wantTargetKey)
 	}
 }
 

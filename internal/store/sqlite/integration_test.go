@@ -914,12 +914,8 @@ func TestIntegration_MigrateSecurityScanLegacySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetFinding() migrated legacy decision error = %v", err)
 	}
-	wantDecisionAt, err := time.Parse(time.RFC3339, "2026-08-03T00:00:00Z")
-	if err != nil {
-		t.Fatalf("time.Parse() error = %v", err)
-	}
-	if !migratedFinding.DecisionAt.Equal(wantDecisionAt) {
-		t.Fatalf("migrated decisionAt = %v, want legacy updatedAt %v", migratedFinding.DecisionAt, wantDecisionAt)
+	if !migratedFinding.DecisionAt.IsZero() {
+		t.Fatalf("migrated decisionAt = %v, want unknown legacy decision time", migratedFinding.DecisionAt)
 	}
 
 	ctx := context.Background()
