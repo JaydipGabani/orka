@@ -2775,9 +2775,19 @@ func (r *RuntimePoolReconciler) reconcileSubstrateRuntimePoolRollout(
 
 	if !runtimePoolRolloutProbeIsQuiescent(status.Capacity, probe.Status) {
 		if r.runtimePoolRolloutTimedOut(pool) {
+			if runtimePoolRolloutTimeoutPersisted(pool) && runtimePoolRolloutInstanceIsRecyclable(status.Capacity, probe.Status) {
+				if err := r.recycleSubstrateActor(ctx, pool, control, actorID); err != nil {
+					return ctrl.Result{}, err
+				}
+				status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopping
+				status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
+				status.Message = runtimePoolRolloutRecycleMessage(probe.Status, "old provider actor")
+				r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionUnknown, runtimePoolRolloutReasonStopping, status.Message)
+				return r.finishRuntimePoolStatus(ctx, pool, status, time.Second)
+			}
 			status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDegraded
 			status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
-			status.Message = "timed out waiting for authenticated rollout drain barriers; preserving the old provider actor"
+			status.Message = runtimePoolRolloutTimedOutMessage(status.Capacity, probe.Status, "old provider actor")
 			r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, runtimePoolRolloutReasonTimedOut, status.Message)
 			return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
 		}

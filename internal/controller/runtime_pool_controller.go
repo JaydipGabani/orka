@@ -423,15 +423,10 @@ func (r *RuntimePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					ctx, pool, "runtime configuration failed", err,
 				)
 			}
+		} else if errors.Is(err, errRuntimePoolImageNotApproved) {
+			return r.reconcileRetiredImageRuntimePool(ctx, pool, err)
 		}
-		status := r.baseRuntimePoolStatus(pool, 0)
-		status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDegraded
-		status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
-		status.ActiveInstance = nil
-		status.Message = sanitizeRuntimePoolMessage(err.Error())
-		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonRolloutFailed, status.Message)
-		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionAdmissionReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonAdmissionClosed, status.Message)
-		return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
+		return r.finishRuntimePoolConfigFailure(ctx, pool, err)
 	}
 
 	logger.Info("Reconciling RuntimePool", "runtimePool", pool.Name, "runtimeNamespace", cfg.namespace, "desiredReplicas", pool.Spec.DesiredReplicas)
@@ -509,6 +504,98 @@ func (r *RuntimePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcileRuntimePoolScaleDown(ctx, pool, cfg, deployment, pods, readyPods, authSecret, status)
 	}
 	return r.reconcileRuntimePoolServing(ctx, pool, cfg, pods, readyPods, authSecret, status)
+}
+
+func (r *RuntimePoolReconciler) finishRuntimePoolConfigFailure(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+	err error,
+) (ctrl.Result, error) {
+	status := r.baseRuntimePoolStatus(pool, 0)
+	status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDegraded
+	status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
+	status.ActiveInstance = nil
+	status.Message = sanitizeRuntimePoolMessage(err.Error())
+	r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonRolloutFailed, status.Message)
+	r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionAdmissionReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonAdmissionClosed, status.Message)
+	return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
+}
+
+// runtimePoolRetiredImageTemplateRevision is the synthetic desired-template
+// revision used only to name the authenticated drain of a retired image's
+// workload; no Deployment is ever rendered from it.
+const runtimePoolRetiredImageTemplateRevision = "retired_image"
+
+// reconcileRetiredImageRuntimePool retires a Deployment-backed pool whose
+// digest-pinned image is no longer the controller-approved image for its
+// provider. Such a pool can never serve again, but the workload it admitted
+// before the rotation must not be stranded: leaving the old Pod running with
+// no authenticated active instance blocks every planned controller upgrade
+// drain and holds the resident sessions forever. The workload is drained
+// through the same authenticated rollout barriers as a Recreate rollout,
+// stopped, and then reported Stopped while RolloutReady keeps the
+// RolloutFailed reason so operators can see why the pool retired. The spec is
+// never mutated and no template carrying the retired image is ever re-rendered.
+func (r *RuntimePoolReconciler) reconcileRetiredImageRuntimePool(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+	imageErr error,
+) (ctrl.Result, error) {
+	cfg, err := r.runtimePoolConfigForDrain(pool)
+	if err != nil {
+		return r.finishRuntimePoolConfigFailure(ctx, pool, imageErr)
+	}
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: cfg.namespace, Name: cfg.baseName}, deployment); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		deployment = nil
+	}
+	pods, err := r.listRuntimePoolPods(ctx, cfg)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	message := sanitizeRuntimePoolMessage(imageErr.Error())
+	status := r.baseRuntimePoolStatus(pool, countRuntimePoolPods(pods))
+	status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
+	r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionAdmissionReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonAdmissionClosed, message)
+
+	if deployment == nil || (ptr.Deref(deployment.Spec.Replicas, 0) == 0 && len(pods) == 0) {
+		status.ActiveInstance = nil
+		status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopped
+		status.Message = message + "; the retired runtime workload is stopped"
+		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionSchedulingReady, metav1.ConditionUnknown, "ScaledToZero", status.Message)
+		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonRolloutFailed, status.Message)
+		return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
+	}
+	r.applyDeploymentFailureConditions(pool, deployment, &status)
+	if ptr.Deref(deployment.Spec.Replicas, 0) == 0 {
+		status.ActiveInstance = nil
+		status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopping
+		status.Message = "waiting for the retired runtime Pod to terminate"
+		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionSchedulingReady, metav1.ConditionUnknown, runtimePoolSchedulingReasonPodNotReady, status.Message)
+		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionUnknown, runtimePoolRolloutReasonStopping, status.Message)
+		return r.finishRuntimePoolStatus(ctx, pool, status, time.Second)
+	}
+
+	status.Message = message + "; draining the retired runtime workload"
+	readyPods := readyRuntimePoolPods(pods)
+	if len(readyPods) > 1 {
+		status.Lifecycle = corev1alpha1.RuntimePoolLifecycleAmbiguous
+		status.AdmissionState = corev1alpha1.RuntimePoolAdmissionAmbiguous
+		status.ActiveInstance = nil
+		status.Message = fmt.Sprintf("found %d Ready runtime Pods while retiring the runtime image", len(readyPods))
+		r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, corev1alpha1.RuntimePoolReasonRuntimeAmbiguous, status.Message)
+		return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
+	}
+	if len(readyPods) == 0 {
+		return r.reconcileUnreadyRuntimePoolRollout(ctx, pool, deployment, pods, status)
+	}
+	retiredTemplate := corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{runtimePoolTemplateRevisionAnnotation: runtimePoolRetiredImageTemplateRevision},
+	}}
+	return r.reconcileReadyRuntimePoolRollout(ctx, pool, cfg, deployment, &readyPods[0], retiredTemplate, status)
 }
 
 func runtimePoolWorkspaceDeletionDrainComplete(pool *corev1alpha1.RuntimePool) bool {
@@ -672,10 +759,15 @@ func (r *RuntimePoolReconciler) validateRuntimePoolImage(pool *corev1alpha1.Runt
 		allowedImage = strings.TrimSpace(r.AllowedImages.Opencode)
 	}
 	if allowedImage == "" || image != allowedImage {
-		return fmt.Errorf("spec.runtime.image is not the controller-approved image for provider %q", pool.Spec.Runtime.Profile.ProviderKind)
+		return fmt.Errorf("%w for provider %q", errRuntimePoolImageNotApproved, pool.Spec.Runtime.Profile.ProviderKind)
 	}
 	return nil
 }
+
+// errRuntimePoolImageNotApproved marks a digest-pinned image that is no longer
+// the controller-approved image for its provider. Fresh demand is planned onto
+// a pool named for the approved image, so such a pool can only retire.
+var errRuntimePoolImageNotApproved = errors.New("spec.runtime.image is not the controller-approved image")
 
 func validateRuntimePoolImageReference(pool *corev1alpha1.RuntimePool) error {
 	image := strings.TrimSpace(pool.Spec.Runtime.Image)
@@ -1231,9 +1323,19 @@ func (r *RuntimePoolReconciler) reconcileReadyRuntimePoolRollout(
 
 	if !runtimePoolRolloutProbeIsQuiescent(status.Capacity, probe.Status) {
 		if r.runtimePoolRolloutTimedOut(pool) {
+			if runtimePoolRolloutTimeoutPersisted(pool) && runtimePoolRolloutInstanceIsRecyclable(status.Capacity, probe.Status) {
+				if err := r.stopRuntimePoolDeployment(ctx, deployment); err != nil {
+					return ctrl.Result{}, err
+				}
+				status.Lifecycle = corev1alpha1.RuntimePoolLifecycleStopping
+				status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
+				status.Message = runtimePoolRolloutRecycleMessage(probe.Status, "old runtime Pod")
+				r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionUnknown, runtimePoolRolloutReasonStopping, status.Message)
+				return r.finishRuntimePoolStatus(ctx, pool, status, time.Second)
+			}
 			status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDegraded
 			status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
-			status.Message = "timed out waiting for authenticated rollout drain barriers; preserving the old runtime Pod"
+			status.Message = runtimePoolRolloutTimedOutMessage(status.Capacity, probe.Status, "old runtime Pod")
 			r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionFalse, runtimePoolRolloutReasonTimedOut, status.Message)
 			return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
 		}
@@ -1259,6 +1361,79 @@ func (r *RuntimePoolReconciler) reconcileReadyRuntimePoolRollout(
 	status.Message = "quiescent old runtime Deployment is stopping before the Recreate template changes"
 	r.setRuntimePoolCondition(pool, &status, corev1alpha1.RuntimePoolConditionRolloutReady, metav1.ConditionUnknown, runtimePoolRolloutReasonStopping, status.Message)
 	return r.finishRuntimePoolStatus(ctx, pool, status, time.Second)
+}
+
+// runtimePoolRolloutTimeoutPersisted reports whether the RolloutTimedOut
+// condition was already written for the current generation, so recycling a
+// timed-out instance always rests on a second, separately persisted
+// observation rather than the same probe that first crossed the deadline.
+func runtimePoolRolloutTimeoutPersisted(pool *corev1alpha1.RuntimePool) bool {
+	if pool == nil {
+		return false
+	}
+	condition := meta.FindStatusCondition(pool.Status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+	return condition != nil && condition.ObservedGeneration == pool.Generation &&
+		condition.Reason == runtimePoolRolloutReasonTimedOut
+}
+
+// runtimePoolRolloutInstanceIsRecyclable reports whether a rollout drain that
+// timed out can recycle the preserved old instance without losing in-flight
+// prompt work. The supervisor retires idle and poisoned sessions itself once
+// drained; a session it could not retire (for example one parked in
+// validating after a failed workspace validation) never settles on its own and
+// would otherwise hold the pool Degraded with admission closed forever. Only
+// such stranded resident sessions may remain: no running prompt, queued
+// admission, pending permission, live descendant, finalization reservation, or
+// controller reservation is allowed to be lost by replacing the instance.
+func runtimePoolRolloutInstanceIsRecyclable(controllerCapacity corev1alpha1.RuntimePoolCapacityStatus, status harnessv2.StatusResponse) bool {
+	if !runtimePoolRolloutControllerWorkIsQuiescent(controllerCapacity) {
+		return false
+	}
+	if !status.Drain.Requested || status.Drain.AcceptingNewSessions {
+		return false
+	}
+	if status.Pressure.ActivePrompts != 0 || status.Pressure.QueuedAdmissions != 0 ||
+		status.Pressure.PendingPermissions != 0 || status.Pressure.LiveDescendants != 0 ||
+		len(status.ActivePrompts) != 0 || len(status.PendingPermissions) != 0 {
+		return false
+	}
+	for i := range status.Sessions {
+		session := status.Sessions[i]
+		if session.ActivePromptID != "" || session.PendingPermissionCount != 0 ||
+			session.LiveDescendantCount != 0 || session.ReservedForFinalization {
+			return false
+		}
+	}
+	return true
+}
+
+func runtimePoolRolloutStrandedSessionCount(status harnessv2.StatusResponse) int {
+	return max(len(status.Sessions), int(status.Pressure.ResidentSessions))
+}
+
+func runtimePoolRolloutRecycleMessage(status harnessv2.StatusResponse, instance string) string {
+	return fmt.Sprintf(
+		"rollout drain barriers timed out with %d stranded resident sessions and no running prompt work; recycling the %s",
+		runtimePoolRolloutStrandedSessionCount(status), instance,
+	)
+}
+
+func runtimePoolRolloutTimedOutMessage(
+	controllerCapacity corev1alpha1.RuntimePoolCapacityStatus,
+	status harnessv2.StatusResponse,
+	instance string,
+) string {
+	if runtimePoolRolloutInstanceIsRecyclable(controllerCapacity, status) {
+		return fmt.Sprintf(
+			"timed out waiting for authenticated rollout drain barriers; %d stranded resident sessions remain and the %s will be recycled",
+			runtimePoolRolloutStrandedSessionCount(status), instance,
+		)
+	}
+	return fmt.Sprintf(
+		"timed out waiting for authenticated rollout drain barriers; preserving the %s while in-flight work settles (running prompts %d, queued admissions %d, pending permissions %d, live descendants %d, finalizing sessions %d, controller reservations %d)",
+		instance, status.Pressure.ActivePrompts, status.Pressure.QueuedAdmissions, status.Pressure.PendingPermissions,
+		status.Pressure.LiveDescendants, controllerCapacity.FinalizingSessions, len(controllerCapacity.Reservations),
+	)
 }
 
 func (r *RuntimePoolReconciler) finishRuntimePoolRolloutFailure(
@@ -3014,6 +3189,7 @@ func validateRuntimePoolProbeWithIdentityCapacityRequirement(
 		BootID:                     string(probe.Status.Fence.SupervisorBootID),
 		RuntimeInstanceID:          expectedInstanceID,
 		ControllerEpoch:            cfg.controllerEpoch,
+		RuntimePoolGeneration:      pool.Generation,
 		ProtocolVersion:            cfg.protocol,
 		ProfileDigest:              pool.Spec.Runtime.Profile.Digest,
 		ProfileDigestSchemaVersion: pool.Spec.Runtime.Profile.DigestSchemaVersion,

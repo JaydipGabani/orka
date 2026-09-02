@@ -446,6 +446,15 @@ type RuntimePoolActiveInstanceStatus struct {
 	// +kubebuilder:validation:Minimum=1
 	ControllerEpoch int64 `json:"controllerEpoch"`
 
+	// RuntimePoolGeneration is the RuntimePool spec generation this instance
+	// was admitted with and advertises in its supervisor fence. A Recreate
+	// rollout that cannot drain preserves the pre-rollout instance while the
+	// spec generation moves on, so authenticated drains validate the exact
+	// instance against this admitted generation rather than the current one.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	RuntimePoolGeneration int64 `json:"runtimePoolGeneration,omitempty"`
+
 	// ProtocolVersion is the supervisor protocol actually advertised by this instance.
 	// +kubebuilder:validation:Required
 	ProtocolVersion RuntimePoolProtocolVersion `json:"protocolVersion"`

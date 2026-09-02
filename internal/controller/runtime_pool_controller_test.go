@@ -1319,8 +1319,15 @@ func TestRuntimePoolReconcilerReportsBadImageAndScheduling(t *testing.T) {
 
 		runtimePoolReconcile(t, r, pool)
 		got := runtimePoolTestGetPool(t, r, pool)
-		if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDegraded || !strings.Contains(got.Status.Message, "controller-approved") {
+		// A pool whose image is not approved never starts; with no workload to
+		// drain it retires straight to Stopped while keeping the reason visible.
+		if got.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopped || got.Status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
+			got.Status.ActiveInstance != nil || !strings.Contains(got.Status.Message, "controller-approved") {
 			t.Fatalf("unapproved-image status = %#v", got.Status)
+		}
+		condition := meta.FindStatusCondition(got.Status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+		if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != corev1alpha1.RuntimePoolReasonRolloutFailed || !strings.Contains(condition.Message, "controller-approved") {
+			t.Fatalf("unapproved-image rollout condition = %#v, want False/RolloutFailed", condition)
 		}
 	})
 
@@ -2365,4 +2372,244 @@ func reflectStringMapEqual(left, right map[string]string) bool {
 		}
 	}
 	return true
+}
+
+func TestRuntimePoolReconcilerRolloutTimeoutRecyclesStrandedSessions(t *testing.T) {
+	scheme := runtimePoolTestScheme(t)
+	pool := runtimePoolTestObject(1)
+	supervisor := &fakeRuntimePoolSupervisorClient{}
+	now := runtimePoolTestNow
+	r := runtimePoolTestReconciler(t, scheme, supervisor, pool)
+	r.Now = func() time.Time { return now }
+	deployment, pod := runtimePoolTestStartServing(t, r, pool, supervisor, "stranded-pod", "stranded-pod-uid", "10.0.0.93", "stranded-boot")
+	oldRevision := deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation]
+	if active := runtimePoolTestGetPool(t, r, pool).Status.ActiveInstance; active == nil || active.RuntimePoolGeneration != pool.Generation {
+		t.Fatalf("active instance = %#v, want admitted generation %d recorded", active, pool.Generation)
+	}
+
+	r.ProviderProxy.BearerToken = bytes.Clone(runtimePoolTestProviderTokenNext)
+	runtimePoolReconcile(t, r, pool)
+	// The supervisor drained everything it could, but one session is parked
+	// in validating and can never retire on its own.
+	strandedProbe := func() RuntimePoolProbeResult {
+		probe := runtimePoolValidProbe(pool, &pod, "stranded-boot", true)
+		probe.Status.Pressure.ResidentSessions = 1
+		probe.Status.Sessions = []harnessv2.RuntimeSessionStatus{{
+			RuntimeSessionID: "rs-stranded", RuntimeSessionUID: "rs-stranded-uid", Generation: 1,
+			State: harnessv2.RuntimeSessionStateValidating, LastTransitionAt: now,
+		}}
+		return probe
+	}
+	supervisor.probe = strandedProbe()
+	now = now.Add(time.Duration(pool.Spec.ColdStartTimeoutSeconds+1) * time.Second)
+	runtimePoolReconcile(t, r, pool)
+	status := runtimePoolTestGetPool(t, r, pool).Status
+	condition := meta.FindStatusCondition(status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+	if status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDegraded || condition == nil || condition.Reason != runtimePoolRolloutReasonTimedOut {
+		t.Fatalf("first timeout status/condition = %s/%#v, want Degraded/RolloutTimedOut before recycling", status.Lifecycle, condition)
+	}
+	if !strings.Contains(status.Message, "1 stranded resident sessions remain") {
+		t.Fatalf("first timeout message = %q, want stranded-session recycle notice", status.Message)
+	}
+	if got := ptr.Deref(runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name).Spec.Replicas, -1); got != 1 {
+		t.Fatalf("replicas after the first timed-out observation = %d, want 1 (recycle needs a persisted timeout)", got)
+	}
+
+	// In-flight prompt work keeps preserving the old Pod even after the timeout persisted.
+	supervisor.probe = strandedProbe()
+	supervisor.probe.Status.Pressure.ActivePrompts = 1
+	supervisor.probe.Status.Sessions[0].State = harnessv2.RuntimeSessionStatePromptRunning
+	supervisor.probe.Status.Sessions[0].ActivePromptID = "prompt-live"
+	supervisor.probe.Status.ActivePrompts = []harnessv2.ActivePromptStatus{{
+		RuntimeSessionUID: "rs-stranded-uid", SessionGeneration: 1, TaskUID: "task-live", TaskAttempt: 1,
+		PromptID: "prompt-live", LeaseExpiresAt: now.Add(time.Minute), FrameSequence: 1, StartedAt: now,
+	}}
+	runtimePoolReconcile(t, r, pool)
+	status = runtimePoolTestGetPool(t, r, pool).Status
+	condition = meta.FindStatusCondition(status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+	if status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDegraded || condition == nil || condition.Reason != runtimePoolRolloutReasonTimedOut {
+		t.Fatalf("running-prompt status/condition = %s/%#v, want Degraded/RolloutTimedOut preserved", status.Lifecycle, condition)
+	}
+	if !strings.Contains(status.Message, "running prompts 1") {
+		t.Fatalf("running-prompt message = %q, want in-flight work detail", status.Message)
+	}
+	if got := ptr.Deref(runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name).Spec.Replicas, -1); got != 1 {
+		t.Fatalf("replicas while a prompt runs = %d, want 1", got)
+	}
+
+	// Once only the stranded session remains, the persisted timeout recycles the old Pod.
+	supervisor.probe = strandedProbe()
+	runtimePoolReconcile(t, r, pool)
+	status = runtimePoolTestGetPool(t, r, pool).Status
+	condition = meta.FindStatusCondition(status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+	if status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopping || status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
+		condition == nil || condition.Reason != runtimePoolRolloutReasonStopping {
+		t.Fatalf("recycle status/condition = %s/%s/%#v, want Stopping/Closed/RolloutStopping", status.Lifecycle, status.AdmissionState, condition)
+	}
+	if !strings.Contains(status.Message, "recycling the old runtime Pod") {
+		t.Fatalf("recycle message = %q, want recycle notice", status.Message)
+	}
+	deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
+	if ptr.Deref(deployment.Spec.Replicas, -1) != 0 || deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation] != oldRevision {
+		t.Fatal("recycle did not stop the old Deployment before replacing the template")
+	}
+
+	if err := r.Delete(context.Background(), &pod); err != nil {
+		t.Fatalf("delete recycled runtime Pod: %v", err)
+	}
+	runtimePoolReconcile(t, r, pool)
+	status = runtimePoolTestGetPool(t, r, pool).Status
+	if status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStarting || status.ActiveInstance != nil {
+		t.Fatalf("post-recycle status = %s/%#v, want Starting with no active instance", status.Lifecycle, status.ActiveInstance)
+	}
+	deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
+	if ptr.Deref(deployment.Spec.Replicas, -1) != 1 || deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation] == oldRevision {
+		t.Fatal("recycled pool did not start the new immutable template")
+	}
+}
+
+func TestRuntimePoolRolloutInstanceIsRecyclable(t *testing.T) {
+	quiescentCapacity := corev1alpha1.RuntimePoolCapacityStatus{}
+	base := func() harnessv2.StatusResponse {
+		return harnessv2.StatusResponse{
+			Lifecycle: harnessv2.SupervisorLifecycleDraining,
+			Drain:     harnessv2.DrainStatus{Requested: true},
+			Pressure:  harnessv2.PressureMetadata{ResidentSessions: 2},
+			Sessions: []harnessv2.RuntimeSessionStatus{
+				{RuntimeSessionUID: "a", State: harnessv2.RuntimeSessionStateValidating},
+				{RuntimeSessionUID: "b", State: harnessv2.RuntimeSessionStateIdle},
+			},
+		}
+	}
+	if !runtimePoolRolloutInstanceIsRecyclable(quiescentCapacity, base()) {
+		t.Fatal("stranded resident sessions without prompt work must be recyclable")
+	}
+	tests := []struct {
+		name     string
+		capacity corev1alpha1.RuntimePoolCapacityStatus
+		mutate   func(*harnessv2.StatusResponse)
+	}{
+		{name: "drain not requested", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Drain = harnessv2.DrainStatus{AcceptingNewSessions: true} }},
+		{name: "still accepting sessions", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Drain.AcceptingNewSessions = true }},
+		{name: "active prompt pressure", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Pressure.ActivePrompts = 1 }},
+		{name: "queued admission", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Pressure.QueuedAdmissions = 1 }},
+		{name: "pending permission", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Pressure.PendingPermissions = 1 }},
+		{name: "live descendant", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Pressure.LiveDescendants = 1 }},
+		{name: "active prompt record", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.ActivePrompts = []harnessv2.ActivePromptStatus{{PromptID: "p"}} }},
+		{name: "session active prompt", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[0].ActivePromptID = "p" }},
+		{name: "session finalization reservation", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].ReservedForFinalization = true }},
+		{name: "session live descendants", capacity: quiescentCapacity, mutate: func(s *harnessv2.StatusResponse) { s.Sessions[1].LiveDescendantCount = 1 }},
+		{name: "controller reservation", capacity: corev1alpha1.RuntimePoolCapacityStatus{ReservedPrompts: 1}, mutate: func(*harnessv2.StatusResponse) {}},
+		{name: "controller finalization", capacity: corev1alpha1.RuntimePoolCapacityStatus{FinalizingSessions: 1}, mutate: func(*harnessv2.StatusResponse) {}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status := base()
+			tt.mutate(&status)
+			if runtimePoolRolloutInstanceIsRecyclable(tt.capacity, status) {
+				t.Fatal("in-flight work must keep the timed-out instance preserved")
+			}
+		})
+	}
+}
+
+func TestRuntimePoolReconcilerRetiredImageDrainsAndStops(t *testing.T) {
+	retiredMessage := "spec.runtime.image is not the controller-approved image"
+	t.Run("live workload drains through authenticated barriers then reports Stopped", func(t *testing.T) {
+		scheme := runtimePoolTestScheme(t)
+		pool := runtimePoolTestObject(1)
+		supervisor := &fakeRuntimePoolSupervisorClient{}
+		r := runtimePoolTestReconciler(t, scheme, supervisor, pool)
+		deployment, pod := runtimePoolTestStartServing(t, r, pool, supervisor, "retired-pod", "retired-pod-uid", "10.0.0.94", "retired-boot")
+		oldRevision := deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation]
+
+		r.AllowedImages.Codex = "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
+		runtimePoolReconcile(t, r, pool)
+		status := runtimePoolTestGetPool(t, r, pool).Status
+		if status.Lifecycle != corev1alpha1.RuntimePoolLifecycleDraining || status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed {
+			t.Fatalf("retired status = %s/%s, want Draining/Closed", status.Lifecycle, status.AdmissionState)
+		}
+		if supervisor.drainCalls != 1 || supervisor.drainReason != "runtime_pool_rollout_"+runtimePoolRetiredImageTemplateRevision {
+			t.Fatalf("drain calls/reason = %d/%q, want one retired-image drain", supervisor.drainCalls, supervisor.drainReason)
+		}
+		admission := meta.FindStatusCondition(status.Conditions, corev1alpha1.RuntimePoolConditionAdmissionReady)
+		if admission == nil || admission.Status != metav1.ConditionFalse || !strings.Contains(admission.Message, retiredMessage) {
+			t.Fatalf("admission condition = %#v, want False with the retired-image reason", admission)
+		}
+		if status.ActiveInstance == nil || status.ActiveInstance.PodUID != string(pod.UID) {
+			t.Fatalf("active instance = %#v, want the drained exact instance retained for the upgrade drain", status.ActiveInstance)
+		}
+		deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
+		if ptr.Deref(deployment.Spec.Replicas, -1) != 1 || deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation] != oldRevision {
+			t.Fatal("retired-image drain request replaced or stopped the live workload before quiescence")
+		}
+
+		supervisor.probe = runtimePoolValidProbe(pool, &pod, "retired-boot", true)
+		runtimePoolReconcile(t, r, pool)
+		if got := runtimePoolTestGetPool(t, r, pool).Status.Lifecycle; got != corev1alpha1.RuntimePoolLifecycleQuiescent {
+			t.Fatalf("lifecycle after quiescent probe = %s, want Quiescent", got)
+		}
+		runtimePoolReconcile(t, r, pool)
+		if got := runtimePoolTestGetPool(t, r, pool).Status.Lifecycle; got != corev1alpha1.RuntimePoolLifecycleStopping {
+			t.Fatalf("lifecycle after persisted quiescence = %s, want Stopping", got)
+		}
+		deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
+		if ptr.Deref(deployment.Spec.Replicas, -1) != 0 || deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation] != oldRevision {
+			t.Fatal("retired-image stop re-rendered the Deployment template or left it running")
+		}
+
+		runtimePoolReconcile(t, r, pool)
+		status = runtimePoolTestGetPool(t, r, pool).Status
+		if status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopping || status.ActiveInstance != nil {
+			t.Fatalf("status while the retired Pod terminates = %s/%#v, want Stopping without an active instance", status.Lifecycle, status.ActiveInstance)
+		}
+		if err := r.Delete(context.Background(), &pod); err != nil {
+			t.Fatalf("delete retired runtime Pod: %v", err)
+		}
+		for range 2 {
+			runtimePoolReconcile(t, r, pool)
+			runtimePoolTestAssertRetiredStopped(t, r, pool, retiredMessage)
+		}
+		deployment = runtimePoolTestDeployment(t, r, pool.Namespace, deployment.Name)
+		if ptr.Deref(deployment.Spec.Replicas, -1) != 0 || deployment.Spec.Template.Annotations[runtimePoolTemplateRevisionAnnotation] != oldRevision {
+			t.Fatal("Stopped retired pool restarted or re-rendered its Deployment")
+		}
+		current := runtimePoolTestGetPool(t, r, pool)
+		if current.Spec.DesiredReplicas != 1 || current.Spec.Runtime.Image != pool.Spec.Runtime.Image {
+			t.Fatalf("retired pool spec = %#v, want it left untouched", current.Spec)
+		}
+	})
+
+	t.Run("pool without a workload reports Stopped immediately", func(t *testing.T) {
+		scheme := runtimePoolTestScheme(t)
+		pool := runtimePoolTestObject(1)
+		r := runtimePoolTestReconciler(t, scheme, &fakeRuntimePoolSupervisorClient{}, pool)
+		r.AllowedImages.Codex = "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
+		runtimePoolReconcile(t, r, pool)
+		runtimePoolTestAssertRetiredStopped(t, r, pool, retiredMessage)
+		var deployments appsv1.DeploymentList
+		if err := r.List(context.Background(), &deployments); err != nil {
+			t.Fatalf("list Deployments: %v", err)
+		}
+		if len(deployments.Items) != 0 {
+			t.Fatalf("retired pool rendered %d Deployments, want none", len(deployments.Items))
+		}
+	})
+}
+
+func runtimePoolTestAssertRetiredStopped(t *testing.T, r *RuntimePoolReconciler, pool *corev1alpha1.RuntimePool, retiredMessage string) {
+	t.Helper()
+	status := runtimePoolTestGetPool(t, r, pool).Status
+	if status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopped || status.AdmissionState != corev1alpha1.RuntimePoolAdmissionClosed ||
+		status.ActiveInstance != nil || status.CurrentReplicas != 0 || status.ObservedGeneration != pool.Generation {
+		t.Fatalf("retired status = %#v, want Stopped/Closed with no workload", status)
+	}
+	rollout := meta.FindStatusCondition(status.Conditions, corev1alpha1.RuntimePoolConditionRolloutReady)
+	if rollout == nil || rollout.Status != metav1.ConditionFalse || rollout.Reason != corev1alpha1.RuntimePoolReasonRolloutFailed ||
+		!strings.Contains(rollout.Message, retiredMessage) {
+		t.Fatalf("rollout condition = %#v, want False/RolloutFailed keeping the retired-image reason", rollout)
+	}
+	if !strings.Contains(status.Message, retiredMessage) {
+		t.Fatalf("status message = %q, want the retired-image reason", status.Message)
+	}
 }

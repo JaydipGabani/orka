@@ -993,3 +993,119 @@ func TestRuntimeSessionControlAvailableWithoutLeaseIsQuiescent(t *testing.T) {
 		t.Fatal("active Session mutation lease did not block planned drain")
 	}
 }
+
+func TestACPUpgradeDrainValidatesPreservedInstanceAgainstAdmittedGeneration(t *testing.T) {
+	tests := []struct {
+		name          string
+		mutate        func(*corev1alpha1.RuntimePool)
+		wantCompleted bool
+	}{
+		{
+			// A Recreate rollout that could not drain preserved the old Pod, which
+			// still advertises the generation it was admitted with, while the
+			// spec generation moved on. The planned drain must still observe and
+			// quiesce that exact instance instead of deadlocking on the fence.
+			name: "recorded admitted generation drains the preserved old-generation instance",
+			mutate: func(pool *corev1alpha1.RuntimePool) {
+				pool.Status.ActiveInstance.RuntimePoolGeneration = pool.Generation
+				pool.Generation += 2
+				pool.Status.ObservedGeneration = pool.Generation
+				pool.Status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDegraded
+				pool.Status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
+			},
+			wantCompleted: true,
+		},
+		{
+			name: "unrecorded admitted generation keeps the strict current-generation fence",
+			mutate: func(pool *corev1alpha1.RuntimePool) {
+				pool.Status.ActiveInstance.RuntimePoolGeneration = 0
+				pool.Generation += 2
+				pool.Status.ObservedGeneration = pool.Generation
+			},
+		},
+		{
+			name: "recorded admitted generation must match the advertised fence",
+			mutate: func(pool *corev1alpha1.RuntimePool) {
+				pool.Status.ActiveInstance.RuntimePoolGeneration = pool.Generation + 1
+				pool.Generation += 2
+				pool.Status.ObservedGeneration = pool.Generation
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := upgradeDrainTestScheme(t)
+			pool, pod, auth, supervisor := upgradeDrainRuntimePoolFixture(t)
+			tt.mutate(pool)
+			fence := store.ControllerEpochFence{Name: store.DefaultControllerEpochName, Epoch: 7, HolderID: "controller-7"}
+			epochRecord, epochLease := upgradeDrainEpochObjects(fence)
+			kubeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&corev1alpha1.RuntimePool{}).
+				WithObjects(pool, &pod, auth, epochRecord, epochLease).
+				Build()
+			options := testUpgradeDrainOptions()
+			options.Timeout = 60 * time.Millisecond
+			coordinator := NewACPUpgradeDrainCoordinator(
+				kubeClient,
+				kubeClient,
+				fixedUpgradeDrainEpochSource{fence: fence},
+				&fakeUpgradeDrainEpochStore{current: store.ControllerEpoch{Name: fence.Name, Epoch: fence.Epoch, HolderID: fence.HolderID}},
+				ACPUpgradeDrainBarrierObserverFunc(func(context.Context) (ACPUpgradeDrainBarrierSnapshot, error) {
+					return ACPUpgradeDrainBarrierSnapshot{}, nil
+				}),
+				NewACPAdmissionGate(),
+				options,
+			)
+			coordinator.SupervisorClient = supervisor
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			err := coordinator.Trigger(ctx)
+			marker, markerErr := ReadACPUpgradeDrainMarker(ctx, kubeClient, options.MarkerNamespace, fence.Name)
+			if markerErr != nil {
+				t.Fatalf("ReadACPUpgradeDrainMarker: %v", markerErr)
+			}
+			if !tt.wantCompleted {
+				if !errors.Is(err, ErrACPUpgradeDrainTimedOut) {
+					t.Fatalf("Trigger() error = %v, want safe timeout fallback", err)
+				}
+				if supervisor.drainCallCount() != 0 {
+					t.Fatalf("drain calls = %d, want 0 for a generation fence mismatch", supervisor.drainCallCount())
+				}
+				if marker.State == ACPUpgradeDrainMarkerCompleted {
+					t.Fatal("generation fence mismatch published a Completed marker")
+				}
+				if status := coordinator.Status(); !strings.Contains(status.LastError, "fenced to another RuntimePool generation") {
+					t.Fatalf("drain status last error = %q, want generation fence rejection", status.LastError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Trigger() error = %v, want nil", err)
+			}
+			if supervisor.drainCallCount() != 1 {
+				t.Fatalf("drain calls = %d, want 1", supervisor.drainCallCount())
+			}
+			if marker.State != ACPUpgradeDrainMarkerCompleted || !marker.Snapshot.Quiescent() {
+				t.Fatalf("marker = %#v, want quiescent Completed marker", marker)
+			}
+		})
+	}
+}
+
+func TestUpgradeDrainValidationTargetPrefersAdmittedGeneration(t *testing.T) {
+	pool := &corev1alpha1.RuntimePool{ObjectMeta: metav1.ObjectMeta{Generation: 5}}
+	if got := upgradeDrainValidationTarget(pool, nil); got != pool {
+		t.Fatal("nil active instance must validate against the current pool")
+	}
+	if got := upgradeDrainValidationTarget(pool, &corev1alpha1.RuntimePoolActiveInstanceStatus{}); got != pool {
+		t.Fatal("unrecorded admitted generation must validate against the current pool")
+	}
+	if got := upgradeDrainValidationTarget(pool, &corev1alpha1.RuntimePoolActiveInstanceStatus{RuntimePoolGeneration: 5}); got != pool {
+		t.Fatal("matching admitted generation must reuse the current pool")
+	}
+	got := upgradeDrainValidationTarget(pool, &corev1alpha1.RuntimePoolActiveInstanceStatus{RuntimePoolGeneration: 3})
+	if got == pool || got.Generation != 3 || pool.Generation != 5 {
+		t.Fatalf("validation target generation = %d (pool %d), want a copy at admitted generation 3", got.Generation, pool.Generation)
+	}
+}

@@ -66,6 +66,25 @@ Serving -> Draining -> Quiescent -> Stopping -> Stopped
 
 `Degraded` and `Ambiguous` close admission. Every mutating request is fenced by the controller epoch, pool UID/generation, exact runtime instance and supervisor boot ID, RuntimeSession UID/generation, operation ID, request digest, and expiry.
 
+A Recreate rollout (for example a runtime image rotation) drains the old
+instance through the same authenticated barriers. If the drain does not settle
+within `coldStartTimeoutSeconds`, the pool reports `RolloutTimedOut` and keeps
+the old instance while running prompts, pending permissions, live descendants,
+finalization reservations, or controller reservations remain. Once only
+stranded resident sessions are left (sessions the supervisor could not retire,
+such as one parked in `validating`), the next observation recycles the old
+instance so the new template can start; a pool never parks forever behind a
+timed-out drain. The active instance records the pool generation it was
+admitted with (`status.activeInstance.runtimePoolGeneration`), so a planned
+controller-upgrade drain can still validate and quiesce a preserved
+pre-rollout instance whose fence predates the current spec generation.
+
+A pool whose digest-pinned image is no longer the controller-approved image for
+its provider can never serve again (fresh demand is planned onto a pool named
+for the approved image). Such a pool drains and stops any workload it admitted
+before the rotation and then reports `Stopped` with `RolloutReady=False` and
+reason `RolloutFailed` explaining the retired image; it is safe to delete.
+
 Capacity reservations live in `RuntimePool.status` and use Kubernetes
 `resourceVersion` compare-and-swap. The dispatcher claims a resident/prompt slot
 before changing an attempt to `Reserved`, renews or converts it as work moves

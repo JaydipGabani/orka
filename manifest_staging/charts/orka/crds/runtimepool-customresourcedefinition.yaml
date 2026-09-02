@@ -505,6 +505,16 @@ spec:
                     maxLength: 253
                     minLength: 1
                     type: string
+                  runtimePoolGeneration:
+                    description: |-
+                      RuntimePoolGeneration is the RuntimePool spec generation this instance
+                      was admitted with and advertises in its supervisor fence. A Recreate
+                      rollout that cannot drain preserves the pre-rollout instance while the
+                      spec generation moves on, so authenticated drains validate the exact
+                      instance against this admitted generation rather than the current one.
+                    format: int64
+                    minimum: 1
+                    type: integer
                 required:
                 - bootID
                 - controllerEpoch

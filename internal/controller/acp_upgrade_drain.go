@@ -797,7 +797,7 @@ func (c *ACPUpgradeDrainCoordinator) observeAndDrainRuntimeInstance(
 	if err != nil {
 		return err
 	}
-	observed, err := validateRuntimePoolProbe(pool, cfg, pod, probe, c.now())
+	observed, err := validateRuntimePoolProbe(upgradeDrainValidationTarget(pool, active), cfg, pod, probe, c.now())
 	if err != nil {
 		return fmt.Errorf("validate authenticated supervisor probe: %w", err)
 	}
@@ -822,6 +822,26 @@ func (c *ACPUpgradeDrainCoordinator) observeAndDrainRuntimeInstance(
 		return fmt.Errorf("authenticated supervisor is still draining")
 	}
 	return nil
+}
+
+// upgradeDrainValidationTarget validates the exact active instance against the
+// RuntimePool generation it was admitted with. A Recreate rollout that could
+// not drain preserves the pre-rollout instance while the spec generation moves
+// on, and the planned drain's own desiredReplicas=0 patch moves it again; the
+// instance identity (Pod UID, supervisor boot, instance ID, pool UID, epoch,
+// profile) stays exact while only the fenced generation is allowed to be the
+// admitted one. An active instance without a recorded generation keeps the
+// strict current-generation check.
+func upgradeDrainValidationTarget(
+	pool *corev1alpha1.RuntimePool,
+	active *corev1alpha1.RuntimePoolActiveInstanceStatus,
+) *corev1alpha1.RuntimePool {
+	if pool == nil || active == nil || active.RuntimePoolGeneration <= 0 || active.RuntimePoolGeneration == pool.Generation {
+		return pool
+	}
+	target := pool.DeepCopy()
+	target.Generation = active.RuntimePoolGeneration
+	return target
 }
 
 func upgradeDrainSubstrateInstancePod(

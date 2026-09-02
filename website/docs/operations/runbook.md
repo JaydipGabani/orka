@@ -66,7 +66,9 @@ deletion the safe, general remedy when a pool wedges.
 
 | Symptom | What it means | Remedy |
 |---|---|---|
-| Pool status shows `RolloutTimedOut` or `RolloutFailed` and never recovers | The pool latched a failed rollout (for example, an image that could not be pulled, or an interrupted deploy) and will not retry on its own | Fix the underlying cause if there is one (image digest, registry access), then **delete the RuntimePool**; the controller recreates it on demand |
+| Pool status shows `RolloutTimedOut` with in-flight work listed in the message | The rollout drain did not settle in time and the old instance is kept while running prompts, pending permissions, live descendants, or reservations finish | Wait; the message lists what is still in flight. Once only stranded resident sessions remain, the controller recycles the old instance on its own and the rollout continues |
+| Pool status shows `Stopped` with `RolloutReady=False/RolloutFailed` mentioning "not the controller-approved image" | The pool's image digest was superseded by a deploy; the controller drained and stopped its old workload and will never start it again | Nothing required. Delete the RuntimePool when convenient; new tasks already use a pool named for the approved image |
+| Pool status shows `RolloutFailed` and never recovers | The pool latched a failed rollout (for example, an image that could not be pulled, or an interrupted deploy) and will not retry on its own | Fix the underlying cause if there is one (image digest, registry access), then **delete the RuntimePool**; the controller recreates it on demand |
 | A deleted or superseded pool keeps coming back with an old image digest | A queued or running Task still references the old profile, and the controller faithfully rebuilds the pool that task asked for | Find and delete (or cancel) the stale Task first, then delete the pool |
 | Tasks queue forever with no runtime Pod appearing | The pool exists but is not `Serving`/`Accepting` | `kubectl describe` the pool for its condition message, then apply the row above that matches |
 
@@ -96,7 +98,8 @@ new run is refused while another is `pending` or `running`. Two consequences:
 |---|---|---|
 | Controller Pod `Pending` with `Multi-Attach error` | `kubectl get deploy` replica count — scale back to 1 | [One active controller](#one-active-controller-by-design) |
 | Task message mentions "settled from the durable attempt record" | Nothing — informational; check the task's final phase | [Running work during a restart](#what-happens-to-running-work-during-a-restart-or-deploy) |
-| Pool stuck `RolloutTimedOut` / `RolloutFailed` | Pool conditions, then delete the pool | [RuntimePool recovery](#runtimepool-recovery) |
+| Pool `RolloutTimedOut` | Pool message for the in-flight work it is waiting on; it recycles on its own once only stranded sessions remain | [RuntimePool recovery](#runtimepool-recovery) |
+| Pool stuck `RolloutFailed` | Pool conditions, then delete the pool (a `Stopped` retired-image pool needs no action) | [RuntimePool recovery](#runtimepool-recovery) |
 | Old-digest pool resurrects after deletion | Queued Tasks referencing the old profile | [RuntimePool recovery](#runtimepool-recovery) |
 | `409 already running` starting a scan | Wait a few seconds and retry | [Security scan operations](#security-scan-operations) |
 | Scan failed with "terminal task result was not found" | Was one of its Tasks deleted mid-run? | [Security scan operations](#security-scan-operations) |
