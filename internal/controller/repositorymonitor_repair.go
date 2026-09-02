@@ -351,7 +351,7 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorUpdateBranchRequiresRecon
 	if err != nil {
 		return false, err
 	}
-	return mutation.Status == repositoryMonitorAutomergeStatePending || mutation.Status == repositoryMonitorRunPhaseSucceeded, nil
+	return mutation.Status == repositoryMonitorAutomergeStateStarted || mutation.Status == repositoryMonitorAutomergeStatePending || mutation.Status == repositoryMonitorRunPhaseSucceeded, nil
 }
 
 func repositoryMonitorUpdateBranchMutationMismatch(mutation *store.GitHubMutationRecord, command *store.CommandEvent, pr repositoryMonitorPullRequest) string {

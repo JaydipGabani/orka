@@ -2207,7 +2207,7 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 			if _, skip := excluded[candidate.ID]; skip {
 				continue
 			}
-			if !findingTargetKeyMatches(targetKey, candidate.TargetKey) {
+			if !findingTargetKeyMatches(scan, targetKey, &candidate) {
 				continue
 			}
 			if findingIdentityMatchScore(finding, &candidate) < 2 {
@@ -2228,7 +2228,7 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 				if canonical.RepositoryScan != scan.Name {
 					return nil, fmt.Errorf("finding duplicate %s points outside repository scan %s", candidate.ID, scan.Name)
 				}
-				if !findingTargetKeyMatches(targetKey, canonical.TargetKey) {
+				if !findingTargetKeyMatches(scan, targetKey, canonical) {
 					targetMatches = false
 					break
 				}
@@ -2263,8 +2263,44 @@ func (r *RepositoryScanReconciler) semanticFindingMatches(ctx context.Context, s
 	return matches, nil
 }
 
-func findingTargetKeyMatches(targetKey, candidateTargetKey string) bool {
-	return targetKey == "" || strings.TrimSpace(candidateTargetKey) == targetKey
+func findingTargetKeyMatches(scan *corev1alpha1.RepositoryScan, targetKey string, candidate *store.Finding) bool {
+	if candidate == nil {
+		return false
+	}
+	targetKey = strings.TrimSpace(targetKey)
+	if targetKey == "" {
+		return true
+	}
+	if candidateTargetKey := strings.TrimSpace(candidate.TargetKey); candidateTargetKey != "" {
+		return candidateTargetKey == targetKey
+	}
+
+	repo := trustedFindingsRepository(scan, nil)
+	if security.FindingV2TargetKey(repo.RepoURL, repo.Branch, repo.SubPath) != targetKey {
+		return false
+	}
+	evidence := make([]security.FindingsV2EvidenceRef, 0, len(candidate.Evidence))
+	for _, storedRef := range candidate.Evidence {
+		ref := security.FindingsV2EvidenceRef{
+			Path:      storedRef.Path,
+			StartLine: storedRef.StartLine,
+			EndLine:   storedRef.EndLine,
+		}
+		if symbol := strings.TrimSpace(storedRef.Symbol); symbol != "" {
+			ref.Symbol = &symbol
+		}
+		evidence = append(evidence, ref)
+	}
+	legacyFingerprint := security.FindingV2Fingerprint(
+		candidate.Namespace,
+		candidate.RepositoryScan,
+		repo.RepoURL,
+		repo.Branch,
+		repo.SubPath,
+		candidate.SliceID,
+		security.FindingsV2Finding{Title: candidate.Title, Category: candidate.Category, Evidence: evidence},
+	)
+	return candidate.Fingerprint == legacyFingerprint
 }
 
 func canonicalFinding(matches []store.Finding) *store.Finding {
@@ -2673,8 +2709,11 @@ func (r *RepositoryScanReconciler) repositoryScanReviewedSlicesForResolution(ctx
 	}
 }
 
-func findingEligibleForMergedResolution(finding *store.Finding, run *store.ScanRun, inconclusiveSlices, reviewedSlices map[string]struct{}, allSlicesInconclusive bool) bool {
+func findingEligibleForMergedResolution(finding *store.Finding, run *store.ScanRun, targetKey string, inconclusiveSlices, reviewedSlices map[string]struct{}, allSlicesInconclusive bool) bool {
 	if finding == nil || finding.ScanRunID == run.ID || finding.PRNumber == nil || *finding.PRNumber < 1 {
+		return false
+	}
+	if strings.TrimSpace(finding.TargetKey) != strings.TrimSpace(targetKey) {
 		return false
 	}
 	sliceID := strings.TrimSpace(finding.SliceID)
@@ -2749,9 +2788,11 @@ func (r *RepositoryScanReconciler) resolveMergedFindingsNotObserved(ctx context.
 	if err != nil {
 		return err
 	}
+	currentTarget := trustedFindingsRepository(scan, run)
+	targetKey := security.FindingV2TargetKey(currentTarget.RepoURL, currentTarget.Branch, currentTarget.SubPath)
 	for i := range findings {
 		finding := &findings[i]
-		if !findingEligibleForMergedResolution(finding, run, inconclusiveSlices, reviewedSlices, allSlicesInconclusive) {
+		if !findingEligibleForMergedResolution(finding, run, targetKey, inconclusiveSlices, reviewedSlices, allSlicesInconclusive) {
 			continue
 		}
 		prNumber := *finding.PRNumber
