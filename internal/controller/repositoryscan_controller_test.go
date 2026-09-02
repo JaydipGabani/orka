@@ -5751,24 +5751,42 @@ func TestEnqueueAutoValidationTasksScopesActiveTaskToFindingOccurrence(t *testin
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, priorTask).Build()
 	securityStore := setupControllerSQLiteStore(t)
-	finding := &storepkg.Finding{
+	priorFinding := &storepkg.Finding{
 		ID:               "fnd_reopened",
 		Namespace:        defaultNS,
 		RepositoryScan:   scan.Name,
-		ScanRunID:        "scan_current",
+		ScanRunID:        "scan_old",
 		Fingerprint:      "reopened-finding",
 		Title:            "Reopened finding",
 		Severity:         "high",
 		Confidence:       "high",
-		ValidationStatus: "unvalidated",
+		ValidationStatus: findingValidationStatusPending,
+		ValidationJSON:   `{"status":"pending"}`,
 		State:            findingStateOpen,
 	}
-	if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+	if err := securityStore.UpsertFinding(ctx, priorFinding); err != nil {
 		t.Fatalf("UpsertFinding() error = %v", err)
 	}
 	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore}
+	finding := *priorFinding
+	finding.ScanRunID = "scan_current"
+	finding.ValidationStatus = "unvalidated"
+	finding.ValidationJSON = ""
+	if err := reconciler.mergeExistingFinding(ctx, scan, &finding); err != nil {
+		t.Fatalf("mergeExistingFinding() error = %v", err)
+	}
+	if err := securityStore.UpsertObservedFinding(ctx, &finding); err != nil {
+		t.Fatalf("UpsertObservedFinding() error = %v", err)
+	}
+	if finding.ValidationStatus != "unvalidated" || finding.ValidationJSON != "" {
+		t.Fatalf("current validation = %q/%q, want prior pending state reset", finding.ValidationStatus, finding.ValidationJSON)
+	}
+	observed, err := securityStore.GetFinding(ctx, defaultNS, finding.ID)
+	if err != nil || observed.ScanRunID != finding.ScanRunID || observed.ValidationStatus != "unvalidated" || observed.ValidationJSON != "" {
+		t.Fatalf("observed finding = %#v, err %v, want current occurrence unvalidated", observed, err)
+	}
 
-	if err := reconciler.enqueueAutoValidationTasks(ctx, scan, []*storepkg.Finding{finding}); err != nil {
+	if err := reconciler.enqueueAutoValidationTasks(ctx, scan, []*storepkg.Finding{&finding}); err != nil {
 		t.Fatalf("enqueueAutoValidationTasks() error = %v", err)
 	}
 	var tasks corev1alpha1.TaskList

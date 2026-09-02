@@ -3772,6 +3772,10 @@ func mergeFindingValidationState(target, source *store.Finding) {
 	if target == nil || source == nil {
 		return
 	}
+	if source.ValidationStatus == findingValidationStatusPending &&
+		strings.TrimSpace(source.ScanRunID) != strings.TrimSpace(target.ScanRunID) {
+		return
+	}
 	if findingValidationStatusRank(source.ValidationStatus) < findingValidationStatusRank(target.ValidationStatus) {
 		return
 	}
