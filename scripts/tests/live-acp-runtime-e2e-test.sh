@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# scripts/tests suites rely on 'set -e' stopping on failed (( )) arithmetic,
+# which macOS's stock bash 3.2 does not honor; failures would be silently
+# masked there. Require a modern bash (for example: brew install bash).
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "error: this test suite requires bash >= 4; found ${BASH_VERSION}" >&2
+  exit 1
+fi
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="${root}/scripts/live-acp-runtime-e2e.sh"
 export ACP_E2E_OPENCODE_CONTEXT_WINDOW=32768
@@ -179,6 +187,34 @@ grep -F 'wait_until "RuntimePool/${pool} stopped after phase parking" "${state_w
 grep -F 'wait_pool_serving "${pool}"' "${script}" >/dev/null
 
 printf '%s\n' 'ok - profile-specific RuntimePools are parked and resumed in capacity-safe order'
+
+mutation_allowed_body="$(awk '/^runtimepool_mutations_allowed\(\) \{/,/^\}$/' "${script}")"
+require_mutation_body="$(awk '/^require_runtimepool_mutation_scope\(\) \{/,/^\}$/' "${script}")"
+[[ -n "${mutation_allowed_body}" && -n "${require_mutation_body}" ]] || {
+  echo "shared RuntimePool mutation guards are missing" >&2
+  exit 1
+}
+eval "${mutation_allowed_body}"
+eval "${require_mutation_body}"
+namespace="shared-namespace"
+namespace_shared=1
+shared_pool_mutation_allowed=0
+warn() { :; }
+if runtimepool_mutations_allowed || require_runtimepool_mutation_scope; then
+  echo "shared namespace permitted RuntimePool mutation without an isolated-cluster opt-in" >&2
+  exit 1
+fi
+shared_pool_mutation_allowed=1
+runtimepool_mutations_allowed
+require_runtimepool_mutation_scope
+namespace_shared=0
+shared_pool_mutation_allowed=0
+runtimepool_mutations_allowed
+require_runtimepool_mutation_scope
+grep -F 'Shared watch namespace: skipping controller restart and RuntimePool parking, resume, and replacement checks' "${script}" >/dev/null
+grep -F 'RELEASE_GATE=1 requires an isolated namespace or ACP_E2E_ALLOW_SHARED_POOL_MUTATION=1 on a dedicated cluster' "${script}" >/dev/null
+
+printf '%s\n' 'ok - shared namespaces fail closed for RuntimePool mutations unless a dedicated cluster is explicit'
 
 
 profile_valid_body="$(awk '/^pool_profile_projection_valid\(\) \{/,/^\}$/' "${script}")"
@@ -569,6 +605,66 @@ EOF
     exit 1
   fi
 )
+
+(
+  eval "${provider_handoff_body}"
+  handoff_root="$(mktemp -d "${TMPDIR:-/tmp}/orka-provider-handoff-shared-test.XXXXXX")"
+  trap 'rm -rf "${handoff_root}"' EXIT
+  temp_root="${handoff_root}"
+  namespace="test-namespace"
+  # shellcheck disable=SC2034 # Consumed by remove_provider_resources from the evaluated script body.
+  run_id="test-run"
+  # shellcheck disable=SC2034 # Consumed by remove_provider_resources from the evaluated script body.
+  state_wait_seconds=37
+  # shellcheck disable=SC2034 # Shared watch-namespace mode is the branch under test.
+  namespace_shared=1
+  events_file="${handoff_root}/events"
+  expected_file="${handoff_root}/expected"
+  : >"${events_file}"
+
+  log() { printf 'log:%s\n' "$1" >>"${events_file}"; }
+  assert_all_tasks_validated() { :; }
+  record_runtime_namespace() { printf 'record-runtime-namespace:%s\n' "$1" >>"${events_file}"; }
+  pool_stopped() { printf 'pool-stopped:%s\n' "$1" >>"${events_file}"; }
+  wait_until() { printf 'wait:%s\n' "$1" >>"${events_file}"; }
+  delete_test_branchclaims() { printf 'delete-branchclaims:%s\n' "$1" >>"${events_file}"; }
+  die() {
+    printf 'unexpected die: %s\n' "$*" >&2
+    return 1
+  }
+  k() {
+    if [[ "$*" == "-n ${namespace} get task -l orka.ai/acp-e2e-run=test-run -o json" ]]; then
+      printf '%s\n' '{"items":[{"metadata":{"uid":"run-task-uid"},"status":{"execution":{"runtimeSessionUID":"run-session-uid"}}}]}'
+      return 0
+    fi
+    if [[ "$*" == "-n ${namespace} get task -o json" || "$*" == "-n ${namespace} get runtimepool -o json" ]]; then
+      printf 'unexpected namespace-wide read: %s\n' "$*" >&2
+      return 1
+    fi
+    printf 'kubectl:%s\n' "$*" >>"${events_file}"
+  }
+
+  remove_provider_resources codex codex-agent
+
+  cat >"${expected_file}" <<EOF
+log:Removing codex Tasks, Agents, and RuntimePools before the next provider
+kubectl:-n test-namespace delete task -l orka.ai/acp-e2e-run=test-run --wait=true --timeout=5m
+log:Shared watch namespace: leaving codex RuntimePools to the controller idle policy
+kubectl:-n test-namespace delete agent codex-agent --ignore-not-found=true --wait=true --timeout=2m
+delete-branchclaims:${handoff_root}/provider-codex-owner-uids.txt
+EOF
+  if ! cmp -s "${expected_file}" "${events_file}"; then
+    echo "shared-namespace provider handoff must delete only run-labeled Tasks and leave RuntimePools alone" >&2
+    diff -u "${expected_file}" "${events_file}" >&2 || true
+    exit 1
+  fi
+  if ! grep -q 'run-task-uid' "${handoff_root}/provider-codex-owner-uids.txt"; then
+    echo "shared-namespace provider handoff must record run-owned Task owners for BranchClaim cleanup" >&2
+    exit 1
+  fi
+)
+
+printf '%s\n' 'ok - shared watch-namespace provider handoff removes only run-owned Tasks and Agents'
 
 provider_remove_line="$(line_of_script 'remove_provider_resources codex "${codex_agent}" "${codex_tool_agent}"')"
 provider_children_line="$(line_of_script 'wait_until "Codex runtime children removal" 300 runtime_children_absent')"

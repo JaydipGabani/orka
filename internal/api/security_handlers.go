@@ -493,33 +493,45 @@ func (h *Handlers) ListRepositoryScans(c fiber.Ctx) error {
 	opts.Limit = pagination.Limit
 	opts.Continue = pagination.Continue
 
-	list := &corev1alpha1.RepositoryScanList{}
-	if err := h.client.List(c.Context(), list, opts); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list repository scans: %v", err))
-	}
-
-	items := list.Items
 	filteredList := false
-	if h.contextTokenAuthorization.Enabled() {
-		filtered := make([]corev1alpha1.RepositoryScan, 0, len(list.Items))
-		for i := range list.Items {
-			scan := &list.Items[i]
-			if h.contextTokenSecurityScanAllowed(c, scan, scan.Spec.AnalysisAgentRef) {
-				filtered = append(filtered, *scan)
-			}
+	var remainingItemCount *int64
+	items, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string, pageLimit int64) ([]corev1alpha1.RepositoryScan, string, error) {
+		list := &corev1alpha1.RepositoryScanList{}
+		pageOpts := *opts
+		pageOpts.Continue = continueToken
+		pageOpts.Limit = pageLimit
+		if err := h.listPage(c.Context(), list, &pageOpts, "repository scans"); err != nil {
+			return nil, "", err
 		}
-		filteredList = len(filtered) != len(list.Items)
-		items = filtered
+		remainingItemCount = list.RemainingItemCount
+		items := list.Items
+		if h.contextTokenAuthorization.Enabled() {
+			filtered := make([]corev1alpha1.RepositoryScan, 0, len(list.Items))
+			for i := range list.Items {
+				scan := &list.Items[i]
+				if h.contextTokenSecurityScanAllowed(c, scan, scan.Spec.AnalysisAgentRef) {
+					filtered = append(filtered, *scan)
+				}
+			}
+			if len(filtered) != len(list.Items) {
+				filteredList = true
+			}
+			items = filtered
+		}
+		return items, list.Continue, nil
+	})
+	if err != nil {
+		return err
 	}
-	remainingItemCount := list.RemainingItemCount
 	if filteredList {
+		// The raw count describes scans the caller is not allowed to see.
 		remainingItemCount = nil
 	}
 
 	return c.JSON(ListResponse{
 		Items: items,
 		Metadata: ListMeta{
-			Continue:           list.Continue,
+			Continue:           NormalizeListContinue(continueToken),
 			RemainingItemCount: remainingItemCount,
 		},
 	})

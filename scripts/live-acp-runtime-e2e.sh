@@ -27,6 +27,8 @@ Modes:
 Common environment:
   ACP_E2E_NAMESPACE                  Unique test namespace
   ACP_E2E_KEEP_RESOURCES=1           Preserve Kubernetes resources after the run
+  ACP_E2E_ALLOW_SHARED_POOL_MUTATION=1
+                                      Allow destructive pool checks in a known-isolated shared namespace
   ACP_E2E_REPO                       Public GitHub read repository URL
   ACP_E2E_REF                        Immutable read repository commit SHA
   ACP_E2E_CODEX_MODEL                Codex model (default: gpt-5.4)
@@ -38,6 +40,7 @@ Common environment:
   ACP_E2E_CONCURRENCY_TASKS          Concurrent Codex task count (default: 6)
   ACP_E2E_REQUIRE_PARALLEL=1         Require >=2 running prompts in smoke; release always requires it
   ACP_E2E_BLOCKING_PROMPT            Prompt that remains Running long enough to cancel
+  ACP_E2E_TASK_MAX_TURNS             Provider inference-request budget per Task (default 24)
   ACP_E2E_TIMEOUT_DURATION           Task timeout; Running must be observed before expiry (default: 90s)
   ACP_E2E_CANCEL_SETTLE_SECONDS      Explicit-cancel settlement bound (default: 120)
   ACP_E2E_WAIT_SECONDS               Terminal wait bound (default: 900)
@@ -229,7 +232,11 @@ keep_resources="${ACP_E2E_KEEP_RESOURCES:-0}"
 require_parallel="${ACP_E2E_REQUIRE_PARALLEL:-1}"
 timeout_duration="${ACP_E2E_TIMEOUT_DURATION:-90s}"
 cancel_settle_seconds="${ACP_E2E_CANCEL_SETTLE_SECONDS:-120}"
-blocking_prompt="${ACP_E2E_BLOCKING_PROMPT:-Immediately use the Bash tool to run sleep 180. Do not return a final answer before the command completes. Do not modify repository files.}"
+blocking_prompt="${ACP_E2E_BLOCKING_PROMPT:-Immediately use the Bash tool to run sleep 180 with a command timeout of at least 240 seconds (timeout_ms 240000). Do not return a final answer before the command completes. Do not modify repository files.}"
+# Real agents may spend one inference request per file read or per retried
+# sleep, so the per-Task budget is twice what the prompts below need on a good
+# day; Task timeouts still bound every stage.
+task_max_turns="${ACP_E2E_TASK_MAX_TURNS:-24}"
 long_prompt="${ACP_E2E_LONG_PROMPT:-Read LICENSE, NOTICE.md, go.mod, Makefile, and the first ten Go source files you find. Compare their purpose and provide a detailed evidence-backed summary. Do not modify files.}"
 api_local_port="${ACP_E2E_API_LOCAL_PORT:-$((20000 + ($$ % 20000)))}"
 
@@ -328,6 +335,11 @@ chmod 700 "${temp_root}"
 namespace_create_attempted=0
 namespace_created=0
 namespace_shared=0
+shared_pool_mutation_allowed=0
+shared_mutation_checks_skipped=0
+if bool_env "${ACP_E2E_ALLOW_SHARED_POOL_MUTATION:-0}"; then
+  shared_pool_mutation_allowed=1
+fi
 namespace_uid=""
 api_forward_pid=""
 api_token_file="${temp_root}/api-token"
@@ -359,6 +371,18 @@ record_runtime_namespace() {
     [[ "${existing}" == "${candidate}" ]] && return 0
   done
   runtime_namespaces_seen+=("${candidate}")
+}
+
+runtimepool_mutations_allowed() {
+  [[ "${namespace_shared:-0}" -ne 1 || "${shared_pool_mutation_allowed:-0}" -eq 1 ]]
+}
+
+require_runtimepool_mutation_scope() {
+  if runtimepool_mutations_allowed; then
+    return 0
+  fi
+  warn "refusing RuntimePool or controller mutation in shared namespace ${namespace}; use an isolated namespace or explicitly allow shared pool mutation only on a dedicated cluster"
+  return 1
 }
 
 namespace_probe_state=""
@@ -795,10 +819,15 @@ settle_and_delete_test_tasks() {
   local inventory_file="${temp_root}/cleanup-tasks.tsv"
   local name uid session_uid current_uid
   : >"${owners_file}"
-  k -n "${namespace}" get task -o json >"${tasks_file}" || return 1
-  if ! jq -e --arg run "${run_id}" 'all(.items[]; .metadata.labels["orka.ai/acp-e2e-run"] == $run)' "${tasks_file}" >/dev/null; then
-    warn "test namespace contains a Task not owned by release-gate run ${run_id}"
-    return 1
+  if [[ "${namespace_shared:-0}" -eq 1 ]]; then
+    # Shared watch-namespace mode: settle and delete only this run's Tasks.
+    k -n "${namespace}" get task -l "orka.ai/acp-e2e-run=${run_id}" -o json >"${tasks_file}" || return 1
+  else
+    k -n "${namespace}" get task -o json >"${tasks_file}" || return 1
+    if ! jq -e --arg run "${run_id}" 'all(.items[]; .metadata.labels["orka.ai/acp-e2e-run"] == $run)' "${tasks_file}" >/dev/null; then
+      warn "test namespace contains a Task not owned by release-gate run ${run_id}"
+      return 1
+    fi
   fi
   jq -r '.items[] | [.metadata.name, .metadata.uid, (.status.execution.runtimeSessionUID // "")] | @tsv' \
     "${tasks_file}" >"${inventory_file}"
@@ -842,8 +871,19 @@ settle_and_delete_test_tasks() {
 
 delete_test_agents() {
   local agents_file="${temp_root}/cleanup-agents.json"
+  local agent
   k -n "${namespace}" get agent -o json >"${agents_file}" || return 1
-  if ! jq -e --arg run "${run_id}" 'all(.items[]; (.metadata.name | endswith($run)))' "${agents_file}" >/dev/null; then
+  if [[ "${namespace_shared:-0}" -eq 1 ]]; then
+    # Shared watch-namespace mode: only Agents this run labeled as its own
+    # are removed; a name-suffix match could select unrelated Agents (a
+    # short run id such as "test" would also match "latest").
+    while IFS= read -r agent; do
+      [[ -n "${agent}" ]] || continue
+      k -n "${namespace}" delete agent "${agent}" --ignore-not-found=true --wait=true --timeout=2m >/dev/null || return 1
+    done < <(jq -r --arg run "${run_id}" '.items[] | select(.metadata.labels["orka.ai/acp-e2e-run"] == $run) | .metadata.name' "${agents_file}")
+    return 0
+  fi
+  if ! jq -e --arg run "${run_id}" 'all(.items[]; .metadata.labels["orka.ai/acp-e2e-run"] == $run)' "${agents_file}" >/dev/null; then
     warn "test namespace contains an Agent not owned by release-gate run ${run_id}"
     return 1
   fi
@@ -851,6 +891,7 @@ delete_test_agents() {
 }
 
 stop_and_delete_test_runtimepools() {
+  require_runtimepool_mutation_scope || return 1
   local pools_file="${temp_root}/cleanup-runtimepools.json"
   local inventory_file="${temp_root}/cleanup-runtimepools.tsv"
   local name uid runtime_ns current_uid
@@ -930,15 +971,20 @@ delete_test_namespace_now() {
   log "Settling run-owned Tasks before namespace teardown"
   settle_and_delete_test_tasks "${owners_file}" || return 1
   delete_test_agents || return 1
-  stop_and_delete_test_runtimepools || return 1
-  if ! wait_until "runtime children for ${namespace} to be removed" 300 runtime_children_absent; then
-    warn "runtime children remain or could not be listed before namespace teardown"
-    runtime_children_for_test_namespace 2>&1 | redact >&2
-    return 1
+  if [[ "${namespace_shared:-0}" -eq 1 ]]; then
+    # RuntimePools are profile-keyed and may serve unrelated Agents in a
+    # shared namespace; the controller's idle policy retires them.
+    log "Shared watch namespace: leaving ${namespace} RuntimePools to the controller idle policy"
+  else
+    stop_and_delete_test_runtimepools || return 1
+    if ! wait_until "runtime children for ${namespace} to be removed" 300 runtime_children_absent; then
+      warn "runtime children remain or could not be listed before namespace teardown"
+      runtime_children_for_test_namespace 2>&1 | redact >&2
+      return 1
+    fi
   fi
   delete_test_branchclaims "${owners_file}" || return 1
-
-  if [[ "${namespace_shared}" -eq 1 ]]; then
+  if [[ "${namespace_shared:-0}" -eq 1 ]]; then
     log "Leaving shared namespace ${namespace} in place after run-resource cleanup"
     return 0
   fi
@@ -1469,12 +1515,13 @@ apply_agent() {
   local provider="$1"
   local model="$2"
   local name="$3"
-  local max_turns="${4:-12}"
+  local max_turns="${4:-${task_max_turns}}"
   local allow_bash="${5:-false}"
   jq -n \
     --arg provider "${provider}" \
     --arg model "${model}" \
     --arg name "${name}" \
+    --arg run "${run_id}" \
     --argjson maxTurns "${max_turns}" \
     --argjson allowBash "${allow_bash}" \
     --argjson opencodeContextWindow "${opencode_context_window}" \
@@ -1482,7 +1529,7 @@ apply_agent() {
     '{
       apiVersion:"core.orka.ai/v1alpha1",
       kind:"Agent",
-      metadata:{name:$name},
+      metadata:{name:$name,labels:{"orka.ai/acp-e2e-run":$run,"app.kubernetes.io/managed-by":"live-acp-runtime-e2e"}},
       spec:{
         runtime:({
           type:$provider,
@@ -1532,6 +1579,7 @@ apply_read_task() {
     --arg timeout "${timeout}" \
     --arg provider "${provider}" \
     --argjson create "${create}" \
+    --argjson maxTurns "${task_max_turns}" \
     --argjson allowBash "${allow_bash}" \
     '{
       apiVersion:"core.orka.ai/v1alpha1",
@@ -1543,7 +1591,7 @@ apply_read_task() {
         prompt:$prompt,
         workspace:({intent:"read",gitRepo:$repo,ref:$ref} +
           (if ($identity|length)>0 then {sourceRepository:{provider:"github",id:$identity}} else {} end)),
-        agentRuntime:({maxTurns:12} + (
+        agentRuntime:({maxTurns:$maxTurns} + (
           if $provider == "codex" and $allowBash then {} else {
             allowBash:$allowBash,
             allowedTools:(if $allowBash then ["Read","Glob","Grep","Bash"] else ["Read","Glob","Grep"] end)
@@ -1824,6 +1872,7 @@ pool_stopped() {
 
 park_runtimepool() {
   local pool="$1"
+  require_runtimepool_mutation_scope || return 1
   log "Parking RuntimePool/${pool} between profile-specific ACP checks"
   k -n "${namespace}" patch runtimepool "${pool}" --type=merge \
     -p '{"spec":{"desiredReplicas":0}}' >/dev/null
@@ -1834,6 +1883,7 @@ park_provider_runtimepools_except() {
   local provider="$1"
   local keep_pool="$2"
   local pools pool
+  require_runtimepool_mutation_scope || return 1
   pools="$(k -n "${namespace}" get runtimepool -o json | jq -r \
     --arg provider "${provider}" --arg keep "${keep_pool}" \
     '.items[] | select(.metadata.name != $keep and .spec.runtime.profile.providerKind == $provider) | .metadata.name')"
@@ -1846,6 +1896,7 @@ park_provider_runtimepools_except() {
 
 resume_runtimepool() {
   local pool="$1"
+  require_runtimepool_mutation_scope || return 1
   log "Resuming RuntimePool/${pool} for continuation recovery checks"
   k -n "${namespace}" patch runtimepool "${pool}" --type=merge \
     -p '{"spec":{"desiredReplicas":1}}' >/dev/null
@@ -2173,21 +2224,26 @@ assert_task_succeeded_read() {
   mark_task_validated "${task}"
 }
 
+# assert_cancelled_task requires a controller-owned Cancelled settlement. The
+# execution reason distinguishes why: an explicit cancellation request settles
+# with reason "Cancelled", while a Task deadline settles with reason
+# "TaskTimeout" (message "task deadline cancellation settled").
 assert_cancelled_task() {
   local task="$1"
   local snapshot="$2"
+  local expected_reason="${3:-Cancelled}"
   wait_task_terminal "${task}"
   local payload
   payload="$(task_json "${task}")"
-  if ! jq -e '
+  if ! jq -e --arg reason "${expected_reason}" '
     .status.phase == "Cancelled"
     and .status.execution.state == "Cancelled"
     and .status.execution.outcome == "Cancelled"
-    and .status.execution.reason == "Cancelled"
+    and .status.execution.reason == $reason
     and ((.status.jobName // "") == "")
   ' <<<"${payload}" >/dev/null; then
     safe_task_summary "${task}"
-    die "Task/${task} cancellation did not settle as controller-owned Cancelled"
+    die "Task/${task} cancellation did not settle as controller-owned Cancelled with reason ${expected_reason}"
   fi
   assert_task_fence "${task}" "${snapshot}"
   mark_task_validated "${task}"
@@ -2227,9 +2283,13 @@ assert_restart_task_settled() {
   mark_task_validated "${task}"
 }
 
+# assert_all_tasks_validated requires every Task this run created to have
+# passed exact fence/result validation. It is scoped to run-owned Tasks so a
+# shared watch namespace (adopted harness-v2 mode) that also hosts unrelated
+# Tasks does not fail the release gate.
 assert_all_tasks_validated() {
   local unvalidated
-  unvalidated="$(k -n "${namespace}" get tasks -o json | jq -r '
+  unvalidated="$(k -n "${namespace}" get tasks -l "orka.ai/acp-e2e-run=${run_id}" -o json | jq -r '
     .items[]
     | select((.status.execution.state // "") != "" or (.status.phase // "") != "")
     | select(.metadata.labels["orka.ai/acp-e2e-validated"] != "true")
@@ -2556,7 +2616,7 @@ run_timeout_check() {
   wait_until "Task/${task} active Running prompt" "${state_wait_seconds}" pool_running_for_task "${task}" "${pool}"
   snapshot="${temp_root}/${task}-running-pool.json"
   capture_pool_snapshot "${pool}" "${provider}" "${model}" read "${snapshot}"
-  assert_cancelled_task "${task}" "${snapshot}"
+  assert_cancelled_task "${task}" "${snapshot}" "TaskTimeout"
   elapsed_seconds=$((SECONDS - start_seconds))
   (( elapsed_seconds >= timeout_duration_seconds )) || \
     die "timeout Task/${task} cancelled before its configured ${timeout_duration} deadline"
@@ -2602,6 +2662,7 @@ run_explicit_cancel_check() {
 }
 
 run_controller_restart_check() {
+  require_runtimepool_mutation_scope || return 1
   local provider="$1"
   local model="$2"
   local agent="$3"
@@ -2661,6 +2722,7 @@ run_controller_restart_check() {
 replacement_session_uid=""
 replacement_session_generation=""
 run_pool_replacement_check() {
+  require_runtimepool_mutation_scope || return 1
   local provider="$1"
   local model="$2"
   local agent="$3"
@@ -2701,6 +2763,7 @@ run_pool_replacement_check() {
 }
 
 run_scale_to_zero_recovery_check() {
+  require_runtimepool_mutation_scope || return 1
   local provider="$1"
   local model="$2"
   local agent="$3"
@@ -2896,7 +2959,8 @@ apply_write_task() {
     --arg forgeCredential "${write_forge_credential_target}" \
     --arg forgeCredentialKey "${write_forge_credential_key}" \
     --arg branch "${write_branch}" \
-    --arg base "${write_pr_base}" '{
+    --arg base "${write_pr_base}" \
+    --argjson maxTurns "${task_max_turns}" '{
       apiVersion:"core.orka.ai/v1alpha1",
       kind:"Task",
       metadata:{name:$task,labels:{"orka.ai/acp-e2e-run":$run}},
@@ -2919,7 +2983,7 @@ apply_write_task() {
           prBaseBranch:$base,
           createPR:true
         },
-        agentRuntime:({maxTurns:12} + (if $provider == "codex" then {} else {
+        agentRuntime:({maxTurns:$maxTurns} + (if $provider == "codex" then {} else {
           allowBash:true,
           allowedTools:["Read","Glob","Grep","Bash","Write","Edit"]
         } end)),
@@ -3228,6 +3292,7 @@ settle_write_task_for_remote_cleanup() {
 
   pool="$(jq -r '.status.execution.runtimePoolName // ""' "${task_probe_file}")" || return 1
   if [[ -n "${pool}" ]]; then
+    require_runtimepool_mutation_scope || return 1
     probe_runtimepool "${pool}" || return 1
     [[ "${runtimepool_probe_state}" == "present" ]] || return 1
     log "Parking write RuntimePool/${pool} after terminal publication"
@@ -3264,12 +3329,25 @@ remove_provider_resources() {
   local owners_file="${temp_root}/provider-${provider}-owner-uids.txt"
   log "Removing ${provider} Tasks, Agents, and RuntimePools before the next provider"
   assert_all_tasks_validated
-  k -n "${namespace}" get task -o json | jq -r '
-    .items[] | .metadata.uid, (.status.execution.runtimeSessionUID // empty)
-  ' | sort -u >"${owners_file}"
-  k -n "${namespace}" delete task --all --wait=true --timeout=5m >/dev/null
-  pools="$(k -n "${namespace}" get runtimepool -o json | jq -r --arg provider "${provider}" \
-    '.items[] | select(.spec.runtime.profile.providerKind == $provider) | [.metadata.name, (.status.activeInstance.podNamespace // .spec.runtimeNamespace // "")] | @tsv')"
+  if [[ "${namespace_shared:-0}" -eq 1 ]]; then
+    # Shared watch-namespace mode: only run-labeled Tasks are removed, and
+    # RuntimePools are left alone because they are profile-keyed and may be
+    # serving unrelated Agents in the same namespace; the controller's idle
+    # policy scales them down.
+    k -n "${namespace}" get task -l "orka.ai/acp-e2e-run=${run_id}" -o json | jq -r '
+      .items[] | .metadata.uid, (.status.execution.runtimeSessionUID // empty)
+    ' | sort -u >"${owners_file}"
+    k -n "${namespace}" delete task -l "orka.ai/acp-e2e-run=${run_id}" --wait=true --timeout=5m >/dev/null
+    log "Shared watch namespace: leaving ${provider} RuntimePools to the controller idle policy"
+    pools=""
+  else
+    k -n "${namespace}" get task -o json | jq -r '
+      .items[] | .metadata.uid, (.status.execution.runtimeSessionUID // empty)
+    ' | sort -u >"${owners_file}"
+    k -n "${namespace}" delete task --all --wait=true --timeout=5m >/dev/null
+    pools="$(k -n "${namespace}" get runtimepool -o json | jq -r --arg provider "${provider}" \
+      '.items[] | select(.spec.runtime.profile.providerKind == $provider) | [.metadata.name, (.status.activeInstance.podNamespace // .spec.runtimeNamespace // "")] | @tsv')"
+  fi
   if [[ -n "${pools}" ]]; then
     while IFS=$'\t' read -r pool runtime_ns; do
       [[ -n "${pool}" ]] || continue
@@ -3375,6 +3453,12 @@ else
 fi
 namespace_uid="$(k get namespace "${namespace}" -o jsonpath='{.metadata.uid}')"
 [[ -n "${namespace_uid}" ]] || die "test namespace UID is unavailable"
+if [[ "${namespace_shared}" -eq 1 && "${shared_pool_mutation_allowed}" -eq 1 ]]; then
+  warn "shared namespace RuntimePool mutation was explicitly enabled; this is safe only on a dedicated cluster"
+fi
+if [[ "${release_gate}" -eq 1 ]] && ! runtimepool_mutations_allowed; then
+  die "RELEASE_GATE=1 requires an isolated namespace or ACP_E2E_ALLOW_SHARED_POOL_MUTATION=1 on a dedicated cluster"
+fi
 
 if [[ "${release_gate}" -eq 1 ]]; then
   create_api_identity
@@ -3398,15 +3482,22 @@ codex_pool="${read_smoke_pool}"
 
 assert_unsafe_workspace_rejected "${codex_agent}"
 run_concurrency_check "${codex_agent}" codex "${codex_model}" "${codex_pool}"
-park_runtimepool "${codex_pool}"
+if runtimepool_mutations_allowed; then
+  park_runtimepool "${codex_pool}"
+fi
 codex_tool_agent="$(sanitize_name "acp-codex-tools-${run_id}")"
 apply_agent codex "${codex_model}" "${codex_tool_agent}" 12 true
 run_timeout_check codex "${codex_model}" "${codex_tool_agent}"
 run_explicit_cancel_check codex "${codex_model}" "${codex_tool_agent}"
-run_controller_restart_check codex "${codex_model}" "${codex_tool_agent}" "${restart_nonce}"
-park_provider_runtimepools_except codex "${codex_pool}"
-resume_runtimepool "${codex_pool}"
-run_pool_replacement_check codex "${codex_model}" "${codex_agent}" "${codex_pool}" "${codex_session}" "${session_nonce}"
+if runtimepool_mutations_allowed; then
+  run_controller_restart_check codex "${codex_model}" "${codex_tool_agent}" "${restart_nonce}"
+  park_provider_runtimepools_except codex "${codex_pool}"
+  resume_runtimepool "${codex_pool}"
+  run_pool_replacement_check codex "${codex_model}" "${codex_agent}" "${codex_pool}" "${codex_session}" "${session_nonce}"
+else
+  shared_mutation_checks_skipped=1
+  log "Shared watch namespace: skipping controller restart and RuntimePool parking, resume, and replacement checks"
+fi
 
 if [[ "${release_gate}" -eq 1 ]]; then
   run_scale_to_zero_recovery_check codex "${codex_model}" "${codex_agent}" "${codex_pool}" "${codex_session}" "${session_nonce}"
@@ -3420,7 +3511,7 @@ if [[ "${release_gate}" -eq 1 ]]; then
 fi
 
 remove_provider_resources codex "${codex_agent}" "${codex_tool_agent}"
-wait_until "Codex runtime children removal" 300 runtime_children_absent
+[[ "${namespace_shared:-0}" -eq 1 ]] || wait_until "Codex runtime children removal" 300 runtime_children_absent
 
 opencode_agent="$(sanitize_name "acp-opencode-${run_id}")"
 opencode_task="$(sanitize_name "acp-opencode-read-${run_id}")"
@@ -3434,7 +3525,7 @@ apply_agent opencode "${opencode_model}" "${opencode_policy_agent}" 12 true
 run_opencode_read_policy_check "${opencode_policy_agent}" "${opencode_model}"
 assert_all_tasks_validated
 remove_provider_resources opencode "${opencode_agent}" "${opencode_policy_agent}"
-wait_until "OpenCode runtime children removal" 300 runtime_children_absent
+[[ "${namespace_shared:-0}" -eq 1 ]] || wait_until "OpenCode runtime children removal" 300 runtime_children_absent
 
 claude_agent="$(sanitize_name "acp-claude-${run_id}")"
 claude_task="$(sanitize_name "acp-claude-read-${run_id}")"
@@ -3446,7 +3537,7 @@ run_read_smoke claude "${claude_model}" "${claude_agent}" "${claude_task}" "${cl
 assert_all_tasks_validated
 
 remove_provider_resources claude "${claude_agent}"
-wait_until "Claude runtime children removal" 300 runtime_children_absent
+[[ "${namespace_shared:-0}" -eq 1 ]] || wait_until "Claude runtime children removal" 300 runtime_children_absent
 
 copilot_agent="$(sanitize_name "acp-copilot-${run_id}")"
 copilot_task="$(sanitize_name "acp-copilot-read-${run_id}")"
@@ -3466,5 +3557,9 @@ if [[ "${release_gate}" -eq 1 ]]; then
   fi
   log "ACP v2 RELEASE GATE PASSED on context ${context}"
 else
-  log "ACP v2 smoke validation passed on context ${context}; release-only publication, remote verification, Task result/fork, and scale-to-zero gates were skipped. Set RELEASE_GATE=1 for release acceptance."
+  if [[ "${shared_mutation_checks_skipped}" -eq 1 ]]; then
+    log "ACP v2 shared-namespace smoke validation passed on context ${context}; controller restart and RuntimePool lifecycle/replacement checks were skipped. Use an isolated namespace for complete smoke acceptance."
+  else
+    log "ACP v2 smoke validation passed on context ${context}; release-only publication, remote verification, Task result/fork, and scale-to-zero gates were skipped. Set RELEASE_GATE=1 for release acceptance."
+  fi
 fi

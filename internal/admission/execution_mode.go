@@ -172,6 +172,11 @@ func (v *AgentContractValidator) Handle(ctx context.Context, req ctrladmission.R
 	if *object.Spec.Runtime.ContractVersion != mode.ContractVersion() {
 		return ctrladmission.Denied(fmt.Sprintf("Agent contractVersion must match namespace execution mode %q", mode))
 	}
+	if mode == executionmode.HarnessV2 && (object.Spec.Model == nil || strings.TrimSpace(object.Spec.Model.Name) == "") {
+		// The ACP session configuration requires a model; rejecting here
+		// turns a run-time Task failure into an immediate, actionable error.
+		return ctrladmission.Denied("built-in Agent runtime requires spec.model.name (the ACP runtime session has no default model)")
+	}
 	if oldObject != nil {
 		if oldObject.Spec.Runtime == nil || oldObject.Spec.Runtime.ContractVersion == nil {
 			return ctrladmission.Denied("stored unclassified Agent cannot be adopted; recreate it in the mode namespace")

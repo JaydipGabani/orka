@@ -39,6 +39,22 @@ make lint-fix
 make ui-lint
 ```
 
+### Local Environment Notes
+
+- **Script test suites need bash >= 4.** The suites under `scripts/tests/`
+  rely on `set -e` stopping on failed `(( ))` arithmetic, which macOS's stock
+  bash 3.2 does not honor — failures would pass silently. The suites refuse to
+  run under bash < 4; on macOS install a modern bash (`brew install bash`) and
+  invoke the suites with it.
+- **A green Gateway E2E can be an empty one.** Without `E2E_GATEWAY=true` the
+  gateway specs skip themselves and Ginkgo prints `Ran 0 of N Specs` with a
+  `SUCCESS` exit. If you see that line, nothing was validated — re-run with
+  the environment shown above. (CI fails this shape explicitly.)
+- **Running `go test` directly on controller packages needs envtest assets.**
+  `make test` wires `KUBEBUILDER_ASSETS` automatically; for a bare `go test`
+  on packages that start an envtest API server, export it first:
+  `KUBEBUILDER_ASSETS="$(bin/setup-envtest use -p path)"`.
+
 ## Test Structure
 
 ### Go Tests

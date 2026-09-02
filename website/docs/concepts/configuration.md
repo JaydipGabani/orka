@@ -200,7 +200,11 @@ spec:
 | `branch` | string | No | Base branch to scan. Defaults to the literal `main` when omitted (not resolved from the repository's actual default branch). Set this explicitly for repositories whose default branch is not `main`. |
 | `ref` | string | No | Specific git ref, tag, or commit SHA to check out for scan tasks. When `ref` is set and `branch` is omitted, scan workspaces check out the ref directly instead of forcing `main`; PR remediation still uses `prBaseBranch` or `main` unless `branch` is set. |
 | `subPath` | string | No | Optional subdirectory to scan in a monorepo. |
-| `gitSecretRef` | LocalObjectReference | No | Secret containing credentials for private repository access. |
+| `gitSecretRef` | LocalObjectReference | No | Compatibility source-read Secret for scan Tasks; `readCredentialRef` takes precedence when both are set. Never used for publication. |
+| `readCredentialRef` | LocalObjectReference | For patches | Source clone/read Secret. Required, together with the three publication roles below, before any patch proposal or remediation PR. |
+| `publicationReadCredentialRef` | LocalObjectReference | For patches | Target-repository read Secret used only for publication preflight and independent verification. |
+| `publicationCredentialRef` | LocalObjectReference | For patches | Target-repository write Secret used only for the exact compare-and-swap branch push. |
+| `forgeCredentialRef` | LocalObjectReference | For patches | Forge API Secret used for controller-side forge reads and PR upkeep: fetching the published remediation commit to derive and verify patch evidence, and reconciling/decorating the remediation pull request. Never mounted into any Task. The four patch roles must reference pairwise-distinct Secrets. |
 | `forkRepo` | string | No | Writable fork repository URL for patch proposal branches and remediation PRs. |
 | `prBaseBranch` | string | No | Pull request base branch for remediation. Defaults to `branch` when omitted. |
 | `schedule` | string | No | Cron expression for scheduled incremental scans. |
@@ -467,7 +471,8 @@ spec:
   systemPrompt:
     inline: "You are a senior software engineer."
   runtime:
-    type: claude         # or "codex" / "copilot"
+    type: claude         # or "codex" / "copilot" / "opencode"
+    contractVersion: orka.harness.v2
     defaultMaxTurns: 50
     defaultAllowBash: true
     defaultAllowedTools:

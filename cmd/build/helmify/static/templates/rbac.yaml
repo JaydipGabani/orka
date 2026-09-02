@@ -328,6 +328,13 @@ rules:
     resources: ["skills"]
     verbs: ["get", "list", "watch"]
 
+  # Provider permissions (read-only). The dashboard Chat provider picker calls
+  # GET /providers, which passes a SubjectAccessReview for this resource, and
+  # native chat exists in every controller mode.
+  - apiGroups: ["core.orka.ai"]
+    resources: ["providers"]
+    verbs: ["get", "list", "watch"]
+
   # Virtual Session API permissions
   - apiGroups: ["core.orka.ai"]
     resources: ["sessions"]
@@ -337,6 +344,13 @@ rules:
   # Generic gateway resource permissions (read-only; durable ledgers use the Orka REST API).
   - apiGroups: ["gateway.orka.ai"]
     resources: ["gateways", "gatewaybindings"]
+    verbs: ["get", "list", "watch"]
+
+  # ACP runtime resource permissions (read-only; the dashboard Runtimes page
+  # and `orka runtime-pool` / `orka agent-runtime` reads pass a
+  # SubjectAccessReview for these resources).
+  - apiGroups: ["core.orka.ai"]
+    resources: ["runtimepools", "agentruntimes"]
     verbs: ["get", "list", "watch"]
   {{- end }}
 

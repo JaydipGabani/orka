@@ -33,6 +33,7 @@ const (
 	responseContentIndexField   = "content_index"
 	responseOutputTextType      = "output_text"
 	responseTextField           = "text"
+	messageRoleUser             = "user"
 )
 
 var responseSequence atomic.Uint64
@@ -482,7 +483,7 @@ func newestUserMessage(body []byte) ([]byte, bool) {
 	}
 	for _, item := range slices.Backward(items) {
 		role, _ := item["role"].(string)
-		if role != "user" {
+		if role != messageRoleUser {
 			continue
 		}
 		encoded, err := json.Marshal(item)
@@ -515,7 +516,7 @@ func assistantHistoryContent(body []byte) ([]string, bool) {
 		case "assistant":
 			found = true
 			contents = appendTextContent(contents, item["content"])
-		case "user":
+		case messageRoleUser:
 			for _, text := range appendTextContent(nil, item["content"]) {
 				_, after, ok := strings.Cut(text, canonicalTranscriptHeader)
 				if !ok {
@@ -588,7 +589,7 @@ func inputRoles(body []byte) string {
 	// verbatim so a crafted role/type field can never smuggle request
 	// material into fixture diagnostics.
 	known := map[string]bool{
-		"user": true, "assistant": true, "system": true, "developer": true,
+		messageRoleUser: true, "assistant": true, "system": true, "developer": true,
 		"tool": true, "message": true, "function_call": true,
 		"function_call_output": true, "reasoning": true,
 	}

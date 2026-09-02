@@ -239,20 +239,24 @@ type sessionState struct {
 }
 
 type promptState struct {
-	request              harnessv2.StartPromptRequest
-	operation            harnessv2.OperationRecord
-	lease                harnessv2.PromptLease
-	startedAt            time.Time
-	acceptedAt           time.Time
-	sequence             uint64
-	assistant            strings.Builder
-	assistantOverflow    bool
-	finalAnswer          strings.Builder
-	finalAnswerSeen      bool
-	finalAnswerOverflow  bool
-	settlement           *harnessv2.PromptSettlement
-	settlementDigest     string
-	permissionRequestIDs map[harnessv2.PermissionRequestID]struct{}
+	request             harnessv2.StartPromptRequest
+	operation           harnessv2.OperationRecord
+	lease               harnessv2.PromptLease
+	startedAt           time.Time
+	acceptedAt          time.Time
+	sequence            uint64
+	assistant           strings.Builder
+	assistantOverflow   bool
+	finalAnswer         strings.Builder
+	finalAnswerSeen     bool
+	finalAnswerOverflow bool
+	settlement          *harnessv2.PromptSettlement
+	settlementDigest    string
+	// providerDrainTimedOut records that an admitted inference request was
+	// still in flight when the child settled and did not finish within the
+	// cancel grace, so the prompt's inference accounting is incomplete.
+	providerDrainTimedOut bool
+	permissionRequestIDs  map[harnessv2.PermissionRequestID]struct{}
 }
 
 type promptMutationExecutor interface {
@@ -1020,7 +1024,7 @@ func (s *Server) createSession(
 		if err = s.cfg.WorkspaceMaterializer.Materialize(ctx, request, baselineDir); err != nil {
 			return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, sessionCreationFailed("baseline reconstruction materialization", err)
 		}
-		baseline, err = workspacedelta.Capture(baselineDir, s.cfg.DeltaOptions)
+		baseline, err = workspacedelta.Capture(baselineDir, s.baselineCaptureOptions())
 		if err != nil {
 			return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, sessionCreationFailed("baseline reconstruction capture", err)
 		}
@@ -1028,7 +1032,7 @@ func (s *Server) createSession(
 			return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, sessionCreationFailed("baseline reconstruction cleanup", err)
 		}
 	} else {
-		baseline, err = workspacedelta.Capture(paths.Workspace, s.cfg.DeltaOptions)
+		baseline, err = workspacedelta.Capture(paths.Workspace, s.baselineCaptureOptions())
 		if err != nil {
 			return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, sessionCreationFailed("workspace baseline capture", err)
 		}
@@ -1117,14 +1121,15 @@ func (s *Server) createSession(
 			GID:           gid,
 			ClientOptions: acp.Options{MaxMessageBytes: s.cfg.Capabilities.Limits.MaxRequestBytes},
 		},
-		MCPServers:        []acp.MCPServer{mcpServer},
-		NewSessionMeta:    projection.NewSessionMeta,
-		AuthMethodID:      s.cfg.Provider.AuthMethodID,
-		InitializeTimeout: defaultDuration(s.cfg.InitializeTimeout, acp.DefaultInitializeTimeout),
-		PromptLease:       time.Duration(s.cfg.Capabilities.Limits.MaxPromptLeaseMillis) * time.Millisecond,
-		PermissionTimeout: defaultDuration(s.cfg.PermissionTimeout, acp.DefaultPermissionTimeout),
-		CancelGrace:       defaultDuration(s.cfg.CancelGrace, acp.DefaultStopGrace),
-		MaxBufferedEvents: s.cfg.Capabilities.Limits.MaxBufferedEvents,
+		MCPServers:            []acp.MCPServer{mcpServer},
+		NewSessionMeta:        projection.NewSessionMeta,
+		AuthMethodID:          s.cfg.Provider.AuthMethodID,
+		InitializeTimeout:     defaultDuration(s.cfg.InitializeTimeout, acp.DefaultInitializeTimeout),
+		PromptLease:           time.Duration(s.cfg.Capabilities.Limits.MaxPromptLeaseMillis) * time.Millisecond,
+		PermissionTimeout:     defaultDuration(s.cfg.PermissionTimeout, acp.DefaultPermissionTimeout),
+		CancelGrace:           defaultDuration(s.cfg.CancelGrace, acp.DefaultStopGrace),
+		MaxBufferedEvents:     s.cfg.Capabilities.Limits.MaxBufferedEvents,
+		MaxBufferedEventBytes: supervisorMaxBufferedPromptEventBytes,
 	})
 	if err != nil {
 		return nil, harnessv2.RuntimeSessionDescriptor{}, acp.SessionPaths{}, nil, nil, nil, sessionCreationFailed("provider adapter initialization", err)

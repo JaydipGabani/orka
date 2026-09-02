@@ -197,6 +197,9 @@ func (h *Handlers) ListProviders(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	if err := h.authorizeProviderResourceAction(c, "list", namespace, ""); err != nil {
+		return err
+	}
 	if err := h.authorizeContextTokenAction(
 		c,
 		"listProviders",
@@ -208,43 +211,53 @@ func (h *Handlers) ListProviders(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
-	list := &corev1alpha1.ProviderList{}
-	if err := h.client.List(c.Context(), list, &client.ListOptions{
-		Namespace: namespace,
-		Limit:     pagination.Limit,
-		Continue:  pagination.Continue,
-	}); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list providers: %v", err))
-	}
-	items := list.Items
 	filteredList := false
-	if h.contextTokenAuthorization.Enabled() {
-		filtered := make([]corev1alpha1.Provider, 0, len(items))
-		for i := range items {
-			provider := &items[i]
-			allowed := contextTokenAllowsListedProviderModel(
-				c,
-				h.contextTokenAuthorization,
-				"listProviders",
-				namespace,
-				providerResolutionInfo(provider),
-				provider.Spec.DefaultModel,
-			)
-			if allowed {
-				filtered = append(filtered, *provider)
-			}
+	var remainingItemCount *int64
+	items, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string, pageLimit int64) ([]corev1alpha1.Provider, string, error) {
+		list := &corev1alpha1.ProviderList{}
+		if err := h.listPage(c.Context(), list, &client.ListOptions{
+			Namespace: namespace,
+			Limit:     pageLimit,
+			Continue:  continueToken,
+		}, "providers"); err != nil {
+			return nil, "", err
 		}
-		filteredList = len(filtered) != len(items)
-		items = filtered
+		remainingItemCount = list.RemainingItemCount
+		items := list.Items
+		if h.contextTokenAuthorization.Enabled() {
+			filtered := make([]corev1alpha1.Provider, 0, len(items))
+			for i := range items {
+				provider := &items[i]
+				allowed := contextTokenAllowsListedProviderModel(
+					c,
+					h.contextTokenAuthorization,
+					"listProviders",
+					namespace,
+					providerResolutionInfo(provider),
+					provider.Spec.DefaultModel,
+				)
+				if allowed {
+					filtered = append(filtered, *provider)
+				}
+			}
+			if len(filtered) != len(items) {
+				filteredList = true
+			}
+			items = filtered
+		}
+		return items, list.Continue, nil
+	})
+	if err != nil {
+		return err
 	}
-	remainingItemCount := list.RemainingItemCount
 	if filteredList {
+		// The raw count describes Providers the caller is not allowed to see.
 		remainingItemCount = nil
 	}
 	return c.JSON(ListResponse{
 		Items: providerReadItems(c, items),
 		Metadata: ListMeta{
-			Continue:           list.Continue,
+			Continue:           NormalizeListContinue(continueToken),
 			RemainingItemCount: remainingItemCount,
 		},
 	})
@@ -252,6 +265,16 @@ func (h *Handlers) ListProviders(c fiber.Ctx) error {
 
 // GetProvider returns a configured LLM provider.
 func (h *Handlers) GetProvider(c fiber.Ctx) error {
+	namespace, err := h.resolveNamespace(c, c.Query("namespace", ""))
+	if err != nil {
+		return err
+	}
+	// Authorize the requested name before any controller-credential read so
+	// an unauthorized caller cannot tell an existing Provider (403) from an
+	// unknown one (404).
+	if err := h.authorizeProviderResourceAction(c, "get", namespace, c.Params("name")); err != nil {
+		return err
+	}
 	provider, err := h.fetchProvider(c, c.Params("name"))
 	if err != nil {
 		return err
@@ -399,6 +422,18 @@ func (h *Handlers) DeleteProvider(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to delete provider: %v", err))
 	}
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// authorizeProviderResourceAction enforces Kubernetes RBAC for Provider
+// reads, like the RuntimePool, AgentRuntime, Session, and gateway paths: a
+// TokenReview-authenticated identity must pass a SubjectAccessReview for the
+// exact verb, resource, and name before the controller client reads on its
+// behalf. It is a no-op for non-TokenReview auth (context tokens carry their
+// own provider-use scope checks).
+func (h *Handlers) authorizeProviderResourceAction(c fiber.Ctx, verb, namespace, name string) error {
+	return authorizeKubernetesResourceAction(
+		c.Context(), h.clientset, GetUserInfo(c), namespace, verb, corev1alpha1.GroupVersion.Group, "providers", name,
+	)
 }
 
 func (h *Handlers) fetchProvider(c fiber.Ctx, name string) (*corev1alpha1.Provider, error) {
@@ -596,17 +631,17 @@ func (h *Handlers) ListSubstrateActorPools(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	list := &corev1alpha1.SubstrateActorPoolList{}
-	if err := h.client.List(c.Context(), list, &client.ListOptions{
+	if err := h.listPage(c.Context(), list, &client.ListOptions{
 		Namespace: namespace,
 		Limit:     pagination.Limit,
 		Continue:  pagination.Continue,
-	}); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list substrate actor pools: %v", err))
+	}, "substrate actor pools"); err != nil {
+		return err
 	}
 	return c.JSON(ListResponse{
 		Items: list.Items,
 		Metadata: ListMeta{
-			Continue:           list.Continue,
+			Continue:           NormalizeListContinue(list.Continue),
 			RemainingItemCount: list.RemainingItemCount,
 		},
 	})

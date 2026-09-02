@@ -16,10 +16,12 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/orka-agents/orka/internal/acp"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
+	"github.com/orka-agents/orka/internal/redact"
 	"github.com/orka-agents/orka/internal/security"
 	"github.com/orka-agents/orka/internal/workspacedelta"
 )
@@ -283,6 +285,9 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 				events = nil
 				continue
 			}
+			if run.Release != nil {
+				run.Release(event)
+			}
 			for _, ready := range compactor.push(event, time.Now()) {
 				mapAndEncode(ready)
 			}
@@ -302,9 +307,36 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 			"rpcService", rpcService,
 			"rpcErrorName", rpcErrorName,
 			"accepted", result.Accepted,
+			"resultOutcome", string(result.Outcome),
+			"resultStopReason", string(result.StopReason),
+			"errorType", fmt.Sprintf("%T", result.Err),
+			// Credential-redacted before bounding (a truncation could cut a
+			// credential ahead of the text its recognizer needs), then
+			// bounded: the text is the ACP transport/client diagnostic.
+			"errorDetail", redactedPromptErrorDetail(result.Err),
 		)
 	}
-	deactivatePromptCapabilities(state, request.Metadata.PromptID, harnessv2.RuntimeSessionStateCancelling)
+	// The ACP child can settle its turn while the provider proxy is still
+	// relaying the final bytes of the last inference response. A 2xx is only
+	// accounted once its body has been relayed, so let in-flight proxy
+	// requests drain (bounded) before revoking the prompt's capabilities;
+	// otherwise the upstream-failure classification could read a snapshot
+	// with an earlier failure and no success yet, and turn a successfully
+	// retried prompt into provider_upstream_error.
+	// Capabilities close before the drain: a settled child must not start
+	// MCP/tool side effects or launch further inference calls while the
+	// last provider relay finishes. Only the provider proxy's deactivation
+	// waits, and only for responses that were already admitted.
+	if state.mcpProxy != nil {
+		state.mcpProxy.deactivate(request.Metadata.PromptID, harnessv2.RuntimeSessionStateCancelling)
+	}
+	if state.providerProxy != nil {
+		state.providerProxy.closeAdmission(string(request.Metadata.PromptID))
+	}
+	s.waitProviderProxyDrained(state, prompt)
+	if state.providerProxy != nil {
+		state.providerProxy.deactivate(string(request.Metadata.PromptID))
+	}
 	terminal, settledResult, terminalErr := s.terminalEvent(state, prompt, result)
 	if settledResult.Outcome == acp.PromptOutcomeFailed {
 		outcome, stopReason := promptTerminalDiagnostic(settledResult)
@@ -379,6 +411,26 @@ func promptTerminalDiagnostic(result acp.PromptResult) (string, string) {
 		stopReason = ""
 	}
 	return outcome, stopReason
+}
+
+// redactedPromptErrorDetail removes control and format runes before redacting
+// the complete error text and bounding it for a log field. Dropping every
+// separator reassembles credentials split across lines or tabs so the
+// redactor can recognize the complete value.
+func redactedPromptErrorDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsControl(r):
+			return -1
+		case unicode.Is(unicode.Cf, r):
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(err.Error(), ""))
+	return promptStreamErrorDetail(errors.New(redact.SensitiveText(cleaned)))
 }
 
 func promptStreamErrorDetail(err error) string {
@@ -498,6 +550,8 @@ func promptExecutionDiagnostic(err error) (string, int, string, string) {
 		return promptExecutionStageJSONRPCError, rpcErr.Code, "", ""
 	case errors.Is(err, acp.ErrClosed):
 		return "transport-closed", 0, "", ""
+	case errors.Is(err, acp.ErrPromptEventBufferOverflow):
+		return "event-buffer-overflow", 0, "", ""
 	case errors.Is(err, context.DeadlineExceeded):
 		return "deadline-exceeded", 0, "", ""
 	case errors.Is(err, context.Canceled):
@@ -595,9 +649,26 @@ func (s *Server) handleRenewLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusGone, harnessv2.ErrorCodeSettled, safeError(err), nil, false)
 		return
 	}
-	if providerProxy == nil || mcpProxy == nil ||
-		providerProxy.renew(string(request.Metadata.PromptID), request.Lease.ExpiresAt, now) != nil ||
-		mcpProxy.renew(request.MCPAuthorization, request.Lease, now) != nil {
+	var providerRenewErr, mcpRenewErr error
+	if providerProxy != nil {
+		providerRenewErr = providerProxy.renew(string(request.Metadata.PromptID), request.Lease.ExpiresAt, now)
+	}
+	if mcpProxy != nil && providerRenewErr == nil {
+		mcpRenewErr = mcpProxy.renew(request.MCPAuthorization, request.Lease, now)
+	}
+	if providerProxy == nil || mcpProxy == nil || providerRenewErr != nil || mcpRenewErr != nil {
+		// The renewal is rejected fail-closed and the prompt is cancelled;
+		// record which capability refused so a cancelled prompt can be
+		// traced to its cause. Both messages are supervisor-generated.
+		slog.Error(
+			"ACP prompt lease renewal rejected; cancelling the prompt",
+			"promptID", request.Metadata.PromptID,
+			"leaseGeneration", request.Lease.Generation,
+			"providerProxyPresent", providerProxy != nil,
+			"mcpProxyPresent", mcpProxy != nil,
+			"providerRenewError", errorString(providerRenewErr),
+			"mcpRenewError", errorString(mcpRenewErr),
+		)
 		if providerProxy != nil {
 			providerProxy.revoke()
 		}
@@ -785,6 +856,7 @@ func (s *Server) handleCancelPrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	if state.prompt == nil {
 		s.mu.Unlock()
+		slog.Info("ACP prompt cancellation rejected: no active prompt", "promptID", request.Metadata.PromptID, "reason", request.Reason)
 		writeError(w, http.StatusGone, harnessv2.ErrorCodeSettled, "prompt is not active", nil, false)
 		return
 	}
@@ -819,6 +891,11 @@ func (s *Server) handleCancelPrompt(w http.ResponseWriter, r *http.Request) {
 	result, cancelErr := mutations.CancelPrompt(cancelCtx, string(request.Metadata.PromptID))
 	if cancelErr != nil && result.Outcome == "" {
 		result = acp.PromptResult{Outcome: acp.PromptOutcomeOutcomeUnknown, Accepted: true, Err: cancelErr, SettledAt: time.Now().UTC()}
+	}
+	if cancelErr != nil || result.Outcome == acp.PromptOutcomeOutcomeUnknown {
+		slog.Warn("ACP prompt cancellation did not settle cleanly",
+			"promptID", request.Metadata.PromptID, "reason", request.Reason, "outcome", result.Outcome,
+			"errorClass", promptStreamErrorClass(cancelErr), "deadlineExceeded", errors.Is(cancelErr, context.DeadlineExceeded))
 	}
 	settlement := settlementFromResult(result, time.Now().UTC())
 	forced := cancelErr != nil && result.Outcome == acp.PromptOutcomeOutcomeUnknown
@@ -1456,11 +1533,71 @@ func buildWorkspaceDeltaContext(
 	)
 }
 
-func workspaceDeltaContentPolicyViolation(artifact []byte, limits harnessv2.WorkspaceDeltaLimits) (string, error) {
-	return workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits)
+// baselineCaptureOptions returns the delta options for trusted baseline
+// captures. The ContentFlagger records which baseline files already carry
+// secret-like content before any agent execution, so the delta content policy
+// can exempt pre-existing repository content (a vulnerable app's hardcoded
+// demo credential) while still rejecting secrets a prompt introduced.
+func (s *Server) baselineCaptureOptions() workspacedelta.Options {
+	options := s.cfg.DeltaOptions
+	options.ContentFlagger = func(content []byte) bool {
+		return security.LooksLikeSecret(string(content))
+	}
+	options.ContentFingerprinter = func(content []byte) []string {
+		return security.SecretLikeLineDigests(string(content))
+	}
+	return options
 }
 
-func workspaceDeltaContentPolicyViolationContext(ctx context.Context, artifact []byte, limits harnessv2.WorkspaceDeltaLimits) (string, error) {
+// workspaceDeltaBaselineExempts reports whether the secret-like content of
+// the changed file at path is entirely pre-existing. Every secret-like line
+// must match a baseline fingerprint (as a multiset) that covers the line's
+// code block together with the previous and next code blocks and every
+// blank or comment-only line in between — the only places an expression
+// continuation could still reach the credential — and once
+// those known lines are removed nothing secret-like may remain. Appending,
+// replacing, continuing, or relocating a credential is rejected, and so is
+// any edit in the neighbouring code blocks (fail closed); an untouched demo
+// credential with edits elsewhere in the file stays publishable.
+func workspaceDeltaBaselineExempts(baseline *workspacedelta.Snapshot, changedPath string, content []byte) bool {
+	if baseline == nil || !baseline.BaselineContentFlagged(changedPath) {
+		return false
+	}
+	// Fingerprints are a multiset: a known block copied to a second place in
+	// the file reproduces its digest but exceeds the baseline count, which
+	// rejects the relocated credential.
+	budget := map[string]int{}
+	for _, digest := range baseline.BaselineContentFingerprints(changedPath) {
+		budget[digest]++
+	}
+	if len(budget) == 0 {
+		return false
+	}
+	text := string(content)
+	for _, digest := range security.SecretLikeLineDigests(text) {
+		if budget[digest] == 0 {
+			return false
+		}
+		budget[digest]--
+	}
+	known := make(map[string]struct{}, len(budget))
+	for digest := range budget {
+		known[digest] = struct{}{}
+	}
+	return !security.LooksLikeSecret(security.StripLinesByDigest(text, known))
+}
+
+func workspaceDeltaContentPolicyViolation(artifact []byte, limits harnessv2.WorkspaceDeltaLimits) (string, error) {
+	return workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits, nil)
+}
+
+// workspaceDeltaContentPolicyViolationContext scans the delta artifact for
+// policy violations. baselineExempts, when non-nil, reports whether the
+// secret-like content of the named workspace-relative file is entirely
+// pre-existing in the trusted pre-prompt baseline (see
+// workspaceDeltaBaselineExempts); only then is the file exempt from the
+// secret-like rejection.
+func workspaceDeltaContentPolicyViolationContext(ctx context.Context, artifact []byte, limits harnessv2.WorkspaceDeltaLimits, baselineExempts func(changedPath string, content []byte) bool) (string, error) {
 	if len(artifact) == 0 || (!limits.RejectBinaryFiles && !limits.RejectSecretLikeContent) {
 		return "", nil
 	}
@@ -1494,11 +1631,17 @@ func workspaceDeltaContentPolicyViolationContext(ctx context.Context, artifact [
 		if int64(len(content)) != header.Size {
 			return "", fmt.Errorf("workspace delta file content is incomplete")
 		}
+		// The violating path is safe to surface: it names the file, never
+		// the content, and lets the operator or agent fix the right file.
 		if fileContent && limits.RejectBinaryFiles && (bytes.IndexByte(content, 0) >= 0 || !utf8.Valid(content)) {
-			return "workspace delta contains binary file content", nil
+			return "workspace delta contains binary file content: " + strings.TrimPrefix(header.Name, "files/"), nil
 		}
 		if limits.RejectSecretLikeContent && security.LooksLikeSecret(string(content)) {
-			return "workspace delta contains secret-like file content", nil
+			changedPath := strings.TrimPrefix(header.Name, "files/")
+			if fileContent && baselineExempts != nil && baselineExempts(changedPath, content) {
+				continue
+			}
+			return "workspace delta contains secret-like file content: " + changedPath, nil
 		}
 	}
 }
@@ -1691,18 +1834,22 @@ func (s *Server) handleWorkspaceDelta(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta path looks secret-like", nil, false)
 		return
 	}
-	if violation, policyErr := workspaceDeltaContentPolicyViolationContext(r.Context(), result.Artifact, request.Limits); policyErr != nil {
+	// Check exact prompt-scoped credentials before content policy builds a
+	// diagnostic containing an agent-controlled file path.
+	if workspaceDeltaContainsSessionCredential(result.Artifact, state) {
+		s.poisonSession(state, "workspace delta contains a session credential")
+		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta contains a session credential", nil, false)
+		return
+	}
+	if violation, policyErr := workspaceDeltaContentPolicyViolationContext(r.Context(), result.Artifact, request.Limits, func(changedPath string, content []byte) bool {
+		return workspaceDeltaBaselineExempts(state.baseline, changedPath, content)
+	}); policyErr != nil {
 		s.poisonSession(state, "workspace delta content policy could not be verified")
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta content policy could not be verified", nil, false)
 		return
 	} else if violation != "" {
 		s.poisonSession(state, violation)
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, violation, nil, false)
-		return
-	}
-	if workspaceDeltaContainsSessionCredential(result.Artifact, state) {
-		s.poisonSession(state, "workspace delta contains a session credential")
-		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta contains a session credential", nil, false)
 		return
 	}
 	if entryCount > int(request.Limits.MaxEntries) || int64(len(result.Artifact)) > request.Limits.MaxBytes {
@@ -1897,6 +2044,19 @@ func (s *Server) terminalEvent(
 		effective = promptResultFromSettlement(*prompt.settlement)
 	} else {
 		effective = providerTurnLimitResult(state, prompt, effective)
+		// Drain-timeout is checked before recorded upstream failures: when a
+		// later-issued request never resolved, blaming an earlier recorded
+		// failure as "the final request" would be a false diagnosis — the
+		// actually-final request's outcome is unknown.
+		effective = providerDrainFailureResult(prompt, effective)
+		effective = providerUpstreamFailureResult(state, prompt, effective)
+		// The durable settlement is derived from the same result the Failed
+		// event is built from: a failed result that still carries the child's
+		// end_turn or cancelled stop reason would otherwise settle as
+		// Completed or Cancelled while the controller received Failed.
+		if effective.Outcome == acp.PromptOutcomeFailed {
+			effective.StopReason = acp.StopReason(failedEventStopReason(effective.StopReason))
+		}
 	}
 	now := effective.SettledAt
 	if now.IsZero() {
@@ -1967,9 +2127,20 @@ func (s *Server) buildTerminalEventLocked(
 		if result.StopReason == acp.StopReasonMaxTurnRequests {
 			code = "turn_limit"
 			message = "ACP prompt exceeded maximum provider inference requests"
+		} else if upstreamFailure, ok := errors.AsType[*providerUpstreamFailureError](result.Err); ok {
+			code = providerUpstreamErrorCode
+			message = promptStreamErrorDetail(upstreamFailure)
+		} else if drainFailure, ok := errors.AsType[*providerDrainTimeoutError](result.Err); ok {
+			code = providerUpstreamErrorCode
+			message = drainFailure.Error()
+		} else if detail := promptFailureErrorDetail(result.Err); detail != "" {
+			// Keep the generic code but carry the agent's own error text
+			// (JSON-RPC error message and service/errorName data) so a
+			// provider or session failure is diagnosable from Task status.
+			message = "ACP prompt failed: " + detail
 		}
 		event.Failed = &harnessv2.FailedEvent{
-			StopReason: harnessv2.ACPStopReason(result.StopReason),
+			StopReason: failedEventStopReason(result.StopReason),
 			Code:       code,
 			Message:    message,
 			Retryable:  false,
@@ -2014,6 +2185,117 @@ func providerTurnLimitResult(state *sessionState, prompt *promptState, result ac
 	result.StopReason = acp.StopReasonMaxTurnRequests
 	result.Accepted = true
 	return result
+}
+
+// providerUpstreamErrorCode is the terminal Failed event code for a prompt whose
+// final inference request failed upstream.
+const providerUpstreamErrorCode = "provider_upstream_error"
+
+// providerUpstreamFailureError records that the final provider inference request
+// made during a prompt failed upstream, even though the ACP agent reported the
+// provider error as ordinary assistant text and ended its turn.
+type providerUpstreamFailureError struct {
+	Status int
+	Detail string
+}
+
+func (e providerUpstreamFailureError) Error() string {
+	message := fmt.Sprintf("provider upstream returned HTTP %d for the final inference request", e.Status)
+	if detail := sanitizeProviderUpstreamDetail(e.Detail); detail != "" {
+		message += ": " + detail
+	}
+	return message
+}
+
+// providerDrainTimeoutError records that an admitted inference request was
+// still unresolved when the child settled and did not finish within the
+// cancel grace, so the prompt's final inference outcome is unknown.
+type providerDrainTimeoutError struct{}
+
+func (providerDrainTimeoutError) Error() string {
+	return "a provider inference request was still in flight when the prompt settled and did not complete within the cancel grace"
+}
+
+// providerDrainFailureResult converts a Completed prompt whose inference
+// accounting is incomplete (an in-flight request never resolved) into a
+// Failed settlement: a successful Task must rest on accounted evidence, and
+// an unresolved request could still be a final failure that a child-reported
+// end_turn would otherwise mask.
+func providerDrainFailureResult(prompt *promptState, result acp.PromptResult) acp.PromptResult {
+	if prompt == nil || !prompt.providerDrainTimedOut || result.Outcome != acp.PromptOutcomeCompleted {
+		return result
+	}
+	slog.Error("ACP prompt settled as failed: an inference request did not drain before settlement", "promptID", string(prompt.request.Metadata.PromptID))
+	result.Outcome = acp.PromptOutcomeFailed
+	result.StopReason = acp.StopReasonRefusal
+	result.Accepted = true
+	result.Err = &providerDrainTimeoutError{}
+	return result
+}
+
+// providerUpstreamFailureResult converts a Completed prompt whose final
+// inference request failed upstream into a Failed settlement so a provider
+// quota or outage never surfaces as a successful Task result, even when an
+// earlier inference round in the same prompt succeeded.
+func providerUpstreamFailureResult(state *sessionState, prompt *promptState, result acp.PromptResult) acp.PromptResult {
+	if state == nil || prompt == nil || state.providerProxy == nil || result.Outcome != acp.PromptOutcomeCompleted {
+		return result
+	}
+	promptID := string(prompt.request.Metadata.PromptID)
+	failed, status, detail := state.providerProxy.upstreamFailureUnrecovered(promptID)
+	if !failed {
+		return result
+	}
+	slog.Error(
+		"ACP prompt settled as failed: the final provider inference request failed upstream",
+		"promptID", promptID, "upstreamStatus", status,
+	)
+	result.Outcome = acp.PromptOutcomeFailed
+	result.StopReason = acp.StopReasonRefusal
+	result.Accepted = true
+	result.Err = &providerUpstreamFailureError{Status: status, Detail: detail}
+	return result
+}
+
+// promptFailureErrorDetail renders a bounded, low-cardinality description of
+// the error that failed a prompt. Free-text error messages are never copied:
+// the ACP child (and the provider behind it) can echo credentials or private
+// routes into them, and the terminal event is persisted and projected onto
+// Task status. Only the validated JSON-RPC code plus the identifier-shaped
+// service/errorName data the agent attached, or the supervisor's own
+// classification stage, are exposed.
+func promptFailureErrorDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	stage, rpcCode, service, errorName := promptExecutionDiagnostic(err)
+	if stage != promptExecutionStageJSONRPCError {
+		return stage
+	}
+	detail := fmt.Sprintf("json-rpc error %d", rpcCode)
+	switch {
+	case service != "" && errorName != "":
+		detail += " " + service + "/" + errorName
+	case errorName != "":
+		detail += " " + errorName
+	case service != "":
+		detail += " " + service
+	}
+	return detail
+}
+
+// failedEventStopReason maps a failed prompt's ACP stop reason onto one the
+// harness v2 Failed event accepts. An agent that errors while reporting
+// end_turn or cancelled (for example a provider error surfaced after the
+// child was interrupted) would otherwise produce a malformed terminal event,
+// break the prompt stream, and leave the Task with an unknown settlement.
+func failedEventStopReason(reason acp.StopReason) harnessv2.ACPStopReason {
+	switch reason {
+	case acp.StopReasonEndTurn, acp.StopReasonCancelled:
+		return harnessv2.ACPStopReasonRefusal
+	default:
+		return harnessv2.ACPStopReason(reason)
+	}
 }
 
 func serializedEventWithinLimit(event harnessv2.Event, limit int) bool {
@@ -2074,6 +2356,30 @@ func settlePromptLocked(prompt *promptState, settlement harnessv2.PromptSettleme
 		prompt.settlementDigest = digest
 	}
 	return settlement
+}
+
+// waitProviderProxyDrained waits, bounded by the cancel grace, for the
+// session's in-flight *inference* requests to finish so their outcomes are
+// accounted before the terminal result is classified. An inference request
+// that does not finish in time leaves the accounting incomplete: the prompt
+// is marked so a child-reported Completed result settles fail-closed instead
+// of trusting evidence that never arrived. Metadata requests (model listings,
+// token counting) never feed classification and are not waited on: a stalled
+// GET /models must not convert a completed prompt into a provider failure.
+func (s *Server) waitProviderProxyDrained(state *sessionState, prompt *promptState) {
+	if state == nil || state.providerProxy == nil {
+		return
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), defaultDuration(s.cfg.CancelGrace, acp.DefaultStopGrace))
+	defer cancel()
+	if err := state.providerProxy.waitInference(waitCtx); err != nil {
+		slog.Warn("ACP provider proxy did not drain before prompt settlement; settling fail-closed", "errorClass", promptStreamErrorClass(err))
+		if prompt != nil {
+			s.mu.Lock()
+			prompt.providerDrainTimedOut = true
+			s.mu.Unlock()
+		}
+	}
 }
 
 func deactivatePromptCapabilities(state *sessionState, promptID harnessv2.PromptID, next harnessv2.RuntimeSessionState) {
@@ -2164,4 +2470,11 @@ func pathMatchesPermission(r *http.Request, request harnessv2.ResolvePermissionR
 func sessionWorkspaceOutsideRoot(paths acp.SessionPaths) bool {
 	root := strings.TrimSuffix(paths.Root, "/")
 	return paths.Workspace != root && !strings.HasPrefix(paths.Workspace, root+"/")
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

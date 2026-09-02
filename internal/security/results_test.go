@@ -219,3 +219,63 @@ func mustMarshalSecurityResult(t *testing.T, value any) []byte {
 	}
 	return data
 }
+
+const testPatchFindingID = "fnd_1"
+
+func TestParsePatchResultAcceptsIdentityBoundEnvelope(t *testing.T) {
+	t.Parallel()
+	data := []byte(`{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"Escaped the redirect parameter.","changedFiles":["./routes/index.js","routes/index.js","views/login.hbs"],"testsRun":[{"command":"npm test","exitCode":0}],"risk":"LOW"}`)
+	got, err := ParsePatchResult(data, PatchResultExpectation{RepositoryScan: "kaset", FindingID: testPatchFindingID})
+	if err != nil {
+		t.Fatalf("ParsePatchResult() error = %v", err)
+	}
+	if got.SchemaVersion != SchemaVersionPatchSummary || got.FindingID != testPatchFindingID || got.Risk != "low" || len(got.TestsRun) != 1 {
+		t.Fatalf("summary = %#v", got)
+	}
+	if len(got.ChangedFiles) != 2 || got.ChangedFiles[0] != "routes/index.js" || got.ChangedFiles[1] != "views/login.hbs" {
+		t.Fatalf("changedFiles = %#v, want deduplicated normalized paths", got.ChangedFiles)
+	}
+}
+
+func TestParsePatchResultNormalizesInvisibleRunes(t *testing.T) {
+	t.Parallel()
+	data := []byte(`{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"Escaped\u200b redirect parameter.","changedFiles":["routes/\u200bindex.js"],"testsRun":[{"command":"npm\u200b test","exitCode":0}],"risk":"low"}`)
+	got, err := ParsePatchResult(data, PatchResultExpectation{RepositoryScan: "kaset", FindingID: testPatchFindingID})
+	if err != nil {
+		t.Fatalf("ParsePatchResult() error = %v", err)
+	}
+	if got.Summary != "Escaped redirect parameter." || got.ChangedFiles[0] != "routes/index.js" || got.TestsRun[0].Command != "npm test" {
+		t.Fatalf("normalized summary = %#v", got)
+	}
+}
+
+func TestParsePatchResultRejectsInvalidEnvelopes(t *testing.T) {
+	t.Parallel()
+	expected := PatchResultExpectation{RepositoryScan: "kaset", FindingID: testPatchFindingID}
+	cases := map[string]string{
+		"wrong kind":                          `{"schemaVersion":1,"kind":"orka.security.findings.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"risk":"low"}`,
+		"wrong finding":                       `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_2","summary":"s","changedFiles":["a.go"],"risk":"low"}`,
+		"wrong scan":                          `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"other","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"risk":"low"}`,
+		"unknown field":                       `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"risk":"low","diff":"x"}`,
+		"no changed files":                    `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":[],"risk":"low"}`,
+		"unsafe path":                         `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["../etc/passwd"],"risk":"low"}`,
+		"bad risk":                            `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"risk":"critical"}`,
+		"tool transcript":                     `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"<tool_call>rm</tool_call>","changedFiles":["a.go"],"risk":"low"}`,
+		"markdown fence":                      "```json\n{\"schemaVersion\":1}\n```",
+		"empty":                               ``,
+		"credential summary":                  `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"Removed api_key=0123456789abcdef0123 from config","changedFiles":["a.go"],"risk":"low"}`,
+		"credential summary with format rune": `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"Removed password=short\u200bcorrect-horse-battery-staple","changedFiles":["a.go"],"risk":"low"}`,
+		"credential test command":             `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"testsRun":[{"command":"AUTH_TOKEN=0123456789abcdef0123 npm test","exitCode":0}],"risk":"low"}`,
+		"credential test command with format rune": `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["a.go"],"testsRun":[{"command":"PASSWORD=short\u200bcorrect-horse-battery-staple npm test","exitCode":0}],"risk":"low"}`,
+		"credential-shaped path":                   `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["cfg/api_key=0123456789abcdef0123.txt"],"risk":"low"}`,
+		"credential-shaped path with format rune":  `{"schemaVersion":1,"kind":"orka.security.patch.v1","repositoryScan":"kaset","findingId":"fnd_1","summary":"s","changedFiles":["cfg/password=short\u200bcorrect-horse-battery-staple.txt"],"risk":"low"}`,
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := ParsePatchResult([]byte(payload), expected); err == nil {
+				t.Fatalf("ParsePatchResult() accepted %s", name)
+			}
+		})
+	}
+}

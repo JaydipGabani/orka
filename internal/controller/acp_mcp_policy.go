@@ -194,7 +194,7 @@ func buildCanonicalMCPToolDescriptors(
 		if registry != nil {
 			if tool, ok := registry.Get(name); ok {
 				if _, localOnly := controllerLocalOnlyTools[name]; localOnly {
-					return nil, fmt.Errorf("built-in tool %q is local-process-only and cannot be exposed through the controller MCP broker", name)
+					return nil, permanentACPAgentConfiguration(fmt.Errorf("built-in tool %q is local-process-only and cannot be exposed through the controller MCP broker", name))
 				}
 				descriptors = append(descriptors, harnessv2.MCPToolDescriptor{
 					Name: name, Description: tool.Description(), InputSchema: append(json.RawMessage(nil), tool.Parameters()...),
@@ -213,12 +213,12 @@ func buildCanonicalMCPToolDescriptors(
 			}
 		}
 		if reader == nil {
-			return nil, fmt.Errorf("allowed tool %q is not a known provider-native or brokered built-in tool", name)
+			return nil, permanentACPAgentConfiguration(fmt.Errorf("allowed tool %q is not a known provider-native or brokered built-in tool", name))
 		}
 		custom := &corev1alpha1.Tool{}
 		err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, custom)
 		if apierrors.IsNotFound(err) {
-			return nil, fmt.Errorf("allowed tool %q is not a known provider-native, built-in, or Tool resource", name)
+			return nil, permanentACPAgentConfiguration(fmt.Errorf("allowed tool %q is not a known provider-native, built-in, or Tool resource", name))
 		}
 		if err != nil {
 			return nil, fmt.Errorf("load allowed Tool %q: %w", name, err)

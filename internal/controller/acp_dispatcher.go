@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -30,6 +32,7 @@ import (
 	v2conformance "github.com/orka-agents/orka/internal/harness/v2/conformance"
 	v2eventjournal "github.com/orka-agents/orka/internal/harness/v2/eventjournal"
 	publisherservice "github.com/orka-agents/orka/internal/publisher/service"
+	"github.com/orka-agents/orka/internal/redact"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/tools"
 )
@@ -1745,7 +1748,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 			}
 			continue
 		}
-		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), acpInterruptedOutputFlushTimeout)
 		if persistErr := flushInterruptedOutput(flushCtx); persistErr != nil {
 			streamErr = acpUpdatePersistenceError(persistErr, nil)
 		}
@@ -1912,19 +1915,20 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		}
 		recordACPPromptOutcome(ctx, acpPromptOutcomeSucceeded)
 		promptTrace.End(nil)
-		if transitionErr := d.transitionDelivery(ctx, attemptID, fence, store.PromptDeliveryValidating, store.PromptDeliveryConflict, "workspace-validation-failed", "workspace validation failed before a trusted delta was established"); transitionErr != nil {
+		validationMessage := acpWorkspaceValidationFailureMessage(err)
+		if transitionErr := d.transitionDelivery(ctx, attemptID, fence, store.PromptDeliveryValidating, store.PromptDeliveryConflict, "workspace-validation-failed", validationMessage); transitionErr != nil {
 			return transitionErr
 		}
 		status := corev1alpha1.TaskDeliveryStatus{
 			State: corev1alpha1.TaskDeliveryStateDeliveryConflict, Outcome: corev1alpha1.TaskDeliveryOutcomeDeliveryConflict,
-			Reason: "WorkspaceValidationFailed", Message: "workspace validation failed before a trusted delta was established", LastTransitionTime: nowMeta(),
+			Reason: "WorkspaceValidationFailed", Message: validationMessage, LastTransitionTime: nowMeta(),
 		}
 		_ = d.patchDeliveryStatus(ctx, task, status)
 		_ = cleanupRuntimeSession("workspace_validation_failed")
 		if sessionExecution != nil {
 			d.forgetRuntimeSessionBinding(sessionExecution.Binding.SessionUID)
 		}
-		return d.failTaskForDelivery(ctx, task, status, "workspace validation failed")
+		return d.failTaskForDelivery(ctx, task, status, status.Message)
 	}
 	runtimePublicationFinalizationRequired = delta.Delta.State == harnessv2.WorkspaceDeltaPrepared
 	if err := d.publishTaskResultReference(ctx, task); err != nil {
@@ -4165,8 +4169,20 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 	lease harnessv2.PromptLease,
 	authorization harnessv2.PromptMCPAuthorization,
 ) {
+	log := logf.FromContext(ctx).WithValues("namespace", task.Namespace, "task", task.Name)
+	retryDelay := time.Duration(0)
+	// pending is the exact sealed mutation of a renewal whose outcome is
+	// ambiguous (transient failure after the request may have been written).
+	// It is replayed verbatim so a renewal the supervisor already applied is
+	// classified as a duplicate of the same operation instead of a
+	// digest_conflict on a rebuilt request with fresh timestamps.
+	var pending *harnessv2.RenewPromptLeaseRequest
 	for {
 		wait := max(time.Until(lease.ExpiresAt)/2, 5*time.Second)
+		if retryDelay > 0 {
+			wait = retryDelay
+			retryDelay = 0
+		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
@@ -4175,35 +4191,152 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 		case <-timer.C:
 		}
 		now := time.Now().UTC()
-		proposed := harnessv2.PromptLease{Generation: lease.Generation + 1, IssuedAt: now, ExpiresAt: now.Add(90 * time.Second)}
-		metadata := mutationMetadata(
-			fence, task, "renew-lease-"+strconv.FormatUint(proposed.Generation, 10), true, now.Add(30*time.Second),
-		)
-		authorization.LeaseGeneration = proposed.Generation
-		authorization.ExpiresAt = proposed.ExpiresAt
-		if maximum := now.Add(60 * time.Second); authorization.ExpiresAt.After(maximum) {
-			authorization.ExpiresAt = maximum
-		}
-		authorization.RuntimeSessionUID = metadata.Fence.RuntimeSessionUID
-		authorization.SessionGeneration = metadata.Fence.RuntimeSessionGeneration
-		authorization.TaskUID = metadata.TaskUID
-		authorization.TaskAttempt = metadata.TaskAttempt
-		authorization.PromptID = metadata.PromptID
-		request := harnessv2.RenewPromptLeaseRequest{
-			Protocol: harnessv2.ProtocolVersion, Metadata: metadata,
-			ExpectedLeaseGeneration: lease.Generation, Lease: proposed, MCPAuthorization: authorization,
-		}
-		if err := sealMutation(&request.Metadata.RequestDigest, request); err != nil {
+		var request harnessv2.RenewPromptLeaseRequest
+		switch {
+		case pending != nil && pending.Metadata.ExpiresAt.After(now.Add(promptLeaseRenewalRetryMargin)):
+			request = *pending
+		case pending != nil:
+			// The ambiguous mutation can no longer be delivered before its
+			// expiry, and there is no evidence it was not applied: resealing
+			// the same operation with fresh timestamps would collide with the
+			// supervisor's recorded operation (digest_conflict) if it was.
+			// The mutation is sealed to outlive the retry window, so reaching
+			// this point means the lease itself is about to expire.
+			log.Info("ACP prompt lease renewal replay expired without a settled outcome; cancelling the prompt",
+				"leaseGeneration", lease.Generation, "pendingGeneration", pending.Lease.Generation)
 			cancelRuntime()
 			return
+		default:
+			proposed := harnessv2.PromptLease{Generation: lease.Generation + 1, IssuedAt: now, ExpiresAt: now.Add(90 * time.Second)}
+			authorization.LeaseGeneration = proposed.Generation
+			authorization.ExpiresAt = proposed.ExpiresAt
+			if maximum := now.Add(60 * time.Second); authorization.ExpiresAt.After(maximum) {
+				authorization.ExpiresAt = maximum
+			}
+			// The mutation stays valid for as long as its MCP authorization so
+			// a transient failure can replay the identical sealed request for
+			// the entire retry window instead of resealing it.
+			metadata := mutationMetadata(
+				fence, task, "renew-lease-"+strconv.FormatUint(proposed.Generation, 10), true, authorization.ExpiresAt,
+			)
+			authorization.RuntimeSessionUID = metadata.Fence.RuntimeSessionUID
+			authorization.SessionGeneration = metadata.Fence.RuntimeSessionGeneration
+			authorization.TaskUID = metadata.TaskUID
+			authorization.TaskAttempt = metadata.TaskAttempt
+			authorization.PromptID = metadata.PromptID
+			request = harnessv2.RenewPromptLeaseRequest{
+				Protocol: harnessv2.ProtocolVersion, Metadata: metadata,
+				ExpectedLeaseGeneration: lease.Generation, Lease: proposed, MCPAuthorization: authorization,
+			}
+			if err := sealMutation(&request.Metadata.RequestDigest, request); err != nil {
+				cancelRuntime()
+				return
+			}
 		}
+		proposed := request.Lease
 		response, err := runtimeClient.RenewPromptLease(ctx, sessionID, request)
-		if err != nil || response.Lease.Generation != proposed.Generation {
-			cancelRuntime()
+		if err == nil && response.Lease.Generation == proposed.Generation {
+			pending = nil
+			lease = response.Lease
+			continue
+		}
+		// A prompt that already settled on the supervisor no longer needs a
+		// lease: its terminal event is delivered (or recovered) through the
+		// prompt stream, so renewal simply stops. Cancelling the runtime
+		// context here would abort that stream and turn a completed prompt
+		// into a client-error or outcome-unknown settlement.
+		if promptLeaseRenewalSettled(err) {
+			log.Info("ACP prompt lease renewal found the prompt settled; stopping renewal", "leaseGeneration", lease.Generation)
 			return
 		}
-		lease = response.Lease
+		// One slow or dropped renewal under load must not cancel a healthy
+		// prompt: a transient failure is retried while the current lease is
+		// still valid, replaying the identical sealed request. Only a
+		// definitive supervisor rejection, a generation mismatch, or an
+		// expired lease ends the prompt.
+		if remaining := time.Until(lease.ExpiresAt); err != nil && promptLeaseRenewalRetryable(err) && remaining > promptLeaseRenewalRetryMargin {
+			replay := request
+			pending = &replay
+			retryDelay = min(promptLeaseRenewalRetryDelay, remaining/4)
+			log.Info("ACP prompt lease renewal failed; retrying while the lease is valid",
+				"errorClass", promptLeaseRenewalErrorClass(err), "leaseGeneration", lease.Generation,
+				"leaseRemaining", remaining.Round(time.Second).String(), "retryIn", retryDelay.Round(time.Millisecond).String())
+			continue
+		}
+		// Only the low-cardinality class is logged: a supervisor rejection
+		// message is runtime-supplied text and must not reach controller logs.
+		if err != nil {
+			log.Info("ACP prompt lease renewal rejected; cancelling the prompt",
+				"errorClass", promptLeaseRenewalErrorClass(err), "leaseGeneration", lease.Generation)
+		} else {
+			log.Info("ACP prompt lease renewal returned an unexpected generation; cancelling the prompt",
+				"leaseGeneration", lease.Generation, "proposedGeneration", proposed.Generation, "returnedGeneration", response.Lease.Generation)
+		}
+		cancelRuntime()
+		return
 	}
+}
+
+const (
+	// promptLeaseRenewalRetryDelay bounds how soon a transiently failed lease
+	// renewal is retried; promptLeaseRenewalRetryMargin is the remaining lease
+	// time below which a retry is no longer attempted.
+	promptLeaseRenewalRetryDelay  = 3 * time.Second
+	promptLeaseRenewalRetryMargin = 5 * time.Second
+)
+
+// promptLeaseRenewalErrorClass renders a low-cardinality, credential-free
+// class for a failed lease renewal (client error kind, HTTP status, and v2
+// error code) suitable for structured logs.
+func promptLeaseRenewalErrorClass(err error) string {
+	if clientErr, ok := errors.AsType[*harnessv2.ClientError](err); ok {
+		class := string(clientErr.Kind)
+		if clientErr.StatusCode != 0 {
+			class += "/" + strconv.Itoa(clientErr.StatusCode)
+		}
+		if clientErr.Code != "" {
+			class += "/" + string(clientErr.Code)
+		}
+		return class
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	return "unclassified"
+}
+
+// promptLeaseRenewalSettled reports whether the supervisor rejected a lease
+// renewal because the prompt has already settled (HTTP 410 with the v2
+// "settled" code).
+func promptLeaseRenewalSettled(err error) bool {
+	var clientErr *harnessv2.ClientError
+	return errors.As(err, &clientErr) && clientErr.Kind == harnessv2.ClientErrorHTTP &&
+		clientErr.StatusCode == http.StatusGone && clientErr.Code == harnessv2.ErrorCodeSettled
+}
+
+// promptLeaseRenewalRetryable reports whether a failed lease renewal may be
+// retried while the current lease is still valid. Definitive rejections from
+// the supervisor (settled prompt, stale fence, identity or digest conflict,
+// poisoned session) end the prompt; transport, protocol, stream, and
+// retryable or server-side HTTP failures are transient.
+func promptLeaseRenewalRetryable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if clientErr, ok := errors.AsType[*harnessv2.ClientError](err); ok {
+		switch clientErr.Kind {
+		case harnessv2.ClientErrorHTTP:
+			return clientErr.Retryable || clientErr.StatusCode >= http.StatusInternalServerError
+		case harnessv2.ClientErrorTransport, harnessv2.ClientErrorProtocol, harnessv2.ClientErrorStream:
+			return true
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (d *ACPDispatcher) resolvePromptPermission(ctx context.Context, runtimeClient *harnessv2.Client, sessionID harnessv2.RuntimeSessionID, task *corev1alpha1.Task, fence harnessv2.Fence, event harnessv2.Event) error {
@@ -4388,25 +4521,57 @@ func runtimeSessionStartFailureMessage(err error) string {
 	}
 }
 
+// acpWorkspaceValidationFailureMessage projects the supervisor's categorized
+// workspace-validation rejection (for example "reserved workspace path" or
+// "workspace delta exceeds request limits") onto the Task delivery receipt so
+// operators do not need controller logs to learn why a delta was refused.
+// The supervisor already bounds and categorizes the message; only the client
+// error text is used and it is re-bounded here.
+func acpWorkspaceValidationFailureMessage(err error) string {
+	const generic = "workspace validation failed before a trusted delta was established"
+	var clientErr *harnessv2.ClientError
+	if !errors.As(err, &clientErr) || strings.TrimSpace(clientErr.Message) == "" {
+		return generic
+	}
+	detail := redact.SensitiveText(boundedRuntimeSessionServerMessage(err))
+	return boundACPStatusMessage(generic + ": " + detail)
+}
+
 func boundedRuntimeSessionServerMessage(err error) string {
 	var clientErr *harnessv2.ClientError
 	if !errors.As(err, &clientErr) {
 		return "non-client runtime session error"
 	}
-	message := strings.TrimSpace(strings.Map(func(current rune) rune {
-		if current < 0x20 || current == 0x7f {
-			return ' '
-		}
-		return current
-	}, clientErr.Message))
+	message := strings.TrimSpace(stripACPControlRunes(clientErr.Message))
 	if message == "" {
 		return "empty runtime error response"
 	}
+	// Redact the complete message before bounding it: truncating first could
+	// cut a credential-shaped value ahead of the text its recognizer needs.
+	message = redact.SensitiveText(message)
 	runes := []rune(message)
 	if len(runes) > 256 {
 		message = string(runes[:256])
 	}
 	return message
+}
+
+// stripACPControlRunes removes control characters (C0, DEL, and C1) and
+// Unicode format runes from runtime-supplied text. Dropping every separator
+// before redaction reassembles credentials split across lines or tabs while
+// keeping terminal escapes and invisible runes out of status and logs.
+func stripACPControlRunes(value string) string {
+	return strings.Map(func(current rune) rune {
+		switch {
+		case current < 0x20 || current == 0x7f || (current >= 0x80 && current < 0xa0):
+			return -1
+		// Format runes (zero-width spaces, joiners, directional marks) are
+		// as invisible as controls and equally capable of splitting a token.
+		case unicode.Is(unicode.Cf, current):
+			return -1
+		}
+		return current
+	}, strings.ToValidUTF8(value, ""))
 }
 
 func runtimeSessionCreationMayHaveApplied(err error) bool {
@@ -4539,6 +4704,13 @@ func (d *ACPDispatcher) handlePromptStreamError(
 		"diagnostic", promptStreamDiagnostic(err),
 	)
 	if persistenceErr, ok := errors.AsType[*acpExecutionUpdatePersistenceError](err); ok {
+		// The diagnostic above is intentionally low-cardinality; the store
+		// error itself is what an operator needs to fix a failing journal or
+		// plan write, so record it once here before the Task is failed.
+		logf.FromContext(ctx).Error(persistenceErr, "ACP execution update persistence failed",
+			"namespace", task.Namespace, "task", task.Name,
+			"journalFailed", persistenceErr.journalFailed(),
+		)
 		return d.handlePromptUpdatePersistenceFailure(
 			ctx, runtimeClient, sessionID, task, attemptID, fence, runtimeFence, journalState, accepted, persistenceErr,
 		)
@@ -4619,6 +4791,9 @@ func (d *ACPDispatcher) handlePromptStreamError(
 					)
 				}
 			}
+			logACPCancelSettlementUnknown(ctx, task, reason, response, cancelErr)
+		} else {
+			logf.FromContext(ctx).Error(sealErr, "seal ACP prompt cancellation request", "namespace", task.Namespace, "task", task.Name)
 		}
 		if lifecycleErr := appendPromptStreamFailureLifecycleDetached(ctx, journalState, err); lifecycleErr != nil {
 			logf.FromContext(ctx).Error(lifecycleErr, "persist unknown ACP prompt settlement", "namespace", task.Namespace, "task", task.Name)
@@ -4702,6 +4877,7 @@ func (d *ACPDispatcher) handlePromptUpdatePersistenceFailure(
 				ctx, task, attemptID, fence, "prompt was settled after execution update persistence failed",
 			)
 		}
+		logACPCancelSettlementUnknown(ctx, task, cancelRequest.Reason, response, cancelErr)
 	}
 	if !persistenceErr.journalFailed() {
 		if lifecycleErr := appendPromptStreamFailureLifecycleDetached(ctx, journalState, persistenceErr); lifecycleErr != nil {
@@ -4736,6 +4912,58 @@ func (d *ACPDispatcher) failPromptForExecutionEventPersistence(
 }
 
 const promptStreamMissingTerminalDiagnostic = "runtime stream ended without a terminal event"
+
+// acpInterruptedOutputFlushTimeout bounds the durable write of buffered
+// assistant/tool output after a prompt stream ends. The journal shares one
+// SQLite connection with every other controller write, so a short deadline
+// turns ordinary contention between concurrent ACP prompts into a failed
+// Task with ExecutionEventPersistenceFailed.
+const acpInterruptedOutputFlushTimeout = 60 * time.Second
+
+const (
+	acpCancelLogKeyNamespace = "namespace"
+	acpCancelLogKeyTask      = "task"
+	acpCancelLogKeyStatus    = "status"
+	acpCancelLogKeyKind      = "kind"
+)
+
+// logACPCancelSettlementUnknown records why an explicit prompt cancellation
+// could not prove settlement, so an OutcomeUnknown/RuntimeLost Task can be
+// diagnosed from controller logs. Fields stay low-cardinality: transport
+// status/code/kind for a client error, and the runtime's barrier, forced
+// termination, and terminal event when the request itself succeeded.
+func logACPCancelSettlementUnknown(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	reason harnessv2.CancelReason,
+	response *harnessv2.CancelPromptResponse,
+	cancelErr error,
+) {
+	httpStatus, code, kind := 0, harnessv2.ErrorCode(""), harnessv2.ClientErrorKind("")
+	if clientErr, ok := errors.AsType[*harnessv2.ClientError](cancelErr); ok {
+		httpStatus, code, kind = clientErr.StatusCode, clientErr.Code, clientErr.Kind
+	}
+	fields := []any{
+		acpCancelLogKeyNamespace, task.Namespace,
+		acpCancelLogKeyTask, task.Name,
+		eventReasonField, reason,
+		"requestFailed", cancelErr != nil,
+		"timedOut", errors.Is(cancelErr, context.DeadlineExceeded),
+		acpCancelLogKeyStatus, httpStatus,
+		"code", code,
+		acpCancelLogKeyKind, kind,
+	}
+	if response != nil {
+		fields = append(fields,
+			"classification", response.Classification.Class,
+			"barrier", response.BarrierState,
+			"forcedTermination", response.ForcedTermination,
+			"terminalEvent", response.Settlement.TerminalEvent,
+			"settlementProven", response.SettlementProven,
+		)
+	}
+	logf.FromContext(ctx).Info("ACP prompt cancellation settlement unknown", fields...)
+}
 
 func promptStreamDiagnostic(err error) string {
 	var persistenceErr *acpExecutionUpdatePersistenceError
@@ -4904,19 +5132,116 @@ func (d *ACPDispatcher) finishNonSuccessWithCancellationReason(
 		}
 		return d.failTask(ctx, task, corev1alpha1.TaskExecutionStateOutcomeUnknown, corev1alpha1.TaskExecutionOutcomeOutcomeUnknown, "RuntimeLost", "prompt outcome is unknown")
 	default:
-		if err := d.transitionAttemptToTerminal(ctx, attemptID, fence, store.PromptExecutionFailed, "failed"); err != nil {
+		message := acpPromptFailureMessage(terminal)
+		if err := d.transitionAttemptToFailed(ctx, attemptID, fence, "failed", acpPromptFailedReason, message); err != nil {
 			return err
 		}
 		execution := corev1alpha1.TaskExecutionStatus{
 			State: corev1alpha1.TaskExecutionStateFailed, Outcome: corev1alpha1.TaskExecutionOutcomeFailed,
 			Attempt: task.Status.Execution.Attempt, PromptID: task.Status.Execution.PromptID,
-			Reason: "PromptFailed", Message: "prompt failed",
+			Reason: acpPromptFailedReason, Message: message,
 		}
-		if err := d.finalizeTaskSessionMarker(ctx, task, fence, session, "Failed", "prompt failed", corev1alpha1.TaskPhaseFailed, execution); err != nil {
+		if err := d.finalizeTaskSessionMarker(ctx, task, fence, session, "Failed", message, corev1alpha1.TaskPhaseFailed, execution); err != nil {
 			return err
 		}
-		return d.failTask(ctx, task, corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed, "PromptFailed", "prompt failed")
+		return d.failTask(ctx, task, corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed, acpPromptFailedReason, message)
 	}
+}
+
+// acpPromptFailedReason classifies a prompt that the runtime settled as
+// failed; the message carries the runtime's bounded failure code and detail.
+const acpPromptFailedReason corev1alpha1.TaskExecutionReason = "PromptFailed"
+
+// acpPromptFailureMessageLimit bounds the projected Task failure message so a
+// runtime-supplied detail can never bloat Task status.
+const acpPromptFailureMessageLimit = 512
+
+// acpPromptFailureMessage projects the runtime's terminal Failed event into a
+// human-readable Task message. The generic "prompt failed" text is kept when
+// the runtime reported no code or detail; otherwise the runtime's bounded
+// failure code and message are appended so operators can distinguish provider
+// upstream errors, turn limits, and refusals without reading runtime logs.
+func acpPromptFailureMessage(terminal harnessv2.Event) string {
+	const generic = "prompt failed"
+	if terminal.Failed == nil {
+		return generic
+	}
+	// Both fields are runtime-controlled (only bounded by the harness).
+	// Controls are stripped before redaction so a control byte cannot split a
+	// credential-shaped value past the redactor, and the composed logical
+	// value is redacted as one string: a credential assignment split across
+	// the code and the message ("password" / "hunter2") is only recognizable
+	// once they are joined, so redacting the fields separately would persist
+	// the raw value in Task status, the PromptAttempt, and the Session turn.
+	detail := strings.TrimSpace(stripACPControlRunes(terminal.Failed.Message))
+	code := strings.TrimSpace(stripACPControlRunes(terminal.Failed.Code))
+	switch {
+	case detail == "" && code == "":
+		return generic
+	case detail == "":
+		detail = code
+	case code != "" && code != "acp_prompt_failed" && !strings.HasPrefix(detail, code):
+		detail = code + ": " + detail
+	}
+	return boundACPStatusMessage(generic + ": " + redact.SensitiveText(detail))
+}
+
+// boundACPStatusMessage truncates a runtime-derived status message to
+// acpPromptFailureMessageLimit bytes on a rune boundary so the persisted
+// message stays valid UTF-8 for the control store.
+func boundACPStatusMessage(message string) string {
+	if len(message) <= acpPromptFailureMessageLimit {
+		return message
+	}
+	limit := acpPromptFailureMessageLimit
+	for limit > 0 && !utf8.RuneStart(message[limit]) {
+		limit--
+	}
+	return message[:limit]
+}
+
+// transitionAttemptToFailed mirrors transitionAttemptToCancelled for the
+// Failed terminal state so the durable PromptAttempt records the same reason
+// and message that the Task projection exposes; controller-restart recovery
+// then reproduces that classification instead of the generic default.
+func (d *ACPDispatcher) transitionAttemptToFailed(
+	ctx context.Context,
+	id string,
+	fence store.ControllerEpochFence,
+	operation string,
+	reason corev1alpha1.TaskExecutionReason,
+	message string,
+) error {
+	if strings.TrimSpace(string(reason)) == "" || strings.TrimSpace(message) == "" {
+		return errors.New("terminal attempt classification requires a reason and message")
+	}
+	attempt, err := d.Store.GetPromptAttempt(ctx, id)
+	if err != nil {
+		return err
+	}
+	target := store.PromptExecutionFailed
+	if attempt.ExecutionState == target {
+		if attempt.TerminalReason != string(reason) || attempt.OutcomeMarker != message {
+			return fmt.Errorf("%w: prompt attempt %s terminal classification does not match", store.ErrConflict, id)
+		}
+		return nil
+	}
+	if err := store.ValidatePromptExecutionTransition(attempt.ExecutionState, target); err != nil {
+		return err
+	}
+	digest, err := acpDomainDigest("attempt-transition", map[string]any{
+		"id": id, "from": attempt.ExecutionState, "to": target, "operation": operation,
+		"version": attempt.Version, "terminalReason": reason, "outcomeMarker": message,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.Store.TransitionPromptAttemptExecution(ctx, store.PromptAttemptExecutionTransition{
+		ID: id, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState, NewState: target,
+		OperationID: operation + "-" + strconv.FormatInt(attempt.Version, 10), OperationDigest: digest,
+		TerminalReason: string(reason), OutcomeMarker: message, UpdatedAt: time.Now().UTC(),
+	})
+	return err
 }
 
 func (d *ACPDispatcher) transitionAttemptToTerminal(ctx context.Context, id string, fence store.ControllerEpochFence, target store.PromptExecutionState, operation string) error {

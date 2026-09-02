@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	DefaultPromptLease       = 2 * time.Minute
-	DefaultPermissionTimeout = 5 * time.Minute
-	DefaultBufferedEvents    = 256
-	DefaultInitializeTimeout = 60 * time.Second
+	DefaultPromptLease        = 2 * time.Minute
+	DefaultPermissionTimeout  = 5 * time.Minute
+	DefaultBufferedEvents     = 256
+	DefaultBufferedEventBytes = 32 << 20
+	DefaultInitializeTimeout  = 60 * time.Second
 )
 
 type RuntimeSessionConfig struct {
@@ -32,6 +34,12 @@ type RuntimeSessionConfig struct {
 	PermissionTimeout time.Duration
 	CancelGrace       time.Duration
 	MaxBufferedEvents int
+	// MaxBufferedEventBytes bounds the aggregate size of buffered, not yet
+	// consumed prompt events (measured as the raw notification payload) so a
+	// burst of large valid events cannot exhaust the runtime's memory before
+	// the event-count limit fires. Consumers release bytes through
+	// PromptRun.Release.
+	MaxBufferedEventBytes int
 }
 
 type RuntimeSession struct {
@@ -65,6 +73,9 @@ type PromptEvent struct {
 	Timestamp  time.Time
 	Update     *SessionNotification
 	Permission *PermissionRequestEvent
+	// Size is the raw notification payload size counted against the prompt's
+	// buffered-bytes budget until the consumer releases the event.
+	Size int
 }
 
 type PermissionRequestEvent struct {
@@ -91,7 +102,10 @@ type PromptResult struct {
 
 type PromptRun struct {
 	Events <-chan PromptEvent
-	Result <-chan PromptResult
+	// Release returns an event's bytes to the buffered-bytes budget; call it
+	// as soon as the event has been received from Events.
+	Release func(PromptEvent)
+	Result  <-chan PromptResult
 }
 
 type PromptTombstone struct {
@@ -136,6 +150,7 @@ type activePrompt struct {
 	accepted        bool
 	settled         bool
 	overflowed      bool
+	bufferedBytes   int
 	cancelRequested bool
 	lease           *time.Timer
 	permissions     map[string]*pendingPermission
@@ -175,6 +190,9 @@ func NewRuntimeSession(ctx context.Context, cfg RuntimeSessionConfig) (*RuntimeS
 	}
 	if cfg.MaxBufferedEvents <= 0 {
 		cfg.MaxBufferedEvents = DefaultBufferedEvents
+	}
+	if cfg.MaxBufferedEventBytes <= 0 {
+		cfg.MaxBufferedEventBytes = DefaultBufferedEventBytes
 	}
 	session := &RuntimeSession{
 		id:            cfg.ID,
@@ -303,7 +321,7 @@ func (s *RuntimeSession) StartPromptWithLease(ctx context.Context, promptID, req
 		case <-active.done:
 		}
 	}()
-	return PromptRun{Events: active.events, Result: active.result}, nil
+	return PromptRun{Events: active.events, Result: active.result, Release: func(event PromptEvent) { s.releaseBufferedEvent(active, event) }}, nil
 }
 
 func (s *RuntimeSession) RenewPromptLease(promptID string) error {
@@ -448,6 +466,9 @@ func (s *RuntimeSession) runPrompt(active *activePrompt) {
 		queued := append([]PromptEvent(nil), active.preAccepted...)
 		active.preAccepted = nil
 		for _, event := range queued {
+			// Bytes were counted when the event was parked pre-acceptance;
+			// hand them back before emitLocked counts the enqueue.
+			active.bufferedBytes -= event.Size
 			s.emitLocked(active, event)
 		}
 		s.mu.Unlock()
@@ -496,7 +517,7 @@ func (s *RuntimeSession) finishPrompt(active *activePrompt, result PromptResult)
 	cancelPendingPermissions(active)
 	if active.overflowed && result.Outcome != PromptOutcomeOutcomeUnknown {
 		result.Outcome = PromptOutcomeFailed
-		result.Err = fmt.Errorf("ACP prompt event buffer overflowed")
+		result.Err = ErrPromptEventBufferOverflow
 	}
 	s.tombstones[active.id] = PromptTombstone{PromptID: active.id, RequestDigest: active.requestDigest, Result: result}
 	if s.active == active {
@@ -522,7 +543,7 @@ func (s *RuntimeSession) handleNotification(_ context.Context, notification Inco
 	if active == nil || active.settled || update.SessionID != s.providerSessionID {
 		return
 	}
-	s.emitLocked(active, PromptEvent{Type: PromptEventUpdate, Update: &update})
+	s.emitLocked(active, PromptEvent{Type: PromptEventUpdate, Update: &update, Size: len(notification.Params)})
 }
 
 func (s *RuntimeSession) handleRequest(ctx context.Context, request IncomingRequest) (any, *RPCError) {
@@ -549,7 +570,7 @@ func (s *RuntimeSession) handleRequest(ctx context.Context, request IncomingRequ
 		pending.options[option.OptionID] = struct{}{}
 	}
 	active.permissions[requestID] = pending
-	s.emitLocked(active, PromptEvent{Type: PromptEventPermissionRequested, Permission: &PermissionRequestEvent{RequestID: requestID, Request: permission}})
+	s.emitLocked(active, PromptEvent{Type: PromptEventPermissionRequested, Permission: &PermissionRequestEvent{RequestID: requestID, Request: permission}, Size: len(request.Params)})
 	done := active.done
 	s.mu.Unlock()
 
@@ -571,11 +592,16 @@ func (s *RuntimeSession) handleRequest(ctx context.Context, request IncomingRequ
 
 func (s *RuntimeSession) emitLocked(active *activePrompt, event PromptEvent) {
 	if !active.accepted && event.Type != PromptEventAccepted {
-		if len(active.preAccepted) >= s.config.MaxBufferedEvents {
+		if len(active.preAccepted) >= s.config.MaxBufferedEvents || active.bufferedBytes+event.Size > s.config.MaxBufferedEventBytes {
 			s.markOverflowedLocked(active)
 			return
 		}
+		active.bufferedBytes += event.Size
 		active.preAccepted = append(active.preAccepted, event)
+		return
+	}
+	if event.Size > 0 && active.bufferedBytes+event.Size > s.config.MaxBufferedEventBytes {
+		s.markOverflowedLocked(active)
 		return
 	}
 	active.seq++
@@ -583,9 +609,24 @@ func (s *RuntimeSession) emitLocked(active *activePrompt, event PromptEvent) {
 	event.Timestamp = time.Now().UTC()
 	select {
 	case active.events <- event:
+		active.bufferedBytes += event.Size
 	default:
 		s.markOverflowedLocked(active)
 	}
+}
+
+// releaseBufferedEvent returns a consumed event's bytes to the prompt's
+// buffered-bytes budget.
+func (s *RuntimeSession) releaseBufferedEvent(active *activePrompt, event PromptEvent) {
+	if active == nil || event.Size <= 0 {
+		return
+	}
+	s.mu.Lock()
+	active.bufferedBytes -= event.Size
+	if active.bufferedBytes < 0 {
+		active.bufferedBytes = 0
+	}
+	s.mu.Unlock()
 }
 
 // markOverflowedLocked records event loss and schedules the bounded prompt
@@ -597,6 +638,9 @@ func (s *RuntimeSession) markOverflowedLocked(active *activePrompt) {
 		return
 	}
 	active.overflowed = true
+	slog.Warn("ACP prompt event buffer overflowed; cancelling the prompt",
+		"promptID", active.id, "bufferedEvents", s.config.MaxBufferedEvents, "bufferedBytes", active.bufferedBytes,
+		"maxBufferedEventBytes", s.config.MaxBufferedEventBytes, "lastSequence", active.seq, "accepted", active.accepted)
 	go func(promptID string) {
 		ctx, cancel := context.WithTimeout(context.Background(), s.config.CancelGrace*2)
 		defer cancel()

@@ -16,7 +16,7 @@ func TestAssistantMessageCompactorKeepsCodexBurstBelowHarnessRateLimit(t *testin
 	compactor.flushInterval = time.Hour
 	t.Cleanup(compactor.close)
 	now := time.Now().UTC()
-	const rawUpdates = runtimeCodexMaxUpdateEventsPerSecond + 1
+	const rawUpdates = runtimeMaxUpdateEventsPerSecond + 1
 
 	var compacted []acp.PromptEvent
 	for sequence := 1; sequence <= rawUpdates; sequence++ {

@@ -2,6 +2,14 @@
 # shellcheck disable=SC2016 # This test intentionally matches literal shell expressions.
 set -Eeuo pipefail
 
+# scripts/tests suites rely on 'set -e' stopping on failed (( )) arithmetic,
+# which macOS's stock bash 3.2 does not honor; failures would be silently
+# masked there. Require a modern bash (for example: brew install bash).
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "error: this test suite requires bash >= 4; found ${BASH_VERSION}" >&2
+  exit 1
+fi
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 wrapper="${root}/scripts/live-acp-runtime-kind-e2e.sh"
 bootstrap="${root}/scripts/lib/live-acp-runtime-kind-bootstrap.sh"
@@ -35,6 +43,7 @@ grep -F 'live_acp_kind_validate_vekil_catalog "${models_file}"' "${bootstrap}" >
 grep -F 'live_acp_kind_probe_configured_models' "${bootstrap}" >/dev/null
 # shellcheck disable=SC2016 # Match the literal delegation expression in the wrapper.
 grep -F '"${LIVE_ACP_VALIDATOR_SCRIPT}" "${validator_args[@]}"' "${wrapper}" >/dev/null
+grep -F 'export ACP_E2E_ALLOW_SHARED_POOL_MUTATION="${ACP_E2E_ALLOW_SHARED_POOL_MUTATION:-1}"' "${wrapper}" >/dev/null
 grep -F 'ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN' "${bootstrap}" >/dev/null
 grep -F 'Creating four role-separated release-gate credential Secrets' "${bootstrap}" >/dev/null
 if grep -Eq 'set +-x|echo .*COPILOT_GITHUB_TOKEN' "${bootstrap}" "${wrapper}"; then

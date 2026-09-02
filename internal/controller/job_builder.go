@@ -343,6 +343,9 @@ func (b *JobBuilder) BuildWithOptions(ctx context.Context, task *corev1alpha1.Ta
 	if err := validateReadOnlyAgentRuntime(task, agent); err != nil {
 		return nil, err
 	}
+	if err := b.validateContainerDeliveredPromptSize(ctx, task, agent); err != nil {
+		return nil, err
+	}
 
 	jobName := buildTaskJobName(task)
 	execution := resolveExecution(task, agent)
@@ -2651,5 +2654,54 @@ func (b *JobBuilder) addSkillVolumes(ctx context.Context, job *batchv1.Job, task
 		},
 	)
 
+	return nil
+}
+
+// maxContainerDeliveredPromptBytes bounds the prompt and system prompt a
+// worker Job can carry: both travel as environment variables, and Linux
+// rejects any single execve argument or environment string over
+// MAX_ARG_STRLEN (128 KiB) with the opaque "argument list too long" exec
+// failure. Guard well below that so the Task fails with an actionable
+// message instead of a dead container.
+const maxContainerDeliveredPromptBytes = 110 * 1024
+
+func (b *JobBuilder) validateContainerDeliveredPromptSize(ctx context.Context, task *corev1alpha1.Task, agent *corev1alpha1.Agent) error {
+	if task == nil || (task.Spec.Type != corev1alpha1.TaskTypeAI && task.Spec.Type != corev1alpha1.TaskTypeAgent) {
+		// Only AI and Agent worker Jobs export prompts through the process
+		// environment; a container Task's unused optional prompt fields must
+		// not make an otherwise runnable container fail this guard.
+		return nil
+	}
+	// Mirror each builder's precedence exactly — resolveAIConfig prefers
+	// spec.ai.prompt over spec.prompt, addAgentEnvVars the reverse — and
+	// resolve a ConfigMap-backed Agent system prompt before measuring: the
+	// guard must see the values that actually reach the environment.
+	prompt := ""
+	if task.Spec.AI != nil {
+		prompt = task.Spec.AI.Prompt
+	}
+	if task.Spec.Type == corev1alpha1.TaskTypeAgent && task.Spec.Prompt != "" {
+		prompt = task.Spec.Prompt
+	}
+	if prompt == "" {
+		prompt = task.Spec.Prompt
+	}
+	systemPrompt := ""
+	if task.Spec.Type == corev1alpha1.TaskTypeAI && task.Spec.AI != nil {
+		systemPrompt = task.Spec.AI.SystemPrompt
+	}
+	if systemPrompt == "" && agent != nil && agent.Spec.SystemPrompt != nil {
+		systemPrompt = agent.Spec.SystemPrompt.Inline
+		if systemPrompt == "" && agent.Spec.SystemPrompt.ConfigMapRef != nil {
+			systemPrompt = b.resolveConfigMapValue(ctx, agent.Namespace, agent.Spec.SystemPrompt.ConfigMapRef)
+		}
+	}
+	for name, value := range map[string]string{"prompt": prompt, "system prompt": systemPrompt} {
+		if len(value) > maxContainerDeliveredPromptBytes {
+			return fmt.Errorf(
+				"%s is %d bytes; container-delivered prompts are limited to %d bytes because they are passed as process environment (Linux MAX_ARG_STRLEN). Shorten the %s or supply the content through the workspace instead",
+				name, len(value), maxContainerDeliveredPromptBytes, name)
+		}
+	}
 	return nil
 }

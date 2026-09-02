@@ -37,6 +37,7 @@ func TestProviderProfilesDisableUpdatesAndUsePrivateHomes(t *testing.T) {
 	if codexConfig["model"] != "gpt-test" {
 		t.Fatalf("Codex model config = %#v, want gpt-test", codexConfig["model"])
 	}
+	assertCodexWebSocketTransportsDisabled(t, codexConfig)
 	if strings.Contains(strings.Join(codex.Args, " "), "npx") {
 		t.Fatalf("Codex runtime uses a download-on-start command: %v", codex.Args)
 	}
@@ -115,6 +116,7 @@ func TestCodexProviderSessionProjection(t *testing.T) {
 	if config["model"] != "gpt-test" || config["developer_instructions"] != "codex system" || config["model_reasoning_effort"] != "high" {
 		t.Fatalf("Codex config = %#v", config)
 	}
+	assertCodexWebSocketTransportsDisabled(t, config)
 	if strings.Contains(strings.Join(codex.Args, " "), "npx") {
 		t.Fatalf("Codex runtime uses a download-on-start command: %v", codex.Args)
 	}
@@ -434,8 +436,8 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		cfg.Provider.AdapterName != "codex-acp-orka-dist" || cfg.Provider.AdapterDigest != "sha256:"+acp.CodexACPOrkaDistSHA256 {
 		t.Fatalf("unexpected adapter digests: capabilities=%#v provider=%#v", cfg.Capabilities.AdapterDigests, cfg.Provider)
 	}
-	if cfg.Capabilities.Limits.MaxUpdateEventsPerSecond != runtimeCodexMaxUpdateEventsPerSecond {
-		t.Fatalf("max update events per second = %d, want %d", cfg.Capabilities.Limits.MaxUpdateEventsPerSecond, runtimeCodexMaxUpdateEventsPerSecond)
+	if cfg.Capabilities.Limits.MaxUpdateEventsPerSecond != runtimeMaxUpdateEventsPerSecond {
+		t.Fatalf("max update events per second = %d, want %d", cfg.Capabilities.Limits.MaxUpdateEventsPerSecond, runtimeMaxUpdateEventsPerSecond)
 	}
 	if cfg.ProviderProxy.UpstreamBaseURL != "http://vekil.vekil-system.svc:1337/v1" {
 		t.Fatalf("unexpected provider proxy base URL: %q", cfg.ProviderProxy.UpstreamBaseURL)
@@ -531,9 +533,10 @@ func TestDefaultProtocolLimitsUseProviderSpecificUpdateRates(t *testing.T) {
 		provider string
 		want     int
 	}{
-		{provider: providerKindCodex, want: runtimeCodexMaxUpdateEventsPerSecond},
-		{provider: providerKindClaude, want: harnessv2.DefaultMaxUpdateEventsPerSecond},
-		{provider: providerKindCopilot, want: harnessv2.DefaultMaxUpdateEventsPerSecond},
+		{provider: providerKindCodex, want: runtimeMaxUpdateEventsPerSecond},
+		{provider: providerKindClaude, want: runtimeMaxUpdateEventsPerSecond},
+		{provider: providerKindCopilot, want: runtimeMaxUpdateEventsPerSecond},
+		{provider: providerKindOpencode, want: runtimeMaxUpdateEventsPerSecond},
 	}
 	for _, test := range tests {
 		t.Run(test.provider, func(t *testing.T) {
@@ -631,4 +634,38 @@ func testProviderProjectionRequest(
 
 func containsArg(args []string, want string) bool {
 	return slices.Contains(args, want)
+}
+
+// assertCodexWebSocketTransportsDisabled proves the session config selects
+// the custom HTTPS-only provider instead of Codex's built-in "openai"
+// provider, whose Responses WebSocket attempt the proxy rejects with 403 and
+// whose fallback warning would leak into the agent's first message.
+func assertCodexWebSocketTransportsDisabled(t *testing.T, config map[string]any) {
+	t.Helper()
+	if config["model_provider"] != codexProviderID {
+		t.Fatalf("Codex model_provider = %#v, want %q", config["model_provider"], codexProviderID)
+	}
+	if _, ok := config["openai_base_url"]; ok {
+		t.Fatalf("Codex config still selects the built-in openai provider: %#v", config)
+	}
+	providers, _ := config["model_providers"].(map[string]any)
+	provider, _ := providers[codexProviderID].(map[string]any)
+	if provider["wire_api"] != "responses" || provider["env_key"] != "CODEX_API_KEY" || provider["base_url"] == "" {
+		t.Fatalf("Codex provider definition = %#v", provider)
+	}
+}
+
+func TestPrepareCodexHomeDisablesResponsesWebSockets(t *testing.T) {
+	paths := acp.SessionPaths{Home: t.TempDir()}
+	if err := prepareCodexHome(paths); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(paths.Home, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(data)
+	if !strings.Contains(config, "check_for_update_on_startup = false") {
+		t.Fatalf("config.toml lacks the update opt-out:\n%s", config)
+	}
 }

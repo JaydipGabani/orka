@@ -17,13 +17,16 @@ controller:
     digest: ""
     pullPolicy: IfNotPresent
 
-  # Resource limits
+  # Resource limits. The controller serves the REST API, the ACP dispatcher,
+  # and the single-writer SQLite journal from one process; a 500m CPU cap
+  # throttles concurrent ACP prompts until their durable writes miss their
+  # deadlines.
   resources:
     limits:
-      cpu: 500m
-      memory: 512Mi
+      cpu: "2"
+      memory: 1Gi
     requests:
-      cpu: 100m
+      cpu: 250m
       memory: 256Mi
 
   # Required exclusive tenant namespace. Label it with

@@ -23,6 +23,12 @@ const DefaultMaxConcurrentRequests = 32
 
 var ErrClosed = errors.New("ACP connection closed")
 
+// ErrPromptEventBufferOverflow fails a prompt whose buffered, unconsumed
+// events exceeded the advertised per-prompt limit before the controller-facing
+// stream drained them. It is a supervisor-side condition (a slow consumer),
+// not an agent or provider error, so callers classify it distinctly.
+var ErrPromptEventBufferOverflow = errors.New("ACP prompt event buffer overflowed")
+
 type RPCError struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`

@@ -328,6 +328,13 @@ func (d *ACPDispatcher) prepareTaskSession(
 			preparation.plan.Reason = "persisted-runtime-session-recreation"
 		}
 	}
+	logf.FromContext(ctx).Info("ACP runtime session planned",
+		"namespace", task.Namespace, "task", task.Name, "sessionUID", preparation.control.SessionUID,
+		"reason", preparation.plan.Reason, "generation", preparation.plan.Binding.Generation,
+		"recreate", preparation.plan.Recreate, "bootstrap", preparation.plan.BootstrapRequired,
+		"currentBindingKnown", preparation.current != nil, "leaseGeneration", lease.Session.LeaseGeneration,
+		"durableGeneration", preparation.control.RuntimeSessionGeneration,
+	)
 	return &acpTaskSession{
 		Turn: turn, Binding: preparation.plan.Binding, Bootstrap: preparation.bootstrap,
 		UserPrompt:       preparation.userPrompt,
@@ -852,7 +859,12 @@ func (d *ACPDispatcher) finalizeTaskSessionResult(
 	})
 	if err == nil {
 		session.finalized = true
-		d.setRuntimeSessionBinding(session.Binding)
+		// Only a complete binding may replace the live one: a recovered
+		// session that could not rebuild its generation must not clobber
+		// the binding the live path recorded.
+		if session.Binding.Generation > 0 {
+			d.setRuntimeSessionBinding(session.Binding)
+		}
 	}
 	return err
 }
@@ -986,6 +998,44 @@ func (d *ACPDispatcher) removeRuntimeSessionBinding(sessionUID string) {
 	d.mu.Lock()
 	delete(d.runtimeSessions, strings.TrimSpace(sessionUID))
 	d.mu.Unlock()
+}
+
+// retireRecoveredRuntimeSessionBinding drops the in-memory RuntimeSession
+// binding after recovered terminal settlement unless the RuntimeSession is
+// known to stay live: a session-bound read RuntimeSession whose prompt
+// succeeded remains resident on the supervisor after its turn finalizes, and
+// its binding must survive so the next continuation Task plans a reuse
+// instead of a controller-restart style recreation at a new generation with
+// a full transcript bootstrap. Task-scoped sessions (no durable Session, or a
+// write workspace) are retired with the Task, and any non-successful
+// settlement (failed, cancelled, outcome unknown) schedules supervisor
+// cleanup of the RuntimeSession, so those bindings are dropped exactly as the
+// normal failure path does.
+//
+// Retention additionally requires a reusable terminal delivery state (a read
+// prompt that succeeded but whose delivery failed, for example a modified
+// read-only workspace, is cleaned up by the live failure paths) and a
+// complete binding: a recovered session may carry only the SessionUID, and
+// retaining a binding without a generation would make the next continuation
+// fail planning instead of recreating the runtime.
+func (d *ACPDispatcher) retireRecoveredRuntimeSessionBinding(task *corev1alpha1.Task, attempt *store.PromptAttempt, binding ACPRuntimeSessionBinding) {
+	sessionUID := strings.TrimSpace(binding.SessionUID)
+	reusable := task != nil && attempt != nil && sessionUID != "" &&
+		attempt.ExecutionState == store.PromptExecutionSucceeded &&
+		(attempt.DeliveryState == store.PromptDeliveryNotRequested || attempt.DeliveryState == store.PromptDeliveryReadValidated) &&
+		task.Spec.SessionRef != nil &&
+		(task.Spec.Workspace == nil || task.Spec.Workspace.Intent != corev1alpha1.WorkspaceIntentWrite)
+	if reusable {
+		if binding.Generation > 0 {
+			return
+		}
+		// The recovered binding could not be rebuilt; the live binding, if
+		// complete, is still authoritative and stays.
+		if current := d.currentRuntimeSessionBinding(sessionUID); current != nil && current.Generation > 0 {
+			return
+		}
+	}
+	d.removeRuntimeSessionBinding(sessionUID)
 }
 
 func bootstrapPromptText(bootstrap *ACPBootstrapTranscript) string {

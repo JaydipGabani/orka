@@ -640,32 +640,41 @@ func (h *Handlers) ListRepositoryMonitors(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
-	opts := &client.ListOptions{Namespace: namespace, Limit: pagination.Limit, Continue: pagination.Continue}
-	list := &corev1alpha1.RepositoryMonitorList{}
-	if err := h.client.List(c.Context(), list, opts); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list repository monitors: %v", err))
-	}
-
-	items := list.Items
 	filteredList := false
-	if h.contextTokenAuthorization.Enabled() {
-		filtered := make([]corev1alpha1.RepositoryMonitor, 0, len(items))
-		for i := range items {
-			if h.contextTokenRepositoryMonitorAllowed(c, &items[i]) {
-				filtered = append(filtered, items[i])
-			}
+	var remainingItemCount *int64
+	items, continueToken, err := collectAuthorizedPages(pagination.Limit, pagination.Continue, func(continueToken string, pageLimit int64) ([]corev1alpha1.RepositoryMonitor, string, error) {
+		list := &corev1alpha1.RepositoryMonitorList{}
+		opts := &client.ListOptions{Namespace: namespace, Limit: pageLimit, Continue: continueToken}
+		if err := h.listPage(c.Context(), list, opts, "repository monitors"); err != nil {
+			return nil, "", err
 		}
-		filteredList = len(filtered) != len(items)
-		items = filtered
+		remainingItemCount = list.RemainingItemCount
+		items := list.Items
+		if h.contextTokenAuthorization.Enabled() {
+			filtered := make([]corev1alpha1.RepositoryMonitor, 0, len(items))
+			for i := range items {
+				if h.contextTokenRepositoryMonitorAllowed(c, &items[i]) {
+					filtered = append(filtered, items[i])
+				}
+			}
+			if len(filtered) != len(items) {
+				filteredList = true
+			}
+			items = filtered
+		}
+		return items, list.Continue, nil
+	})
+	if err != nil {
+		return err
 	}
-	remainingItemCount := list.RemainingItemCount
 	if filteredList {
+		// The raw count describes monitors the caller is not allowed to see.
 		remainingItemCount = nil
 	}
 	return c.JSON(ListResponse{
 		Items: items,
 		Metadata: ListMeta{
-			Continue:           list.Continue,
+			Continue:           NormalizeListContinue(continueToken),
 			RemainingItemCount: remainingItemCount,
 		},
 	})

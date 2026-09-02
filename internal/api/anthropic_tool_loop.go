@@ -120,6 +120,26 @@ func validateToolLoopCompletion(resp *llm.CompletionResponse) error {
 	switch outcome {
 	case llm.CompletionOutcomeCompleted, llm.CompletionOutcomeToolCalls:
 		return nil
+	case llm.CompletionOutcomeIncomplete:
+		// A text response truncated by the caller's max_tokens budget is a
+		// valid terminal outcome for the compatibility APIs: Anthropic and
+		// OpenAI clients expect the partial text with stop_reason "max_tokens"
+		// / finish_reason "length" (and typically raise the budget and retry).
+		// Every other incomplete reason (pause_turn, response.incomplete, a
+		// bare "incomplete", or no reason at all), an empty truncated body,
+		// and a truncated tool call (its arguments are unusable and must not
+		// be executed) keep failing.
+		if isTokenBudgetTruncatedText(resp) {
+			return nil
+		}
+		reason := strings.TrimSpace(resp.StopReason)
+		if reason == "" {
+			return fmt.Errorf("LLM returned %s completion outcome without a stop reason", outcome)
+		}
+		if len(resp.ToolCalls) > 0 {
+			return fmt.Errorf("LLM returned %s completion outcome with truncated tool calls (stop reason %q)", outcome, reason)
+		}
+		return fmt.Errorf("LLM returned %s completion outcome with stop reason %q", outcome, reason)
 	default:
 		reason := ""
 		if resp != nil {
@@ -129,6 +149,22 @@ func validateToolLoopCompletion(resp *llm.CompletionResponse) error {
 			return fmt.Errorf("LLM returned %s completion outcome without a stop reason", outcome)
 		}
 		return fmt.Errorf("LLM returned %s completion outcome with stop reason %q", outcome, reason)
+	}
+}
+
+// isTokenBudgetTruncatedText reports whether resp is a text-only response cut
+// off by the caller's output token budget ("max_tokens" / "length"). Such a
+// response is returned to the client as-is: the loop must not discard the
+// partial text and keep calling the model.
+func isTokenBudgetTruncatedText(resp *llm.CompletionResponse) bool {
+	if resp == nil || len(resp.ToolCalls) > 0 || strings.TrimSpace(resp.Content) == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(resp.StopReason)) {
+	case oaiParamMaxTokens, oaiStopReasonLength:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -292,7 +328,8 @@ your bug — read this section before calling create_agent):
     instructions belong in initialPrompt or Task prompts and credentials come from
     the controller proxy.
     For credential-backed compatibility runtimes, set runtime.secretRef when required.
-    For codex, claude, and copilot, model.name is optional because the runtime can select a default.
+    For codex, claude, and copilot, model.name is REQUIRED: the ACP runtime session has
+    no default model, and admission rejects a built-in runtime Agent without it.
   - For pure LLM analysis personas (no git, no shell): set model.provider
     + model.name, OMIT runtime.
 - Built-in ACP RuntimePool Agents (runtime.type=codex|claude|copilot|opencode)
@@ -742,6 +779,19 @@ func runToolLoopWithObserver(
 		}
 		if err := validateToolLoopCompletion(resp); err != nil {
 			return nil, err
+		}
+
+		// A text response cut off by the output token budget is terminal:
+		// return the partial text with its max_tokens/length stop reason
+		// instead of treating it as a premature end of turn, which would
+		// discard the text and issue more model calls.
+		if isTokenBudgetTruncatedText(resp) {
+			anthropicLog.Info("response truncated by output token budget — returning partial text",
+				"iteration", iteration,
+				"stop_reason", resp.StopReason,
+			)
+			observer.finalContent(resp.Content)
+			return resp, nil
 		}
 
 		// No tool calls → potentially final response. Guard against premature

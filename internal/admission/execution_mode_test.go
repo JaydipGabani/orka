@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrladmission "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
@@ -231,4 +232,43 @@ func mustMarshalNamespace(t *testing.T, namespace *corev1.Namespace) []byte {
 	data, err := json.Marshal(namespace)
 	require.NoError(t, err)
 	return data
+}
+
+func TestAgentContractValidatorRequiresModelForHarnessV2Agents(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	namespace := admissionNamespace(string(executionmode.HarnessV2))
+	validator := &AgentContractValidator{
+		decoder: ctrladmission.NewDecoder(scheme),
+		reader:  fake.NewClientBuilder().WithScheme(scheme).WithObjects(namespace).Build(),
+	}
+	contract := executionmode.HarnessV2.ContractVersion()
+	agent := func(model string) *corev1alpha1.Agent {
+		object := &corev1alpha1.Agent{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "core.orka.ai/v1alpha1", Kind: "Agent"},
+			ObjectMeta: metav1.ObjectMeta{Name: "implementer", Namespace: namespace.Name},
+			Spec: corev1alpha1.AgentSpec{
+				Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeCodex, ContractVersion: &contract},
+			},
+		}
+		if model != "" {
+			object.Spec.Model = &corev1alpha1.ModelConfig{Name: model}
+		}
+		return object
+	}
+	request := func(object *corev1alpha1.Agent) ctrladmission.Request {
+		raw, err := json.Marshal(object)
+		require.NoError(t, err)
+		return ctrladmission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+			Operation: admissionv1.Create,
+			Namespace: namespace.Name,
+			Object:    runtime.RawExtension{Raw: raw},
+		}}
+	}
+	denied := validator.Handle(context.Background(), request(agent("")))
+	require.False(t, denied.Allowed, denied.Result.Message)
+	require.Contains(t, denied.Result.Message, "requires spec.model.name")
+	allowed := validator.Handle(context.Background(), request(agent("gpt-5.6-sol")))
+	require.True(t, allowed.Allowed, allowed.Result.Message)
 }

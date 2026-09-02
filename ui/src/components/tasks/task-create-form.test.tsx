@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { render, screen, waitFor, fireEvent } from '@/test/test-utils'
+import { act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
+import { focusManager } from '@tanstack/react-query'
 import { server } from '@/test/mocks/server'
 
 let useStateTypeOverride: string | null = null
@@ -150,7 +152,47 @@ describe('TaskCreateForm', () => {
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith('Task created')
     })
-    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks' })
+    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks/$taskId', params: { taskId: 'new-task' } })
+  })
+
+  it('tokenizes the container command like a shell, keeping quoted arguments intact', async () => {
+    let submitted: Record<string, unknown> | undefined
+    server.use(
+      http.post('/api/v1/tasks', async ({ request }) => {
+        submitted = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ metadata: { name: 'quoted', namespace: 'default' }, spec: { type: 'container' } })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    await user.type(screen.getByPlaceholderText('my-task'), 'quoted')
+    await user.type(screen.getByPlaceholderText('alpine:latest'), 'alpine:latest')
+    await user.type(screen.getByPlaceholderText('echo hello'), 'sh -c "echo UI_TASK_OK"')
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith('Task created')
+    })
+    expect(submitted?.command).toEqual(['sh', '-c', 'echo UI_TASK_OK'])
+  })
+
+  it('flags an unterminated quote inline and blocks submission', async () => {
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    expect(screen.getByText(/Split like a shell/)).toBeInTheDocument()
+    await user.type(screen.getByPlaceholderText('my-task'), 'bad-quote')
+    await user.type(screen.getByPlaceholderText('alpine:latest'), 'alpine:latest')
+    await user.type(screen.getByPlaceholderText('echo hello'), 'sh -c "echo oops')
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Unterminated double quote in command')
+    expect(screen.getByPlaceholderText('echo hello')).toHaveAttribute('aria-invalid', 'true')
+
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+    expect(toast.error).toHaveBeenCalledWith('Command is invalid: Unterminated double quote in command')
+    expect(toast.success).not.toHaveBeenCalled()
+    expect(mockNavigate).not.toHaveBeenCalled()
   })
 
   it('submits container task without command', async () => {
@@ -166,7 +208,7 @@ describe('TaskCreateForm', () => {
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith('Task created')
     })
-    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks' })
+    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks/$taskId', params: { taskId: 'new-task' } })
   })
 
   it('cancel button navigates to tasks', async () => {
@@ -199,6 +241,9 @@ describe('TaskCreateForm', () => {
     render(<TaskCreateForm />)
 
     await user.type(screen.getByPlaceholderText('my-task'), 'ai-task')
+    const providerTrigger = screen.getByRole('combobox', { name: 'AI provider' })
+    fireEvent.pointerDown(providerTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: 'Anthropic' }))
     await user.type(screen.getByPlaceholderText('claude-sonnet-4-20250514'), 'my-model')
     await user.type(screen.getByPlaceholderText('Enter your prompt...'), 'Hello AI')
 
@@ -207,7 +252,251 @@ describe('TaskCreateForm', () => {
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith('Task created')
     })
-    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks' })
+    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks/$taskId', params: { taskId: 'new-task' } })
+  })
+
+  it('AI type lists only Agents without a built-in runtime and submits agentRef', async () => {
+    useStateTypeOverride = 'ai'
+    let submitted: Record<string, unknown> | undefined
+    server.use(
+      http.get('/api/v1/agents', () =>
+        HttpResponse.json({
+          items: [
+            { metadata: { name: 'native-agent', namespace: 'default' }, spec: { providerRef: { name: 'anthropic' }, model: { provider: 'anthropic', name: 'claude' } } },
+            { metadata: { name: 'codex-agent', namespace: 'default' }, spec: { runtime: { type: 'codex' } } },
+          ],
+        }),
+      ),
+      http.post('/api/v1/tasks', async ({ request }) => {
+        submitted = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ metadata: { name: 'ai-task', namespace: 'default' }, spec: { type: 'ai' } })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    const agentTrigger = await screen.findByRole('combobox', { name: 'AI agent' })
+    await waitFor(() => expect(agentTrigger).not.toBeDisabled())
+    fireEvent.pointerDown(agentTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    expect(await screen.findByRole('option', { name: /native-agent/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /codex-agent/ })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('option', { name: /native-agent/ }))
+
+    await waitFor(() => expect(screen.getByTestId('ai-agent-info-card')).toBeInTheDocument())
+    // Provider/model collapse into optional overrides once an Agent is chosen.
+    expect(screen.queryByRole('combobox', { name: 'AI provider' })).not.toBeInTheDocument()
+    expect(screen.getByText(/Provider \/ model overrides/)).toBeInTheDocument()
+    expect(screen.getByText(/built-in CLI runtime are hidden/)).toBeInTheDocument()
+
+    await user.type(screen.getByPlaceholderText('my-task'), 'ai-task')
+    await user.type(screen.getByPlaceholderText('Enter your prompt...'), 'Summarize')
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Task created'))
+    expect(submitted).toMatchObject({ type: 'ai', agentRef: { name: 'native-agent' }, ai: { prompt: 'Summarize' } })
+    expect((submitted?.ai as Record<string, unknown>).provider).toBeUndefined()
+  })
+
+  it('drops a selected Agent when the list refetch errors instead of silently submitting it', async () => {
+    useStateTypeOverride = 'ai'
+    let submitted: Record<string, unknown> | undefined
+    let agentCalls = 0
+    server.use(
+      http.get('/api/v1/agents', () => {
+        agentCalls += 1
+        if (agentCalls > 1) {
+          return HttpResponse.json({ error: { code: 403, message: 'forbidden' } }, { status: 403 })
+        }
+        return HttpResponse.json({
+          items: [
+            { metadata: { name: 'native-agent', namespace: 'default' }, spec: { providerRef: { name: 'anthropic' }, model: { provider: 'anthropic', name: 'claude' } } },
+          ],
+        })
+      }),
+      http.post('/api/v1/tasks', async ({ request }) => {
+        submitted = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ metadata: { name: 'ai-task', namespace: 'default' }, spec: { type: 'ai' } })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    const agentTrigger = await screen.findByRole('combobox', { name: 'AI agent' })
+    await waitFor(() => expect(agentTrigger).not.toBeDisabled())
+    fireEvent.pointerDown(agentTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: /native-agent/ }))
+    await waitFor(() => expect(screen.getByTestId('ai-agent-info-card')).toBeInTheDocument())
+
+    // A refocus refetch now 403s; the selection must not survive as a
+    // hidden agentRef while the selector renders empty.
+    await act(async () => {
+      focusManager.setFocused(false)
+      focusManager.setFocused(true)
+    })
+    await waitFor(() => expect(agentCalls).toBeGreaterThan(1))
+    await waitFor(() => expect(screen.queryByTestId('ai-agent-info-card')).not.toBeInTheDocument())
+
+    await user.type(screen.getByPlaceholderText('my-task'), 'ai-task')
+    await user.type(screen.getByPlaceholderText('Enter your prompt...'), 'Summarize')
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+    // With the stale selection dropped, submission demands the visible
+    // Agent/Provider choice instead of silently sending the hidden Agent.
+    expect(toast.error).toHaveBeenCalledWith('Select an Agent or a Provider for the AI task')
+    expect(submitted).toBeUndefined()
+  })
+
+  it('clears inline provider/model when an Agent is picked and only sends re-entered overrides', async () => {
+    useStateTypeOverride = 'ai'
+    const submitted: Array<Record<string, unknown>> = []
+    server.use(
+      http.get('/api/v1/agents', () =>
+        HttpResponse.json({
+          items: [
+            { metadata: { name: 'native-agent', namespace: 'default' }, spec: { providerRef: { name: 'anthropic' }, model: { provider: 'anthropic', name: 'claude' } } },
+          ],
+        }),
+      ),
+      http.post('/api/v1/tasks', async ({ request }) => {
+        submitted.push((await request.json()) as Record<string, unknown>)
+        return HttpResponse.json({ metadata: { name: 'ai-task', namespace: 'default' }, spec: { type: 'ai' } })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    // Configure the inline provider/model first, as if no Agent were going to be used.
+    fireEvent.pointerDown(screen.getByRole('combobox', { name: 'AI provider' }), { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: 'OpenAI' }))
+    await user.type(screen.getByPlaceholderText('claude-sonnet-4-20250514'), 'gpt-5')
+
+    const agentTrigger = await screen.findByRole('combobox', { name: 'AI agent' })
+    await waitFor(() => expect(agentTrigger).not.toBeDisabled())
+    fireEvent.pointerDown(agentTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: /native-agent/ }))
+    await waitFor(() => expect(screen.getByTestId('ai-agent-info-card')).toBeInTheDocument())
+
+    const disclosure = screen.getByRole('button', { name: /Provider \/ model overrides/ })
+    expect(disclosure).toHaveAttribute('aria-expanded', 'false')
+    expect(disclosure).toHaveAttribute('aria-controls', 'ai-model-overrides')
+    expect(document.getElementById('ai-model-overrides')).toBeNull()
+
+    await user.type(screen.getByPlaceholderText('my-task'), 'ai-task')
+    await user.type(screen.getByPlaceholderText('Enter your prompt...'), 'Summarize')
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+    await waitFor(() => expect(submitted).toHaveLength(1))
+    // The stale inline values must not travel as hidden overrides.
+    expect(submitted[0]).toMatchObject({ agentRef: { name: 'native-agent' }, ai: { prompt: 'Summarize' } })
+    expect(submitted[0].ai).not.toHaveProperty('provider')
+    expect(submitted[0].ai).not.toHaveProperty('model')
+
+    // Overrides re-entered after opening the disclosure are sent.
+    await user.click(disclosure)
+    expect(disclosure).toHaveAttribute('aria-expanded', 'true')
+    expect(document.getElementById('ai-model-overrides')).not.toBeNull()
+    expect(screen.getByPlaceholderText('Agent default')).toHaveValue('')
+    await user.type(screen.getByPlaceholderText('Agent default'), 'claude-opus-4-1')
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+    await waitFor(() => expect(submitted).toHaveLength(2))
+    expect(submitted[1].ai).toEqual({ prompt: 'Summarize', model: 'claude-opus-4-1' })
+  })
+
+  it('hides the ignored provider override for Provider-backed Agents and resets the selection on namespace change', async () => {
+    useStateTypeOverride = 'ai'
+    server.use(
+      http.get('/api/v1/agents', ({ request }) => {
+        const ns = new URL(request.url).searchParams.get('namespace')
+        return HttpResponse.json({
+          items: ns === 'default'
+            ? [{ metadata: { name: 'native-agent', namespace: 'default' }, spec: { providerRef: { name: 'anthropic' }, model: { provider: 'anthropic', name: 'claude' } } }]
+            : [],
+        })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    const agentTrigger = await screen.findByRole('combobox', { name: 'AI agent' })
+    await waitFor(() => expect(agentTrigger).not.toBeDisabled())
+    fireEvent.pointerDown(agentTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: /native-agent/ }))
+    await waitFor(() => expect(screen.getByTestId('ai-agent-info-card')).toBeInTheDocument())
+
+    await user.click(screen.getByRole('button', { name: /Provider \/ model overrides/ }))
+    // A providerRef Agent's Provider CRD is authoritative: no provider picker, only the model.
+    expect(screen.queryByRole('combobox', { name: 'AI provider' })).not.toBeInTheDocument()
+    expect(screen.getByTestId('ai-provider-locked')).toHaveTextContent('anthropic')
+    expect(screen.getByPlaceholderText('Agent default')).toBeInTheDocument()
+
+    // Switching namespaces drops the (namespace-scoped) selection.
+    act(() => {
+      useUIStore.setState({ namespace: 'other' })
+    })
+    await waitFor(() => expect(screen.queryByTestId('ai-agent-info-card')).not.toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: /Provider \/ model overrides/ })).not.toBeInTheDocument()
+  })
+
+  it('flags a trailing backslash inline and blocks submission', async () => {
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    await user.type(screen.getByPlaceholderText('my-task'), 'bad-escape')
+    await user.type(screen.getByPlaceholderText('alpine:latest'), 'alpine:latest')
+    await user.type(screen.getByPlaceholderText('echo hello'), 'echo foo\\')
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Trailing backslash in command')
+    expect(screen.getByPlaceholderText('echo hello')).toHaveAttribute('aria-invalid', 'true')
+
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+    expect(toast.error).toHaveBeenCalledWith('Command is invalid: Trailing backslash in command')
+    expect(toast.success).not.toHaveBeenCalled()
+  })
+
+  it('drops an AI Agent selection that disappears from the refreshed list', async () => {
+    useStateTypeOverride = 'ai'
+    let agents = [{ metadata: { name: 'native-agent', namespace: 'default' }, spec: { model: { provider: 'anthropic', name: 'claude' } } }]
+    server.use(http.get('/api/v1/agents', () => HttpResponse.json({ items: agents })))
+    render(<TaskCreateForm />)
+
+    const agentTrigger = await screen.findByRole('combobox', { name: 'AI agent' })
+    await waitFor(() => expect(agentTrigger).not.toBeDisabled())
+    fireEvent.pointerDown(agentTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: /native-agent/ }))
+    await waitFor(() => expect(screen.getByTestId('ai-agent-info-card')).toBeInTheDocument())
+
+    // The Agent is deleted; the next refetch no longer lists it.
+    agents = []
+    window.dispatchEvent(new Event('visibilitychange'))
+    await waitFor(() => expect(screen.queryByTestId('ai-agent-info-card')).not.toBeInTheDocument())
+    expect(screen.getByRole('combobox', { name: 'AI provider' })).toBeInTheDocument()
+  })
+
+  it('AI type without an Agent still submits the inline provider path', async () => {
+    useStateTypeOverride = 'ai'
+    let submitted: Record<string, unknown> | undefined
+    server.use(
+      http.get('/api/v1/agents', () => HttpResponse.json({ items: [] })),
+      http.post('/api/v1/tasks', async ({ request }) => {
+        submitted = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ metadata: { name: 'ai-task', namespace: 'default' }, spec: { type: 'ai' } })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<TaskCreateForm />)
+
+    await user.type(screen.getByPlaceholderText('my-task'), 'inline-ai')
+    await user.type(screen.getByPlaceholderText('Enter your prompt...'), 'Hello')
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+    expect(toast.error).toHaveBeenCalledWith('Select an Agent or a Provider for the AI task')
+
+    const providerTrigger = screen.getByRole('combobox', { name: 'AI provider' })
+    fireEvent.pointerDown(providerTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: 'OpenAI' }))
+    await user.type(screen.getByPlaceholderText('claude-sonnet-4-20250514'), 'gpt-5')
+    await user.click(screen.getByRole('button', { name: 'Create Task' }))
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Task created'))
+    expect(submitted).toMatchObject({ type: 'ai', ai: { provider: 'openai', model: 'gpt-5', prompt: 'Hello' } })
+    expect(submitted?.agentRef).toBeUndefined()
   })
 
   it('submits Agent task form and navigates', async () => {
@@ -232,7 +521,7 @@ describe('TaskCreateForm', () => {
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith('Task created')
     })
-    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks' })
+    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks/$taskId', params: { taskId: 'new-task' } })
   })
 
   it('toggles advanced options visibility', async () => {
@@ -656,5 +945,29 @@ describe('TaskCreateForm', () => {
     expect(await screen.findByRole('option', { name: /built-in-agent/ })).toBeInTheDocument()
     expect(screen.queryByRole('option', { name: /external-agent/ })).not.toBeInTheDocument()
     expect(screen.queryByRole('option', { name: /provider-agent/ })).not.toBeInTheDocument()
+  })
+
+  it('clears a runtime Agent selection when the namespace changes', async () => {
+    useStateTypeOverride = 'agent'
+    server.use(
+      http.get('/api/v1/agents', ({ request }) => {
+        const namespace = new URL(request.url).searchParams.get('namespace')
+        return HttpResponse.json({
+          items: [{ metadata: { name: 'shared-agent', namespace }, spec: { runtime: { type: 'codex' } } }],
+          metadata: {},
+        })
+      }),
+    )
+    render(<TaskCreateForm />)
+
+    const trigger = screen.getByText('Agent Reference').closest('.space-y-2')!.querySelector('[role="combobox"]')!
+    await waitFor(() => expect(trigger).not.toBeDisabled())
+    fireEvent.pointerDown(trigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('option', { name: /shared-agent/ }))
+    await waitFor(() => expect(screen.getByTestId('agent-info-card')).toBeInTheDocument())
+
+    act(() => useUIStore.setState({ namespace: 'other' }))
+    await waitFor(() => expect(screen.queryByTestId('agent-info-card')).not.toBeInTheDocument())
+    expect(trigger).toHaveTextContent('Select an agent')
   })
 })

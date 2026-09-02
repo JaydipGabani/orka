@@ -5,6 +5,7 @@ metadata:
 spec:
   runtime:
     type: claude
+    contractVersion: orka.harness.v2
     defaultMaxTurns: 50
     defaultAllowBash: true
     defaultAllowedTools:
@@ -20,5 +21,3 @@ spec:
       Respond with a clear verdict:
       - "APPROVED" if the code is ready
       - "CHANGES_NEEDED" with specific feedback if changes are required
-  secretRef:
-    name: claude-credentials

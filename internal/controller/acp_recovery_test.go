@@ -794,6 +794,32 @@ func TestACPDispatcherRecoversSettlingResultReceipt(t *testing.T) {
 	}
 }
 
+func TestACPDispatcherRecoversJournaledFailureClassification(t *testing.T) {
+	fixture := newACPRecoveryFixture(t, store.PromptExecutionRunning)
+	defer fixture.close(t)
+
+	task := configureRecoveryJournalIdentity(t, fixture)
+	appendRecoveryPromptTerminal(t, fixture, task, harnessv2.EventFailed, false)
+	if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.ExecutionState != store.PromptExecutionFailed {
+		t.Fatalf("recovered attempt state = %s, want %s", attempt.ExecutionState, store.PromptExecutionFailed)
+	}
+	// The journaled failure classification must survive the restart instead
+	// of degrading to the generic default the recovery projection falls back to.
+	if attempt.TerminalReason != string(acpPromptFailedReason) {
+		t.Fatalf("recovered terminal reason = %q, want %q", attempt.TerminalReason, acpPromptFailedReason)
+	}
+	if !strings.Contains(attempt.OutcomeMarker, "prompt_failed") || !strings.Contains(attempt.OutcomeMarker, acpRecoveryPromptFailedMessage) {
+		t.Fatalf("recovered outcome marker = %q, want the journaled code and message", attempt.OutcomeMarker)
+	}
+}
+
 func TestACPDispatcherRestoredTaskPreservesJournaledCompletion(t *testing.T) {
 	for _, target := range []store.PromptExecutionState{store.PromptExecutionRunning, store.PromptExecutionSettling} {
 		t.Run(string(target), func(t *testing.T) {
@@ -3496,5 +3522,75 @@ func TestRecoveredTerminalDeliveryStatusUsesTaskReceiptWithoutPublication(t *tes
 	}
 	if status.Outcome != corev1alpha1.TaskDeliveryOutcomeDeliveryConflict || status.Reason != task.Status.Delivery.Reason {
 		t.Fatalf("status = %#v", status)
+	}
+}
+
+func TestRetireRecoveredRuntimeSessionBindingKeepsSessionBoundReadBindings(t *testing.T) {
+	t.Parallel()
+	const sessionUID = "acp-session-retire-test"
+	newDispatcher := func() *ACPDispatcher {
+		d := &ACPDispatcher{}
+		d.setRuntimeSessionBinding(ACPRuntimeSessionBinding{SessionUID: sessionUID, Generation: 1})
+		return d
+	}
+	sessionRef := &corev1alpha1.SessionReference{Name: "durable"}
+	succeeded := &store.PromptAttempt{ExecutionState: store.PromptExecutionSucceeded, DeliveryState: store.PromptDeliveryReadValidated}
+	promptOnly := &store.PromptAttempt{ExecutionState: store.PromptExecutionSucceeded, DeliveryState: store.PromptDeliveryNotRequested}
+	readTask := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+		SessionRef: sessionRef, Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead},
+	}}
+	complete := ACPRuntimeSessionBinding{SessionUID: sessionUID, Generation: 1}
+	cases := []struct {
+		name           string
+		task           *corev1alpha1.Task
+		attempt        *store.PromptAttempt
+		binding        ACPRuntimeSessionBinding
+		liveIncomplete bool
+		keep           bool
+	}{
+		{name: "session-bound prompt-only success keeps the live binding", keep: true, attempt: promptOnly, binding: complete, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{SessionRef: sessionRef}}},
+		{name: "session-bound read success keeps the live binding", keep: true, attempt: succeeded, binding: complete, task: readTask},
+		{name: "session-bound write success retires the task-scoped binding", keep: false, attempt: succeeded, binding: complete, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+			SessionRef: sessionRef, Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentWrite},
+		}}},
+		{name: "task without a durable session retires the binding", keep: false, attempt: succeeded, binding: complete, task: &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{}}},
+		{name: "failed session-bound read retires the binding (supervisor cleans the session)", keep: false, binding: complete, attempt: &store.PromptAttempt{ExecutionState: store.PromptExecutionFailed}, task: readTask},
+		{name: "cancelled session-bound read retires the binding", keep: false, binding: complete, attempt: &store.PromptAttempt{ExecutionState: store.PromptExecutionCancelled}, task: readTask},
+		{name: "outcome-unknown session-bound read retires the binding", keep: false, binding: complete, attempt: &store.PromptAttempt{ExecutionState: store.PromptExecutionOutcomeUnknown}, task: readTask},
+		{name: "succeeded read with a delivery conflict retires the binding", keep: false, binding: complete, attempt: &store.PromptAttempt{ExecutionState: store.PromptExecutionSucceeded, DeliveryState: store.PromptDeliveryConflict}, task: readTask},
+		{name: "incomplete recovered binding keeps a complete live binding", keep: true, attempt: succeeded, binding: ACPRuntimeSessionBinding{SessionUID: sessionUID}, task: readTask},
+		{name: "incomplete recovered binding without a complete live binding is retired", keep: false, attempt: succeeded, binding: ACPRuntimeSessionBinding{SessionUID: sessionUID}, task: readTask, liveIncomplete: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := newDispatcher()
+			if tc.liveIncomplete {
+				d.setRuntimeSessionBinding(ACPRuntimeSessionBinding{SessionUID: sessionUID})
+			}
+			d.retireRecoveredRuntimeSessionBinding(tc.task, tc.attempt, tc.binding)
+			if got := d.currentRuntimeSessionBinding(sessionUID) != nil; got != tc.keep {
+				t.Fatalf("binding retained = %v, want %v", got, tc.keep)
+			}
+		})
+	}
+}
+
+func TestRecoveredRuntimeSessionBindingRebuildsFromTaskStatus(t *testing.T) {
+	t.Parallel()
+	digest := acpSessionTestDigest("recovered-workspace")
+	const recoveredSessionUID = "recovered-status-session"
+	const recoveredBootID = "recovered-boot"
+	task := &corev1alpha1.Task{Status: corev1alpha1.TaskStatus{Execution: &corev1alpha1.TaskExecutionStatus{
+		RuntimeInstanceID: "instance", RuntimeSessionUID: recoveredSessionUID, RuntimeSessionGeneration: 3,
+		RuntimeSessionSupervisorBootID: recoveredBootID, RuntimeSessionProfileDigest: acpSessionTestDigest("profile"),
+		RuntimeSessionMCPDigest: acpSessionTestDigest("mcp"), RuntimeSessionWorkspaceDigest: digest,
+	}}}
+	got := recoveredRuntimeSessionBinding(task, recoveredSessionUID)
+	if got.Generation != 3 || got.RuntimeInstanceID != "instance" || got.SupervisorBootID != recoveredBootID || got.WorkspaceDigest != digest {
+		t.Fatalf("recovered binding = %#v, want the durable Task status binding", got)
+	}
+	if got := recoveredRuntimeSessionBinding(&corev1alpha1.Task{}, recoveredSessionUID); got.Generation != 0 || got.SessionUID != recoveredSessionUID {
+		t.Fatalf("recovered binding without status = %#v, want identity-only", got)
 	}
 }

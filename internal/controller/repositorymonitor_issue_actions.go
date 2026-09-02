@@ -211,6 +211,16 @@ func (r *RepositoryMonitorReconciler) processIssueCommandRun(ctx context.Context
 	if actionKind == "" {
 		return 0, nil
 	}
+	if command.Intent == repositoryMonitorCommandIntentImplement && repositoryMonitorIssueImplementationInProgress(item.WorkflowPhase) {
+		// Plan approval already queued the implementation; a maintainer's
+		// explicit implement label arriving now must not restart planning
+		// (which would discard the approved plan) or start a second job.
+		reason := "implementation_already_active:" + item.WorkflowPhase
+		if err := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorIssueKind, item.Number, "", item.SnapshotDigest, repositoryMonitorIssueActionImplementation, repositoryMonitorWorkActionStatusSucceeded, item.WorkflowPhase, "", reason); err != nil {
+			return 0, err
+		}
+		return 0, r.createMonitorEvent(ctx, monitor, run.ID, repositoryMonitorIssueKind, item.Number, item.SnapshotDigest, "issue_action_skipped", fmt.Sprintf("Issue #%d implement command skipped: %s", item.Number, reason), map[string]any{repositoryMonitorEventActionKindKey: repositoryMonitorIssueActionImplementation, "phase": item.WorkflowPhase})
+	}
 	if command.Intent == repositoryMonitorCommandIntentImplement && repositoryMonitorRequireApprovedPlan(monitor) && item.WorkflowPhase != repositoryMonitorIssuePhaseApproved {
 		actionKind, phase, agent = repositoryMonitorIssueActionPlan, repositoryMonitorIssuePhasePlanQueued, monitor.Spec.Agents.Planner
 	}
@@ -337,6 +347,20 @@ func repositoryMonitorIssueActionForIntent(monitor *corev1alpha1.RepositoryMonit
 	default:
 		return "", "", nil
 	}
+}
+
+const repositoryMonitorEventActionKindKey = "actionKind"
+
+// repositoryMonitorIssueImplementationInProgress reports whether the issue
+// already has an implementation queued, running, or being turned into a pull
+// request, so a repeated implement command is a no-op rather than a restart.
+func repositoryMonitorIssueImplementationInProgress(phase string) bool {
+	switch phase {
+	case repositoryMonitorIssuePhaseImplementationQueued, repositoryMonitorIssuePhaseImplementing,
+		repositoryMonitorIssuePhasePatchReady, repositoryMonitorIssuePhaseMutationQueued, repositoryMonitorIssuePhaseMutatingToPR:
+		return true
+	}
+	return false
 }
 
 func repositoryMonitorRequireApprovedPlan(monitor *corev1alpha1.RepositoryMonitor) bool {
@@ -708,7 +732,7 @@ func buildRepositoryMonitorIssueActionPrompt(monitor *corev1alpha1.RepositoryMon
 		instruction = "Create an implementation plan from the issue text and existing prior action context. Do not edit files, post comments, push, or mutate GitHub. Avoid tool use unless absolutely necessary; do not perform an exhaustive repository review. Keep the plan concise and actionable so implementation can inspect the actual code later. Current Orka patch artifacts are text-only: do not plan binary/generated assets (for example .ico, screenshots, archives, compiled outputs, or vendored blobs). If a binary asset would be useful, leave it out of allowedFiles and document a follow-up/manual asset step instead."
 		schema = `{"schemaVersion":"orka.issuePlan.v1","repo":"owner/repo","issueNumber":123,"snapshotDigest":"sha256:...","status":"ready|blocked|needs_human","summary":"...","acceptanceCriteria":[],"steps":[],"validationCommands":[],"allowedFiles":["text/source/docs files only; no binary/generated assets"],"risk":"low|medium|high","categories":["security|database-migration|other"],"requiresHumanApproval":true}`
 	case repositoryMonitorIssueActionImplementation:
-		instruction = "Implement the approved plan for this issue as a tracer-bullet vertical slice. Keep scope tight and prefer the smallest reviewable source/docs patch that proves the intended route. Make the planned code/documentation changes first; do not run tests before making changes. If the approved plan is too broad for one bounded agent turn, do not keep iterating indefinitely: return a blocked or needs_human JSON result that says the issue should be decomposed with orka:to-issues. Current Orka patch artifacts are text-only: do not create or modify binary/generated assets (for example .ico, screenshots, archives, compiled outputs, or vendored blobs), even if they appear in the plan; use text/source/docs changes and mention any omitted binary asset as a follow-up. After edits, run focused validation only for the files/packages you changed; avoid long full-repository test suites inside this task because CI/Orka repair will run broad validation after the PR is opened. Leave final changes for Orka to commit and push through the configured push branch. Do not open a pull request yourself."
+		instruction = "Implement the approved plan for this issue as a tracer-bullet vertical slice. Keep scope tight and prefer the smallest reviewable source/docs patch that proves the intended route. Make the planned code/documentation changes first; do not run tests before making changes. If the approved plan is too broad for one bounded agent turn, do not keep iterating indefinitely: return a blocked or needs_human JSON result that says the issue should be decomposed with orka:to-issues. Current Orka patch artifacts are text-only: do not create or modify binary/generated assets (for example .ico, screenshots, archives, compiled outputs, or vendored blobs), even if they appear in the plan; use text/source/docs changes and mention any omitted binary asset as a follow-up. After edits, run focused validation only for the files/packages you changed; avoid long full-repository test suites inside this task because CI/Orka repair will run broad validation after the PR is opened. Leave final changes for Orka to commit and push through the configured push branch. Do not open a pull request yourself. Never write realistic secret values (API keys, tokens, passwords) into any file, including docs, examples, and tests; use placeholders such as ${env:VAR} or <your-api-key>, because a workspace delta containing secret-like content is rejected before publication."
 		schema = `{"schemaVersion":"orka.issueImplementation.v1","repo":"owner/repo","issueNumber":123,"snapshotDigest":"sha256:...","status":"patch_ready|blocked|needs_human","summary":"...","validation":[]}`
 	case repositoryMonitorIssueActionDecompose:
 		instruction = "Decompose this issue into small, independently implementable child issue drafts. Do not create issues or mutate GitHub; return drafts only."
@@ -1031,7 +1055,29 @@ func repositoryMonitorIssueFailedTaskSummary(actionKind string, task *corev1alph
 		}
 		return fmt.Sprintf("Task `%s` timed out before producing a result.", name)
 	}
+	if guidance := repositoryMonitorWorkspaceValidationGuidance(task); guidance != "" {
+		return fmt.Sprintf("Task `%s` produced changes that were rejected before publication: %s.", name, guidance)
+	}
 	return fmt.Sprintf("Task `%s` ended in phase %s without producing a valid result.", name, phase)
+}
+
+// repositoryMonitorWorkspaceValidationGuidance turns a workspace content
+// policy rejection into public, actionable guidance. Only the policy class is
+// surfaced; the Task status message (which names the file) stays private to
+// the namespace.
+func repositoryMonitorWorkspaceValidationGuidance(task *corev1alpha1.Task) string {
+	if task == nil || task.Status.Delivery == nil || task.Status.Delivery.Reason != corev1alpha1.TaskDeliveryReason(corev1alpha1.ExecutionWorkspaceReasonValidationFailed) {
+		return ""
+	}
+	lower := strings.ToLower(task.Status.Delivery.Message)
+	switch {
+	case strings.Contains(lower, "secret-like"):
+		return "a changed file contains secret-like content such as an API key or token literal. Use placeholders like `${env:VAR}` or `<your-api-key>` in examples and tests instead of realistic values, then request implementation again"
+	case strings.Contains(lower, "binary"):
+		return "a changed file is binary, and implementation may only publish text changes"
+	default:
+		return "the workspace changes did not pass content policy; see the Task status in the Orka namespace for details"
+	}
 }
 
 func anySliceField(body map[string]any, key string) []any {
@@ -2394,7 +2440,11 @@ func renderRepositoryMonitorIssuePRBody(item *store.MonitorItem, task *corev1alp
 
 func repositoryMonitorIssueActionUpdatesStatusComment(actionKind, workflowPhase string) bool {
 	switch actionKind {
-	case repositoryMonitorIssueActionPlan, repositoryMonitorIssueActionMutateToPR, repositoryMonitorIssueActionDecompose:
+	case repositoryMonitorIssueActionPlan, repositoryMonitorIssueActionMutateToPR, repositoryMonitorIssueActionDecompose,
+		repositoryMonitorIssueActionResearch:
+		// Research is user-triggered (orka:research); without a status-comment
+		// update its result would be stored only as internal planning context
+		// and the requester would see nothing on the issue.
 		return true
 	case repositoryMonitorIssueActionImplementation:
 		return workflowPhase == repositoryMonitorIssuePhaseBlocked || workflowPhase == repositoryMonitorIssuePhasePROpened
@@ -2523,7 +2573,7 @@ func renderRepositoryMonitorIssueStatusComment(item *store.MonitorItem, record *
 	}
 	var payload map[string]any
 	_ = json.Unmarshal([]byte(record.PayloadJSON), &payload)
-	planSummary := sanitizeRepositoryMonitorPublicCommentText(firstNonEmptyIssueAction(stringField(payload, "summary"), record.Summary))
+	planSummary := sanitizeRepositoryMonitorPublicCommentText(firstNonEmptyIssueAction(stringField(payload, "summary"), stringField(payload, "problemStatement"), record.Summary))
 	if planSummary == "" {
 		planSummary = "No summary provided."
 	}

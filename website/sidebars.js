@@ -29,6 +29,7 @@ const sidebars = {
         'guides/bring-your-own-agent-runtime',
         'guides/multi-agent-coordination',
         'guides/autonomous-tasks',
+        'guides/scheduled-tasks',
         'guides/transaction-token-migration',
         'guides/repository-security-scanning',
         'guides/repository-monitors',
@@ -46,6 +47,7 @@ const sidebars = {
         'operations/harness-modes',
         'operations/agent-runtime-security',
         'operations/gateways',
+        'operations/runbook',
       ],
     },
     {

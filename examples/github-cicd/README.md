@@ -10,9 +10,10 @@ This example shows how to use Orka's multi-agent coordination with the ACP v2 wo
 
 ## Credential roles
 
-The example uses three independent credential roles:
+The example uses two independent Git credential roles; the Claude ACP runtime
+obtains provider access through the controller-managed provider proxy and
+carries no Agent `secretRef`:
 
-- `claude-credentials` — provider/proxy access for the Claude ACP runtime;
 - `repository-read` — clone/read credential used only by the clean-room workspace boundary;
 - `repository-publish` — branch/forge credential used only by the Workspace/Publisher and GitHub coordination tools.
 
@@ -33,10 +34,6 @@ Neither Git Secret is delivered to the ACP process tree.
 # Update spec.providerRef.name in agents.yaml to match your Provider CRD.
 # Replace the placeholder values in secret.yaml before applying it.
 kubectl apply -f examples/github-cicd/secret.yaml
-
-# Create the Claude provider/proxy credential separately.
-kubectl create secret generic claude-credentials \
-  --from-literal=ANTHROPIC_API_KEY=sk-ant-your-key
 
 kubectl apply -k examples/github-cicd
 kubectl apply -f examples/github-cicd/task.yaml

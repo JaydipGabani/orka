@@ -84,6 +84,12 @@ func stripPrefixedExecutionEventURLQuery(candidate string) string {
 
 func stripExecutionEventURLQuery(candidate string) string {
 	trimmed := strings.TrimRight(candidate, ".,;:!?)]}")
+	// A redaction placeholder ends with ']': when the candidate already
+	// carries one (redact.SensitiveText runs first), its closing bracket is
+	// part of the placeholder, not trailing punctuation.
+	if idx := strings.LastIndex(candidate, ExecutionEventRedactedValue); idx >= 0 && len(trimmed) < idx+len(ExecutionEventRedactedValue) {
+		trimmed = candidate[:idx+len(ExecutionEventRedactedValue)]
+	}
 	suffix := candidate[len(trimmed):]
 	parsed, err := url.Parse(trimmed)
 	if err != nil {

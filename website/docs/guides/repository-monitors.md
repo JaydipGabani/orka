@@ -60,12 +60,14 @@ metadata:
 spec:
   runtime:
     type: claude
+    contractVersion: orka.harness.v2
     defaultMaxTurns: 50
     defaultAllowedTools:
       - Read
       - Grep
       - Glob
-      - LS
+  model:
+    name: claude-opus-5
   systemPrompt:
     inline: |
       Review the exact pull request head for correctness, tests, security, and maintainability.
@@ -95,9 +97,11 @@ Implementation and repair are write workflows and require four explicit, pairwis
 
 ## Review Workspace Context
 
-The review Task is pinned to the exact PR head SHA with `workspace.intent: read`. Before creating it, the controller fetches the pull request identity, requests GitHub's exact `baseSHA...headSHA` comparison, and refetches the pull request to ensure the base, head, and head repository did not change during context assembly. A race fails closed instead of queueing a stale review.
+The review Task is pinned to the exact PR head SHA with `workspace.intent: read`. Before creating it, the controller fetches the pull request identity, lists the pull request's changed files with their patches, and refetches the pull request to ensure the base, head, and head repository did not change during context assembly. The drift check runs even when the file listing failed, so a race fails closed instead of queueing a stale review; a GitHub read failure does not fail the run and instead marks the context `contextUnavailable`.
 
-The controller embeds a bounded `orka.prReview.context.v1` payload in the prompt: at most 100 changed files, at most 700 KiB encoded context, at most 64 KiB encoded patch excerpt per file, and bounded paths/short metadata fields. The payload explicitly marks missing patches and local truncation. The prompt treats titles, labels, paths, patches, and repository content as untrusted data and tells the reviewer to inspect the verified checkout whenever GitHub context is incomplete.
+The controller embeds a bounded `orka.prReview.context.v1` payload in the prompt: at most 700 KiB encoded context, patch excerpts (at most 64 KiB encoded each) for the first 100 changed files, and path-only identity entries (`patchOmitted: "capped"`) for up to 2,000 changed files, with bounded paths/short metadata fields. Identities take precedence over patches inside the byte budget: patches are dropped first, and `truncated.files` is set only when the complete change set could not be represented — a missing identity, a compare listing shorter than the pull request's `changed_files` total (GitHub caps the compare file array at 300 entries), or an omitted patch that hides content the checkout cannot show (a removed file, a renamed file's previous contents, or deleted lines in any changed file). Because the checkout carries no Git metadata, the prompt then requires a non-`passed` verdict (`needs_human` or stricter). Patches and paths pass through the shared credential redaction before they are persisted in the Task prompt. The prompt treats titles, labels, paths, patches, and repository content as untrusted data and tells the reviewer to inspect the verified checkout whenever GitHub context is incomplete.
+
+If a Task with the predictable review name already exists, the controller adopts it only when its spec is byte-identical to the freshly rendered review (including the diff context) or carries only the controller-shaped `contextUnavailable` envelope; any other pre-existing Task fails the run.
 
 The reviewer must not mutate the verified tree. Any unexpected workspace change fails read validation. GitHub review publishing, when enabled, happens later through the controller's deterministic publisher path; the ACP child has no GitHub mutation credential.
 
@@ -312,6 +316,39 @@ Inspect command intake with:
 orka monitor commands list orka-main --namespace default
 orka monitor commands get <command-id> --namespace default
 ```
+
+### Label quick reference
+
+Once label intake is enabled, applying one label on GitHub is the whole user
+interface. This table maps each default label to what Orka does and where the
+result appears:
+
+| Label | Target | What Orka does | Where you see the result |
+|---|---|---|---|
+| `orka:triage` | issue | Read-only triage task classifies the issue | Orka's status comment on the issue; `orka monitor actions list` |
+| `orka:research` | issue | Read-only research task investigates the problem | Status comment (problem statement and findings); action record |
+| `orka:plan` | issue | Read-only planning task drafts an implementation plan | Status comment; issue moves to `plan_ready` (or `approval_required`) |
+| `orka:approve-plan` | issue | Records human approval of the plan | Issue state moves to `approved` |
+| `orka:implement` | issue | Write task implements the approved plan in a sanitized workspace | A pull request opened by the clean-room publisher |
+| `orka:review` | PR | Exact-head review of the PR | Review comment and readiness state on the PR |
+| `orka:fix` | PR | Repair task on the PR head branch | New commits pushed to the PR branch |
+| `orka:fix-ci` | PR | CI-focused repair on the PR head branch | New commits pushed to the PR branch |
+| `orka:update-branch` | PR | Merges the base branch into the PR head | Updated PR branch |
+| `orka:automerge` | PR | Arms the optional automerge workflow (if enabled) | PR merges once review and CI gates pass |
+
+Notes:
+
+- Label names are configurable per monitor (`spec.triggers.github.labels`);
+  the table shows the conventional defaults.
+- Orka maintains **one status comment per issue** and edits it in place as
+  phases complete, rather than posting a new comment per phase.
+- Labels listed in `spec.policy.pauseLabels` (and `protectedLabels`) block
+  command intake for that item: the command is recorded as blocked and no work
+  is queued.
+- Commands act on the monitor's *inventoried* view of an item. If the PR or
+  issue changed very recently, run a targeted inventory pass first
+  (`orka monitor run <name> --target-kind pr --target-number <n>`) so the
+  command binds to the current head.
 
 ## Issue Triage, Research, Planning, and Implementation
 

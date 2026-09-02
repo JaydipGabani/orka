@@ -1374,13 +1374,16 @@ func TestRepositoryMonitorReviewTaskReuseAllowsDefaultedTaskScheduleFields(t *te
 		WithStatusSubresource(&corev1alpha1.RepositoryMonitor{}).
 		WithObjects(repositoryMonitorControllerObjects(monitor)...).
 		Build()
+	server := newRepositoryMonitorReviewContextUnavailableServer(t)
+	t.Cleanup(server.Close)
 	reconciler := &RepositoryMonitorReconciler{
-		Client: cl,
-		Scheme: scheme,
-		Store:  setupControllerSQLiteStore(t),
+		Client:           cl,
+		Scheme:           scheme,
+		Store:            setupControllerSQLiteStore(t),
+		GitHubAPIBaseURL: server.URL,
 	}
 
-	taskName, created, err := reconciler.createRepositoryMonitorReviewTask(ctx, monitor, run, "orka-agents", "orka", pr)
+	taskName, created, err := reconciler.createRepositoryMonitorReviewTask(ctx, monitor, run, "orka-agents", "orka", "", pr)
 	if err != nil {
 		t.Fatalf("createRepositoryMonitorReviewTask() error = %v", err)
 	}
@@ -1400,7 +1403,7 @@ func TestRepositoryMonitorReviewTaskReuseAllowsDefaultedTaskScheduleFields(t *te
 	existing.Spec.SuccessfulRunsHistoryLimit = &successfulRunsHistoryLimit
 	existing.Spec.FailedRunsHistoryLimit = &failedRunsHistoryLimit
 
-	if err := validateRepositoryMonitorReviewTaskMatchesExpected(&existing, expected, monitor, run, "orka-agents/orka", pr); err != nil {
+	if err := validateRepositoryMonitorReviewTaskMatchesExpected(&existing, expected, monitor, run, "orka-agents", "orka", pr); err != nil {
 		t.Fatalf("validateRepositoryMonitorReviewTaskMatchesExpected() error = %v", err)
 	}
 }
@@ -1492,6 +1495,45 @@ func TestRepositoryMonitorReconcileKeepsSucceededBackingTaskPendingWithoutTypedR
 	}
 	if item.LastReviewID != "completed-review-task" || item.LastReviewedHeadSHA != "" || item.LastVerdict != repositoryMonitorRunPhaseQueued || item.SkipReason != repositoryMonitorSkipReasonPending {
 		t.Fatalf("item = %#v, want succeeded task to remain pending until typed result ingest", item)
+	}
+}
+
+func TestRepositoryMonitorIngestDowngradesPassedVerdictWithoutCompleteContext(t *testing.T) {
+	ctx := context.Background()
+	monitorStore := setupControllerSQLiteStore(t)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "gate-monitor", Namespace: "default", UID: types.UID("uid-gate-monitor")}, Spec: corev1alpha1.RepositoryMonitorSpec{RepoURL: repositoryMonitorTestRepoURL, Branch: "main", Agents: corev1alpha1.RepositoryMonitorAgents{Reviewer: &corev1alpha1.AgentReference{Name: "reviewer"}}}}
+	task := repositoryMonitorReviewIngestTestTask("gate-review-task", monitor.Name, 91, "head91")
+	task.Spec.Prompt = "review\n" + renderRepositoryMonitorReviewContext(repositoryMonitorReviewContext{
+		SchemaVersion: repositoryMonitorReviewContextSchemaVersion, Repo: "orka-agents/orka", PRNumber: 91, HeadSHA: "head91",
+		ContextUnavailable: repositoryMonitorReviewContextErrorTimeout,
+	}) + "\n"
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(monitor, task).Build()
+	reconciler := &RepositoryMonitorReconciler{Client: cl, Scheme: scheme, Store: monitorStore, ResultStore: monitorStore}
+	if err := monitorStore.SaveResult(ctx, "default", task.Name, repositoryMonitorReviewResultEnvelope(t, 91, "head91", repositoryMonitorReviewVerdictPassed)); err != nil {
+		t.Fatal(err)
+	}
+	item := &store.MonitorItem{MonitorNamespace: "default", MonitorName: monitor.Name, Kind: repositoryMonitorPullRequestKind, ItemKey: "91", Number: 91, State: repositoryMonitorItemStateOpen, HeadSHA: "head91", BaseBranch: "main", LastVerdict: repositoryMonitorRunPhaseQueued, LastReviewID: task.Name}
+	if err := monitorStore.UpsertMonitorItem(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	handled, err := reconciler.ingestCompletedRepositoryMonitorReviewTask(ctx, monitor, item, task)
+	if err != nil || !handled {
+		t.Fatalf("ingest = (%v, %v), want handled without error", handled, err)
+	}
+	updated, err := monitorStore.GetMonitorItem(ctx, "default", monitor.Name, repositoryMonitorPullRequestKind, "91")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.LastVerdict != repositoryMonitorReviewVerdictNeedsHuman || updated.AutomergeState != "" {
+		t.Fatalf("item after gated ingest = verdict %q automerge %q, want needs_human and no merge-ready state", updated.LastVerdict, updated.AutomergeState)
+	}
+	events, _, err := monitorStore.ListMonitorEvents(ctx, store.MonitorEventFilter{Namespace: "default", MonitorName: monitor.Name, EventType: "review_verdict_downgraded", Limit: 5})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("downgrade events = %d (err %v), want 1", len(events), err)
 	}
 }
 
@@ -3500,25 +3542,92 @@ func newRepositoryMonitorSinglePullRequestServerWithBodyAndAuth(t *testing.T, nu
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wantPath := fmt.Sprintf("/repos/orka-agents/orka/pulls/%d", number)
-		if r.URL.Path != wantPath {
-			t.Fatalf("request path = %q, want single pull request path %q", r.URL.Path, wantPath)
-		}
 		if got := r.Header.Get("Authorization"); got != wantAuth {
 			t.Fatalf("Authorization header = %q, want %q", got, wantAuth)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == wantPath+"/files" {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/repos/orka-agents/orka/compare/") {
+			_, _ = w.Write([]byte(`{"files":[]}`))
+			return
+		}
+		if r.URL.Path != wantPath {
+			t.Fatalf("request path = %q, want single pull request path %q", r.URL.Path, wantPath)
+		}
 		_, _ = w.Write([]byte(body))
 	}))
+}
+
+// newRepositoryMonitorReviewContextUnavailableServer answers every GitHub
+// request with 404 so review Task creation embeds contextUnavailable.
+func newRepositoryMonitorReviewContextUnavailableServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+	}))
+}
+
+// repositoryMonitorInventoryServerRoutesReviewContext serves the single pull
+// request and pull request files endpoints the review-context builder calls,
+// derived from the same inventory body. It returns true when it handled the
+// request.
+func repositoryMonitorInventoryServerRoutesReviewContext(t *testing.T, w http.ResponseWriter, r *http.Request, body string) bool {
+	t.Helper()
+	const prefix = "/repos/orka-agents/orka/pulls/"
+	const comparePrefix = "/repos/orka-agents/orka/compare/"
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, comparePrefix) {
+		// The review-context builder binds the file set to base...head SHAs.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"files":[{"filename":"main.go","status":"modified","additions":1,"deletions":0,"patch":"@@ -1 +1,2 @@\n package main\n+// change"}]}`))
+		return true
+	}
+	if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	number, wantFiles := strings.CutSuffix(rest, "/files")
+	w.Header().Set("Content-Type", "application/json")
+	if wantFiles {
+		_, _ = w.Write([]byte(`[{"filename":"main.go","status":"modified","additions":1,"deletions":0,"patch":"@@ -1 +1,2 @@\n package main\n+// change"}]`))
+		return true
+	}
+	var pullRequests []json.RawMessage
+	if err := json.Unmarshal([]byte(body), &pullRequests); err != nil {
+		t.Fatalf("inventory body is not a JSON array: %v", err)
+	}
+	for _, raw := range pullRequests {
+		var pr struct {
+			Number int64 `json:"number"`
+		}
+		if err := json.Unmarshal(raw, &pr); err != nil {
+			t.Fatalf("inventory element is not a pull request: %v", err)
+		}
+		if strconv.FormatInt(pr.Number, 10) == number {
+			_, _ = w.Write(raw)
+			return true
+		}
+	}
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+	return true
 }
 
 func newRepositoryMonitorPullRequestInventoryServerWithAuth(t *testing.T, body, wantAuth string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/orka-agents/orka/pulls" {
-			t.Fatalf("request path = %q, want pull inventory path", r.URL.Path)
-		}
 		if got := r.Header.Get("Authorization"); got != wantAuth {
 			t.Fatalf("Authorization header = %q, want %q", got, wantAuth)
+		}
+		if repositoryMonitorInventoryServerRoutesReviewContext(t, w, r, body) {
+			return
+		}
+		if r.URL.Path != "/repos/orka-agents/orka/pulls" {
+			t.Fatalf("request path = %q, want pull inventory path", r.URL.Path)
 		}
 		if got := r.URL.Query().Get("state"); got != "open" {
 			t.Fatalf("state query = %q, want open", got)
@@ -3599,7 +3708,15 @@ func repositoryMonitorReviewIngestTestTask(name, monitorName string, prNumber in
 				labels.AnnotationGitHubRepository:      "orka-agents/orka",
 			},
 		},
-		Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent},
+		Spec: corev1alpha1.TaskSpec{
+			Type: corev1alpha1.TaskTypeAgent,
+			// A complete (non-truncated, available) rendered context so passed
+			// verdicts from these fixtures pass the controller-side gate.
+			Prompt: "review\n" + renderRepositoryMonitorReviewContext(repositoryMonitorReviewContext{
+				SchemaVersion: repositoryMonitorReviewContextSchemaVersion, Repo: "orka-agents/orka",
+				PRNumber: prNumber, HeadSHA: headSHA,
+			}) + "\n",
+		},
 		Status: corev1alpha1.TaskStatus{
 			Phase:     corev1alpha1.TaskPhaseSucceeded,
 			ResultRef: &corev1alpha1.ResultReference{Available: true},
@@ -3724,6 +3841,12 @@ func newRepositoryMonitorPublishTestServer(t *testing.T, cfg repositoryMonitorPu
 			_, _ = w.Write([]byte(cfg.ReviewsBody))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/pulls/1/files":
 			_, _ = w.Write([]byte(cfg.FilesBody))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/orka-agents/orka/compare/"):
+			body := cfg.FilesBody
+			if strings.HasPrefix(strings.TrimSpace(body), "[") {
+				body = `{"files":` + body + `}`
+			}
+			_, _ = w.Write([]byte(body))
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/orka-agents/orka/pulls/1/reviews":
 			testServer.PostCount++
 			if err := json.NewDecoder(r.Body).Decode(&testServer.PostedReview); err != nil {
@@ -3923,9 +4046,37 @@ func assertRepositoryMonitorReviewTask(t *testing.T, ctx context.Context, cl crc
 	if !strings.Contains(task.Spec.Prompt, `"schemaVersion": "orka.prReview.input.v1"`) || !strings.Contains(task.Spec.Prompt, `"headSHA": "sha1"`) || !strings.Contains(task.Spec.Prompt, `"schemaVersion": "orka.prReview.v1"`) {
 		t.Fatalf("task prompt does not include expected review input/output contracts:\n%s", task.Spec.Prompt)
 	}
-	if !strings.Contains(task.Spec.Prompt, "/workspace/.git/orka/pr-review.diff") {
-		t.Fatalf("task prompt does not include generated PR diff context path:\n%s", task.Spec.Prompt)
+	if strings.Contains(task.Spec.Prompt, "/workspace/.git/orka") {
+		t.Fatalf("task prompt still references legacy .git/orka review artifacts:\n%s", task.Spec.Prompt)
 	}
+	reviewContext := decodeRepositoryMonitorReviewContextFromPrompt(t, task.Spec.Prompt)
+	if reviewContext.SchemaVersion != repositoryMonitorReviewContextSchemaVersion || reviewContext.Repo != "orka-agents/orka" || reviewContext.PRNumber != 1 || reviewContext.HeadSHA != "sha1" || reviewContext.BaseSHA != "base1" {
+		t.Fatalf("review context = %#v, want orka.prReview.context.v1 for orka-agents/orka#1 at sha1", reviewContext)
+	}
+	if reviewContext.ContextUnavailable != "" || reviewContext.ChangedFileCount != 1 || len(reviewContext.Files) != 1 || reviewContext.Files[0].Path != "main.go" || reviewContext.Files[0].Status != "modified" || !strings.Contains(reviewContext.Files[0].Patch, "+// change") || reviewContext.Files[0].PatchOmitted != "" {
+		t.Fatalf("review context files = %#v, want one modified main.go entry with its patch", reviewContext.Files)
+	}
+	if reviewContext.Truncated.Files || reviewContext.Truncated.Bytes {
+		t.Fatalf("review context truncated = %#v, want no truncation", reviewContext.Truncated)
+	}
+	if !strings.Contains(task.Spec.Prompt, "without Git metadata or history") || !strings.Contains(task.Spec.Prompt, "untrusted data") {
+		t.Fatalf("task prompt does not describe the sanitized checkout and untrusted context:\n%s", task.Spec.Prompt)
+	}
+}
+
+func decodeRepositoryMonitorReviewContextFromPrompt(t *testing.T, prompt string) repositoryMonitorReviewContext {
+	t.Helper()
+	start := strings.Index(prompt, repositoryMonitorReviewContextBeginMarker)
+	end := strings.Index(prompt, repositoryMonitorReviewContextEndMarker)
+	if start < 0 || end < 0 || end < start {
+		t.Fatalf("task prompt does not embed a delimited review context:\n%s", prompt)
+	}
+	encoded := strings.TrimSpace(prompt[start+len(repositoryMonitorReviewContextBeginMarker) : end])
+	var reviewContext repositoryMonitorReviewContext
+	if err := json.Unmarshal([]byte(encoded), &reviewContext); err != nil {
+		t.Fatalf("review context is not valid JSON: %v\n%s", err, encoded)
+	}
+	return reviewContext
 }
 
 func TestRepositoryMonitorReconcileRejectsInvalidRepoURLWithoutPersistingMetadata(t *testing.T) {
@@ -5755,6 +5906,10 @@ func TestRepositoryMonitorPRReviewRepairReadinessAutomergeFakeGitHubE2E(t *testi
 			_, _ = w.Write([]byte(`{"number":88,"title":"Repair me","state":"open","draft":false,"mergeable_state":"clean","user":{"login":"alice"},"base":{"ref":"main","sha":"base88","repo":{"full_name":"orka-agents/orka","clone_url":"https://github.com/orka-agents/orka.git"}},"head":{"ref":"feature-repair","sha":"head88-fixed","repo":{"full_name":"orka-agents/orka","clone_url":"https://github.com/orka-agents/orka.git"}},"labels":[]}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/pulls":
 			_, _ = w.Write([]byte(`[{"number":88,"title":"Repair me","state":"open","draft":false,"mergeable_state":"clean","user":{"login":"alice"},"base":{"ref":"main","sha":"base88","repo":{"full_name":"orka-agents/orka","clone_url":"https://github.com/orka-agents/orka.git"}},"head":{"ref":"feature-repair","sha":"head88-fixed","repo":{"full_name":"orka-agents/orka","clone_url":"https://github.com/orka-agents/orka.git"}},"labels":[]}]`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/pulls/88/files":
+			_, _ = w.Write([]byte(`[{"filename":"pkg/repair.go","status":"modified","additions":2,"deletions":1,"patch":"@@ -1,2 +1,3 @@\n-old\n+new\n+more"}]`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/orka-agents/orka/compare/"):
+			_, _ = w.Write([]byte(`{"files":[{"filename":"pkg/repair.go","status":"modified","additions":2,"deletions":1,"patch":"@@ -1,2 +1,3 @@\n-old\n+new\n+more"}]}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/commits/head88-fixed/check-runs":
 			_, _ = w.Write([]byte(`{"total_count":1,"check_runs":[{"name":"test","status":"completed","conclusion":"success"}]}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/orka-agents/orka/commits/head88-fixed/status":
@@ -6653,6 +6808,14 @@ func TestRepositoryMonitorIssueStatusCommentNeutralizesActiveText(t *testing.T) 
 	}
 }
 
+func TestRepositoryMonitorReviewTextWithholdsWrappedCredentials(t *testing.T) {
+	credential := "sk-proj-abc\ndefghijklmnopqrstuvwxyz0123456789"
+	got := sanitizeRepositoryMonitorReviewText("Do not publish "+credential, repositoryMonitorReviewTextMaxRunes)
+	if got != "[REDACTED]" {
+		t.Fatalf("sanitizeRepositoryMonitorReviewText() = %q, want wrapped credential withheld", got)
+	}
+}
+
 func TestRepositoryMonitorIssueCommandBlocksInvalidPhaseTransition(t *testing.T) {
 	ctx := context.Background()
 	monitorStore := setupControllerSQLiteStore(t)
@@ -6684,6 +6847,89 @@ func TestRepositoryMonitorIssueInventoryPreservesStatusCommentIdentity(t *testin
 	got := repositoryMonitorItemFromIssue(monitor, issue, existing)
 	if got.StatusCommentID != existing.StatusCommentID || got.StatusCommentURL != existing.StatusCommentURL {
 		t.Fatalf("status comment identity lost during inventory refresh: %#v", got)
+	}
+}
+
+func TestRepositoryMonitorIssueRunLimitRefreshRetainsActiveWorkflowAcrossSnapshotChanges(t *testing.T) {
+	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+	existing := &store.MonitorItem{
+		SnapshotDigest:     "sha256:old",
+		WorkflowPhase:      repositoryMonitorIssuePhasePROpened,
+		LastActionID:       "action-44",
+		LastActionKind:     repositoryMonitorIssueActionImplementation,
+		LastActionTaskName: "implement-44",
+		LastVerdict:        repositoryMonitorIssueVerdictReady,
+		LinkedPRNumber:     144,
+	}
+	issue := repositoryMonitorIssue{Number: 44, Title: "Updated title", Body: "Updated body", State: "open"}
+	got := repositoryMonitorItemFromIssue(monitor, issue, existing)
+	if got.SnapshotDigest == existing.SnapshotDigest {
+		t.Fatal("inventory refresh did not record the changed issue snapshot")
+	}
+	if !repositoryMonitorIssueRetainWorkflowUnderRunLimit(got, existing) {
+		t.Fatal("active workflow was not eligible for retention under the run limit")
+	}
+	if got.WorkflowPhase != existing.WorkflowPhase || got.LastActionID != existing.LastActionID ||
+		got.LastActionKind != existing.LastActionKind || got.LastActionTaskName != existing.LastActionTaskName ||
+		got.LastVerdict != existing.LastVerdict || got.LinkedPRNumber != existing.LinkedPRNumber {
+		t.Fatalf("inventory refresh lost active workflow state: %#v", got)
+	}
+	// The retained workflow keeps the snapshot it was started from, so the
+	// next uncapped run still sees the edit as a digest change.
+	if got.SnapshotDigest != existing.SnapshotDigest || got.Title != existing.Title || got.Body != existing.Body {
+		t.Fatalf("retention advanced the snapshot past the retained workflow: %#v", got)
+	}
+	rediscovered := repositoryMonitorItemFromIssue(monitor, issue, got)
+	if rediscovered.SnapshotDigest == got.SnapshotDigest || rediscovered.WorkflowPhase != repositoryMonitorIssuePhaseDiscovered {
+		t.Fatalf("edited issue was not rediscovered after retention: %#v", rediscovered)
+	}
+}
+
+func TestRepositoryMonitorIssueRunLimitRetainsActiveWorkflow(t *testing.T) {
+	for _, phase := range []string{repositoryMonitorIssuePhaseApprovalRequired, repositoryMonitorIssuePhaseImplementationQueued, repositoryMonitorIssuePhasePROpened, repositoryMonitorIssuePhaseComplete} {
+		if !repositoryMonitorIssueWorkflowRetainedUnderRunLimit(&store.MonitorItem{WorkflowPhase: phase}) {
+			t.Fatalf("phase %q should be retained under the per-run selection cap", phase)
+		}
+	}
+	for _, phase := range []string{"", repositoryMonitorIssuePhaseDiscovered, repositoryMonitorIssuePhaseBlocked} {
+		if repositoryMonitorIssueWorkflowRetainedUnderRunLimit(&store.MonitorItem{WorkflowPhase: phase}) {
+			t.Fatalf("phase %q should remain subject to the per-run selection cap", phase)
+		}
+	}
+	if repositoryMonitorIssueWorkflowRetainedUnderRunLimit(nil) {
+		t.Fatal("an unknown issue has no workflow to retain")
+	}
+}
+
+func TestRepositoryMonitorRepairPushKeepsQueuedReview(t *testing.T) {
+	queued := &store.MonitorItem{LastVerdict: repositoryMonitorRunPhaseQueued, LastReviewID: "monrev-358-newhead", LastReviewedHeadSHA: "old", AutomergeState: "merge_ready", SkipReason: "already_reviewed"}
+	repositoryMonitorResetItemAfterRepairPush(queued)
+	if queued.LastVerdict != repositoryMonitorRunPhaseQueued || queued.LastReviewID != "monrev-358-newhead" {
+		t.Fatalf("queued review was cleared by the repair push: %#v", queued)
+	}
+	if queued.LastReviewedHeadSHA != "" || queued.AutomergeState != "" || queued.SkipReason != "" {
+		t.Fatalf("stale review state survived the repair push: %#v", queued)
+	}
+	reviewed := &store.MonitorItem{LastVerdict: repositoryMonitorReviewVerdictNeedsChanges, LastReviewID: "monrev-358-oldhead", LastReviewedHeadSHA: "old"}
+	repositoryMonitorResetItemAfterRepairPush(reviewed)
+	if reviewed.LastVerdict != "" || reviewed.LastReviewedHeadSHA != "" {
+		t.Fatalf("previous verdict survived the repair push: %#v", reviewed)
+	}
+	repositoryMonitorResetItemAfterRepairPush(nil)
+}
+
+func TestRepositoryMonitorResearchUpdatesStatusComment(t *testing.T) {
+	if !repositoryMonitorIssueActionUpdatesStatusComment(repositoryMonitorIssueActionResearch, "blocked") {
+		t.Fatal("research completion should surface on the issue status comment")
+	}
+	record := &store.ActionRecord{PayloadJSON: `{"schemaVersion":"orka.issueResearch.v1","problemStatement":"CI lacks performance regression coverage for the proxy hot path.","needsHuman":true}`}
+	item := &store.MonitorItem{MonitorName: "m", Number: 354, WorkflowPhase: "blocked", SkipReason: "needs_human"}
+	body := renderRepositoryMonitorIssueStatusComment(item, record)
+	if !strings.Contains(body, "CI lacks performance regression coverage") {
+		t.Fatalf("research problem statement missing from status comment: %q", body)
+	}
+	if strings.Contains(body, "No summary provided.") {
+		t.Fatalf("research comment fell back to the empty-summary placeholder: %q", body)
 	}
 }
 
@@ -7334,6 +7580,36 @@ func TestRepositoryMonitorFailedTaskSummaryDoesNotExposeStatusMessage(t *testing
 	}
 }
 
+func TestRepositoryMonitorFailedTaskSummaryExplainsWorkspaceValidationFailure(t *testing.T) {
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "impl-task"},
+		Status: corev1alpha1.TaskStatus{
+			Phase:   corev1alpha1.TaskPhaseFailed,
+			Message: "ACP delivery failed: workspace validation failed before a trusted delta was established: workspace delta contains secret-like file content: docs/private-config.md",
+			Delivery: &corev1alpha1.TaskDeliveryStatus{
+				State:   corev1alpha1.TaskDeliveryStateDeliveryConflict,
+				Reason:  corev1alpha1.TaskDeliveryReason(corev1alpha1.ExecutionWorkspaceReasonValidationFailed),
+				Message: "workspace validation failed before a trusted delta was established: workspace delta contains secret-like file content: docs/private-config.md",
+			},
+		},
+	}
+	summary := repositoryMonitorIssueFailedTaskSummary(repositoryMonitorIssueActionImplementation, task)
+	if !strings.Contains(summary, "secret-like content") || !strings.Contains(summary, "${env:VAR}") {
+		t.Fatalf("summary did not explain the secret policy rejection: %q", summary)
+	}
+	if strings.Contains(summary, "private-config") || strings.Contains(summary, "trusted delta") {
+		t.Fatalf("public summary leaked the task status message: %q", summary)
+	}
+	task.Status.Delivery.Message = "workspace delta contains binary file content: assets/logo.png"
+	if summary = repositoryMonitorIssueFailedTaskSummary(repositoryMonitorIssueActionImplementation, task); !strings.Contains(summary, "binary") || strings.Contains(summary, "logo.png") {
+		t.Fatalf("binary summary = %q", summary)
+	}
+	task.Status.Delivery = nil
+	if summary = repositoryMonitorIssueFailedTaskSummary(repositoryMonitorIssueActionImplementation, task); !strings.Contains(summary, "without producing a valid result") {
+		t.Fatalf("summary without delivery status = %q", summary)
+	}
+}
+
 func TestRepositoryMonitorJSONExtractionBoundsDecodeAttempts(t *testing.T) {
 	raw := strings.Repeat("{", repositoryMonitorIssueJSONDecodeAttempts+1) + `{"status":"ready"}`
 	if got := repositoryMonitorFirstJSONObject(raw); got != "" {
@@ -7605,5 +7881,29 @@ func TestRepositoryMonitorUpdateBranchNoChangeVerifiesBaseAncestry(t *testing.T)
 	ok, err := reconciler.repositoryMonitorHeadContainsBase(ctx, monitor, &store.RepairJob{Repo: "orka-agents/orka", BaseSHA: "base-sha", HeadSHA: "head-sha"})
 	if err != nil || !ok {
 		t.Fatalf("repositoryMonitorHeadContainsBase() = %v, %v", ok, err)
+	}
+}
+
+func TestRepositoryMonitorRepeatedImplementCommandDoesNotRestartPlanning(t *testing.T) {
+	for _, phase := range []string{repositoryMonitorIssuePhaseImplementationQueued, repositoryMonitorIssuePhaseImplementing, repositoryMonitorIssuePhaseMutatingToPR} {
+		if !repositoryMonitorIssueImplementationInProgress(phase) {
+			t.Fatalf("phase %q should count as implementation in progress", phase)
+		}
+	}
+	for _, phase := range []string{repositoryMonitorIssuePhaseApproved, repositoryMonitorIssuePhaseApprovalRequired, repositoryMonitorIssuePhaseBlocked, repositoryMonitorIssuePhasePROpened, repositoryMonitorIssuePhaseComplete} {
+		if repositoryMonitorIssueImplementationInProgress(phase) {
+			t.Fatalf("phase %q should not count as implementation in progress", phase)
+		}
+	}
+}
+
+func TestRepositoryMonitorIssueStatusCommentRedactsCredentials(t *testing.T) {
+	t.Parallel()
+	// A research agent can echo a credential it found in the repository;
+	// the public status comment must carry the redaction, not the secret.
+	const secret = "ak-live-0123456789abcdef"
+	got := sanitizeRepositoryMonitorPublicCommentText("The bug: api_key=" + secret + " is hard-coded in config.py")
+	if strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("public comment text = %q, want the credential redacted", got)
 	}
 }

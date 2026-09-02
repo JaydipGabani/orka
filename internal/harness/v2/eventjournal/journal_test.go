@@ -2443,3 +2443,46 @@ func (s *faultingAppendEventStore) ListExecutionEvents(
 	}
 	return s.ExecutionEventStore.ListExecutionEvents(ctx, filter)
 }
+
+func TestFindPromptTerminalCarriesJournaledFailureClassification(t *testing.T) {
+	ctx := context.Background()
+	eventStore := storetest.NewFakeExecutionEventStore()
+	journal := Journal{EventStore: eventStore, MapContext: testMapContext()}
+	state, err := journal.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	accepted := testUpdateEvent(1, now, harnessv2.UpdateEvent{})
+	accepted.Type = harnessv2.EventAccepted
+	accepted.Update = nil
+	accepted.Accepted = &harnessv2.AcceptedEvent{
+		AcceptedAt: now,
+		Lease:      harnessv2.PromptLease{Generation: 1, IssuedAt: now, ExpiresAt: now.Add(time.Minute)},
+		ACPVersion: harnessv2.ACPProfileV1,
+	}
+	if _, isNew, err := state.AppendPromptLifecycleIfNew(ctx, accepted); err != nil || !isNew {
+		t.Fatalf("append accepted: new=%t err=%v", isNew, err)
+	}
+	terminal := testUpdateEvent(2, now.Add(time.Millisecond), harnessv2.UpdateEvent{})
+	terminal.Type = harnessv2.EventFailed
+	terminal.Update = nil
+	terminal.Failed = &harnessv2.FailedEvent{
+		StopReason: harnessv2.ACPStopReasonRefusal, Code: "provider_upstream_error",
+		Message: "provider upstream returned HTTP 402 for the final inference request",
+	}
+	if _, isNew, err := state.AppendPromptLifecycleIfNew(ctx, terminal); err != nil || !isNew {
+		t.Fatalf("append failed terminal: new=%t err=%v", isNew, err)
+	}
+	recoveryJournal := journal
+	recoveryJournal.RecoveryIdentity = mappedUpdateIdentity(accepted)
+	evidence, err := recoveryJournal.FindPromptTerminal(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence == nil || evidence.TerminalEvent != harnessv2.EventFailed ||
+		evidence.FailureCode != "provider_upstream_error" ||
+		evidence.FailureMessage != "provider upstream returned HTTP 402 for the final inference request" {
+		t.Fatalf("failed terminal recovery evidence = %#v", evidence)
+	}
+}

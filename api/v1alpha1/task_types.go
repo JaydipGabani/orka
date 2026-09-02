@@ -509,7 +509,11 @@ type TaskStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// LastScheduleTime is the last time a child task was created for a scheduled run.
+	// LastScheduleTime is the schedule's progress cursor: the last time a
+	// child task was created, or — when a run was missed past
+	// startingDeadlineSeconds (for example while suspended) — the time the
+	// skipped window was re-anchored so the schedule resumes from the
+	// present instead of replaying missed runs.
 	// +optional
 	LastScheduleTime *metav1.Time `json:"lastScheduleTime,omitempty"`
 

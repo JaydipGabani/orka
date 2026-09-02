@@ -801,6 +801,32 @@ func verifyACPClassWorkspace(
 	if workspace.Labels[workspacev1alpha1.QuarantinedLabel] == booleanTrueValue {
 		return fmt.Errorf("%w: workspace %s is quarantined and must never be reused", errACPWorkspaceBindingConflict, workspace.Name)
 	}
+	if err := verifyACPClassWorkspaceBindings(workspace, binding, poolName); err != nil {
+		return err
+	}
+	if err := validateACPWorkspaceSuspendedCap(workspace, binding.Class.MaxSuspendedWorkspaces); err != nil {
+		return err
+	}
+	if workspace.Spec.Slot != binding.WorkspaceSlot {
+		return fmt.Errorf("%w: workspace %s slot does not match the frozen binding", errACPWorkspaceBindingConflict, workspace.Name)
+	}
+	if err := verifyACPClassWorkspaceOwnership(workspace, task, binding); err != nil {
+		return err
+	}
+	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady &&
+		!acpClassWorkspaceResumesFromSuspended(workspace, binding) {
+		return fmt.Errorf("%w: workspace %s desired state %q cannot admit new work", errACPWorkspaceBindingConflict, workspace.Name, workspace.Spec.DesiredState)
+	}
+	return nil
+}
+
+// verifyACPClassWorkspaceBindings checks the materialization markers, mode,
+// and frozen class/provider identity of an existing workspace.
+func verifyACPClassWorkspaceBindings(
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+	binding *ACPRuntimeWorkspaceBinding,
+	poolName string,
+) error {
 	if workspace.Labels[workspacev1alpha1.ProviderControllerLabel] != acpWorkspaceControllerLabelValue ||
 		workspace.Annotations[acpExecutionWorkspacePoolAnnotation] != poolName {
 		return fmt.Errorf("%w: workspace %s materialization markers do not match the frozen RuntimePool binding", errACPWorkspaceBindingConflict, workspace.Name)
@@ -824,39 +850,49 @@ func verifyACPClassWorkspace(
 		workspace.Annotations[acpWorkspaceSuspendModeAnnotation] != binding.Class.SuspendMode {
 		return fmt.Errorf("%w: workspace %s provider config, backend, or suspend mode does not match the frozen binding", errACPWorkspaceBindingConflict, workspace.Name)
 	}
-	if err := validateACPWorkspaceSuspendedCap(workspace, binding.Class.MaxSuspendedWorkspaces); err != nil {
-		return err
-	}
-	if workspace.Spec.Slot != binding.WorkspaceSlot {
-		return fmt.Errorf("%w: workspace %s slot does not match the frozen binding", errACPWorkspaceBindingConflict, workspace.Name)
-	}
+	return nil
+}
+
+// verifyACPClassWorkspaceOwnership checks that a session-reused workspace
+// carries the immutable Session UID, or that a Task-scoped workspace is owned
+// by this Task and carries no session reference.
+func verifyACPClassWorkspaceOwnership(
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+	task *corev1alpha1.Task,
+	binding *ACPRuntimeWorkspaceBinding,
+) error {
 	if binding.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession {
 		if workspace.Spec.SessionRef == nil || string(workspace.Spec.SessionRef.UID) != binding.SessionUID {
 			return fmt.Errorf("%w: workspace %s session identity does not match the immutable Session UID", errACPWorkspaceBindingConflict, workspace.Name)
 		}
-	} else {
-		owned := false
-		for _, owner := range workspace.OwnerReferences {
-			if owner.UID == task.UID {
-				owned = true
-				break
-			}
-		}
-		if workspace.Spec.SessionRef != nil || !owned {
-			return fmt.Errorf("%w: workspace %s is not owned by this Task", errACPWorkspaceBindingConflict, workspace.Name)
+		return nil
+	}
+	owned := false
+	for _, owner := range workspace.OwnerReferences {
+		if owner.UID == task.UID {
+			owned = true
+			break
 		}
 	}
+	if workspace.Spec.SessionRef != nil || !owned {
+		return fmt.Errorf("%w: workspace %s is not owned by this Task", errACPWorkspaceBindingConflict, workspace.Name)
+	}
+	return nil
+}
+
+// acpClassWorkspaceResumesFromSuspended reports whether a suspended, detached
+// workspace may admit new work through a DataOnly cold resume.
+func acpClassWorkspaceResumesFromSuspended(
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+	binding *ACPRuntimeWorkspaceBinding,
+) bool {
 	resumeProviderSupported := binding.Provider == corev1alpha1.WorkspaceProviderSubstrate ||
 		binding.Provider == corev1alpha1.WorkspaceProviderAgentSandbox
-	resumeFromSuspended := workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended &&
+	return workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended &&
 		workspace.Spec.Attachment == nil &&
 		resumeProviderSupported &&
 		binding.ReusePolicy == corev1alpha1.WorkspaceReusePolicySession &&
 		binding.Class.SuspendMode == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly)
-	if workspace.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredReady && !resumeFromSuspended {
-		return fmt.Errorf("%w: workspace %s desired state %q cannot admit new work", errACPWorkspaceBindingConflict, workspace.Name, workspace.Spec.DesiredState)
-	}
-	return nil
 }
 
 // validateACPWorkspaceSuspendedCap verifies a materialized cap when present.
