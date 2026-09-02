@@ -928,12 +928,20 @@ func (s *Store) GetFindingCounts(ctx context.Context, namespace, repositoryScan 
 func (s *Store) UpdateFindingState(ctx context.Context, namespace, id, state string) error {
 	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE security_findings
+		`WITH RECURSIVE canonical(id, duplicate_of) AS (
+			SELECT id, duplicate_of FROM security_findings WHERE namespace = ? AND id = ?
+			UNION ALL
+			SELECT finding.id, finding.duplicate_of
+			  FROM security_findings finding
+			  JOIN canonical parent ON finding.id = parent.duplicate_of
+			 WHERE finding.namespace = ?
+		)
+		UPDATE security_findings
 		 SET state = ?,
 		     decision_at = CASE WHEN ? IN ('dismissed', 'suppressed', 'false_positive') THEN ? ELSE NULL END,
 		     updated_at = ?
-		 WHERE namespace = ? AND id = ?`,
-		state, state, now, now, namespace, id,
+		 WHERE namespace = ? AND id = (SELECT id FROM canonical WHERE duplicate_of = '' LIMIT 1)`,
+		namespace, id, namespace, state, state, now, now, namespace,
 	)
 	if err != nil {
 		return err
@@ -987,14 +995,15 @@ func (s *Store) MarkFindingDuplicate(ctx context.Context, namespace, id, canonic
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var sourceRepo, canonicalRepo, canonicalDuplicate string
-	if err := tx.QueryRowContext(ctx, `SELECT repository_scan FROM security_findings WHERE namespace = ? AND id = ?`, namespace, id).Scan(&sourceRepo); err != nil {
+	var sourceRepo, sourceState, canonicalRepo, canonicalDuplicate, canonicalState string
+	var sourceDecision, canonicalDecision sql.NullTime
+	if err := tx.QueryRowContext(ctx, `SELECT repository_scan, state, decision_at FROM security_findings WHERE namespace = ? AND id = ?`, namespace, id).Scan(&sourceRepo, &sourceState, &sourceDecision); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return store.ErrNotFound
 		}
 		return err
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT repository_scan, duplicate_of FROM security_findings WHERE namespace = ? AND id = ?`, namespace, canonicalID).Scan(&canonicalRepo, &canonicalDuplicate); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT repository_scan, duplicate_of, state, decision_at FROM security_findings WHERE namespace = ? AND id = ?`, namespace, canonicalID).Scan(&canonicalRepo, &canonicalDuplicate, &canonicalState, &canonicalDecision); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return store.ErrNotFound
 		}
@@ -1002,6 +1011,15 @@ func (s *Store) MarkFindingDuplicate(ctx context.Context, namespace, id, canonic
 	}
 	if sourceRepo != canonicalRepo || canonicalDuplicate != "" {
 		return store.ValidationErrorf("duplicate and canonical findings must share a repository scan and the canonical finding cannot be an alias")
+	}
+	newerSourceDecision := sourceDecision.Valid && (!canonicalDecision.Valid || sourceDecision.Time.After(canonicalDecision.Time))
+	if findingUserFinalState(sourceState) && (!findingUserFinalState(canonicalState) || newerSourceDecision) {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE security_findings SET state = ?, decision_at = ?, updated_at = ? WHERE namespace = ? AND id = ?`,
+			sourceState, sourceDecision, time.Now().UTC(), namespace, canonicalID,
+		); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `WITH RECURSIVE descendants(id) AS (
 		SELECT id FROM security_findings

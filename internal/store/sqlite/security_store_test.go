@@ -945,6 +945,42 @@ func TestMarkFindingDuplicateExcludesAliasFromListsAndCounts(t *testing.T) {
 	}
 }
 
+func TestFindingAliasStateMutationsFollowCanonical(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	newFinding := func(suffix string) *store.Finding {
+		return &store.Finding{ID: "fnd-" + suffix, Namespace: "ns1", RepositoryScan: "repo1", ScanRunID: "scan-1", Fingerprint: "fingerprint-" + suffix, Title: "Finding " + suffix, Summary: "summary", Severity: "high", Confidence: "high", ValidationStatus: "validated", State: testStateOpen}
+	}
+	canonical := newFinding("canonical-state")
+	alias := newFinding("alias-state")
+	for _, finding := range []*store.Finding{canonical, alias} {
+		if err := s.UpsertFinding(ctx, finding); err != nil {
+			t.Fatalf("UpsertFinding(%s): %v", finding.ID, err)
+		}
+	}
+	if err := s.UpdateFindingState(ctx, alias.Namespace, alias.ID, "dismissed"); err != nil {
+		t.Fatalf("UpdateFindingState(alias dismissed): %v", err)
+	}
+	decidedAlias, err := s.GetFinding(ctx, alias.Namespace, alias.ID)
+	if err != nil || decidedAlias.DecisionAt.IsZero() {
+		t.Fatalf("GetFinding(decided alias) = %#v, err %v", decidedAlias, err)
+	}
+	if err := s.MarkFindingDuplicate(ctx, alias.Namespace, alias.ID, canonical.ID); err != nil {
+		t.Fatalf("MarkFindingDuplicate: %v", err)
+	}
+	storedCanonical, err := s.GetFinding(ctx, canonical.Namespace, canonical.ID)
+	if err != nil || storedCanonical.State != "dismissed" || !storedCanonical.DecisionAt.Equal(decidedAlias.DecisionAt) {
+		t.Fatalf("canonical after merge = %#v, err %v, want alias decision", storedCanonical, err)
+	}
+	if err := s.UpdateFindingState(ctx, alias.Namespace, alias.ID, "suppressed"); err != nil {
+		t.Fatalf("UpdateFindingState(alias suppressed): %v", err)
+	}
+	storedCanonical, err = s.GetFinding(ctx, canonical.Namespace, canonical.ID)
+	if err != nil || storedCanonical.State != "suppressed" || storedCanonical.DecisionAt.IsZero() {
+		t.Fatalf("canonical after alias update = %#v, err %v", storedCanonical, err)
+	}
+}
+
 func TestListPatchProposalsFollowsFlattenedFindingAliases(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
