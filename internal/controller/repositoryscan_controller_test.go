@@ -489,6 +489,22 @@ func bindReviewSliceContext(t *testing.T, slice *storepkg.ReviewSlice) security.
 	return manifest
 }
 
+func reviewedSliceWithContext(t *testing.T, repositoryScan, runID, sliceID string, paths ...string) *storepkg.ReviewSlice {
+	t.Helper()
+	reviewSlice := &storepkg.ReviewSlice{
+		ID:             sliceID,
+		Namespace:      defaultNS,
+		RepositoryScan: repositoryScan,
+		Status:         reviewSliceStatusReviewed,
+		LastScanRunID:  runID,
+	}
+	for _, path := range paths {
+		reviewSlice.OwnedFiles = append(reviewSlice.OwnedFiles, storepkg.ReviewSliceFile{Path: path})
+	}
+	bindReviewSliceContext(t, reviewSlice)
+	return reviewSlice
+}
+
 func saveFindingsTaskResult(
 	t *testing.T,
 	store *sqlitestore.Store,
@@ -5020,7 +5036,15 @@ func TestRefreshScanRunStatusResolvesUnseenFindingAfterRemediationPRMerged(t *te
 	if err := securityStore.CreateScanRun(ctx, run); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
-	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_api", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
+	reviewSlice := reviewedSliceWithContext(t, scan.Name, run.ID, "slice_api",
+		"fnd_merged.go",
+		"fnd_open_pr.go",
+		"fnd_observed.go",
+		"fnd_wrong_base.go",
+		"fnd_merge_after_scan.go",
+		"fnd_concurrent_decision.go",
+	)
+	if err := securityStore.UpsertReviewSlice(ctx, reviewSlice); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
 	}
 	targetKey := security.FindingV2TargetKey(scan.Spec.RepoURL, trustedFindingsBranch(scan), scan.Spec.SubPath)
@@ -5113,7 +5137,8 @@ func TestRefreshScanRunStatusUsesFrozenTaskTargetAfterSpecChanges(t *testing.T) 
 	if err := securityStore.CreateScanRun(ctx, run); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
-	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_api", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
+	reviewSlice := reviewedSliceWithContext(t, scan.Name, run.ID, "slice_api", "fnd_frozen_target.go", "fnd_current_spec.go")
+	if err := securityStore.UpsertReviewSlice(ctx, reviewSlice); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
 	}
 	for _, candidate := range []struct {
@@ -5125,7 +5150,7 @@ func TestRefreshScanRunStatusUsesFrozenTaskTargetAfterSpecChanges(t *testing.T) 
 		{id: "fnd_current_spec", pr: 43, targetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, "release", "services/new")},
 	} {
 		prNumber := candidate.pr
-		finding := &storepkg.Finding{ID: candidate.id, Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: "slice_api", Fingerprint: candidate.id, TargetKey: candidate.targetKey, Title: candidate.id, Summary: candidate.id, Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, PRNumber: &prNumber}
+		finding := &storepkg.Finding{ID: candidate.id, Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: "slice_api", Fingerprint: candidate.id, TargetKey: candidate.targetKey, Title: candidate.id, Summary: candidate.id, Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, FilePath: candidate.id + ".go", PRNumber: &prNumber}
 		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
 			t.Fatalf("UpsertFinding(%s) error = %v", candidate.id, err)
 		}
@@ -5195,7 +5220,8 @@ func TestRefreshScanRunStatusRetriesMergedPRLookup(t *testing.T) {
 	if err := securityStore.CreateScanRun(ctx, run); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
-	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_api", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
+	reviewSlice := reviewedSliceWithContext(t, scan.Name, run.ID, "slice_api", "api.go")
+	if err := securityStore.UpsertReviewSlice(ctx, reviewSlice); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
 	}
 	prNumber := 42
@@ -5265,7 +5291,8 @@ func TestRefreshScanRunStatusRetriesMergedResolutionAfterForgeCredentialReturns(
 	if err := securityStore.CreateScanRun(ctx, run); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
-	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_api", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
+	reviewSlice := reviewedSliceWithContext(t, scan.Name, run.ID, "slice_api", "api.go")
+	if err := securityStore.UpsertReviewSlice(ctx, reviewSlice); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
 	}
 	prNumber := 42
@@ -5315,11 +5342,12 @@ func TestResolveMergedFindingsRetriesForgeCredentialReadErrors(t *testing.T) {
 	}
 	run := &storepkg.ScanRun{ID: "scan_retry_secret", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 1}
 	securityStore := setupControllerSQLiteStore(t)
-	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_api", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
+	reviewSlice := reviewedSliceWithContext(t, scan.Name, run.ID, "slice_api", "api.go")
+	if err := securityStore.UpsertReviewSlice(ctx, reviewSlice); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
 	}
 	prNumber := 42
-	if err := securityStore.UpsertFinding(ctx, &storepkg.Finding{ID: "fnd_retry_secret", Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: "slice_api", Fingerprint: "fnd_retry_secret", TargetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, trustedFindingsBranch(scan), scan.Spec.SubPath), Title: "finding", Summary: "finding", Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, PRNumber: &prNumber}); err != nil {
+	if err := securityStore.UpsertFinding(ctx, &storepkg.Finding{ID: "fnd_retry_secret", Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: "slice_api", Fingerprint: "fnd_retry_secret", TargetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, trustedFindingsBranch(scan), scan.Spec.SubPath), Title: "finding", Summary: "finding", Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, FilePath: "api.go", PRNumber: &prNumber}); err != nil {
 		t.Fatalf("UpsertFinding() error = %v", err)
 	}
 	reconciler := &RepositoryScanReconciler{
@@ -5373,11 +5401,12 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 	legacyTask.Spec.Workspace = repositoryScanTaskWorkspace(scan, corev1alpha1.WorkspaceIntentRead)
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, legacyTask).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
-	run := &storepkg.ScanRun{ID: "scan_scoped", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: mode, Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 1, HeadCommit: testRepositoryScanHeadSHA}
+	run := &storepkg.ScanRun{ID: "scan_scoped", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: mode, Phase: scanRunPhaseSucceeded, HeadCommit: testRepositoryScanHeadSHA}
 	if err := securityStore.CreateScanRun(ctx, &storepkg.ScanRun{ID: "scan_old", Namespace: defaultNS, RepositoryScan: scan.Name, TaskName: legacyTask.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, StartedAt: time.Now()}); err != nil {
 		t.Fatalf("CreateScanRun(legacy) error = %v", err)
 	}
-	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_reviewed", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
+	reviewSlice := reviewedSliceWithContext(t, scan.Name, run.ID, "slice_reviewed", "reviewed.go", "legacy.go")
+	if err := securityStore.UpsertReviewSlice(ctx, reviewSlice); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
 	}
 	currentTargetKey := security.FindingV2TargetKey(scan.Spec.RepoURL, trustedFindingsBranch(scan), scan.Spec.SubPath)
@@ -5386,13 +5415,15 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 		sliceID   string
 		pr        int
 		targetKey string
+		filePath  string
 	}{
-		{id: "fnd_reviewed", sliceID: "slice_reviewed", pr: 42, targetKey: currentTargetKey},
-		{id: "fnd_unreviewed", sliceID: "slice_other", pr: 43, targetKey: currentTargetKey},
-		{id: "fnd_old_target", sliceID: "slice_reviewed", pr: 44, targetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, "release", scan.Spec.SubPath)},
+		{id: "fnd_reviewed", sliceID: "slice_reviewed", pr: 42, targetKey: currentTargetKey, filePath: "reviewed.go"},
+		{id: "fnd_unreviewed", sliceID: "slice_other", pr: 43, targetKey: currentTargetKey, filePath: "unreviewed.go"},
+		{id: "fnd_old_target", sliceID: "slice_reviewed", pr: 44, targetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, "release", scan.Spec.SubPath), filePath: "reviewed.go"},
+		{id: "fnd_uncovered", sliceID: "slice_reviewed", pr: 46, targetKey: currentTargetKey, filePath: "outside.go"},
 	} {
 		prNumber := candidate.pr
-		finding := &storepkg.Finding{ID: candidate.id, Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: candidate.sliceID, Fingerprint: candidate.id, TargetKey: candidate.targetKey, Title: candidate.id, Summary: candidate.id, Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, PRNumber: &prNumber}
+		finding := &storepkg.Finding{ID: candidate.id, Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: candidate.sliceID, Fingerprint: candidate.id, TargetKey: candidate.targetKey, Title: candidate.id, Summary: candidate.id, Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, FilePath: candidate.filePath, PRNumber: &prNumber}
 		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
 			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
 		}
@@ -5411,6 +5442,7 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 		Confidence:       "high",
 		ValidationStatus: findingValidationStatusValidated,
 		State:            findingStatePROpen,
+		FilePath:         "legacy.go",
 		PRNumber:         &legacyPRNumber,
 	}
 	legacyRepo := trustedFindingsRepository(scan, nil)
@@ -5435,9 +5467,10 @@ func testResolveMergedFindingsScopesRunToReviewedSlices(t *testing.T, mode strin
 	reviewed, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_reviewed")
 	unreviewed, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_unreviewed")
 	oldTarget, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_old_target")
+	uncovered, _ := securityStore.GetFinding(ctx, defaultNS, "fnd_uncovered")
 	legacyTarget, _ := securityStore.GetFinding(ctx, defaultNS, legacy.ID)
-	if reviewed.State != findingStateResolved || unreviewed.State != findingStatePROpen || oldTarget.State != findingStatePROpen || legacyTarget.State != findingStateResolved || requests[42] != 1 || requests[43] != 0 || requests[44] != 0 || requests[45] != 1 || compareRequests != 2 {
-		t.Fatalf("reviewed = %#v, unreviewed = %#v, old target = %#v, legacy target = %#v, requests = %#v, comparisons = %d", reviewed, unreviewed, oldTarget, legacyTarget, requests, compareRequests)
+	if reviewed.State != findingStateResolved || unreviewed.State != findingStatePROpen || oldTarget.State != findingStatePROpen || uncovered.State != findingStatePROpen || legacyTarget.State != findingStateResolved || requests[42] != 1 || requests[43] != 0 || requests[44] != 0 || requests[45] != 1 || requests[46] != 0 || compareRequests != 2 {
+		t.Fatalf("reviewed = %#v, unreviewed = %#v, old target = %#v, uncovered = %#v, legacy target = %#v, requests = %#v, comparisons = %d", reviewed, unreviewed, oldTarget, uncovered, legacyTarget, requests, compareRequests)
 	}
 }
 
@@ -5478,7 +5511,8 @@ func TestResolveMergedFindingsCollectsAllPagesBeforeMutation(t *testing.T) {
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	reconciler := &RepositoryScanReconciler{Client: kubeClient, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
 	run := &storepkg.ScanRun{ID: "scan_current", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 1, HeadCommit: testRepositoryScanHeadSHA}
-	if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: "slice_all", Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
+	reviewSlice := reviewedSliceWithContext(t, scan.Name, run.ID, "slice_all", "all.go")
+	if err := securityStore.UpsertReviewSlice(ctx, reviewSlice); err != nil {
 		t.Fatalf("UpsertReviewSlice() error = %v", err)
 	}
 	for i := range 201 {
@@ -5498,6 +5532,7 @@ func TestResolveMergedFindingsCollectsAllPagesBeforeMutation(t *testing.T) {
 			ValidationStatus: findingValidationStatusValidated,
 			State:            findingStatePROpen,
 			SliceID:          "slice_all",
+			FilePath:         "all.go",
 			PRNumber:         &prNumber,
 		}
 		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
@@ -5566,8 +5601,8 @@ func TestResolveMergedFindingsSkipsSlicesWithDroppedResults(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, SecurityStore: securityStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
 	run := &storepkg.ScanRun{ID: "scan_dropped", Namespace: defaultNS, RepositoryScan: scan.Name, Mode: "initial", Phase: scanRunPhaseSucceeded, ReviewedSliceCount: 2, HeadCommit: testRepositoryScanHeadSHA}
-	for _, sliceID := range []string{"slice_dropped", "slice_clean"} {
-		if err := securityStore.UpsertReviewSlice(ctx, &storepkg.ReviewSlice{ID: sliceID, Namespace: defaultNS, RepositoryScan: scan.Name, Status: reviewSliceStatusReviewed, LastScanRunID: run.ID}); err != nil {
+	for sliceID, path := range map[string]string{"slice_dropped": "fnd_dropped_slice.go", "slice_clean": "fnd_clean_slice.go"} {
+		if err := securityStore.UpsertReviewSlice(ctx, reviewedSliceWithContext(t, scan.Name, run.ID, sliceID, path)); err != nil {
 			t.Fatalf("UpsertReviewSlice(%s) error = %v", sliceID, err)
 		}
 	}
@@ -5580,7 +5615,7 @@ func TestResolveMergedFindingsSkipsSlicesWithDroppedResults(t *testing.T) {
 		{id: "fnd_clean_slice", sliceID: "slice_clean", pr: 43},
 	} {
 		prNumber := candidate.pr
-		finding := &storepkg.Finding{ID: candidate.id, Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: candidate.sliceID, Fingerprint: candidate.id, TargetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, trustedFindingsBranch(scan), scan.Spec.SubPath), Title: candidate.id, Summary: candidate.id, Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, PRNumber: &prNumber}
+		finding := &storepkg.Finding{ID: candidate.id, Namespace: defaultNS, RepositoryScan: scan.Name, ScanRunID: "scan_old", SliceID: candidate.sliceID, Fingerprint: candidate.id, TargetKey: security.FindingV2TargetKey(scan.Spec.RepoURL, trustedFindingsBranch(scan), scan.Spec.SubPath), Title: candidate.id, Summary: candidate.id, Severity: "high", Confidence: "high", ValidationStatus: findingValidationStatusValidated, State: findingStatePROpen, FilePath: candidate.id + ".go", PRNumber: &prNumber}
 		if err := securityStore.UpsertFinding(ctx, finding); err != nil {
 			t.Fatalf("UpsertFinding(%s) error = %v", finding.ID, err)
 		}
