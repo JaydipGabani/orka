@@ -1760,6 +1760,7 @@ func TestCreateSecurityPatchTaskRequestsGovernedPublication(t *testing.T) {
 	finding := &store.Finding{
 		ID:         "fnd_123",
 		Namespace:  "demo",
+		ScanRunID:  "scan-run-123",
 		Title:      "Command injection",
 		Severity:   "high",
 		Confidence: "high",
@@ -1776,6 +1777,7 @@ func TestCreateSecurityPatchTaskRequestsGovernedPublication(t *testing.T) {
 	require.Len(t, tasks.Items, 1)
 	task := tasks.Items[0]
 	require.Equal(t, proposal.TaskName, task.Name)
+	require.Equal(t, finding.ScanRunID, task.Labels[labels.LabelSecurityScanID])
 	require.Equal(t, corev1alpha1.TaskTypeAgent, task.Spec.Type)
 	require.Equal(t, "patch", task.Spec.AgentRef.Name)
 	require.Empty(t, task.Spec.Env)

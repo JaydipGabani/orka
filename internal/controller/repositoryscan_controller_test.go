@@ -3205,6 +3205,7 @@ func patchTaskForFixture(fixture patchIngestFixture, resultAvailable bool) *core
 			UID:       types.UID("uid-" + fixture.proposal.TaskName),
 			Labels: map[string]string{
 				labels.LabelSecurityTarget:    fixture.scan.Name,
+				labels.LabelSecurityScanID:    fixture.finding.ScanRunID,
 				labels.LabelSecurityFindingID: fixture.finding.ID,
 				labels.LabelSecurityStage:     security.StagePatch,
 				labels.LabelSecurityMode:      security.StagePatch,
@@ -3400,6 +3401,50 @@ func TestIngestPatchTaskDoesNotReopenResolvedFinding(t *testing.T) {
 		t.Fatalf("ingestPatchTask() second pass error = %v", err)
 	}
 	assertPatchIngestState(t, fixture, patchProposalStatusPROpened, findingStateResolved)
+}
+
+func TestIngestPatchTaskDoesNotProjectPriorOccurrenceOntoReopenedFinding(t *testing.T) {
+	ctx := context.Background()
+	var seenToken string
+	fixture := patchFixtureWithForgeSecret(t, "reopened-occurrence", newPatchCommitServer(t, []repositoryScanCommitFileResponse{{Filename: "app.py", Status: "modified", Additions: 1, Deletions: 1, Patch: "@@ -1 +1 @@\n-unsafe()\n+safe()"}}, &seenToken), true)
+	savePatchStructuredResult(t, fixture, &common.StructuredResult{
+		Summary:    "patched successfully",
+		Diff:       testPatchFullDiff,
+		Files:      []string{"app.py"},
+		PushBranch: fixture.proposal.Branch,
+	})
+	savePatchArtifacts(t, fixture, testPatchFullDiff, []string{"app.py"})
+	task := patchTaskForFixture(fixture, true)
+
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, task); err != nil {
+		t.Fatalf("ingestPatchTask() first pass error = %v", err)
+	}
+	if err := fixture.store.UpdateFindingState(ctx, fixture.finding.Namespace, fixture.finding.ID, findingStateResolved); err != nil {
+		t.Fatalf("UpdateFindingState(resolved) error = %v", err)
+	}
+	reopened, err := fixture.store.GetFinding(ctx, fixture.finding.Namespace, fixture.finding.ID)
+	if err != nil {
+		t.Fatalf("GetFinding() error = %v", err)
+	}
+	reopened.ScanRunID = "scan_recurrence"
+	reopened.State = findingStateOpen
+	reopened.PatchProposalID = ""
+	reopened.PRNumber = nil
+	reopened.PRURL = ""
+	if err := fixture.store.UpsertObservedFinding(ctx, reopened); err != nil {
+		t.Fatalf("UpsertObservedFinding() error = %v", err)
+	}
+
+	if err := fixture.reconciler.ingestPatchTask(ctx, fixture.scan, task); err != nil {
+		t.Fatalf("ingestPatchTask() second pass error = %v", err)
+	}
+	stored, err := fixture.store.GetFinding(ctx, fixture.finding.Namespace, fixture.finding.ID)
+	if err != nil {
+		t.Fatalf("GetFinding(reopened) error = %v", err)
+	}
+	if stored.State != findingStateOpen || stored.PatchProposalID != "" || stored.PRNumber != nil || stored.PRURL != "" {
+		t.Fatalf("reopened finding = %#v, want no prior patch projection", stored)
+	}
 }
 
 func TestIngestPatchTaskAcceptsDiffArtifactWithDifferentIndexFormatting(t *testing.T) {

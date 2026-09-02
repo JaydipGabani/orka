@@ -424,7 +424,7 @@ func (h *Handlers) createSecurityPatchTask(ctx context.Context, ui *UserInfo, sc
 				labels.LabelManaged:           "true",
 				labels.LabelCreatedBy:         "repository-security",
 				labels.LabelSecurityTarget:    labels.SelectorValue(scan.Name),
-				labels.LabelSecurityScanID:    proposalID,
+				labels.LabelSecurityScanID:    finding.ScanRunID,
 				labels.LabelSecurityMode:      "patch",
 				labels.LabelSecurityStage:     security.StagePatch,
 				labels.LabelSecurityFindingID: finding.ID,

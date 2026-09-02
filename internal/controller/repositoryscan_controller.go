@@ -3915,6 +3915,20 @@ func (r *RepositoryScanReconciler) ingestPatchTask(ctx context.Context, scan *co
 		return nil
 	}
 
+	finding, err := r.SecurityStore.GetFinding(ctx, scan.Namespace, findingID)
+	if err != nil {
+		return err
+	}
+	if finding.DuplicateOf != "" {
+		finding, err = r.SecurityStore.GetFinding(ctx, scan.Namespace, finding.DuplicateOf)
+		if err != nil {
+			return err
+		}
+	}
+	if !patchTaskMatchesCurrentFindingOccurrence(task, proposal, finding) {
+		return nil
+	}
+
 	proposal.Status = taskPhaseToSecurityPhase(task.Status.Phase)
 	requestedBranch := ""
 	if task.Spec.Workspace != nil {
@@ -3955,16 +3969,6 @@ func (r *RepositoryScanReconciler) ingestPatchTask(ctx context.Context, scan *co
 		}
 	}
 
-	finding, err := r.SecurityStore.GetFinding(ctx, scan.Namespace, findingID)
-	if err != nil {
-		return err
-	}
-	if finding.DuplicateOf != "" {
-		finding, err = r.SecurityStore.GetFinding(ctx, scan.Namespace, finding.DuplicateOf)
-		if err != nil {
-			return err
-		}
-	}
 	finding.PatchProposalID = proposal.ID
 	switch proposal.Status {
 	case patchProposalStatusPROpened:
@@ -3979,6 +3983,20 @@ func (r *RepositoryScanReconciler) ingestPatchTask(ctx context.Context, scan *co
 		finding.State = findingStateOpen
 	}
 	return r.SecurityStore.UpsertFinding(ctx, finding)
+}
+
+func patchTaskMatchesCurrentFindingOccurrence(task *corev1alpha1.Task, proposal *store.PatchProposal, finding *store.Finding) bool {
+	if task == nil || proposal == nil || finding == nil {
+		return false
+	}
+	// Older patch Tasks stored the proposal ID in the scan-ID label. Keep an
+	// explicitly current proposal replayable, but require occurrence identity
+	// before adopting a proposal onto a finding with no current patch work.
+	if currentProposalID := strings.TrimSpace(finding.PatchProposalID); currentProposalID != "" {
+		return currentProposalID == proposal.ID
+	}
+	taskScanRunID := strings.TrimSpace(task.Labels[labels.LabelSecurityScanID])
+	return taskScanRunID != "" && taskScanRunID == strings.TrimSpace(finding.ScanRunID)
 }
 
 func (r *RepositoryScanReconciler) updateStatusWithRetry(ctx context.Context, scan *corev1alpha1.RepositoryScan, mutate func(*corev1alpha1.RepositoryScan)) error {
