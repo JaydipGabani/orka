@@ -1170,16 +1170,12 @@ func TestToolReconcilerMCPSubstrateActorUsesPoolRef(t *testing.T) {
 		t.Fatalf("lease annotations = %#v, want held by mcp-tool", gotLease.Annotations)
 	}
 
-	taskReconciler := &TaskReconciler{Client: r.Client}
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: defaultNS, UID: "task-uid"},
-	}
-	reserved, err := taskReconciler.tryReserveSubstratePoolActor(context.Background(), task, defaultNS, executor.claimName)
+	busy, err := substratePoolActorLeaseHasActiveHolder(context.Background(), r.Client, &gotLease)
 	if err != nil {
-		t.Fatalf("tryReserveSubstratePoolActor() error = %v", err)
+		t.Fatalf("substratePoolActorLeaseHasActiveHolder() error = %v", err)
 	}
-	if reserved {
-		t.Fatal("task reserved MCP tool-held pool actor, want busy")
+	if !busy {
+		t.Fatal("MCP tool-held pool actor lease reported idle, want busy")
 	}
 }
 

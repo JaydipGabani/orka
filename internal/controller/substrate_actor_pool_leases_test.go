@@ -17,45 +17,11 @@ import (
 	"github.com/orka-agents/orka/internal/labels"
 )
 
-func TestSubstratePoolActorLeaseTaskHolderKeepsToolAnnotations(t *testing.T) {
+func TestSubstrateMCPPoolActorLeaseToolHolder(t *testing.T) {
 	lease := &coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "ns",
 			Name:      "actor-00000",
-			Annotations: map[string]string{
-				substratePoolActorLeaseToolNSAnno:   "tool-ns",
-				substratePoolActorLeaseToolNameAnno: "tool-name",
-				substratePoolActorLeaseToolUIDAnno:  "tool-uid",
-			},
-		},
-	}
-	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "task", UID: types.UID("task-uid")}}
-
-	setSubstratePoolActorLeaseHolder(lease, task, "actor-00000")
-
-	if lease.Labels[labels.LabelPurpose] != substratePoolActorLeasePurpose {
-		t.Fatalf("purpose label = %q, want %q", lease.Labels[labels.LabelPurpose], substratePoolActorLeasePurpose)
-	}
-	if !substratePoolActorLeaseHeldByTask(lease, task) {
-		t.Fatalf("lease should be held by task")
-	}
-	if lease.Annotations[substratePoolActorLeaseToolNSAnno] != "tool-ns" ||
-		lease.Annotations[substratePoolActorLeaseToolNameAnno] != "tool-name" ||
-		lease.Annotations[substratePoolActorLeaseToolUIDAnno] != "tool-uid" {
-		t.Fatalf("task holder update should preserve existing tool annotations, got %#v", lease.Annotations)
-	}
-}
-
-func TestSubstrateMCPPoolActorLeaseToolHolderClearsTaskAnnotations(t *testing.T) {
-	lease := &coordinationv1.Lease{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "ns",
-			Name:      "actor-00000",
-			Annotations: map[string]string{
-				substratePoolActorLeaseTaskNSAnno:   "task-ns",
-				substratePoolActorLeaseTaskNameAnno: "task-name",
-				substratePoolActorLeaseTaskUIDAnno:  "task-uid",
-			},
 		},
 	}
 	tool := &corev1alpha1.Tool{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "tool", UID: types.UID("tool-uid")}}
@@ -65,17 +31,11 @@ func TestSubstrateMCPPoolActorLeaseToolHolderClearsTaskAnnotations(t *testing.T)
 	if lease.Labels[labels.LabelPurpose] != substratePoolActorLeasePurpose {
 		t.Fatalf("purpose label = %q, want %q", lease.Labels[labels.LabelPurpose], substratePoolActorLeasePurpose)
 	}
+	if lease.Labels[substratePoolActorLeaseHolderUIDLabel] != "tool-uid" {
+		t.Fatalf("holder uid label = %q, want tool-uid", lease.Labels[substratePoolActorLeaseHolderUIDLabel])
+	}
 	if !substratePoolActorLeaseHeldByTool(lease, tool) {
 		t.Fatalf("lease should be held by tool")
-	}
-	if _, ok := lease.Annotations[substratePoolActorLeaseTaskNSAnno]; ok {
-		t.Fatalf("tool holder update should clear task namespace annotation")
-	}
-	if _, ok := lease.Annotations[substratePoolActorLeaseTaskNameAnno]; ok {
-		t.Fatalf("tool holder update should clear task name annotation")
-	}
-	if _, ok := lease.Annotations[substratePoolActorLeaseTaskUIDAnno]; ok {
-		t.Fatalf("tool holder update should clear task uid annotation")
 	}
 }
 
