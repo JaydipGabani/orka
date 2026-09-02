@@ -3498,6 +3498,10 @@ func (r *RepositoryScanReconciler) ingestValidationTask(ctx context.Context, sca
 		}
 		return err
 	}
+	taskScanRunID := strings.TrimSpace(task.Labels[labels.LabelSecurityScanID])
+	if taskScanRunID != "" && taskScanRunID != strings.TrimSpace(finding.ScanRunID) {
+		return nil
+	}
 
 	if task.Status.Phase == corev1alpha1.TaskPhaseSucceeded {
 		validationProblem := ""

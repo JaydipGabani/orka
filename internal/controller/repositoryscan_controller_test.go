@@ -2782,6 +2782,52 @@ func TestIngestValidationTaskUpdatesFindingValidationDetails(t *testing.T) {
 	}
 }
 
+func TestIngestValidationTaskIgnoresPriorFindingOccurrence(t *testing.T) {
+	for _, phase := range []corev1alpha1.TaskPhase{corev1alpha1.TaskPhaseSucceeded, corev1alpha1.TaskPhaseFailed} {
+		t.Run(string(phase), func(t *testing.T) {
+			ctx := context.Background()
+			securityStore := setupControllerSQLiteStore(t)
+			reconciler := &RepositoryScanReconciler{SecurityStore: securityStore}
+			scan := &corev1alpha1.RepositoryScan{ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS}}
+			finding := &storepkg.Finding{
+				ID:               "fnd_reopened_validation",
+				Namespace:        defaultNS,
+				RepositoryScan:   scan.Name,
+				ScanRunID:        "scan_current",
+				Fingerprint:      "reopened-validation",
+				Title:            "Reopened finding",
+				Severity:         "high",
+				Confidence:       "high",
+				ValidationStatus: "unvalidated",
+				State:            findingStateOpen,
+			}
+			if err := securityStore.UpsertFinding(ctx, finding); err != nil {
+				t.Fatalf("UpsertFinding() error = %v", err)
+			}
+			task := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "kaset-validation-prior-occurrence",
+					Namespace: defaultNS,
+					Labels: map[string]string{
+						labels.LabelSecurityScanID:    "scan_old",
+						labels.LabelSecurityFindingID: finding.ID,
+						labels.LabelSecurityStage:     security.StageValidation,
+					},
+				},
+				Status: corev1alpha1.TaskStatus{Phase: phase},
+			}
+
+			if err := reconciler.ingestValidationTask(ctx, scan, task); err != nil {
+				t.Fatalf("ingestValidationTask() error = %v", err)
+			}
+			stored, err := securityStore.GetFinding(ctx, defaultNS, finding.ID)
+			if err != nil || stored.ValidationStatus != "unvalidated" || stored.ValidationJSON != "" {
+				t.Fatalf("finding = %#v, err %v, want current occurrence unchanged", stored, err)
+			}
+		})
+	}
+}
+
 func TestIngestValidationTaskRedirectsDuplicateResultToCanonicalFinding(t *testing.T) {
 	ctx := context.Background()
 	securityStore := setupControllerSQLiteStore(t)

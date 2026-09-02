@@ -255,6 +255,11 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 	if reason := repositoryMonitorUpdateBranchMutationMismatch(mutation, command, pr); reason != "" {
 		return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, reason)
 	}
+	if mutation.Status == repositoryMonitorRunPhaseSucceeded {
+		projectedPR := pr
+		projectedPR.BaseSHA = mutation.ExternalID
+		return true, 0, r.completeRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, projectedPR)
+	}
 	containsBase, err := r.repositoryMonitorRepoHeadContainsBase(ctx, monitor, owner+"/"+repository, pr.BaseSHA, pr.HeadSHA)
 	if err != nil {
 		return true, 0, err
@@ -263,8 +268,6 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 		return true, 0, r.completeRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, pr)
 	}
 	switch mutation.Status {
-	case repositoryMonitorRunPhaseSucceeded:
-		return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "updated PR head no longer contains the live base revision")
 	case repositoryMonitorRunPhaseFailed:
 		return true, 0, r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusFailed, repositoryMonitorRepairPhaseFailed, "", mutation.Error)
 	case repositoryMonitorAutomergeStatePending:
@@ -465,6 +468,16 @@ func (r *RepositoryMonitorReconciler) reconcileRepositoryMonitorCompletedUpdateB
 			return false, itemErr
 		}
 		return true, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, reason)
+	}
+	if mutation.Status == repositoryMonitorRunPhaseSucceeded {
+		existing, itemErr := r.Store.GetMonitorItem(ctx, monitor.Namespace, monitor.Name, repositoryMonitorPullRequestKind, fmt.Sprintf("%d", current.Number))
+		if itemErr != nil {
+			return true, itemErr
+		}
+		projectedPR := *current
+		projectedPR.BaseSHA = mutation.ExternalID
+		item := repositoryMonitorItemFromPullRequest(monitor, projectedPR, existing)
+		return true, r.completeRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, projectedPR)
 	}
 	owner, repository, err := repositoryMonitorOwnerRepository(monitor)
 	if err != nil {
