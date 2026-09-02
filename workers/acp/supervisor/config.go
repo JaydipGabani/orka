@@ -49,10 +49,11 @@ type ProviderSessionProjection struct {
 // supervisor anchors it on prompt state it can prove, so a model chunk that
 // merely repeats a diagnostic sentence is forwarded:
 //
-//   - Startup diagnostics are withheld only until the provider proxy has
-//     begun relaying the prompt's first non-error inference response. Model
-//     output can only be derived from those bytes, while the CLI emits its
-//     startup diagnostics ahead of its first inference request.
+//   - Startup diagnostics are withheld only when the supervisor received
+//     them before the provider proxy began relaying the prompt's first
+//     non-error inference response. Model output can only be derived from
+//     those bytes, while the CLI emits its startup diagnostics ahead of its
+//     first inference request.
 //   - InferenceRetry notices are withheld only while the provider proxy has
 //     recorded more failed inference requests for the prompt than notices
 //     already withheld. The proxy accounts every failure before relaying

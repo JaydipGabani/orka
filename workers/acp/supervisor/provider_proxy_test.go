@@ -967,8 +967,8 @@ func TestProviderProxyStreamTerminalErrorIsAccountedBeforeDelivery(t *testing.T)
 		UpstreamBaseURL: upstream.URL, UpstreamBearerToken: testUpstreamToken,
 	})
 	defer session.close()
-	if session.inferenceResponseStarted(testPromptOneID) {
-		t.Fatal("inference response reported as started before any request")
+	if session.modelOutputPossibleAt(testPromptOneID, time.Now().UTC()) {
+		t.Fatal("model output reported as possible before any request")
 	}
 
 	response := doProviderProxyRequest(
@@ -979,8 +979,8 @@ func TestProviderProxyStreamTerminalErrorIsAccountedBeforeDelivery(t *testing.T)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("stream status = %d", response.StatusCode)
 	}
-	if !session.inferenceResponseStarted(testPromptOneID) {
-		t.Fatal("inference response not reported as started once headers were relayed")
+	if !session.modelOutputPossibleAt(testPromptOneID, time.Now().UTC()) {
+		t.Fatal("model output not reported as possible once headers were relayed")
 	}
 	reader := bufio.NewReader(response.Body)
 	var delivered strings.Builder
@@ -1011,6 +1011,65 @@ func TestProviderProxyStreamTerminalErrorIsAccountedBeforeDelivery(t *testing.T)
 	if successes := session.inferenceSuccesses; successes != 0 {
 		t.Fatalf("inference successes after a terminal error = %d, want 0", successes)
 	}
+}
+
+// The failure must be accounted before the byte that completes the terminal
+// error line is written: an SSE client cannot dispatch the event without it,
+// so nothing the child can observe precedes the accounting, even when the
+// downstream writer exposes bytes before the explicit flush.
+func TestProviderProxyStreamTerminalErrorIsAccountedBeforeItsLineCompletes(t *testing.T) {
+	proxy, session, _ := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: testUnreachableUpstreamURL, UpstreamBearerToken: testUpstreamToken,
+	})
+	defer session.close()
+	seq := testAllocateInferenceSeq(session)
+	if err := session.consumeInferenceRequest(testPromptOneID, providerRequestInference, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	const head = "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\",\"error\":\"quota\"}"
+	const tail = "\n\ndata: trailing\n\n"
+	writer := &accountingObserverWriter{header: http.Header{}, session: session}
+	proxy.relayUpstreamResponse(context.Background(), writer, session, testPromptOneID, providerRequestInference, seq, &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(head + tail)),
+	})
+	if len(writer.writes) != 2 {
+		t.Fatalf("downstream writes = %d, want the chunk split around the completing newline: %+v", len(writer.writes), writer.writes)
+	}
+	if writer.writes[0].bytes != head || writer.writes[0].failures != 0 {
+		t.Fatalf("first write = %q with %d failures already accounted, want the bytes before the completing newline and 0", writer.writes[0].bytes, writer.writes[0].failures)
+	}
+	if writer.writes[1].bytes != tail || writer.writes[1].failures != 1 {
+		t.Fatalf("second write = %q with %d failures accounted, want the remainder and 1", writer.writes[1].bytes, writer.writes[1].failures)
+	}
+	if failures := session.inferenceFailureCount(testPromptOneID); failures != 1 {
+		t.Fatalf("inference failures after the stream = %d, want exactly 1", failures)
+	}
+	if _, _, detail := session.upstreamFailureUnrecovered(testPromptOneID); detail != "provider stream reported a terminal error: quota" {
+		t.Fatalf("terminal error detail = %q", detail)
+	}
+}
+
+type observedWrite struct {
+	bytes    string
+	failures int
+}
+
+// accountingObserverWriter records, for every downstream write, how many
+// inference failures the session had accounted at the moment the bytes were
+// handed over.
+type accountingObserverWriter struct {
+	header  http.Header
+	session *providerProxySession
+	writes  []observedWrite
+}
+
+func (w *accountingObserverWriter) Header() http.Header { return w.header }
+func (w *accountingObserverWriter) WriteHeader(int)     {}
+func (w *accountingObserverWriter) Write(p []byte) (int, error) {
+	w.writes = append(w.writes, observedWrite{bytes: string(p), failures: w.session.inferenceFailureCount(testPromptOneID)})
+	return len(p), nil
 }
 
 func TestProviderProxyIncompleteStreamIsAccountedAsFailure(t *testing.T) {
@@ -1505,6 +1564,18 @@ func TestProviderProxyChildDisconnectAccountsOnlyDeliveredStreamBytes(t *testing
 			name:          "terminal error is delivered before disconnect",
 			delivered:     "data: {\"type\":\"response.failed\",\"error\":\"quota\"}\n\n",
 			undelivered:   "data: trailing\n\n",
+			wantFailure:   true,
+			wantDetail:    "provider stream reported a terminal error: quota",
+			wantSuccesses: 0,
+			wantFailures:  2,
+		},
+		{
+			// The child took the whole error line except its completing
+			// newline: the delivered bytes still settle as that terminal
+			// error at stream end, exactly once.
+			name:          "terminal error line is delivered without its newline",
+			delivered:     "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\",\"error\":\"quota\"}",
+			undelivered:   "\n\n",
 			wantFailure:   true,
 			wantDetail:    "provider stream reported a terminal error: quota",
 			wantSuccesses: 0,

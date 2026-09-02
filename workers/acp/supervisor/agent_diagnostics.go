@@ -41,8 +41,8 @@ const (
 // Anchoring on the session's own exclusion list means a chunk about some
 // other tool is never recognized. The CLI forwards model deltas verbatim and
 // without a messageId, so the supervisor additionally withholds startup
-// diagnostics only until the provider proxy has begun relaying the prompt's
-// first inference response.
+// diagnostics only when they were received before the provider proxy began
+// relaying the prompt's first inference response.
 func copilotStartupDiagnostic(excludedTools []string) func(string) bool {
 	excluded := make(map[string]struct{}, len(excludedTools))
 	for _, name := range excludedTools {
@@ -120,11 +120,14 @@ func withholdAgentDiagnostic(state *sessionState, prompt *promptState, event acp
 	}
 	promptID := prompt.request.Metadata.PromptID
 	switch {
+	// The event timestamp is stamped when the supervisor received the
+	// chunk from the child, so a startup diagnostic queued behind a slow
+	// consumer keeps the phase it was emitted in.
 	case filter.Startup != nil && filter.Startup(text) &&
-		!state.providerProxy.inferenceResponseStarted(string(promptID)):
+		!state.providerProxy.modelOutputPossibleAt(string(promptID), event.Timestamp):
 		slog.Info(
 			"ACP provider CLI startup diagnostic withheld from the agent message stream",
-			"promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
+			"runtimeSession", state.id, "promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
 		)
 		return true
 	case filter.InferenceRetry != nil && filter.InferenceRetry(text) &&
@@ -132,7 +135,7 @@ func withholdAgentDiagnostic(state *sessionState, prompt *promptState, event acp
 		prompt.withheldRetryNotices++
 		slog.Info(
 			"ACP provider CLI inference retry notice withheld from the agent message stream",
-			"promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
+			"runtimeSession", state.id, "promptID", promptID, "sequence", event.Sequence, "diagnostic", text,
 		)
 		return true
 	}

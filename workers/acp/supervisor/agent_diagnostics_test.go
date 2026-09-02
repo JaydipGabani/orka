@@ -79,14 +79,14 @@ func TestWithholdAgentDiagnosticKeepsModelTextIntact(t *testing.T) {
 	t.Cleanup(compactor.close)
 	now := time.Now().UTC()
 	proxy := &providerProxySession{turnPromptID: "prompt-1"}
-	state := &sessionState{agentDiagnosticFilter: filter, providerProxy: proxy}
+	state := &sessionState{id: "session-1", agentDiagnosticFilter: filter, providerProxy: proxy}
 	prompt := testDiagnosticPromptState()
 
 	var texts []string
 	sequence := int64(0)
-	push := func(text string) {
+	push := func(text string, receivedAt time.Time) {
 		sequence++
-		event := testAssistantMessagePromptEvent(t, sequence, now, text)
+		event := testAssistantMessagePromptEvent(t, sequence, receivedAt, text)
 		if withholdAgentDiagnostic(state, prompt, event) {
 			return
 		}
@@ -99,15 +99,14 @@ func TestWithholdAgentDiagnosticKeepsModelTextIntact(t *testing.T) {
 	// request fails in-stream and is retried; the retried response then
 	// streams a model answer that repeats both diagnostic sentences
 	// verbatim, the first of them as the very first delta.
-	push(copilotObservedStartupDiagnostics[0])
-	proxy.inferenceResponsesStarted = 1
+	push(copilotObservedStartupDiagnostics[0], now)
+	proxy.firstInferenceResponseStartedAt = now.Add(time.Millisecond)
 	proxy.inferenceFailures = 1
-	push(copilotObservedRetryNotice)
-	proxy.inferenceResponsesStarted = 2
-	push(copilotObservedStartupDiagnostics[0])
-	push("PO")
-	push("NG")
-	push(copilotObservedRetryNotice)
+	push(copilotObservedRetryNotice, now.Add(2*time.Millisecond))
+	push(copilotObservedStartupDiagnostics[0], now.Add(3*time.Millisecond))
+	push("PO", now.Add(4*time.Millisecond))
+	push("NG", now.Add(5*time.Millisecond))
+	push(copilotObservedRetryNotice, now.Add(6*time.Millisecond))
 	for _, ready := range compactor.flushPending() {
 		text, _ := assistantMessageText(ready)
 		texts = append(texts, text)
@@ -139,21 +138,27 @@ func TestWithholdAgentDiagnosticAnchorsOnProviderProxyState(t *testing.T) {
 		t.Fatal("session without a diagnostic filter withheld a chunk")
 	}
 
-	// A startup diagnostic is withheld until the prompt's first non-error
-	// inference response begins relaying; after that an identical chunk is
-	// model output. Non-text updates are never withheld.
-	state := &sessionState{agentDiagnosticFilter: filter, providerProxy: &providerProxySession{turnPromptID: "prompt-1"}}
+	// A startup diagnostic is withheld when it was received before the
+	// prompt's first non-error inference response began relaying, even if
+	// it is consumed only after the proxy moved on; an identical chunk
+	// received after that instant is model output. Non-text updates are
+	// never withheld.
+	state := &sessionState{id: "session-1", agentDiagnosticFilter: filter, providerProxy: &providerProxySession{turnPromptID: "prompt-1"}}
 	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
 		t.Fatal("startup diagnostic was forwarded before any inference response")
 	}
 	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), toolCall) {
 		t.Fatal("tool_call update was withheld as a diagnostic")
 	}
-	state.providerProxy = &providerProxySession{turnPromptID: "prompt-1", inferenceResponsesStarted: 1}
-	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
-		t.Fatal("startup diagnostic text was withheld after an inference response started")
+	state.providerProxy = &providerProxySession{turnPromptID: "prompt-1", firstInferenceResponseStartedAt: now.Add(time.Millisecond)}
+	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
+		t.Fatal("startup diagnostic received before the first inference response was forwarded once consumed late")
 	}
-	state.providerProxy = &providerProxySession{turnPromptID: "other-prompt", inferenceResponsesStarted: 1}
+	state.providerProxy = &providerProxySession{turnPromptID: "prompt-1", firstInferenceResponseStartedAt: now.Add(-time.Millisecond)}
+	if withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
+		t.Fatal("startup diagnostic text received after an inference response started was withheld")
+	}
+	state.providerProxy = &providerProxySession{turnPromptID: "other-prompt", firstInferenceResponseStartedAt: now.Add(-time.Millisecond)}
 	if !withholdAgentDiagnostic(state, testDiagnosticPromptState(), startup) {
 		t.Fatal("another prompt's inference response unblocked a startup diagnostic")
 	}
