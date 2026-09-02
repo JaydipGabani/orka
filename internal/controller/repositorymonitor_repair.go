@@ -222,10 +222,6 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 	pr repositoryMonitorPullRequest,
 	item *store.MonitorItem,
 ) (bool, int, error) {
-	token, err := r.repositoryMonitorForgeToken(ctx, monitor)
-	if err != nil {
-		return true, 0, err
-	}
 	mutationID := repositoryMonitorUpdateBranchMutationID(command.ID)
 	mutation, err := r.Store.GetGitHubMutationRecord(ctx, monitor.Namespace, mutationID)
 	if errorsIsStoreNotFound(err) {
@@ -288,6 +284,15 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 		if err != nil || cancelled {
 			return true, 0, err
 		}
+	default:
+		return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "update-branch mutation has an invalid state")
+	}
+
+	token, err := r.repositoryMonitorForgeToken(ctx, monitor)
+	if err != nil {
+		return true, 0, err
+	}
+	if mutation.Status == repositoryMonitorAutomergeStateStarted {
 		submittingAt := time.Now()
 		mutation.Status = repositoryMonitorUpdateBranchSubmitting
 		mutation.PendingAt = &submittingAt
@@ -296,15 +301,13 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 		if err := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); err != nil {
 			return true, 0, pendingMutationProjectionError("mutation submission", err)
 		}
-		cancelled, err = r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
+		cancelled, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
 		if err != nil {
 			return true, 0, err
 		}
 		if cancelled {
 			return r.waitForRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, pr, repositoryMonitorUpdateBranchSubmitting)
 		}
-	default:
-		return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, "update-branch mutation has an invalid state")
 	}
 
 	requestID, err := r.updateRepositoryMonitorPullRequestBranch(ctx, owner, repository, token, pr.Number, command.HeadSHA)

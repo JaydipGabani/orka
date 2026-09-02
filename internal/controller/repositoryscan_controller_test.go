@@ -4164,18 +4164,21 @@ func TestMergeExistingFindingKeepsDifferentScanTargetsIndependent(t *testing.T) 
 func TestMergeExistingFindingReconcilesLegacyTargetKeyFromFrozenRunTarget(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
+		repoURL       string
 		currentBranch string
 		wantMerged    bool
 	}{
-		{name: "same target", currentBranch: "main", wantMerged: true},
-		{name: "different target", currentBranch: "release", wantMerged: false},
+		{name: "same target", repoURL: "https://github.com/example/kaset", currentBranch: "main", wantMerged: true},
+		{name: "same SSH target", repoURL: "git@github.com:example/kaset.git", currentBranch: "main", wantMerged: true},
+		{name: "same HTTPS dot git target", repoURL: "https://github.com/example/kaset.git", currentBranch: "main", wantMerged: true},
+		{name: "different target", repoURL: "https://github.com/example/kaset", currentBranch: "release", wantMerged: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			securityStore := setupControllerSQLiteStore(t)
 			scan := &corev1alpha1.RepositoryScan{
 				ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
-				Spec:       corev1alpha1.RepositoryScanSpec{RepoURL: "https://github.com/example/kaset", Branch: tc.currentBranch},
+				Spec:       corev1alpha1.RepositoryScanSpec{RepoURL: tc.repoURL, Branch: tc.currentBranch},
 			}
 			legacyScan := scan.DeepCopy()
 			legacyScan.Spec.Branch = "main"

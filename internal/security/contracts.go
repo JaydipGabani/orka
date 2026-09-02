@@ -361,7 +361,7 @@ func FindingV2TargetKey(repoURL, branch, subPath string) string {
 		SubPath string `json:"subPath"`
 	}{
 		Version: 1,
-		RepoURL: strings.TrimSpace(repoURL),
+		RepoURL: CanonicalRepositoryCloneURL(repoURL),
 		Branch:  strings.TrimSpace(branch),
 		SubPath: strings.Trim(strings.TrimSpace(subPath), "/"),
 	}

@@ -8179,14 +8179,22 @@ func TestRepositoryMonitorUpdateBranchKeepsAcceptedMutationRetryableWhenProjecti
 func TestRepositoryMonitorUpdateBranchDoesNotUseLegacyReadCredential(t *testing.T) {
 	ctx := context.Background()
 	monitorStore := setupControllerSQLiteStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/repos/orka-agents/orka/compare/live-base-sha...old-head-sha" {
+			t.Fatalf("unexpected GitHub request %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"status":"diverged"}`))
+	}))
+	t.Cleanup(server.Close)
+
 	scheme := runtime.NewScheme()
 	_ = corev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	monitor, readSecret := repositoryMonitorInventoryTestObjects("update-branch-forge-required")
 	monitor.Spec.ForgeCredentialRef = nil
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(monitor, readSecret).Build()
-	reconciler := &RepositoryMonitorReconciler{Client: client, Store: monitorStore}
-	command := &store.CommandEvent{ID: "cmd-update-forge-required", MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Kind: repositoryMonitorPullRequestKind, Number: 42, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "old-head-sha"}
+	reconciler := &RepositoryMonitorReconciler{Client: client, Store: monitorStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
+	command := &store.CommandEvent{ID: "cmd-update-forge-required", MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Repo: "orka-agents/orka", Kind: repositoryMonitorPullRequestKind, Number: 42, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "old-head-sha"}
 	run := &store.MonitorRun{ID: "run-update-forge-required", MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, CommandEventID: command.ID, TargetKind: command.Kind, TargetNumber: command.Number, TargetSHA: command.HeadSHA}
 	pr := repositoryMonitorPullRequest{Number: command.Number, State: repositoryMonitorItemStateOpen, BaseBranch: "main", BaseSHA: "live-base-sha", HeadSHA: command.HeadSHA}
 	item := repositoryMonitorItemFromPullRequest(monitor, pr, nil)
@@ -8195,8 +8203,9 @@ func TestRepositoryMonitorUpdateBranchDoesNotUseLegacyReadCredential(t *testing.
 	if err == nil || !handled || created != 0 || !strings.Contains(err.Error(), "spec.forgeCredentialRef is required") {
 		t.Fatalf("update branch = handled %v, created %d, err %v, want explicit forge credential failure", handled, created, err)
 	}
-	if _, getErr := monitorStore.GetGitHubMutationRecord(ctx, monitor.Namespace, repositoryMonitorUpdateBranchMutationID(command.ID)); !errors.Is(getErr, store.ErrNotFound) {
-		t.Fatalf("mutation error = %v, want no mutation before forge credential validation", getErr)
+	mutation, getErr := monitorStore.GetGitHubMutationRecord(ctx, monitor.Namespace, repositoryMonitorUpdateBranchMutationID(command.ID))
+	if getErr != nil || mutation.Status != repositoryMonitorAutomergeStateStarted {
+		t.Fatalf("mutation = %#v, err %v, want durable started state before forge credential validation", mutation, getErr)
 	}
 }
 
@@ -8382,6 +8391,7 @@ func TestRepositoryMonitorUpdateBranchPreservesSucceededMutationWhenBaseAdvances
 	_ = corev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	monitor, secret := repositoryMonitorInventoryTestObjects("update-branch-succeeded-base-advance")
+	monitor.Spec.ForgeCredentialRef = nil
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(monitor, secret).Build()
 	reconciler := &RepositoryMonitorReconciler{Client: client, Store: monitorStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
 	command := &store.CommandEvent{ID: "cmd-update-succeeded-base-advance", MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, Repo: "orka-agents/orka", Kind: repositoryMonitorPullRequestKind, Number: 42, Intent: repositoryMonitorCommandIntentUpdateBranch, HeadSHA: "old-head-sha", Status: "accepted", CreatedAt: time.Now()}
@@ -8464,6 +8474,7 @@ func TestRepositoryMonitorUpdateBranchReconcilesAcceptedMutationBeforeBlockedLab
 	_ = corev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	monitor, secret := repositoryMonitorInventoryTestObjects("update-branch-pending-blocked")
+	monitor.Spec.ForgeCredentialRef = nil
 	monitor.Spec.Policy.PauseLabels = []string{"do-not-merge"}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(monitor, secret).Build()
 	reconciler := &RepositoryMonitorReconciler{Client: client, Store: monitorStore, GitHubAPIBaseURL: server.URL, HTTPClient: server.Client()}
