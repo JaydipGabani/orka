@@ -51,20 +51,40 @@ func TestRuntimeSessionCreateDigestConflict(t *testing.T) {
 
 func TestNextTaskScopedRuntimeSessionGeneration(t *testing.T) {
 	t.Parallel()
-	if got := nextTaskScopedRuntimeSessionGeneration(nil); got != 1 {
+	const instanceID = "pod-uid.boot-id"
+	if got := nextTaskScopedRuntimeSessionGeneration(nil, instanceID); got != 1 {
 		t.Fatalf("nil task generation = %d, want 1", got)
 	}
-	task := &corev1alpha1.Task{}
-	if got := nextTaskScopedRuntimeSessionGeneration(task); got != 1 {
+	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{UID: types.UID("task-uid")}}
+	if got := nextTaskScopedRuntimeSessionGeneration(task, instanceID); got != 1 {
 		t.Fatalf("missing execution generation = %d, want 1", got)
 	}
-	task.Status.Execution = &corev1alpha1.TaskExecutionStatus{}
-	if got := nextTaskScopedRuntimeSessionGeneration(task); got != 1 {
+	task.Status.Execution = &corev1alpha1.TaskExecutionStatus{Attempt: 1}
+	if got := nextTaskScopedRuntimeSessionGeneration(task, instanceID); got != 1 {
 		t.Fatalf("fresh attempt generation = %d, want 1", got)
 	}
 	task.Status.Execution.RuntimeSessionRetiredGeneration = 3
-	if got := nextTaskScopedRuntimeSessionGeneration(task); got != 4 {
+	if got := nextTaskScopedRuntimeSessionGeneration(task, instanceID); got != 4 {
 		t.Fatalf("generation after retiring 3 = %d, want 4", got)
+	}
+
+	// A pre-upgrade cleanup receipt without a recorded retired generation is
+	// backfilled from the receipt itself on the same runtime instance.
+	task.Status.Execution.RuntimeSessionRetiredGeneration = 0
+	receipt, err := taskScopedRuntimeSessionCleanupDigest(task.UID, 1, instanceID, taskRuntimeSessionUID(task), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Execution.RuntimeSessionCleanupDigest = receipt
+	if got := nextTaskScopedRuntimeSessionGeneration(task, instanceID); got != 3 {
+		t.Fatalf("generation backfilled from a legacy receipt for generation 2 = %d, want 3", got)
+	}
+	if got := nextTaskScopedRuntimeSessionGeneration(task, "other-pod.other-boot"); got != 1 {
+		t.Fatalf("legacy receipt from another runtime instance advanced generation to %d, want 1", got)
+	}
+	task.Status.Execution.RuntimeSessionRetiredGeneration = 5
+	if got := nextTaskScopedRuntimeSessionGeneration(task, instanceID); got != 6 {
+		t.Fatalf("recorded retired generation lost precedence over the receipt: got %d, want 6", got)
 	}
 }
 

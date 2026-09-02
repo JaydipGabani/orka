@@ -1147,7 +1147,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		leaseGeneration = sessionExecution.LeaseGeneration
 	} else {
 		runtimeFence.RuntimeSessionUID = harnessv2.RuntimeSessionUID(taskRuntimeSessionUID(task))
-		runtimeFence.RuntimeSessionGeneration = nextTaskScopedRuntimeSessionGeneration(task)
+		runtimeFence.RuntimeSessionGeneration = nextTaskScopedRuntimeSessionGeneration(task, string(runtimeFence.RuntimeInstanceID))
 		leaseGeneration = int64(runtimeFence.RuntimeSessionGeneration)
 	}
 	sessionTrace.setRuntimeSession(string(runtimeFence.RuntimeSessionUID), runtimeFence.RuntimeSessionGeneration)
@@ -4715,12 +4715,40 @@ func runtimeSessionCreateDigestConflict(err error) bool {
 // generation stays tombstoned there and its create operation identity is bound
 // to this attempt's prompt, so rebuilding the create request under the same
 // generation could only be classified as a digest conflict.
-func nextTaskScopedRuntimeSessionGeneration(task *corev1alpha1.Task) uint64 {
-	if task == nil || task.Status.Execution == nil || task.Status.Execution.RuntimeSessionRetiredGeneration <= 0 {
+//
+// A cleanup receipt written before the retired generation was recorded
+// (controller upgrade with a re-admitted attempt in flight) is backfilled by
+// matching the receipt against the bounded generations this attempt can have
+// retired on the same runtime instance.
+func nextTaskScopedRuntimeSessionGeneration(task *corev1alpha1.Task, runtimeInstanceID string) uint64 {
+	if task == nil || task.Status.Execution == nil {
 		return 1
 	}
-	return uint64(task.Status.Execution.RuntimeSessionRetiredGeneration) + 1
+	execution := task.Status.Execution
+	if execution.RuntimeSessionRetiredGeneration > 0 {
+		return uint64(execution.RuntimeSessionRetiredGeneration) + 1
+	}
+	if receipt := strings.TrimSpace(execution.RuntimeSessionCleanupDigest); receipt != "" {
+		for generation := int64(1); generation <= legacyRetiredRuntimeSessionGenerationProbe; generation++ {
+			digest, err := taskScopedRuntimeSessionCleanupDigest(
+				task.UID, execution.Attempt, runtimeInstanceID, taskRuntimeSessionUID(task), generation,
+			)
+			if err != nil {
+				break
+			}
+			if digest == receipt {
+				return uint64(generation) + 1
+			}
+		}
+	}
+	return 1
 }
+
+// legacyRetiredRuntimeSessionGenerationProbe bounds how many generations a
+// legacy cleanup receipt is matched against. Each generation costs one
+// runtime identity, so a re-admitted attempt never legitimately retires more
+// than a handful before it fails or completes.
+const legacyRetiredRuntimeSessionGenerationProbe = 16
 
 func runtimeSessionCreationMayHaveApplied(err error) bool {
 	var clientErr *harnessv2.ClientError
