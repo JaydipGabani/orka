@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -272,13 +273,11 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestUpdateBranchCommand(
 		if repositoryMonitorUpdateBranchTimedOut(mutation) {
 			return true, 0, r.failRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, repositoryMonitorUpdateBranchTimeoutReason)
 		}
-		cancelled, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
+		_, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
 		if err != nil {
 			return true, 0, err
 		}
-		if cancelled {
-			return r.waitForRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, pr, repositoryMonitorUpdateBranchSubmitting)
-		}
+		return r.waitForRepositoryMonitorUpdateBranch(ctx, monitor, run, command, item, mutation, pr, repositoryMonitorUpdateBranchSubmitting)
 	case repositoryMonitorAutomergeStateStarted:
 		cancelled, err := r.repositoryMonitorWorkActionCancelled(ctx, monitor, command.ID, command.Intent)
 		if err != nil || cancelled {
@@ -341,8 +340,11 @@ func (r *RepositoryMonitorReconciler) recordRepositoryMonitorUpdateBranchSubmiss
 ) (bool, int, error) {
 	failureState := repositoryMonitorRunFailureState(submissionErr)
 	if repositoryMonitorFailedCommandRunRetryable("[" + failureState + "]") {
-		mutation.Status = repositoryMonitorAutomergeStateStarted
-		mutation.PendingAt = nil
+		mutation.Status = repositoryMonitorUpdateBranchSubmitting
+		if _, rejected := errors.AsType[*repositoryMonitorGitHubAPIError](submissionErr); rejected {
+			mutation.Status = repositoryMonitorAutomergeStateStarted
+			mutation.PendingAt = nil
+		}
 		mutation.GitHubRequestID = ""
 		mutation.Error = submissionErr.Error()
 		if updateErr := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); updateErr != nil {
