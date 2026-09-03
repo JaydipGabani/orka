@@ -102,18 +102,24 @@ Two versions of Orka exist and they are not the same product yet.
 
 | | Latest release (v0.1.3) | `main` |
 | --- | --- | --- |
-| Install | One command, no clone | Build the images yourself |
+| Install | Published images, no clone | Build the images yourself |
 | `type: ai` and `type: container` Tasks | Yes | Yes |
 | Chat, gateways, monitors, security scanning | Yes | Yes |
-| `type: agent` coding agents | **No** | Yes |
+| `type: agent` coding agents | Yes, via the legacy Job path | Yes, via RuntimePools |
 | RuntimePools, harness modes, workspace providers | **No** | Yes |
 
 This README and the docs describe `main`. See
 [Release status](website/docs/reference/release-status.md) for the full difference.
 
-**Latest release** — one command:
+**Latest release** — no clone needed:
 
 ```bash
+# The manifest mounts a harness-wrapper-auth Secret but does not create it,
+# so make the namespace and that Secret first or the Pods never start.
+kubectl create namespace orka-system
+kubectl -n orka-system create secret generic harness-wrapper-auth \
+  --from-literal=token="$(openssl rand -hex 32)"
+
 kubectl apply -f https://raw.githubusercontent.com/orka-agents/orka/v0.1.3/deploy/orka.yaml
 ```
 
@@ -228,6 +234,8 @@ are brokered separately to the clean-room Workspace/Publisher.
 Use the built-in dashboard, or connect any OpenAI-compatible client:
 
 ```bash
+# Helm installs name the Service after the release (svc/orka);
+# the release manifest names it svc/orka-api.
 kubectl port-forward -n orka-system svc/orka 8080:8080
 
 # Open the web dashboard

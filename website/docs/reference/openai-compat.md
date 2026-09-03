@@ -50,7 +50,7 @@ apiVersion: core.orka.ai/v1alpha1
 kind: Provider
 metadata:
   name: anthropic
-  namespace: default
+  namespace: orka-system
 spec:
   type: anthropic
   secretRef:
@@ -66,7 +66,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: anthropic-secret
-  namespace: default
+  namespace: orka-system
 type: Opaque
 stringData:
   api-key: sk-ant-...
@@ -81,7 +81,7 @@ apiVersion: core.orka.ai/v1alpha1
 kind: Provider
 metadata:
   name: azure-openai
-  namespace: default
+  namespace: orka-system
 spec:
   type: azure-openai
   secretRef:
@@ -98,15 +98,15 @@ spec:
 
 ```bash
 # Create a service account
-kubectl create serviceaccount orka-client
+kubectl -n orka-system create serviceaccount orka-client
 
 # Bind it to the orka viewer role (or a custom role)
 kubectl create clusterrolebinding orka-client-binding \
   --clusterrole=orka-task-viewer-role \
-  --serviceaccount=default:orka-client
+  --serviceaccount=orka-system:orka-client
 
 # Get a token
-export ORKA_TOKEN=$(kubectl create token orka-client)
+export ORKA_TOKEN=$(kubectl -n orka-system create token orka-client)
 ```
 
 ## Using with Continue
@@ -134,7 +134,7 @@ Configure Continue to use Orka as an OpenAI-compatible provider. Add to your Con
 Set your Orka API token:
 
 ```bash
-export ORKA_TOKEN=$(kubectl create token orka-client)
+export ORKA_TOKEN=$(kubectl -n orka-system create token orka-client)
 ```
 
 ## Using with curl

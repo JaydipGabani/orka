@@ -40,7 +40,8 @@ The whole agent-runtime layer landed after v0.1.3 was cut. Missing there:
 | Native AI tasks (`type: ai`) | Yes | Yes |
 | Chat and compatibility APIs | Yes | Yes |
 | Repository monitors, scans, gateways | Yes | Yes |
-| Coding agents over [ACP](glossary.md#running-coding-agents) (`type: agent`) | **No** | Yes |
+| Coding-agent tasks (`type: agent`) | Yes, on a per-Task Job with a harness wrapper | Yes |
+| Coding agents over [ACP](glossary.md#running-coding-agents) | **No** | Yes |
 | `RuntimePool` / `RuntimeSession` | **No** | Yes |
 | `PromptAttempt`, `ControllerEpoch`, `Publication`, `BranchClaim`, `ExternalEffect` | **No** | Yes |
 | `RuntimeProviderConfig`, `RuntimeWorkspaceProfile`, `RuntimeSessionControl` | **No** | Yes |
@@ -48,13 +49,21 @@ The whole agent-runtime layer landed after v0.1.3 was cut. Missing there:
 | `--watch-namespace` | Optional; empty watches the whole cluster | **Required** |
 
 Nine CRDs are new on `main`. If a page here mentions a `RuntimePool`, a supervisor, a
-prompt attempt, or clean-room publication, it does not apply to v0.1.3.
+prompt attempt, or clean-room publication, it does not apply to v0.1.3. v0.1.3 does run
+`type: agent` Tasks — what it lacks is the ACP execution path that replaced the older
+per-Task Job.
 
 ## Installing v0.1.3
 
-One command, no clone:
+No clone needed:
 
 ```bash
+# The manifest mounts a harness-wrapper-auth Secret but does not create it,
+# so make the namespace and that Secret first or the Pods never start.
+kubectl create namespace orka-system
+kubectl -n orka-system create secret generic harness-wrapper-auth \
+  --from-literal=token="$(openssl rand -hex 32)"
+
 kubectl apply -f https://raw.githubusercontent.com/orka-agents/orka/v0.1.3/deploy/orka.yaml
 ```
 

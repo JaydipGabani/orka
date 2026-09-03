@@ -83,7 +83,8 @@ The controller is the central component that runs as a Kubernetes Deployment. It
 
 ### Custom Resource Definitions (`api/v1alpha1/`)
 
-An install ships 26 CRDs, but you only ever write a handful of them by hand. The rest are
+A chart install from `main` ships 26 CRDs (the v0.1.3 release manifest ships 12), but you
+only ever write a handful of them by hand. The rest are
 bookkeeping the controller creates and owns — they exist so that a controller restart, a crashed
 Pod, or a lost network call cannot lose track of work in flight.
 
@@ -160,12 +161,25 @@ Read them when you are debugging. Do not edit them.
 
 ### Gateway and workspace CRDs
 
-These live in their own API groups. All of them are installed by the chart and the release
-manifest — the 26 CRDs above include these — but they differ in whether anything reconciles
-them out of the box. Gateway reconciliation is **on by default** (`--gateway-enabled`
-defaults to true). The workspace groups are **off by default** and need
-`--enable-workspace-provider-api` plus the matching provider flag; until then the CRDs
-exist and accept objects that nothing acts on.
+These live in their own API groups.
+
+**Which of them you actually get depends on how you installed.** The full set of 26 is
+packaged only by the Helm chart built from `main`. The released `deploy/orka.yaml` manifest
+carries 12 CRDs and none of the workspace kinds, so applying it and then creating an
+`ExecutionWorkspaceClass` returns `no matches for kind`. Install the chart, or apply the
+CRDs separately from `config/crd/bases/`, before using anything in the workspace groups.
+
+They also differ in whether anything reconciles them once installed. Gateway reconciliation
+is **on by default** (`--gateway-enabled` defaults to true). The workspace groups are **off
+by default**; until they are enabled the CRDs exist and accept objects that nothing acts on.
+Turning them on takes three flags together, not two:
+
+- `--enable-workspace-provider-api` — serves the workspace provider API
+- `--acp-workspace-dispatch-enabled` — lets Tasks actually dispatch onto a workspace
+- the provider flag — `--agent-sandbox-enabled` or `--substrate-enabled`
+
+Miss the dispatch flag and you can create every workspace object successfully while every
+Task that references a class is still rejected.
 
 | CRD | Group | Purpose |
 |-----|-------|---------|

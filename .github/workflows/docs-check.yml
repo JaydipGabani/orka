@@ -8,13 +8,19 @@ on:
     paths:
       - "cmd/cli/**"
       - "scripts/generate-cli-docs.sh"
-      - "website/docs/reference/cli-commands.md"
+      - "website/docs/**"
+      - "examples/**"
+      - "README.md"
+      - "internal/admission/examples_manifests_test.go"
       - ".github/workflows/docs-check.yml"
   pull_request:
     paths:
       - "cmd/cli/**"
       - "scripts/generate-cli-docs.sh"
-      - "website/docs/reference/cli-commands.md"
+      - "website/docs/**"
+      - "examples/**"
+      - "README.md"
+      - "internal/admission/examples_manifests_test.go"
       - ".github/workflows/docs-check.yml"
 
 permissions:
@@ -22,7 +28,7 @@ permissions:
 
 jobs:
   cli-docs:
-    name: CLI Reference Up To Date
+    name: Docs Up To Date
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -38,3 +44,6 @@ jobs:
 
       - name: Check generated CLI command reference
         run: make docs-cli-check
+
+      - name: Check documented manifests still decode
+        run: go test ./internal/admission/ -run TestDocumentedManifestsDecodeStrictly -v

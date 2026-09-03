@@ -15,6 +15,7 @@ spec:
     - readCredentialRef: repository-read
     - publicationGitRepo: https://github.com/example/api.git
     - publicationCredentialRef: repository-publish
+    - forgeCredentialRef: repository-forge
     - pushBranch: feature/jwt-auth
     - prBaseBranch: main
 

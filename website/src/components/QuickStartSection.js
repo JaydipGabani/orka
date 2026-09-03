@@ -14,10 +14,15 @@ export default function QuickStartSection() {
         <div className="quickstart-card">
           <h3>Install the controller</h3>
           <p>
-            One manifest: namespace, CRDs, RBAC, controller, and the built-in
-            dashboard.
+            CRDs, RBAC, controller, and the built-in dashboard. The manifest
+            mounts a harness-wrapper-auth Secret without creating it, so make
+            the namespace and that Secret first.
           </p>
-          <CodeBlock language="bash">{`kubectl apply -f https://raw.githubusercontent.com/orka-agents/orka/v0.1.3/deploy/orka.yaml
+          <CodeBlock language="bash">{`kubectl create namespace orka-system
+kubectl -n orka-system create secret generic harness-wrapper-auth \\
+  --from-literal=token="$(openssl rand -hex 32)"
+
+kubectl apply -f https://raw.githubusercontent.com/orka-agents/orka/v0.1.3/deploy/orka.yaml
 
 kubectl -n orka-system rollout status deploy/orka-controller-manager`}</CodeBlock>
         </div>
@@ -30,12 +35,13 @@ kubectl -n orka-system rollout status deploy/orka-controller-manager`}</CodeBloc
           <CodeBlock language="bash">{`kubectl -n orka-system create secret generic anthropic-secret \\
   --from-literal=api-key=your-api-key
 
-kubectl port-forward -n orka-system svc/orka 8080:8080
+kubectl port-forward -n orka-system svc/orka-api 8080:8080
 # open http://localhost:8080`}</CodeBlock>
         </div>
       </div>
       <p className="section-subtitle">
-        Running coding agents such as Codex or Claude Code needs a build from{' '}
+        Running coding agents such as Codex or Claude Code on the ACP runtime path
+        needs a build from{' '}
         <code>main</code> — see{' '}
         <Link to="/docs/getting-started">Getting started</Link> and{' '}
         <Link to="/docs/release-status">Release status</Link>.

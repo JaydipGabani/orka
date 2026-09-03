@@ -72,7 +72,7 @@ docker run -p 1337:1337 \
 Point Vekil at a providers file that references Secrets rather than inline keys:
 
 ```bash
-scripts/deploy_vekil_reverse_proxy.sh \
+.agents/skills/vekil-reverse-proxy-deploy/scripts/deploy_vekil_reverse_proxy.sh \
   --context <kubectl-context> \
   --providers-config ./providers.yaml \
   --env-secret AZURE_OPENAI_API_KEY=azure-openai:key
@@ -86,7 +86,7 @@ a GitHub token:
 
 ```bash
 # Preferred: reference a Secret you already manage
-scripts/deploy_vekil_reverse_proxy.sh \
+.agents/skills/vekil-reverse-proxy-deploy/scripts/deploy_vekil_reverse_proxy.sh \
   --env-secret COPILOT_GITHUB_TOKEN=copilot-github-token:token
 ```
 

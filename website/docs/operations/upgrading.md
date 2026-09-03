@@ -41,8 +41,20 @@ outboundaccesspolicies,gateways,gatewaybindings,agentruntimes \
 kubectl get gatewayclasses -o json > orka-gatewayclasses.json
 ```
 
-If you have the workspace provider API enabled, back up its resources too —
-`executionworkspaceclasses`, `executionworkspaceproviders`, and `executionworkspacepools`.
+If you have the workspace provider API enabled, back up its resources too:
+
+```bash
+kubectl -n orka-system get \
+  executionworkspaceclasses,executionworkspaceproviders,executionworkspacepools,\
+executionworkspaces,runtimeproviderconfigs,runtimeworkspaceprofiles \
+  -o json > orka-workspace-crs.json
+```
+
+Do not stop at the classes. A class is unusable without the
+`RuntimeProviderConfig` and `RuntimeWorkspaceProfile` objects its `parametersRef` points
+at, so a backup holding only classes, providers, and pools restores a set of resources
+that cannot run anything.
+
 Leave out any kind your cluster does not have; `kubectl` fails the whole command on an
 unknown resource rather than skipping it.
 

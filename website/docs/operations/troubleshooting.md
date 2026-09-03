@@ -55,8 +55,13 @@ kubectl -n orka-system create secret generic orka-agent-snapshot-key \
 
 :::danger[Do not rotate this casually]
 The Secret name, the item key, and the key material must stay the same for the life of the
-release. Changing any of them makes every retained snapshot permanently unreadable. The
-chart blocks the change on upgrade for exactly this reason.
+release. Changing any of them makes every retained snapshot permanently unreadable.
+
+The chart guards only two of those three. On upgrade it compares the Secret **name** and
+**item key** against the live Deployment and fails if either changed. It cannot see the
+key material, so replacing the bytes under the same name and key passes the guard
+silently — and the controller then restarts unable to read any snapshot it wrote before.
+Treat the material as immutable yourself; nothing in the chart will stop you.
 :::
 
 ### The controller crashes immediately
@@ -65,9 +70,15 @@ Check the logs first. The Deployment name depends on how you installed, so disco
 rather than guessing:
 
 ```bash
+# The two installs label the controller differently, so try both.
+# Helm sets app.kubernetes.io/component=controller; the release manifest
+# sets control-plane=controller-manager and no component label at all.
 CONTROLLER="$(kubectl -n orka-system get deploy \
-  -l app.kubernetes.io/name=orka,app.kubernetes.io/component!=provider-proxy \
-  -o jsonpath='{.items[0].metadata.name}')"
+  -l app.kubernetes.io/component=controller \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+CONTROLLER="${CONTROLLER:-$(kubectl -n orka-system get deploy \
+  -l control-plane=controller-manager \
+  -o jsonpath='{.items[0].metadata.name}')}"
 
 kubectl -n orka-system logs "deploy/$CONTROLLER" --previous
 ```

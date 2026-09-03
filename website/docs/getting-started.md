@@ -57,8 +57,9 @@ The [Glossary](reference/glossary.md) defines all of them in one place.
   [kind](https://kind.sigs.k8s.io/) or [minikube](https://minikube.sigs.k8s.io/) is fine.
 - An API key for at least one LLM provider (Anthropic, OpenAI, or Azure OpenAI).
 
-That is all you need for the released install below. Running `type: agent` coding-agent
-Tasks needs more — see [Installing from source](#option-b-current-main-from-source).
+That is all you need for the released install below. Running `type: agent` coding agents
+on the newer RuntimePool path needs more — see
+[Installing from source](#option-b-current-main-from-source).
 
 For building Orka yourself, see [Development](development/development.md) for the
 toolchain versions.
@@ -69,23 +70,29 @@ There are two versions of Orka, and it is worth being clear about which one you 
 
 | | Latest release (v0.1.3) | `main` |
 | --- | --- | --- |
-| Install | One command, no clone | Build the images yourself |
+| Install | Published images, no clone | Build the images yourself |
 | `type: ai` and `type: container` Tasks | Yes | Yes |
 | Chat, gateways, repository monitors, security scanning | Yes | Yes |
-| `type: agent` coding agents (ACP) | **No** | Yes |
+| `type: agent` coding agents | Yes, via the legacy Job path | Yes, via RuntimePools |
 | Harness modes, RuntimePools, workspace providers | **No** | Yes |
 
-Most of these docs describe `main`. The v0.1.3 release predates the coding-agent work
-entirely, so any page that mentions ACP, RuntimePools, or harness modes does not apply
-to it. See [Release status](reference/release-status.md) for the full breakdown.
+Most of these docs describe `main`. v0.1.3 does run `type: agent` Tasks, but through an
+older per-Task Job and harness-wrapper path, so any page here that mentions ACP,
+RuntimePools, or harness modes does not apply to it. See [Release status](reference/release-status.md) for the full breakdown.
 
-### Option A: latest release, one command
+### Option A: latest release
 
 ```bash
+# The manifest mounts a harness-wrapper-auth Secret but does not create it,
+# so make the namespace and that Secret first or the Pods never start.
+kubectl create namespace orka-system
+kubectl -n orka-system create secret generic harness-wrapper-auth \
+  --from-literal=token="$(openssl rand -hex 32)"
+
 kubectl apply -f https://raw.githubusercontent.com/orka-agents/orka/v0.1.3/deploy/orka.yaml
 ```
 
-That creates the `orka-system` namespace, the CRDs, RBAC, and the controller. Wait for it:
+That installs the CRDs, RBAC, the controller, and the harness wrapper. Wait for it:
 
 ```bash
 kubectl -n orka-system rollout status deploy/orka-controller-manager
@@ -241,6 +248,8 @@ Kustomize, create one yourself — [Upgrading and access](operations/troubleshoo
 shows the roles it needs.
 
 ```bash
+# Helm names the Service after the release (svc/orka); the release
+# manifest from Option A names it svc/orka-api. Pick the one you installed.
 kubectl port-forward -n orka-system svc/orka 8080:8080
 export ORKA_TOKEN="$(kubectl -n orka-system create token orka-client)"
 ```
@@ -425,6 +434,8 @@ See [Configuration](reference/configuration.md#execution) and
 ## The dashboard
 
 ```bash
+# Helm names the Service after the release (svc/orka); the release
+# manifest from Option A names it svc/orka-api. Pick the one you installed.
 kubectl port-forward -n orka-system svc/orka 8080:8080
 open http://localhost:8080
 ```

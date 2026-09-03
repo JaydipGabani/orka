@@ -138,17 +138,22 @@ Container Tasks use the same Task fields as everything else:
 - `spec.timeout` — how long before the Task is killed
 - `spec.retryPolicy` — retries with backoff
 - `spec.resources` — CPU and memory requests and limits
-- `spec.secretRef` — a Secret, exposed as environment variables
+- `spec.secretRef` — a Secret. For a container Task it is **not delivered by default**;
+  see the caution below
 - `spec.execution` — a `RuntimeClass` such as `gvisor` for stronger isolation
 - `spec.schedule` — a cron expression, for recurring work
 
 See [Configuration](../reference/configuration.md) for the full list.
 
-:::caution[`spec.secretRef` does not mount a file for container Tasks]
-Container Tasks are treated as untrusted compute, so the controller does not give them a
-direct Secret mount: there is no `/secrets/task` file unless an operator has turned on the
-legacy `ORKA_AGENT_DIRECT_SECRET_MOUNTS` opt-in. Read your credentials from the
-environment instead. [Security](../concepts/security.md) explains the boundary.
+:::caution[A container Task does not receive `spec.secretRef` by default]
+Container Tasks are treated as untrusted compute, so the controller skips the direct Secret
+mount for them. Your Secret is delivered only if an operator has turned on the legacy
+`ORKA_AGENT_DIRECT_SECRET_MOUNTS` opt-in — and even then it arrives as **files under
+`/secrets/task`** (one file per Secret key), never as environment variables. Read the key
+you need from `/secrets/task/<key>`. [Security](../concepts/security.md) explains the
+boundary.
+
+Environment-variable injection applies to an Agent's `secretRef`, not a Task's.
 :::
 
 ## When an agent creates these

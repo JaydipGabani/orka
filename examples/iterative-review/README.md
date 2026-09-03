@@ -29,6 +29,27 @@ Before applying, edit `iterative-task.yaml`: the repository URLs, branches, and 
 names in the prompt are placeholders. `coordinator-agent.yaml` also points at a Provider
 named `my-provider` — change it to a Provider that exists in your cluster.
 
+The loop needs three separate credentials, so create all three Secrets first:
+
+```bash
+# Clone/read the source repository
+kubectl -n orka-system create secret generic repository-read \
+  --from-literal=token=<read-token>
+
+# Push the branch to the target repository
+kubectl -n orka-system create secret generic repository-publish \
+  --from-literal=token=<write-token>
+
+# Open the pull request through the forge API
+kubectl -n orka-system create secret generic repository-forge \
+  --from-literal=token=<forge-token>
+```
+
+The last one is easy to miss. `readCredentialRef` and `publicationCredentialRef` only get
+the branch pushed; opening the PR is a separate forge API call, and without
+`forgeCredentialRef` the final step fails with `workspace has no forgeCredentialRef
+configured` after all the work is already done.
+
 Watch the loop run:
 
 ```bash
