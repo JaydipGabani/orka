@@ -21,8 +21,16 @@ That starts Vite on `:5173` and proxies `/api/*` to `http://localhost:8080`, so 
 controller there in another terminal:
 
 ```bash
-make run    # from the repository root
+# from the repository root
+openssl rand 32 > /path/outside-the-repository/orka-snapshot-key
+chmod 600 /path/outside-the-repository/orka-snapshot-key
+make run RUN_AGENT_EXECUTION_SNAPSHOT_KEY_FILE=/path/outside-the-repository/orka-snapshot-key
 ```
+
+The key is not optional. A `harness-v2` controller — the default — refuses to start
+without `--agent-execution-snapshot-key-file`, and `make run` passes whatever
+`RUN_AGENT_EXECUTION_SNAPSHOT_KEY_FILE` holds, empty included. Generate it once and reuse
+it; see [Development](../website/docs/development/development.md#build-commands).
 
 The dev server hot-reloads; you do not need to rebuild the Go binary while working on the
 UI.

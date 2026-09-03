@@ -34,7 +34,9 @@ Two authentication methods are supported:
 - **`x-api-key: <orka-token>`** — Anthropic convention (recommended for Anthropic clients)
 - **`Authorization: Bearer <orka-token>`** — Standard Bearer token
 
-Both use a Kubernetes ServiceAccount token as the value.
+Both carry the same value and go through the same authentication middleware. A Kubernetes
+ServiceAccount token is the default; OIDC JWTs and context tokens also work when the
+operator has configured them. See [Authentication](./api-reference.md#authentication).
 
 ## Model name format
 

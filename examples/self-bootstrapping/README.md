@@ -17,8 +17,8 @@ Update `spec.providerRef.name` in `coordinator-agent.yaml` to match the Provider
 
 ### Via YAML
 ```bash
-kubectl apply -f examples/self-bootstrapping/coordinator-agent.yaml
-kubectl apply -f examples/self-bootstrapping/coordinator-task.yaml
+kubectl -n orka-system apply -f examples/self-bootstrapping/coordinator-agent.yaml
+kubectl -n orka-system apply -f examples/self-bootstrapping/coordinator-task.yaml
 ```
 
 ### Via Chat (One-Shot)

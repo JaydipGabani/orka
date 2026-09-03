@@ -26,10 +26,14 @@ needs.
 
 **Apply into the controller's watched namespace.** The static harness-v2 controller
 reconciles exactly one namespace (`--watch-namespace`, which is `orka-system` for
-`make deploy` and the Helm chart). The manifests carry no `metadata.namespace`, so pass it
-explicitly, for example
-`kubectl apply -n orka-system -k examples/repository-monitor-pr-review-repair`; a resource
+`make deploy` and the Helm chart). No manifest here carries a `metadata.namespace`, so pass
+it explicitly, for example
+`kubectl -n orka-system apply -k examples/repository-monitor-pr-review-repair`; a resource
 created anywhere else is never reconciled.
+
+The same applies to the Secrets each example needs. Secret references are namespace-local,
+so a Secret created in `default` is invisible to a monitor in `orka-system` — the commands
+in each README use `-n orka-system` for exactly this reason.
 
 **Models and providers are placeholders.** Agent `spec.model.name`, Provider names, and
 credential Secret names reflect one working setup. Swap in the models and Secrets that

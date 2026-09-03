@@ -229,14 +229,23 @@ func TestDocumentedManifestsDecodeStrictly(t *testing.T) {
 		for _, block := range blocks {
 			documents, err := splitYAMLDocumentsFrom(strings.NewReader(block.body))
 			if err != nil {
-				// A fragment that is not parseable YAML at all is prose, not a
-				// manifest. Only well-formed documents are our business.
+				if block.strict {
+					return fmt.Errorf("%s:%d: block is fenced as YAML but does not parse: %w", path, block.line, err)
+				}
+				// Not a YAML fence — a heredoc may carry anything.
 				continue
 			}
 			for index, document := range documents {
+				isManifest, err := looksLikeManifest(document)
+				if err != nil {
+					if block.strict {
+						return fmt.Errorf("%s:%d document %d: block is fenced as YAML but does not parse: %w", path, block.line, index+1, err)
+					}
+					continue
+				}
 				// A block that is not a mapping with apiVersion and kind is a
 				// fragment illustrating one field, not a manifest.
-				if !looksLikeManifest(document) {
+				if !isManifest {
 					continue
 				}
 				object, checked, err := strictDecodeOrkaDocument(scheme, document)
@@ -261,6 +270,10 @@ func TestDocumentedManifestsDecodeStrictly(t *testing.T) {
 type yamlCodeBlock struct {
 	line int
 	body string
+	// strict marks a block that is fenced as YAML and must therefore parse as
+	// YAML. Blocks lifted out of shell heredocs are not strict: a heredoc may
+	// legitimately carry a script, a patch, or anything else.
+	strict bool
 }
 
 const docsStrictDecodeSkipMarker = "<!-- orka:skip-strict-decode"
@@ -294,7 +307,7 @@ func extractYAMLCodeBlocks(path string) ([]yamlCodeBlock, error) {
 		}
 		switch language {
 		case "yaml", "yml":
-			blocks = append(blocks, yamlCodeBlock{line: start + 1, body: strings.Join(body, "\n")})
+			blocks = append(blocks, yamlCodeBlock{line: start + 1, body: strings.Join(body, "\n"), strict: true})
 		case "bash", "sh", "shell", "console":
 			// The install and first-task instructions pipe manifests through
 			// `kubectl apply -f - <<'EOF'`. Those are the manifests users copy
@@ -352,10 +365,24 @@ func parseOpeningFence(line string) (string, string, bool) {
 // looksLikeManifest reports whether a YAML document is a mapping carrying both
 // apiVersion and kind. Documentation is full of fragments that are perfectly
 // good YAML but are not whole objects; those are not this test's business.
-func looksLikeManifest(document []byte) bool {
+// looksLikeManifest reports whether a document is shaped like a Kubernetes
+// object. A document that does not parse as YAML at all is reported through the
+// error rather than as "not a manifest", so a documented manifest with a syntax
+// error cannot slip past the guard by failing to parse. A document that parses
+// but is not a mapping — a bare list or scalar illustrating one field — is not
+// malformed, just not a manifest.
+func looksLikeManifest(document []byte) (bool, error) {
+	var probe any
+	if err := sigsyaml.Unmarshal(document, &probe); err != nil {
+		return false, err
+	}
+	if _, isMapping := probe.(map[string]any); !isMapping {
+		return false, nil
+	}
+
 	var typeMeta metav1.TypeMeta
 	if err := sigsyaml.Unmarshal(document, &typeMeta); err != nil {
-		return false
+		return false, err
 	}
-	return typeMeta.APIVersion != "" && typeMeta.Kind != ""
+	return typeMeta.APIVersion != "" && typeMeta.Kind != "", nil
 }

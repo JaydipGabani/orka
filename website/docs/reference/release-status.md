@@ -15,8 +15,13 @@ cluster. This page tells you which one you are on and what the difference is.
 ## Which one am I running?
 
 ```bash
-kubectl -n orka-system get deploy orka -o jsonpath='{.spec.template.spec.containers[0].image}'
-kubectl get crd -l app.kubernetes.io/name=orka --no-headers | wc -l
+# Neither install creates a Deployment named plain `orka`: a Helm release named `orka`
+# creates `orka-controller`, and the release manifest creates `orka-controller-manager`.
+kubectl -n orka-system get deploy -l app.kubernetes.io/name=orka \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[0].image}{"\n"}{end}'
+
+# Orka CRDs carry no common label, so count them by group instead.
+kubectl get crd -o name | grep -c '\.orka\.ai$'
 ```
 
 | CRDs | You have |
@@ -71,8 +76,10 @@ images yourself. [Getting started](../getting-started.md) has the full path.
 
 :::warning[Do not install from `charts/orka/` or `deploy/orka.yaml` at the repo root]
 Those are *promoted release snapshots*, refreshed only during release preparation. On
-`main` today they hold a 12-CRD chart that is behind both v0.1.3 and `main`. It installs
-without error and gives you a controller that crashes on startup.
+`main` today they still hold v0.1.1 — `charts/orka/Chart.yaml` says `0.1.1`, its values
+deploy `ghcr.io/orka-agents/orka:0.1.1`, and it ships 12 CRDs. It is internally consistent,
+so it installs and runs; it just gives you a release that is two versions old, without
+saying so.
 
 Build from `manifest_staging/charts/orka/` instead — that is the chart regenerated from
 current source by `make manifests`.
@@ -82,9 +89,14 @@ current source by `make manifests`.
 
 Orka is pre-1.0.
 
-- CRD schemas may change between minor releases. Read the release notes before upgrading,
-  and follow [Upgrading](../operations/upgrading.md) — Helm will not update CRDs for you.
+- CRD schemas may change between minor releases. Diff the CRDs before upgrading, and follow
+  [Upgrading](../operations/upgrading.md) — Helm will not update CRDs for you.
 - Only the latest release gets fixes. There are no patch backports to older tags.
 - No release is supported for production use yet.
 
-Release notes and assets: [github.com/orka-agents/orka/releases](https://github.com/orka-agents/orka/releases).
+There are currently no GitHub Release entries and no written release notes: `release.yml`
+publishes images and the Helm repository on a `v*` tag, and nothing else. To see what
+changed between two versions, compare the tags directly —
+[github.com/orka-agents/orka/tags](https://github.com/orka-agents/orka/tags) lists them,
+and `git diff v0.1.2..v0.1.3 -- config/crd/bases` shows the schema changes that matter
+most for an upgrade.

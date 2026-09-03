@@ -29,7 +29,10 @@ These used to live at `/v1/`. They are now at `/openai/v1/`. See
 | `POST` | `/openai/v1/chat/completions` | Chat completions (streaming & non-streaming) |
 | `GET` | `/openai/v1/models` | List available models from configured providers |
 
-Both endpoints require authentication via `Authorization: Bearer <token>` using a Kubernetes ServiceAccount token.
+Both endpoints require authentication via `Authorization: Bearer <token>`. A Kubernetes
+ServiceAccount token is the default and works with no extra configuration; if the operator
+has configured OIDC or context-token authentication, tokens of those kinds are accepted on
+the same header. See [Authentication](./api-reference.md#authentication).
 
 ## Model name format
 

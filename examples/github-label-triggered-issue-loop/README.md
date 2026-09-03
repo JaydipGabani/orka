@@ -13,16 +13,16 @@ four jobs on separate GitHub tokens so a leak of one does not grant the others, 
 refuses to run if any two of them are the same Secret. Create all four outside git:
 
 ```bash
-kubectl create secret generic orka-monitor-source-read \
+kubectl -n orka-system create secret generic orka-monitor-source-read \
   --from-literal=token='<read-only token for the source repository>'
 
-kubectl create secret generic orka-monitor-publication-read \
+kubectl -n orka-system create secret generic orka-monitor-publication-read \
   --from-literal=token='<read-only token for the target repository>'
 
-kubectl create secret generic orka-monitor-publication \
+kubectl -n orka-system create secret generic orka-monitor-publication \
   --from-literal=token='<token that may push branches to the target repository>'
 
-kubectl create secret generic orka-monitor-forge \
+kubectl -n orka-system create secret generic orka-monitor-forge \
   --from-literal=token='<token for GitHub API calls: PRs, comments, permission checks>'
 ```
 
@@ -38,7 +38,7 @@ Configure your GitHub webhook to send `issues` and `pull_request` events to `/we
 ## Try it
 
 1. Update `repoURL` in `repository-monitor.yaml`.
-2. Apply the example: `kubectl apply -k examples/github-label-triggered-issue-loop`.
+2. Apply the example: `kubectl -n orka-system apply -k examples/github-label-triggered-issue-loop`.
 3. Add `orka:plan` or `orka:implement` to an issue.
 4. Inspect state:
 

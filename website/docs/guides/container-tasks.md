@@ -28,16 +28,24 @@ understanding, because both fail in confusing ways.
 
 ## The filesystem is read-only
 
-Task Pods run with `readOnlyRootFilesystem: true`. Exactly three paths are writable:
+Task Pods run with `readOnlyRootFilesystem: true`. Which paths are writable depends on
+whether the Task has a workspace:
 
-| Path | What it is |
-| --- | --- |
-| `/tmp` | Scratch space |
-| `/home/worker` | The worker's home directory |
-| `/workspace` | The working directory, including any cloned repository |
+| Path | What it is | When you get it |
+| --- | --- | --- |
+| `/tmp` | Scratch space | Always |
+| `/workspace` | The working directory, including any cloned repository | Only with `spec.workspace` |
+| `/home/worker` | The worker's home directory | Only with `spec.workspace` |
 
 Everything else — including the places most language toolchains put their caches — will
 reject writes.
+
+:::caution[A container Task without `spec.workspace` gets `/tmp` and nothing else]
+`/workspace` and `/home/worker` are backed by `emptyDir` volumes that the controller only
+attaches when the Task needs a workspace — that is, agent Tasks, and container Tasks that
+set `spec.workspace`. Write to `/workspace` from a plain container Task and the path is
+simply not there. Either set `spec.workspace`, or keep everything under `/tmp`.
+:::
 
 This is a deliberate hardening choice, not an oversight. It means a command cannot modify
 its own image at runtime. See [Security](../concepts/security.md#execution-workloads).
@@ -130,11 +138,18 @@ Container Tasks use the same Task fields as everything else:
 - `spec.timeout` — how long before the Task is killed
 - `spec.retryPolicy` — retries with backoff
 - `spec.resources` — CPU and memory requests and limits
-- `spec.secretRef` — a Secret mounted at `/secrets/task`
+- `spec.secretRef` — a Secret, exposed as environment variables
 - `spec.execution` — a `RuntimeClass` such as `gvisor` for stronger isolation
 - `spec.schedule` — a cron expression, for recurring work
 
 See [Configuration](../reference/configuration.md) for the full list.
+
+:::caution[`spec.secretRef` does not mount a file for container Tasks]
+Container Tasks are treated as untrusted compute, so the controller does not give them a
+direct Secret mount: there is no `/secrets/task` file unless an operator has turned on the
+legacy `ORKA_AGENT_DIRECT_SECRET_MOUNTS` opt-in. Read your credentials from the
+environment instead. [Security](../concepts/security.md) explains the boundary.
+:::
 
 ## When an agent creates these
 

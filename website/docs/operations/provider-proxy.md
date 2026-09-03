@@ -50,8 +50,9 @@ quietly route model traffic somewhere unreviewed. One trailing slash is tolerate
 Vekil's own repository has full instructions. The short version, for a cluster:
 
 ```bash
-# From a vekil checkout
-scripts/deploy_vekil_reverse_proxy.sh --context <kubectl-context>
+# From an Orka checkout — this helper ships with Orka, not with Vekil
+.agents/skills/vekil-reverse-proxy-deploy/scripts/deploy_vekil_reverse_proxy.sh \
+  --context <kubectl-context>
 ```
 
 Defaults: namespace `vekil-system`, service `vekil`, port `1337`, image

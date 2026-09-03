@@ -160,8 +160,12 @@ Read them when you are debugging. Do not edit them.
 
 ### Gateway and workspace CRDs
 
-These live in their own API groups. Both are opt-in: you will not see them on a default install
-unless you turn the matching feature on.
+These live in their own API groups. All of them are installed by the chart and the release
+manifest — the 26 CRDs above include these — but they differ in whether anything reconciles
+them out of the box. Gateway reconciliation is **on by default** (`--gateway-enabled`
+defaults to true). The workspace groups are **off by default** and need
+`--enable-workspace-provider-api` plus the matching provider flag; until then the CRDs
+exist and accept objects that nothing acts on.
 
 | CRD | Group | Purpose |
 |-----|-------|---------|
@@ -248,7 +252,7 @@ stateDiagram-v2
     direction LR
     [*] --> Pending
     Pending --> Scheduled: cron Tasks only
-    Scheduled --> Running
+    Scheduled --> Scheduled: creates a child Task each fire time
     Pending --> Running
     Running --> Finalizing
     Finalizing --> Succeeded

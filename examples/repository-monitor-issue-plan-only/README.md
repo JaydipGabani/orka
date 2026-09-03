@@ -5,7 +5,7 @@ Use this example when you want durable triage/research/planning and approval rec
 Apply with:
 
 ```bash
-kubectl apply -k examples/repository-monitor-issue-plan-only
+kubectl -n orka-system apply -k examples/repository-monitor-issue-plan-only
 ```
 
 Then add `orka:plan` to an issue and inspect:
@@ -20,10 +20,10 @@ This monitor only reads and plans, so it needs two tokens rather than the four a
 monitor needs. Create both outside git:
 
 ```bash
-kubectl create secret generic orka-monitor-source-read \
+kubectl -n orka-system create secret generic orka-monitor-source-read \
   --from-literal=token='<read-only token for the repository>'
 
-kubectl create secret generic orka-monitor-forge \
+kubectl -n orka-system create secret generic orka-monitor-forge \
   --from-literal=token='<token for GitHub API calls, including the label sender permission check>'
 ```
 

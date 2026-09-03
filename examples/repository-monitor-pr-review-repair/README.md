@@ -3,7 +3,7 @@
 This example focuses on durable PR review, repair, branch update, and optional automerge command labels.
 
 ```bash
-kubectl apply -k examples/repository-monitor-pr-review-repair
+kubectl -n orka-system apply -k examples/repository-monitor-pr-review-repair
 ```
 
 Useful commands:
@@ -23,16 +23,16 @@ four jobs on separate GitHub tokens so a leak of one does not grant the others, 
 refuses to run if any two of them are the same Secret. Create all four outside git:
 
 ```bash
-kubectl create secret generic orka-monitor-source-read \
+kubectl -n orka-system create secret generic orka-monitor-source-read \
   --from-literal=token='<read-only token for the source repository>'
 
-kubectl create secret generic orka-monitor-publication-read \
+kubectl -n orka-system create secret generic orka-monitor-publication-read \
   --from-literal=token='<read-only token for the target repository>'
 
-kubectl create secret generic orka-monitor-publication \
+kubectl -n orka-system create secret generic orka-monitor-publication \
   --from-literal=token='<token that may push branches to the target repository>'
 
-kubectl create secret generic orka-monitor-forge \
+kubectl -n orka-system create secret generic orka-monitor-forge \
   --from-literal=token='<token for GitHub API calls: PRs, comments, permission checks>'
 ```
 

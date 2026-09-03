@@ -32,9 +32,19 @@ Two things hold state:
 - Your **custom resources** — Agents, Tasks, Providers, Tools, Skills, monitors, gateways.
 
 ```bash
-kubectl -n orka-system get agents,providers,tools,skills,tasks,repositorymonitors -o json \
-  > orka-crs.json
+kubectl -n orka-system get \
+  agents,providers,tools,skills,tasks,repositorymonitors,repositoryscans,\
+outboundaccesspolicies,gateways,gatewaybindings,agentruntimes \
+  -o json > orka-crs.json
+
+# Cluster-scoped, so no -n:
+kubectl get gatewayclasses -o json > orka-gatewayclasses.json
 ```
+
+If you have the workspace provider API enabled, back up its resources too —
+`executionworkspaceclasses`, `executionworkspaceproviders`, and `executionworkspacepools`.
+Leave out any kind your cluster does not have; `kubectl` fails the whole command on an
+unknown resource rather than skipping it.
 
 :::danger[Do not copy the SQLite file from a running controller]
 Copying `orka.db` while the controller is writing produces a backup that restores without
@@ -67,10 +77,15 @@ helm upgrade orka "$TARGET_CHART" --namespace orka-system --wait
 ### 4. Verify
 
 ```bash
-kubectl -n orka-system rollout status deploy/orka
+# A Helm release named `orka` creates a Deployment named `orka-controller`.
+kubectl -n orka-system rollout status deploy/orka-controller
 kubectl -n orka-system get runtimepools
-kubectl get crd -l app.kubernetes.io/name=orka
+kubectl get crd -o name | grep '\.orka\.ai$' | wc -l
 ```
+
+The CRD count should match the target chart. Orka CRDs are the ones whose group ends in
+`.orka.ai`; they carry no common label, so counting by name is the check that actually
+works. [Release status](../reference/release-status.md) lists the count per version.
 
 Submit one small Task and confirm it reaches `Succeeded`.
 

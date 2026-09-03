@@ -22,7 +22,7 @@ kubectl apply -n orka-system -f examples/tavily/tool.yaml -f examples/tavily/tas
 kubectl logs -n orka-system -l orka.ai/task=tavily-test -f
 ```
 
-`kubectl apply -k examples/tavily` applies all three files including `secret.yaml`, whose
+`kubectl -n orka-system apply -k examples/tavily` applies all three files including `secret.yaml`, whose
 key is the literal string `YOUR_TAVILY_API_KEY_HERE`. Replace it before using kustomize,
 or use the two `kubectl create secret` commands above and skip `secret.yaml`.
 

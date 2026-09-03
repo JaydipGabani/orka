@@ -100,8 +100,9 @@ helm install orka orka/orka --version 0.1.3 \
   --namespace orka-system --create-namespace
 ```
 
-Check [the releases page](https://github.com/orka-agents/orka/releases) for a newer
-version before pinning to v0.1.3.
+Check [the tag list](https://github.com/orka-agents/orka/tags) for a newer version before
+pinning to v0.1.3. The project publishes tags and chart artifacts; it does not currently
+create GitHub Release entries, so the tags are the list to watch.
 
 Then skip to [Your first task](#your-first-task).
 
@@ -151,11 +152,32 @@ keep it somewhere safe, because rotating it makes existing snapshots unreadable:
 ```bash
 kubectl -n orka-system create secret generic orka-agent-snapshot-key \
   --from-literal=key="$(openssl rand -base64 32)"
-
-# For local evaluation, this script issues a short-lived self-signed certificate.
-# Use your own CA or cert-manager for anything real.
-bash scripts/lib/e2e-admission-tls.sh
 ```
+
+Now the webhook certificate. The chart serves admission on the Service
+`orka-webhook.orka-system.svc`, so the certificate has to name exactly that — a
+certificate for any other name is rejected by the API server at admission time, not at
+install time. For local evaluation a self-signed certificate is fine; use your own CA or
+[cert-manager](https://cert-manager.io/) for anything real.
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout /tmp/webhook.key -out /tmp/webhook.crt \
+  -subj "/CN=orka-webhook.orka-system.svc" \
+  -addext "subjectAltName=DNS:orka-webhook.orka-system.svc,DNS:orka-webhook.orka-system.svc.cluster.local"
+
+kubectl -n orka-system create secret generic orka-webhook-tls \
+  --type=kubernetes.io/tls \
+  --from-file=tls.crt=/tmp/webhook.crt \
+  --from-file=tls.key=/tmp/webhook.key \
+  --from-file=ca.crt=/tmp/webhook.crt
+```
+
+:::note[Why `ca.crt` is the certificate again]
+The certificate is self-signed, so it is its own issuer. The chart reads `ca.crt` to build
+the `caBundle` the API server uses to trust the webhook. With a real CA, `ca.crt` is that
+CA's certificate instead.
+:::
 
 Install the chart. Use `manifest_staging/charts/orka` — that is the chart that matches
 `main`. The `charts/orka` directory at the repo root is the snapshot of the last release

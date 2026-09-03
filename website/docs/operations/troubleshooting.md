@@ -61,7 +61,19 @@ chart blocks the change on upgrade for exactly this reason.
 
 ### The controller crashes immediately
 
-Check the logs first: `kubectl -n orka-system logs deploy/orka --previous`.
+Check the logs first. The Deployment name depends on how you installed, so discover it
+rather than guessing:
+
+```bash
+CONTROLLER="$(kubectl -n orka-system get deploy \
+  -l app.kubernetes.io/name=orka,app.kubernetes.io/component!=provider-proxy \
+  -o jsonpath='{.items[0].metadata.name}')"
+
+kubectl -n orka-system logs "deploy/$CONTROLLER" --previous
+```
+
+That is `orka-controller` for a Helm release named `orka`, and `orka-controller-manager`
+for the release manifest, as the table above shows.
 
 **`--watch-namespace is required; controller modes cannot use a cluster-wide watch`**
 
@@ -223,7 +235,7 @@ enough to have their own page — including the two ways to corrupt a backup. Se
 ## Getting more detail
 
 ```bash
-kubectl -n orka-system logs deploy/orka -f
+kubectl -n orka-system logs "deploy/$CONTROLLER" -f   # $CONTROLLER from above
 kubectl -n orka-system describe task <name>
 kubectl -n orka-system get events --sort-by=.lastTimestamp
 orka task events <name>
