@@ -1,3 +1,7 @@
+---
+description: "What to do when an Orka installation looks stuck, and why each remedy works."
+---
+
 # Operations runbook
 
 This page is for the person keeping an Orka installation healthy. It explains
@@ -21,12 +25,14 @@ enforce this:
   a time. The Deployment uses the `Recreate` strategy so a new Pod never starts
   while the old one still holds the volume.
 
+:::danger[Do not scale the controller above one replica]
+A second replica cannot attach the volume. It sits in `Pending` with a `Multi-Attach` volume
+warning, and if the leader is then disrupted, *both* Pods can end up `Pending`. Scaling up
+makes an Orka controller less available, not more.
+:::
+
 What this means in practice:
 
-- **Do not scale the controller above one replica.** A second replica cannot
-  attach the volume and sits in `Pending` with a `Multi-Attach` volume warning.
-  Worse, if the leader is then disrupted, both Pods can end up `Pending` — a
-  scaled-up controller is *less* available, not more.
 - **Failover is node replacement, not a hot standby.** If the controller's node
   dies, expect a short outage (a few minutes) while Kubernetes reschedules the
   Pod and reattaches the volume. In-flight work is not lost: running agent

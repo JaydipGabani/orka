@@ -1,0 +1,186 @@
+---
+slug: /provider-proxy
+description: "Standing up the proxy that holds model credentials so agent runtimes never see them."
+---
+
+# Provider proxy
+
+Built-in coding agents in Orka never receive your LLM API key. Every model call they make
+goes through a proxy that adds the real credential on the way out. This page explains the
+two pieces involved and how to set them up.
+
+If you are only running `type: ai` Tasks, you do not need any of this — the AI worker reads
+provider Secrets directly. This is required for `type: agent` Tasks, and the Helm chart
+refuses to install a `harness-v2` release without it.
+
+## Why
+
+A coding agent runs shell commands that a model chose. If that process also held your
+Anthropic or OpenAI key, any command it ran could read the key and use it for anything.
+
+So Orka splits it up:
+
+```
+agent runtime Pod  ──►  provider-auth-proxy  ──►  Vekil  ──►  Anthropic / OpenAI / Gemini
+   (short-lived           (in the Orka             (holds the        (upstream)
+    proxy token,           namespace)               real keys)
+    one model)
+```
+
+The agent gets a token that works only through the proxy, only for the model its Agent
+resource was approved for. The upstream credential never enters the agent's process tree.
+
+## The two pieces
+
+**`provider-auth-proxy`** ships with Orka. The Helm chart deploys it into the release
+namespace when `providerProxy.enabled=true`. It checks the caller's token, enforces the
+model scope, and forwards upstream.
+
+**[Vekil](https://github.com/sozercan/vekil)** is a separate open-source reverse proxy that
+holds the actual provider credentials and presents Anthropic, OpenAI Chat Completions,
+OpenAI Responses, and Gemini-compatible endpoints on one port. Orka does not install or
+manage it.
+
+Orka only accepts Vekil at exactly `http://vekil.vekil-system.svc:1337`. Other hosts,
+namespaces, and ports are rejected at chart render time, so a misconfigured install cannot
+quietly route model traffic somewhere unreviewed. One trailing slash is tolerated.
+
+## Install Vekil
+
+Vekil's own repository has full instructions. The short version, for a cluster:
+
+```bash
+# From a vekil checkout
+scripts/deploy_vekil_reverse_proxy.sh --context <kubectl-context>
+```
+
+Defaults: namespace `vekil-system`, service `vekil`, port `1337`, image
+`ghcr.io/sozercan/vekil:latest`, ClusterIP. Those defaults are exactly what Orka expects,
+so do not change the namespace or port.
+
+For a workstation:
+
+```bash
+docker run -p 1337:1337 \
+  -v ~/.config/vekil:/home/nonroot/.config/vekil \
+  ghcr.io/sozercan/vekil:latest
+```
+
+### Giving it credentials
+
+Point Vekil at a providers file that references Secrets rather than inline keys:
+
+```bash
+scripts/deploy_vekil_reverse_proxy.sh \
+  --context <kubectl-context> \
+  --providers-config ./providers.yaml \
+  --env-secret AZURE_OPENAI_API_KEY=azure-openai:key
+```
+
+Use `api_key_env` in that file, not `api_key` — the deploy script stores the config in a
+ConfigMap and rejects inline credentials.
+
+With no providers file, Vekil runs in zero-config mode against GitHub Copilot. That needs
+a GitHub token:
+
+```bash
+# Preferred: reference a Secret you already manage
+scripts/deploy_vekil_reverse_proxy.sh \
+  --env-secret COPILOT_GITHUB_TOKEN=copilot-github-token:token
+```
+
+Without a token, Vekil falls back to device-code login and prints a code and URL to its
+Pod logs. Deploy with `--skip-wait`, watch `kubectl -n vekil-system logs deploy/vekil`,
+complete the login in a browser, then check readiness.
+
+OpenAI Codex providers additionally need an `auth.json` from `codex login`, mounted with
+`--codex-auth-secret <secret>[:auth.json]`.
+
+:::tip[Cache the tokens across restarts]
+Vekil's token cache is an `emptyDir` by default, so a Pod restart discards cached auth and
+may force another login. Pass `--token-pvc <claim>` if that matters.
+:::
+
+## Verify Vekil before wiring Orka
+
+```bash
+kubectl -n vekil-system port-forward svc/vekil 1337:1337
+
+curl http://127.0.0.1:1337/healthz
+curl http://127.0.0.1:1337/readyz
+curl http://127.0.0.1:1337/v1/models
+```
+
+Do not continue until `/readyz` succeeds and the model you plan to use appears in
+`/v1/models`. A Vekil that is up but has no working upstream will make every agent Task
+fail with an authentication error that looks like an Orka problem.
+
+:::warning[The base URL differs by client]
+Anthropic and Gemini clients use `http://host:1337`. OpenAI and Codex clients use
+`http://host:1337/v1`. Getting this wrong produces 404s that look like a broken proxy.
+:::
+
+An end-to-end check with a real client:
+
+```bash
+env ANTHROPIC_BASE_URL=http://127.0.0.1:1337 ANTHROPIC_API_KEY=dummy \
+  claude --model claude-sonnet-4 --print --output-format text "Reply with exactly PROXY_OK"
+```
+
+The API key is deliberately `dummy` — Vekil supplies the real one.
+
+## Enable it in Orka
+
+Helm:
+
+```bash
+helm upgrade orka ./manifest_staging/charts/orka \
+  --namespace orka-system --reuse-values \
+  --set providerProxy.enabled=true
+```
+
+Kustomize: apply `config/acp-production` rather than `config/default`. The production
+overlay adds the network policy that permits model traffic only through the proxy — with
+`config/default`, a runtime Pod could reach Vekil directly and skip the scope check.
+
+Confirm the Deployment is Ready before submitting agent Tasks:
+
+```bash
+kubectl -n orka-system get deploy -l app.kubernetes.io/component=provider-auth-proxy
+```
+
+## Rotating the proxy token
+
+The proxy reads its token from a mounted Secret and reloads it every 5 seconds — no
+restart needed. To rotate without dropping requests, publish the new token as current and
+the old one as `previous-token`, with `previous-token-valid-until` set to an absolute
+RFC3339 time. Both are accepted until that deadline, capped at
+`providerProxy.previousTokenOverlap` (default 10 minutes, maximum 24 hours).
+
+Order matters depending on which side you roll first:
+
+- **Proxy first** — publish new-as-current and old-as-previous, wait for the reload, then
+  roll the controller and runtime pools.
+- **Controller first** — pre-stage the new token as `previous-token` while current stays
+  old, verify it works through the proxy, then swap and roll. The pre-staged value covers
+  a controller request that arrives before the proxy sees the swap.
+
+Remove the old token once every workload reports the new generation.
+
+:::danger[A failed reload stops all forwarding]
+If either token file becomes unreadable or invalid, the proxy fails its readiness check and
+refuses every authenticated request until both files are valid again. It does not keep
+serving with the last known-good value.
+:::
+
+## When something is wrong
+
+| Symptom | Where to look |
+| --- | --- |
+| Chart refuses to install, mentions `upstreamBaseURL` | The value must be exactly `http://vekil.vekil-system.svc:1337`. |
+| Agent Tasks fail with an auth error | Check Vekil `/readyz` first; it fails independently of Orka. |
+| Vekil `/healthz` passes but `/readyz` fails | Provider auth, upstream reachability, or a missing secret env var. |
+| 404s from the proxy | Base URL path — see the warning above. |
+| Rotation left requests failing | Check `previous-token-valid-until` is absolute RFC3339 and not in the past. |
+
+More in [Troubleshooting](troubleshooting.md).

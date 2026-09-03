@@ -1,4 +1,8 @@
-# Issue-to-PR Automation
+---
+description: "The full orka:* label workflow that takes an issue through to a merged pull request."
+---
+
+# Issue-to-PR automation
 
 RepositoryMonitor can run a durable maintainer-controlled issue-to-PR loop from `orka:*` labels or equivalent API/CLI/UI commands.
 

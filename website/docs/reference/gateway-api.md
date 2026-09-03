@@ -1,3 +1,7 @@
+---
+description: "The GatewayClass, Gateway, and GatewayBinding resources, field by field."
+---
+
 # Generic Gateway API
 
 Orka exposes a provider-neutral external conversation plane through `GatewayClass`, `Gateway`, and `GatewayBinding` plus durable event and delivery ledgers.

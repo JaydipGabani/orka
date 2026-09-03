@@ -1,5 +1,6 @@
 ---
 slug: /execution-events
+description: "The event stream behind task timelines, traces, forks, and approvals."
 ---
 
 # Execution events, session timelines, traces, forks, and approvals

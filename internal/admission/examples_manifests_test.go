@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -100,7 +101,13 @@ func splitYAMLDocuments(path string) ([][]byte, error) {
 		return nil, err
 	}
 	defer func() { _ = file.Close() }()
-	reader := apimachineryyaml.NewYAMLReader(bufio.NewReader(file))
+	return splitYAMLDocumentsFrom(file)
+}
+
+// splitYAMLDocumentsFrom splits a multi-document YAML stream on "---",
+// dropping empty documents.
+func splitYAMLDocumentsFrom(source io.Reader) ([][]byte, error) {
+	reader := apimachineryyaml.NewYAMLReader(bufio.NewReader(source))
 	var documents [][]byte
 	for {
 		document, err := reader.Read()
@@ -184,4 +191,171 @@ func validateExampleAgentContract(t *testing.T, scheme *runtime.Scheme, agent *c
 		return fmt.Errorf("Agent %q would be denied by admission: %s", object.Name, response.Result.Message)
 	}
 	return nil
+}
+
+// TestDocumentedManifestsDecodeStrictly guards the YAML people copy out of the
+// documentation site. Every fenced ```yaml block under website/docs/ that
+// carries an Orka apiVersion and kind must strict-decode into its typed API
+// object, so a renamed or misspelled field cannot sit in the docs telling
+// users to write something the API server rejects.
+//
+// Fragments without apiVersion/kind and non-Orka kinds are skipped: this test
+// owns Orka's API surface, not Kubernetes'. A block that is deliberately
+// invalid (showing a rejected manifest, for example) opts out with an HTML
+// comment on the line before its opening fence:
+//
+//	<!-- orka:skip-strict-decode reason -->
+func TestDocumentedManifestsDecodeStrictly(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	require.NoError(t, workspacev1alpha1.AddToScheme(scheme))
+	require.NoError(t, acpworkspacev1alpha1.AddToScheme(scheme))
+	require.NoError(t, fakeworkspacev1alpha1.AddToScheme(scheme))
+	require.NoError(t, gatewayv1alpha1.AddToScheme(scheme))
+
+	root := filepath.Join("..", "..", "website", "docs")
+	checkedDocuments := 0
+	require.NoError(t, filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(path, ".md") {
+			return nil
+		}
+		blocks, err := extractYAMLCodeBlocks(path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		for _, block := range blocks {
+			documents, err := splitYAMLDocumentsFrom(strings.NewReader(block.body))
+			if err != nil {
+				// A fragment that is not parseable YAML at all is prose, not a
+				// manifest. Only well-formed documents are our business.
+				continue
+			}
+			for index, document := range documents {
+				// A block that is not a mapping with apiVersion and kind is a
+				// fragment illustrating one field, not a manifest.
+				if !looksLikeManifest(document) {
+					continue
+				}
+				object, checked, err := strictDecodeOrkaDocument(scheme, document)
+				if err != nil {
+					return fmt.Errorf("%s:%d document %d: %w", path, block.line, index+1, err)
+				}
+				if !checked || object == nil {
+					continue
+				}
+				checkedDocuments++
+			}
+		}
+		return nil
+	}))
+	// Guard the guard: if the walk finds nothing, the docs moved and the test
+	// is validating air.
+	require.Greater(t, checkedDocuments, 40, "expected Orka manifests in website/docs/ code blocks")
+}
+
+// yamlCodeBlock is one fenced YAML block, with the 1-based line number of its
+// opening fence so a failure points at the right place in the source file.
+type yamlCodeBlock struct {
+	line int
+	body string
+}
+
+const docsStrictDecodeSkipMarker = "<!-- orka:skip-strict-decode"
+
+// extractYAMLCodeBlocks returns every ```yaml (or ```yml) fenced block in a
+// markdown file, skipping any block preceded by the opt-out marker.
+func extractYAMLCodeBlocks(path string) ([]yamlCodeBlock, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(content), "\n")
+	var blocks []yamlCodeBlock
+	for i := 0; i < len(lines); i++ {
+		fence, language, ok := parseOpeningFence(lines[i])
+		if !ok {
+			continue
+		}
+		start := i
+		var body []string
+		i++
+		for ; i < len(lines); i++ {
+			if strings.HasPrefix(strings.TrimSpace(lines[i]), fence) &&
+				strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(lines[i]), fence)) == "" {
+				break
+			}
+			body = append(body, lines[i])
+		}
+		if start > 0 && strings.Contains(lines[start-1], docsStrictDecodeSkipMarker) {
+			continue
+		}
+		switch language {
+		case "yaml", "yml":
+			blocks = append(blocks, yamlCodeBlock{line: start + 1, body: strings.Join(body, "\n")})
+		case "bash", "sh", "shell", "console":
+			// The install and first-task instructions pipe manifests through
+			// `kubectl apply -f - <<'EOF'`. Those are the manifests users copy
+			// before any other, so they get checked too.
+			blocks = append(blocks, extractShellHeredocs(start+1, body)...)
+		}
+	}
+	return blocks, nil
+}
+
+var heredocOpener = regexp.MustCompile(`<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+
+// extractShellHeredocs returns the body of every heredoc in a shell code
+// block. Heredocs that hold something other than a manifest are filtered out
+// later by looksLikeManifest.
+func extractShellHeredocs(baseLine int, lines []string) []yamlCodeBlock {
+	var blocks []yamlCodeBlock
+	for i := 0; i < len(lines); i++ {
+		match := heredocOpener.FindStringSubmatch(lines[i])
+		if match == nil {
+			continue
+		}
+		delimiter := match[1]
+		start := i
+		var body []string
+		i++
+		for ; i < len(lines); i++ {
+			if strings.TrimSpace(lines[i]) == delimiter {
+				break
+			}
+			body = append(body, lines[i])
+		}
+		blocks = append(blocks, yamlCodeBlock{line: baseLine + start, body: strings.Join(body, "\n")})
+	}
+	return blocks
+}
+
+// parseOpeningFence reports the fence run and language of a code fence line.
+// Docusaurus allows metadata after the language ("```yaml title=x"); only the
+// first word is the language.
+func parseOpeningFence(line string) (string, string, bool) {
+	trimmed := strings.TrimSpace(line)
+	run := 0
+	for run < len(trimmed) && trimmed[run] == '`' {
+		run++
+	}
+	if run < 3 {
+		return "", "", false
+	}
+	info := strings.TrimSpace(trimmed[run:])
+	language, _, _ := strings.Cut(info, " ")
+	return strings.Repeat("`", run), strings.ToLower(language), true
+}
+
+// looksLikeManifest reports whether a YAML document is a mapping carrying both
+// apiVersion and kind. Documentation is full of fragments that are perfectly
+// good YAML but are not whole objects; those are not this test's business.
+func looksLikeManifest(document []byte) bool {
+	var typeMeta metav1.TypeMeta
+	if err := sigsyaml.Unmarshal(document, &typeMeta); err != nil {
+		return false
+	}
+	return typeMeta.APIVersion != "" && typeMeta.Kind != ""
 }

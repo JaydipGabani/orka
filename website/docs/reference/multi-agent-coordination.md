@@ -1,8 +1,9 @@
 ---
 slug: /multi-agent-coordination
+description: "How one agent delegates to another: tool schemas, controller guardrails, and the child task lifecycle."
 ---
 
-# Multi-Agent Coordination
+# Multi-agent coordination
 
 Enable coordinator agents to dynamically delegate subtasks to specialist agents at runtime. The LLM decides what to delegate, to whom, and how to synthesize results. The controller enforces guardrails (allowed agents, max depth, max concurrency). Each child task is a real Kubernetes Job with full isolation.
 
@@ -215,7 +216,7 @@ Implementation (`internal/tools/check_messages.go`):
 3. Returns all unread messages addressed to this task or broadcast to all siblings (same parent)
 4. Messages are marked as read by default to avoid re-delivery
 
-### Inter-Agent Messaging
+### Inter-agent messaging
 
 Sibling tasks (children of the same coordinator) can exchange messages to coordinate work, share findings, and avoid duplicated effort. Messages flow through the controller's internal API — no direct pod-to-pod communication.
 
@@ -230,11 +231,11 @@ Sibling tasks (children of the same coordinator) can exchange messages to coordi
 - `ORKA_PARENT_TASK`: Set automatically by the job builder for child tasks (from `orka.ai/parent-task` label)
 - `ORKA_CONTROLLER_URL`, `ORKA_TASK_NAME`, `ORKA_TASK_NAMESPACE`: Already available for all workers
 
-### Controller Enforcement
+### Controller enforcement
 
 Located in `internal/controller/task_controller.go`.
 
-#### `handlePending` — Coordination Validation
+#### `handlePending` — coordination validation
 
 After agent resolution, before Job creation, the controller validates coordination constraints for child tasks (identified by `orka.ai/coordination-depth` annotation):
 
@@ -288,7 +289,7 @@ if depthStr := task.Annotations["orka.ai/coordination-depth"]; depthStr != "" {
 }
 ```
 
-#### `handleRunning` — ChildTaskStatus Population
+#### `handleRunning` — ChildTaskStatus population
 
 For coordinator tasks (those without a `orka.ai/parent-task` label), the controller lists child tasks and populates `status.childTasks[]` with name, agent, phase, and truncated result (max 500 chars):
 
@@ -324,7 +325,7 @@ if _, hasChildren := task.Labels["orka.ai/parent-task"]; !hasChildren {
 }
 ```
 
-### Job Builder — Coordination Config
+### Job builder — coordination config
 
 Located in `internal/controller/job_builder.go`. In `addAIEnvVars`, when an agent has coordination enabled, the following env vars are injected:
 
@@ -360,7 +361,7 @@ if agent != nil && agent.Spec.Coordination != nil && agent.Spec.Coordination.Ena
 
 Coordination, memory, PR, dynamic-agent, and plan tools are automatically injected into the tools list when coordination is enabled. This includes `delegate_task`, `wait_for_tasks`, `create_container_task`, sibling messaging tools, memory tools (`recall_memory`, `remember`, `propose_memory`, `search_transcript`), PR workflow tools, dynamic agent management, and `update_plan`.
 
-### AI Worker Wiring
+### AI worker wiring
 
 Located in `workers/ai/main.go`. When `ORKA_COORDINATION_ENABLED=true`:
 
@@ -478,7 +479,7 @@ spec:
   priority: 800
 ```
 
-### Expected Task Status (while running)
+### Expected Task status (while running)
 ```yaml
 status:
   phase: Running
@@ -494,7 +495,7 @@ status:
       result: "Updated 12 components to use new auth context..."
 ```
 
-## File Summary
+## File summary
 
 | File | Description |
 |---|---|
@@ -532,11 +533,11 @@ status:
 2. **Controller tests** for coordination validation (depth, allowedAgents, concurrency) using envtest
 3. **Job builder tests** verifying coordination env vars and auto-injected memory tools are set correctly
 
-## Self-Healing Coordination
+## Self-healing coordination
 
 When `auto_retry` is enabled on a delegated task, `wait_for_tasks` automatically re-creates failed child tasks with the error context prepended to the original prompt.
 
-### How It Works
+### How it works
 
 1. Coordinator calls `delegate_task` with `auto_retry: true` (and optional `max_retries`, default 2)
 2. `delegate_task` stores retry config as annotations on the child task:
@@ -571,7 +572,7 @@ When `auto_retry` is enabled on a delegated task, `wait_for_tasks` automatically
 }
 ```
 
-### Result Format
+### Result format
 
 When a task is retried, its result includes:
 ```json
@@ -588,7 +589,7 @@ When a task is retried, its result includes:
 }
 ```
 
-## Iterative Code Review Workflows
+## Iterative code review workflows
 
 Orka supports iterative multi-agent workflows where a coordinator orchestrates coding, review, and feedback loops until code is approved.
 
@@ -649,7 +650,7 @@ COORDINATOR (AI worker)
   └── COMPLETE with merged PR
 ```
 
-### delegate_task Iteration Parameters
+### delegate_task iteration parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -662,7 +663,7 @@ When `prior_task` is set:
 - Workspace config is copied from the prior task if not explicitly provided
 - Iteration labels are tracked: `orka.ai/iteration` (incremented) and `orka.ai/iteration-group` (shared ID)
 
-### Structured Result Format
+### Structured result format
 
 Workers with git workspaces produce structured results:
 
@@ -685,14 +686,14 @@ Workers with git workspaces produce structured results:
 - `wait_for_tasks` **strips the diff** from results returned to the coordinator to prevent context bloat
 - Plain-text results remain backward compatible
 
-### Iteration Labels
+### Iteration labels
 
 | Label | Description |
 |-------|-------------|
 | `orka.ai/iteration` | Iteration number (1, 2, 3...) |
 | `orka.ai/iteration-group` | Shared ID grouping all iterations of the same logical task |
 
-### Recommended Coordinator System Prompt
+### Recommended coordinator system prompt
 
 ```
 You are a coordinator agent. Follow this protocol:
@@ -975,7 +976,7 @@ Updates the autonomous execution plan state. Must be called at least once per it
 | `goal_complete` | boolean | no | Set to `true` when the overall goal has been fully achieved |
 | `plan_document` | string | yes | Full markdown plan document. Replaces the previous plan document entirely |
 
-### Recommended Coordinator System Prompt (with PR Workflow)
+### Recommended coordinator system prompt (with PR workflow)
 
 ```
 You are a coordinator agent. Follow this protocol:
@@ -1006,9 +1007,9 @@ You are a coordinator agent. Follow this protocol:
 7. Report final result with the PR URL, review result, and CI status.
 ```
 
-## Autonomous Mode
+## Autonomous mode
 
-For long-running goals that require multiple planning and execution cycles, enable autonomous mode on the coordinator agent. See [Autonomous Task Execution](autonomous-tasks.md) for details.
+For long-running goals that require multiple planning and execution cycles, enable autonomous mode on the coordinator agent. See [Autonomous Task execution](../guides/autonomous-tasks.md) for details.
 
 When `coordination.autonomous: true` is set, the controller runs the coordinator in a loop — each iteration gets the accumulated plan state, delegates sub-tasks, and updates the plan. The loop continues until the goal is complete, max iterations are reached, or the task is suspended.
 

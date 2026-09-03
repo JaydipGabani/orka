@@ -1,0 +1,65 @@
+# Iterative code review loop
+
+A coordinator agent that writes a feature, has a second agent review it, sends the
+feedback back to the writer, and repeats until the review passes — then opens the pull
+request.
+
+Three Agents play distinct parts:
+
+| Agent | Runtime | What it does |
+| --- | --- | --- |
+| `coordinator` | native `type: ai` | Runs the loop. It never touches the repository itself; it delegates and waits. |
+| `coder` | Claude ACP runtime, write workspace | Edits files. It cannot commit or push — see below. |
+| `reviewer` | Claude ACP runtime, read workspace | Reads the published branch and answers `APPROVED` or `CHANGES_NEEDED`. |
+
+## Apply it
+
+There is no kustomization here, because the Agents must exist before the Task that
+references them:
+
+```bash
+kubectl apply -n orka-system \
+  -f examples/iterative-review/coder-agent.yaml \
+  -f examples/iterative-review/reviewer-agent.yaml \
+  -f examples/iterative-review/coordinator-agent.yaml
+kubectl apply -n orka-system -f examples/iterative-review/iterative-task.yaml
+```
+
+Before applying, edit `iterative-task.yaml`: the repository URLs, branches, and Secret
+names in the prompt are placeholders. `coordinator-agent.yaml` also points at a Provider
+named `my-provider` — change it to a Provider that exists in your cluster.
+
+Watch the loop run:
+
+```bash
+kubectl get tasks -n orka-system -w
+```
+
+Child Tasks appear with generated names like `deliver-auth-feature-child-xxxxx` and are
+deleted along with the parent.
+
+## Why the coder cannot push
+
+The coder agent has the repository checked out but holds no Git credentials. When it
+finishes, Orka's clean-room publisher — a separate process that has the publication
+credential and no model access — validates the resulting tree and pushes it to
+`pushBranch`. A prompt injection that fully captures the coder still cannot write to your
+repository. See [Security](../../website/docs/concepts/security.md).
+
+This is why step 4 of the coordinator's protocol matters: the reviewer reads
+`publicationGitRepo` at `pushBranch`, not the original branch. The coder's work only
+exists on the published branch, so reviewing the source branch would review unchanged code.
+
+## Where the guardrails come from
+
+`coordinator-agent.yaml` sets `spec.coordination`:
+
+- `allowedAgents` — the only Agents this coordinator may delegate to. Anything else is
+  rejected by the controller, not by the prompt.
+- `maxDepth: 3` — a delegated agent may delegate further, but only three levels deep.
+- `maxConcurrentChildren: 2` — at most two child Tasks running at once.
+
+These are enforced when the child Task is reconciled, so a coordinator that ignores its
+system prompt still cannot exceed them. See
+[Multi-agent coordination](../../website/docs/reference/multi-agent-coordination.md) for
+the full tool schemas and controller checks.

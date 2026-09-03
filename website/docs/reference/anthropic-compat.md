@@ -1,12 +1,22 @@
 ---
 slug: /anthropic-compat
+description: "Pointing Anthropic-compatible clients at Orka's Messages API endpoint."
 ---
 
-# Anthropic-Compatible API
+# Anthropic-compatible API
 
-Orka exposes an **Anthropic-compatible Messages API** at `/anthropic/v1/messages`, enabling Anthropic-compatible clients (Claude Code, etc.) to use Orka as a transparent proxy.
+Orka speaks the Anthropic Messages API at `/anthropic/v1/messages`, so Claude Code and other
+Anthropic-native clients can point at Orka instead of at a model vendor. Your cluster holds
+the API keys; the client holds a ServiceAccount token.
 
-Orka acts as a **proxy** to whichever LLM provider is configured in your cluster, with credentials managed securely via Kubernetes Secrets and Provider CRDs. See also [OpenAI Compatibility](openai-compat.md) for the OpenAI-compatible proxy.
+:::warning[This is not a transparent proxy by default]
+Orka rewrites your request before sending it upstream: it **discards the tools your client
+sent**, injects its own, and prepends its own system prompt. See
+[Coordinator mode](openai-compat.md#coordinator-mode) for exactly what changes and how to
+turn it off — the behavior is identical on both compatibility endpoints.
+:::
+
+See also [OpenAI compatibility](openai-compat.md) for the OpenAI-shaped equivalent.
 
 ## Endpoints
 
@@ -26,7 +36,7 @@ Two authentication methods are supported:
 
 Both use a Kubernetes ServiceAccount token as the value.
 
-## Model Name Format
+## Model name format
 
 The `model` field supports two formats:
 
@@ -127,62 +137,54 @@ curl https://orka.example.com/anthropic/v1/models \
   -H "x-api-key: $ORKA_TOKEN"
 ```
 
-## Supported Features
+## Supported features
 
 | Feature | Supported |
 |---------|-----------|
 | Messages API | Yes |
 | Streaming (SSE) | Yes |
-| Tool use (function calling) | Yes |
-| Extended thinking (`thinking` content blocks with `budget_tokens`) | Yes |
-| System messages (string format) | Yes |
-| System messages (content block array format) | Yes |
+| Tool use (function calling) | Server-side only by default — see [Coordinator mode](openai-compat.md#coordinator-mode) |
+| System messages (string format) | Yes, but Orka's own prompt is prepended in coordinator mode |
+| System messages (content block array format) | Same |
 | `max_tokens` | Yes |
 | `temperature` | Yes |
 | `stop_sequences` | Yes |
+| Extended thinking (`thinking` with `budget_tokens`) | **No.** The field is accepted and ignored — see below |
 | Image inputs | Not yet |
 | PDF inputs | Not supported |
 
-## Server-Side Tool Execution
+:::warning[`thinking` is accepted but has no effect]
+A `thinking` block in your request parses without error and is then dropped: it is never
+forwarded to the provider, and Orka never returns `thinking` content blocks. A client that
+sets `budget_tokens` gets an ordinary response and no error telling it why.
 
-By default, the Anthropic endpoint enables **server-side tool execution** — it injects Orka's built-in tools into the request and runs an autonomous tool loop. When the LLM returns `tool_use` content blocks, the proxy intercepts them, executes the tools, feeds results back to the LLM, and repeats until a final text response is produced. Clients never need to execute tools locally.
+If you need extended thinking, call the provider directly.
+:::
 
-To disable this and use the endpoint as a **transparent proxy**, set the `X-Orka-Tools: disabled` header:
+## Server-side tool execution
 
-```
-X-Orka-Tools: disabled
-```
+By default this endpoint runs the tool loop itself. When the model returns `tool_use` blocks,
+Orka executes the tools, feeds the results back, and repeats until the model produces text.
+Your client never executes a tool.
 
-When this header is set, requests are forwarded to the LLM and responses are returned without intercepting tool calls. The client manages its own tool execution loop.
+[Coordinator mode](openai-compat.md#coordinator-mode) describes the full rewrite — which
+tools are injected, what happens to yours, and the `X-Orka-Tools: disabled` header that
+turns all of it off. It applies identically here; the rest of this page covers what is
+specific to the Anthropic shape.
 
-### Available Tools
+### The loop
 
-By default (without the `X-Orka-Tools: disabled` header), the proxy automatically injects these built-in tools into the request:
+1. You `POST /anthropic/v1/messages`.
+2. Orka rewrites the request (coordinator mode) and calls the model.
+3. If the response contains `tool_use` blocks, Orka executes each one, appends the results
+   to the conversation, and calls the model again.
+4. Step 3 repeats until the model returns text only.
+5. That final response goes back to you.
 
-| Tool | Description |
-|------|-------------|
-| `web_search` | Search the web for information |
-| `code_exec` | Execute code snippets in a sandbox |
-| `file_read` | Read file contents from workspace |
-| `file_write` | Write files to workspace |
-| `web_fetch` | Fetch and extract content from URLs |
+Any [Tool CRD](configuration.md) in your namespace that defines `parameters` becomes an
+available HTTP tool in this loop.
 
-Additionally, any [Tool CRDs](../concepts/configuration.md) defined in the user's namespace are automatically included as custom HTTP tools.
-
-Client-provided tools in the request are preserved and merged with the injected tools.
-
-### How It Works
-
-1. Client sends a `POST /anthropic/v1/messages` request (tools are injected automatically)
-2. Proxy injects Orka tools into the request and forwards to the LLM
-3. If the LLM returns `tool_use` blocks:
-   - Proxy executes each tool server-side
-   - Tool results are appended to the conversation
-   - Proxy calls the LLM again with updated context
-4. Steps 2-3 repeat until the LLM returns a text-only response
-5. Final response is returned to the client
-
-### Streaming Behavior
+### Streaming behavior
 
 When `stream: true`, the proxy streams Anthropic SSE events throughout the entire tool loop:
 
@@ -193,30 +195,31 @@ When `stream: true`, the proxy streams Anthropic SSE events throughout the entir
 
 This means clients see real-time progress as tools are called and results are produced, even across multiple LLM round-trips.
 
-### Limits and Timeouts
+### Limits and timeouts
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| Max iterations | 50 | Maximum number of LLM calls per request |
-| Max duration | 30 minutes | Overall request timeout |
-| Tool timeout | 60 seconds | Per-tool execution timeout |
-| Max session size | 500 KB | Conversation size budget (triggers truncation) |
+| Setting | Flag | Default | What it caps |
+|---------|------|---------|--------------|
+| Max iterations | `--chat-max-iterations` | 50 | Model calls per request |
+| Max duration | `--chat-max-duration` | 30m | Wall-clock time for the whole request |
+| Tool timeout | `--chat-tool-timeout` | 60s | One tool execution |
+| Max session size | `--chat-max-session-size` | 512,000 bytes | Conversation size before truncation |
 
-These values come from the chat configuration and apply to both streaming and non-streaming requests.
+These are the shared chat settings and apply to streaming and non-streaming requests alike.
+See [Configuration](configuration.md#controller-flags).
 
 When the iteration limit is reached, the proxy injects a summary prompt and makes one final LLM call without tools to produce a closing response.
 
-### Repetition Detection
+### Repetition detection
 
 If the LLM calls the same tool with identical arguments 3 or more times, the proxy injects a warning message asking it to try a different approach. This prevents infinite loops where the LLM repeatedly calls a failing tool.
 
-### Error Handling
+### Error handling
 
 - **Tool execution errors**: Wrapped as JSON results (`{"success": false, "error": "..."}`) and fed back to the LLM, which can decide how to recover
 - **LLM errors**: If the LLM returns a context-too-long error, the proxy truncates the conversation to ~50% and retries once. Other LLM errors terminate the loop and return an Anthropic error response
 - **Timeout**: If the overall request timeout is reached, the proxy returns whatever progress has been made
 
-### Example: curl with Server-Side Tools
+### Example: curl with server-side tools
 
 Server-side tool execution is enabled by default — no special header needed:
 
@@ -235,24 +238,23 @@ curl -X POST https://orka.example.com/anthropic/v1/messages \
 
 To use as a transparent proxy instead (client manages tools), add `X-Orka-Tools: disabled`.
 
-## Architecture
+## Request path
 
 ```
 ┌─────────────┐     ┌──────────────────────────────┐     ┌───────────────┐
-│ Claude Code │────▶│ Orka API Server              │────▶│ Anthropic API │
+│ Claude Code │────▶│ Orka API server              │────▶│ Anthropic API │
 │ (or any     │◀────│ /anthropic/v1/messages       │◀────│ OpenAI API    │
 │ Anthropic   │     │                              │     │ Azure OpenAI  │
-│ client)     │     │ Provider resolution:         │     └───────────────┘
-└─────────────┘     │ - Provider CRD lookup        │
-                    │ - Secret-based API keys      │
-                    │ - Model routing              │
-                    │ - Server-side tool execution │
+│ client)     │     │ 1. Resolve Provider CRD      │     └───────────────┘
+└─────────────┘     │ 2. Read API key from Secret  │
+                    │ 3. Coordinator rewrite       │
+                    │    (unless X-Orka-Tools:     │
+                    │     disabled)                │
+                    │ 4. Server-side tool loop     │
                     └──────────────────────────────┘
 ```
 
-Orka injects built-in tools and runs server-side tool execution by default. Set `X-Orka-Tools: disabled` to use as a transparent proxy where the client manages its own tool execution loop — see [Server-Side Tool Execution](#server-side-tool-execution) above.
-
-## Token Budgets and "Incomplete" Errors
+## Token budgets and "incomplete" errors
 
 `max_tokens` caps the model's *entire* output for a turn, and for reasoning
 models that budget is shared with hidden reasoning tokens. Two shapes come

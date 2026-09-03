@@ -1,14 +1,26 @@
 ---
 slug: /openai-compat
+description: "Pointing OpenAI-compatible clients at Orka's chat completions endpoint."
 ---
 
-# OpenAI-Compatible API
+# OpenAI-compatible API
 
-Orka exposes an **OpenAI-compatible API** at `/openai/v1/chat/completions` and `/openai/v1/models`, allowing any OpenAI-compatible client to use Orka as a provider. This includes tools like [Continue](https://continue.dev/), [Cursor](https://cursor.sh/), and others.
+Orka speaks the OpenAI chat API at `/openai/v1/chat/completions` and `/openai/v1/models`,
+so clients like [Continue](https://continue.dev/) and [Cursor](https://cursor.sh/) can point
+at Orka instead of at a model vendor. Your cluster holds the API keys; the client holds a
+ServiceAccount token.
 
-Orka acts as a **proxy** to whichever LLM provider is configured in your cluster (Anthropic, OpenAI, Azure OpenAI, etc.), with credentials managed securely via Kubernetes Secrets and Provider CRDs.
+:::warning[This is not a transparent proxy by default]
+Orka rewrites your request before sending it upstream: it **discards the tools your client
+sent**, injects its own, and prepends its own system prompt. Read
+[Coordinator mode](#coordinator-mode) before wiring up a client that relies on its own
+tools. One header turns it off.
+:::
 
-> **Breaking change:** These endpoints moved from `/v1/` to `/openai/v1/` — update your client configurations accordingly. See also [Anthropic Compatibility](anthropic-compat.md) for the Anthropic-native proxy.
+:::info[Endpoints moved]
+These used to live at `/v1/`. They are now at `/openai/v1/`. See
+[Anthropic compatibility](anthropic-compat.md) for the Anthropic-native equivalent.
+:::
 
 ## Endpoints
 
@@ -19,7 +31,7 @@ Orka acts as a **proxy** to whichever LLM provider is configured in your cluster
 
 Both endpoints require authentication via `Authorization: Bearer <token>` using a Kubernetes ServiceAccount token.
 
-## Model Name Format
+## Model name format
 
 The `model` field supports two formats:
 
@@ -144,14 +156,14 @@ curl https://orka.example.com/openai/v1/models \
   -H "Authorization: Bearer $ORKA_TOKEN"
 ```
 
-## Supported Features
+## Supported features
 
 | Feature | Supported |
 |---------|-----------|
 | Chat completions | Yes |
 | Streaming (SSE) | Yes |
-| Tool/function calling | Yes |
-| System messages | Yes |
+| Tool/function calling | Server-side only by default — see [Coordinator mode](#coordinator-mode) |
+| System messages | Yes, but Orka's own prompt is prepended in coordinator mode |
 | Multi-part content | Yes (text parts extracted) |
 | `max_tokens` / `max_completion_tokens` | Yes |
 | `temperature` | Yes |
@@ -161,25 +173,65 @@ curl https://orka.example.com/openai/v1/models \
 | Embeddings | Not supported |
 | Audio / Vision | Not supported |
 
-## Architecture
+## Coordinator mode
+
+Both compatibility endpoints — this one and
+[Anthropic](anthropic-compat.md) — default to **coordinator mode**. The idea is that your
+editor's chat window becomes a way to drive the cluster: ask for a change, and the model
+creates Agents and Tasks, waits for them, and opens a pull request. It is not a pass-through
+proxy.
+
+Concretely, Orka does five things to every request before it reaches the model:
+
+| # | What happens | Consequence for you |
+| --- | --- | --- |
+| 1 | **Your `tools` array is discarded.** Not merged — replaced. | Your client's own tools never run. |
+| 2 | 18 Orka tools are injected, plus every `Tool` CRD in the namespace that defines `parameters`. | The model can act on your cluster. |
+| 3 | The tool list is filtered against your context token's allowed tools, if you use [transaction tokens](../concepts/transaction-tokens.md). | Denied tools disappear rather than failing at call time. |
+| 4 | A large Orka system prompt is **prepended** to yours. | Your system prompt still applies, but it is no longer first. |
+| 5 | Tool history is stripped from your messages. `role: tool` messages are dropped; assistant messages keep their text but lose their tool calls; consecutive same-role messages are merged. | Sending back a conversation that contains client-side tool use loses that structure. |
+
+Orka then runs the tool loop itself and returns the final answer.
+
+The 18 injected tools:
+
+| Group | Tools |
+| --- | --- |
+| Built-in | `web_search`, `web_fetch`, `code_exec`, `file_read`, `file_write` |
+| Create work | `create_agent`, `create_agent_task`, `create_ai_task`, `create_container_task`, `create_pr_monitor` |
+| Track work | `check_task_progress`, `fetch_task_output`, `wait_for_task`, `cancel_task`, `list_agents`, `list_tasks` |
+| Pull requests | `create_pull_request`, `check_pull_request_ci` |
+
+### Turning it off
+
+```
+X-Orka-Tools: disabled
+```
+
+With that header the endpoint is a plain proxy: your tools are forwarded untouched, your
+system prompt is used as-is, your message history is passed through, and your client runs
+its own tool loop. Provider resolution and credential handling are unchanged.
+
+Use `disabled` when you want Orka only for centralized credentials and model routing. Leave
+it on when you want the model to be able to do things in the cluster.
+
+## Request path
 
 ```
 ┌─────────────┐     ┌─────────────────────────────┐     ┌───────────────┐
-│ Continue    │────▶│ Orka API Server             │────▶│ Anthropic API │
+│ Continue    │────▶│ Orka API server             │────▶│ Anthropic API │
 │ (or any     │◀────│ /openai/v1/chat/completions │◀────│ OpenAI API    │
 │ OAI client) │     │                             │     │ Azure OpenAI  │
-└─────────────┘     │ Provider resolution:        │     └───────────────┘
-                    │ - Provider CRD lookup       │
-                    │ - Secret-based API keys     │
-                    │ - Model routing             │
+└─────────────┘     │ 1. Resolve Provider CRD     │     └───────────────┘
+                    │ 2. Read API key from Secret │
+                    │ 3. Coordinator rewrite      │
+                    │    (unless X-Orka-Tools:    │
+                    │     disabled)               │
+                    │ 4. Server-side tool loop    │
                     └─────────────────────────────┘
 ```
 
-Orka transparently proxies requests to the backend LLM provider. The client manages its own tool execution loop — Orka simply forwards the messages and tool definitions to the LLM and returns the response.
-
-> **Note:** Both the OpenAI and Anthropic endpoints inject Orka's built-in tools (web_search, code_exec, etc.) and run server-side tool execution by default. Set `X-Orka-Tools: disabled` header to use as a transparent proxy instead.
-
-## Token Budgets and "Incomplete" Errors
+## Token budgets and "incomplete" errors
 
 `max_tokens` caps the model's *entire* output for a turn, and for reasoning
 models that budget is shared with hidden reasoning tokens. Two shapes come

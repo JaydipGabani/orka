@@ -1,0 +1,146 @@
+---
+slug: /container-tasks
+description: "Running an ordinary container as a Task, and the filesystem rules it has to live with."
+---
+
+# Container tasks
+
+A `type: container` Task runs an ordinary container command — no model involved. It is how
+you get a build, a test run, or a lint pass done, either on its own or because a coding
+agent asked for one.
+
+```yaml
+apiVersion: core.orka.ai/v1alpha1
+kind: Task
+metadata:
+  name: unit-tests
+  namespace: orka-system
+spec:
+  type: container
+  image: golang:1.26
+  command: ["sh", "-c"]
+  args: ["export GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomodcache && go test ./..."]
+  timeout: 20m
+```
+
+That example already contains both of the things people get wrong. They are worth
+understanding, because both fail in confusing ways.
+
+## The filesystem is read-only
+
+Task Pods run with `readOnlyRootFilesystem: true`. Exactly three paths are writable:
+
+| Path | What it is |
+| --- | --- |
+| `/tmp` | Scratch space |
+| `/home/worker` | The worker's home directory |
+| `/workspace` | The working directory, including any cloned repository |
+
+Everything else — including the places most language toolchains put their caches — will
+reject writes.
+
+This is a deliberate hardening choice, not an oversight. It means a command cannot modify
+its own image at runtime. See [Security](../concepts/security.md#execution-workloads).
+
+### Redirect your toolchain's cache
+
+Every toolchain that caches outside those three paths needs an environment variable:
+
+| Toolchain | Default location | Set instead |
+| --- | --- | --- |
+| Go modules | `/go/pkg/mod` | `GOMODCACHE=/tmp/gomodcache` |
+| Go build | `/root/.cache/go-build` | `GOCACHE=/tmp/gocache` |
+| npm | `~/.npm` | `npm_config_cache=/tmp/npm-cache` |
+| pip | `~/.cache/pip` | `PIP_CACHE_DIR=/tmp/pip-cache` |
+
+:::danger[An inline prefix only applies to the first command]
+This looks right and is not:
+
+```bash
+GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomodcache go test ./... && go build ./...
+```
+
+Shell variable prefixes apply to a single command. `go test` gets the redirected caches;
+`go build` reverts to `/go/pkg` and crashes with
+`could not create module cache: mkdir /go/pkg: read-only file system`.
+
+Use `export` so the whole chain inherits it:
+
+```bash
+export GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomodcache && go test ./... && go build ./...
+```
+:::
+
+You can also set them in `spec.env` instead of in the command, which is cleaner when the
+command is long:
+
+```yaml
+spec:
+  type: container
+  image: golang:1.26
+  env:
+    - name: GOCACHE
+      value: /tmp/gocache
+    - name: GOMODCACHE
+      value: /tmp/gomodcache
+  command: ["sh", "-c"]
+  args: ["go test ./... && go build ./..."]
+```
+
+## Use `sh -c`, not `bash -lc`
+
+Always:
+
+```yaml
+command: ["sh", "-c"]
+```
+
+Never:
+
+```yaml
+command: ["bash", "-lc"]    # breaks official language images
+```
+
+The `-l` flag makes bash a *login* shell, which rebuilds `PATH` from `/etc/profile`. The
+official `golang`, `node`, and `python` images put their tool on `PATH` through a
+Dockerfile `ENV` instruction, and a login shell throws that away. The result is:
+
+```
+bash: line 1: go: command not found
+```
+
+A non-login `sh -c` keeps the environment the image set up. If the image has its own
+entrypoint that you want, use that instead.
+
+## Error messages and what they mean
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `go: command not found` in a `golang:*` image | `bash -lc` reset `PATH` | Use `["sh","-c"]` |
+| `could not create module cache` | Go module cache outside `/tmp` | `export GOMODCACHE=/tmp/gomodcache` |
+| `mkdir /go/pkg: read-only file system` | Same | Same |
+| `mkdir /root/.cache: read-only file system` | Go build cache outside `/tmp` | `export GOCACHE=/tmp/gocache` |
+| Second command in a chain fails, first succeeded | Inline env prefix, not `export` | Use `export ... && ...` |
+| `EACCES` / `EROFS` from npm or pip | Cache outside `/tmp` | Set `npm_config_cache` or `PIP_CACHE_DIR` |
+
+## Other fields
+
+Container Tasks use the same Task fields as everything else:
+
+- `spec.timeout` — how long before the Task is killed
+- `spec.retryPolicy` — retries with backoff
+- `spec.resources` — CPU and memory requests and limits
+- `spec.secretRef` — a Secret mounted at `/secrets/task`
+- `spec.execution` — a `RuntimeClass` such as `gvisor` for stronger isolation
+- `spec.schedule` — a cron expression, for recurring work
+
+See [Configuration](../reference/configuration.md) for the full list.
+
+## When an agent creates these
+
+Coordinator agents create container Tasks through the `create_container_task` tool to
+compile and test their own work. They are given the same rules above in their system
+prompt, so they usually get it right — but if you see an agent looping on
+`go: command not found`, this page is what it failed to apply.
+
+See [Multi-agent coordination](../reference/multi-agent-coordination.md).
