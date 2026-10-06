@@ -42,6 +42,9 @@ func (a taskAccess) load(c fiber.Ctx, namespace, taskName string) (*corev1alpha1
 		}
 		return nil, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get task: %v", err))
 	}
+	if err := denyRemediationTaskPublicAccess(task); err != nil {
+		return nil, err
+	}
 	return task, nil
 }
 
@@ -84,7 +87,7 @@ func (a taskAccess) loadReadableForContextToken(c fiber.Ctx, action, namespace, 
 		ui.AuthType == AuthTypeContextToken && ui.ContextToken != nil
 	tokenReviewCaller := ui != nil && ui.AuthType == AuthTypeTokenReview
 	if !contextTokenCaller && !tokenReviewCaller {
-		return nil, nil
+		return nil, a.h.checkRemediationTaskPublicAccess(c.Context(), namespace, taskName)
 	}
 	task, err := a.load(c, namespace, taskName)
 	if err != nil {

@@ -1,0 +1,10 @@
+diff --git a/order.go b/order.go
+--- a/order.go
++++ b/order.go
+@@ -3,5 +3,5 @@
+ package order
+ 
+ func Accept(quantity int) bool {
+-	return true
++	return quantity >= 1
+ }

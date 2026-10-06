@@ -1,0 +1,232 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: orka-validation
+  labels:
+    orka.ai/controller-mode: harness-v2
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: caller
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: manager-role
+subjects:
+  - kind: ServiceAccount
+    name: controller
+    namespace: orka-validation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: authentication
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: metrics-auth-role
+subjects:
+  - kind: ServiceAccount
+    name: controller
+    namespace: orka-validation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: namespace-reader
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["orka-validation"]
+    verbs: ["get"]
+  # The full v2 controller starts these read-only informers even when validation
+  # is the only workload exercised by this development installation.
+  - apiGroups: ["workspace.orka.ai"]
+    resources: ["executionworkspaceproviders"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["acp.workspace.orka.ai"]
+    resources: ["runtimeproviderconfigs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: namespace-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: namespace-reader
+subjects:
+  - kind: ServiceAccount
+    name: controller
+    namespace: orka-validation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: caller
+rules:
+  - apiGroups: ["core.orka.ai"]
+    resources: ["validations"]
+    verbs: ["create", "get"]
+  - apiGroups: ["core.orka.ai"]
+    resources: ["validations/evidence"]
+    verbs: ["get"]
+  - apiGroups: ["core.orka.ai"]
+    resources: ["validations/cancel"]
+    verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: caller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: caller
+subjects:
+  - kind: ServiceAccount
+    name: caller
+    namespace: orka-validation
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: inputs
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: orka-validation-controller
+  template:
+    metadata:
+      labels:
+        app: orka-validation-controller
+    spec:
+      serviceAccountName: controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: validation-controller:development
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-elect=true
+            - --controller-mode=harness-v2
+            - --acp-runtime-namespace=orka-validation
+            - --watch-namespace=orka-validation
+            - --enforce-namespace-isolation=true
+            - --execution-mode-controller-usernames=system:serviceaccount:orka-validation:validation-controller
+            - --gateway-enabled=false
+            - --health-probe-bind-address=:8081
+            - --store-path=/data/orka.db
+            - --agent-execution-snapshot-key-file=/snapshot/key
+            - --validation-enabled=true
+            - --validation-input-root=/validation
+            - --validation-helper-image=REPLACE_WITH_HELPER_DIGEST
+            - --validation-tool-image=golang@sha256:116489021a0d8ca3facf79f84ee69052cff88733547150a644d45c5eaa91dc43
+            - --validation-tool-image-id=golang@sha256:116489021a0d8ca3facf79f84ee69052cff88733547150a644d45c5eaa91dc43
+            - --validation-platform=linux/amd64
+            - --validation-profile=offline
+          ports:
+            - name: api
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: inputs
+              mountPath: /validation
+              readOnly: true
+            - name: snapshot
+              mountPath: /snapshot
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: data
+        - name: inputs
+          persistentVolumeClaim:
+            claimName: inputs
+        - name: snapshot
+          secret:
+            secretName: validation-snapshot
+            defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector:
+    app: orka-validation-controller
+  ports:
+    - name: http
+      port: 8080
+      targetPort: api

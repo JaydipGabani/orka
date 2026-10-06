@@ -133,6 +133,9 @@ func (h *Handlers) StreamTaskEvents(c fiber.Ctx) error {
 			}
 		}
 		writeAvailable := func() bool {
+			if err := h.checkRemediationTaskPublicAccess(ctx, namespace, taskName); err != nil {
+				return false
+			}
 			listed, err := streamStore.ListExecutionEvents(ctx, store.ExecutionEventFilter{
 				Namespace:  namespace,
 				StreamType: events.ExecutionEventStreamTypeTask,
@@ -286,6 +289,9 @@ func (h *Handlers) ListSessionEvents(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list session execution events: %v", err))
 	}
+	if err := h.checkRemediationSessionEvents(c.Context(), namespace, listed); err != nil {
+		return err
+	}
 
 	success = true
 	return c.JSON(NewListSessionExecutionEventsResponse(namespace, sessionName, query.afterSeq, latestSeq, listed))
@@ -355,6 +361,9 @@ func (h *Handlers) StreamSessionEvents(c fiber.Ctx) error {
 				metrics.RecordExecutionEventStreamError("session", "list")
 				log.Error(err, "failed to list execution events for session stream", "namespace", namespace, "session", sessionName)
 				return true
+			}
+			if err := h.checkRemediationSessionEvents(ctx, namespace, listed); err != nil {
+				return false
 			}
 			for _, event := range listed {
 				if event.SessionSeq > lastSeq {
@@ -509,6 +518,13 @@ func (h *Handlers) ensureSessionReadable(c fiber.Ctx, namespace, sessionName str
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get session type: %v", err))
 	}
 	if sessionType == store.SessionTypeGateway {
+		return fiber.NewError(fiber.StatusNotFound, "session not found")
+	}
+	visibility, err := h.remediationVisibility(c.Context(), namespace)
+	if err != nil {
+		return err
+	}
+	if visibility.sessionPrivate(sessionName, "") {
 		return fiber.NewError(fiber.StatusNotFound, "session not found")
 	}
 	return nil

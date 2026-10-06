@@ -11,7 +11,7 @@ UID, groups, and extra attributes. The permission must cover the final namespace
 resource, verb, and name. Missing clients, review errors, denied decisions, and
 ambiguous results return `403` before the requested operation runs.
 
-The table covers all 129 authenticated external route registrations, including 50
+The table covers all 139 authenticated external route registrations, including 55
 non-GET registrations under `/api/v1` and the OpenAI and Anthropic compatibility
 routes. `GET /api/v1/auth/validate` and `GET /api/v1/auth/whoami` only validate or
 report the authenticated identity. They do not access tenant resources and require
@@ -22,6 +22,61 @@ tokens retain their `off`, `audit`, and `enforce` scope and `tctx` policies. Nei
 identity is converted into a TokenReview identity for these checks. Existing
 route-specific restrictions still apply. See [Security](../concepts/security.md)
 and [Transaction Token integration](../concepts/transaction-tokens.md).
+
+The standalone `/api/v1/validations` routes currently accept only Kubernetes
+TokenReview identities. They reject direct OIDC and transaction-token identities,
+even when those identities can use other API routes. Validation is opt-in; a
+disabled validation service returns `404` to an otherwise authorized caller.
+
+The experimental `/api/v1/remediations` routes also require Kubernetes
+TokenReview authentication, even if transaction-token enforcement is disabled.
+The remediation service is separately opt-in. A fresh disabled installation
+returns `404`; disabling admission on an installation with retained runs keeps
+read, cancellation, cleanup-reconciliation, and retention paths available.
+Submission requires both `create remediations` and named `use
+remediationpolicies` in the resolved namespace. A policy name selects only
+server-configured policy; callers cannot choose Agents, models, execution drivers,
+or host paths. Approval, cancellation, cleanup reconciliation, drain visibility,
+listing, and artifact grants are independent of `get remediations`. All responses
+are `Cache-Control: private, no-store`.
+
+Before accepting new pipeline-backed work, the service takes a metadata-only
+snapshot of the approved model/account boundary and stores it atomically with
+the run and encrypted intake. Temporary snapshot failures return a redacted
+`503` and leave no runnable run or intake row. Exact request replays are resolved
+before consulting current Agent/Provider resources, so replacement or outage of
+those resources does not rewrite or prevent replay of an accepted boundary.
+Current caller authorization and policy-use checks still apply; changed
+submission input returns `409`.
+
+`orka remediate start --incident ID_OR_URL` acquires a complete read-only IcM
+snapshot **on the caller's machine**, using the existing local `icm-cli` and
+`azcli` authentication (or explicit `--icm-auth env`). It does not log in
+automatically or require IcM/Azure CLI credentials in the controller image.
+The CLI prints its stable request ID before acquisition, persists a private
+intent and export under the user cache's `orka/remediation/<requestID>/export`,
+outside Git checkouts, and posts only the complete report JSON. The report's
+source ID preserves the incident identity. Retrying with the same request ID
+verifies the saved receipt and artifact digests instead of exporting a newer
+incident snapshot; incomplete or changed captures fail closed and remain private.
+The submitted payload is still limited to 8 MiB, even if the exporter can capture
+larger responses. `--input` submits a supplied private report without contacting
+IcM. Once accepted, the remote run no longer depends on the caller's connection.
+
+Reserved remediation proposal Tasks are not a public report retrieval surface.
+Generic Task detail, result, log, event, trace, plan, artifact, approval, and fork
+routes return `404` for them, even when the caller has broad Task permissions or
+remediation artifact access. Task collections, child lists, and API-hosted
+management tools omit them. Associated Sessions are also hidden; the native
+proposal policy itself prohibits Session use. This restriction remains in effect
+when the remediation service is disabled. Use the private, named
+`remediations/artifacts` route instead.
+
+**Deploy remediation in a dedicated namespace.** These API checks do not alter
+Kubernetes RBAC or protect direct `kubectl`/Kubernetes clients. Restrict direct
+Task, Job, Pod, and Pod-log access in that namespace to trusted operators and
+controller identities, including writes that could remove reserved metadata.
+Kubernetes RBAC cannot hide selected objects by their labels.
 
 Health probes, static UI files, Gateway adapter ingress, GitHub webhooks, and
 internal worker/ACP routes are outside this inventory. Their existing probe,
@@ -59,17 +114,89 @@ resource and subresource fields and to the same slash-separated string in RBAC.
   `monitoractions`, `monitorworkactions`, `monitorimplementationjobs`,
   `monitormutations`, and `monitorevents` authorize the corresponding stored
   ledgers. Their collection filters do not narrow a namespace-wide `list` grant.
+- `validations` authorizes standalone validation submissions, independently of
+  RepositoryMonitor and security-finding permissions. `validations/evidence`
+  covers the evidence record and its blobs; `validations/cancel` covers
+  cancellation and the returned current submission state. These named actions
+  use the submission's `requestID`, not its execution `runID`. A create request
+  with `earlierValidation` first resolves that run ID in the request's namespace,
+  then requires named `get` on `validations/evidence` for the earlier submission's
+  `requestID`, before the service can consume its frozen evidence or prepare work.
+  A create grant alone does not permit linking another submission.
 - `gatewayevents` and `gatewaydeliveries` are virtual resources in
   `gateway.orka.ai`. Their permissions are additional to the current Gateway
   identity and access checks.
+- `remediations` and its `approve`, `cancel`, `reconcile`, `drain`, and `artifacts` subresources are
+  namespaced virtual resources in `core.orka.ai`. Named operations use the run
+  `id`, not the caller's stable submission `requestID`. Creation resolves the
+  configured policy (including an omitted default), then checks named
+  `use remediationpolicies` before storing input. A stable request ID permits
+  identical replays; different input returns `409`. Artifact downloads are
+  attachment-only, bounded to 8 MiB, and include `Digest: sha-256=<base64>` plus an
+  `ETag` containing the quoted `sha256:<hex>` metadata digest.
+  `list remediations` returns metadata only, at most 100 rows per page; `limit`
+  selects 1–100 rows and `continue` uses the preceding page's last run ID.
+  `get remediations/drain` returns full-namespace active, quarantined, and
+  retained-intake counts, not a recent-page estimate. `update
+  remediations/reconcile` accepts only `{"expectedRevision": N}` for the exact
+  named quarantined run. The durable audit and bounded cleanup-budget reset are
+  atomic. It cannot resume execution, change effect identities, discard intake,
+  release the active source reservation, or declare unresolved resources gone.
+  HTTP `202` acknowledges the cleanup re-drive, not completed cleanup. An
+  ambiguous create without a recovered exact UID may remain unresolved through
+  repeated re-drives; its visible quarantine continues to hold the source,
+  active-run/payload quota, and encrypted intake. Drain and key rotation can
+  therefore remain blocked. This is an accepted POC scope limit: name-only
+  `NotFound`, timers, or retry counts are not absence proofs, and no force release
+  or permanent inert-name tombstone mechanism is provided. See the
+  [operator limitation](../development/report-remediation.md#ambiguous-creates-accepted-poc-limitation).
+
+For example, the additional policy-use review for a remediation submission in
+`team-a` selecting policy `approved` has this shape (identity groups, UID, and
+extra attributes are also forwarded from the TokenReview):
+
+```yaml
+apiVersion: authorization.k8s.io/v1
+kind: SubjectAccessReview
+spec:
+  user: system:serviceaccount:team-a:remediator
+  resourceAttributes:
+    namespace: team-a
+    group: core.orka.ai
+    resource: remediationpolicies
+    name: approved
+    verb: use
+```
+
+For cleanup re-drive, the exact resource permission is:
+
+```yaml
+apiVersion: authorization.k8s.io/v1
+kind: SubjectAccessReview
+spec:
+  user: system:serviceaccount:team-a:remediation-operator
+  resourceAttributes:
+    namespace: team-a
+    group: core.orka.ai
+    resource: remediations
+    subresource: reconcile
+    name: rm-0123456789abcdef0123456789abcdef
+    verb: update
+```
+
+This grant is separate from `update remediations/cancel`; neither implies
+`create remediations` or `use remediationpolicies`. Drain inspection uses
+`get remediations/drain` with no resource name. See
+[operator recovery and key rotation](../development/report-remediation.md#operator-recovery-and-key-rotation)
+for the bounded cleanup and retention lifecycle.
 
 The HTTP method does not define the permission. `PUT /api/v1/agents/:name` patches
 the Kubernetes Agent, so it requires `patch` on `agents`. Approval decisions require
 `update` on `tasks/approvals` and `patch` on the parent Task. A monitor run or
 command also needs `patch` on its RepositoryMonitor. Commands also require named
 `create` on `repositorymonitors/runs` before the command or its derived run is
-stored. A scan, validation, or patch request that creates a Task also needs
-`create` on `tasks` before any work is queued. Starting a scan also requires
+stored. A scan or security-finding validation or patch request that creates a Task
+also needs `create` on `tasks` before any work is queued. Starting a scan also requires
 `list` on Tasks to check for active scan work.
 `POST /api/v1/security/findings/:id/pull-request` only returns a stored PR
 receipt, so its permission is `get`, despite the HTTP method.
@@ -132,6 +259,9 @@ means no name, including Kubernetes collection creates. A named virtual action
 uses the parent name or record ID even when its verb is `create` or `list`.
 Proposal review, apply, and archive trim the proposal ID to match store lookup;
 noncanonical namespaces for these actions are rejected.
+Standalone validation routes also reject noncanonical Kubernetes namespace names,
+including whitespace-padded names, rather than authorizing one name and using
+another.
 
 ## Route permissions
 
@@ -165,6 +295,19 @@ otherwise. In the additional-checks column:
 | `GET` | `/api/v1/tasks/:id/children` | `core.orka.ai` | `tasks` | `get` | `:id` | `Q` | `list` on `core.orka.ai/tasks`, empty name; Gateway read |
 | `GET` | `/api/v1/tasks/:id/artifacts` | `core.orka.ai` | `tasks` | `get` | `:id` | `Q` | Gateway read |
 | `GET` | `/api/v1/tasks/:id/artifacts/:filename` | `core.orka.ai` | `tasks` | `get` | `:id` | `Q` | Gateway read |
+| `POST` | `/api/v1/validations` | `core.orka.ai` | `validations` | `create` | empty | `Q` | TokenReview only; with `earlierValidation`, named `get validations/evidence` on the earlier submission |
+| `GET` | `/api/v1/validations/:id` | `core.orka.ai` | `validations` | `get` | `:id` | `Q` | TokenReview only |
+| `GET` | `/api/v1/validations/:id/evidence` | `core.orka.ai` | `validations/evidence` | `get` | `:id` | `Q` | TokenReview only |
+| `GET` | `/api/v1/validations/:id/evidence/:digest` | `core.orka.ai` | `validations/evidence` | `get` | `:id` | `Q` | TokenReview only |
+| `POST` | `/api/v1/validations/:id/cancel` | `core.orka.ai` | `validations/cancel` | `update` | `:id` | `Q` | TokenReview only; idempotent cancellation returns actual current state |
+| `POST` | `/api/v1/remediations` | `core.orka.ai` | `remediations` | `create` | empty | `Q` | TokenReview only; named `use remediationpolicies` for the resolved server policy |
+| `GET` | `/api/v1/remediations` | `core.orka.ai` | `remediations` | `list` | empty | `Q` | TokenReview only; metadata-only keyset pages, at most 100 rows |
+| `GET` | `/api/v1/remediations/drain` | `core.orka.ai` | `remediations/drain` | `get` | empty | `Q` | TokenReview only; full-namespace counts, no side effects |
+| `GET` | `/api/v1/remediations/:id` | `core.orka.ai` | `remediations` | `get` | `:id` | `Q` | TokenReview only |
+| `POST` | `/api/v1/remediations/:id/approve` | `core.orka.ai` | `remediations/approve` | `update` | `:id` | `Q` | TokenReview only; exact pending `planDigest` |
+| `POST` | `/api/v1/remediations/:id/cancel` | `core.orka.ai` | `remediations/cancel` | `update` | `:id` | `Q` | TokenReview only; cancellation does not delete evidence |
+| `POST` | `/api/v1/remediations/:id/reconcile` | `core.orka.ai` | `remediations/reconcile` | `update` | `:id` | `Q` | TokenReview only; exact quarantined `expectedRevision`, audited cleanup-only re-drive |
+| `GET` | `/api/v1/remediations/:id/artifacts/:name` | `core.orka.ai` | `remediations/artifacts` | `get` | `:id` | `Q` | TokenReview only; namespace-bound immutable artifact |
 | `GET` | `/api/v1/sessions` | `core.orka.ai` | `sessions` | `list` | empty | `Q` | none |
 | `GET` | `/api/v1/sessions/:id` | `core.orka.ai` | `sessions` | `get` | `:id` | `Q` | none |
 | `GET` | `/api/v1/sessions/:id/events` | `core.orka.ai` | `sessions` | `get` | `:id` | `Q` | none |
@@ -288,6 +431,8 @@ permissions above. The editor adds the listed Orka mutations. Nested tools that
 run Kubernetes workloads need separate
 workload grants, including `get` on `pods/log` when reading Pod logs. Neither
 helper grants Secrets, ConfigMaps, or workspace-class use.
+Standalone validation grants are also separate from the helper roles; add only
+the validation permissions needed by the caller.
 Kubernetes `code_exec` preflights `create` and `delete` on its temporary Secrets,
 ServiceAccounts, Jobs, and optional NetworkPolicies before creating any of them.
 The delete permissions cover cleanup after completion or failed setup.
@@ -303,6 +448,36 @@ the selected repository's read credential; `create_pull_request` uses
 Optional Git credential discovery skips Secret names that the caller cannot
 read. Other lookup errors still stop discovery, and explicit Secret reads
 remain subject to authorization.
+
+For standalone validation, this namespaced Role permits creating a submission,
+reading and cancelling a selected submission, and reading or linking selected
+earlier evidence. Replace the example names with actual returned `requestID`
+values, and bind the Role to the caller with a RoleBinding in `team-a`. Generic
+Task or RepositoryMonitor grants do not substitute for these permissions.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: validation-client
+  namespace: team-a
+rules:
+- apiGroups: [core.orka.ai]
+  resources: [validations]
+  verbs: [create]
+- apiGroups: [core.orka.ai]
+  resources: [validations]
+  resourceNames: [vr-current]
+  verbs: [get]
+- apiGroups: [core.orka.ai]
+  resources: [validations/evidence]
+  resourceNames: [vr-earlier]
+  verbs: [get]
+- apiGroups: [core.orka.ai]
+  resources: [validations/cancel]
+  resourceNames: [vr-current]
+  verbs: [update]
+```
 
 Existing Task helper roles retain session access; Task editor/admin roles also
 grant `update` on `tasks/approvals`. Gateway helper roles include ledger reads;

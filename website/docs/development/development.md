@@ -92,6 +92,9 @@ make test-e2e
 
 See [Testing](testing.md) for full test structure and patterns.
 
+For experimental private report ingestion, reproduction, and patch workflows,
+see [Report-driven remediation](report-remediation.md).
+
 ### CI validation
 
 The repository has additional GitHub Actions workflows in addition to the normal test matrix:

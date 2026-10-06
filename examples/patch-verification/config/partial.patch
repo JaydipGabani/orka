@@ -1,0 +1,13 @@
+diff --git a/policy.json b/policy.json
+--- a/policy.json
++++ b/policy.json
+@@ -1,7 +1,7 @@
+ {
+-  "revision": 1,
+-  "allowAnonymous": true,
++  "revision": 2,
++  "allowAnonymous": false,
+   "allowAuthenticated": true,
+   "migrateExisting": false,
+   "postInstallOverride": false
+ }

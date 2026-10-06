@@ -1,0 +1,9 @@
+diff --git a/order.c b/order.c
+--- a/order.c
++++ b/order.c
+@@ -1,4 +1,3 @@
+ int accept_quantity(int quantity) {
+-    (void)quantity;
+-    return 1;
++    return quantity >= 1;
+ }

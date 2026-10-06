@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/google/uuid"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -70,6 +72,7 @@ import (
 	_ "github.com/orka-agents/orka/internal/llm/openai"
 	_ "github.com/orka-agents/orka/internal/metrics"
 	"github.com/orka-agents/orka/internal/outboundaccess"
+	validationkube "github.com/orka-agents/orka/internal/patchverification/kube"
 	publisherservice "github.com/orka-agents/orka/internal/publisher/service"
 	"github.com/orka-agents/orka/internal/store"
 	storekube "github.com/orka-agents/orka/internal/store/kube"
@@ -261,6 +264,7 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var apiPort int
+	var apiBindHost string
 	var watchNamespace string
 	var generalWorkerImage string
 	var aiWorkerServiceAccountName string
@@ -291,6 +295,19 @@ func main() {
 	var gatewayClaimLease time.Duration
 	var gatewayPollInterval time.Duration
 	var gatewayBatchSize int
+	var validationEnabled bool
+	var validationInputRoot string
+	var validationHelperImage string
+	var validationToolImage string
+	var validationToolImageID string
+	var validationPlatform string
+	var validationProfile string
+	var validationNodeSelector string
+	var validationLocalServicesEnabled bool
+	var validationNetworkCanary string
+	var remediationEnabled bool
+	var remediationPrivateNamespace bool
+	var remediationPolicyFile string
 	var aiWorkerImage string
 	var storeBackend string
 	var storePath string
@@ -422,6 +439,7 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.IntVar(&apiPort, "api-port", 8080, "The port the REST API server binds to.")
+	flag.StringVar(&apiBindHost, "api-bind-host", "", "Literal IP for the REST API listener; empty preserves all-interface binding. Use 127.0.0.1 for local-only development.")
 	flag.StringVar(&watchNamespace, "watch-namespace", "", "Required single namespace to watch for resources.")
 	flag.BoolVar(&workspaceProviderAPIEnabled, "enable-workspace-provider-api",
 		envBool("ORKA_ENABLE_WORKSPACE_PROVIDER_API"),
@@ -466,6 +484,19 @@ func main() {
 			"no-tool-use response as the final turn. The model must emit the GOAL_STATE sentinel on its true "+
 			"final turn — see coordinatorSystemPrompt.")
 	flag.BoolVar(&gatewayEnabled, "gateway-enabled", true, "Enable generic gateway reconciliation and ingress.")
+	flag.BoolVar(&validationEnabled, "validation-enabled", false, "Enable Kubernetes-backed patch validation.")
+	flag.StringVar(&validationInputRoot, "validation-input-root", "", "Absolute operator-provisioned validation input root.")
+	flag.StringVar(&validationHelperImage, "validation-helper-image", "", "Digest-pinned validation helper image.")
+	flag.StringVar(&validationToolImage, "validation-tool-image", "", "Digest-pinned validation tool image.")
+	flag.StringVar(&validationToolImageID, "validation-tool-image-id", "", "Expected runtime image ID for the validation tool image.")
+	flag.StringVar(&validationPlatform, "validation-platform", "linux/amd64", "Validation worker platform (linux/amd64 or linux/arm64).")
+	flag.StringVar(&validationProfile, "validation-profile", "offline", "Validation sandbox profile (offline or local-services).")
+	flag.StringVar(&validationNodeSelector, "validation-node-selector", "kubernetes.io/os=linux", "Validation worker node selector key=value (no custom node configuration is required).")
+	flag.BoolVar(&validationLocalServicesEnabled, "validation-local-services-enabled", false, "Allow local-services validation with enforced NetworkPolicy.")
+	flag.StringVar(&validationNetworkCanary, "validation-network-canary", "", "Trusted local-services canary IP:port.")
+	flag.BoolVar(&remediationEnabled, "remediation-enabled", false, "Enable operator-policy-backed remediation; requires a reviewed, digest-pinned AI worker supporting memory opt-out.")
+	flag.StringVar(&remediationPolicyFile, "remediation-policy-file", "", "Absolute path to private, operator-provisioned remediation policy JSON.")
+	flag.BoolVar(&remediationPrivateNamespace, "remediation-private-namespace", false, "Acknowledge that remediation uses a dedicated private watch namespace and restricted Task, audit, Secret and datastore access.")
 	flag.IntVar(&gatewayPendingPerSession, "gateway-pending-per-session", 100,
 		"Maximum pending gateway events per Session.")
 	flag.IntVar(&gatewayMaxRecordsPerGateway, "gateway-max-records-per-gateway", 1000,
@@ -1433,6 +1464,65 @@ func main() {
 	)
 	jobBuilder.OutboundAccessTrustedGatewayServices = outboundAccessTrustedGatewayServices
 	jobBuilder.OutboundAccessTrustedTokenEndpointServices = outboundAccessTrustedTokenEndpointServices
+	remediationService, err := setupRemediationService(processCtx, mgr, sqliteStore, remediationOptions{
+		Enabled: remediationEnabled, Namespace: watchNamespace, PolicyFile: remediationPolicyFile,
+		StorePath: storePath, AIWorkerImage: aiWorkerImage, KubeClient: kubeClient,
+		PrivateNamespaceAcknowledged: remediationPrivateNamespace,
+		ACPRuntimeEnabled:            acpRuntimeEnabled, ACPRuntimeNamespace: acpRuntimeNamespace, CopilotRuntimeImage: acpCopilotRuntimeImage,
+		ProviderProxyBaseURL: acpProviderProxyBaseURL, ProviderProxyNamespace: acpProviderProxyNamespace,
+		IntakeRetention: agentExecutionSnapshotRetention, IntakeRetentionInterval: agentExecutionSnapshotRetentionInterval,
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to configure remediation")
+		os.Exit(1)
+	}
+	jobBuilder.RemediationDispatchValidator = remediationDispatchValidator(remediationService)
+	var validationService *validationkube.Service
+	var validationTaskReconciler controller.ValidationTaskReconciler
+	var validationAPIService api.ValidationService
+	if validationEnabled {
+		nodeSelectorKey, nodeSelectorValue, ok := strings.Cut(validationNodeSelector, "=")
+		if !ok || strings.TrimSpace(nodeSelectorKey) == "" || strings.TrimSpace(nodeSelectorValue) == "" {
+			setupLog.Error(fmt.Errorf("selector must be key=value"), "invalid validation node selector")
+			os.Exit(1)
+		}
+		canaryHost, canaryPort := "", 0
+		if validationNetworkCanary != "" {
+			var portText string
+			var err error
+			canaryHost, portText, err = net.SplitHostPort(validationNetworkCanary)
+			if err != nil {
+				setupLog.Error(err, "invalid validation network canary")
+				os.Exit(1)
+			}
+			canaryPort, err = strconv.Atoi(portText)
+			if err != nil {
+				setupLog.Error(err, "invalid validation network canary port")
+				os.Exit(1)
+			}
+		}
+		var err error
+		validationService, err = validationkube.New(mgr.GetClient(), mgr.GetAPIReader(), kubeClient, sqliteStore, mgr.GetScheme(), validationkube.Config{
+			Enabled: validationEnabled, Namespace: watchNamespace, InputRoot: validationInputRoot, HelperImage: validationHelperImage,
+			ToolImage: validationToolImage, ToolImageID: validationToolImageID, Platform: validationPlatform,
+			Profile: validationProfile, NodeSelectorKey: nodeSelectorKey, NodeSelectorValue: nodeSelectorValue,
+			LocalServices: validationLocalServicesEnabled, CanaryHost: canaryHost, CanaryPort: canaryPort,
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to configure Kubernetes validation")
+			os.Exit(1)
+		}
+		jobBuilder.ValidationJobBuilder = validationService.BuildValidationJob
+		validationTaskReconciler = validationService
+		validationAPIService = validationService
+		validationService.SetJobRenderer(func(ctx context.Context, task *corev1alpha1.Task) (*batchv1.Job, error) {
+			return jobBuilder.Build(ctx, task, nil, nil)
+		})
+		if err := mgr.Add(validationService); err != nil {
+			setupLog.Error(err, "unable to add Kubernetes validation service")
+			os.Exit(1)
+		}
+	}
 	// Auto-discover controller URL from in-cluster service if not explicitly set
 	if jobBuilder.ControllerURL == "" {
 		ns := os.Getenv(workerenv.PodNamespace)
@@ -1518,6 +1608,7 @@ func main() {
 		APIReader:                    mgr.GetAPIReader(),
 		Scheme:                       mgr.GetScheme(),
 		JobBuilder:                   jobBuilder,
+		ValidationTaskReconciler:     validationTaskReconciler,
 		SessionManager:               sessionManager,
 		WebhookNotifier:              webhookNotifier,
 		KubeClient:                   kubeClient,
@@ -1573,6 +1664,9 @@ func main() {
 			contextTokenAuthzConfig.SecretCredentialReadScopes()...,
 		),
 		OutboundAccessTrust: outboundAccessTrust,
+	}
+	if remediationService != nil {
+		taskReconciler.RemediationACPValidator = remediationService.CopilotQueueValidator
 	}
 	if err := taskReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Task")
@@ -1654,6 +1748,10 @@ func main() {
 			// cancellation, finalization, drain, and cleanup against their actors.
 			SubstrateRouterURL:      substrateConfig.RouterURL,
 			SubstrateActorDNSSuffix: substrateConfig.ActorDNSSuffix,
+		}
+		if remediationService != nil {
+			acpDispatcher.RemediationQueueValidator = remediationService.CopilotQueueValidator
+			acpDispatcher.RemediationDispatchValidator = remediationService.CopilotDispatchValidator
 		}
 		if err := mgr.Add(acpDispatcher); err != nil {
 			setupLog.Error(err, "unable to add ACP dispatcher")
@@ -1947,6 +2045,7 @@ func main() {
 	}
 	apiServer := api.NewServer(mgr.GetClient(), sessionManager, api.ServerConfig{
 		Port:                      apiPort,
+		BindHost:                  apiBindHost,
 		WatchNamespace:            watchNamespace,
 		ExecutionMode:             mode,
 		EnforceNamespaceIsolation: enforceNamespaceIsolation,
@@ -1980,6 +2079,8 @@ func main() {
 		APIReader:                 mgr.GetAPIReader(),
 		ControllerEpochs:          publisherControllerEpochs,
 		E2EPromptFaultEnabled:     strings.TrimSpace(acpE2EPromptWriteAmbiguityMarker) != "",
+		ValidationService:         validationAPIService,
+		RemediationService:        remediationService,
 		Chat: api.ChatConfig{
 			Enabled:                chatEnabled,
 			Provider:               chatProvider,

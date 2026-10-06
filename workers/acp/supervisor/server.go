@@ -256,6 +256,9 @@ type sessionState struct {
 	creating                bool
 	drainCleanupScheduled   bool
 	publicationFinalization *harnessv2.PublicationFinalizationReceipt
+
+	// A settled prompt may be abandoned only while no validator owns its tree.
+	workspaceValidationInProgress bool
 }
 
 type promptState struct {

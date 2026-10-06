@@ -833,6 +833,12 @@ func TestACPDispatcherRestoredTaskPreservesJournaledCompletion(t *testing.T) {
 			); err != nil {
 				t.Fatal(err)
 			}
+			// This journal-restoration fixture already retired its runtime.
+			// Absence of the pool alone must not substitute for that evidence.
+			if err := fixture.dispatcher.markTaskScopedRuntimeSessionCleanupComplete(fixture.ctx, task, task.UID,
+				task.Status.Execution.RuntimeInstanceID, task.Status.Execution.RuntimeSessionUID, task.Status.Execution.RuntimeSessionGeneration); err != nil {
+				t.Fatal(err)
+			}
 			sourceUID, restoredUID := restoreACPRecoveryFixtureTask(t, fixture)
 			if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
 				t.Fatal(err)
@@ -1225,11 +1231,11 @@ func TestACPDispatcherMarksRestoredPostWriteTaskOutcomeUnknown(t *testing.T) {
 		corev1alpha1.TaskExecutionStateOutcomeUnknown, corev1alpha1.TaskExecutionOutcomeOutcomeUnknown, acpRestorePostWriteMessage)
 }
 
-func TestACPDispatcherRestoredTaskRecordsSourceBoundCleanupWhenRuntimeIsAbsent(t *testing.T) {
+func TestACPDispatcherRestoredTaskRequiresRetirementProofWhenRuntimeIsAbsent(t *testing.T) {
 	fixture := newACPRecoveryFixture(t, store.PromptExecutionAccepted)
 	defer fixture.close(t)
 
-	sourceUID, _ := restoreACPRecoveryFixtureTask(t, fixture)
+	restoreACPRecoveryFixtureTask(t, fixture)
 	task := &corev1alpha1.Task{}
 	key := types.NamespacedName{Namespace: "default", Name: "task"}
 	if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
@@ -1244,42 +1250,19 @@ func TestACPDispatcherRestoredTaskRecordsSourceBoundCleanupWhenRuntimeIsAbsent(t
 		t.Fatal(err)
 	}
 
-	if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
-		t.Fatal(err)
+	if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("missing runtime without retirement proof: %v, want conflict", err)
 	}
 	if err := fixture.kubeClient.Get(fixture.ctx, key, task); err != nil {
 		t.Fatal(err)
 	}
-	wantDigest, err := taskScopedRuntimeSessionCleanupDigest(
-		sourceUID, task.Status.Execution.Attempt, task.Status.Execution.RuntimeInstanceID,
-		task.Status.Execution.RuntimeSessionUID, task.Status.Execution.RuntimeSessionGeneration,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if task.Status.Execution.RuntimeSessionCleanupDigest != wantDigest || !taskScopedRuntimeSessionCleanupComplete(task) {
-		t.Fatalf("restored cleanup receipt = %q, want source-bound %q", task.Status.Execution.RuntimeSessionCleanupDigest, wantDigest)
-	}
-
-	projector := &ACPOutboxProjector{
-		Client: fixture.kubeClient, Store: fixture.controlStore, Epochs: fixture.dispatcher.Epochs,
-		WorkerID: "restored-cleanup-projector", MaxAttempts: 3,
-	}
-	if err := projector.projectOnce(fixture.ctx); err != nil {
-		t.Fatal(err)
-	}
-	projectionID := standaloneTaskTerminalProjectionIDForUID(task.Namespace, sourceUID, task.Status.Execution.Attempt)
-	projection, err := fixture.controlStore.GetOutboxProjection(fixture.ctx, projectionID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if projection.State != store.OutboxProjectionDelivered {
-		t.Fatalf("restored source projection state = %s, want Delivered", projection.State)
+	if task.Status.Execution.RuntimeSessionCleanupDigest != "" || taskScopedRuntimeSessionCleanupComplete(task) {
+		t.Fatal("pool absence minted an unproven runtime cleanup receipt")
 	}
 	reconciler := &TaskReconciler{Client: fixture.kubeClient, DurableControlStore: fixture.controlStore}
 	ready, err := reconciler.acpTaskDeletionReady(fixture.ctx, task)
-	if err != nil || !ready {
-		t.Fatalf("restored Task deletion readiness = %v, %v", ready, err)
+	if !errors.Is(err, store.ErrConflict) || ready {
+		t.Fatalf("unproven restored Task deletion readiness = %v, %v", ready, err)
 	}
 }
 

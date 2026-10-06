@@ -10,8 +10,10 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,6 +68,7 @@ func (s *ControllerEpochStoreFenceSource) CurrentFence(ctx context.Context) (sto
 // ServerConfig holds configuration for the API server
 type ServerConfig struct {
 	Port                      int
+	BindHost                  string
 	WatchNamespace            string
 	ExecutionMode             executionmode.Mode
 	EnforceNamespaceIsolation bool
@@ -94,6 +97,8 @@ type ServerConfig struct {
 	APIReader                 client.Reader
 	ControllerEpochs          ControllerEpochFenceSource
 	E2EPromptFaultEnabled     bool
+	ValidationService         ValidationService
+	RemediationService        RemediationService
 }
 
 // Server is the REST API server
@@ -167,6 +172,8 @@ func NewServer(c client.Client, sessionManager *controller.SessionManager, confi
 		GatewayEventStore:         config.GatewayEventStore,
 		GatewayDeliveryStore:      config.GatewayDeliveryStore,
 		GatewayService:            config.GatewayService,
+		ValidationService:         config.ValidationService,
+		RemediationService:        config.RemediationService,
 	})
 	resolver := NewProviderResolver(c, config.Chat)
 	server.chatHandler = NewChatHandler(c, config.APIReader, sessionManager, config.Chat, config.WatchNamespace, config.EnforceNamespaceIsolation, config.SessionStore, config.ResultStore, resolver, config.Clientset)
@@ -195,6 +202,9 @@ func requestBodyConfig(header *fasthttp.RequestHeader) fasthttp.RequestConfig {
 	}
 	if isGatewayIngressPath(path) {
 		return fasthttp.RequestConfig{MaxRequestBodySize: protocol.MaxHTTPBodyBytes}
+	}
+	if strings.EqualFold(strings.TrimSuffix(path, "/"), "/api/v1/remediations") {
+		return fasthttp.RequestConfig{MaxRequestBodySize: 8 << 20, ReadTimeout: 30 * time.Second}
 	}
 	// Internal broker endpoints authorize against per-pool secrets that are
 	// only resolvable from the request body, so unauthenticated peers cannot
@@ -291,6 +301,8 @@ func (s *Server) setupRoutes() {
 	// GitHub webhooks use HMAC verification instead of Kubernetes/OIDC bearer auth.
 	s.app.Post("/webhooks/github", s.handlers.HandleGitHubWebhook)
 
+	s.app.Use("/api/v1/remediations", s.handlers.requireRemediationEnabled)
+
 	externalAuth := NewAuthMiddleware(s.client, AuthConfig{OIDC: s.config.OIDC, ContextTokens: s.config.ContextTokens})
 
 	// API v1 group
@@ -313,6 +325,21 @@ func (s *Server) setupRoutes() {
 	api.Get("/tasks/:id/children", s.handlers.GetTaskChildren)
 	api.Get("/tasks/:id/artifacts", s.handlers.ListTaskArtifacts)
 	api.Get("/tasks/:id/artifacts/:filename", s.handlers.DownloadTaskArtifact)
+
+	api.Post("/validations", s.handlers.CreateValidation)
+	api.Get("/validations/:id", s.handlers.GetValidation)
+	api.Get("/validations/:id/evidence", s.handlers.GetValidationEvidence)
+	api.Get("/validations/:id/evidence/:digest", s.handlers.GetValidationEvidenceBlob)
+	api.Post("/validations/:id/cancel", s.handlers.CancelValidation)
+
+	api.Post("/remediations", s.handlers.CreateRemediation)
+	api.Get("/remediations", s.handlers.ListRemediations)
+	api.Get("/remediations/drain", s.handlers.GetRemediationDrain)
+	api.Get("/remediations/:id", s.handlers.GetRemediation)
+	api.Post("/remediations/:id/approve", s.handlers.ApproveRemediation)
+	api.Post("/remediations/:id/cancel", s.handlers.CancelRemediation)
+	api.Post("/remediations/:id/reconcile", s.handlers.ReconcileRemediationCleanup)
+	api.Get("/remediations/:id/artifacts/:name", s.handlers.DownloadRemediationArtifact)
 
 	// Session endpoints
 	api.Get("/sessions", s.handlers.ListSessions)
@@ -523,7 +550,10 @@ func (s *Server) hasInternalStores() bool {
 
 // Start starts the API server
 func (s *Server) Start(ctx context.Context) error {
-	addr := fmt.Sprintf(":%d", s.config.Port)
+	if s.config.BindHost != "" && net.ParseIP(s.config.BindHost) == nil {
+		return fmt.Errorf("API bind host must be a literal IP address")
+	}
+	addr := net.JoinHostPort(s.config.BindHost, strconv.Itoa(s.config.Port))
 	log.Info("starting API server", "address", addr)
 
 	// Start server in a goroutine

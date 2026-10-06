@@ -675,11 +675,11 @@ func (d *ACPDispatcher) readRecoverableTask(
 		return nil, false, nil
 	}
 	if !latest.DeletionTimestamp.IsZero() && !acpTaskHasUnvalidatedSourceIdentity(latest) {
-		// A deleting standalone Task may still need its terminal projection after
-		// publication failed. Recover only an already settled attempt with exact
-		// runtime cleanup proof; deleting prompts must never be replayed.
+		// Deletion must not hide the work which produces its cleanup receipt.
+		// Only terminal or post-write attempts are recoverable here; neither
+		// branch can requeue a deleting prompt for execution.
 		if !taskDispatchableByACP(latest) || latest.Spec.SessionRef != nil || latest.Status.Execution == nil ||
-			acpTaskHasRestoredSourceIdentityBinding(latest) || !taskScopedRuntimeSessionCleanupComplete(latest) {
+			acpTaskHasRestoredSourceIdentityBinding(latest) {
 			return nil, false, nil
 		}
 		attemptID, idErr := promptAttemptIDFromTask(latest)
@@ -693,8 +693,13 @@ func (d *ACPDispatcher) readRecoverableTask(
 		if getErr != nil {
 			return nil, false, getErr
 		}
-		if !store.IsTerminalPromptExecutionState(attempt.ExecutionState) || !store.IsTerminalPromptDeliveryState(attempt.DeliveryState) {
-			return nil, false, nil
+		switch attempt.ExecutionState {
+		case store.PromptExecutionSubmitting, store.PromptExecutionSubmittedUnknown,
+			store.PromptExecutionAccepted, store.PromptExecutionRunning, store.PromptExecutionSettling:
+		default:
+			if !store.IsTerminalPromptExecutionState(attempt.ExecutionState) || !store.IsTerminalPromptDeliveryState(attempt.DeliveryState) {
+				return nil, false, nil
+			}
 		}
 	}
 	return latest, true, nil
@@ -1337,7 +1342,7 @@ func persistTaskScopedRuntimeSessionCleanupReceipt(
 		if latest.Status.Execution == nil {
 			return fmt.Errorf("%w: Task execution status is missing during RuntimeSession cleanup receipt", store.ErrConflict)
 		}
-		if latest.Status.Execution.Attempt != task.Status.Execution.Attempt ||
+		if latest.UID != task.UID || latest.Status.Execution.Attempt != task.Status.Execution.Attempt ||
 			latest.Status.Execution.RuntimeInstanceID != runtimeInstanceID ||
 			latest.Status.Execution.RuntimeSessionUID != runtimeSessionUID ||
 			latest.Status.Execution.RuntimeSessionGeneration != runtimeSessionGeneration ||
@@ -1730,21 +1735,22 @@ func (d *ACPDispatcher) reconcileRecoveredRuntimeSession(
 	var mcpConfiguration harnessv2.MCPPolicyConfiguration
 	var runtimeClient *harnessv2.Client
 	var runtimeFence harnessv2.Fence
+	var poolCleanup *runtimePoolCleanupAuthority
 	var externalEndpointRotated bool
 	if poolName := strings.TrimSpace(execution.RuntimePoolName); poolName != "" {
 		pool := &corev1alpha1.RuntimePool{}
 		if err := d.APIReader.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: poolName}, pool); err != nil {
 			if apierrors.IsNotFound(err) {
-				if sessionDeletion {
-					return false, fmt.Errorf("%w: Session runtime cleanup cannot prove the missing RuntimePool was retired", store.ErrConflict)
-				}
-				if !deleteAfterSettlement {
+				if !deleteAfterSettlement && !sessionDeletion {
 					return true, nil
 				}
-				if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration); markErr != nil {
-					return false, markErr
+				if task.Spec.SessionRef != nil && !sessionDeletion {
+					// Preserve the existing task-scoped write-Session policy.
+					err := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, taskUID,
+						execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration)
+					return err == nil, err
 				}
-				return true, nil
+				return false, fmt.Errorf("%w: runtime cleanup cannot prove the missing RuntimePool was retired", store.ErrConflict)
 			}
 			return false, err
 		}
@@ -1753,20 +1759,32 @@ func (d *ACPDispatcher) reconcileRecoveredRuntimeSession(
 		if err != nil {
 			return false, err
 		}
-		if active == nil || active.RuntimeInstanceID != execution.RuntimeInstanceID {
-			if sessionDeletion {
-				return false, fmt.Errorf("%w: Session runtime cleanup requires the frozen RuntimePool instance", store.ErrConflict)
-			}
-			if !deleteAfterSettlement {
+		if string(pool.UID) != execution.RuntimePoolUID || active == nil || active.RuntimeInstanceID != execution.RuntimeInstanceID {
+			if !deleteAfterSettlement && !sessionDeletion {
 				return true, nil
 			}
-			if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration); markErr != nil {
-				return false, markErr
+			if task.Spec.SessionRef != nil && !sessionDeletion {
+				err := d.markTaskScopedRuntimeSessionCleanupComplete(ctx, task, taskUID,
+					execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration)
+				return err == nil, err
 			}
-			return true, nil
+			return false, fmt.Errorf("%w: runtime cleanup requires proof for the frozen RuntimePool instance", store.ErrConflict)
 		}
 		if active.ControllerEpoch != currentFence.Epoch {
-			return false, nil
+			if active.ControllerEpoch < 1 || active.ControllerEpoch >= currentFence.Epoch || pool.Spec.ExecutionWorkspace != nil {
+				return false, nil
+			}
+			// Historical retirement is limited to durably settled standalone
+			// attempts; it neither settles Reserved work nor abandons Sessions.
+			ready, err := d.standaloneRuntimePoolRetirementReady(ctx, task, taskUID)
+			if err != nil || !ready {
+				return false, err
+			}
+			runtimeClient, poolCleanup, err = d.runtimePoolRetirementClient(ctx, task, taskUID, pool, currentFence)
+			if err != nil {
+				return false, err
+			}
+			runtimeFence = poolCleanup.fence
 		}
 		if sessionDeletion && (string(pool.UID) != execution.RuntimePoolUID ||
 			active.BootID != execution.RuntimeSessionSupervisorBootID ||
@@ -1882,7 +1900,7 @@ func (d *ACPDispatcher) reconcileRecoveredRuntimeSession(
 	if statusErr != nil {
 		return false, statusErr
 	}
-	if sessionDeletion {
+	if sessionDeletion || poolCleanup != nil {
 		if err := validateSessionRuntimeCleanupStatus(runtimeFence, status); err != nil {
 			return false, err
 		}
@@ -1897,6 +1915,10 @@ func (d *ACPDispatcher) reconcileRecoveredRuntimeSession(
 		if !deleteAfterSettlement || sessionDeletion {
 			return true, nil
 		}
+		if poolCleanup != nil {
+			err := poolCleanup.recordCleanup(ctx, d)
+			return err == nil, err
+		}
 		if markErr := d.markTaskScopedRuntimeSessionCleanupComplete(
 			ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration,
 		); markErr != nil {
@@ -1904,7 +1926,38 @@ func (d *ACPDispatcher) reconcileRecoveredRuntimeSession(
 		}
 		return true, nil
 	}
+	abandonUnvalidatedPrompt := false
+	if poolCleanup == nil && target.pool != nil && target.pool.Spec.ExecutionWorkspace == nil && deleteAfterSettlement &&
+		(observed.State == harnessv2.RuntimeSessionStateValidating || observed.State == harnessv2.RuntimeSessionStatePromptRunning ||
+			observed.State == harnessv2.RuntimeSessionStateCancelling) {
+		ready, err := d.standaloneRuntimePoolRetirementReady(ctx, task, taskUID)
+		if err != nil {
+			return false, err
+		}
+		if ready {
+			owner, err := d.Epochs.CurrentFence(ctx)
+			if err != nil {
+				return false, err
+			}
+			runtimeClient, poolCleanup, err = d.runtimePoolRetirementClient(ctx, task, taskUID, target.pool, owner)
+			if err != nil {
+				return false, err
+			}
+			runtimeFence = poolCleanup.fence
+		}
+	}
 	switch observed.State {
+	case harnessv2.RuntimeSessionStateValidating:
+		if poolCleanup == nil || !poolCleanup.abandon || !deleteAfterSettlement {
+			return false, nil
+		}
+		abandonUnvalidatedPrompt = true
+	case harnessv2.RuntimeSessionStatePromptRunning, harnessv2.RuntimeSessionStateCancelling:
+		if poolCleanup == nil || !deleteAfterSettlement {
+			return false, nil
+		}
+		// Exact deletion requests cancellation first. The supervisor must settle
+		// that prompt before any retry can prove descendant termination.
 	case harnessv2.RuntimeSessionStatePublicationPrepared:
 		if task.Spec.Workspace == nil || task.Spec.Workspace.Intent != corev1alpha1.WorkspaceIntentWrite {
 			return false, fmt.Errorf("recover RuntimeSession publication finalization: prepared session is not bound to a write workspace")
@@ -1942,12 +1995,21 @@ func (d *ACPDispatcher) reconcileRecoveredRuntimeSession(
 			return false, err
 		}
 	}
-	if err := d.deleteRuntimeSessionForTaskUID(
-		context.WithoutCancel(ctx), runtimeClient, harnessv2.RuntimeSessionID(runtimeSessionID(runtimeFence)), task, taskUID, runtimeFence, reason,
-	); err != nil {
+	request, err := newDeleteRuntimeSessionRequestForTaskUID(task, taskUID, runtimeFence, reason, time.Now().UTC().Add(30*time.Second))
+	if err != nil {
+		return false, err
+	}
+	if abandonUnvalidatedPrompt {
+		request.AbandonUnvalidatedPrompt = true
+		request.Metadata.PromptID = harnessv2.PromptID(execution.PromptID)
+		if err := sealMutation(&request.Metadata.RequestDigest, request); err != nil {
+			return false, err
+		}
+	}
+	if err := d.deleteRuntimeSessionRequest(context.WithoutCancel(ctx), runtimeClient, harnessv2.RuntimeSessionID(runtimeSessionID(runtimeFence)), request); err != nil {
 		return false, fmt.Errorf("recover task-scoped RuntimeSession cleanup: %w", err)
 	}
-	if sessionDeletion {
+	if sessionDeletion || poolCleanup != nil {
 		status, err := runtimeClient.Status(ctx)
 		if err != nil {
 			return false, err
@@ -1958,7 +2020,13 @@ func (d *ACPDispatcher) reconcileRecoveredRuntimeSession(
 		if _, present := runtimeSessionStatusForFence(status.Sessions, runtimeFence); present {
 			return false, nil
 		}
-		return true, nil
+		if sessionDeletion {
+			return true, nil
+		}
+	}
+	if poolCleanup != nil {
+		err := poolCleanup.recordCleanup(ctx, d)
+		return err == nil, err
 	}
 	if err := d.markTaskScopedRuntimeSessionCleanupComplete(
 		ctx, task, taskUID, execution.RuntimeInstanceID, execution.RuntimeSessionUID, execution.RuntimeSessionGeneration,

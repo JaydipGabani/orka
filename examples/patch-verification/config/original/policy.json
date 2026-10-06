@@ -1,0 +1,7 @@
+{
+  "revision": 1,
+  "allowAnonymous": true,
+  "allowAuthenticated": true,
+  "migrateExisting": false,
+  "postInstallOverride": false
+}

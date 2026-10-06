@@ -662,13 +662,20 @@ type DeleteRuntimeSessionRequest struct {
 	Protocol string           `json:"protocol"`
 	Metadata MutationMetadata `json:"metadata"`
 	Reason   string           `json:"reason,omitempty"`
+	// AbandonUnvalidatedPrompt retires an exact settled prompt whose controller
+	// has durably abandoned delivery. It requires prompt identity and cannot
+	// interrupt workspace validation or prepared publication. Older supervisors
+	// reject this optional field rather than weakening the deletion barrier.
+	AbandonUnvalidatedPrompt bool `json:"abandonUnvalidatedPrompt,omitempty"`
 }
 
 func (r DeleteRuntimeSessionRequest) ValidateAt(now time.Time) error {
 	if err := validateProtocol(r.Protocol); err != nil {
 		return err
 	}
-	if err := r.Metadata.validateAt(now, metadataRequirements{session: true}); err != nil {
+	if err := r.Metadata.validateAt(now, metadataRequirements{
+		session: true, task: r.AbandonUnvalidatedPrompt, prompt: r.AbandonUnvalidatedPrompt,
+	}); err != nil {
 		return fmt.Errorf("metadata: %w", err)
 	}
 	if err := validateBoundedString("delete reason", r.Reason, false, MaxDiagnosticBytes); err != nil {

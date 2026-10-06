@@ -56,6 +56,7 @@ import (
 	"github.com/orka-agents/orka/internal/events"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	orkametrics "github.com/orka-agents/orka/internal/metrics"
+	"github.com/orka-agents/orka/internal/remediationpolicy"
 	storekube "github.com/orka-agents/orka/internal/store/kube"
 	"github.com/orka-agents/orka/internal/workspace"
 )
@@ -949,8 +950,9 @@ func validateRuntimePoolProfile(pool *corev1alpha1.RuntimePool) (harnessv2.Runti
 	if err != nil {
 		return harnessv2.RuntimeProfile{}, "", err
 	}
-	if profile.ResourceClass != runtimePoolResourceClassStandard {
-		return harnessv2.RuntimeProfile{}, "", fmt.Errorf("spec.runtime.profile.resourceClass %q is not supported", profile.ResourceClass)
+	if profile.ResourceClass == remediationpolicy.CopilotResourceClass &&
+		(pool.Spec.Capacity == nil || pool.Spec.Capacity.MaxResidentSessions != 1 || pool.Spec.Capacity.MaxRunningPrompts != 1) {
+		return harnessv2.RuntimeProfile{}, "", fmt.Errorf("remediation RuntimePools require exactly one session and prompt")
 	}
 	profileDigest, err := harnessv2.CanonicalProfileDigest(profile)
 	if err != nil {
@@ -2730,7 +2732,7 @@ func runtimePoolPodTemplateRevision(template corev1.PodTemplateSpec) string {
 }
 
 func runtimePoolResourceRequirements(resourceClass string) corev1.ResourceRequirements {
-	if resourceClass != runtimePoolResourceClassStandard {
+	if resourceClass != runtimePoolResourceClassStandard && resourceClass != remediationpolicy.CopilotResourceClass {
 		return corev1.ResourceRequirements{}
 	}
 	return corev1.ResourceRequirements{
@@ -3926,7 +3928,13 @@ func runtimePoolHarnessProfile(spec corev1alpha1.RuntimePoolProfileSpec) (harnes
 	default:
 		return harnessv2.RuntimeProfile{}, fmt.Errorf("spec.runtime.profile.providerKind %q is not a supported built-in provider", profile.ProviderKind)
 	}
-	if profile.ResourceClass != runtimePoolResourceClassStandard {
+	switch profile.ResourceClass {
+	case runtimePoolResourceClassStandard:
+	case remediationpolicy.CopilotResourceClass:
+		if err := remediationpolicy.ValidateCopilotProfile(profile); err != nil {
+			return harnessv2.RuntimeProfile{}, err
+		}
+	default:
 		return harnessv2.RuntimeProfile{}, fmt.Errorf("spec.runtime.profile.resourceClass %q is not supported", profile.ResourceClass)
 	}
 	return profile, nil

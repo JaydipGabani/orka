@@ -1,0 +1,12 @@
+diff --git a/client.go b/client.go
+--- a/client.go
++++ b/client.go
+@@ -12,7 +12,7 @@
+ )
+ 
+ func allowed(quantity int) bool {
+-	return true
++	return quantity >= 1 && quantity <= 3
+ }
+ 
+ func main() {

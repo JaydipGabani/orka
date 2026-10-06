@@ -37,6 +37,7 @@ import (
 	"github.com/orka-agents/orka/internal/executionmode"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/metrics"
+	"github.com/orka-agents/orka/internal/remediationpolicy"
 	"github.com/orka-agents/orka/internal/taskmeta"
 	"github.com/orka-agents/orka/internal/tools"
 	"github.com/orka-agents/orka/internal/workerenv"
@@ -103,6 +104,8 @@ const (
 // JobBuilder builds Kubernetes Jobs for Tasks
 type JobBuilder struct {
 	client.Client
+	ValidationJobBuilder                       func(context.Context, *corev1alpha1.Task) (*batchv1.Job, error)
+	RemediationDispatchValidator               func(context.Context, *corev1alpha1.Task, *corev1alpha1.Agent, *corev1alpha1.Provider) error
 	AIWorkerImage                              string
 	GeneralWorkerImage                         string
 	InitImage                                  string
@@ -446,6 +449,27 @@ func (b *JobBuilder) Build(ctx context.Context, task *corev1alpha1.Task, agent *
 
 // BuildWithOptions creates a Job for the given Task using additional resolved options.
 func (b *JobBuilder) BuildWithOptions(ctx context.Context, task *corev1alpha1.Task, agent *corev1alpha1.Agent, provider *corev1alpha1.Provider, opts JobBuildOptions) (*batchv1.Job, error) {
+	if remediationpolicy.IsNativeProposal(task) {
+		if b.RemediationDispatchValidator == nil {
+			return nil, fmt.Errorf("remediation proposal execution is disabled")
+		}
+		if err := b.RemediationDispatchValidator(ctx, task, agent, provider); err != nil {
+			return nil, fmt.Errorf("remediation proposal dispatch is not authorized: %w", err)
+		}
+	}
+	if task != nil {
+		for name := range task.Annotations {
+			if strings.HasPrefix(name, "patchverification.orka.ai/") {
+				if b.ValidationJobBuilder == nil {
+					return nil, fmt.Errorf("standalone validation execution is disabled")
+				}
+				if opts.RepositoryMonitorValidation || agent != nil || provider != nil {
+					return nil, fmt.Errorf("standalone validation cannot use monitor or agent execution")
+				}
+				return b.ValidationJobBuilder(ctx, task)
+			}
+		}
+	}
 	if err := validateContainerPublicationWorkspace(task); err != nil {
 		return nil, err
 	}

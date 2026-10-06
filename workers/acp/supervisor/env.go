@@ -14,6 +14,7 @@ import (
 	"github.com/orka-agents/orka/internal/acp"
 	"github.com/orka-agents/orka/internal/artifactcap"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
+	"github.com/orka-agents/orka/internal/remediationpolicy"
 )
 
 const (
@@ -147,6 +148,14 @@ func LoadConfigFromEnv() (Config, error) {
 		return Config{}, err
 	}
 	limits := defaultProtocolLimits(providerKind)
+	provider, err = restrictRemediationProvider(profile, provider)
+	if err != nil {
+		return Config{}, err
+	}
+	if profile.ResourceClass == remediationpolicy.CopilotResourceClass {
+		limits.MaxResidentSessions = 1
+		limits.MaxConcurrentPrompts = 1
+	}
 	durableWorkspaceKey := strings.TrimSpace(os.Getenv(EnvDurableWorkspaceKey))
 	if durableWorkspaceKey != "" {
 		// A stable data key belongs to one dedicated workspace. Enforce its

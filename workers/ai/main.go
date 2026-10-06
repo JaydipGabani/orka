@@ -714,7 +714,8 @@ func memoryControllerConfigPresent() bool {
 
 func autoEnableMemoryTools(enabled []string) []string {
 	normalized := normalizeEnabledTools(enabled)
-	if !memoryControllerConfigPresent() {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv(workerenv.MemoryToolsAutoEnable)), "false") ||
+		!memoryControllerConfigPresent() {
 		return normalized
 	}
 

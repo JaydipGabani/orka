@@ -307,7 +307,7 @@ func newExternalACPDispatchFixtureWithOptions(
 	objects = append(objects, extraObjects...)
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(
-			&corev1alpha1.Task{}, &corev1alpha1.AgentRuntime{}, &corev1alpha1.ControllerEpoch{},
+			&corev1alpha1.Task{}, &corev1alpha1.AgentRuntime{}, &corev1alpha1.RuntimePool{}, &corev1alpha1.ControllerEpoch{},
 			&corev1alpha1.PromptAttempt{}, &corev1alpha1.RuntimeSessionControl{},
 			&corev1alpha1.BranchClaim{}, &corev1alpha1.Publication{}, &corev1alpha1.ExternalEffect{},
 		).

@@ -73,16 +73,15 @@ func buildWorkspaceArchive(
 		Schema: workspaceManifestSchema, RepositoryID: repositoryID, SourceRef: sourceRef,
 		BaselineOID: baselineOID, TreeOID: treeOID, Entries: entries,
 	}
-	manifestBytes, err := harnessv2.CanonicalValue(manifest)
+	manifestDigest, err := workspaceManifestDigest(manifest)
 	if err != nil {
 		return workspaceArchive{}, invalidRequest("workspace manifest could not be canonicalized", err)
 	}
-	manifestHash := sha256.Sum256(manifestBytes)
-	manifestDigest := "sha256:" + hex.EncodeToString(manifestHash[:])
 	archive, err := os.CreateTemp(runner.tempRoot, "workspace-*.tar")
 	if err != nil {
 		return workspaceArchive{}, apiError(ErrSCMTransport, "workspace_archive_failed", "workspace archive could not be created", 500, false, err)
 	}
+
 	archivePath := archive.Name()
 	cleanup := true
 	defer func() {

@@ -136,6 +136,12 @@ type failingExecutionEventStore struct {
 	err error
 }
 
+type validationTaskReconcilerFunc func(context.Context, *corev1alpha1.Task) (ctrl.Result, bool, error)
+
+func (f validationTaskReconcilerFunc) ReconcileValidationTask(ctx context.Context, task *corev1alpha1.Task) (ctrl.Result, bool, error) {
+	return f(ctx, task)
+}
+
 func (s failingExecutionEventStore) AppendExecutionEvent(context.Context, *store.ExecutionEvent) (*store.ExecutionEvent, error) {
 	return nil, s.err
 }
@@ -154,6 +160,38 @@ func (s failingExecutionEventStore) GetLatestExecutionEventSeq(context.Context, 
 
 func (s failingExecutionEventStore) DeleteExecutionEvents(context.Context, string, string, string) error {
 	return s.err
+}
+
+func TestTaskReconcilerValidationTaskInterceptsBeforeGenericLifecycle(t *testing.T) {
+	scheme := newTestScheme()
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "validation", Namespace: "default", UID: "task-uid"},
+		Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeContainer, Image: "ignored.example/image:latest"},
+	}
+	reconciler := newUnitReconciler(scheme, task)
+	want := ctrl.Result{RequeueAfter: 17 * time.Second}
+	reconciler.ValidationTaskReconciler = validationTaskReconcilerFunc(func(_ context.Context, got *corev1alpha1.Task) (ctrl.Result, bool, error) {
+		if got.UID != task.UID {
+			t.Fatalf("callback Task UID = %q, want %q", got.UID, task.UID)
+		}
+		return want, true, nil
+	})
+
+	result, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(task)})
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result != want {
+		t.Fatalf("Reconcile() result = %#v, want %#v", result, want)
+	}
+
+	stored := &corev1alpha1.Task{}
+	if err := reconciler.Get(t.Context(), client.ObjectKeyFromObject(task), stored); err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if len(stored.Finalizers) != 0 || stored.Status.Phase != "" {
+		t.Fatalf("generic lifecycle mutated handled Task: finalizers=%v phase=%q", stored.Finalizers, stored.Status.Phase)
+	}
 }
 
 // ---------------------------------------------------------------------------

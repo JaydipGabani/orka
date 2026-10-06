@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "control": {
+    "tag": "replace-control",
+    "clusterUID": "REPLACE_WITH_EXISTING_CONTROL_NAMESPACE_UID",
+    "controller": {
+      "namespace": "replace-control-namespace",
+      "name": "replace-controller-deployment",
+      "uid": "REPLACE_WITH_EXISTING_DEPLOYMENT_UID"
+    },
+    "gateway": {
+      "namespace": "replace-gateway-namespace",
+      "name": "replace-gateway-service",
+      "uid": "REPLACE_WITH_EXISTING_SERVICE_UID"
+    }
+  },
+  "subject": {
+    "tag": "replace-subject",
+    "privateRoot": "/absolute/private/new-subject-lab",
+    "podCIDR": "10.250.0.0/16",
+    "serviceCIDR": "10.251.0.0/16"
+  },
+  "approved": {
+    "policyFile": "/absolute/private/approved-policy.json",
+    "policySHA256": "REPLACE_WITH_APPROVED_POLICY_SHA256",
+    "catalogRoot": "/absolute/private/approved-catalog",
+    "crdsFile": "/absolute/private/approved-keda-crds.json",
+    "crdsSHA256": "REPLACE_WITH_APPROVED_CRD_BUNDLE_SHA256",
+    "newPolicyName": "replace-new-policy-name"
+  },
+  "registry": {
+    "container": "replace-existing-registry",
+    "containerID": "REPLACE_WITH_FULL_EXISTING_DOCKER_CONTAINER_ID",
+    "networkID": "REPLACE_WITH_FULL_EXISTING_KIND_NETWORK_ID",
+    "port": 5000,
+    "caFile": "/absolute/private/registry-ca.crt",
+    "caSHA256": "REPLACE_WITH_REGISTRY_PUBLIC_CA_SHA256",
+    "authFile": "/absolute/private/registry-auth.json"
+  },
+  "ciliumChartFile": "/absolute/private/cilium-1.18.2.tgz",
+  "buildkitPort": 1235
+}

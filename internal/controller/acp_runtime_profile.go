@@ -16,6 +16,7 @@ import (
 	"github.com/orka-agents/orka/internal/acp"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/labels"
+	"github.com/orka-agents/orka/internal/remediationpolicy"
 	"github.com/orka-agents/orka/internal/tools"
 )
 
@@ -144,6 +145,18 @@ func PlanACPRuntimeWithConfiguration(
 		ModelLimits: modelLimits, AgentConfigurationDigest: agentDigest, ToolPolicyDigest: toolDigest, ApprovalPolicyDigest: approvalDigest,
 		MCPConfigurationDigest: mcpDigest, WorkspaceIntent: harnessv2.WorkspaceIntent(intent),
 		ProxyCredentialRole: "provider-inference", ProxyCredentialScope: "model:" + model, ResourceClass: "standard",
+	}
+	if remediationpolicy.IsNativeProposal(task) {
+		if err := remediationpolicy.ValidateCopilotAgent(agent); err != nil {
+			return ACPRuntimePlan{}, err
+		}
+		if err := remediationpolicy.ValidateCopilotTask(task); err != nil {
+			return ACPRuntimePlan{}, err
+		}
+		profile.ResourceClass = remediationpolicy.CopilotResourceClass
+		if err := remediationpolicy.ValidateCopilotProfile(profile); err != nil {
+			return ACPRuntimePlan{}, err
+		}
 	}
 	digest, err := harnessv2.CanonicalProfileDigest(profile)
 	if err != nil {

@@ -21,6 +21,7 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
+	"github.com/orka-agents/orka/internal/remediationpolicy"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/workspace/statusrules"
 )
@@ -50,6 +51,19 @@ var errACPWorkspaceRecoveryPending = fmt.Errorf("execution workspace recovery is
 
 //nolint:gocyclo // ACP queueing keeps durable planning, recovery, and binding gates auditable together.
 func (r *TaskReconciler) queueACPRuntimeTask(ctx context.Context, task *corev1alpha1.Task, _ *corev1alpha1.Agent) (ctrl.Result, error) {
+	if remediationpolicy.IsNativeProposal(task) && (task.Status.Execution == nil ||
+		task.Status.Execution.State == corev1alpha1.TaskExecutionStateQueued ||
+		task.Status.Execution.State == corev1alpha1.TaskExecutionStateReserved) {
+		if r.RemediationACPValidator == nil {
+			return r.failTask(ctx, task, "remediation ACP admission is disabled")
+		}
+		if err := r.RemediationACPValidator(ctx, task); err != nil {
+			if apierrors.IsServiceUnavailable(err) {
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			return r.failACPPlanningTask(ctx, task, corev1alpha1.TaskExecutionReason("RemediationPolicyBlocked"), "remediation proposal no longer has dispatch authority")
+		}
+	}
 	if task == nil || task.Status.AgentExecutionBinding == nil {
 		return ctrl.Result{}, errors.New("immutable v2 execution binding is required before ACP queueing")
 	}
@@ -1413,6 +1427,12 @@ func (r *TaskReconciler) ensureACPRuntimePoolWithPolicy(
 		capacity := &corev1alpha1.RuntimePoolCapacitySpec{
 			MaxResidentSessions: corev1alpha1.DefaultRuntimePoolMaxResidentSessions,
 			MaxRunningPrompts:   corev1alpha1.DefaultRuntimePoolMaxRunningPrompts,
+		}
+		if plan.Profile.ResourceClass == remediationpolicy.CopilotResourceClass {
+			if err := remediationpolicy.ValidateCopilotProfile(plan.Profile); err != nil {
+				return nil, false, err
+			}
+			capacity = &corev1alpha1.RuntimePoolCapacitySpec{MaxResidentSessions: 1, MaxRunningPrompts: 1}
 		}
 		labels := map[string]string{
 			acpRuntimePoolLabel: booleanTrueValue, acpRuntimeTrustLabel: namespace,

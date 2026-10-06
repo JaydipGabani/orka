@@ -53,6 +53,19 @@ GET /api/v1/tasks/:id/plan | get core.orka.ai:tasks protected
 GET /api/v1/tasks/:id/children | get core.orka.ai:tasks protected; list core.orka.ai:tasks
 GET /api/v1/tasks/:id/artifacts | get core.orka.ai:tasks protected
 GET /api/v1/tasks/:id/artifacts/:filename | get core.orka.ai:tasks protected
+POST /api/v1/validations | create core.orka.ai:validations
+GET /api/v1/validations/:id | get core.orka.ai:validations protected
+GET /api/v1/validations/:id/evidence | get core.orka.ai:validations/evidence protected
+GET /api/v1/validations/:id/evidence/:digest | get core.orka.ai:validations/evidence protected
+POST /api/v1/validations/:id/cancel | update core.orka.ai:validations/cancel protected
+POST /api/v1/remediations | create core.orka.ai:remediations
+GET /api/v1/remediations | list core.orka.ai:remediations
+GET /api/v1/remediations/drain | get core.orka.ai:remediations/drain
+GET /api/v1/remediations/:id | get core.orka.ai:remediations protected
+POST /api/v1/remediations/:id/approve | update core.orka.ai:remediations/approve protected
+POST /api/v1/remediations/:id/cancel | update core.orka.ai:remediations/cancel protected
+POST /api/v1/remediations/:id/reconcile | update core.orka.ai:remediations/reconcile protected
+GET /api/v1/remediations/:id/artifacts/:name | get core.orka.ai:remediations/artifacts protected
 GET /api/v1/sessions | list core.orka.ai:sessions
 GET /api/v1/sessions/:id | get core.orka.ai:sessions protected
 GET /api/v1/sessions/:id/events | get core.orka.ai:sessions protected
@@ -312,7 +325,8 @@ func newExternalAuthorizationFixture(t *testing.T) *externalAuthorizationFixture
 		MemoryStore: f.store, MemoryProposalStore: f.store, SecurityStore: f.store, RepositoryMonitorStore: f.store,
 		SessionStore: f.store, ResultStore: f.store, PlanStore: f.store, ArtifactStore: f.store,
 		ExecutionEventStore: f.store, GatewayEventStore: f.store, GatewayDeliveryStore: f.store,
-		Chat: ChatConfig{Enabled: true, Provider: "protected", Model: "fixture", MaxDuration: time.Second, MaxIterations: 1, MaxConcurrent: 2},
+		RemediationService: newRemediationServiceStub(),
+		Chat:               ChatConfig{Enabled: true, Provider: "protected", Model: "fixture", MaxDuration: time.Second, MaxIterations: 1, MaxConcurrent: 2},
 	})
 	return f
 }
@@ -413,7 +427,7 @@ func TestExternalAPIEveryPermissionDeniesBeforeEffects(t *testing.T) {
 							return nil
 						}
 						method, path, _ := strings.Cut(tc.route, " ")
-						for _, parameter := range []string{":approvalID", ":filename", ":sessionId", ":sliceID", ":name", ":id"} {
+						for _, parameter := range []string{":approvalID", ":filename", ":sessionId", ":sliceID", ":digest", ":name", ":id"} {
 							path = strings.ReplaceAll(path, parameter, "protected")
 						}
 						status, body := f.request(t, method, path, `{"name":"created","metadata":{"name":"created"},"content":"new content","message":"hello","model":"protected/fixture","messages":[{"role":"user","content":"hello"}]}`)

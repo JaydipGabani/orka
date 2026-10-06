@@ -202,6 +202,9 @@ func externalToolResource(obj runtime.Object) (schema.GroupResource, bool) {
 }
 
 func (c *externalToolClient) authorizeTask(ctx context.Context, task *corev1alpha1.Task) error {
+	if remediationTaskPrivate(task) {
+		return apierrors.NewNotFound(schema.GroupResource{Group: corev1alpha1.GroupVersion.Group, Resource: externalToolTaskResource}, task.Name)
+	}
 	_, gatewayOwned, err := gatewayTaskIdentity(ctx, c.authorization.gatewayEventStore, task)
 	if err != nil {
 		return err
@@ -252,6 +255,9 @@ func (c *externalToolClient) List(ctx context.Context, list client.ObjectList, o
 				return err
 			}
 			visible = append(visible, loaded.Items[i])
+		}
+		if len(visible) != len(loaded.Items) {
+			loaded.SetRemainingItemCount(nil)
 		}
 		loaded.Items = visible
 		*tasks = *loaded

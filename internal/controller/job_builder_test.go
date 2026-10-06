@@ -157,6 +157,28 @@ func TestNewJobBuilder(t *testing.T) {
 	}
 }
 
+func TestJobBuilderRejectsUnboundStandaloneValidation(t *testing.T) {
+	for _, annotation := range []string{"patchverification.orka.ai/run", "patchverification.orka.ai/backend"} {
+		t.Run(annotation, func(t *testing.T) {
+			builder := setupJobBuilder()
+			task := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "standalone-validation", Namespace: defaultNS,
+					Annotations: map[string]string{annotation: "untrusted"},
+				},
+				Spec: corev1alpha1.TaskSpec{
+					Type: corev1alpha1.TaskTypeContainer, Image: testBusyboxImage,
+					Command: []string{"/bin/true"},
+				},
+			}
+			job, err := builder.Build(context.Background(), task, nil, nil)
+			if err == nil || job != nil || !strings.Contains(err.Error(), "validation execution is disabled") {
+				t.Fatalf("unbound validation fell through to generic execution: job=%v err=%v", job, err)
+			}
+		})
+	}
+}
+
 func TestJobBuilder_Build_UsesConfiguredWorkerServiceAccountNames(t *testing.T) {
 	builder := setupJobBuilder()
 	builder.AIWorkerServiceAccountName = testAIWorkerServiceAccountName

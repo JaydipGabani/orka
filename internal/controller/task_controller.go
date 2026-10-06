@@ -52,6 +52,7 @@ import (
 	execevents "github.com/orka-agents/orka/internal/events"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/outboundaccess"
+	"github.com/orka-agents/orka/internal/remediationpolicy"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/tools"
 	"github.com/orka-agents/orka/internal/tracing"
@@ -104,10 +105,12 @@ const (
 
 // TaskReconciler reconciles a Task object
 type TaskReconciler struct {
+	RemediationACPValidator func(context.Context, *corev1alpha1.Task) error
 	client.Client
 	APIReader                         client.Reader
 	Scheme                            *runtime.Scheme
 	JobBuilder                        *JobBuilder
+	ValidationTaskReconciler          ValidationTaskReconciler
 	SessionManager                    *SessionManager
 	WebhookNotifier                   *WebhookNotifier
 	Recorder                          record.EventRecorder
@@ -169,6 +172,12 @@ type TaskReconciler struct {
 	OutboundAccessTrust               outboundaccess.TrustConfig
 	trustedServiceCleanupMu           sync.RWMutex
 	trustedServiceCleanupDone         bool
+}
+
+// ValidationTaskReconciler intercepts controller-owned validation Tasks before
+// the generic Task lifecycle can create or observe an ordinary worker Job.
+type ValidationTaskReconciler interface {
+	ReconcileValidationTask(context.Context, *corev1alpha1.Task) (ctrl.Result, bool, error)
 }
 
 // +kubebuilder:rbac:groups=core.orka.ai,resources=tasks,verbs=get;list;watch;create;update;patch;delete
@@ -294,6 +303,12 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 		log.Error(err, "unable to fetch Task")
 		return ctrl.Result{}, err
+	}
+	if r.ValidationTaskReconciler != nil {
+		result, handled, err := r.ValidationTaskReconciler.ReconcileValidationTask(ctx, task)
+		if handled || err != nil {
+			return result, err
+		}
 	}
 	if tx := task.Spec.Transaction; tx != nil {
 		values := []any{}
@@ -1454,6 +1469,10 @@ func (r *TaskReconciler) createTaskJob(ctx context.Context, task *corev1alpha1.T
 		RepositoryMonitorValidation: validationTask,
 	})
 	if err != nil {
+		if remediationpolicy.IsNativeProposal(jobTask) && apierrors.IsServiceUnavailable(err) {
+			log.Info("remediation proposal dispatch is waiting for authorization")
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 		log.Error(err, "failed to build Job")
 		return r.failTask(ctx, task, fmt.Sprintf("failed to build job: %v", err))
 	}
@@ -2773,7 +2792,7 @@ func (r *TaskReconciler) collectResult(ctx context.Context, task *corev1alpha1.T
 }
 
 func taskUsesStdoutResult(task *corev1alpha1.Task) bool {
-	return taskRequestsReadOnlyAgent(task)
+	return taskRequestsReadOnlyAgent(task) || remediationpolicy.IsNativeProposal(task)
 }
 
 func extractStdoutTaskResult(logs string) ([]byte, bool, error) {
@@ -3206,6 +3225,9 @@ func validateReadOnlyBuiltInAgentRuntime(task *corev1alpha1.Task, runtimeType co
 	}
 	switch runtimeType {
 	case corev1alpha1.AgentRuntimeCopilot:
+		if remediationpolicy.IsNativeProposal(task) {
+			return remediationpolicy.ValidateCopilotTask(task)
+		}
 		return fmt.Errorf("read-only agent tasks do not support copilot runtime credentials because GITHUB_TOKEN can mutate GitHub")
 	default:
 		// Codex is supported: read-only tasks run inside the RuntimeSession

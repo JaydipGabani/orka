@@ -403,6 +403,22 @@ func TestAutoEnableMemoryTools_NoControllerConfigDoesNotMutateTools(t *testing.T
 	}
 }
 
+func TestAutoEnableMemoryTools_ExplicitOptOut(t *testing.T) {
+	t.Setenv("ORKA_CONTROLLER_URL", "http://controller.example")
+	t.Setenv("ORKA_TASK_NAMESPACE", "default")
+	t.Setenv("ORKA_TASK_NAME", "task-1")
+	t.Setenv("ORKA_MEMORY_TOOLS_AUTO_ENABLE", " false ")
+
+	if got := autoEnableMemoryTools(nil); len(got) != 0 {
+		t.Fatalf("tool-free worker enabled memory tools: %#v", got)
+	}
+	enabled := []string{"recall_memory", " web_search ", "recall_memory"}
+	want := []string{"recall_memory", "web_search"}
+	if got := autoEnableMemoryTools(enabled); !slices.Equal(got, want) {
+		t.Fatalf("explicit tools changed: got %#v, want %#v", got, want)
+	}
+}
+
 func TestLoadPlanContext(t *testing.T) {
 	t.Run("successful plan fetch", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

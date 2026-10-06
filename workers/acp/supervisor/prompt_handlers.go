@@ -1359,6 +1359,13 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, err.Error(), nil, false)
 		return
 	}
+	if request.AbandonUnvalidatedPrompt {
+		if err := abandonUnvalidatedPromptLocked(state, request.Metadata, now); err != nil {
+			s.mu.Unlock()
+			writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, err.Error(), nil, false)
+			return
+		}
+	}
 	ready, transitionErr := prepareSessionDeletionLocked(state, publicationFinalized, now)
 	if transitionErr != nil {
 		s.mu.Unlock()
@@ -1435,6 +1442,24 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		Protocol: harnessv2.ProtocolVersion, Classification: harnessv2.Classification{Class: harnessv2.RequestClassificationFresh},
 		State: harnessv2.RuntimeSessionStateDeleted, Tombstone: tombstone.RuntimeSessionTombstone,
 	})
+}
+
+// The controller can lose a completed stream before it requests workspace
+// validation. Explicit, prompt-scoped abandonment breaks that recovery deadlock
+// without treating a generic drain as permission to discard a pending result.
+// The caller holds s.mu; descendant cleanup still has to prove deletion.
+func abandonUnvalidatedPromptLocked(state *sessionState, metadata harnessv2.MutationMetadata, now time.Time) error {
+	if state.prompt == nil || !promptMetadataMatches(metadata, state.prompt.request.Metadata) {
+		return fmt.Errorf("abandonment does not match the settled prompt identity")
+	}
+	if state.descriptor.State != harnessv2.RuntimeSessionStateValidating || state.prompt.settlement == nil ||
+		state.prompt.settlement.TerminalEvent != harnessv2.EventCompleted ||
+		state.workspaceValidationInProgress || state.publicationFinalization != nil {
+		return fmt.Errorf("abandonment requires a settled prompt with no workspace validation or publication in progress")
+	}
+	state.descriptor.State = harnessv2.RuntimeSessionStatePoisoned
+	state.descriptor.LastTransitionAt = now
+	return nil
 }
 
 type promptDeletionCancellation struct {
@@ -1860,7 +1885,7 @@ func (s *Server) handleWorkspaceDelta(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeDigestConflict, "workspace delta prompt identity does not match the settled prompt", nil, false)
 		return
 	}
-	if state.descriptor.State != harnessv2.RuntimeSessionStateValidating {
+	if state.descriptor.State != harnessv2.RuntimeSessionStateValidating || state.workspaceValidationInProgress {
 		s.mu.Unlock()
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "runtime session is not awaiting workspace validation", nil, false)
 		return
@@ -1881,8 +1906,14 @@ func (s *Server) handleWorkspaceDelta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	recordSessionOperationLocked(state, request.Metadata, harnessv2.OperationPhaseRecorded, "", now)
+	state.workspaceValidationInProgress = true
 	runtimeSession, baseline, paths := state.runtime, state.baseline, state.paths
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		state.workspaceValidationInProgress = false
+		s.mu.Unlock()
+	}()
 
 	freezeCtx, cancel := context.WithTimeout(r.Context(), defaultDuration(s.cfg.CancelGrace, acp.DefaultStopGrace))
 	defer cancel()

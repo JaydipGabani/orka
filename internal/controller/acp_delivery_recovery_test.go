@@ -89,7 +89,7 @@ func TestACPDispatcherRecoversPublicationConflictPhase(t *testing.T) {
 	}
 }
 
-func TestACPDispatcherDeletingRecoveryRequiresTerminalCleanupProof(t *testing.T) {
+func TestACPDispatcherDeletingRecoveryNeverReplaysOrInventsCleanupProof(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		state  store.PromptExecutionState
@@ -126,17 +126,35 @@ func TestACPDispatcherDeletingRecoveryRequiresTerminalCleanupProof(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := fixture.dispatcher.recoverStaleAttempts(fixture.ctx); err != nil {
+			missingProof := tc.name == "missing cleanup" || tc.name == "different runtime generation"
+			err = fixture.dispatcher.recoverStaleAttempts(fixture.ctx)
+			if missingProof {
+				if !errors.Is(err, store.ErrConflict) {
+					t.Fatalf("unproven runtime retirement: %v, want conflict", err)
+				}
+			} else if err != nil {
 				t.Fatal(err)
 			}
 			attemptAfter, err := fixture.controlStore.GetPromptAttempt(fixture.ctx, fixture.attemptID)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if attemptAfter.Version != attemptBefore.Version || attemptAfter.ExecutionState != attemptBefore.ExecutionState {
-				t.Fatal("deleting attempt was replayed or changed without terminal cleanup proof")
+			if attemptAfter.Key != attemptBefore.Key {
+				t.Fatal("deleting attempt lost its accepted identity")
 			}
-			if _, err := fixture.controlStore.GetOutboxProjection(fixture.ctx, standaloneTaskTerminalProjectionID(task, 1)); !errors.Is(err, store.ErrNotFound) {
+			if tc.state == store.PromptExecutionRunning {
+				if attemptAfter.ExecutionState != store.PromptExecutionOutcomeUnknown {
+					t.Fatal("deleting post-write attempt was not durably classified without replay")
+				}
+			} else if attemptAfter.Version != attemptBefore.Version || attemptAfter.ExecutionState != attemptBefore.ExecutionState {
+				t.Fatal("deleting terminal or pre-submission attempt was replayed")
+			}
+			_, err = fixture.controlStore.GetOutboxProjection(fixture.ctx, standaloneTaskTerminalProjectionID(task, 1))
+			if tc.state == store.PromptExecutionRunning {
+				if err != nil {
+					t.Fatalf("missing durable outcome-unknown projection: %v", err)
+				}
+			} else if !errors.Is(err, store.ErrNotFound) {
 				t.Fatalf("created projection without terminal cleanup proof: %v", err)
 			}
 		})

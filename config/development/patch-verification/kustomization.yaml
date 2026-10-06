@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: orka-validation
+namePrefix: validation-
+resources:
+  - ../../rbac/role.yaml
+  - ../../rbac/metrics_auth_role.yaml
+  - resources.yaml

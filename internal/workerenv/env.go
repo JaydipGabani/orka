@@ -224,6 +224,7 @@ const (
 	GitConfigValue0 = "GIT_CONFIG_VALUE_0"
 
 	// Memory/controller context env vars used by AI worker memory integration.
+	MemoryToolsAutoEnable   = "ORKA_MEMORY_TOOLS_AUTO_ENABLE"
 	MemoryContextEnabled    = "ORKA_MEMORY_CONTEXT_ENABLED"
 	MemoryContextLimit      = "ORKA_MEMORY_CONTEXT_LIMIT"
 	MemoryContextMaxChars   = "ORKA_MEMORY_CONTEXT_MAX_CHARS"

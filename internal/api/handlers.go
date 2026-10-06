@@ -105,6 +105,8 @@ type Handlers struct {
 	gatewayEventStore         store.GatewayEventStore
 	gatewayDeliveryStore      store.GatewayDeliveryStore
 	gatewayService            *gatewayruntime.Service
+	validationService         ValidationService
+	remediationService        RemediationService
 	gatewayIngressLimiter     *gatewayIngressLimiter
 	eventStreamPollInterval   time.Duration
 	eventStreamHeartbeatEvery time.Duration
@@ -133,6 +135,8 @@ type HandlersConfig struct {
 	GatewayEventStore         store.GatewayEventStore
 	GatewayDeliveryStore      store.GatewayDeliveryStore
 	GatewayService            *gatewayruntime.Service
+	ValidationService         ValidationService
+	RemediationService        RemediationService
 }
 
 // NewHandlers creates a new Handlers instance
@@ -159,6 +163,8 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		gatewayEventStore:         cfg.GatewayEventStore,
 		gatewayDeliveryStore:      cfg.GatewayDeliveryStore,
 		gatewayService:            cfg.GatewayService,
+		validationService:         cfg.ValidationService,
+		remediationService:        cfg.RemediationService,
 		gatewayIngressLimiter:     newGatewayIngressLimiter(),
 		eventStreamPollInterval:   defaultEventStreamPollInterval,
 		eventStreamHeartbeatEvery: defaultEventStreamHeartbeatEvery,
@@ -620,6 +626,9 @@ func (h *Handlers) ListTasks(c fiber.Ctx) error {
 		filtered := taskList.Items[:0]
 		for i := range taskList.Items {
 			task := &taskList.Items[i]
+			if remediationTaskPrivate(task) {
+				continue
+			}
 			allowed := true
 			if h.contextTokenAuthorization.Enabled() {
 				allowed, err = h.contextTokenAllowsLoadedTask(c, "listTasks", task)
@@ -720,6 +729,9 @@ func (h *Handlers) DeleteTask(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusNotFound, "task not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get task: %v", err))
+	}
+	if err := denyRemediationTaskPublicAccess(task); err != nil {
+		return err
 	}
 	if err := h.authorizeContextTokenLoadedTask(c, "deleteTask", task); err != nil {
 		return err
@@ -927,16 +939,36 @@ func (h *Handlers) ListSessions(c fiber.Ctx) error {
 	if limit <= MaxLimit {
 		pageLimit = int(limit)
 	}
-	sessions, more, err := h.sessionStore.ListSessionsPage(ctx, namespace, sessionCursor, pageLimit, store.SessionTypeGateway)
+	var visibility *remediationTaskVisibility
+	sessions, continueToken, err := collectAuthorizedPages(int64(pageLimit), sessionCursor, func(cursor string, remaining int64) ([]store.SessionMetadata, string, error) {
+		page, more, err := h.sessionStore.ListSessionsPage(ctx, namespace, cursor, int(remaining), store.SessionTypeGateway)
+		if err != nil {
+			return nil, "", fiber.NewError(fiber.StatusInternalServerError, "failed to list sessions")
+		}
+		next := ""
+		if more && len(page) > 0 {
+			next = page[len(page)-1].Name
+		}
+		if len(page) > 0 && visibility == nil {
+			current, err := h.remediationVisibility(ctx, namespace)
+			if err != nil {
+				return nil, "", err
+			}
+			visibility = &current
+		}
+		visible := page[:0]
+		for _, session := range page {
+			if !visibility.sessionPrivate(session.Name, session.ActiveTask) {
+				visible = append(visible, session)
+			}
+		}
+		return visible, next, nil
+	})
 	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list sessions: %v", err))
+		return err
 	}
 
 	items := make([]fiber.Map, 0, len(sessions))
-	continueToken := ""
-	if more && len(sessions) > 0 {
-		continueToken = sessions[len(sessions)-1].Name
-	}
 	for _, s := range sessions {
 		items = append(items, fiber.Map{
 			"id":           s.Name,
@@ -985,6 +1017,13 @@ func (h *Handlers) GetSession(c fiber.Ctx) error {
 	if sessionType == store.SessionTypeGateway {
 		return fiber.NewError(fiber.StatusNotFound, "session not found")
 	}
+	visibility, err := h.remediationVisibility(ctx, namespace)
+	if err != nil {
+		return err
+	}
+	if visibility.sessionPrivate(id, "") {
+		return fiber.NewError(fiber.StatusNotFound, "session not found")
+	}
 	session, err := h.sessionStore.GetSession(ctx, namespace, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -992,7 +1031,7 @@ func (h *Handlers) GetSession(c fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get session: %v", err))
 	}
-	if session.SessionType == store.SessionTypeGateway {
+	if session.SessionType == store.SessionTypeGateway || visibility.recordPrivate(session) {
 		return fiber.NewError(fiber.StatusNotFound, "session not found")
 	}
 
@@ -1800,6 +1839,9 @@ func (h *Handlers) GetTaskChildren(c fiber.Ctx) error {
 	gatewayAuthorizations := map[gatewayTaskAuthorizationKey]bool{}
 	for i := range taskList.Items {
 		child := &taskList.Items[i]
+		if remediationTaskPrivate(child) {
+			continue
+		}
 		allowed := true
 		if h.contextTokenAuthorization.Enabled() {
 			allowed, err = h.contextTokenAllowsLoadedTaskWithIdentity(c, "getTaskChildren", child, false)

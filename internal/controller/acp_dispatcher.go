@@ -78,33 +78,36 @@ const (
 	acpReservedRetrySessionPreparation   acpReservedRetryStage = "session-preparation"
 	acpReservedRetryReservationResize    acpReservedRetryStage = "reservation-resize"
 	acpReservedRetryWorkspaceLifetime    acpReservedRetryStage = "workspace-lifetime"
+	acpReservedRetryRemediationAuthority acpReservedRetryStage = "remediation-authority"
 )
 
 // ACPDispatcher owns long-lived v2 prompt streams outside reconcile workers.
 // Task reconciliation only persists queued demand; this leader-elected runnable
 // reserves capacity and advances the durable attempt state machine.
 type ACPDispatcher struct {
-	Client                   client.Client
-	APIReader                client.Reader
-	Store                    store.DurableControlStore
-	ResultStore              store.ResultStore
-	EventStore               store.ExecutionEventStore
-	PlanStore                store.PlanStore
-	Snapshots                store.AgentExecutionSnapshotStore
-	Epochs                   *ControllerEpochManager
-	Sessions                 *ACPSessionContinuity
-	Publisher                *publisherservice.Client
-	ArtifactCapabilitySecret []byte
-	ArtifactReservations     artifactcap.CapabilityReservationRecorder
-	MCPRegistry              *tools.Registry
-	Interval                 time.Duration
-	MaxConcurrent            int
-	IdlePoolTTL              time.Duration
-	ReservationTTL           time.Duration
-	RateLimitRetryInterval   time.Duration
-	AdmissionGate            *ACPAdmissionGate
-	ACPRuntimeImages         ACPRuntimeImages
-	runtimeContextFactory    func(context.Context, *corev1alpha1.Task) (context.Context, context.CancelFunc)
+	Client                       client.Client
+	APIReader                    client.Reader
+	Store                        store.DurableControlStore
+	ResultStore                  store.ResultStore
+	EventStore                   store.ExecutionEventStore
+	PlanStore                    store.PlanStore
+	Snapshots                    store.AgentExecutionSnapshotStore
+	Epochs                       *ControllerEpochManager
+	Sessions                     *ACPSessionContinuity
+	Publisher                    *publisherservice.Client
+	ArtifactCapabilitySecret     []byte
+	ArtifactReservations         artifactcap.CapabilityReservationRecorder
+	MCPRegistry                  *tools.Registry
+	Interval                     time.Duration
+	MaxConcurrent                int
+	IdlePoolTTL                  time.Duration
+	ReservationTTL               time.Duration
+	RateLimitRetryInterval       time.Duration
+	AdmissionGate                *ACPAdmissionGate
+	ACPRuntimeImages             ACPRuntimeImages
+	RemediationQueueValidator    func(context.Context, *corev1alpha1.Task) error
+	RemediationDispatchValidator func(context.Context, *corev1alpha1.Task, *corev1alpha1.RuntimePool) error
+	runtimeContextFactory        func(context.Context, *corev1alpha1.Task) (context.Context, context.CancelFunc)
 
 	// SubstrateRouterURL and SubstrateActorDNSSuffix route Substrate-backed
 	// RuntimePool instances through the provider router while preserving the
@@ -237,10 +240,15 @@ func (d *ACPDispatcher) dispatchOnce(ctx context.Context) error {
 	}
 	sortACPTasksByQueuePriority(queued, time.Now().UTC())
 	admissible := queued[:0]
+	var settlementErrors []error
 	for _, queuedTask := range queued {
 		keep, err := d.settleQueuedTaskBeforeAdmission(ctx, queuedTask)
 		if err != nil {
-			return fmt.Errorf("settle ACP task before admission %s/%s: %w", queuedTask.Namespace, queuedTask.Name, err)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			settlementErrors = append(settlementErrors, fmt.Errorf("settle ACP task before admission %s/%s: %w", queuedTask.Namespace, queuedTask.Name, err))
+			continue
 		}
 		if keep {
 			admissible = append(admissible, queuedTask)
@@ -248,10 +256,15 @@ func (d *ACPDispatcher) dispatchOnce(ctx context.Context) error {
 	}
 	queued = admissible
 	if err := d.AdmissionGate.Check(); err != nil {
-		return nil
+		return errors.Join(settlementErrors...)
 	}
 dispatchLoop:
 	for _, queuedTask := range queued {
+		if err := d.validateRemediationACPQueue(ctx, queuedTask); err != nil {
+			logf.FromContext(ctx).V(1).Info("ACP remediation task is waiting for dispatch authority",
+				"namespace", queuedTask.Namespace, "task", queuedTask.Name)
+			continue
+		}
 		select {
 		case d.sem <- struct{}{}:
 			if !d.markActive(queuedTask.UID) {
@@ -280,7 +293,7 @@ dispatchLoop:
 			break dispatchLoop
 		}
 	}
-	return d.reapIdlePools(ctx, tasks.Items)
+	return errors.Join(append(settlementErrors, d.reapIdlePools(ctx, tasks.Items))...)
 }
 
 //nolint:gocyclo // Terminal projection and cleanup recovery branches are audited together.
@@ -1048,6 +1061,9 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
 		return deadlineErr
 	}
+	if err := d.validateRemediationACPDispatch(runtimeCtx, task, target.pool); err != nil {
+		return d.requeueReservedTask(ctx, task, acpReservedRetryRemediationAuthority, err)
+	}
 	runtimeClient, runtimeFence, profile, maxResultBytes, authErr := d.runtimeClient(
 		runtimeCtx, target, bound.mcpConfiguration, true,
 	)
@@ -1785,6 +1801,13 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	accepted := false
 	admissionRetry := 0
 	for {
+		if err := d.validateRemediationACPDispatch(runtimeCtx, task, target.pool); err != nil {
+			_ = cleanupRuntimeSession("remediation_authority_changed_before_prompt")
+			return recordACPPromptOutcomeIfSettled(
+				ctx, promptTrace, acpPromptOutcomeFailed,
+				d.finishNonSuccess(ctx, task, attemptID, fence, sessionExecution, harnessv2.Event{Type: harnessv2.EventFailed}),
+			)
+		}
 		promptRequest, err := d.buildPromptRequest(
 			task, runtimeFence, profile, mcpConfiguration, bootstrap, userPrompt, promptLimits, admissionRetry,
 		)
