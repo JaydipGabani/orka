@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/orka-agents/orka/internal/remediation/isolation"
+	"github.com/orka-agents/orka/internal/remediation/kubeauth"
 	"github.com/orka-agents/orka/internal/remediation/provenance"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -101,9 +102,10 @@ type RecipeChoice struct {
 }
 
 type KubernetesConfig struct {
-	Kubeconfig    string
-	Context       string
-	ObserverCIDRs []string
+	Kubeconfig            string
+	Context               string
+	ObserverCIDRs         []string
+	AzureWorkloadIdentity *kubeauth.AzureWorkloadIdentity `json:",omitempty"`
 }
 
 // IsolationConfig is operator-only. Nil is the legacy, manually qualified

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/distribution/reference"
+	"github.com/orka-agents/orka/internal/remediation/kubeauth"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -177,6 +178,9 @@ func validateConfig(c Config) error {
 		}
 	}
 	if c.Kubernetes != nil {
+		if c.Kubernetes.AzureWorkloadIdentity != nil && c.Kubernetes.AzureWorkloadIdentity.Validate() != nil {
+			return failure(NeedsAdapter, "invalid-azure-workload-identity")
+		}
 		if err := validateObserverPolicy(*c.Kubernetes); err != nil {
 			return err
 		}
@@ -345,6 +349,9 @@ func dedicatedClient(c KubernetesConfig) (kubernetes.Interface, error) {
 	rest, err := clientcmd.NewNonInteractiveClientConfig(*raw, c.Context, &clientcmd.ConfigOverrides{}, nil).ClientConfig()
 	if err != nil {
 		return nil, failure(NeedsAdapter, "approved-context-unavailable")
+	}
+	if err := kubeauth.ConfigureAzure(rest, c.AzureWorkloadIdentity); err != nil {
+		return nil, failure(NeedsAdapter, "invalid-azure-workload-identity")
 	}
 	rest.Timeout, rest.QPS, rest.Burst = 10*time.Second, 5, 10
 	// Explicitly disable environment-controlled proxies for this dedicated

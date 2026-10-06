@@ -82,6 +82,52 @@ the CLI child receives a scoped local proxy capability, not that credential.
 The model/account route and permission to disclose technical report content
 must be approved explicitly. A local Pod does not make inference local.
 
+#### Experimental AKS client authentication
+
+The trusted controller and build coordinator can explicitly use an Azure
+Workload Identity for a dedicated AKS API. This is not permission for an agent
+or candidate workload to create Azure resources. The cluster's Entra
+authorization and Kubernetes permissions must be provisioned independently.
+Workload Identity does not grant IcM or GitHub Copilot access.
+
+Set `azureWorkloadIdentity` in the controller adapter and
+`buildEnvironment.Kubernetes.AzureWorkloadIdentity` for the build/cleanup client:
+
+```json
+{
+  "tenantID": "<approved-tenant-uuid>",
+  "clientID": "<approved-federated-application-uuid>",
+  "federatedTokenFile": "/var/run/secrets/azure/tokens/azure-identity-token"
+}
+```
+
+Both clients retain an explicit private kubeconfig/context for the endpoint and
+embedded cluster CA, but its selected user must contain no static credentials,
+impersonation, `exec`, or auth-provider plugin. The Azure path currently accepts
+only verified HTTPS Azure Public AKS endpoints under `.azmk8s.io` on port 443.
+It never invokes `kubelogin` or falls back to the developer's Azure CLI, managed
+identity, ambient tenant/client settings, or proxy configuration. Requests are
+bound to the configured API origin, and token failures return a sanitized error
+instead of sending an anonymous or expired-token request.
+`AZURE_REGIONAL_AUTHORITY_NAME` and `MSAL_FORCE_REGION` must both be unset:
+regional discovery and IMDS autodetection are not part of this explicit Azure
+Public authentication boundary.
+
+The official Azure Identity SDK exchanges the explicitly configured projected
+ServiceAccount assertion for the AKS server audience and caches access tokens
+in memory. Token acquisition has a 15-second context deadline, including queueing and
+retries, and a shorter caller deadline still applies. Concurrent callers wait
+outside the SDK's token mutex so cancellation does not wait for another
+exchange to finish. Kubernetes owns projected-token rotation; neither the
+assertion nor an access token is copied into Task specs, generated source, model context or
+artifact output. Missing authentication configuration retains the existing
+static kubeconfig path and its serialized policy identity. AKS deployment,
+registry authentication, networking and live federation still require separate
+qualification; this option does not turn the local Kind bootstrap into an AKS
+installer.
+
+#### Runtime recovery and verification
+
 Copilot result acceptance retains the exact Task, prompt, runtime and session
 identity while tolerating terminal status redelivery and monotonic controller
 recovery. Cancellation remains pending until execution settles; a recorded

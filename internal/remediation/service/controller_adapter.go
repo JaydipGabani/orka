@@ -15,6 +15,7 @@ import (
 	"github.com/distribution/reference"
 	"github.com/orka-agents/orka/internal/remediation/controllerlab"
 	"github.com/orka-agents/orka/internal/remediation/environment"
+	"github.com/orka-agents/orka/internal/remediation/kubeauth"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -27,15 +28,16 @@ const controllerAdapterKind = "dalec-keda-events"
 // ControllerAdapterConfig is operator-only. Identity pins are established once
 // during setup and are frozen in the policy snapshot, never selected by a model.
 type ControllerAdapterConfig struct {
-	Capability           controllerlab.Capability `json:"capability,omitempty"`
-	BuildEnvironment     environment.Config       `json:"buildEnvironment"`
-	Controller           controllerlab.Config     `json:"controller"`
-	Kubeconfig           string                   `json:"kubeconfig"`
-	Context              string                   `json:"context"`
-	ProbeImage           string                   `json:"probeImage"`
-	ClusterUID           types.UID                `json:"clusterUID"`
-	RequiredCapabilities []string                 `json:"requiredCapabilities,omitempty"`
-	RequiredRequirements []string                 `json:"requiredRequirements,omitempty"`
+	Capability            controllerlab.Capability        `json:"capability,omitempty"`
+	BuildEnvironment      environment.Config              `json:"buildEnvironment"`
+	Controller            controllerlab.Config            `json:"controller"`
+	Kubeconfig            string                          `json:"kubeconfig"`
+	Context               string                          `json:"context"`
+	AzureWorkloadIdentity *kubeauth.AzureWorkloadIdentity `json:"azureWorkloadIdentity,omitempty"`
+	ProbeImage            string                          `json:"probeImage"`
+	ClusterUID            types.UID                       `json:"clusterUID"`
+	RequiredCapabilities  []string                        `json:"requiredCapabilities,omitempty"`
+	RequiredRequirements  []string                        `json:"requiredRequirements,omitempty"`
 }
 
 type controllerBuildBackend interface {
@@ -67,6 +69,7 @@ func decodeControllerPolicy(policy AdapterPolicy) (ControllerAdapterConfig, erro
 		return ControllerAdapterConfig{}, ErrPolicy
 	}
 	if !validControllerCapability(config) ||
+		(config.AzureWorkloadIdentity != nil && config.AzureWorkloadIdentity.Validate() != nil) ||
 		(selectedControllerCapability(config) == controllerlab.KEDAEventPublishing && !validControllerLeaseNamespace(config)) {
 		return ControllerAdapterConfig{}, ErrPolicy
 	}
@@ -161,6 +164,9 @@ func controllerRESTConfig(config ControllerAdapterConfig) (*rest.Config, error) 
 	server, err := url.Parse(result.Host)
 	if err != nil || server.Scheme != "https" || server.Hostname() == "" || server.User != nil || server.RawQuery != "" || server.Fragment != "" ||
 		(server.Path != "" && server.Path != "/") {
+		return nil, ErrPolicy
+	}
+	if err := kubeauth.ConfigureAzure(result, config.AzureWorkloadIdentity); err != nil {
 		return nil, ErrPolicy
 	}
 	result.Timeout = 5 * time.Second
