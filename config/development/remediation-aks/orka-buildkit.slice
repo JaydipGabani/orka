@@ -1,0 +1,7 @@
+[Unit]
+Description=Physical verification builder resource envelope
+
+[Slice]
+CPUQuota=400%
+MemoryMax=12G
+TasksMax=512

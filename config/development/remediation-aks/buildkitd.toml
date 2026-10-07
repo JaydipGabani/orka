@@ -1,0 +1,30 @@
+# Staged configuration only; provision and qualify the daemon separately.
+root = "/var/lib/orka-buildkit"
+insecure-entitlements = []
+
+[dns]
+  nameservers = ["168.63.129.16"]
+
+[grpc]
+  address = ["tcp://0.0.0.0:1234"]
+  [grpc.tls]
+    cert = "/etc/orka-buildkit/tls/server.pem"
+    key = "/etc/orka-buildkit/tls/server-key.pem"
+    ca = "/etc/orka-buildkit/tls/client-ca.pem"
+
+[worker.oci]
+  enabled = true
+  max-parallelism = 1
+  noProcessSandbox = false
+  networkMode = "cni"
+  cniConfigPath = "/etc/orka-buildkit/cni.json"
+  cniBinaryPath = "/opt/orka-buildkit/cni"
+  cniPoolSize = 0
+  defaultCgroupParent = "/workloads"
+  gc = true
+  reservedSpace = "4GB"
+  maxUsedSpace = "48GB"
+  minFreeSpace = "8GB"
+
+[worker.containerd]
+  enabled = false

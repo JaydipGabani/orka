@@ -1,0 +1,29 @@
+[Unit]
+Description=Isolated verification BuildKit (mutual TLS only)
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/orka-buildkit
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+Slice=orka-buildkit.slice
+DelegateSubgroup=supervisor
+ExecStartPre=/usr/bin/mountpoint -q /var/lib/orka-buildkit
+ExecStartPre=/opt/orka-buildkit/bin/buildkit-preflight.py host
+ExecStart=/opt/orka-buildkit/bin/start-bounded-buildkit.sh
+Restart=on-failure
+RestartSec=5s
+CPUQuota=400%
+MemoryMax=12G
+TasksMax=512
+Delegate=yes
+LimitNOFILE=65536
+KillMode=control-group
+TimeoutStopSec=30s
+SendSIGKILL=yes
+InaccessiblePaths=/run/dbus/system_bus_socket
+
+[Install]
+WantedBy=multi-user.target

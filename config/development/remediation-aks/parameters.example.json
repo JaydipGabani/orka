@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "suffix": {"value": "<unique-suffix>"},
+    "location": {"value": "eastus2"},
+    "owner": {"value": "<accountable-team>"},
+    "budgetStartUtc": {"value": "<actual-UTC-start-after-cleanup-is-armed>"},
+    "cleanupReceipt": {"value": "<approved-durable-cleanup-receipt-id>"},
+    "sourceDigest": {"value": "<reviewed-source-bundle-sha256>"},
+    "vnetCidr": {"value": "<approved-nonoverlapping-RFC1918-/16>"},
+    "podCidr": {"value": "<approved-nonoverlapping-overlay-/16>"},
+    "serviceCidr": {"value": "<approved-nonoverlapping-service-/16>"},
+    "trustedBuildClientCidr": {"value": "<control-node-subnet>"},
+    "trustedControlVnetCidr": {"value": "<entire-control-VNet-CIDR>"},
+    "builderImageVersion": {"value": "<exact-Canonical-image-version-not-latest>"},
+    "operatorSshPublicKey": {"value": "<public-SSH-key-only-never-a-private-key>"}
+  }
+}

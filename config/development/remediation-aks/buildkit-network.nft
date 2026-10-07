@@ -1,0 +1,13 @@
+table inet orka_buildkit {
+    chain input {
+        type filter hook input priority -200; policy accept;
+        iifname "orka-build0" counter drop
+    }
+    chain forward {
+        type filter hook forward priority -200; policy accept;
+        iifname "orka-build0" ip daddr 169.254.169.254 counter drop
+        iifname "orka-build0" ip daddr 168.63.129.16 udp dport 53 counter accept
+        iifname "orka-build0" ip daddr 168.63.129.16 tcp dport 53 counter accept
+        iifname "orka-build0" ip daddr 168.63.129.16 counter drop
+    }
+}
