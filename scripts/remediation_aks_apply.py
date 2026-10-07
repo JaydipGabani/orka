@@ -45,6 +45,7 @@ ABSENT_CODES = frozenset(("ResourceNotFound", "ResourceGroupNotFound", "NotFound
                          "RoleAssignmentNotFound", "ParentResourceNotFound"))
 PREFLIGHT_QUEUE_ALLOWANCE_SECONDS = 600
 PREFLIGHT_EXECUTION_SECONDS = 600
+ASSIGNMENT_READBACK_SECONDS = 120
 ACR_PULL_ROLE = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 
 
@@ -587,7 +588,54 @@ def quota_blocked_inputs(args, path):
     return previous_work, previous, receipt, link["plan"]["partialProof"]["expectedTags"]
 
 
-def quota_blocked_proof(azure, previous, receipt, original_tags):
+def granted_bootstrap_inputs(args, path):
+    previous_work = plan.private_path(path)
+    require(previous_work != plan.private_path(args.work_dir), "new-authorization-bundle-required")
+    previous = json.loads((previous_work / "bundle.json").read_text())
+    receipt = json.loads((previous_work / "receipt.json").read_text())
+    record = json.loads((previous_work / "authorization-link.json").read_text())
+    link = record["plan"]
+    require(previous["version"] == 1 and previous["subscriptionId"] == args.subscription and
+            previous["scope"] == plan.targets(args.subscription, previous["suffix"],
+                args.control_vnet_id, args.control_aks_id) and
+            previous.get("authorizationModel") == AUTHORIZATION_MODEL and
+            previous["roleGuids"] == builtin_role_guids(), "prior-builtin-bootstrap-scope-mismatch")
+    require(sha(wire(previous["sourceHashes"])) == previous["sourceDigest"] and
+            sha((previous_work / "compute-inputs.json").read_bytes()) == previous["computeInputsSha256"],
+            "prior-builtin-bootstrap-bundle-drift")
+    for name, digest in previous["compiledHashes"].items():
+        require(sha((previous_work / (name + ".arm.json")).read_bytes()) == digest, "prior-compiled-input-drift")
+    require(record["sha256"] == sha(wire(link)) and link["kind"] == "builtin-authorization-transition" and
+            link["authorizationModel"] == AUTHORIZATION_MODEL and
+            link["nextSourceDigest"] == previous["sourceDigest"], "original-builtin-transition-required")
+    original_work, original, _, _ = quota_blocked_inputs(args, link["previousWorkDir"])
+    for name, key in (("bundle.json", "previousBundleSha256"), ("receipt.json", "previousReceiptSha256"),
+                      ("recovery-link.json", "previousLinkSha256")):
+        require(sha((original_work / name).read_bytes()) == link[key], "builtin-continuation-origin-drift")
+    require(link["previousSourceDigest"] == original["sourceDigest"] and
+            all(previous[key] == original[key] for key in (
+                "subscriptionId", "tenantId", "scope", "owner", "suffix", "cleanupReceipt",
+                "controlKubeletIdentity", "publicKeyReady")), "builtin-continuation-input-drift")
+    original_values = json.loads((original_work / "compute-inputs.json").read_text())
+    original_values["sourceDigest"] = previous["sourceDigest"]
+    require(json.loads((previous_work / "compute-inputs.json").read_text()) == original_values,
+            "builtin-continuation-compute-input-drift")
+    assignments = receipt.get("cleanupAssignments")
+    require(isinstance(assignments, dict) and set(assignments) == {"verification", "groupsRead"} and
+            all(isinstance(value, str) and value for value in assignments.values()),
+            "only-two-recorded-bootstrap-grants-supported")
+    require(receipt == {
+        "phase": "authorization-transition-intent", "subscriptionId": previous["subscriptionId"],
+        "cleanupReceipt": previous["cleanupReceipt"], "sourceDigest": previous["sourceDigest"],
+        "principalId": link["proof"]["principalId"], "authorizationModel": AUTHORIZATION_MODEL,
+        "authorizationOf": {"previousSourceDigest": original["sourceDigest"],
+            "previousReceiptSha256": link["previousReceiptSha256"], "authorizationLinkSha256": record["sha256"]},
+        "cleanupAssignments": assignments,
+    }, "only-recorded-prepublication-bootstrap-supported")
+    return previous_work, previous, receipt, link["proof"]["accountTags"]
+
+
+def quota_blocked_proof(azure, previous, receipt, original_tags, granted=False):
     scope = previous["scope"]
     tags = {**original_tags, "orka-source-digest": previous["sourceDigest"]}
     for key in ("verificationResourceGroupId", "cleanupResourceGroupId", "automationAccountId"):
@@ -601,8 +649,22 @@ def quota_blocked_proof(azure, previous, receipt, original_tags):
                     resource["properties"]["publicNetworkAccess"] is False,
                     "stopped-automation-boundary-drift")
     require(account_identity(azure, previous, receipt) == receipt["principalId"], "stopped-principal-drift")
-    require(principal_assignments(azure, previous, receipt["principalId"]) == [],
-            "stopped-identity-has-existing-authority")
+    if granted:
+        validate_builtin_roles(azure, previous)
+        expected = cleanup_assignment_scopes(previous)
+        require(set(receipt["cleanupAssignments"]) == set(expected), "bootstrap-grant-set-drift")
+        for key, (assignment_scope, role_name) in expected.items():
+            identity = receipt["cleanupAssignments"][key]
+            require(identity.lower().startswith(assignment_scope.lower() +
+                    "/providers/microsoft.authorization/roleassignments/"), "bootstrap-grant-scope-drift")
+            role = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + \
+                previous["roleGuids"][role_name]
+            assignment_readback(azure.get(identity, "2022-04-01"), {"properties": {
+                "principalId": receipt["principalId"], "roleDefinitionId": role}}, assignment_scope)
+        audit_cleanup_assignments(azure, previous, receipt, expected, complete=True)
+    else:
+        require(principal_assignments(azure, previous, receipt["principalId"]) == [],
+                "stopped-identity-has-existing-authority")
     require(not azure.cli("resource", "list", "--resource-group",
                          scope["verificationResourceGroupId"].split("/")[-1]),
             "stopped-verification-group-not-empty")
@@ -627,24 +689,30 @@ def quota_blocked_proof(azure, previous, receipt, original_tags):
         items = azure.get(account + "/" + collection, AUTO_API)
         require(items.get("value") == [] and not items.get("nextLink"),
                 "stopped-cleanup-has-jobs-or-schedules")
-    for guid in previous["roleGuids"].values():
+    for guid in role_guids(scope).values():
         identity = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/{guid}"
         require(azure.get(identity, "2022-04-01", absent=True) is None, "legacy-custom-role-already-exists")
-    deployment_id = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Resources/deployments/bounded-cleanup-access"
+    deployment_name = "bounded-cleanup-builtin-access" if granted else "bounded-cleanup-access"
+    deployment_id = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Resources/deployments/{deployment_name}"
     failed = azure.get(deployment_id, "2024-03-01")
     require(failed["id"].lower() == deployment_id.lower() and
-            failed["properties"]["provisioningState"] == "Failed" and
-            "RoleDefinitionLimitExceeded" in json.dumps(failed["properties"].get("error")),
+            failed["properties"]["provisioningState"] == ("Succeeded" if granted else "Failed") and
+            (granted or "RoleDefinitionLimitExceeded" in json.dumps(failed["properties"].get("error"))),
             "exact-role-capacity-stop-required")
     return {"principalId": receipt["principalId"], "groupTags": tags, "accountTags": original_tags,
-            "failureDeploymentId": deployment_id, "failure": "RoleDefinitionLimitExceeded",
-            "runtimeId": runtime["id"], "unpublishedRunbookId": book["id"], "existingAssignments": 0}
+            "failureDeploymentId": deployment_id,
+            "failure": "recorded-grants-before-publication" if granted else "RoleDefinitionLimitExceeded",
+            "runtimeId": runtime["id"], "unpublishedRunbookId": book["id"],
+            "existingAssignments": len(receipt["cleanupAssignments"]) if granted else 0}
 
 
 def prepare_builtin_resume(args, work, azure):
     require(args.previous_work_dir and not (work / "bundle.json").exists(), "fresh-builtin-resume-plan-required")
-    previous_work, previous, old_receipt, tags = quota_blocked_inputs(args, args.previous_work_dir)
-    proof = quota_blocked_proof(azure, previous, old_receipt, tags)
+    continuation = getattr(args, "continue_granted_bootstrap", False)
+    loader = granted_bootstrap_inputs if continuation else quota_blocked_inputs
+    previous_work, previous, old_receipt, tags = loader(args, args.previous_work_dir)
+    proof = (quota_blocked_proof(azure, previous, old_receipt, tags, granted=True) if continuation else
+             quota_blocked_proof(azure, previous, old_receipt, tags))
     hashes = source_hashes()
     values = json.loads((previous_work / "compute-inputs.json").read_text())
     values["sourceDigest"] = sha(wire(hashes))
@@ -655,10 +723,12 @@ def prepare_builtin_resume(args, work, azure):
               "computeInputsSha256": sha((work / "compute-inputs.json").read_bytes())}
     validate_builtin_roles(azure, bundle)
     require(source_hashes() == hashes, "source-changed-during-authorization-plan")
-    link = {"kind": "builtin-authorization-transition", "authorizationModel": AUTHORIZATION_MODEL,
+    link_file = "authorization-link.json" if continuation else "recovery-link.json"
+    link = {"kind": "builtin-prepublication-continuation" if continuation else "builtin-authorization-transition",
+            "authorizationModel": AUTHORIZATION_MODEL,
             "previousWorkDir": str(previous_work), "previousBundleSha256": sha((previous_work / "bundle.json").read_bytes()),
             "previousReceiptSha256": sha((previous_work / "receipt.json").read_bytes()),
-            "previousLinkSha256": sha((previous_work / "recovery-link.json").read_bytes()),
+            "previousLinkSha256": sha((previous_work / link_file).read_bytes()),
             "previousSourceDigest": previous["sourceDigest"], "nextSourceDigest": bundle["sourceDigest"],
             "proof": proof, "assignments": cleanup_assignment_scopes(bundle, node=True, peer=True),
             "networkAssignmentScopes": network_assignment_scopes(bundle),
@@ -675,7 +745,7 @@ def resume_builtin_bootstrap(azure, bundle, receipt, args):
     record = json.loads((azure.work / "authorization-link.json").read_text())
     link = record["plan"]
     require(record["sha256"] == sha(wire(link)) == args.approved_authorization_sha256 and
-            link["kind"] == "builtin-authorization-transition" and
+            link["kind"] in ("builtin-authorization-transition", "builtin-prepublication-continuation") and
             link["authorizationModel"] == AUTHORIZATION_MODEL and
             link["nextSourceDigest"] == bundle["sourceDigest"], "approved-authorization-link-required")
     expected_roles = {name: {"id": guid, "name": title, "actions": sorted(actions)}
@@ -685,10 +755,13 @@ def resume_builtin_bootstrap(azure, bundle, receipt, args):
             link["builtinRoles"] == expected_roles and
             link["kubernetesAuthorization"] == "native-rbac-after-temporary-operator-bootstrap",
             "authorization-plan-does-not-match-execution")
-    previous_work, previous, old_receipt, tags = quota_blocked_inputs(args, link["previousWorkDir"])
+    continuation = link["kind"] == "builtin-prepublication-continuation"
+    loader = granted_bootstrap_inputs if continuation else quota_blocked_inputs
+    previous_work, previous, old_receipt, tags = loader(args, link["previousWorkDir"])
     require(previous["sourceDigest"] == link["previousSourceDigest"], "authorization-origin-source-drift")
+    link_file = "authorization-link.json" if continuation else "recovery-link.json"
     for name, key in (("bundle.json", "previousBundleSha256"), ("receipt.json", "previousReceiptSha256"),
-                      ("recovery-link.json", "previousLinkSha256")):
+                      (link_file, "previousLinkSha256")):
         require(sha((previous_work / name).read_bytes()) == link[key], "authorization-origin-record-drift")
     require(all(bundle[key] == previous[key] for key in (
         "subscriptionId", "tenantId", "scope", "owner", "suffix", "cleanupReceipt",
@@ -697,7 +770,9 @@ def resume_builtin_bootstrap(azure, bundle, receipt, args):
     values["sourceDigest"] = bundle["sourceDigest"]
     require(json.loads((azure.work / "compute-inputs.json").read_text()) == values,
             "authorization-transition-compute-input-drift")
-    require(quota_blocked_proof(azure, previous, old_receipt, tags) == link["proof"],
+    proof = (quota_blocked_proof(azure, previous, old_receipt, tags, granted=True) if continuation else
+             quota_blocked_proof(azure, previous, old_receipt, tags))
+    require(proof == link["proof"],
             "stopped-authorization-proof-drift")
     validate_builtin_roles(azure, bundle)
     receipt.update({"phase": "authorization-transition-intent", "subscriptionId": bundle["subscriptionId"],
@@ -706,6 +781,8 @@ def resume_builtin_bootstrap(azure, bundle, receipt, args):
                     "authorizationOf": {"previousSourceDigest": previous["sourceDigest"],
                         "previousReceiptSha256": link["previousReceiptSha256"],
                         "authorizationLinkSha256": record["sha256"]}})
+    if continuation:
+        receipt["cleanupAssignments"] = dict(old_receipt["cleanupAssignments"])
     save_receipt(azure.work, receipt)
     for key in ("verificationResourceGroupId", "cleanupResourceGroupId"):
         identity = bundle["scope"][key]
@@ -762,7 +839,7 @@ def access(azure, bundle, receipt, node=False, peer=False):
                             bundle["scope"]["controlSidePeeringId"])
         receipt["peeringAssignmentId"] = identity
         assignments["peerDelete"] = identity
-    audit_cleanup_assignments(azure, bundle, receipt, expected, complete=True)
+    audit_cleanup_assignments(azure, bundle, receipt, expected, complete=True, wait_missing=True)
     receipt["nodeScopeReady"] = node
     receipt["peeringScopeReady"] = peer
     save_receipt(azure.work, receipt)
@@ -793,24 +870,30 @@ def principal_assignments(azure, bundle, principal):
     return result["value"]
 
 
-def audit_cleanup_assignments(azure, bundle, receipt, expected, complete):
+def audit_cleanup_assignments(azure, bundle, receipt, expected, complete, wait_missing=False):
+    require(not wait_missing or complete, "readback-wait-requires-complete-audit")
     allowed = {(scope.lower(), bundle["roleGuids"][name]): key for key, (scope, name) in expected.items()}
-    seen = set()
-    for assignment in principal_assignments(azure, bundle, receipt["principalId"]):
-        props = assignment["properties"]
-        key = (props["scope"].lower(), props["roleDefinitionId"].split("/")[-1].lower())
-        require(key in allowed and key not in seen, "unexpected-cleanup-assignment")
-        require(not any(props.get(k) for k in ("condition", "conditionVersion", "delegatedManagedIdentityResourceId")),
-                "unexpected-conditional-cleanup-assignment")
-        if complete:
-            require(receipt["cleanupAssignments"].get(allowed[key], "").lower() == assignment["id"].lower(),
-                    "cleanup-assignment-not-in-receipt")
-        else:
-            require(assignment["id"].lower() in
-                    {value.lower() for value in receipt.get("cleanupAssignments", {}).values()},
-                    "unrecorded-existing-cleanup-assignment")
-        seen.add(key)
-    require(not complete or seen == set(allowed), "cleanup-assignment-inventory-incomplete")
+    end = time.monotonic() + ASSIGNMENT_READBACK_SECONDS
+    while True:
+        seen = set()
+        for assignment in principal_assignments(azure, bundle, receipt["principalId"]):
+            props = assignment["properties"]
+            key = (props["scope"].lower(), props["roleDefinitionId"].split("/")[-1].lower())
+            require(key in allowed and key not in seen, "unexpected-cleanup-assignment")
+            require(not any(props.get(k) for k in ("condition", "conditionVersion", "delegatedManagedIdentityResourceId")),
+                    "unexpected-conditional-cleanup-assignment")
+            if complete:
+                require(receipt["cleanupAssignments"].get(allowed[key], "").lower() == assignment["id"].lower(),
+                        "cleanup-assignment-not-in-receipt")
+            else:
+                require(assignment["id"].lower() in
+                        {value.lower() for value in receipt.get("cleanupAssignments", {}).values()},
+                        "unrecorded-existing-cleanup-assignment")
+            seen.add(key)
+        if not complete or seen == set(allowed):
+            return
+        require(wait_missing and time.monotonic() + 2 < end, "cleanup-assignment-inventory-incomplete")
+        time.sleep(2)
 
 
 def peer_assignment(bundle, receipt):
@@ -1350,6 +1433,7 @@ def parser():
     p.add_argument("--failed-recovery-work-dir")
     p.add_argument("--approved-recovery-sha256")
     p.add_argument("--approved-authorization-sha256")
+    p.add_argument("--continue-granted-bootstrap", action="store_true")
     return p
 
 

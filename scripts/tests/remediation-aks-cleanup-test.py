@@ -383,6 +383,52 @@ class BuiltinAuthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(apply.Failure, "unrecorded"):
             apply.audit_cleanup_assignments(azure, self.bundle, receipt, expected, complete=False)
 
+    def test_post_grant_list_visibility_wait_is_bounded_and_subset_only(self):
+        expected, receipt, assignments = self.assignment_fixture()
+        azure = mock.Mock()
+        clock = [0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        azure.cli.side_effect = [{"value": assignments[:1]}, {"value": assignments}]
+        with mock.patch.object(apply.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(apply.time, "sleep", side_effect=sleep):
+            apply.audit_cleanup_assignments(azure, self.bundle, receipt, expected, complete=True, wait_missing=True)
+        self.assertEqual(azure.cli.call_count, 2)
+        self.assertEqual(clock[0], 2)
+        azure.cli.reset_mock(side_effect=True)
+        azure.cli.return_value = {"value": assignments[:1]}
+        clock[0] = 0
+        with mock.patch.object(apply.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(apply.time, "sleep", side_effect=sleep), \
+             self.assertRaisesRegex(apply.Failure, "inventory-incomplete"):
+            apply.audit_cleanup_assignments(azure, self.bundle, receipt, expected, complete=True, wait_missing=True)
+        self.assertGreater(azure.cli.call_count, 1)
+        self.assertLess(clock[0], apply.ASSIGNMENT_READBACK_SECONDS)
+        azure.rest.assert_not_called()
+        azure.deploy.assert_not_called()
+
+    def test_post_grant_wait_never_retries_extra_scope_conditions_or_pagination(self):
+        expected, receipt, assignments = self.assignment_fixture()
+        for mode in ("scope", "condition", "unrecorded", "pagination"):
+            document = {"value": copy.deepcopy(assignments)}
+            if mode == "scope":
+                document["value"][0]["properties"]["scope"] = self.scope["controlVnetId"]
+            elif mode == "condition":
+                document["value"][0]["properties"]["condition"] = "unexpected"
+            elif mode == "unrecorded":
+                document["value"][0]["id"] += "-different"
+            else:
+                document["nextLink"] = "https://management.azure.com/unknown-page"
+            azure = mock.Mock()
+            azure.cli.return_value = document
+            with self.subTest(mode=mode), mock.patch.object(apply.time, "sleep") as sleep, \
+                 self.assertRaises(apply.Failure):
+                apply.audit_cleanup_assignments(azure, self.bundle, receipt, expected, complete=True, wait_missing=True)
+            sleep.assert_not_called()
+            self.assertEqual(azure.cli.call_count, 1)
+
     def test_custom_role_resource_is_rejected_even_inside_conditional_nested_template(self):
         for condition in (True, False):
             value = {"resources": [{"type": "Microsoft.Resources/deployments", "properties": {"template": {
@@ -430,6 +476,7 @@ class BuiltinAuthorizationTests(unittest.TestCase):
                 self.assignments = {}
                 self.deployments = []
                 self.puts = []
+                self.delayed_reads = 0
 
             def get(self, identity, _version, absent=False):
                 if identity in outer.roles:
@@ -441,7 +488,11 @@ class BuiltinAuthorizationTests(unittest.TestCase):
 
             def cli(self, *arguments):
                 outer.assertEqual(arguments[:3], ("rest", "--method", "GET"))
-                return {"value": copy.deepcopy(list(self.assignments.values()))}
+                values = list(self.assignments.values())
+                if mode == "delayed-list" and self.deployments and self.delayed_reads < 2:
+                    self.delayed_reads += 1
+                    values = values[:-1]
+                return {"value": copy.deepcopy(values)}
 
             def rest(self, method, identity, _version, body):
                 outer.assertEqual(method, "PUT")
@@ -497,11 +548,31 @@ class BuiltinAuthorizationTests(unittest.TestCase):
                                ("extra-after-deploy", "unexpected-cleanup-assignment")):
             azure = self.grant_client(mode)
             receipt = {"principalId": self.principal}
-            with self.subTest(mode=mode), self.assertRaisesRegex(apply.Failure, expected):
+            with self.subTest(mode=mode), mock.patch.object(apply.time, "sleep") as sleep, \
+                 self.assertRaisesRegex(apply.Failure, expected):
                 apply.access(azure, self.bundle, receipt)
+            sleep.assert_not_called()
             self.assertEqual(len(azure.deployments), 1)
             self.assertNotIn("nodeScopeReady", receipt)
             self.assertEqual(azure.puts, [])
+
+    def test_access_waits_for_new_bindings_at_its_actual_post_deploy_audit(self):
+        azure = self.grant_client("delayed-list")
+        receipt = {"principalId": self.principal}
+        clock = [0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(apply.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(apply.time, "sleep", side_effect=sleep):
+            apply.access(azure, self.bundle, receipt)
+        self.assertEqual(len(azure.deployments), 1)
+        self.assertEqual(azure.delayed_reads, 2)
+        self.assertEqual(clock[0], 4)
+        self.assertEqual(set(receipt["cleanupAssignments"]), {"verification", "groupsRead"})
+        self.assertEqual(len(azure.assignments), 2)
+        self.assertEqual(azure.puts, [])
 
     def test_access_does_not_deploy_when_an_unrecorded_grant_already_exists(self):
         azure = self.grant_client()
@@ -687,6 +758,35 @@ class BuiltinAuthorizationTests(unittest.TestCase):
         objects[self.scope["verificationResourceGroupId"]]["tags"]["orka-owner"] = "someone-else"
         with self.assertRaisesRegex(apply.Failure, "ownership"):
             apply.quota_blocked_proof(azure, previous, receipt, tags)
+        objects[self.scope["verificationResourceGroupId"]]["tags"]["orka-owner"] = previous["owner"]
+        builtin = {**previous, "authorizationModel": apply.AUTHORIZATION_MODEL,
+                   "roleGuids": apply.builtin_role_guids()}
+        _, recorded, assignments = self.assignment_fixture()
+        grant_receipt = {**receipt, "cleanupAssignments": {
+            key: recorded["cleanupAssignments"][key] for key in ("verification", "groupsRead")}}
+        objects.update(copy.deepcopy(self.roles))
+        for assignment in assignments[:2]:
+            objects[assignment["id"]] = assignment
+        state["assignments"] = assignments[:2]
+        deployment = f"/subscriptions/{self.subscription}/providers/Microsoft.Resources/deployments/bounded-cleanup-builtin-access"
+        objects[deployment] = {"id": deployment, "properties": {"provisioningState": "Succeeded"}}
+        result = apply.quota_blocked_proof(azure, builtin, grant_receipt, tags, granted=True)
+        self.assertEqual(result["existingAssignments"], 2)
+        for state_name in ("Failed", "Running"):
+            objects[deployment]["properties"]["provisioningState"] = state_name
+            with self.subTest(deployment=state_name), self.assertRaisesRegex(apply.Failure, "capacity-stop-required"):
+                apply.quota_blocked_proof(azure, builtin, grant_receipt, tags, granted=True)
+        objects[deployment]["properties"]["provisioningState"] = "Succeeded"
+        for key in ("verification", "groupsRead"):
+            identity = grant_receipt["cleanupAssignments"][key]
+            original_scope = objects[identity]["properties"]["scope"]
+            objects[identity]["properties"]["scope"] = self.scope["controlVnetId"]
+            with self.subTest(grant=key), self.assertRaisesRegex(apply.Failure, "readback-mismatch"):
+                apply.quota_blocked_proof(azure, builtin, grant_receipt, tags, granted=True)
+            objects[identity]["properties"]["scope"] = original_scope
+        state["assignments"] = assignments[:1]
+        with self.assertRaisesRegex(apply.Failure, "inventory-incomplete"):
+            apply.quota_blocked_proof(azure, builtin, grant_receipt, tags, granted=True)
         azure.rest.assert_not_called()
         azure.deploy.assert_not_called()
 
@@ -768,6 +868,80 @@ class BuiltinAuthorizationTests(unittest.TestCase):
         self.assertEqual(targets, [self.scope["verificationResourceGroupId"], self.scope["cleanupResourceGroupId"]])
         self.assertNotIn(self.scope["automationAccountId"], targets)
         self.assertTrue(all(path.read_bytes() == raw for path, raw in original_records.items()))
+        azure.rest.assert_not_called()
+        azure.deploy.assert_not_called()
+
+    @mock.patch.object(apply.plan, "private_path", side_effect=Path)
+    def test_prepublication_continuation_preserves_verified_grants_and_all_old_records(self, _private_path):
+        stopped, previous, _, tags, args = self.transition_fixture()
+        args.previous_work_dir = str(stopped)
+        granted_dir = Path(args.work_dir)
+        proof = {"principalId": self.principal, "accountTags": tags,
+                 "groupTags": {**tags, "orka-source-digest": previous["sourceDigest"]}}
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=proof), \
+             mock.patch.object(apply, "source_hashes", return_value={"fixture-source": "d" * 64}), \
+             mock.patch.object(apply, "compile_templates", return_value={}):
+            apply.prepare_builtin_resume(args, granted_dir, self.grant_client())
+        granted_bundle = json.loads((granted_dir / "bundle.json").read_text())
+        grant_link = json.loads((granted_dir / "authorization-link.json").read_text())
+        args.approved_authorization_sha256 = grant_link["sha256"]
+        azure = mock.Mock(work=granted_dir)
+        azure.get.return_value = {"tags": {**proof["groupTags"], "orka-source-digest": granted_bundle["sourceDigest"]}}
+        granted_receipt = {}
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=proof), \
+             mock.patch.object(apply, "validate_builtin_roles"), mock.patch.object(apply, "finish_bootstrap"):
+            apply.resume_builtin_bootstrap(azure, granted_bundle, granted_receipt, args)
+        _, fixture_receipt, _ = self.assignment_fixture()
+        grants = {key: fixture_receipt["cleanupAssignments"][key] for key in ("verification", "groupsRead")}
+        granted_receipt["cleanupAssignments"] = grants
+        apply.write_json(granted_dir / "receipt.json", granted_receipt)
+        before = {path: path.read_bytes() for path in self.directory.rglob("*.json")}
+        next_dir = self.directory / "continuation"
+        next_dir.mkdir()
+        args.work_dir = str(next_dir)
+        args.previous_work_dir = str(granted_dir)
+        args.continue_granted_bootstrap = True
+        observed = apply.granted_bootstrap_inputs(args, str(granted_dir))
+        self.assertEqual(observed, (granted_dir, granted_bundle, granted_receipt, tags))
+        for change in ("clock", "phase", "missing-grant", "extra-grant"):
+            mutated = copy.deepcopy(granted_receipt)
+            if change == "clock":
+                mutated["T0"] = "2026-01-01T00:00:00Z"
+            elif change == "phase":
+                mutated["phase"] = "bootstrap-ready"
+            elif change == "missing-grant":
+                mutated["cleanupAssignments"].pop("groupsRead")
+            else:
+                mutated["cleanupAssignments"]["nodes"] = fixture_receipt["cleanupAssignments"]["nodes"]
+            apply.write_json(granted_dir / "receipt.json", mutated)
+            with self.subTest(change=change), self.assertRaises(apply.Failure):
+                apply.granted_bootstrap_inputs(args, str(granted_dir))
+        (granted_dir / "receipt.json").write_bytes(before[granted_dir / "receipt.json"])
+        continuation_proof = {**proof, "groupTags": {
+            **tags, "orka-source-digest": granted_bundle["sourceDigest"]}, "existingAssignments": 2}
+        planning_azure = self.grant_client()
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=continuation_proof) as checked, \
+             mock.patch.object(apply, "source_hashes", return_value={"fixture-source": "e" * 64}), \
+             mock.patch.object(apply, "compile_templates", return_value={}):
+            apply.prepare_builtin_resume(args, next_dir, planning_azure)
+        checked.assert_called_once_with(planning_azure, granted_bundle, granted_receipt, tags, granted=True)
+        next_bundle = json.loads((next_dir / "bundle.json").read_text())
+        link = json.loads((next_dir / "authorization-link.json").read_text())
+        self.assertEqual(link["plan"]["kind"], "builtin-prepublication-continuation")
+        args.approved_authorization_sha256 = link["sha256"]
+        azure = mock.Mock(work=next_dir)
+        azure.get.return_value = {"tags": {**continuation_proof["groupTags"],
+                                          "orka-source-digest": next_bundle["sourceDigest"]}}
+        receipt = {}
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=continuation_proof), \
+             mock.patch.object(apply, "validate_builtin_roles"), \
+             mock.patch.object(apply, "finish_bootstrap") as finish:
+            apply.resume_builtin_bootstrap(azure, next_bundle, receipt, args)
+        finish.assert_called_once_with(azure, next_bundle, receipt)
+        self.assertEqual(receipt["cleanupAssignments"], grants)
+        self.assertEqual(receipt["phase"], "authorization-transition-intent")
+        self.assertTrue(all(path.read_bytes() == raw for path, raw in before.items()))
+        self.assertEqual(azure.cli.call_count, 2)
         azure.rest.assert_not_called()
         azure.deploy.assert_not_called()
 

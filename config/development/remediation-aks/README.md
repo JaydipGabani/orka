@@ -94,6 +94,11 @@ DNS link, or trusted setup Job is created by this template or the planner.
    checks its lack of data actions and exclusions, and audits all assignments
    visible for the cleanup principal. Extra grants, different scopes, conditions,
    duplicated bindings, or unrecorded existing assignments fail closed. The
+   post-grant list audit waits at most 120 seconds when the observed bindings
+   are only a strict subset of the exact recorded set. Extra or changed
+   bindings, conditions, malformed results and pagination are never retried
+   as missing data. This is a read-only consistency wait, not another grant.
+   The
    runbook requires an explicit version-2 manifest and verifies the exact
    effective group-cleanup action set during preflight; it does not simply
    disable the former wildcard guard.
@@ -394,6 +399,32 @@ receipt before granting the explicitly approved built-in assignments. It does
 not recreate or modify the Automation account, replay child creation, start
 compute, or edit earlier receipts. The new access deployment uses a different
 name so the original quota-failure deployment record remains available.
+
+If those two exact built-in assignments were created and recorded but the
+post-grant list audit stopped before publication, use a new private bundle
+and explicitly select the prepublication continuation:
+
+```bash
+python3 "$APPLY" plan-builtin-resume --subscription "$APPROVED_SUBSCRIPTION" \
+  --control-vnet-id "$CONTROL_VNET_ID" --control-aks-id "$CONTROL_AKS_ID" \
+  --previous-work-dir "$STOPPED_BUILTIN_BUNDLE_DIR" \
+  --continue-granted-bootstrap --work-dir "$CONTINUATION_BUNDLE_DIR"
+# Review and approve the new source and authorization-link digests.
+python3 "$APPLY" resume-builtin-bootstrap ... \
+  --reviewed-source-sha256 "$REVIEWED_DIGEST" \
+  --approved-authorization-sha256 "$AUTHORIZATION_LINK_DIGEST"
+```
+
+This continuation requires the original built-in transition link and every
+preceding failed receipt to remain unchanged, exactly the two recorded
+verification-group/subscription-reader assignments with successful individual
+readbacks and a complete list audit, a still-unpublished runbook, no jobs or
+schedules, an empty verification group, and no node group or clock. It cannot
+adopt unrelated grants, change scope/compute inputs, repeat a preflight job or
+recursively continue another continuation. Only a new intent receipt is
+updated; the stopped receipt remains immutable. The same approved assignments
+are carried into the new receipt before the idempotent access/publish/preflight
+path, so existing recorded grants are not mistaken for unrelated permissions.
 
 This is not a generic resume/adoption framework. A partially failed phase stops
 with a private intent receipt and requires bounded operator recovery; never
