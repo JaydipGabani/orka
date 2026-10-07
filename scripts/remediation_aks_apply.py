@@ -27,28 +27,25 @@ Failure = plan.Failure
 AUTO_API = "2024-10-23"
 ARM = "https://management.azure.com"
 NEW_TEMPLATES = ("cleanup", "cleanup-access", "cleanup-recovery", "peering", "dns-link", "registry-pull")
-REQUIRED_ACTIONS = {
-    "Microsoft.Resources/subscriptions/resourceGroups/read",
-    "Microsoft.Resources/subscriptions/resourceGroups/delete",
-    "Microsoft.Resources/subscriptions/resourceGroups/resources/read",
-    "Microsoft.Resources/deployments/read",
-    "Microsoft.Resources/deployments/operations/read",
-    "Microsoft.ContainerService/managedClusters/read",
-    "Microsoft.ContainerService/managedClusters/delete",
-    "Microsoft.Compute/virtualMachines/read",
-    "Microsoft.Compute/virtualMachines/instanceView/read",
-    "Microsoft.Compute/virtualMachines/delete",
-    "Microsoft.Authorization/permissions/read",
+AUTHORIZATION_MODEL = "builtin-group-cleanup-v1"
+BUILTIN_ROLES = {
+    "resource-cleanup": ("94877a25-7520-40c5-9c42-68e02e4758bd", "Resource Group Contributor", {
+        "Microsoft.Resources/subscriptions/resourceGroups/read",
+        "Microsoft.Resources/subscriptions/resourceGroups/write",
+        "Microsoft.Resources/subscriptions/resourceGroups/delete",
+    }),
+    "group-metadata-read": ("acdd72a7-3385-48ef-bd42-f606fba81ae7", "Reader", {"*/read"}),
+    "peering-cleanup": ("4d97b98b-1d4f-4787-a291-c67834d212e7", "Network Contributor", {
+        "Microsoft.Authorization/*/read", "Microsoft.Insights/alertRules/*", "Microsoft.Network/*",
+        "Microsoft.ResourceHealth/availabilityStatuses/read", "Microsoft.Resources/deployments/*",
+        "Microsoft.Resources/subscriptions/resourceGroups/read", "Microsoft.Support/*",
+    }),
 }
 ABSENT_CODES = frozenset(("ResourceNotFound", "ResourceGroupNotFound", "NotFound", "RoleDefinitionDoesNotExist",
                          "RoleAssignmentNotFound", "ParentResourceNotFound"))
 PREFLIGHT_QUEUE_ALLOWANCE_SECONDS = 600
 PREFLIGHT_EXECUTION_SECONDS = 600
 ACR_PULL_ROLE = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
-READ_ONLY_ACTIONS = {
-    "group-metadata-read": {"Microsoft.Resources/subscriptions/resourceGroups/read"},
-    "peering-metadata-read": {"Microsoft.Network/virtualNetworks/virtualNetworkPeerings/read"},
-}
 
 
 def missing_azure_response(stderr, rest):
@@ -129,6 +126,52 @@ def arm_parameters(values):
 def role_guids(scope):
     return {kind: str(uuid.uuid5(uuid.NAMESPACE_URL, scope["cleanupResourceGroupId"] + "/" + kind))
             for kind in ("resource-cleanup", "peering-cleanup", "group-metadata-read", "peering-metadata-read")}
+
+
+def builtin_role_guids():
+    return {name: value[0] for name, value in BUILTIN_ROLES.items()}
+
+
+def network_assignment_scopes(bundle):
+    group = bundle["scope"]["verificationResourceGroupId"]
+    prefix = "orka-verify-" + bundle["suffix"]
+    return {
+        "vnet": bundle["scope"]["verificationVnetId"],
+        "nodes": group + "/providers/Microsoft.Network/networkSecurityGroups/" + prefix + "-nodes",
+        "nat": group + "/providers/Microsoft.Network/natGateways/" + prefix + "-egress",
+    }
+
+
+def arm_guid(*values):
+    return str(uuid.uuid5(uuid.UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830"), "-".join(values)))
+
+
+def validate_builtin_roles(azure, bundle):
+    require(bundle.get("authorizationModel") == AUTHORIZATION_MODEL and
+            bundle.get("roleGuids") == builtin_role_guids(), "explicit-builtin-authorization-required")
+    for guid, name, actions in BUILTIN_ROLES.values():
+        identity = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/{guid}"
+        resource = azure.get(identity, "2022-04-01")
+        role = resource["properties"]
+        require(resource["id"].split("/")[-1].lower() == guid and
+                role["type"] == "BuiltInRole" and role["roleName"] == name,
+                "builtin-role-identity-drift")
+        permissions = role["permissions"]
+        require(len(permissions) == 1 and set(permissions[0]["actions"]) == actions and
+                not any(permissions[0].get(key) for key in
+                        ("notActions", "dataActions", "notDataActions", "condition", "conditionVersion")),
+                "builtin-role-permission-drift")
+
+
+def reject_custom_role_definitions(template):
+    if isinstance(template, dict):
+        require(str(template.get("type", "")).lower() != "microsoft.authorization/roledefinitions",
+                "custom-role-creation-forbidden")
+        for value in template.values():
+            reject_custom_role_definitions(value)
+    elif isinstance(template, list):
+        for value in template:
+            reject_custom_role_definitions(value)
 
 
 def owned(resource, scope, owner, receipt, expected_id=None):
@@ -225,6 +268,7 @@ def compile_templates(work):
         completed = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
         require(completed.returncode == 0 and not completed.stderr.strip(), "bicep-build-or-warning")
         value = json.loads(completed.stdout)
+        reject_custom_role_definitions(value)
         destination = work / (name + ".arm.json")
         write_json(destination, value)
         result[name] = sha(destination.read_bytes())
@@ -263,8 +307,10 @@ def prepare(args, work, azure):
               "scope": scope, "owner": values["owner"], "suffix": values["suffix"],
               "cleanupReceipt": receipt, "sourceHashes": hashes, "compiledHashes": compiled,
               "sourceDigest": sha(wire(hashes)), "computeInputsSha256": sha((work / "compute-inputs.json").read_bytes()),
-              "publicKeyReady": key_ready, "roleGuids": role_guids(scope),
+              "publicKeyReady": key_ready, "roleGuids": builtin_role_guids(),
+              "authorizationModel": AUTHORIZATION_MODEL,
               "controlKubeletIdentity": control_kubelet}
+    validate_builtin_roles(azure, bundle)
     plan.check_subscription_ids(bundle, args.subscription)
     bootstrap = {"suffix": bundle["suffix"], "owner": bundle["owner"], "cleanupReceipt": receipt,
                  "sourceDigest": bundle["sourceDigest"], "location": "eastus2"}
@@ -486,6 +532,9 @@ def load_bundle(args, work):
     require(bundle["scope"] == plan.targets(args.subscription, bundle["suffix"],
             args.control_vnet_id, args.control_aks_id), "bundle-target-mismatch")
     require(source_hashes() == bundle["sourceHashes"], "reviewed-source-drift")
+    require(bundle.get("authorizationModel") == AUTHORIZATION_MODEL and
+            bundle["roleGuids"] == builtin_role_guids(), "explicit-builtin-authorization-required")
+    require(sha(wire(bundle["sourceHashes"])) == bundle["sourceDigest"], "source-manifest-digest-mismatch")
     require(args.reviewed_source_sha256 == bundle["sourceDigest"], "independent-review-digest-required")
     require(sha((work / "compute-inputs.json").read_bytes()) == bundle["computeInputsSha256"],
             "compute-input-drift")
@@ -493,6 +542,179 @@ def load_bundle(args, work):
         require(sha((work / (name + ".arm.json")).read_bytes()) == digest, "compiled-template-drift")
     plan.check_subscription_ids(bundle, args.subscription)
     return bundle
+
+
+def quota_blocked_inputs(args, path):
+    previous_work = plan.private_path(path)
+    require(previous_work != plan.private_path(args.work_dir), "new-authorization-bundle-required")
+    previous = json.loads((previous_work / "bundle.json").read_text())
+    receipt = json.loads((previous_work / "receipt.json").read_text())
+    link = json.loads((previous_work / "recovery-link.json").read_text())
+    require(previous["version"] == 1 and previous["subscriptionId"] == args.subscription and
+            previous["scope"] == plan.targets(args.subscription, previous["suffix"],
+                args.control_vnet_id, args.control_aks_id), "prior-authorization-scope-mismatch")
+    require(not previous.get("authorizationModel") and
+            previous["roleGuids"] == role_guids(previous["scope"]),
+            "only-unassigned-custom-role-transition-supported")
+    require(sha(wire(previous["sourceHashes"])) == previous["sourceDigest"] and
+            sha((previous_work / "compute-inputs.json").read_bytes()) == previous["computeInputsSha256"],
+            "prior-authorization-bundle-drift")
+    for name, digest in previous["compiledHashes"].items():
+        require(sha((previous_work / (name + ".arm.json")).read_bytes()) == digest, "prior-compiled-input-drift")
+    require(link["sha256"] == sha(wire(link["plan"])) and
+            link["plan"]["kind"] == "automation-child-zero-tag-recovery" and
+            link["plan"]["nextSourceDigest"] == previous["sourceDigest"], "prior-zero-tag-link-required")
+    original_work, original = previous_recovery_inputs(link["plan"]["previousWorkDir"], args)
+    require(sha((original_work / "bundle.json").read_bytes()) == link["plan"]["previousBundleSha256"] and
+            sha((original_work / "receipt.json").read_bytes()) == link["plan"]["previousReceiptSha256"],
+            "original-receipt-link-drift")
+    failed = link["plan"]["failedRecovery"]
+    failed_work = plan.private_path(failed["workDir"])
+    for name, key in (("bundle.json", "bundleSha256"), ("receipt.json", "receiptSha256"),
+                      ("recovery-link.json", "linkFileSha256")):
+        require(sha((failed_work / name).read_bytes()) == failed[key], "intermediate-receipt-link-drift")
+    require(receipt == {
+        "phase": "recovery-intent", "subscriptionId": previous["subscriptionId"],
+        "cleanupReceipt": previous["cleanupReceipt"], "sourceDigest": previous["sourceDigest"],
+        "principalId": link["plan"]["partialProof"]["principalId"],
+        "recoveryOf": {"sourceDigest": original["sourceDigest"],
+                       "receiptSha256": link["plan"]["previousReceiptSha256"],
+                       "recoveryLinkSha256": link["sha256"], "failedRecovery": failed},
+    }, "only-stopped-unassigned-recovery-supported")
+    require(all(previous[key] == original[key] for key in (
+        "subscriptionId", "tenantId", "scope", "owner", "suffix", "cleanupReceipt",
+        "roleGuids", "controlKubeletIdentity", "publicKeyReady")), "prior-authorization-input-drift")
+    return previous_work, previous, receipt, link["plan"]["partialProof"]["expectedTags"]
+
+
+def quota_blocked_proof(azure, previous, receipt, original_tags):
+    scope = previous["scope"]
+    tags = {**original_tags, "orka-source-digest": previous["sourceDigest"]}
+    for key in ("verificationResourceGroupId", "cleanupResourceGroupId", "automationAccountId"):
+        resource = azure.get(scope[key], AUTO_API if key == "automationAccountId" else "2024-03-01")
+        owned(resource, scope, previous["owner"], previous["cleanupReceipt"], scope[key])
+        require(resource["tags"] == (original_tags if key == "automationAccountId" else tags),
+                "stopped-authorization-ownership-drift")
+        if key == "automationAccountId":
+            require(resource["properties"]["state"] == "Ok" and
+                    resource["properties"]["disableLocalAuth"] is True and
+                    resource["properties"]["publicNetworkAccess"] is False,
+                    "stopped-automation-boundary-drift")
+    require(account_identity(azure, previous, receipt) == receipt["principalId"], "stopped-principal-drift")
+    require(principal_assignments(azure, previous, receipt["principalId"]) == [],
+            "stopped-identity-has-existing-authority")
+    require(not azure.cli("resource", "list", "--resource-group",
+                         scope["verificationResourceGroupId"].split("/")[-1]),
+            "stopped-verification-group-not-empty")
+    require(azure.cli("group", "exists", "--name", scope["managedNodeResourceGroupId"].split("/")[-1]) is False,
+            "stopped-node-group-already-exists")
+    account = scope["automationAccountId"]
+    runtime = azure.get(account + "/runtimeEnvironments/PowerShell74", AUTO_API)
+    book = azure.get(account + "/runbooks/ExactFoundationCleanup", AUTO_API)
+    require(runtime["id"].lower() == (account + "/runtimeEnvironments/PowerShell74").lower() and
+            runtime.get("tags", {}) == {} and
+            runtime["properties"]["runtime"] == {"language": "PowerShell", "version": "7.4"} and
+            not runtime["properties"].get("defaultPackages"), "stopped-runtime-drift")
+    require(book["id"].lower() == (account + "/runbooks/ExactFoundationCleanup").lower() and
+            book.get("tags", {}) == {} and book["properties"]["state"] == "New" and
+            book["properties"]["runbookType"] == "PowerShell" and
+            book["properties"]["runtimeEnvironment"] == "PowerShell74",
+            "only-unpublished-cleanup-runbook-supported")
+    allowed = {account.lower(), runtime["id"].lower(), book["id"].lower()}
+    resources = azure.cli("resource", "list", "--resource-group", scope["cleanupResourceGroupId"].split("/")[-1])
+    require({item["id"].lower() for item in resources} <= allowed, "unexpected-stopped-cleanup-resource")
+    for collection in ("jobs", "schedules", "jobSchedules"):
+        items = azure.get(account + "/" + collection, AUTO_API)
+        require(items.get("value") == [] and not items.get("nextLink"),
+                "stopped-cleanup-has-jobs-or-schedules")
+    for guid in previous["roleGuids"].values():
+        identity = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/{guid}"
+        require(azure.get(identity, "2022-04-01", absent=True) is None, "legacy-custom-role-already-exists")
+    deployment_id = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Resources/deployments/bounded-cleanup-access"
+    failed = azure.get(deployment_id, "2024-03-01")
+    require(failed["id"].lower() == deployment_id.lower() and
+            failed["properties"]["provisioningState"] == "Failed" and
+            "RoleDefinitionLimitExceeded" in json.dumps(failed["properties"].get("error")),
+            "exact-role-capacity-stop-required")
+    return {"principalId": receipt["principalId"], "groupTags": tags, "accountTags": original_tags,
+            "failureDeploymentId": deployment_id, "failure": "RoleDefinitionLimitExceeded",
+            "runtimeId": runtime["id"], "unpublishedRunbookId": book["id"], "existingAssignments": 0}
+
+
+def prepare_builtin_resume(args, work, azure):
+    require(args.previous_work_dir and not (work / "bundle.json").exists(), "fresh-builtin-resume-plan-required")
+    previous_work, previous, old_receipt, tags = quota_blocked_inputs(args, args.previous_work_dir)
+    proof = quota_blocked_proof(azure, previous, old_receipt, tags)
+    hashes = source_hashes()
+    values = json.loads((previous_work / "compute-inputs.json").read_text())
+    values["sourceDigest"] = sha(wire(hashes))
+    write_json(work / "compute-inputs.json", values)
+    bundle = {**previous, "authorizationModel": AUTHORIZATION_MODEL, "roleGuids": builtin_role_guids(),
+              "sourceHashes": hashes, "sourceDigest": values["sourceDigest"],
+              "compiledHashes": compile_templates(work),
+              "computeInputsSha256": sha((work / "compute-inputs.json").read_bytes())}
+    validate_builtin_roles(azure, bundle)
+    require(source_hashes() == hashes, "source-changed-during-authorization-plan")
+    link = {"kind": "builtin-authorization-transition", "authorizationModel": AUTHORIZATION_MODEL,
+            "previousWorkDir": str(previous_work), "previousBundleSha256": sha((previous_work / "bundle.json").read_bytes()),
+            "previousReceiptSha256": sha((previous_work / "receipt.json").read_bytes()),
+            "previousLinkSha256": sha((previous_work / "recovery-link.json").read_bytes()),
+            "previousSourceDigest": previous["sourceDigest"], "nextSourceDigest": bundle["sourceDigest"],
+            "proof": proof, "assignments": cleanup_assignment_scopes(bundle, node=True, peer=True),
+            "networkAssignmentScopes": network_assignment_scopes(bundle),
+            "builtinRoles": {name: {"id": guid, "name": title, "actions": sorted(actions)}
+                             for name, (guid, title, actions) in BUILTIN_ROLES.items()},
+            "kubernetesAuthorization": "native-rbac-after-temporary-operator-bootstrap"}
+    write_json(work / "bundle.json", bundle)
+    write_json(work / "authorization-link.json", {"plan": link, "sha256": sha(wire(link))})
+    print("Read-only built-in authorization transition prepared; explicit review and approval are required.")
+
+
+def resume_builtin_bootstrap(azure, bundle, receipt, args):
+    require(not receipt and args.approved_authorization_sha256, "approved-new-authorization-receipt-required")
+    record = json.loads((azure.work / "authorization-link.json").read_text())
+    link = record["plan"]
+    require(record["sha256"] == sha(wire(link)) == args.approved_authorization_sha256 and
+            link["kind"] == "builtin-authorization-transition" and
+            link["authorizationModel"] == AUTHORIZATION_MODEL and
+            link["nextSourceDigest"] == bundle["sourceDigest"], "approved-authorization-link-required")
+    expected_roles = {name: {"id": guid, "name": title, "actions": sorted(actions)}
+                      for name, (guid, title, actions) in BUILTIN_ROLES.items()}
+    require(wire(link["assignments"]) == wire(cleanup_assignment_scopes(bundle, node=True, peer=True)) and
+            link["networkAssignmentScopes"] == network_assignment_scopes(bundle) and
+            link["builtinRoles"] == expected_roles and
+            link["kubernetesAuthorization"] == "native-rbac-after-temporary-operator-bootstrap",
+            "authorization-plan-does-not-match-execution")
+    previous_work, previous, old_receipt, tags = quota_blocked_inputs(args, link["previousWorkDir"])
+    require(previous["sourceDigest"] == link["previousSourceDigest"], "authorization-origin-source-drift")
+    for name, key in (("bundle.json", "previousBundleSha256"), ("receipt.json", "previousReceiptSha256"),
+                      ("recovery-link.json", "previousLinkSha256")):
+        require(sha((previous_work / name).read_bytes()) == link[key], "authorization-origin-record-drift")
+    require(all(bundle[key] == previous[key] for key in (
+        "subscriptionId", "tenantId", "scope", "owner", "suffix", "cleanupReceipt",
+        "controlKubeletIdentity", "publicKeyReady")), "authorization-transition-scope-drift")
+    values = json.loads((previous_work / "compute-inputs.json").read_text())
+    values["sourceDigest"] = bundle["sourceDigest"]
+    require(json.loads((azure.work / "compute-inputs.json").read_text()) == values,
+            "authorization-transition-compute-input-drift")
+    require(quota_blocked_proof(azure, previous, old_receipt, tags) == link["proof"],
+            "stopped-authorization-proof-drift")
+    validate_builtin_roles(azure, bundle)
+    receipt.update({"phase": "authorization-transition-intent", "subscriptionId": bundle["subscriptionId"],
+                    "cleanupReceipt": bundle["cleanupReceipt"], "sourceDigest": bundle["sourceDigest"],
+                    "principalId": old_receipt["principalId"], "authorizationModel": AUTHORIZATION_MODEL,
+                    "authorizationOf": {"previousSourceDigest": previous["sourceDigest"],
+                        "previousReceiptSha256": link["previousReceiptSha256"],
+                        "authorizationLinkSha256": record["sha256"]}})
+    save_receipt(azure.work, receipt)
+    for key in ("verificationResourceGroupId", "cleanupResourceGroupId"):
+        identity = bundle["scope"][key]
+        azure.cli("tag", "update", "--resource-id", identity, "--operation", "Merge",
+                  "--tags", "orka-source-digest=" + bundle["sourceDigest"])
+        actual = azure.get(identity, "2024-03-01")
+        require(actual["tags"] == {**link["proof"]["groupTags"], "orka-source-digest": bundle["sourceDigest"]},
+                "authorization-transition-tag-drift")
+    finish_bootstrap(azure, bundle, receipt)
 
 
 def save_receipt(work, receipt):
@@ -512,14 +734,12 @@ def account_identity(azure, bundle, receipt):
 
 
 def access(azure, bundle, receipt, node=False, peer=False):
-    control = bundle["scope"]["controlVnetId"].split("/")
+    validate_builtin_roles(azure, bundle)
+    expected = cleanup_assignment_scopes(bundle, node, peer)
+    audit_cleanup_assignments(azure, bundle, receipt, expected, complete=False)
     values = {"suffix": bundle["suffix"], "principalId": receipt["principalId"],
-              "resourceRoleGuid": bundle["roleGuids"]["resource-cleanup"],
-              "peeringRoleGuid": bundle["roleGuids"]["peering-cleanup"],
-              "groupMetadataRoleGuid": bundle["roleGuids"]["group-metadata-read"],
-              "peerMetadataRoleGuid": bundle["roleGuids"]["peering-metadata-read"],
-              "controlResourceGroup": control[4], "includeNodeGroup": node}
-    deployed = azure.deploy("bounded-cleanup-access", azure.work / "cleanup-access.arm.json", values,
+              "includeNodeGroup": node}
+    deployed = azure.deploy("bounded-cleanup-builtin-access", azure.work / "cleanup-access.arm.json", values,
                             provider_validate=True)
     outputs = deployed["properties"]["outputs"]
     assignments = receipt.setdefault("cleanupAssignments", {})
@@ -527,41 +747,12 @@ def access(azure, bundle, receipt, node=False, peer=False):
                         ("nodes", "nodeAssignmentId")):
         if outputs[output]["value"]:
             assignments[key] = outputs[output]["value"]
-    action_sets = {"resource-cleanup": REQUIRED_ACTIONS, "peering-cleanup": {
-        "Microsoft.Network/virtualNetworks/virtualNetworkPeerings/read",
-        "Microsoft.Network/virtualNetworks/virtualNetworkPeerings/delete"}, **READ_ONLY_ACTIONS}
-    expected_scopes = {
-        "resource-cleanup": [bundle["scope"]["verificationResourceGroupId"]] +
-            ([bundle["scope"]["managedNodeResourceGroupId"]] if node else []),
-        "peering-cleanup": ["/".join(bundle["scope"]["controlVnetId"].split("/")[:5])],
-        "group-metadata-read": [f"/subscriptions/{bundle['subscriptionId']}"],
-        "peering-metadata-read": ["/".join(bundle["scope"]["controlVnetId"].split("/")[:5])],
-    }
-    for name, expected_actions in action_sets.items():
-        identity = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + bundle["roleGuids"][name]
-        role = azure.get(identity, "2022-04-01")["properties"]
-        require(role["type"] == "CustomRole" and role["roleName"] ==
-                bundle["scope"]["verificationResourceGroupId"].split("/rg-")[-1] + "-" + name,
-                "cleanup-role-drift")
-        permissions = role["permissions"]
-        require(len(permissions) == 1 and set(permissions[0]["actions"]) == expected_actions and
-                not any(permissions[0].get(k) for k in ("notActions", "dataActions", "notDataActions")),
-                "cleanup-role-permission-drift")
-        require({s.lower() for s in role["assignableScopes"]} ==
-                {s.lower() for s in expected_scopes[name]}, "cleanup-role-assignable-scope-drift")
-    read_id, read_body = scoped_assignment(bundle, receipt, bundle["scope"]["controlVnetId"],
-                                           "peering-metadata-read")
-    existing = azure.get(read_id, "2022-04-01", absent=True)
-    if existing is None:
-        azure.rest("PUT", read_id, "2022-04-01", read_body)
-        existing = azure.get(read_id, "2022-04-01")
-    assignment_readback(existing, read_body, bundle["scope"]["controlVnetId"])
-    assignments["peerMetadataRead"] = read_id
-    group_read = azure.get(assignments["groupsRead"], "2022-04-01")
-    group_role = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + bundle["roleGuids"]["group-metadata-read"]
-    assignment_readback(group_read, {"properties": {"principalId": receipt["principalId"],
-                                                  "roleDefinitionId": group_role}},
-                        f"/subscriptions/{bundle['subscriptionId']}")
+            scope, role_name = expected[key]
+            role = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + bundle["roleGuids"][role_name]
+            assignment_readback(azure.get(assignments[key], "2022-04-01"),
+                                {"properties": {"principalId": receipt["principalId"], "roleDefinitionId": role}},
+                                scope)
+    save_receipt(azure.work, receipt)
     if peer:
         identity, body = peer_assignment(bundle, receipt)
         require(azure.get(identity, "2022-04-01", absent=True) is None,
@@ -571,9 +762,55 @@ def access(azure, bundle, receipt, node=False, peer=False):
                             bundle["scope"]["controlSidePeeringId"])
         receipt["peeringAssignmentId"] = identity
         assignments["peerDelete"] = identity
+    audit_cleanup_assignments(azure, bundle, receipt, expected, complete=True)
     receipt["nodeScopeReady"] = node
     receipt["peeringScopeReady"] = peer
     save_receipt(azure.work, receipt)
+
+
+def cleanup_assignment_scopes(bundle, node=False, peer=False):
+    scope = bundle["scope"]
+    expected = {
+        "verification": (scope["verificationResourceGroupId"], "resource-cleanup"),
+        "groupsRead": (f"/subscriptions/{bundle['subscriptionId']}", "group-metadata-read"),
+    }
+    if node:
+        expected["nodes"] = (scope["managedNodeResourceGroupId"], "resource-cleanup")
+    if peer:
+        expected["peerDelete"] = (scope["controlSidePeeringId"], "peering-cleanup")
+    return expected
+
+
+def principal_assignments(azure, bundle, principal):
+    require(plan.UUID.fullmatch(principal), "invalid-cleanup-principal")
+    query = urlencode({"api-version": "2022-04-01", "$filter": f"principalId eq '{principal}'"})
+    result = azure.cli("rest", "--method", "GET", "--url",
+        f"{ARM}/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleAssignments?{query}")
+    require(not result.get("nextLink") and isinstance(result.get("value"), list),
+            "cleanup-assignment-inventory-incomplete")
+    require(all(item["properties"]["principalId"].lower() == principal.lower() for item in result["value"]),
+            "cleanup-assignment-inventory-principal-mismatch")
+    return result["value"]
+
+
+def audit_cleanup_assignments(azure, bundle, receipt, expected, complete):
+    allowed = {(scope.lower(), bundle["roleGuids"][name]): key for key, (scope, name) in expected.items()}
+    seen = set()
+    for assignment in principal_assignments(azure, bundle, receipt["principalId"]):
+        props = assignment["properties"]
+        key = (props["scope"].lower(), props["roleDefinitionId"].split("/")[-1].lower())
+        require(key in allowed and key not in seen, "unexpected-cleanup-assignment")
+        require(not any(props.get(k) for k in ("condition", "conditionVersion", "delegatedManagedIdentityResourceId")),
+                "unexpected-conditional-cleanup-assignment")
+        if complete:
+            require(receipt["cleanupAssignments"].get(allowed[key], "").lower() == assignment["id"].lower(),
+                    "cleanup-assignment-not-in-receipt")
+        else:
+            require(assignment["id"].lower() in
+                    {value.lower() for value in receipt.get("cleanupAssignments", {}).values()},
+                    "unrecorded-existing-cleanup-assignment")
+        seen.add(key)
+    require(not complete or seen == set(allowed), "cleanup-assignment-inventory-incomplete")
 
 
 def peer_assignment(bundle, receipt):
@@ -594,6 +831,9 @@ def assignment_readback(resource, body, scope):
     require(actual["principalId"] == body["properties"]["principalId"] and
             actual["roleDefinitionId"].lower() == body["properties"]["roleDefinitionId"].lower() and
             actual["scope"].lower() == scope.lower(), "cleanup-assignment-readback-mismatch")
+    require(not any(actual.get(key) for key in
+                    ("condition", "conditionVersion", "delegatedManagedIdentityResourceId")),
+            "unexpected-conditional-role-assignment")
 
 
 def kubelet_identity(cluster, subscription):
@@ -639,7 +879,8 @@ def registry_pulls(azure, bundle, receipt, aks):
     save_receipt(azure.work, receipt)
 
 def manifest(bundle, receipt, cleanup=False):
-    return {"version": 1, "subscriptionId": bundle["subscriptionId"], "tenantId": bundle["tenantId"],
+    return {"version": 2, "authorizationModel": AUTHORIZATION_MODEL,
+            "subscriptionId": bundle["subscriptionId"], "tenantId": bundle["tenantId"],
             "principalId": receipt["principalId"], "suffix": bundle["suffix"], "owner": bundle["owner"],
             "cleanupReceipt": bundle["cleanupReceipt"], "controlVnetId": bundle["scope"]["controlVnetId"],
             "budgetStartUtc": receipt.get("T0", ""), "expiresAtUtc": receipt.get("deadline", ""),
@@ -680,9 +921,7 @@ def bootstrap(azure, bundle, receipt):
     for key in ("verificationResourceGroupId", "managedNodeResourceGroupId", "cleanupResourceGroupId"):
         require(azure.cli("group", "exists", "--name", scope[key].split("/")[-1]) is False,
                 "unexpected-existing-resource-group")
-    for guid in bundle["roleGuids"].values():
-        identity = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/{guid}"
-        require(azure.get(identity, "2022-04-01", absent=True) is None, "unexpected-existing-role-definition")
+    validate_builtin_roles(azure, bundle)
     receipt.update({"phase": "bootstrap-intent", "subscriptionId": bundle["subscriptionId"],
                     "cleanupReceipt": bundle["cleanupReceipt"], "sourceDigest": bundle["sourceDigest"]})
     save_receipt(azure.work, receipt)
@@ -716,6 +955,34 @@ def finish_bootstrap(azure, bundle, receipt):
             (SOURCE / "cleanup-runbook.ps1").read_text().strip(), "published-runbook-content-mismatch")
     preflight_job(azure, bundle, receipt)
     receipt["phase"] = "bootstrap-ready"
+    save_receipt(azure.work, receipt)
+
+
+def verify_network_assignments(azure, bundle, receipt, aks):
+    group = bundle["scope"]["verificationResourceGroupId"]
+    identity_id = group + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/orka-verify-" + \
+        bundle["suffix"] + "-aks-control-plane"
+    attached = aks["identity"].get("userAssignedIdentities") or {}
+    require(aks["identity"]["type"] == "UserAssigned" and
+            {value.lower() for value in attached} == {identity_id.lower()}, "aks-control-identity-mismatch")
+    identity = azure.get(identity_id, "2023-01-31")
+    owned(identity, bundle["scope"], bundle["owner"], bundle["cleanupReceipt"], identity_id)
+    principal = identity["properties"]["principalId"]
+    require(plan.UUID.fullmatch(principal), "invalid-aks-control-principal")
+    attachment = next(iter(attached.values()))
+    require(attachment.get("principalId") == principal and
+            attachment.get("clientId") == identity["properties"]["clientId"],
+            "aks-control-identity-instance-drift")
+    role = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + \
+        BUILTIN_ROLES["peering-cleanup"][0]
+    assignments = {}
+    for name, scope in network_assignment_scopes(bundle).items():
+        assignment = scope + "/providers/Microsoft.Authorization/roleAssignments/" + arm_guid(scope, identity_id, role)
+        assignment_readback(azure.get(assignment, "2022-04-01"), {"properties": {
+            "principalId": principal, "roleDefinitionId": role}}, scope)
+        assignments[name] = assignment
+    receipt["networkAssignments"] = assignments
+    receipt["aksControlPrincipalId"] = principal
     save_receipt(azure.work, receipt)
 
 
@@ -845,6 +1112,8 @@ def arm(azure, bundle, receipt):
                                       bundle["subscriptionId"])
     require(current_kubelet == bundle["controlKubeletIdentity"], "control-kubelet-identity-drift")
     account_identity(azure, bundle, receipt)
+    validate_builtin_roles(azure, bundle)
+    audit_cleanup_assignments(azure, bundle, receipt, cleanup_assignment_scopes(bundle), complete=True)
     group = azure.get(bundle["scope"]["verificationResourceGroupId"], "2024-03-01")
     cleanup_group = azure.get(bundle["scope"]["cleanupResourceGroupId"], "2024-03-01")
     owned(cleanup_group, bundle["scope"], bundle["owner"], bundle["cleanupReceipt"],
@@ -926,6 +1195,8 @@ def compute(azure, bundle, receipt):
             properties["apiServerAccessProfile"]["enablePrivateCluster"] is True and
             properties["disableLocalAccounts"] is True and properties["aadProfile"]["enableAzureRBAC"] is True,
             "aks-boundary-readback-mismatch")
+    verify_network_assignments(azure, bundle, receipt, aks)
+    receipt["kubernetesAuthorization"] = "azure-rbac-bootstrap-only"
     vm = azure.get(bundle["scope"]["builderVirtualMachineId"], "2024-11-01")
     owned(vm, bundle["scope"], bundle["owner"], bundle["cleanupReceipt"],
           bundle["scope"]["builderVirtualMachineId"])
@@ -1007,6 +1278,20 @@ def retire(azure, bundle, receipt):
     account_identity(azure, bundle, receipt)
     jobs = azure.get(scope["automationAccountId"] + "/jobs", AUTO_API)
     write_json(azure.work / "retired-cleanup-job-status.json", redacted(jobs))
+    for name, identity in receipt.get("networkAssignments", {}).items():
+        scopes = network_assignment_scopes(bundle)
+        require(name in scopes and identity.lower().startswith(
+            scopes[name].lower() + "/providers/microsoft.authorization/roleassignments/"),
+            "network-retirement-assignment-outside-scope")
+        actual = azure.get(identity, "2022-04-01", absent=True)
+        if actual is not None:
+            role = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + \
+                BUILTIN_ROLES["peering-cleanup"][0]
+            assignment_readback(actual, {"properties": {
+                "principalId": receipt["aksControlPrincipalId"], "roleDefinitionId": role}}, scopes[name])
+            azure.rest("DELETE", identity, "2022-04-01")
+            require(azure.get(identity, "2022-04-01", absent=True) is None,
+                    "network-assignment-retirement-unverified")
     for name, identity in receipt.get("registryPullAssignments", {}).items():
         require(name in ("control", "verification") and identity.lower().startswith(
             scope["verificationRegistryId"].lower() + "/providers/microsoft.authorization/roleassignments/"),
@@ -1022,13 +1307,8 @@ def retire(azure, bundle, receipt):
             azure.rest("DELETE", identity, "2022-04-01")
             require(azure.get(identity, "2022-04-01", absent=True) is None,
                     "registry-assignment-retirement-unverified")
-    expected = {
-        "verification": (scope["verificationResourceGroupId"], "resource-cleanup"),
-        "nodes": (scope["managedNodeResourceGroupId"], "resource-cleanup"),
-        "groupsRead": (f"/subscriptions/{bundle['subscriptionId']}", "group-metadata-read"),
-        "peerMetadataRead": (scope["controlVnetId"], "peering-metadata-read"),
-        "peerDelete": (scope["controlSidePeeringId"], "peering-cleanup"),
-    }
+    require(bundle.get("authorizationModel") == AUTHORIZATION_MODEL, "explicit-builtin-authorization-required")
+    expected = cleanup_assignment_scopes(bundle, node=True, peer=True)
     for name, identity in receipt.get("cleanupAssignments", {}).items():
         require(name in expected, "unknown-cleanup-assignment")
         assignment_scope, role_name = expected[name]
@@ -1042,14 +1322,6 @@ def retire(azure, bundle, receipt):
                                                         "roleDefinitionId": role}}, assignment_scope)
             azure.rest("DELETE", identity, "2022-04-01")
             require(azure.get(identity, "2022-04-01", absent=True) is None, "assignment-retirement-unverified")
-    for name, guid in bundle["roleGuids"].items():
-        identity = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/{guid}"
-        role = azure.get(identity, "2022-04-01", absent=True)
-        if role is not None:
-            require(role["properties"]["roleName"] ==
-                    "orka-verify-" + bundle["suffix"] + "-" + name, "retirement-role-identity-mismatch")
-            azure.rest("DELETE", identity, "2022-04-01")
-            require(azure.get(identity, "2022-04-01", absent=True) is None, "role-retirement-unverified")
     receipt["metadataReadAuthorityRetired"] = True
     receipt["physicalAbsenceVerifiedUtc"] = timestamp(utc())
     save_receipt(azure.work, receipt)
@@ -1064,7 +1336,8 @@ def retire(azure, bundle, receipt):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("operation", choices=("plan", "plan-recovery", "bootstrap", "recover-bootstrap",
+    p.add_argument("operation", choices=("plan", "plan-recovery", "plan-builtin-resume", "bootstrap",
+                                        "recover-bootstrap", "resume-builtin-bootstrap",
                                         "arm", "compute", "connect", "retire"))
     p.add_argument("--subscription", required=True)
     p.add_argument("--control-vnet-id", required=True)
@@ -1076,6 +1349,7 @@ def parser():
     p.add_argument("--previous-work-dir")
     p.add_argument("--failed-recovery-work-dir")
     p.add_argument("--approved-recovery-sha256")
+    p.add_argument("--approved-authorization-sha256")
     return p
 
 
@@ -1094,6 +1368,9 @@ def main():
     if args.operation == "plan-recovery":
         prepare_recovery(args, work, azure)
         return
+    if args.operation == "plan-builtin-resume":
+        prepare_builtin_resume(args, work, azure)
+        return
     bundle = load_bundle(args, work)
     account = azure.cli("account", "show", "--query",
                         "{subscription:id,tenant:tenantId,environment:environmentName}")
@@ -1108,6 +1385,10 @@ def main():
     if args.operation == "recover-bootstrap":
         recover_bootstrap(azure, bundle, receipt, args)
         print("Reviewed receipt-linked cleanup recovery completed; no compute or lifetime was started.")
+        return
+    if args.operation == "resume-builtin-bootstrap":
+        resume_builtin_bootstrap(azure, bundle, receipt, args)
+        print("Reviewed built-in cleanup bootstrap completed; no compute or lifetime was started.")
         return
     actions = {"bootstrap": bootstrap, "arm": arm, "compute": compute, "connect": connect, "retire": retire}
     actions[args.operation](azure, bundle, receipt)

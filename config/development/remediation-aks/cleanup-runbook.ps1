@@ -52,12 +52,13 @@ function Read-CleanupManifest {
     Assert-Cleanup ($Json.Length -le 32768) 'manifest-too-large'
     try { $m = ConvertFrom-CleanupJson $Json }
     catch { throw 'invalid-manifest-json' }
-    $keys = @('version', 'subscriptionId', 'tenantId', 'principalId', 'suffix', 'owner',
+    $keys = @('version', 'authorizationModel', 'subscriptionId', 'tenantId', 'principalId', 'suffix', 'owner',
         'cleanupReceipt', 'controlVnetId', 'budgetStartUtc', 'expiresAtUtc',
         'requireNodeScope', 'requirePeeringScope')
     Assert-Cleanup (($m -is [hashtable]) -and ($m.Count -eq $keys.Count)) 'invalid-manifest-shape'
     foreach ($key in $keys) { Assert-Cleanup ($m.ContainsKey($key)) 'missing-manifest-field' }
-    Assert-Cleanup ($m.version -eq 1) 'unsupported-manifest-version'
+    Assert-Cleanup (($m.version -eq 2) -and
+        ($m.authorizationModel -ceq 'builtin-group-cleanup-v1')) 'unsupported-manifest-version'
     $uuid = '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
     foreach ($key in @('subscriptionId', 'tenantId', 'principalId', 'cleanupReceipt')) {
         Assert-Cleanup (($m[$key] -is [string]) -and ($m[$key] -cmatch $uuid)) 'invalid-manifest-uuid'
@@ -160,7 +161,7 @@ function Invoke-CleanupArm {
     param([ValidateSet('GET', 'DELETE')] [string] $Method, [string] $Id, [string] $ApiVersion)
     $m = $script:Manifest
     $readIds = @($m.ids.group, $m.ids.nodeGroup, $m.ids.aks, $m.ids.vm, $m.ids.peer, $m.ids.permissions)
-    $deleteIds = @($m.ids.group, $m.ids.nodeGroup, $m.ids.aks, $m.ids.vm, $m.ids.peer)
+    $deleteIds = @($m.ids.group, $m.ids.nodeGroup, $m.ids.peer)
     Assert-Cleanup ($Id -cin $readIds) 'arm-read-outside-scope'
     if ($Method -eq 'DELETE') { Assert-Cleanup ($Id -cin $deleteIds) 'arm-delete-outside-scope' }
     Assert-Cleanup ($ApiVersion -cmatch '^\d{4}-\d{2}-\d{2}$') 'invalid-api-version'
@@ -222,8 +223,7 @@ function Get-CleanupResource {
 
 function Remove-CleanupResource {
     param([string] $Kind)
-    $versions = @{ group = '2024-03-01'; nodeGroup = '2024-03-01'; aks = '2025-07-01';
-        vm = '2024-11-01'; peer = '2024-05-01' }
+    $versions = @{ group = '2024-03-01'; nodeGroup = '2024-03-01'; peer = '2024-05-01' }
     Assert-Cleanup ($versions.ContainsKey($Kind)) 'unknown-delete-kind'
     return Invoke-CleanupArm 'DELETE' $script:Manifest.ids[$Kind] $versions[$Kind]
 }
@@ -270,27 +270,29 @@ function Set-CleanupRefused {
 }
 
 function Assert-CleanupAuthority {
-    $permissions = Get-CleanupResource 'permissions'
-    Assert-Cleanup (($null -ne $permissions) -and $permissions.Contains('value')) 'permissions-unavailable'
-    $actions = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($entry in $permissions.value) {
-        foreach ($action in $entry.actions) {
-            Assert-Cleanup (-not $action.Contains('*')) 'wildcard-cleanup-authority'
-            $null = $actions.Add($action)
+    # Reader is deliberately broader than the former metadata-only role.
+    # Resource Group Contributor authorizes cascade deletion, not VM/AKS writes.
+    $expected = @('*/read', 'Microsoft.Resources/subscriptions/resourceGroups/read',
+            'Microsoft.Resources/subscriptions/resourceGroups/write',
+            'Microsoft.Resources/subscriptions/resourceGroups/delete')
+    while ($true) {
+        $permissions = Get-CleanupResource 'permissions'
+        Assert-Cleanup (($null -ne $permissions) -and $permissions.Contains('value')) 'permissions-unavailable'
+        $actions = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $permissions.value) {
+            foreach ($action in $entry.actions) {
+                Assert-Cleanup ($action -in $expected) 'unexpected-extra-cleanup-authority'
+                $null = $actions.Add($action)
+            }
+            Assert-Cleanup (($entry.notActions.Count -eq 0) -and
+                ($entry.dataActions.Count -eq 0) -and ($entry.notDataActions.Count -eq 0)) 'unexpected-cleanup-permissions'
         }
-        Assert-Cleanup (($entry.notActions.Count -eq 0) -and
-            ($entry.dataActions.Count -eq 0) -and ($entry.notDataActions.Count -eq 0)) 'unexpected-cleanup-permissions'
-    }
-    $expected = @('Microsoft.Resources/subscriptions/resourceGroups/read',
-            'Microsoft.Resources/subscriptions/resourceGroups/delete',
-            'Microsoft.Resources/subscriptions/resourceGroups/resources/read',
-            'Microsoft.Resources/deployments/read', 'Microsoft.Resources/deployments/operations/read',
-            'Microsoft.ContainerService/managedClusters/read', 'Microsoft.ContainerService/managedClusters/delete',
-            'Microsoft.Compute/virtualMachines/read', 'Microsoft.Compute/virtualMachines/instanceView/read',
-            'Microsoft.Compute/virtualMachines/delete', 'Microsoft.Authorization/permissions/read')
-    Assert-Cleanup ($actions.Count -eq $expected.Count) 'unexpected-extra-cleanup-authority'
-    foreach ($action in $expected) {
-        Assert-Cleanup ($actions.Contains($action)) 'missing-cleanup-authority'
+        if ($actions.Count -eq $expected.Count) { return }
+        # The two assignments can propagate independently. Only a strict subset
+        # may be retried, and only inside the original preflight time budget.
+        Assert-Cleanup ($script:PreflightOnly -and
+            (Get-CleanupTime).AddSeconds(5) -lt $script:RunDeadline) 'missing-cleanup-authority'
+        Start-Sleep -Seconds 5
     }
 }
 
@@ -327,32 +329,29 @@ function Invoke-FoundationCleanup {
         $main = Observe-CleanupResource 'group'
         $mainOwned = $false
         $coreAbsent = ($main.state -eq 'Absent')
+        $coreValidated = $false
         if ($main.state -eq 'Present') {
             try { Assert-Ownership $main.resource $m $m.ids.group; $mainOwned = $true }
             catch { Set-CleanupRefused 'group'; throw 'main-group-ownership-not-confirmed' }
-            $coreAbsent = $true
-            $ownedCore = @()
+            $coreValidated = $true
             # Group-level authorization can disappear while the containing
-            # group is still Deleting. Its children were settled before DELETE.
+            # group is still Deleting. Child ownership was checked before DELETE.
             $coreKinds = if ($requested.ContainsKey('group')) { @() } else { @('aks', 'vm') }
             foreach ($kind in $coreKinds) {
                 $observed = Observe-CleanupResource $kind
                 if ($observed.state -eq 'Absent') { continue }
-                $coreAbsent = $false
-                if ($observed.state -ne 'Present') { continue }
+                if ($observed.state -ne 'Present') { $coreValidated = $false; continue }
                 try {
                     Assert-Ownership $observed.resource $m $m.ids[$kind]
                     if ($kind -eq 'aks') {
                         Assert-Cleanup ($observed.resource.properties.nodeResourceGroup -ceq
                             $m.ids.nodeGroup.Split('/')[-1]) 'aks-node-group-mismatch'
                     }
-                    $ownedCore += $kind
                 } catch { Set-CleanupRefused $kind }
             }
             Assert-Cleanup (@(@('aks', 'vm') | Where-Object {
                 $script:CleanupEvidence[$_].state -eq 'Refused'
             }).Count -eq 0) 'main-cleanup-verification-required'
-            foreach ($kind in $ownedCore) { Request-CleanupDeletion $kind $requested }
         }
         if ($main.state -eq 'Absent') {
             # A resource cannot outlive its deleted containing group.
@@ -363,7 +362,7 @@ function Invoke-FoundationCleanup {
 
         # Request owned main cleanup before any independent residual call can
         # deny access, stall, or consume the remaining execution deadline.
-        if ($mainOwned -and $coreAbsent) {
+        if ($mainOwned -and $coreValidated -and -not $requested.ContainsKey('group')) {
             $fresh = Get-CleanupResource 'group'
             if ($null -ne $fresh) {
                 Assert-Ownership $fresh $m $m.ids.group

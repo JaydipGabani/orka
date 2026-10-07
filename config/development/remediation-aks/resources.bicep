@@ -238,44 +238,35 @@ resource controlPlaneIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@
   tags: ownershipTags
 }
 
-// Explicit actions only, scoped to this NEW group. AKS's separate service-managed
-// node-group Contributor grant is an unresolved approval gate; see README.
-resource networkRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: guid(resourceGroup().id, 'verification-network')
-  properties: {
-    roleName: '${prefix}-network'
-    description: 'AKS joins its new VNet/subnet for private DNS and maintains the new node network security group.'
-    type: 'CustomRole'
-    assignableScopes: [resourceGroup().id]
-    permissions: [
-      {
-        actions: [
-          'Microsoft.Network/virtualNetworks/read'
-          'Microsoft.Network/virtualNetworks/join/action'
-          'Microsoft.Network/virtualNetworks/subnets/read'
-          'Microsoft.Network/virtualNetworks/subnets/join/action'
-          'Microsoft.Network/virtualNetworks/subnets/write'
-          'Microsoft.Network/networkSecurityGroups/read'
-          'Microsoft.Network/networkSecurityGroups/write'
-          'Microsoft.Network/networkSecurityGroups/securityRules/read'
-          'Microsoft.Network/networkSecurityGroups/securityRules/write'
-          'Microsoft.Network/networkSecurityGroups/securityRules/delete'
-          'Microsoft.Network/natGateways/read'
-        ]
-        notActions: []
-        dataActions: []
-        notDataActions: []
-      }
-    ]
-  }
-}
+var networkRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4d97b98b-1d4f-4787-a291-c67834d212e7')
 
 resource networkAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(resourceGroup().id, controlPlaneIdentity.id, networkRole.id)
+  name: guid(vnet.id, controlPlaneIdentity.id, networkRoleId)
+  scope: vnet
   properties: {
     principalId: controlPlaneIdentity.properties.principalId
     principalType: 'ServicePrincipal'
-    roleDefinitionId: networkRole.id
+    roleDefinitionId: networkRoleId
+  }
+}
+
+resource nodeSecurityAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(nodeNSG.id, controlPlaneIdentity.id, networkRoleId)
+  scope: nodeNSG
+  properties: {
+    principalId: controlPlaneIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: networkRoleId
+  }
+}
+
+resource egressAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(egress.id, controlPlaneIdentity.id, networkRoleId)
+  scope: egress
+  properties: {
+    principalId: controlPlaneIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: networkRoleId
   }
 }
 
@@ -352,6 +343,8 @@ resource cluster 'Microsoft.ContainerService/managedClusters@2025-07-01' = {
   }
   dependsOn: [
     networkAccess
+    nodeSecurityAccess
+    egressAccess
   ]
 }
 

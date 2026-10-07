@@ -199,14 +199,25 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(self.template["parameters"]["operatorSshPublicKey"]["type"], "securestring")
         self.assertNotIn("operatorSshPublicKey", json.dumps(self.template["outputs"]))
 
-    def test_no_existing_scope_or_wildcard_roles(self):
-        role = self.resource("Microsoft.Authorization/roleDefinitions")
-        actions = role["properties"]["permissions"][0]["actions"]
-        self.assertTrue(actions)
-        self.assertTrue(all("*" not in action for action in actions))
-        self.assertEqual(role["properties"]["assignableScopes"], ["[resourceGroup().id]"])
-        assignment = self.resource("Microsoft.Authorization/roleAssignments")
-        self.assertNotIn("scope", assignment)
+    def test_no_custom_roles_and_network_grants_only_on_owned_network_resources(self):
+        self.assertFalse(any(r["type"] == "Microsoft.Authorization/roleDefinitions" for r in self.resources))
+        assignments = [r for r in self.resources if r["type"] == "Microsoft.Authorization/roleAssignments"]
+        self.assertEqual(len(assignments), 3)
+        self.assertEqual({r["scope"] for r in assignments}, {
+            "[resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('prefix')))]",
+            "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nodes', parameters('prefix')))]",
+            "[resourceId('Microsoft.Network/natGateways', format('{0}-egress', parameters('prefix')))]",
+        })
+        for assignment in assignments:
+            self.assertEqual(assignment["properties"]["roleDefinitionId"], "[variables('networkRoleId')]")
+            self.assertEqual(assignment["properties"]["principalType"], "ServicePrincipal")
+            identity = "resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', " + \
+                       "format('{0}-aks-control-plane', parameters('prefix')))"
+            self.assertEqual(assignment["name"],
+                             f"[guid({assignment['scope'][1:-1]}, {identity}, variables('networkRoleId'))]")
+        nested = next(r for r in self.template["resources"] if r["type"] == "Microsoft.Resources/deployments")
+        self.assertIn("4d97b98b-1d4f-4787-a291-c67834d212e7",
+                      nested["properties"]["template"]["variables"]["networkRoleId"])
         self.assertEqual([r["type"] for r in self.template["resources"]],
                          ["Microsoft.Resources/resourceGroups", "Microsoft.Resources/deployments"])
         for resource in self.resources:

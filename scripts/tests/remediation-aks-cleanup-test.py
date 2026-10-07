@@ -175,7 +175,7 @@ class ArmedPlanTests(unittest.TestCase):
                         azure.get(self.bundle["scope"]["verificationResourceGroupId"], "2024-03-01", absent=True)
 
     def test_peer_binding_is_direct_and_scoped_to_exact_new_child(self):
-        self.bundle["roleGuids"] = apply.role_guids(self.bundle["scope"])
+        self.bundle["roleGuids"] = apply.builtin_role_guids()
         principal = "33333333-3333-3333-3333-333333333333"
         identity, body = apply.peer_assignment(self.bundle, {"principalId": principal})
         self.assertTrue(identity.startswith(self.bundle["scope"]["controlSidePeeringId"] +
@@ -208,17 +208,17 @@ class ArmedPlanTests(unittest.TestCase):
         apply.schedules(FakeAzure(), bundle, receipt)
         self.assertEqual(len(writes), 4, "readback must not rewrite an existing one-time binding")
 
-    def test_metadata_reader_binding_is_one_action_on_exact_control_vnet(self):
-        self.bundle["roleGuids"] = apply.role_guids(self.bundle["scope"])
+    def test_reader_is_explicitly_subscription_scoped_without_network_write(self):
+        self.bundle["roleGuids"] = apply.builtin_role_guids()
+        scope = "/subscriptions/" + self.bundle["subscriptionId"]
         identity, body = apply.scoped_assignment(
             self.bundle, {"principalId": "33333333-3333-3333-3333-333333333333"},
-            self.bundle["scope"]["controlVnetId"], "peering-metadata-read")
-        self.assertTrue(identity.startswith(self.bundle["scope"]["controlVnetId"] +
+            scope, "group-metadata-read")
+        self.assertTrue(identity.startswith(scope +
                                            "/providers/Microsoft.Authorization/roleAssignments/"))
         self.assertTrue(body["properties"]["roleDefinitionId"].endswith(
-            self.bundle["roleGuids"]["peering-metadata-read"]))
-        self.assertEqual(apply.READ_ONLY_ACTIONS["peering-metadata-read"],
-                         {"Microsoft.Network/virtualNetworks/virtualNetworkPeerings/read"})
+            "acdd72a7-3385-48ef-bd42-f606fba81ae7"))
+        self.assertEqual(apply.BUILTIN_ROLES["group-metadata-read"][2], {"*/read"})
 
     def test_retirement_requires_authoritative_physical_absence_before_any_delete(self):
         azure = mock.Mock()
@@ -274,6 +274,503 @@ class ArmedPlanTests(unittest.TestCase):
                 self.assertRaisesRegex(apply.Failure, "preflight-timed-out"):
             apply.preflight_job(FakeAzure(), bundle, {"principalId": receipt["principalId"]})
         self.assertEqual(elapsed[0], 1200)
+
+class BuiltinAuthorizationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = ROOT / "bin/remediation-aks-tests" / uuid.uuid4().hex
+        self.directory.mkdir(parents=True)
+        self.addCleanup(lambda: shutil.rmtree(self.directory))
+        self.subscription = "11111111-1111-1111-1111-111111111111"
+        base = f"/subscriptions/{self.subscription}/resourceGroups/control/providers/"
+        self.scope = apply.plan.targets(self.subscription, "sample01",
+            base + "Microsoft.Network/virtualNetworks/control",
+            base + "Microsoft.ContainerService/managedClusters/control")
+        self.bundle = {"subscriptionId": self.subscription, "scope": self.scope,
+                       "authorizationModel": apply.AUTHORIZATION_MODEL,
+                       "roleGuids": apply.builtin_role_guids(), "suffix": "sample01",
+                       "owner": "fixture", "cleanupReceipt": "22222222-2222-2222-2222-222222222222"}
+        self.principal = "33333333-3333-3333-3333-333333333333"
+        self.roles = {}
+        for guid, name, actions in apply.BUILTIN_ROLES.values():
+            identity = f"/subscriptions/{self.subscription}/providers/Microsoft.Authorization/roleDefinitions/{guid}"
+            self.roles[identity] = {"id": identity, "properties": {"type": "BuiltInRole", "roleName": name,
+                "permissions": [{"actions": sorted(actions), "notActions": [], "dataActions": [],
+                                 "notDataActions": []}]}}
+
+    def test_exact_builtin_catalog_is_read_without_mutation(self):
+        azure = mock.Mock()
+        azure.get.side_effect = lambda identity, version: self.roles[identity]
+        apply.validate_builtin_roles(azure, self.bundle)
+        self.assertEqual(azure.get.call_count, 3)
+        azure.rest.assert_not_called()
+        azure.deploy.assert_not_called()
+        azure.cli.assert_not_called()
+
+    def test_new_permission_model_requires_explicit_pinned_builtin_ids(self):
+        for field in ("authorizationModel", "roleGuids"):
+            bundle = copy.deepcopy(self.bundle)
+            bundle.pop(field)
+            azure = mock.Mock()
+            with self.subTest(field=field), self.assertRaises(apply.Failure):
+                apply.validate_builtin_roles(azure, bundle)
+            azure.get.assert_not_called()
+
+    def test_builtin_catalog_changes_and_impostors_fail_before_grants(self):
+        for mode in ("custom", "wildcard", "missing", "data", "conditional"):
+            roles = copy.deepcopy(self.roles)
+            first = next(iter(roles.values()))["properties"]
+            permission = first["permissions"][0]
+            if mode == "custom":
+                first["type"] = "CustomRole"
+            elif mode == "wildcard":
+                permission["actions"].append("*")
+            elif mode == "missing":
+                permission["actions"].pop()
+            elif mode == "data":
+                permission["dataActions"].append("Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read")
+            else:
+                permission["condition"] = "unexpected"
+            azure = mock.Mock()
+            azure.get.side_effect = lambda identity, version: roles[identity]
+            with self.subTest(mode=mode), self.assertRaises(apply.Failure):
+                apply.validate_builtin_roles(azure, self.bundle)
+            azure.rest.assert_not_called()
+            azure.deploy.assert_not_called()
+
+    def assignment_fixture(self):
+        expected = apply.cleanup_assignment_scopes(self.bundle, node=True, peer=True)
+        receipt = {"principalId": self.principal, "cleanupAssignments": {}}
+        assignments = []
+        for key, (scope, role) in expected.items():
+            identity, body = apply.scoped_assignment(self.bundle, receipt, scope, role)
+            assignments.append({"id": identity, "properties": {**body["properties"], "scope": scope}})
+            receipt["cleanupAssignments"][key] = identity
+        return expected, receipt, assignments
+
+    def test_exact_assignment_inventory_and_scopes_are_required(self):
+        expected, receipt, assignments = self.assignment_fixture()
+        azure = mock.Mock()
+        azure.cli.return_value = {"value": assignments}
+        apply.audit_cleanup_assignments(azure, self.bundle, receipt, expected, complete=True)
+        for mode in ("extra", "broad-peer", "foreign-principal", "missing", "pagination", "condition", "duplicate"):
+            document = {"value": copy.deepcopy(assignments)}
+            if mode == "extra":
+                extra = copy.deepcopy(assignments[0])
+                extra["properties"]["scope"] = "/subscriptions/" + self.subscription
+                document["value"].append(extra)
+            elif mode == "broad-peer":
+                document["value"][-1]["properties"]["scope"] = self.scope["controlVnetId"]
+            elif mode == "foreign-principal":
+                document["value"][0]["properties"]["principalId"] = "44444444-4444-4444-4444-444444444444"
+            elif mode == "missing":
+                document["value"].pop()
+            elif mode == "pagination":
+                document["nextLink"] = "https://management.azure.com/another-page"
+            elif mode == "condition":
+                document["value"][0]["properties"]["condition"] = "unexpected"
+            else:
+                document["value"].append(copy.deepcopy(assignments[0]))
+            azure.cli.return_value = document
+            with self.subTest(mode=mode), self.assertRaises(apply.Failure):
+                apply.audit_cleanup_assignments(azure, self.bundle, receipt, expected, complete=True)
+        azure.rest.assert_not_called()
+
+    def test_matching_but_unrecorded_assignment_is_not_adopted(self):
+        expected, receipt, assignments = self.assignment_fixture()
+        receipt["cleanupAssignments"] = {}
+        azure = mock.Mock()
+        azure.cli.return_value = {"value": assignments}
+        with self.assertRaisesRegex(apply.Failure, "unrecorded"):
+            apply.audit_cleanup_assignments(azure, self.bundle, receipt, expected, complete=False)
+
+    def test_custom_role_resource_is_rejected_even_inside_conditional_nested_template(self):
+        for condition in (True, False):
+            value = {"resources": [{"type": "Microsoft.Resources/deployments", "properties": {"template": {
+                "resources": [{"type": "Microsoft.Authorization/roleDefinitions", "condition": condition}]}}}]}
+            with self.subTest(condition=condition), self.assertRaisesRegex(apply.Failure, "custom-role-creation"):
+                apply.reject_custom_role_definitions(value)
+
+    def test_retirement_never_deletes_builtin_role_definitions(self):
+        expected, receipt, assignments = self.assignment_fixture()
+        self.bundle.update({"owner": "fixture", "cleanupReceipt": "22222222-2222-2222-2222-222222222222"})
+        receipt["cleanupAssignments"] = {"groupsRead": receipt["cleanupAssignments"]["groupsRead"]}
+        reader = next(item for item in assignments if item["id"] == receipt["cleanupAssignments"]["groupsRead"])
+        group = {"id": self.scope["cleanupResourceGroupId"], "tags": {
+            "orka-purpose": "isolated-remediation-verification", "orka-owner": "fixture",
+            "orka-deployment": "orka-verify-sample01", "orka-cleanup-receipt": self.bundle["cleanupReceipt"]}}
+        deleted = []
+        azure = mock.Mock()
+        azure.work = Path("/unused-private-test-output")
+        azure.get.side_effect = lambda identity, version, **kwargs: (
+            {"value": []} if identity.endswith("/jobs") else
+            group if identity == self.scope["cleanupResourceGroupId"] else
+            reader if identity == reader["id"] and identity not in deleted else None)
+        azure.rest.side_effect = lambda method, identity, version: deleted.append(identity)
+        azure.cli.return_value = False
+        with mock.patch.object(apply, "account_identity", return_value=self.principal), \
+             mock.patch.object(apply, "write_json"), mock.patch.object(apply, "save_receipt"):
+            apply.retire(azure, self.bundle, receipt)
+        self.assertEqual(deleted, [reader["id"]])
+        self.assertTrue(all("/roleAssignments/" in identity for identity in deleted))
+        self.assertFalse(any("/roleDefinitions/" in call.args[1] for call in azure.rest.call_args_list))
+        self.assertEqual(receipt["phase"], "retired")
+
+    def test_unapproved_builtin_resume_has_no_azure_calls(self):
+        azure = mock.Mock()
+        with self.assertRaisesRegex(apply.Failure, "approved-new-authorization"):
+            apply.resume_builtin_bootstrap(azure, self.bundle, {}, SimpleNamespace(approved_authorization_sha256=None))
+        self.assertEqual(azure.mock_calls, [])
+
+    def grant_client(self, mode=None):
+        outer = self
+
+        class FakeAzure:
+            def __init__(self):
+                self.work = outer.directory
+                self.assignments = {}
+                self.deployments = []
+                self.puts = []
+
+            def get(self, identity, _version, absent=False):
+                if identity in outer.roles:
+                    return copy.deepcopy(outer.roles[identity])
+                value = self.assignments.get(identity)
+                if value is None and not absent:
+                    raise AssertionError("unexpected assignment read")
+                return copy.deepcopy(value)
+
+            def cli(self, *arguments):
+                outer.assertEqual(arguments[:3], ("rest", "--method", "GET"))
+                return {"value": copy.deepcopy(list(self.assignments.values()))}
+
+            def rest(self, method, identity, _version, body):
+                outer.assertEqual(method, "PUT")
+                outer.assertIn("/roleAssignments/", identity)
+                self.puts.append(identity)
+                scope = identity.rsplit("/providers/Microsoft.Authorization/roleAssignments/", 1)[0]
+                self.assignments[identity] = {"id": identity, "properties": {**body["properties"], "scope": scope}}
+
+            def deploy(self, name, _template, values, **options):
+                outer.assertEqual(name, "bounded-cleanup-builtin-access")
+                outer.assertTrue(options["provider_validate"])
+                self.deployments.append(copy.deepcopy(values))
+                expected = apply.cleanup_assignment_scopes(outer.bundle, node=values["includeNodeGroup"])
+                outputs = {"nodeAssignmentId": {"value": ""}}
+                keys = {"verification": "verificationAssignmentId", "groupsRead": "groupMetadataAssignmentId",
+                        "nodes": "nodeAssignmentId"}
+                for key, (scope, role_name) in expected.items():
+                    role = f"/subscriptions/{outer.subscription}/providers/Microsoft.Authorization/roleDefinitions/" + \
+                        outer.bundle["roleGuids"][role_name]
+                    identity = scope + "/providers/Microsoft.Authorization/roleAssignments/" + \
+                        apply.arm_guid(scope, role, values["principalId"])
+                    target = outer.scope["cleanupResourceGroupId"] if mode == "wrong-scope" and key == "verification" else scope
+                    self.assignments[identity] = {"id": identity, "properties": {
+                        "scope": target, "principalId": values["principalId"], "roleDefinitionId": role,
+                        "principalType": "ServicePrincipal"}}
+                    outputs[keys[key]] = {"value": identity}
+                if mode == "extra-after-deploy":
+                    extra = copy.deepcopy(next(iter(self.assignments.values())))
+                    extra["id"] += "-unexpected"
+                    extra["properties"]["scope"] = outer.scope["controlVnetId"]
+                    self.assignments[extra["id"]] = extra
+                return {"properties": {"outputs": outputs}}
+
+        return FakeAzure()
+
+    def test_access_executes_each_approved_stage_with_exact_readbacks_and_audits(self):
+        azure = self.grant_client()
+        receipt = {"principalId": self.principal}
+        for node, peer, count in ((False, False, 2), (True, False, 3), (True, True, 4)):
+            apply.access(azure, self.bundle, receipt, node=node, peer=peer)
+            self.assertEqual(len(azure.assignments), count)
+            self.assertEqual(len(receipt["cleanupAssignments"]), count)
+            self.assertIs(receipt["nodeScopeReady"], node)
+            self.assertIs(receipt["peeringScopeReady"], peer)
+            saved = json.loads((self.directory / "receipt.json").read_text())
+            self.assertEqual(saved, receipt)
+        self.assertEqual(len(azure.deployments), 3)
+        self.assertEqual(len(azure.puts), 1)
+        self.assertTrue(azure.puts[0].startswith(self.scope["controlSidePeeringId"] + "/"))
+
+    def test_access_rejects_wrong_scope_outputs_and_extra_grants_after_deploy(self):
+        for mode, expected in (("wrong-scope", "readback-mismatch"),
+                               ("extra-after-deploy", "unexpected-cleanup-assignment")):
+            azure = self.grant_client(mode)
+            receipt = {"principalId": self.principal}
+            with self.subTest(mode=mode), self.assertRaisesRegex(apply.Failure, expected):
+                apply.access(azure, self.bundle, receipt)
+            self.assertEqual(len(azure.deployments), 1)
+            self.assertNotIn("nodeScopeReady", receipt)
+            self.assertEqual(azure.puts, [])
+
+    def test_access_does_not_deploy_when_an_unrecorded_grant_already_exists(self):
+        azure = self.grant_client()
+        _, _, assignments = self.assignment_fixture()
+        azure.assignments[assignments[0]["id"]] = assignments[0]
+        with self.assertRaisesRegex(apply.Failure, "unrecorded"):
+            apply.access(azure, self.bundle, {"principalId": self.principal})
+        self.assertEqual(azure.deployments, [])
+        self.assertEqual(azure.puts, [])
+
+    def test_network_readbacks_match_actual_identity_instance_and_exact_scopes(self):
+        identity_id = self.scope["verificationResourceGroupId"] + \
+            "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/orka-verify-sample01-aks-control-plane"
+        client = "55555555-5555-5555-5555-555555555555"
+        identity = {"id": identity_id, "properties": {"principalId": self.principal, "clientId": client}, "tags": {
+            "orka-owner": self.bundle["owner"], "orka-cleanup-receipt": self.bundle["cleanupReceipt"],
+            "orka-purpose": "isolated-remediation-verification", "orka-deployment": "orka-verify-sample01"}}
+        aks = {"identity": {"type": "UserAssigned", "userAssignedIdentities": {
+            identity_id: {"principalId": self.principal, "clientId": client}}}}
+        role = f"/subscriptions/{self.subscription}/providers/Microsoft.Authorization/roleDefinitions/" + \
+            apply.BUILTIN_ROLES["peering-cleanup"][0]
+        # Independently evaluated by Bicep console for these exact public inputs.
+        self.assertEqual(apply.arm_guid(self.scope["verificationVnetId"], identity_id, role),
+                         "a02ca53c-384d-5d0d-811b-e6351d4301bd")
+        objects = {identity_id: identity}
+        for scope in apply.network_assignment_scopes(self.bundle).values():
+            assignment = scope + "/providers/Microsoft.Authorization/roleAssignments/" + \
+                apply.arm_guid(scope, identity_id, role)
+            objects[assignment] = {"properties": {
+                "principalId": self.principal, "roleDefinitionId": role, "scope": scope}}
+        azure = mock.Mock(work=self.directory)
+        azure.get.side_effect = lambda key, *_args: copy.deepcopy(objects[key])
+        receipt = {}
+        apply.verify_network_assignments(azure, self.bundle, receipt, aks)
+        self.assertEqual(set(receipt["networkAssignments"]), {"vnet", "nodes", "nat"})
+        self.assertEqual(receipt["aksControlPrincipalId"], self.principal)
+        first = next(key for key in objects if key != identity_id)
+        for property_name, value in (("scope", self.scope["controlVnetId"]),
+                                     ("principalId", "66666666-6666-6666-6666-666666666666")):
+            original = objects[first]["properties"][property_name]
+            objects[first]["properties"][property_name] = value
+            with self.subTest(property=property_name), self.assertRaisesRegex(apply.Failure, "readback-mismatch"):
+                apply.verify_network_assignments(azure, self.bundle, {}, aks)
+            objects[first]["properties"][property_name] = original
+        aks["identity"]["userAssignedIdentities"][identity_id]["clientId"] = "different"
+        with self.assertRaisesRegex(apply.Failure, "identity-instance-drift"):
+            apply.verify_network_assignments(azure, self.bundle, {}, aks)
+        azure.rest.assert_not_called()
+        azure.deploy.assert_not_called()
+
+    def transition_fixture(self):
+        directories = [self.directory / name for name in ("original", "middle", "stopped", "next")]
+        for directory in directories:
+            directory.mkdir()
+        original_dir, middle_dir, stopped_dir, next_dir = directories
+        base = {**self.bundle, "version": 1, "suffix": "sample01", "owner": "fixture",
+                "tenantId": "44444444-4444-4444-4444-444444444444",
+                "cleanupReceipt": "22222222-2222-2222-2222-222222222222",
+                "roleGuids": apply.role_guids(self.scope), "controlKubeletIdentity": {}, "publicKeyReady": True}
+        base.pop("authorizationModel")
+        previous = None
+        for index, directory in enumerate(directories[:3]):
+            hashes = {"fixture-source": str(index) * 64}
+            digest = apply.sha(apply.wire(hashes))
+            apply.write_json(directory / "compute-inputs.json", {"sourceDigest": digest})
+            value = {**base, "sourceHashes": hashes, "sourceDigest": digest, "compiledHashes": {},
+                     "computeInputsSha256": apply.sha((directory / "compute-inputs.json").read_bytes())}
+            apply.write_json(directory / "bundle.json", value)
+            if index == 0:
+                original = value
+                apply.write_json(directory / "receipt.json", {
+                    "phase": "bootstrap-intent", "subscriptionId": self.subscription,
+                    "sourceDigest": digest, "cleanupReceipt": base["cleanupReceipt"]})
+            elif index == 1:
+                apply.write_json(directory / "receipt.json", {"phase": "recovery-intent"})
+                apply.write_json(directory / "recovery-link.json", {"plan": {"fixture": True}})
+            else:
+                previous = value
+        failed = {"workDir": str(middle_dir), "bundleSha256": apply.sha((middle_dir / "bundle.json").read_bytes()),
+                  "receiptSha256": apply.sha((middle_dir / "receipt.json").read_bytes()),
+                  "linkFileSha256": apply.sha((middle_dir / "recovery-link.json").read_bytes())}
+        tags = {"orka-purpose": "isolated-remediation-verification", "orka-owner": base["owner"],
+                "orka-deployment": "orka-verify-sample01", "orka-cleanup-receipt": base["cleanupReceipt"],
+                "orka-source-digest": original["sourceDigest"], "orka-budget-start-utc": "pending",
+                "orka-expires-at-utc": "pending"}
+        link = {"kind": "automation-child-zero-tag-recovery", "previousWorkDir": str(original_dir),
+                "previousBundleSha256": apply.sha((original_dir / "bundle.json").read_bytes()),
+                "previousReceiptSha256": apply.sha((original_dir / "receipt.json").read_bytes()),
+                "previousSourceDigest": original["sourceDigest"], "nextSourceDigest": previous["sourceDigest"],
+                "partialProof": {"principalId": self.principal, "expectedTags": tags}, "failedRecovery": failed}
+        link_digest = apply.sha(apply.wire(link))
+        apply.write_json(stopped_dir / "recovery-link.json", {"plan": link, "sha256": link_digest})
+        receipt = {"phase": "recovery-intent", "subscriptionId": self.subscription,
+                   "cleanupReceipt": base["cleanupReceipt"], "sourceDigest": previous["sourceDigest"],
+                   "principalId": self.principal, "recoveryOf": {
+                       "sourceDigest": original["sourceDigest"], "receiptSha256": link["previousReceiptSha256"],
+                       "recoveryLinkSha256": link_digest, "failedRecovery": failed}}
+        apply.write_json(stopped_dir / "receipt.json", receipt)
+        args = SimpleNamespace(subscription=self.subscription, work_dir=str(next_dir),
+                               control_vnet_id=self.scope["controlVnetId"],
+                               control_aks_id=self.scope["controlClusterId"])
+        return stopped_dir, previous, receipt, tags, args
+
+    @mock.patch.object(apply.plan, "private_path", side_effect=Path)
+    def test_transition_reads_and_pins_all_three_historical_receipts_without_edits(self, _private_path):
+        stopped, previous, receipt, tags, args = self.transition_fixture()
+        originals = {path: path.read_bytes() for path in self.directory.rglob("*.json")}
+        result = apply.quota_blocked_inputs(args, str(stopped))
+        self.assertEqual(result, (stopped, previous, receipt, tags))
+        self.assertTrue(all(path.read_bytes() == raw for path, raw in originals.items()))
+        for path in (self.directory / "original/receipt.json", self.directory / "middle/recovery-link.json",
+                     stopped / "compute-inputs.json", stopped / "receipt.json"):
+            raw = path.read_bytes()
+            path.write_bytes(raw + b" ")
+            if path == stopped / "receipt.json":
+                modified = json.loads(raw)
+                modified["T0"] = "2026-01-01T00:00:00Z"
+                apply.write_json(path, modified)
+            with self.subTest(path=path.name), self.assertRaises(apply.Failure):
+                apply.quota_blocked_inputs(args, str(stopped))
+            path.write_bytes(raw)
+
+    def test_transition_live_proof_refuses_publication_grants_and_changed_ownership(self):
+        stopped, previous, receipt, tags, args = self.transition_fixture()
+        account = self.scope["automationAccountId"]
+        objects = {}
+        for key in ("verificationResourceGroupId", "cleanupResourceGroupId", "automationAccountId"):
+            objects[self.scope[key]] = {"id": self.scope[key],
+                "tags": dict(tags if key == "automationAccountId" else
+                             {**tags, "orka-source-digest": previous["sourceDigest"]})}
+        objects[account].update({"identity": {"type": "SystemAssigned", "tenantId": previous["tenantId"],
+            "principalId": self.principal}, "properties": {"state": "Ok", "disableLocalAuth": True,
+                                                          "publicNetworkAccess": False}})
+        runtime = account + "/runtimeEnvironments/PowerShell74"
+        book = account + "/runbooks/ExactFoundationCleanup"
+        objects[runtime] = {"id": runtime, "tags": {}, "properties": {
+            "runtime": {"language": "PowerShell", "version": "7.4"}, "defaultPackages": {}}}
+        objects[book] = {"id": book, "tags": {}, "properties": {
+            "state": "New", "runbookType": "PowerShell", "runtimeEnvironment": "PowerShell74"}}
+        for name in ("jobs", "schedules", "jobSchedules"):
+            objects[account + "/" + name] = {"value": []}
+        failed = f"/subscriptions/{self.subscription}/providers/Microsoft.Resources/deployments/bounded-cleanup-access"
+        objects[failed] = {"id": failed, "properties": {
+            "provisioningState": "Failed", "error": {"code": "RoleDefinitionLimitExceeded"}}}
+        azure = mock.Mock()
+        azure.get.side_effect = lambda identity, *unused, **kwargs: objects.get(identity)
+        state = {"assignments": [], "nodeExists": False, "verificationResources": []}
+        azure.cli.side_effect = lambda *arguments: (
+            {"value": state["assignments"]} if arguments[0] == "rest" else
+            state["nodeExists"] if arguments[:2] == ("group", "exists") else
+            [{"id": account}] if arguments[-1] == self.scope["cleanupResourceGroupId"].split("/")[-1] else
+            state["verificationResources"])
+        proof = apply.quota_blocked_proof(azure, previous, receipt, tags)
+        self.assertEqual(proof["principalId"], self.principal)
+        self.assertEqual(proof["existingAssignments"], 0)
+        for identity, key, wrong in (
+                (book, "state", "Published"), (account, "publicNetworkAccess", True),
+                (failed, "error", {"code": "AuthorizationFailed"})):
+            old = objects[identity]["properties"][key]
+            objects[identity]["properties"][key] = wrong
+            with self.subTest(key=key), self.assertRaises(apply.Failure):
+                apply.quota_blocked_proof(azure, previous, receipt, tags)
+            objects[identity]["properties"][key] = old
+        objects[account + "/schedules"]["value"] = [{"name": "unexpected"}]
+        with self.assertRaisesRegex(apply.Failure, "jobs-or-schedules"):
+            apply.quota_blocked_proof(azure, previous, receipt, tags)
+        objects[account + "/schedules"]["value"] = []
+        for key, value, error in (
+                ("assignments", [{"properties": {"principalId": self.principal}}], "existing-authority"),
+                ("nodeExists", True, "node-group-already-exists"),
+                ("verificationResources", [{"id": "unexpected"}], "verification-group-not-empty")):
+            original = state[key]
+            state[key] = value
+            with self.subTest(guard=key), self.assertRaisesRegex(apply.Failure, error):
+                apply.quota_blocked_proof(azure, previous, receipt, tags)
+            state[key] = original
+        legacy = f"/subscriptions/{self.subscription}/providers/Microsoft.Authorization/roleDefinitions/" + \
+            next(iter(previous["roleGuids"].values()))
+        objects[legacy] = {"id": legacy}
+        with self.assertRaisesRegex(apply.Failure, "legacy-custom-role-already-exists"):
+            apply.quota_blocked_proof(azure, previous, receipt, tags)
+        objects.pop(legacy)
+        objects[self.scope["verificationResourceGroupId"]]["tags"]["orka-owner"] = "someone-else"
+        with self.assertRaisesRegex(apply.Failure, "ownership"):
+            apply.quota_blocked_proof(azure, previous, receipt, tags)
+        azure.rest.assert_not_called()
+        azure.deploy.assert_not_called()
+
+    @mock.patch.object(apply.plan, "private_path", side_effect=Path)
+    def test_readonly_preparation_builds_the_exact_explicit_transition_without_mutations(self, _private_path):
+        stopped, previous, old_receipt, tags, args = self.transition_fixture()
+        args.previous_work_dir = str(stopped)
+        work = Path(args.work_dir)
+        azure = self.grant_client()
+        proof = {"principalId": self.principal, "groupTags": {
+            **tags, "orka-source-digest": previous["sourceDigest"]}}
+        hashes = {"fixture-source": "d" * 64}
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=proof) as checked, \
+             mock.patch.object(apply, "source_hashes", return_value=hashes), \
+             mock.patch.object(apply, "compile_templates", return_value={}):
+            apply.prepare_builtin_resume(args, work, azure)
+        checked.assert_called_once_with(azure, previous, old_receipt, tags)
+        bundle = json.loads((work / "bundle.json").read_text())
+        record = json.loads((work / "authorization-link.json").read_text())
+        self.assertEqual(bundle["authorizationModel"], apply.AUTHORIZATION_MODEL)
+        self.assertEqual(bundle["roleGuids"], apply.builtin_role_guids())
+        self.assertEqual(bundle["sourceDigest"], apply.sha(apply.wire(hashes)))
+        self.assertEqual(record["sha256"], apply.sha(apply.wire(record["plan"])))
+        self.assertEqual(record["plan"]["previousReceiptSha256"], apply.sha((stopped / "receipt.json").read_bytes()))
+        self.assertEqual(record["plan"]["proof"], proof)
+        self.assertEqual(record["plan"]["networkAssignmentScopes"], apply.network_assignment_scopes(bundle))
+        self.assertEqual(azure.deployments, [])
+        self.assertEqual(azure.puts, [])
+        self.assertFalse((work / "receipt.json").exists())
+
+    @mock.patch.object(apply.plan, "private_path", side_effect=Path)
+    def test_approved_resume_checks_every_bound_field_and_only_merges_two_group_tags(self, _private_path):
+        stopped, previous, old_receipt, tags, args = self.transition_fixture()
+        args.previous_work_dir = str(stopped)
+        work = Path(args.work_dir)
+        proof = {"principalId": self.principal,
+                 "groupTags": {**tags, "orka-source-digest": previous["sourceDigest"]}}
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=proof), \
+             mock.patch.object(apply, "source_hashes", return_value={"fixture-source": "d" * 64}), \
+             mock.patch.object(apply, "compile_templates", return_value={}):
+            apply.prepare_builtin_resume(args, work, self.grant_client())
+        bundle = json.loads((work / "bundle.json").read_text())
+        record = json.loads((work / "authorization-link.json").read_text())
+        original_records = {path: path.read_bytes() for path in self.directory.rglob("*.json")
+                            if path.parent != work}
+        azure = mock.Mock(work=work)
+        azure.get.side_effect = lambda identity, *_args: {
+            "id": identity, "tags": {**proof["groupTags"], "orka-source-digest": bundle["sourceDigest"]}}
+        for field in ("kind", "authorizationModel", "nextSourceDigest", "previousSourceDigest",
+                      "previousBundleSha256", "previousReceiptSha256", "previousLinkSha256",
+                      "assignments", "networkAssignmentScopes", "builtinRoles", "kubernetesAuthorization", "proof"):
+            changed = copy.deepcopy(record)
+            changed["plan"][field] = {} if isinstance(changed["plan"][field], dict) else "tampered"
+            changed["sha256"] = apply.sha(apply.wire(changed["plan"]))
+            apply.write_json(work / "authorization-link.json", changed)
+            args.approved_authorization_sha256 = changed["sha256"]
+            azure.reset_mock()
+            with mock.patch.object(apply, "quota_blocked_proof", return_value=proof), \
+                 mock.patch.object(apply, "validate_builtin_roles"), \
+                 mock.patch.object(apply, "finish_bootstrap") as finished, \
+                 self.subTest(field=field), self.assertRaises(apply.Failure):
+                apply.resume_builtin_bootstrap(azure, bundle, {}, args)
+            azure.cli.assert_not_called()
+            azure.rest.assert_not_called()
+            azure.deploy.assert_not_called()
+            finished.assert_not_called()
+            self.assertFalse((work / "receipt.json").exists())
+        apply.write_json(work / "authorization-link.json", record)
+        args.approved_authorization_sha256 = record["sha256"]
+        receipt = {}
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=proof), \
+             mock.patch.object(apply, "validate_builtin_roles"), \
+             mock.patch.object(apply, "finish_bootstrap") as finished:
+            apply.resume_builtin_bootstrap(azure, bundle, receipt, args)
+        finished.assert_called_once_with(azure, bundle, receipt)
+        self.assertEqual(receipt["phase"], "authorization-transition-intent")
+        self.assertEqual(receipt["principalId"], self.principal)
+        targets = [call.args[call.args.index("--resource-id") + 1] for call in azure.cli.call_args_list]
+        self.assertEqual(targets, [self.scope["verificationResourceGroupId"], self.scope["cleanupResourceGroupId"]])
+        self.assertNotIn(self.scope["automationAccountId"], targets)
+        self.assertTrue(all(path.read_bytes() == raw for path, raw in original_records.items()))
+        azure.rest.assert_not_called()
+        azure.deploy.assert_not_called()
+
 
 class RecoveryPlanTests(unittest.TestCase):
     def setUp(self):
@@ -529,26 +1026,32 @@ class NewTemplateTests(unittest.TestCase):
             self.assertEqual(group["tags"], "[variables('tags')]")
         self.assertEqual(len(template["variables"]["tags"]), 7)
 
-    def test_cleanup_roles_are_exact_delete_only_and_assignments_are_narrow(self):
+    def test_cleanup_creates_only_scoped_builtin_assignments_not_role_definitions(self):
         template = self.compile("cleanup-access")
-        roles = [r for r in template["resources"] if r["type"] == "Microsoft.Authorization/roleDefinitions"]
-        self.assertEqual(len(roles), 4)
-        actions = [set(r["properties"]["permissions"][0]["actions"]) for r in roles]
-        self.assertIn(apply.REQUIRED_ACTIONS, actions)
-        self.assertFalse(any("*" in a or a.endswith("/write") for group in actions for a in group))
-        for role in roles:
-            self.assertEqual(role["properties"]["permissions"][0]["dataActions"], [])
+        apply.reject_custom_role_definitions(template)
+        self.assertIn("94877a25-7520-40c5-9c42-68e02e4758bd", template["variables"]["resourceRoleId"])
+        self.assertIn("acdd72a7-3385-48ef-bd42-f606fba81ae7", template["variables"]["readerRoleId"])
         modules = [r for r in template["resources"] if r["type"] == "Microsoft.Resources/deployments"]
         self.assertEqual(len(modules), 2)
-        self.assertTrue(all("control" not in r["resourceGroup"].lower() for r in modules))
-        groups_read = next(r for r in roles if r["name"] == "[parameters('groupMetadataRoleGuid')]")
-        peers_read = next(r for r in roles if r["name"] == "[parameters('peerMetadataRoleGuid')]")
-        self.assertEqual(groups_read["properties"]["permissions"][0]["actions"],
-                         ["Microsoft.Resources/subscriptions/resourceGroups/read"])
-        self.assertEqual(groups_read["properties"]["assignableScopes"], ["[subscription().id]"])
-        self.assertEqual(peers_read["properties"]["permissions"][0]["actions"],
-                         ["Microsoft.Network/virtualNetworks/virtualNetworkPeerings/read"])
-        self.assertIn("Microsoft.Resources/resourceGroups", peers_read["properties"]["assignableScopes"][0])
+        self.assertEqual(template["variables"]["prefix"], "[format('orka-verify-{0}', parameters('suffix'))]")
+        self.assertEqual({module["name"]: module["resourceGroup"] for module in modules}, {
+            "verification-cleanup-access": "[format('rg-{0}', variables('prefix'))]",
+            "node-cleanup-access": "[format('rg-{0}-nodes', variables('prefix'))]",
+        })
+        node = next(module for module in modules if module["name"] == "node-cleanup-access")
+        self.assertEqual(node["condition"], "[parameters('includeNodeGroup')]")
+        readers = [r for r in template["resources"] if r["type"] == "Microsoft.Authorization/roleAssignments"]
+        self.assertEqual(len(readers), 1)
+        self.assertNotIn("scope", readers[0])
+        self.assertEqual(readers[0]["properties"]["roleDefinitionId"], "[variables('readerRoleId')]")
+        for module in modules:
+            self.assertEqual(module["properties"]["parameters"]["roleDefinitionId"]["value"],
+                             "[variables('resourceRoleId')]")
+        self.assertEqual(apply.BUILTIN_ROLES["resource-cleanup"][2], {
+            "Microsoft.Resources/subscriptions/resourceGroups/read",
+            "Microsoft.Resources/subscriptions/resourceGroups/write",
+            "Microsoft.Resources/subscriptions/resourceGroups/delete",
+        })
 
     def test_tag_recovery_cannot_put_existing_account_or_change_child_configuration(self):
         recovery = self.compile("cleanup-recovery")
@@ -597,7 +1100,7 @@ class NewTemplateTests(unittest.TestCase):
                                  "-Runbook", str(SOURCE / "cleanup-runbook.ps1")],
                                 capture_output=True, text=True, env=environment, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn("contracts passed: 21", result.stdout)
+        self.assertIn("contracts passed: 29", result.stdout)
 
 
 class GuestGuardTests(unittest.TestCase):

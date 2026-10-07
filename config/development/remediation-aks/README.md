@@ -15,8 +15,12 @@ Do not point that installer at AKS.
   a third node. No manual upgrade or scale-up is allowed during this 24-hour lab.
   No zones, SKU fallbacks, automatic upgrades, or other regions.
 - Azure CNI **Overlay / Cilium**, private API, no public API FQDN, no AKS Run
-  Command, managed Entra / Azure RBAC, local accounts disabled, OIDC and workload
-  identity enabled. No managed KEDA, ingress, or monitoring add-ons.
+  Command, managed Entra authentication, local accounts disabled, OIDC and
+  workload identity enabled. Azure RBAC is initially enabled only for the
+  temporary operator bootstrap; the new verification cluster must switch to
+  native Kubernetes RBAC before application admission. The existing control
+  cluster's authorization mode is unchanged. No managed KEDA, ingress, or
+  monitoring add-ons.
 - Every build/test-eligible node is in that one pool. ARM `kubeletConfig.podMaxPids`
   is **512** (the API setting corresponding to kubelet `podPidsLimit`). Verify the
   effective kubelet configuration before accepting workloads.
@@ -47,7 +51,7 @@ Do not point that installer at AKS.
 There are three approval items. No scheduler, registration, role grant, peering,
 DNS link, or trusted setup Job is created by this template or the planner.
 
-1. **Independent cleanup service and narrowly scoped delete authority.**
+1. **Independent cleanup service and explicitly approved built-in authority.**
    A CronJob on a single-node control cluster has durable desired state but cannot
    execute when that node is unavailable. It is not sufficient as the sole
    24-hour reaper; do not resize the control cluster to solve this.
@@ -75,45 +79,31 @@ DNS link, or trusted setup Job is created by this template or the planner.
 
    If `Microsoft.Automation` is unregistered, its registration on the explicitly
    approved subscription is also an approval item within this cleanup step.
-   Only the trusted provisioner performs it; the reaper receives no provider
-   registration, resource creation, Owner, Contributor, or wildcard permission.
+   Only the trusted provisioner performs provider registration. The
+   `builtin-group-cleanup-v1` permission model creates **no custom Azure role
+   definitions** and is not equivalent to the previous delete-only custom roles.
+   Explicitly approve these assignments to the dedicated cleanup identity:
 
-   The proposed **resource cleanup custom role**, assigned only to the new
-   verification group and, once AKS creates it, its exact new managed node group:
+   | Built-in role | Exact scope | Permission trade-off |
+   | --- | --- | --- |
+   | Resource Group Contributor (`94877a25-7520-40c5-9c42-68e02e4758bd`) | Only the owned verification group and, after creation, its owned node group | Group read/write/delete; not individual VM/AKS management |
+   | Reader (`acdd72a7-3385-48ef-bd42-f606fba81ae7`) | The approved subscription | All control-plane `*/read`, broader than group/peering metadata |
+   | Network Contributor (`4d97b98b-1d4f-4787-a291-c67834d212e7`) | Only the exact newly created control-side peering | Network read/write/delete within that child scope, not the control VNet or NSGs |
 
-   ```text
-   Microsoft.Resources/subscriptions/resourceGroups/read
-   Microsoft.Resources/subscriptions/resourceGroups/delete
-   Microsoft.Resources/subscriptions/resourceGroups/resources/read
-   Microsoft.Resources/deployments/read
-   Microsoft.Resources/deployments/operations/read
-   Microsoft.ContainerService/managedClusters/read
-   Microsoft.ContainerService/managedClusters/delete
-   Microsoft.Compute/virtualMachines/read
-   Microsoft.Compute/virtualMachines/instanceView/read
-   Microsoft.Compute/virtualMachines/delete
-   Microsoft.Authorization/permissions/read
-   ```
+   The operator reads back each built-in role's ID, type and complete action set,
+   checks its lack of data actions and exclusions, and audits all assignments
+   visible for the cleanup principal. Extra grants, different scopes, conditions,
+   duplicated bindings, or unrecorded existing assignments fail closed. The
+   runbook requires an explicit version-2 manifest and verifies the exact
+   effective group-cleanup action set during preflight; it does not simply
+   disable the former wildcard guard.
 
-   A separate **peering cleanup custom role**, assigned only to the exact newly
-   approved peering child resource on the existing control VNet:
-
-   ```text
-   Microsoft.Network/virtualNetworks/virtualNetworkPeerings/read
-   Microsoft.Network/virtualNetworks/virtualNetworkPeerings/delete
-   ```
-
-   These are proposals, **not grants made here**. Custom-role definitions may be
-   subscription-level catalog objects; their assignments are **not**
-   subscription-wide for deletion. The separately approved metadata-only readers
-   below are explicit exceptions, not broader delete authority. Assignable scopes
-   and assignment IDs must be captured
-   explicitly. The reaper has no permissions on the existing control resource
-   group as a whole, no NSG write permission, no direct VMSS mutation, and no
-   IAM mutation or permission to delete its own Automation account. The trusted
-   provisioner retires recorded custom definitions/remaining bindings and the
-   cleanup group separately after reviewing receipts; the reaper must not gain
-   subscription-wide role-definition delete authority for that housekeeping.
+   Resource Group Contributor permits group writes as well as deletion. Reader
+   exposes other resource configuration in this subscription. Neither grants
+   IAM mutation, workload Kubernetes administration or data-plane credentials.
+   The cleanup identity cannot modify its own Automation account or delete its
+   cleanup group. The trusted provisioner retires only the recorded assignments
+   and cleanup group; **it never deletes built-in or shared role definitions**.
 
    Prepare the owned empty verification group and cleanup service before
    billable foundation resources. Perform a read-only identity/permission
@@ -125,9 +115,12 @@ DNS link, or trusted setup Job is created by this template or the planner.
    failures. The node group must never be pre-created or reused.
 
    At cleanup, validate exact IDs, ownership/expiry/cleanup-receipt tags and the
-   AKS-to-node-group relationship. Delete the dedicated VM and AKS and settle
-   those exact resources. Independently attempt the owned residual node group
-   and exact control-side peering, but **an ungranted or removed residual read
+   AKS-to-node-group relationship. Read and validate the known AKS/VM children,
+   then request deletion of the exact owned verification group. Azure performs
+   cascading resource deletion; no individual VM/AKS delete operation is
+   authorized or issued. Poll the containing group until authoritative absence
+   before attempting the owned residual node group and exact control-side
+   peering, but **an ungranted or removed residual read
    scope must not retain the owned main group's billable NAT/disks**. Continue
    main-group deletion even if an independent residual read is 403 or its
    ownership proof is refused. Keep per-target evidence and report incomplete/
@@ -140,24 +133,14 @@ DNS link, or trusted setup Job is created by this template or the planner.
    scope. Never delete an unrelated or inherited assignment or a resource based
    on a tag alone.
 
-   Resource-scoped read assignments can disappear with their targets. The
-   separately approved post-delete readers are therefore **two single-action
-   custom roles**, only for the new cleanup identity:
-
-   - `Microsoft.Resources/subscriptions/resourceGroups/read` at the exact
-     subscription. This exposes group names/tags/locations, not resource contents.
-   - `Microsoft.Network/virtualNetworks/virtualNetworkPeerings/read` assigned only
-     to the exact existing control VNet. The definition's assignable scope is the
-     control resource group; it is not an assignment on that whole group.
-
-   These add no create/write/delete, wildcard or application permissions.
-   Definitions, assignment scopes and principal IDs are read back, and the
-   managed-identity preflight proves authoritative 404 reads of the not-yet-
+   Resource-scoped assignments can disappear with their targets. The explicitly
+   approved subscription Reader survives those deletions. The managed-identity
+   preflight proves authoritative 404 reads of the not-yet-
    created node group/peering before the clock. Child resource GETs stop when
    their containing group is authoritatively absent. Denied/uncertain reads
    still fail closed and never become success. The trusted `retire` phase
-   records physical absence and removes the exact reader assignments and
-   definitions before retiring the cleanup account/group.
+   records physical absence and removes the exact assignments before retiring
+   the cleanup account/group.
 
    Automation retains job status/output for up to 30 days independently of the
    control cluster. A named operator must check the durable status after each
@@ -180,21 +163,27 @@ DNS link, or trusted setup Job is created by this template or the planner.
    No peering or existing-network DNS mutation is included in this template.
    Use one nonprivileged, bounded trusted setup Job/ServiceAccount in the existing
    control namespace, reached through that cluster's already working public API,
-   for private DNS/API/mTLS checks. It uses the standard private AKS FQDN and the
-   parent's explicit native workload identity configuration; no proxy origin or
-   ambient identity fallback. No VPN, Bastion, jump VM, SSH route, new management
+   for private DNS/API/mTLS checks. With separate explicit approval, the same
+   restricted Job can provide an operator-only TCP tunnel reached through a
+   loopback-only port-forward. It forwards opaque TLS to only the exact private
+   AKS endpoint, has no public Service, and receives no operator credentials.
+   The operator retains Entra authentication and validates the original API
+   hostname and CA. Remove the tunnel/Job after bootstrap.
+   Application clients use the standard private AKS FQDN and explicit native
+   workload identity configuration; no proxy origin or ambient identity
+   fallback. No VPN, Bastion, jump VM, SSH route, new management
    cluster, public verification API, or privileged builder on control nodes is
    requested. VM daemon bootstrap remains separately staged: this Job is not
    permission to enable VM extensions or grant it guest administration.
 
 3. **AKS service-managed authority.** Azure documents a **Contributor** grant on
    the managed node group for the control-plane identity. It contains wildcard
-   actions and is **not equivalent to the enumerated role in this template**.
-   Do not assume a what-if lists this resource-provider side effect. Under a
-   no-wildcard-grants authorization, creation stays blocked until an explicit
-   exception for this exact new node group is approved, or an Azure-supported,
-   verified exact-action alternative is established. Do not grant Owner, change
-   the existing cluster identity, or grant broad access and remove it afterward.
+   actions and requires an explicit exception for that identity and exact new
+   node group; a what-if need not list this provider side effect. Separately,
+   the template assigns built-in Network Contributor to the new AKS identity
+   on only its new VNet, node NSG and NAT gateway. It never creates a network
+   custom-role definition. Do not grant Owner, change the existing cluster
+   identity, or assign these management roles to Orka or candidate workloads.
 
 ## Traffic and identity boundaries
 
@@ -202,7 +191,7 @@ DNS link, or trusted setup Job is created by this template or the planner.
 | --- | --- | --- |
 | Trusted control controller / observer | Verification Kubernetes API, TCP 443 | Peered VNet + private DNS; Azure workload identity and **separately reviewed** Kubernetes RBAC |
 | Trusted build client Job on control nodes | Builder private IP, TCP 1234 | Peered VNet + mTLS; source is the control **node** subnet after overlay SNAT |
-| Trusted operator | Verification API, TCP 443 | Trusted setup Job on control nodes, accessed through the existing control public API; no custom verification API proxy |
+| Trusted operator | Verification API, TCP 443 | Explicitly approved temporary loopback-only TCP tunnel through the restricted setup Job; end-to-end TLS/Entra authentication, no public API proxy |
 | Observer operations | Verification Pods/Services | Kubernetes API-mediated watches/logs/exec/proxy as authorized; **not** cross-cluster Pod IP or Service IP routing |
 | Untrusted build steps | Public registry/package endpoints, TCP 443 | Explicit guest CNI bridge; guest forwarding denies IMDS and non-DNS WireServer; no host-network entitlement |
 | Trusted VM platform agents | Azure IMDS / WireServer | Host access remains available for cloud-init and every boot; VM has no managed identity |
@@ -302,13 +291,17 @@ python3 "$APPLY" connect   ... --reviewed-source-sha256 "$REVIEWED_DIGEST"
 python3 "$APPLY" retire    ... --reviewed-source-sha256 "$REVIEWED_DIGEST"
 ```
 
-`bootstrap` requires all three group names and all four role-definition IDs to be
-unused, creates the owned empty verification/cleanup groups, configures only the
-reviewed cleanup identity/roles, publishes the exact runbook, and executes a
+`bootstrap` requires all three group names to be unused and the approved
+built-in role definitions to match the pinned permission contract. It creates
+the owned empty verification/cleanup groups, configures only the reviewed
+cleanup assignments, publishes the exact runbook, and executes a
 read-only managed-identity/delete-authority preflight. The operator's bounded
 wait allows ten minutes of queue/start delay plus ten minutes of job execution;
 it does not increase runbook runtime or create another job. Only that preflight retries
-initial 403 propagation, bounded to ten minutes; cleanup never treats 403 as
+initial 403 propagation and strict subsets of the expected permission set,
+bounded to the same ten-minute deadline. Any extra action, exclusion or data
+permission fails immediately; missing actions have a distinct failure code.
+Cleanup never treats 403 as
 absence or switches identity. `arm` verifies receipts,
 both groups' ownership/source tags, the empty verification group, and the actual
 public key; chooses a future UTC `T0`; and performs **Provider** what-if using
@@ -324,7 +317,7 @@ the arming source/owner/receipt tags when it updates the prepared group. Later
 node-group and peering permissions are scoped to the exact created resources.
 Schedule bindings are immutable; they are not replaced to extend lifetime.
 Once owned main-group deletion is accepted, cleanup polls that group without
-re-reading its already-settled AKS/VM children under disappearing group-level
+re-reading its already-validated AKS/VM children under disappearing group-level
 permissions. Completion still requires authoritative group absence.
 The control-side peering and its child-scoped role assignment use direct exact-ID
 ARM PUTs rather than group deployments, so no deployment records are created in
@@ -333,7 +326,7 @@ Cleanup bootstrap, cleanup-access grants and registry-pull grants each run
 **Provider-level validation immediately before create**, with the same compiled
 template and parameter hashes. Static Bicep compilation is not RP validation.
 
-### Bounded zero-tag child recovery
+### Preserved child-recovery history
 
 The live Automation RP rejected both seven runtime-environment tags and a
 20-character tag key, despite successful Provider validation. Rather than guess
@@ -349,24 +342,7 @@ The preview accepts only absent tags or `{}`, never any tagged child or
 unexpected child property. Compiled JSON tests assert zero encoded tag count,
 keys and values, including regressions for both previously rejected forms.
 
-Only the two specifically recorded pre-clock failures with an empty owned
-verification group, the exact owned cleanup account, no runtime/runbook/schedules,
-and **zero** cleanup-identity role assignments have a code-supported next proposal:
-
-```bash
-# Read-only, new private directory; the previous bundle and receipt stay immutable.
-python3 "$APPLY" plan-recovery --subscription "$APPROVED_SUBSCRIPTION" \
-  --control-vnet-id "$CONTROL_VNET_ID" --control-aks-id "$CONTROL_AKS_ID" \
-  --previous-work-dir "$ORIGINAL_FAILED_BUNDLE_DIR" \
-  --failed-recovery-work-dir "$FAILED_THREE_TAG_RECOVERY_DIR" \
-  --work-dir "$RECOVERY_BUNDLE_DIR"
-# STOP: obtain explicit user recovery approval and independent review of both hashes.
-python3 "$APPLY" recover-bootstrap ... \
-  --reviewed-source-sha256 "$RECOVERY_SOURCE_DIGEST" \
-  --approved-recovery-sha256 "$APPROVED_RECOVERY_LINK_DIGEST"
-```
-
-The recovery link pins **both** failed bundles/receipts, the failed recovery's
+The historical recovery link pins **both** failed bundles/receipts, the failed recovery's
 approved link and exact deployment identity, original principal, and ownership
 proof. It rechecks the original tag-count failure and the subsequent exact
 runtime tag-key-length failure and allows only creation of the two missing
@@ -388,7 +364,36 @@ receipt tags, group/account IDs and system identity remain unchanged.
 It writes a **new** intent receipt linking both failures; it never edits either
 failed receipt or disables `bootstrap`'s fresh-state guard.
 Recovery completes only the cleanup bootstrap/preflight, not arming or compute.
-The command's existence does not authorize executing it.
+Those archived bundles remain immutable audit inputs, not authorization to
+replay them under a different permission model. Current bundle loading requires
+the explicit built-in model and current reviewed source.
+
+### Bounded custom-role-quota transition
+
+If zero-tag child creation completed but cleanup access stopped at exactly
+`RoleDefinitionLimitExceeded`, the operator may prepare a separate transition:
+
+```bash
+python3 "$APPLY" plan-builtin-resume --subscription "$APPROVED_SUBSCRIPTION" \
+  --control-vnet-id "$CONTROL_VNET_ID" --control-aks-id "$CONTROL_AKS_ID" \
+  --previous-work-dir "$STOPPED_ZERO_TAG_BUNDLE_DIR" \
+  --work-dir "$BUILTIN_BUNDLE_DIR"
+# Review the source and permission trade-offs; approve the exact authorization link.
+python3 "$APPLY" resume-builtin-bootstrap ... \
+  --reviewed-source-sha256 "$REVIEWED_DIGEST" \
+  --approved-authorization-sha256 "$AUTHORIZATION_LINK_DIGEST"
+```
+
+This path requires the exact stopped receipt and all preceding bundle/receipt
+hashes, unchanged ownership and system identity, a still-empty verification
+group, the expected runtime and **unpublished** runbook, no jobs/schedules,
+no legacy cleanup role definitions and **zero** assignments to the cleanup
+identity. The live stopped state and all built-in permissions are revalidated.
+The transition updates only the two groups' source tags and writes a new intent
+receipt before granting the explicitly approved built-in assignments. It does
+not recreate or modify the Automation account, replay child creation, start
+compute, or edit earlier receipts. The new access deployment uses a different
+name so the original quota-failure deployment record remains available.
 
 This is not a generic resume/adoption framework. A partially failed phase stops
 with a private intent receipt and requires bounded operator recovery; never
@@ -460,12 +465,17 @@ NetworkSecurityGroupEnabled`. AKS may rewrite this setting: read back the actual
 subnet and effective private-endpoint policy after provisioning. A template
 property or NSG rule alone is not proof that the private API traffic is filtered.
 
-Keep AKS Azure RBAC enabled. ARM Owner/Contributor does not grant Kubernetes
-access. If explicitly approved, temporary **operator-only** AKS RBAC Cluster
-Admin is scoped to the new cluster and revoked after bootstrap. It is never
-assigned to Orka, Copilot, BuildKit, the reaper, or the controller/setup application
-identity. The parent owns separate enumerated application authorization and
-native-client proof; do not switch authorization modes or fetch admin credentials.
+ARM Owner/Contributor does not grant Kubernetes access. The new cluster starts
+with Azure RBAC enabled for the explicitly approved temporary **operator-only**
+AKS RBAC Cluster Admin assignment. The operator installs native Kubernetes
+bindings, verifies the transition on the **new** cluster, disables its Azure
+RBAC authorization and revokes the temporary Azure assignment. Entra
+authentication and disabled local accounts remain in force. Do not change the
+existing control cluster's mode or fetch admin credentials.
+No application receives cluster-admin or Azure infrastructure management roles.
+Native application permissions, privilege-escalation controls and authenticated
+native-client proof are separate workload-admission prerequisites, not implied
+by this foundation's compute/connect receipts.
 
 ## Receipts, cleanup, and qualification
 
@@ -480,21 +490,19 @@ LoadBalancer/Ingress provisioning and additional cloud resources; fixed IaC
 counts are not an admission policy or an Azure billing cap.
 
 The physical cleanup path uses the reviewed equivalent of these exact-ID
-operator recovery commands; neither command runs as part of planning. IAM
-catalog housekeeping remains a separate trusted-provisioner action:
+operator recovery commands; neither command runs as part of planning.
+Assignment retirement remains a separate trusted-provisioner action:
 
 ```bash
-az aks delete --subscription "$APPROVED_SUBSCRIPTION" --resource-group "$VERIFY_RG" \
-  --name "$VERIFY_AKS" --yes
-# Wait for AKS and its recorded managed node group to disappear. On leftovers:
-# stop and use only the separately approved exact-node-group cleanup permission.
 az group delete --subscription "$APPROVED_SUBSCRIPTION" --name "$VERIFY_RG" --yes
+# Wait for the containing group and AKS-managed node group to disappear.
+# Only an exact positively owned residual node group can be deleted afterward.
 # After physical absence is recorded, the trusted provisioner retires only
-# this deployment's remaining authorization catalog entries and cleanup group.
+# this deployment's remaining assignments and cleanup group, never role definitions.
 ```
 
 Verify both groups and their resources are gone; record final absence and any
-remaining charges (disks, snapshots, public IPs, NAT, role definitions). VM
+remaining resources and charges (disks, snapshots, public IPs, NAT). VM
 deallocation or AKS stop alone leaves billable storage/network resources. Never
 delete a resource based on a tag alone, or use a broad `rg-orka-*` cleanup filter.
 

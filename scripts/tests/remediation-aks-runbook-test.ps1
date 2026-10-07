@@ -18,7 +18,8 @@ function Throws([scriptblock] $Code, [string] $Expected) {
 function Reset-Fixture {
     $script:Now = [DateTimeOffset]::Parse('2026-01-01T23:00:00Z')
     $script:InputManifest = @{
-        version = 1
+        version = 2
+        authorizationModel = 'builtin-group-cleanup-v1'
         subscriptionId = '11111111-1111-1111-1111-111111111111'
         tenantId = '22222222-2222-2222-2222-222222222222'
         principalId = '33333333-3333-3333-3333-333333333333'
@@ -52,13 +53,10 @@ function Reset-Fixture {
         } }
         permissions = @{ value = @(@{
             actions = @(
+                '*/read',
                 'Microsoft.Resources/subscriptions/resourceGroups/read',
-                'Microsoft.Resources/subscriptions/resourceGroups/delete',
-                'Microsoft.Resources/subscriptions/resourceGroups/resources/read',
-                'Microsoft.Resources/deployments/read', 'Microsoft.Resources/deployments/operations/read',
-                'Microsoft.ContainerService/managedClusters/read', 'Microsoft.ContainerService/managedClusters/delete',
-                'Microsoft.Compute/virtualMachines/read', 'Microsoft.Compute/virtualMachines/instanceView/read',
-                'Microsoft.Compute/virtualMachines/delete', 'Microsoft.Authorization/permissions/read'
+                'Microsoft.Resources/subscriptions/resourceGroups/write',
+                'Microsoft.Resources/subscriptions/resourceGroups/delete'
             )
             notActions = @(); dataActions = @(); notDataActions = @()
         }) }
@@ -71,12 +69,22 @@ function Reset-Fixture {
     $script:PendingMainReads = 0
     $script:RejectChildrenAfterMainDelete = $false
     $script:ChildReadsAfterMainDelete = 0
+    $script:PermissionReplies = @()
+    $script:PermissionReads = 0
 }
 
 function Get-CleanupTime { return $script:Now }
 function Start-Sleep { param([double] $Seconds); $script:Now = $script:Now.AddSeconds($Seconds) }
 function Get-CleanupResource {
     param([string] $Kind)
+    if ($Kind -eq 'permissions') {
+        $script:PermissionReads++
+        if ($script:PermissionReplies.Count -gt 0) {
+            $reply = $script:PermissionReplies[0]
+            $script:PermissionReplies = @($script:PermissionReplies | Select-Object -Skip 1)
+            return $reply
+        }
+    }
     if ($script:RejectChildrenAfterMainDelete -and $script:Deletes.Contains('group') -and $Kind -in @('aks', 'vm')) {
         $script:ChildReadsAfterMainDelete++
         throw 'arm-forbidden'
@@ -92,12 +100,12 @@ function Get-CleanupResource {
 }
 function Remove-CleanupResource {
     param([string] $Kind)
-    Check ($Kind -in @('group', 'nodeGroup', 'aks', 'vm', 'peer')) 'unexpected-delete'
+    Check ($Kind -in @('group', 'nodeGroup', 'peer')) 'unapproved-individual-resource-delete'
     $script:Deletes.Add($Kind)
     if ($Kind -eq 'group' -and $script:PendingMainReads -gt 0) {
         $script:Objects.group['properties'] = @{ provisioningState = 'Deleting' }
     } elseif ($Kind -ne $script:Stuck) { $script:Objects.Remove($Kind) }
-    if ($Kind -eq 'aks' -and $script:AutoRemoveNodesWithAKS) { $script:Objects.Remove('nodeGroup') }
+    if ($Kind -eq 'group' -and $script:AutoRemoveNodesWithAKS) { $script:Objects.Remove('nodeGroup') }
     return @{ accepted = $true; completed = $false }
 }
 
@@ -112,7 +120,7 @@ $script:Passed++
 Reset-Fixture
 $result = Invoke-FoundationCleanup ($script:InputManifest | ConvertTo-Json -Compress) 'Cleanup'
 Check ($result.outcome -eq 'cleanup-succeeded') 'cleanup-did-not-complete'
-Check (($script:Deletes -join ',') -eq 'aks,vm,group,nodeGroup,peer') 'unsafe-delete-order'
+Check (($script:Deletes -join ',') -eq 'group,nodeGroup,peer') 'unsafe-delete-order'
 $script:Passed++
 
 Reset-Fixture
@@ -162,10 +170,10 @@ Throws { Invoke-FoundationCleanup ($script:InputManifest | ConvertTo-Json -Compr
 $script:Passed++
 
 Reset-Fixture
-$script:Stuck = 'vm'
+$script:Stuck = 'group'
 Throws { Invoke-FoundationCleanup ($script:InputManifest | ConvertTo-Json -Compress) 'Cleanup' } 'cleanup-deadline-reached'
-Check (@($script:Deletes | Where-Object { $_ -eq 'vm' }).Count -eq 1) 'unbounded-delete-replay'
-Check (-not $script:Deletes.Contains('group')) 'group-deleted-before-compute-settled'
+Check (@($script:Deletes | Where-Object { $_ -eq 'group' }).Count -eq 1) 'unbounded-delete-replay'
+Check (-not $script:Deletes.Contains('nodeGroup')) 'node-group-deleted-before-main-group-settled'
 $script:Passed++
 
 Reset-Fixture
@@ -201,7 +209,7 @@ Reset-Fixture
 $script:AutoRemoveNodesWithAKS = $true
 $script:ForbiddenAbsent = @('nodeGroup')
 Throws { Invoke-FoundationCleanup ($script:InputManifest | ConvertTo-Json -Compress) 'Cleanup' } 'cleanup-residual-verification-required'
-Check (($script:Deletes -join ',') -eq 'aks,vm,group,peer') 'partial-C-did-not-delete-main-group'
+Check (($script:Deletes -join ',') -eq 'group,peer') 'partial-C-did-not-delete-main-group'
 Check ($script:CleanupEvidence.group.state -eq 'Absent') 'partial-C-missing-main-proof'
 $script:Passed++
 
@@ -265,6 +273,62 @@ $start = $script:Now
 $script:Http = [CleanupHttpFixture]::new(99999)
 Throws { Invoke-CleanupArm 'GET' $script:Fixture.ids.group '2024-03-01' } 'retry-exceeds-deadline'
 Check (($script:Now - $start).TotalMinutes -lt 10 -and $script:Http.Calls -gt 2) 'unbounded-preflight-retry'
+$script:Passed++
+
+Reset-Fixture
+$script:InputManifest.version = 1
+Throws { Read-CleanupManifest ($script:InputManifest | ConvertTo-Json -Compress) } 'unsupported-manifest-version'
+$script:Passed++
+
+Reset-Fixture
+$script:Objects.permissions.value[0].actions = @('*')
+Throws { Invoke-FoundationCleanup ($script:InputManifest | ConvertTo-Json -Compress) 'Preflight' } 'unexpected-extra-cleanup-authority'
+$script:Passed++
+
+Reset-Fixture
+$script:Manifest = $script:Fixture
+Throws { Invoke-CleanupArm 'DELETE' $script:Fixture.ids.vm '2024-11-01' } 'arm-delete-outside-scope'
+Throws { Invoke-CleanupArm 'DELETE' $script:Fixture.ids.aks '2025-07-01' } 'arm-delete-outside-scope'
+$script:Passed++
+
+foreach ($visible in @('group', 'reader')) {
+    Reset-Fixture
+    $script:Objects.Remove('nodeGroup')
+    $script:Objects.Remove('peer')
+    $partial = if ($visible -eq 'reader') { @('*/read') } else {
+        @('Microsoft.Resources/subscriptions/resourceGroups/read',
+          'Microsoft.Resources/subscriptions/resourceGroups/write',
+          'Microsoft.Resources/subscriptions/resourceGroups/delete')
+    }
+    $script:PermissionReplies = @(@{ value = @(@{
+        actions = $partial; notActions = @(); dataActions = @(); notDataActions = @()
+    }) })
+    $result = Invoke-FoundationCleanup ($script:InputManifest | ConvertTo-Json -Compress) 'Preflight'
+    Check ($result.outcome -eq 'preflight-succeeded' -and $script:PermissionReads -eq 2) 'partial-grant-not-retried'
+    Check ($script:Deletes.Count -eq 0) 'propagation-check-mutated'
+    $script:Passed++
+}
+
+Reset-Fixture
+$script:Objects.permissions.value[0].actions = @('*/read')
+$start = $script:Now
+Throws { Invoke-FoundationCleanup ($script:InputManifest | ConvertTo-Json -Compress) 'Preflight' } 'missing-cleanup-authority'
+Check ($script:PermissionReads -gt 1 -and ($script:Now - $start).TotalMinutes -lt 10) 'partial-grant-wait-unbounded'
+$script:Passed++
+
+Reset-Fixture
+$script:Objects.permissions.value[0].actions += '*'
+Throws { Invoke-FoundationCleanup ($script:InputManifest | ConvertTo-Json -Compress) 'Preflight' } 'unexpected-extra-cleanup-authority'
+Check ($script:PermissionReads -eq 1) 'extra-authority-was-retried'
+$script:Passed++
+
+Reset-Fixture
+$script:Manifest = $script:Fixture
+$script:PreflightOnly = $false
+$script:RunDeadline = $script:Now.AddMinutes(60)
+$script:Objects.permissions.value[0].actions = @('*/read')
+Throws { Assert-CleanupAuthority } 'missing-cleanup-authority'
+Check ($script:PermissionReads -eq 1) 'nonpreflight-partial-authority-was-retried'
 $script:Passed++
 
 Write-Output ("Runbook offline contracts passed: " + $script:Passed)

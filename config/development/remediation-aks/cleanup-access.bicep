@@ -2,14 +2,12 @@ targetScope = 'subscription'
 
 param suffix string
 param principalId string
-param resourceRoleGuid string
-param peeringRoleGuid string
-param groupMetadataRoleGuid string
-param peerMetadataRoleGuid string
-param controlResourceGroup string
 param includeNodeGroup bool = false
 
 var prefix = 'orka-verify-${suffix}'
+var resourceRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '94877a25-7520-40c5-9c42-68e02e4758bd')
+var readerRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
+var networkRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4d97b98b-1d4f-4787-a291-c67834d212e7')
 
 resource verificationGroup 'Microsoft.Resources/resourceGroups@2024-03-01' existing = {
   name: 'rg-${prefix}'
@@ -19,103 +17,12 @@ resource nodeGroup 'Microsoft.Resources/resourceGroups@2024-03-01' existing = {
   name: 'rg-${prefix}-nodes'
 }
 
-resource controlGroup 'Microsoft.Resources/resourceGroups@2024-03-01' existing = {
-  name: controlResourceGroup
-}
-
-resource resourceRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: resourceRoleGuid
-  properties: {
-    roleName: '${prefix}-resource-cleanup'
-    description: 'Read and delete only dedicated verification resources. No create, IAM mutation, or VMSS operation.'
-    type: 'CustomRole'
-    assignableScopes: includeNodeGroup ? [verificationGroup.id, nodeGroup.id] : [verificationGroup.id]
-    permissions: [
-      {
-        actions: [
-          'Microsoft.Resources/subscriptions/resourceGroups/read'
-          'Microsoft.Resources/subscriptions/resourceGroups/delete'
-          'Microsoft.Resources/subscriptions/resourceGroups/resources/read'
-          'Microsoft.Resources/deployments/read'
-          'Microsoft.Resources/deployments/operations/read'
-          'Microsoft.ContainerService/managedClusters/read'
-          'Microsoft.ContainerService/managedClusters/delete'
-          'Microsoft.Compute/virtualMachines/read'
-          'Microsoft.Compute/virtualMachines/instanceView/read'
-          'Microsoft.Compute/virtualMachines/delete'
-          'Microsoft.Authorization/permissions/read'
-        ]
-        notActions: []
-        dataActions: []
-        notDataActions: []
-      }
-    ]
-  }
-}
-
-resource peerRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: peeringRoleGuid
-  properties: {
-    roleName: '${prefix}-peering-cleanup'
-    description: 'Read/delete only the exact new control-side peering through a child-resource assignment.'
-    type: 'CustomRole'
-    assignableScopes: [controlGroup.id]
-    permissions: [
-      {
-        actions: [
-          'Microsoft.Network/virtualNetworks/virtualNetworkPeerings/read'
-          'Microsoft.Network/virtualNetworks/virtualNetworkPeerings/delete'
-        ]
-        notActions: []
-        dataActions: []
-        notDataActions: []
-      }
-    ]
-  }
-}
-
-resource groupMetadataRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: groupMetadataRoleGuid
-  properties: {
-    roleName: '${prefix}-group-metadata-read'
-    description: 'Approved group-level metadata only, to distinguish post-delete absence from lost child-scope authorization.'
-    type: 'CustomRole'
-    assignableScopes: [subscription().id]
-    permissions: [
-      {
-        actions: ['Microsoft.Resources/subscriptions/resourceGroups/read']
-        notActions: []
-        dataActions: []
-        notDataActions: []
-      }
-    ]
-  }
-}
-
-resource peerMetadataRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: peerMetadataRoleGuid
-  properties: {
-    roleName: '${prefix}-peering-metadata-read'
-    description: 'Approved peering metadata only; assigned to the exact control VNet for post-delete verification.'
-    type: 'CustomRole'
-    assignableScopes: [controlGroup.id]
-    permissions: [
-      {
-        actions: ['Microsoft.Network/virtualNetworks/virtualNetworkPeerings/read']
-        notActions: []
-        dataActions: []
-        notDataActions: []
-      }
-    ]
-  }
-}
-
 resource groupMetadataAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, groupMetadataRole.id, principalId)
+  name: guid(subscription().id, readerRoleId, principalId)
   properties: {
     principalId: principalId
     principalType: 'ServicePrincipal'
-    roleDefinitionId: groupMetadataRole.id
+    roleDefinitionId: readerRoleId
   }
 }
 
@@ -124,7 +31,7 @@ module verificationAccess './cleanup-group-binding.bicep' = {
   name: 'verification-cleanup-access'
   params: {
     principalId: principalId
-    roleDefinitionId: resourceRole.id
+    roleDefinitionId: resourceRoleId
   }
 }
 
@@ -133,14 +40,13 @@ module nodeAccess './cleanup-group-binding.bicep' = if (includeNodeGroup) {
   name: 'node-cleanup-access'
   params: {
     principalId: principalId
-    roleDefinitionId: resourceRole.id
+    roleDefinitionId: resourceRoleId
   }
 }
 
-output resourceRoleId string = resourceRole.id
-output peeringRoleId string = peerRole.id
+output cleanupResourceRoleId string = resourceRoleId
+output peeringRoleId string = networkRoleId
 output verificationAssignmentId string = verificationAccess.outputs.assignmentId
-output groupMetadataRoleId string = groupMetadataRole.id
-output peerMetadataRoleId string = peerMetadataRole.id
+output groupMetadataRoleId string = readerRoleId
 output groupMetadataAssignmentId string = groupMetadataAccess.id
 output nodeAssignmentId string = includeNodeGroup ? nodeAccess!.outputs.assignmentId : ''
