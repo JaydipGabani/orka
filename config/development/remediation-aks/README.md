@@ -333,33 +333,48 @@ Cleanup bootstrap, cleanup-access grants and registry-pull grants each run
 **Provider-level validation immediately before create**, with the same compiled
 template and parameter hashes. Static Bicep compilation is not RP validation.
 
-### Bounded runtime-environment tag failure recovery
+### Bounded zero-tag child recovery
 
-The Automation RP rejects more than **three** runtime-environment tags, even
-though its published schema does not encode that limit. The runtime and runbook
-therefore carry only `orka-owner`, `orka-deployment`, and `orka-cleanup-receipt`;
-the Automation account and both groups keep the full seven-tag ownership/source/
-clock set. Three tags on the runbook are a conservative choice, not a claim that
-its RP limit is three. Azure documents a 15-tag Automation-account limit.
+The live Automation RP rejected both seven runtime-environment tags and a
+20-character tag key, despite successful Provider validation. Rather than guess
+further count/key/value limits, **runtime and runbook tags are omitted entirely**
+in both normal bootstrap and recovery. Their authority never depended on child
+tags: the exact parent-account/group IDs, principal and full seven-tag
+ownership/source/clock sets remain guarded. Optional child descriptions are
+omitted because no readback contract uses them; runtime, logging and publication
+settings remain explicit.
 
-Only the specific pre-clock failure with an empty owned verification group,
-the exact owned cleanup account, no runtime/runbook/schedules, and **zero**
-cleanup-identity role assignments has a code-supported recovery:
+Provider validation is still mandatory but **is not proof of RP acceptance**.
+The preview accepts only absent tags or `{}`, never any tagged child or
+unexpected child property. Compiled JSON tests assert zero encoded tag count,
+keys and values, including regressions for both previously rejected forms.
+
+Only the two specifically recorded pre-clock failures with an empty owned
+verification group, the exact owned cleanup account, no runtime/runbook/schedules,
+and **zero** cleanup-identity role assignments have a code-supported next proposal:
 
 ```bash
 # Read-only, new private directory; the previous bundle and receipt stay immutable.
 python3 "$APPLY" plan-recovery --subscription "$APPROVED_SUBSCRIPTION" \
   --control-vnet-id "$CONTROL_VNET_ID" --control-aks-id "$CONTROL_AKS_ID" \
-  --previous-work-dir "$FAILED_PRIVATE_BUNDLE_DIR" --work-dir "$RECOVERY_BUNDLE_DIR"
+  --previous-work-dir "$ORIGINAL_FAILED_BUNDLE_DIR" \
+  --failed-recovery-work-dir "$FAILED_THREE_TAG_RECOVERY_DIR" \
+  --work-dir "$RECOVERY_BUNDLE_DIR"
 # STOP: obtain explicit user recovery approval and independent review of both hashes.
 python3 "$APPLY" recover-bootstrap ... \
   --reviewed-source-sha256 "$RECOVERY_SOURCE_DIGEST" \
   --approved-recovery-sha256 "$APPROVED_RECOVERY_LINK_DIGEST"
 ```
 
-The recovery link pins the prior bundle/receipt hashes, original principal and
-ownership proof. It rechecks the exact live tag-limit failure and allows only
-creation of the two missing children. The child-only recovery template never
+The recovery link pins **both** failed bundles/receipts, the failed recovery's
+approved link and exact deployment identity, original principal, and ownership
+proof. It rechecks the original tag-count failure and the subsequent exact
+runtime tag-key-length failure and allows only creation of the two missing
+children. This is not a recursive recovery path for arbitrary later failures.
+Its separate `bounded-cleanup-zero-tags` deployment name preserves the failed
+three-tag deployment record; the plan refuses an already-attempted zero-tag
+deployment rather than replaying it.
+The child-only recovery template never
 PUTs the existing Automation account: replaying account creation produces
 ambiguous what-if deletions for provider-added encryption/runtime defaults.
 An `Ignore` entry for that exact already-owned account is allowed; Modify,
@@ -370,8 +385,8 @@ read back unchanged otherwise. The existing Automation account is entirely
 untouched and retains all seven original tags, including its original source
 digest. It rejects all other adoption or scope changes. All original owner/
 receipt tags, group/account IDs and system identity remain unchanged.
-It writes a **new** intent receipt linking the original failure;
-it never edits the failed receipt or disables `bootstrap`'s fresh-state guard.
+It writes a **new** intent receipt linking both failures; it never edits either
+failed receipt or disables `bootstrap`'s fresh-state guard.
 Recovery completes only the cleanup bootstrap/preflight, not arming or compute.
 The command's existence does not authorize executing it.
 

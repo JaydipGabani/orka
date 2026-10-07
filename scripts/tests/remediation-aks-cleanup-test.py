@@ -295,9 +295,12 @@ class RecoveryPlanTests(unittest.TestCase):
                      "orka-budget-start-utc": "pending", "orka-expires-at-utc": "pending"}
         changes = []
         for child in ("runtimeEnvironments/PowerShell74", "runbooks/ExactFoundationCleanup"):
+            properties = ({"runtime": {"language": "PowerShell", "version": "7.4"}, "defaultPackages": {}}
+                          if child.startswith("runtime") else {
+                              "runbookType": "PowerShell", "runtimeEnvironment": "PowerShell74",
+                              "logVerbose": False, "logProgress": False, "logActivityTrace": 0, "draft": {}})
             changes.append({"resourceId": scope["automationAccountId"] + "/" + child, "changeType": "Create",
-                            "after": {"tags": {k: self.tags[k] for k in
-                                              ("orka-owner", "orka-deployment", "orka-cleanup-receipt")}}})
+                            "after": {"properties": properties}})
         self.preview = {"status": "Succeeded", "changes": changes}
 
     def test_only_two_missing_owned_children_are_allowed_in_recovery_deployment(self):
@@ -310,7 +313,7 @@ class RecoveryPlanTests(unittest.TestCase):
         for mutation in ("owner", "recreate", "foreign", "identity"):
             preview = copy.deepcopy(self.preview)
             if mutation == "owner":
-                preview["changes"][0]["after"]["tags"].pop("orka-owner")
+                preview["changes"][0]["after"]["tags"] = {"orka-owner": "unexpected-child-tag"}
             elif mutation == "recreate":
                 preview["changes"][0]["resourceId"] = self.previous["scope"]["automationAccountId"]
             elif mutation == "foreign":
@@ -318,6 +321,28 @@ class RecoveryPlanTests(unittest.TestCase):
             else:
                 preview["changes"][0]["changeType"] = "Modify"
             with self.subTest(mutation=mutation), self.assertRaises(apply.Failure):
+                apply.validate_recovery_preview(preview, self.previous, self.current)
+
+    def test_zero_tag_preview_rejects_any_count_key_or_value_instead_of_guessing_limits(self):
+        for tags in ({}, {"r": "x"}, {"k" * 16: "v"}, {"k" * 17: "v"}, {"r": "v" * 1024},
+                     {str(i): "v" for i in range(3)}, {str(i): "v" for i in range(4)}, None):
+            preview = copy.deepcopy(self.preview)
+            preview["changes"][0]["after"]["tags"] = tags
+            with self.subTest(tags=tags):
+                if tags == {}:
+                    apply.validate_recovery_preview(preview, self.previous, self.current)
+                else:
+                    with self.assertRaisesRegex(apply.Failure, "child-tags-forbidden"):
+                        apply.validate_recovery_preview(preview, self.previous, self.current)
+
+    def test_recovery_preview_rejects_unexpected_child_properties(self):
+        for index, key, value in ((0, "description", "not in reviewed template"),
+                                  (0, "defaultPackages", {"Az": "1.0"}),
+                                  (1, "publishContentLink", {"uri": "https://example.invalid/"}),
+                                  (1, "logVerbose", True), (1, "runtimeEnvironment", "other")):
+            preview = copy.deepcopy(self.preview)
+            preview["changes"][index]["after"]["properties"][key] = value
+            with self.subTest(key=key), self.assertRaises(apply.Failure):
                 apply.validate_recovery_preview(preview, self.previous, self.current)
 
     def test_previous_failed_receipt_is_linked_read_only_and_not_generically_adopted(self):
@@ -362,10 +387,12 @@ class RecoveryPlanTests(unittest.TestCase):
         apply.write_json(previous_dir / "compute-inputs.json", {"sourceDigest": "a" * 64})
         apply.write_json(next_dir / "compute-inputs.json", {"sourceDigest": "b" * 64})
         proof = {"principalId": "33333333-3333-3333-3333-333333333333", "expectedTags": self.tags}
-        link = {"kind": "automation-runtime-three-tag-recovery", "previousWorkDir": str(previous_dir),
+        failed = {"workDir": str(self.directory / "failed-recovery"), "receiptSha256": "e" * 64}
+        link = {"kind": "automation-child-zero-tag-recovery", "previousWorkDir": str(previous_dir),
                 "previousBundleSha256": apply.sha((previous_dir / "bundle.json").read_bytes()),
                 "previousReceiptSha256": apply.sha((previous_dir / "receipt.json").read_bytes()),
-                "previousSourceDigest": "a" * 64, "nextSourceDigest": "b" * 64, "partialProof": proof}
+                "previousSourceDigest": "a" * 64, "nextSourceDigest": "b" * 64, "partialProof": proof,
+                "failedRecovery": failed}
         digest = apply.sha(apply.wire(link))
         apply.write_json(next_dir / "recovery-link.json", {"plan": link, "sha256": digest})
         azure = mock.Mock(work=next_dir)
@@ -373,6 +400,7 @@ class RecoveryPlanTests(unittest.TestCase):
             "id": identity, "tags": {**self.tags, "orka-source-digest": "b" * 64}}
         with mock.patch.object(apply, "previous_recovery_inputs", return_value=(previous_dir, self.previous)), \
                 mock.patch.object(apply, "partial_bootstrap_proof", return_value=proof), \
+                mock.patch.object(apply, "failed_recovery_proof", return_value=failed), \
                 mock.patch.object(apply, "validate_recovery_preview"), \
                 mock.patch.object(apply, "finish_bootstrap"):
             apply.recover_bootstrap(azure, self.current, {}, SimpleNamespace(approved_recovery_sha256=digest))
@@ -381,6 +409,92 @@ class RecoveryPlanTests(unittest.TestCase):
                                self.previous["scope"]["cleanupResourceGroupId"]])
         self.assertNotIn(self.previous["scope"]["automationAccountId"], ids)
         self.assertEqual(self.tags["orka-source-digest"], "a" * 64)
+        self.assertEqual(azure.deploy.call_args_list[-1].args[0], "bounded-cleanup-zero-tags")
+
+    def failed_chain_fixture(self):
+        previous_dir = self.directory / "original"
+        failed_dir = self.directory / "failed"
+        previous_dir.mkdir()
+        failed_dir.mkdir()
+        self.previous.update({"tenantId": "44444444-4444-4444-4444-444444444444", "roleGuids": {},
+                              "controlKubeletIdentity": {}, "publicKeyReady": True,
+                              "computeInputsSha256": apply.sha(b"{}"), "compiledHashes": {}})
+        apply.write_json(previous_dir / "bundle.json", self.previous)
+        apply.write_json(previous_dir / "receipt.json", {
+            "phase": "bootstrap-intent", "subscriptionId": self.previous["subscriptionId"],
+            "cleanupReceipt": self.previous["cleanupReceipt"], "sourceDigest": self.previous["sourceDigest"]})
+        (failed_dir / "compute-inputs.json").write_text("{}")
+        failed = {**self.previous, "sourceDigest": "b" * 64}
+        apply.write_json(failed_dir / "bundle.json", failed)
+        partial = {"principalId": "33333333-3333-3333-3333-333333333333", "expectedTags": self.tags}
+        link = {"kind": "automation-runtime-three-tag-recovery", "previousSourceDigest": "a" * 64,
+                "nextSourceDigest": "b" * 64, "partialProof": partial,
+                "previousBundleSha256": apply.sha((previous_dir / "bundle.json").read_bytes()),
+                "previousReceiptSha256": apply.sha((previous_dir / "receipt.json").read_bytes())}
+        apply.write_json(failed_dir / "recovery-link.json", {"plan": link, "sha256": apply.sha(apply.wire(link))})
+        receipt = {"phase": "recovery-intent", "subscriptionId": self.previous["subscriptionId"],
+                   "cleanupReceipt": self.previous["cleanupReceipt"], "sourceDigest": "b" * 64,
+                   "principalId": partial["principalId"], "recoveryOf": {
+                       "sourceDigest": "a" * 64, "receiptSha256": link["previousReceiptSha256"],
+                       "recoveryLinkSha256": apply.sha(apply.wire(link))}}
+        apply.write_json(failed_dir / "receipt.json", receipt)
+        deployment_id = self.previous["scope"]["cleanupResourceGroupId"] + \
+            "/providers/Microsoft.Resources/deployments/bounded-cleanup-recovery"
+        operation = {"provisioningState": "Failed", "targetResource": {
+            "id": self.previous["scope"]["automationAccountId"] + "/runtimeEnvironments/PowerShell74"},
+            "statusMessage": {"error": {"code": "BadRequest", "message":
+                "Argument RuntimeEnvironmentTags.Key.Length with value 20 cannot be greater than 16."}}}
+        azure = mock.Mock()
+        azure.get.return_value = {"id": deployment_id, "properties": {"provisioningState": "Failed"}}
+        azure.cli.return_value = [operation]
+        azure.cli.side_effect = lambda *args: [] if args[:3] == ("deployment", "group", "list") else azure.cli.return_value
+        args = SimpleNamespace(work_dir=str(self.directory / "next"))
+        return previous_dir, failed_dir, partial, args, azure
+
+    def test_failed_recovery_link_pins_both_receipts_and_exact_live_failure(self):
+        original, failed, partial, args, azure = self.failed_chain_fixture()
+        before = {(p, name): (p / name).read_bytes() for p in (original, failed)
+                  for name in ("bundle.json", "receipt.json")}
+        with mock.patch.object(apply.plan, "private_path", side_effect=Path):
+            proof = apply.failed_recovery_proof(str(failed), args, original, self.previous, partial, azure)
+            self.assertEqual(proof["receiptSha256"], apply.sha((failed / "receipt.json").read_bytes()))
+            self.assertEqual(proof["sourceDigest"], "b" * 64)
+            for (path, name), contents in before.items():
+                self.assertEqual((path / name).read_bytes(), contents)
+            receipt = json.loads((failed / "receipt.json").read_text())
+            receipt["principalId"] = "55555555-5555-5555-5555-555555555555"
+            apply.write_json(failed / "receipt.json", receipt)
+            with self.assertRaisesRegex(apply.Failure, "unsupported-failed-recovery-receipt"):
+                apply.failed_recovery_proof(str(failed), args, original, self.previous, partial, azure)
+        azure.rest.assert_not_called()
+
+    def test_failed_recovery_link_rejects_any_different_platform_failure_or_deployment(self):
+        original, failed, partial, args, azure = self.failed_chain_fixture()
+        with mock.patch.object(apply.plan, "private_path", side_effect=Path):
+            azure.cli.return_value[0]["statusMessage"]["error"]["message"] = "some other failure"
+            with self.assertRaisesRegex(apply.Failure, "exact-tag-key-limit-failure"):
+                apply.failed_recovery_proof(str(failed), args, original, self.previous, partial, azure)
+            azure.get.return_value["id"] += "-different"
+            with self.assertRaisesRegex(apply.Failure, "deployment-mismatch"):
+                apply.failed_recovery_proof(str(failed), args, original, self.previous, partial, azure)
+
+    def test_zero_tag_recovery_is_not_a_generic_recursive_adoption_path(self):
+        original, failed, partial, args, azure = self.failed_chain_fixture()
+        record = json.loads((failed / "recovery-link.json").read_text())
+        record["plan"]["kind"] = "automation-child-zero-tag-recovery"
+        record["sha256"] = apply.sha(apply.wire(record["plan"]))
+        apply.write_json(failed / "recovery-link.json", record)
+        with mock.patch.object(apply.plan, "private_path", side_effect=Path), \
+                self.assertRaisesRegex(apply.Failure, "only-known-three-tag-recovery"):
+            apply.failed_recovery_proof(str(failed), args, original, self.previous, partial, azure)
+        self.assertFalse(azure.mock_calls)
+
+    def test_zero_tag_recovery_cannot_replay_an_existing_zero_tag_attempt(self):
+        original, failed, partial, args, azure = self.failed_chain_fixture()
+        azure.cli.side_effect = None
+        with mock.patch.object(apply.plan, "private_path", side_effect=Path), \
+                self.assertRaisesRegex(apply.Failure, "zero-tag-recovery-already-attempted"):
+            apply.failed_recovery_proof(str(failed), args, original, self.previous, partial, azure)
 
 
 class NewTemplateTests(unittest.TestCase):
@@ -402,13 +516,15 @@ class NewTemplateTests(unittest.TestCase):
         self.assertTrue(account["properties"]["disableLocalAuth"])
         self.assertFalse(account["properties"]["publicNetworkAccess"])
         self.assertFalse(any("schedules" in r["type"].lower() for r in resources))
-        child_tags = nested["properties"]["template"]["variables"]["childOwnershipTags"]
-        self.assertEqual(len(child_tags), 3)
-        self.assertEqual(set(child_tags), {"orka-owner", "orka-deployment", "orka-cleanup-receipt"})
         self.assertEqual(account["tags"], "[parameters('ownershipTags')]")
         for resource in resources:
             if resource["type"] != "Microsoft.Automation/automationAccounts":
-                self.assertEqual(resource["tags"], "[variables('childOwnershipTags')]")
+                self.assertNotIn("tags", resource)
+                self.assertNotIn("description", resource["properties"])
+                encoded = json.dumps(resource, sort_keys=True).encode()
+                self.assertNotIn(b'"tags"', encoded)
+                self.assertEqual(len(resource.get("tags", {})), 0)
+                self.assertEqual(json.dumps(resource.get("tags", {}), separators=(",", ":")).encode(), b"{}")
         for group in groups:
             self.assertEqual(group["tags"], "[variables('tags')]")
         self.assertEqual(len(template["variables"]["tags"]), 7)
@@ -444,8 +560,11 @@ class NewTemplateTests(unittest.TestCase):
             self.assertIn(resource["type"], ("Microsoft.Automation/automationAccounts/runbooks",
                                              "Microsoft.Automation/automationAccounts/runtimeEnvironments"))
             self.assertEqual(resource["properties"], original[resource["type"]]["properties"])
-            self.assertEqual(resource["tags"], "[variables('childOwnershipTags')]")
-        self.assertEqual(len(recovery["variables"]["childOwnershipTags"]), 3)
+            self.assertNotIn("tags", resource)
+            self.assertNotIn("description", resource["properties"])
+            self.assertNotIn(b'"tags"', json.dumps(resource, sort_keys=True).encode())
+            self.assertEqual(json.dumps(resource.get("tags", {}), separators=(",", ":")).encode(), b"{}")
+        self.assertNotIn("ownershipTags", recovery["parameters"])
 
     def test_registry_assignments_are_pull_only_on_the_single_new_registry(self):
         template = self.compile("registry-pull")

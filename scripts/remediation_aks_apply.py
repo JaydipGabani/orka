@@ -346,6 +346,77 @@ def previous_recovery_inputs(path, args):
     return previous_work, previous
 
 
+def failed_recovery_proof(path, args, previous_work, previous, partial, azure):
+    failed_work = plan.private_path(path)
+    require(failed_work not in (previous_work, plan.private_path(args.work_dir)) and
+            not any("quarantine" in part.lower() for part in failed_work.parts), "invalid-failed-recovery-workdir")
+    failed = json.loads((failed_work / "bundle.json").read_text())
+    receipt = json.loads((failed_work / "receipt.json").read_text())
+    link = json.loads((failed_work / "recovery-link.json").read_text())
+    require(link["sha256"] == sha(wire(link["plan"])) and
+            link["plan"]["kind"] == "automation-runtime-three-tag-recovery",
+            "only-known-three-tag-recovery-failure-supported")
+    require(all(failed[key] == previous[key] for key in (
+        "subscriptionId", "tenantId", "scope", "owner", "suffix", "cleanupReceipt",
+        "roleGuids", "controlKubeletIdentity", "publicKeyReady")), "failed-recovery-immutable-input-drift")
+    require(link["plan"]["previousBundleSha256"] == sha((previous_work / "bundle.json").read_bytes()) and
+            link["plan"]["previousReceiptSha256"] == sha((previous_work / "receipt.json").read_bytes()) and
+            link["plan"]["previousSourceDigest"] == previous["sourceDigest"] and
+            link["plan"]["nextSourceDigest"] == failed["sourceDigest"], "failed-recovery-origin-link-mismatch")
+    require(link["plan"]["partialProof"] == partial, "failed-recovery-original-ownership-proof-mismatch")
+    require(receipt == {
+        "phase": "recovery-intent", "subscriptionId": previous["subscriptionId"],
+        "cleanupReceipt": previous["cleanupReceipt"], "sourceDigest": failed["sourceDigest"],
+        "principalId": partial["principalId"],
+        "recoveryOf": {"sourceDigest": previous["sourceDigest"],
+                       "receiptSha256": link["plan"]["previousReceiptSha256"],
+                       "recoveryLinkSha256": link["sha256"]},
+    }, "unsupported-failed-recovery-receipt")
+    require(sha((failed_work / "compute-inputs.json").read_bytes()) == failed["computeInputsSha256"],
+            "failed-recovery-compute-input-drift")
+    for name, digest in failed["compiledHashes"].items():
+        require(sha((failed_work / (name + ".arm.json")).read_bytes()) == digest, "failed-recovery-bom-drift")
+    deployment_id = previous["scope"]["cleanupResourceGroupId"] + "/providers/Microsoft.Resources/deployments/bounded-cleanup-recovery"
+    next_deployment_id = previous["scope"]["cleanupResourceGroupId"] + \
+        "/providers/Microsoft.Resources/deployments/bounded-cleanup-zero-tags"
+    zero_attempts = azure.cli("deployment", "group", "list", "--resource-group",
+        previous["scope"]["cleanupResourceGroupId"].split("/")[-1],
+        "--query", "[?name=='bounded-cleanup-zero-tags'].id")
+    require(zero_attempts == [], "zero-tag-recovery-already-attempted")
+    deployment = azure.get(deployment_id, "2024-03-01")
+    require(deployment["id"].lower() == deployment_id.lower() and
+            deployment["properties"]["provisioningState"] == "Failed", "failed-recovery-deployment-mismatch")
+    operations = azure.cli("deployment", "operation", "group", "list", "--resource-group",
+        previous["scope"]["cleanupResourceGroupId"].split("/")[-1], "--name", "bounded-cleanup-recovery",
+        "--query", "[].properties")
+    runtime = previous["scope"]["automationAccountId"] + "/runtimeEnvironments/PowerShell74"
+    require(any(exact_runtime_key_failure(op, runtime) for op in operations),
+            "exact-tag-key-limit-failure-required")
+    return {"workDir": str(failed_work), "sourceDigest": failed["sourceDigest"], "deploymentId": deployment_id,
+            "nextDeploymentId": next_deployment_id,
+            "failure": "RuntimeEnvironmentTagKeyLength20GreaterThan16",
+            "bundleSha256": sha((failed_work / "bundle.json").read_bytes()),
+            "receiptSha256": sha((failed_work / "receipt.json").read_bytes()),
+            "linkFileSha256": sha((failed_work / "recovery-link.json").read_bytes())}
+
+
+def exact_runtime_key_failure(operation, runtime_id):
+    if operation.get("provisioningState") != "Failed" or \
+            (operation.get("targetResource") or {}).get("id", "").lower() != runtime_id.lower():
+        return False
+    status = operation.get("statusMessage")
+    if isinstance(status, str):
+        try:
+            status = json.loads(status)
+        except ValueError:
+            return False
+    if not isinstance(status, dict):
+        return False
+    error = status.get("error", status)
+    return isinstance(error, dict) and error.get("code") == "BadRequest" and error.get("message") == \
+        "Argument RuntimeEnvironmentTags.Key.Length with value 20 cannot be greater than 16."
+
+
 def validate_recovery_preview(preview, previous, bundle):
     require(preview["status"] == "Succeeded", "recovery-provider-preview-failed")
     scope = previous["scope"]
@@ -362,16 +433,30 @@ def validate_recovery_preview(preview, previous, bundle):
                     "recovery-must-not-update-existing-account")
             continue
         require(identity in children and change["changeType"] == "Create", "unexpected-recovery-create")
-        tags = (change.get("after") or {}).get("tags")
-        require(tags == {"orka-owner": previous["owner"], "orka-deployment": "orka-verify-" + previous["suffix"],
-                         "orka-cleanup-receipt": previous["cleanupReceipt"]}, "recovery-child-owner-mismatch")
+        after = change.get("after") or {}
+        require(after.get("tags", {}) == {}, "recovery-child-tags-forbidden")
+        properties = after.get("properties") or {}
+        if identity.endswith("/runtimeenvironments/powershell74"):
+            require(set(properties).issubset({"runtime", "defaultPackages"}) and
+                    properties.get("runtime") == {"language": "PowerShell", "version": "7.4"} and
+                    properties.get("defaultPackages", {}) == {}, "unexpected-recovery-runtime-properties")
+        else:
+            required = {"runbookType": "PowerShell", "runtimeEnvironment": "PowerShell74",
+                        "logVerbose": False, "logProgress": False, "logActivityTrace": 0}
+            # ARM masks the compiled empty draft object in what-if output.
+            require(set(properties) == set(required) | {"draft"} and
+                    all(type(properties[k]) is type(value) and properties[k] == value
+                        for k, value in required.items()) and
+                    properties["draft"] in ({}, "*******"), "unexpected-recovery-runbook-properties")
     require(children.issubset(observed), "recovery-preview-incomplete")
 
 
 def prepare_recovery(args, work, azure):
-    require(args.previous_work_dir and not (work / "bundle.json").exists(), "fresh-linked-recovery-plan-required")
+    require(args.previous_work_dir and args.failed_recovery_work_dir and not (work / "bundle.json").exists(),
+            "both-failed-attempts-and-fresh-recovery-plan-required")
     previous_work, previous = previous_recovery_inputs(args.previous_work_dir, args)
     proof = partial_bootstrap_proof(azure, previous)
+    failed = failed_recovery_proof(args.failed_recovery_work_dir, args, previous_work, previous, proof, azure)
     values = json.loads((previous_work / "compute-inputs.json").read_text())
     hashes = source_hashes()
     values["sourceDigest"] = sha(wire(hashes))
@@ -382,14 +467,14 @@ def prepare_recovery(args, work, azure):
                    "computeInputsSha256": sha((work / "compute-inputs.json").read_bytes())})
     require(source_hashes() == hashes, "source-changed-during-recovery-plan")
     preview = azure.deploy("review-linked-cleanup-recovery", work / "cleanup-recovery.arm.json", {
-        "prefix": "orka-verify-" + bundle["suffix"], "ownershipTags": proof["expectedTags"], "location": "eastus2"},
+        "prefix": "orka-verify-" + bundle["suffix"], "location": "eastus2"},
         group=bundle["scope"]["cleanupResourceGroupId"].split("/")[-1], preview=True, validation="Provider")
     validate_recovery_preview(preview, previous, bundle)
-    link = {"kind": "automation-runtime-three-tag-recovery", "previousWorkDir": str(previous_work),
+    link = {"kind": "automation-child-zero-tag-recovery", "previousWorkDir": str(previous_work),
             "previousBundleSha256": sha((previous_work / "bundle.json").read_bytes()),
             "previousReceiptSha256": sha((previous_work / "receipt.json").read_bytes()),
             "previousSourceDigest": previous["sourceDigest"], "nextSourceDigest": bundle["sourceDigest"],
-            "partialProof": proof}
+            "partialProof": proof, "failedRecovery": failed}
     write_json(work / "bundle.json", bundle)
     write_json(work / "recovery-link.json", {"plan": link, "sha256": sha(wire(link))})
     print("Read-only linked recovery plan staged; separate user approval and independent review are required.")
@@ -639,7 +724,7 @@ def recover_bootstrap(azure, bundle, receipt, args):
     record = json.loads((azure.work / "recovery-link.json").read_text())
     link = record["plan"]
     require(record["sha256"] == sha(wire(link)) == args.approved_recovery_sha256 and
-            link["kind"] == "automation-runtime-three-tag-recovery" and
+            link["kind"] == "automation-child-zero-tag-recovery" and
             link["nextSourceDigest"] == bundle["sourceDigest"], "approved-recovery-link-required")
     previous_work, previous = previous_recovery_inputs(link["previousWorkDir"], args)
     require(sha((previous_work / "bundle.json").read_bytes()) == link["previousBundleSha256"] and
@@ -653,8 +738,10 @@ def recover_bootstrap(azure, bundle, receipt, args):
     old_values["sourceDigest"] = bundle["sourceDigest"]
     require(new_values == old_values, "recovery-may-only-update-source-digest")
     require(partial_bootstrap_proof(azure, previous) == link["partialProof"], "partial-recovery-state-drift")
-    values = {"prefix": "orka-verify-" + bundle["suffix"], "ownershipTags": link["partialProof"]["expectedTags"],
-              "location": "eastus2"}
+    require(failed_recovery_proof(link["failedRecovery"]["workDir"], args, previous_work, previous,
+                                 link["partialProof"], azure) == link["failedRecovery"],
+            "failed-recovery-link-or-platform-proof-drift")
+    values = {"prefix": "orka-verify-" + bundle["suffix"], "location": "eastus2"}
     cleanup_group = bundle["scope"]["cleanupResourceGroupId"].split("/")[-1]
     preview = azure.deploy("apply-linked-cleanup-recovery", azure.work / "cleanup-recovery.arm.json", values,
                            group=cleanup_group, preview=True, validation="Provider")
@@ -664,9 +751,10 @@ def recover_bootstrap(azure, bundle, receipt, args):
                     "principalId": link["partialProof"]["principalId"],
                     "recoveryOf": {"sourceDigest": previous["sourceDigest"],
                                    "receiptSha256": link["previousReceiptSha256"],
-                                   "recoveryLinkSha256": record["sha256"]}})
+                                   "recoveryLinkSha256": record["sha256"],
+                                   "failedRecovery": link["failedRecovery"]}})
     save_receipt(azure.work, receipt)
-    azure.deploy("bounded-cleanup-recovery", azure.work / "cleanup-recovery.arm.json", values,
+    azure.deploy("bounded-cleanup-zero-tags", azure.work / "cleanup-recovery.arm.json", values,
                  group=cleanup_group, provider_validate=True)
     for key in ("verificationResourceGroupId", "cleanupResourceGroupId"):
         identity = bundle["scope"][key]
@@ -986,6 +1074,7 @@ def parser():
     p.add_argument("--public-key-file")
     p.add_argument("--reviewed-source-sha256")
     p.add_argument("--previous-work-dir")
+    p.add_argument("--failed-recovery-work-dir")
     p.add_argument("--approved-recovery-sha256")
     return p
 
