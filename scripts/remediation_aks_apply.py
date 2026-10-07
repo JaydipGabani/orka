@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
+from urllib.parse import urlencode
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +26,7 @@ require = plan.require
 Failure = plan.Failure
 AUTO_API = "2024-10-23"
 ARM = "https://management.azure.com"
-NEW_TEMPLATES = ("cleanup", "cleanup-access", "peering", "dns-link", "registry-pull")
+NEW_TEMPLATES = ("cleanup", "cleanup-access", "cleanup-recovery", "peering", "dns-link", "registry-pull")
 REQUIRED_ACTIONS = {
     "Microsoft.Resources/subscriptions/resourceGroups/read",
     "Microsoft.Resources/subscriptions/resourceGroups/delete",
@@ -186,7 +187,7 @@ class Azure:
         return self.rest("GET", identity, version, absent=absent)
 
     def deploy(self, name, template, values, group=None, preview=False, validation="Template",
-               expected_parameters=None, expected_template=None):
+               expected_parameters=None, expected_template=None, provider_validate=False):
         parameters = self.work / (name + ".parameters.json")
         write_json(parameters, arm_parameters(values))
         if expected_parameters is not None:
@@ -196,6 +197,20 @@ class Azure:
         arguments = ["deployment", "group" if group else "sub", "what-if" if preview else "create",
                      "--name", name, "--template-file", str(template), "--parameters", "@" + str(parameters)]
         arguments += ["--resource-group", group] if group else ["--location", "eastus2"]
+        if provider_validate:
+            require(not preview, "provider-create-validation-requires-create")
+            validation_arguments = arguments.copy()
+            validation_arguments[2] = "validate"
+            checked_parameters = sha(parameters.read_bytes())
+            checked_template = sha(Path(template).read_bytes())
+            checked = self.cli(*validation_arguments, "--validation-level", "Provider", timeout=900)
+            write_json(self.work / (name + ".provider-validation.json"), redacted(checked))
+            require(not checked.get("error") and
+                    checked.get("properties", {}).get("provisioningState") == "Succeeded",
+                    "provider-validation-required-before-create")
+            require(sha(parameters.read_bytes()) == checked_parameters and
+                    sha(Path(template).read_bytes()) == checked_template,
+                    "provider-validated-create-input-drift")
         if preview:
             arguments += ["--validation-level", validation, "--no-pretty-print"]
         result = self.cli(*arguments, timeout=3600)
@@ -254,7 +269,8 @@ def prepare(args, work, azure):
     bootstrap = {"suffix": bundle["suffix"], "owner": bundle["owner"], "cleanupReceipt": receipt,
                  "sourceDigest": bundle["sourceDigest"], "location": "eastus2"}
     write_json(work / "bundle.json", bundle)
-    preview = azure.deploy("review-cleanup-bootstrap", work / "cleanup.arm.json", bootstrap, preview=True)
+    preview = azure.deploy("review-cleanup-bootstrap", work / "cleanup.arm.json", bootstrap,
+                           preview=True, validation="Provider")
     require(preview["status"] == "Succeeded", "cleanup-preview-failed")
     allowed = [scope["verificationResourceGroupId"].lower(), scope["cleanupResourceGroupId"].lower()]
     for change in preview["changes"]:
@@ -262,6 +278,121 @@ def prepare(args, work, azure):
         require(change["changeType"] == "Create" and any(rid == p or rid.startswith(p + "/") for p in allowed),
                 "unexpected-bootstrap-preview")
     print("Review bundle compiled; no Azure mutation. Independent review is required before bootstrap.")
+
+
+def partial_bootstrap_proof(azure, previous):
+    scope = previous["scope"]
+    expected_tags = {
+        "orka-purpose": "isolated-remediation-verification", "orka-owner": previous["owner"],
+        "orka-deployment": "orka-verify-" + previous["suffix"], "orka-cleanup-receipt": previous["cleanupReceipt"],
+        "orka-source-digest": previous["sourceDigest"],
+        "orka-budget-start-utc": "pending", "orka-expires-at-utc": "pending",
+    }
+    for key in ("verificationResourceGroupId", "cleanupResourceGroupId", "automationAccountId"):
+        resource = azure.get(scope[key], AUTO_API if key == "automationAccountId" else "2024-03-01")
+        owned(resource, scope, previous["owner"], previous["cleanupReceipt"], scope[key])
+        require(resource["tags"] == expected_tags, "partial-bootstrap-ownership-tag-drift")
+        if key == "automationAccountId":
+            require(resource["properties"]["state"] == "Ok" and
+                    resource["properties"]["disableLocalAuth"] is True and
+                    resource["properties"]["publicNetworkAccess"] is False,
+                    "partial-automation-account-boundary-drift")
+    principal = account_identity(azure, previous, {})
+    resources = azure.cli("resource", "list", "--resource-group", scope["cleanupResourceGroupId"].split("/")[-1])
+    require({r["id"].lower() for r in resources} == {scope["automationAccountId"].lower()},
+            "unexpected-partial-cleanup-resources")
+    require(not azure.cli("resource", "list", "--resource-group",
+                         scope["verificationResourceGroupId"].split("/")[-1]),
+            "partial-verification-group-not-empty")
+    require(azure.cli("group", "exists", "--name", scope["managedNodeResourceGroupId"].split("/")[-1]) is False,
+            "partial-node-group-already-exists")
+    for child in ("runtimeEnvironments/PowerShell74", "runbooks/ExactFoundationCleanup",
+                  "schedules/PrimaryCleanup", "schedules/CatchupCleanup"):
+        require(azure.get(scope["automationAccountId"] + "/" + child, AUTO_API, absent=True) is None,
+                "unexpected-partial-cleanup-child")
+    for guid in previous["roleGuids"].values():
+        identity = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/{guid}"
+        require(azure.get(identity, "2022-04-01", absent=True) is None, "partial-role-definition-already-exists")
+    query = urlencode({"api-version": "2022-04-01", "$filter": f"principalId eq '{principal}'"})
+    assignments = azure.cli("rest", "--method", "GET", "--url",
+        f"{ARM}/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Authorization/roleAssignments?{query}")
+    require(not assignments.get("nextLink") and assignments.get("value") == [],
+            "partial-cleanup-identity-already-has-authority")
+    operations = azure.cli("deployment", "operation", "group", "list", "--resource-group",
+        scope["cleanupResourceGroupId"].split("/")[-1], "--name", "bounded-cleanup-service",
+        "--query", "[].properties.statusMessage")
+    require("RuntimeEnvironmentTags with value 7 cannot be greater than 3" in json.dumps(operations),
+            "unsupported-partial-bootstrap-failure")
+    return {"principalId": principal, "expectedTags": expected_tags, "scope": scope,
+            "failure": "RuntimeEnvironmentTags7GreaterThan3", "authoringRoleAssignments": 0}
+
+
+def previous_recovery_inputs(path, args):
+    previous_work = plan.private_path(path)
+    require(previous_work != plan.private_path(args.work_dir) and
+            not any("quarantine" in part.lower() for part in previous_work.parts), "invalid-prior-recovery-workdir")
+    previous = json.loads((previous_work / "bundle.json").read_text())
+    receipt = json.loads((previous_work / "receipt.json").read_text())
+    require(previous["subscriptionId"] == args.subscription and previous["scope"] ==
+            plan.targets(args.subscription, previous["suffix"], args.control_vnet_id, args.control_aks_id),
+            "prior-recovery-scope-mismatch")
+    require(receipt == {"phase": "bootstrap-intent", "subscriptionId": args.subscription,
+                       "cleanupReceipt": previous["cleanupReceipt"], "sourceDigest": previous["sourceDigest"]},
+            "unsupported-prior-receipt-phase")
+    require(sha((previous_work / "compute-inputs.json").read_bytes()) == previous["computeInputsSha256"],
+            "prior-recovery-input-drift")
+    for name, digest in previous["compiledHashes"].items():
+        require(sha((previous_work / (name + ".arm.json")).read_bytes()) == digest, "prior-compiled-input-drift")
+    return previous_work, previous
+
+
+def validate_recovery_preview(preview, previous, bundle):
+    require(preview["status"] == "Succeeded", "recovery-provider-preview-failed")
+    scope = previous["scope"]
+    require(bundle["scope"] == scope, "recovery-scope-must-be-preserved")
+    children = {scope["automationAccountId"].lower() + "/" + name.lower() for name in
+                ("runtimeEnvironments/PowerShell74", "runbooks/ExactFoundationCleanup")}
+    observed = set()
+    for change in preview["changes"]:
+        identity = change["resourceId"].lower()
+        require(identity not in observed, "duplicate-recovery-preview-resource")
+        observed.add(identity)
+        if identity == scope["automationAccountId"].lower():
+            require(change["changeType"] == "Ignore" and not change.get("delta"),
+                    "recovery-must-not-update-existing-account")
+            continue
+        require(identity in children and change["changeType"] == "Create", "unexpected-recovery-create")
+        tags = (change.get("after") or {}).get("tags")
+        require(tags == {"orka-owner": previous["owner"], "orka-deployment": "orka-verify-" + previous["suffix"],
+                         "orka-cleanup-receipt": previous["cleanupReceipt"]}, "recovery-child-owner-mismatch")
+    require(children.issubset(observed), "recovery-preview-incomplete")
+
+
+def prepare_recovery(args, work, azure):
+    require(args.previous_work_dir and not (work / "bundle.json").exists(), "fresh-linked-recovery-plan-required")
+    previous_work, previous = previous_recovery_inputs(args.previous_work_dir, args)
+    proof = partial_bootstrap_proof(azure, previous)
+    values = json.loads((previous_work / "compute-inputs.json").read_text())
+    hashes = source_hashes()
+    values["sourceDigest"] = sha(wire(hashes))
+    write_json(work / "compute-inputs.json", values)
+    bundle = dict(previous)
+    bundle.update({"sourceHashes": hashes, "sourceDigest": values["sourceDigest"],
+                   "compiledHashes": compile_templates(work),
+                   "computeInputsSha256": sha((work / "compute-inputs.json").read_bytes())})
+    require(source_hashes() == hashes, "source-changed-during-recovery-plan")
+    preview = azure.deploy("review-linked-cleanup-recovery", work / "cleanup-recovery.arm.json", {
+        "prefix": "orka-verify-" + bundle["suffix"], "ownershipTags": proof["expectedTags"], "location": "eastus2"},
+        group=bundle["scope"]["cleanupResourceGroupId"].split("/")[-1], preview=True, validation="Provider")
+    validate_recovery_preview(preview, previous, bundle)
+    link = {"kind": "automation-runtime-three-tag-recovery", "previousWorkDir": str(previous_work),
+            "previousBundleSha256": sha((previous_work / "bundle.json").read_bytes()),
+            "previousReceiptSha256": sha((previous_work / "receipt.json").read_bytes()),
+            "previousSourceDigest": previous["sourceDigest"], "nextSourceDigest": bundle["sourceDigest"],
+            "partialProof": proof}
+    write_json(work / "bundle.json", bundle)
+    write_json(work / "recovery-link.json", {"plan": link, "sha256": sha(wire(link))})
+    print("Read-only linked recovery plan staged; separate user approval and independent review are required.")
 
 
 def load_bundle(args, work):
@@ -303,7 +434,8 @@ def access(azure, bundle, receipt, node=False, peer=False):
               "groupMetadataRoleGuid": bundle["roleGuids"]["group-metadata-read"],
               "peerMetadataRoleGuid": bundle["roleGuids"]["peering-metadata-read"],
               "controlResourceGroup": control[4], "includeNodeGroup": node}
-    deployed = azure.deploy("bounded-cleanup-access", azure.work / "cleanup-access.arm.json", values)
+    deployed = azure.deploy("bounded-cleanup-access", azure.work / "cleanup-access.arm.json", values,
+                            provider_validate=True)
     outputs = deployed["properties"]["outputs"]
     assignments = receipt.setdefault("cleanupAssignments", {})
     for key, output in (("verification", "verificationAssignmentId"), ("groupsRead", "groupMetadataAssignmentId"),
@@ -404,7 +536,7 @@ def registry_pulls(azure, bundle, receipt, aks):
     result = azure.deploy("isolated-registry-pulls", azure.work / "registry-pull.arm.json", {
         "registryName": registry["name"], "controlKubeletObjectId": control["objectId"],
         "verificationKubeletObjectId": verification["objectId"]},
-        group=scope["verificationResourceGroupId"].split("/")[-1])
+        group=scope["verificationResourceGroupId"].split("/")[-1], provider_validate=True)
     assignments = {}
     role = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE}"
     for name, principal in (("control", control["objectId"]), ("verification", verification["objectId"])):
@@ -475,7 +607,12 @@ def bootstrap(azure, bundle, receipt):
         azure.cli("provider", "register", "--namespace", "Microsoft.Automation", "--wait")
     values = {"suffix": bundle["suffix"], "owner": bundle["owner"], "cleanupReceipt": bundle["cleanupReceipt"],
               "sourceDigest": bundle["sourceDigest"], "location": "eastus2"}
-    azure.deploy("bounded-cleanup-bootstrap", azure.work / "cleanup.arm.json", values)
+    azure.deploy("bounded-cleanup-bootstrap", azure.work / "cleanup.arm.json", values, provider_validate=True)
+    finish_bootstrap(azure, bundle, receipt)
+
+
+def finish_bootstrap(azure, bundle, receipt):
+    scope = bundle["scope"]
     receipt["principalId"] = account_identity(azure, bundle, receipt)
     save_receipt(azure.work, receipt)
     access(azure, bundle, receipt)
@@ -495,6 +632,51 @@ def bootstrap(azure, bundle, receipt):
     preflight_job(azure, bundle, receipt)
     receipt["phase"] = "bootstrap-ready"
     save_receipt(azure.work, receipt)
+
+
+def recover_bootstrap(azure, bundle, receipt, args):
+    require(not receipt and args.approved_recovery_sha256, "explicit-new-recovery-receipt-required")
+    record = json.loads((azure.work / "recovery-link.json").read_text())
+    link = record["plan"]
+    require(record["sha256"] == sha(wire(link)) == args.approved_recovery_sha256 and
+            link["kind"] == "automation-runtime-three-tag-recovery" and
+            link["nextSourceDigest"] == bundle["sourceDigest"], "approved-recovery-link-required")
+    previous_work, previous = previous_recovery_inputs(link["previousWorkDir"], args)
+    require(sha((previous_work / "bundle.json").read_bytes()) == link["previousBundleSha256"] and
+            sha((previous_work / "receipt.json").read_bytes()) == link["previousReceiptSha256"] and
+            previous["sourceDigest"] == link["previousSourceDigest"], "prior-recovery-receipt-drift")
+    require(all(bundle[key] == previous[key] for key in (
+        "subscriptionId", "tenantId", "scope", "owner", "suffix", "cleanupReceipt",
+        "roleGuids", "controlKubeletIdentity", "publicKeyReady")), "recovery-immutable-input-drift")
+    old_values = json.loads((previous_work / "compute-inputs.json").read_text())
+    new_values = json.loads((azure.work / "compute-inputs.json").read_text())
+    old_values["sourceDigest"] = bundle["sourceDigest"]
+    require(new_values == old_values, "recovery-may-only-update-source-digest")
+    require(partial_bootstrap_proof(azure, previous) == link["partialProof"], "partial-recovery-state-drift")
+    values = {"prefix": "orka-verify-" + bundle["suffix"], "ownershipTags": link["partialProof"]["expectedTags"],
+              "location": "eastus2"}
+    cleanup_group = bundle["scope"]["cleanupResourceGroupId"].split("/")[-1]
+    preview = azure.deploy("apply-linked-cleanup-recovery", azure.work / "cleanup-recovery.arm.json", values,
+                           group=cleanup_group, preview=True, validation="Provider")
+    validate_recovery_preview(preview, previous, bundle)
+    receipt.update({"phase": "recovery-intent", "subscriptionId": bundle["subscriptionId"],
+                    "cleanupReceipt": bundle["cleanupReceipt"], "sourceDigest": bundle["sourceDigest"],
+                    "principalId": link["partialProof"]["principalId"],
+                    "recoveryOf": {"sourceDigest": previous["sourceDigest"],
+                                   "receiptSha256": link["previousReceiptSha256"],
+                                   "recoveryLinkSha256": record["sha256"]}})
+    save_receipt(azure.work, receipt)
+    azure.deploy("bounded-cleanup-recovery", azure.work / "cleanup-recovery.arm.json", values,
+                 group=cleanup_group, provider_validate=True)
+    for key in ("verificationResourceGroupId", "cleanupResourceGroupId"):
+        identity = bundle["scope"][key]
+        azure.cli("tag", "update", "--resource-id", identity, "--operation", "Merge",
+                  "--tags", "orka-source-digest=" + bundle["sourceDigest"])
+        actual = azure.get(identity, "2024-03-01")
+        owned(actual, bundle["scope"], bundle["owner"], bundle["cleanupReceipt"], identity)
+        require(actual["tags"] == {**link["partialProof"]["expectedTags"],
+                                  "orka-source-digest": bundle["sourceDigest"]}, "recovery-tag-merge-drift")
+    finish_bootstrap(azure, bundle, receipt)
 
 
 def schedules(azure, bundle, receipt, create=False):
@@ -794,7 +976,8 @@ def retire(azure, bundle, receipt):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("operation", choices=("plan", "bootstrap", "arm", "compute", "connect", "retire"))
+    p.add_argument("operation", choices=("plan", "plan-recovery", "bootstrap", "recover-bootstrap",
+                                        "arm", "compute", "connect", "retire"))
     p.add_argument("--subscription", required=True)
     p.add_argument("--control-vnet-id", required=True)
     p.add_argument("--control-aks-id", required=True)
@@ -802,6 +985,8 @@ def parser():
     p.add_argument("--parameters")
     p.add_argument("--public-key-file")
     p.add_argument("--reviewed-source-sha256")
+    p.add_argument("--previous-work-dir")
+    p.add_argument("--approved-recovery-sha256")
     return p
 
 
@@ -817,6 +1002,9 @@ def main():
         require(args.parameters is not None, "private-parameters-required")
         prepare(args, work, azure)
         return
+    if args.operation == "plan-recovery":
+        prepare_recovery(args, work, azure)
+        return
     bundle = load_bundle(args, work)
     account = azure.cli("account", "show", "--query",
                         "{subscription:id,tenant:tenantId,environment:environmentName}")
@@ -828,6 +1016,10 @@ def main():
         require(receipt["subscriptionId"] == args.subscription and
                 receipt["cleanupReceipt"] == bundle["cleanupReceipt"] and
                 receipt["sourceDigest"] == bundle["sourceDigest"], "receipt-identity-mismatch")
+    if args.operation == "recover-bootstrap":
+        recover_bootstrap(azure, bundle, receipt, args)
+        print("Reviewed receipt-linked cleanup recovery completed; no compute or lifetime was started.")
+        return
     actions = {"bootstrap": bootstrap, "arm": arm, "compute": compute, "connect": connect, "retire": retire}
     actions[args.operation](azure, bundle, receipt)
     print("Reviewed phase completed; receipts stored privately. No runtime qualification is implied.")

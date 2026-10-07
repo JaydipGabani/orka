@@ -4,26 +4,18 @@ param prefix string
 param location string
 param ownershipTags object
 
-// The Automation RuntimeEnvironment RP enforces a three-tag maximum.
-// Child tags retain ownership identity; account/group guards keep the full set.
 var childOwnershipTags = {
   'orka-owner': ownershipTags['orka-owner']
   'orka-deployment': ownershipTags['orka-deployment']
   'orka-cleanup-receipt': ownershipTags['orka-cleanup-receipt']
 }
 
-resource account 'Microsoft.Automation/automationAccounts@2024-10-23' = {
+resource account 'Microsoft.Automation/automationAccounts@2024-10-23' existing = {
   name: '${prefix}-reaper'
-  location: location
-  tags: ownershipTags
-  identity: { type: 'SystemAssigned' }
-  properties: {
-    sku: { name: 'Basic' }
-    disableLocalAuth: true
-    publicNetworkAccess: false
-  }
 }
 
+// Existing account properties are never PUT during recovery. Provider-added
+// encryption/runtime defaults must not be removed by replaying account creation.
 resource runtime 'Microsoft.Automation/automationAccounts/runtimeEnvironments@2024-10-23' = {
   parent: account
   name: 'PowerShell74'
@@ -51,7 +43,3 @@ resource runbook 'Microsoft.Automation/automationAccounts/runbooks@2024-10-23' =
     description: 'Review-pinned code is uploaded and published separately before schedules are armed.'
   }
 }
-
-output accountId string = account.id
-output principalId string = account.identity.principalId
-output tenantId string = account.identity.tenantId

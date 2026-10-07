@@ -302,7 +302,7 @@ python3 "$APPLY" connect   ... --reviewed-source-sha256 "$REVIEWED_DIGEST"
 python3 "$APPLY" retire    ... --reviewed-source-sha256 "$REVIEWED_DIGEST"
 ```
 
-`bootstrap` requires all three group names and both role-definition IDs to be
+`bootstrap` requires all three group names and all four role-definition IDs to be
 unused, creates the owned empty verification/cleanup groups, configures only the
 reviewed cleanup identity/roles, publishes the exact runbook, and executes a
 read-only managed-identity/delete-authority preflight. The operator's bounded
@@ -329,6 +329,51 @@ permissions. Completion still requires authoritative group absence.
 The control-side peering and its child-scoped role assignment use direct exact-ID
 ARM PUTs rather than group deployments, so no deployment records are created in
 the existing control resource group. Schedules include their required name.
+Cleanup bootstrap, cleanup-access grants and registry-pull grants each run
+**Provider-level validation immediately before create**, with the same compiled
+template and parameter hashes. Static Bicep compilation is not RP validation.
+
+### Bounded runtime-environment tag failure recovery
+
+The Automation RP rejects more than **three** runtime-environment tags, even
+though its published schema does not encode that limit. The runtime and runbook
+therefore carry only `orka-owner`, `orka-deployment`, and `orka-cleanup-receipt`;
+the Automation account and both groups keep the full seven-tag ownership/source/
+clock set. Three tags on the runbook are a conservative choice, not a claim that
+its RP limit is three. Azure documents a 15-tag Automation-account limit.
+
+Only the specific pre-clock failure with an empty owned verification group,
+the exact owned cleanup account, no runtime/runbook/schedules, and **zero**
+cleanup-identity role assignments has a code-supported recovery:
+
+```bash
+# Read-only, new private directory; the previous bundle and receipt stay immutable.
+python3 "$APPLY" plan-recovery --subscription "$APPROVED_SUBSCRIPTION" \
+  --control-vnet-id "$CONTROL_VNET_ID" --control-aks-id "$CONTROL_AKS_ID" \
+  --previous-work-dir "$FAILED_PRIVATE_BUNDLE_DIR" --work-dir "$RECOVERY_BUNDLE_DIR"
+# STOP: obtain explicit user recovery approval and independent review of both hashes.
+python3 "$APPLY" recover-bootstrap ... \
+  --reviewed-source-sha256 "$RECOVERY_SOURCE_DIGEST" \
+  --approved-recovery-sha256 "$APPROVED_RECOVERY_LINK_DIGEST"
+```
+
+The recovery link pins the prior bundle/receipt hashes, original principal and
+ownership proof. It rechecks the exact live tag-limit failure and allows only
+creation of the two missing children. The child-only recovery template never
+PUTs the existing Automation account: replaying account creation produces
+ambiguous what-if deletions for provider-added encryption/runtime defaults.
+An `Ignore` entry for that exact already-owned account is allowed; Modify,
+Delete, or Create of the account is not.
+After child creation, a metadata-only tag merge updates the reviewed source
+digest on **only the two owned groups**, with their complete ownership-tag sets
+read back unchanged otherwise. The existing Automation account is entirely
+untouched and retains all seven original tags, including its original source
+digest. It rejects all other adoption or scope changes. All original owner/
+receipt tags, group/account IDs and system identity remain unchanged.
+It writes a **new** intent receipt linking the original failure;
+it never edits the failed receipt or disables `bootstrap`'s fresh-state guard.
+Recovery completes only the cleanup bootstrap/preflight, not arming or compute.
+The command's existence does not authorize executing it.
 
 This is not a generic resume/adoption framework. A partially failed phase stops
 with a private intent receipt and requires bounded operator recovery; never

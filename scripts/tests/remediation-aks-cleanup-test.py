@@ -12,6 +12,7 @@ import sys
 import unittest
 from unittest import mock
 import uuid
+from types import SimpleNamespace
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
@@ -104,6 +105,33 @@ class ArmedPlanTests(unittest.TestCase):
             with self.subTest(error=error), self.assertRaisesRegex(apply.Failure, error):
                 azure.deploy("fixture", template, {"budgetStartUtc": self.receipt["T0"]}, **arguments)
         runner.assert_not_called()
+
+    def test_provider_validation_precedes_cleanup_and_access_create(self):
+        runner = mock.Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, '{"error":null,"properties":{"provisioningState":"Succeeded"}}', ""),
+            subprocess.CompletedProcess([], 0, '{"properties":{"provisioningState":"Succeeded"}}', ""),
+        ])
+        azure = apply.Azure(self.bundle["subscriptionId"], self.directory, runner=runner)
+        template = self.directory / "template.json"
+        template.write_text("{}")
+        azure.deploy("cleanup", template, {"owner": "fixture"}, provider_validate=True)
+        commands = [call.args[0] for call in runner.call_args_list]
+        self.assertEqual(commands[0][1:4], ["deployment", "sub", "validate"])
+        self.assertEqual(commands[0][commands[0].index("--validation-level") + 1], "Provider")
+        self.assertEqual(commands[1][1:4], ["deployment", "sub", "create"])
+        for flag in ("--template-file", "--parameters", "--subscription"):
+            self.assertEqual(commands[0][commands[0].index(flag) + 1],
+                             commands[1][commands[1].index(flag) + 1])
+
+    def test_failed_provider_validation_never_creates_resource(self):
+        runner = mock.Mock(return_value=subprocess.CompletedProcess(
+            [], 0, '{"error":{"code":"BadRequest"},"properties":{"provisioningState":"Failed"}}', ""))
+        azure = apply.Azure(self.bundle["subscriptionId"], self.directory, runner=runner)
+        template = self.directory / "template.json"
+        template.write_text("{}")
+        with self.assertRaisesRegex(apply.Failure, "validation-required-before-create"):
+            azure.deploy("cleanup", template, {"owner": "fixture"}, provider_validate=True)
+        self.assertEqual(runner.call_count, 1)
 
     def test_matching_parameter_digest_is_used_for_the_exact_cli_input(self):
         runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, '{"properties":{}}', ""))
@@ -247,6 +275,114 @@ class ArmedPlanTests(unittest.TestCase):
             apply.preflight_job(FakeAzure(), bundle, {"principalId": receipt["principalId"]})
         self.assertEqual(elapsed[0], 1200)
 
+class RecoveryPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = ROOT / "bin/remediation-aks-tests" / uuid.uuid4().hex
+        self.directory.mkdir(parents=True)
+        self.addCleanup(lambda: shutil.rmtree(self.directory))
+        subscription = "11111111-1111-1111-1111-111111111111"
+        base = f"/subscriptions/{subscription}/resourceGroups/control/providers/"
+        scope = apply.plan.targets(subscription, "sample01",
+                                   base + "Microsoft.Network/virtualNetworks/control",
+                                   base + "Microsoft.ContainerService/managedClusters/control")
+        self.previous = {"subscriptionId": subscription, "scope": scope, "suffix": "sample01",
+                         "owner": "fixture-owner", "cleanupReceipt": "22222222-2222-2222-2222-222222222222",
+                         "sourceDigest": "a" * 64}
+        self.current = {**self.previous, "sourceDigest": "b" * 64}
+        self.tags = {"orka-purpose": "isolated-remediation-verification", "orka-owner": "fixture-owner",
+                     "orka-deployment": "orka-verify-sample01", "orka-cleanup-receipt": self.previous["cleanupReceipt"],
+                     "orka-source-digest": self.previous["sourceDigest"],
+                     "orka-budget-start-utc": "pending", "orka-expires-at-utc": "pending"}
+        changes = []
+        for child in ("runtimeEnvironments/PowerShell74", "runbooks/ExactFoundationCleanup"):
+            changes.append({"resourceId": scope["automationAccountId"] + "/" + child, "changeType": "Create",
+                            "after": {"tags": {k: self.tags[k] for k in
+                                              ("orka-owner", "orka-deployment", "orka-cleanup-receipt")}}})
+        self.preview = {"status": "Succeeded", "changes": changes}
+
+    def test_only_two_missing_owned_children_are_allowed_in_recovery_deployment(self):
+        apply.validate_recovery_preview(self.preview, self.previous, self.current)
+        self.preview["changes"].append({"resourceId": self.previous["scope"]["automationAccountId"],
+                                        "changeType": "Ignore"})
+        apply.validate_recovery_preview(self.preview, self.previous, self.current)
+
+    def test_recovery_may_not_drop_owner_recreate_account_or_touch_unrelated_scope(self):
+        for mutation in ("owner", "recreate", "foreign", "identity"):
+            preview = copy.deepcopy(self.preview)
+            if mutation == "owner":
+                preview["changes"][0]["after"]["tags"].pop("orka-owner")
+            elif mutation == "recreate":
+                preview["changes"][0]["resourceId"] = self.previous["scope"]["automationAccountId"]
+            elif mutation == "foreign":
+                preview["changes"][0]["resourceId"] = self.previous["scope"]["controlVnetId"]
+            else:
+                preview["changes"][0]["changeType"] = "Modify"
+            with self.subTest(mutation=mutation), self.assertRaises(apply.Failure):
+                apply.validate_recovery_preview(preview, self.previous, self.current)
+
+    def test_previous_failed_receipt_is_linked_read_only_and_not_generically_adopted(self):
+        previous = self.directory / "previous"
+        previous.mkdir()
+        (previous / "compute-inputs.json").write_text("{}")
+        self.previous.update({"computeInputsSha256": apply.sha(b"{}"), "compiledHashes": {}})
+        receipt = {"phase": "bootstrap-intent", "subscriptionId": self.previous["subscriptionId"],
+                   "cleanupReceipt": self.previous["cleanupReceipt"], "sourceDigest": self.previous["sourceDigest"]}
+        apply.write_json(previous / "bundle.json", self.previous)
+        apply.write_json(previous / "receipt.json", receipt)
+        receipt_bytes = (previous / "receipt.json").read_bytes()
+        args = SimpleNamespace(work_dir=str(self.directory / "next"), subscription=self.previous["subscriptionId"],
+                               control_vnet_id=self.previous["scope"]["controlVnetId"],
+                               control_aks_id=self.previous["scope"]["controlClusterId"])
+        with mock.patch.object(apply.plan, "private_path", side_effect=Path):
+            path, bundle = apply.previous_recovery_inputs(str(previous), args)
+            self.assertEqual(path, previous)
+            self.assertEqual(bundle["sourceDigest"], "a" * 64)
+            self.assertEqual((previous / "receipt.json").read_bytes(), receipt_bytes)
+            receipt["phase"] = "armed"
+            apply.write_json(previous / "receipt.json", receipt)
+            with self.assertRaisesRegex(apply.Failure, "unsupported-prior-receipt"):
+                apply.previous_recovery_inputs(str(previous), args)
+
+    def test_mutating_recovery_requires_separate_explicit_approval_before_calls(self):
+        azure = mock.Mock()
+        with self.assertRaisesRegex(apply.Failure, "explicit-new-recovery-receipt"):
+            apply.recover_bootstrap(azure, self.current, {}, SimpleNamespace(approved_recovery_sha256=None))
+        self.assertFalse(azure.mock_calls)
+
+    def test_recovery_tag_merges_only_two_groups_and_leaves_account_untouched(self):
+        previous_dir = self.directory / "previous"
+        next_dir = self.directory / "next"
+        previous_dir.mkdir()
+        next_dir.mkdir()
+        self.previous.update({"tenantId": "44444444-4444-4444-4444-444444444444", "roleGuids": {},
+                              "controlKubeletIdentity": {}, "publicKeyReady": True})
+        self.current = {**self.previous, "sourceDigest": "b" * 64}
+        apply.write_json(previous_dir / "bundle.json", self.previous)
+        apply.write_json(previous_dir / "receipt.json", {"phase": "bootstrap-intent"})
+        apply.write_json(previous_dir / "compute-inputs.json", {"sourceDigest": "a" * 64})
+        apply.write_json(next_dir / "compute-inputs.json", {"sourceDigest": "b" * 64})
+        proof = {"principalId": "33333333-3333-3333-3333-333333333333", "expectedTags": self.tags}
+        link = {"kind": "automation-runtime-three-tag-recovery", "previousWorkDir": str(previous_dir),
+                "previousBundleSha256": apply.sha((previous_dir / "bundle.json").read_bytes()),
+                "previousReceiptSha256": apply.sha((previous_dir / "receipt.json").read_bytes()),
+                "previousSourceDigest": "a" * 64, "nextSourceDigest": "b" * 64, "partialProof": proof}
+        digest = apply.sha(apply.wire(link))
+        apply.write_json(next_dir / "recovery-link.json", {"plan": link, "sha256": digest})
+        azure = mock.Mock(work=next_dir)
+        azure.get.side_effect = lambda identity, version: {
+            "id": identity, "tags": {**self.tags, "orka-source-digest": "b" * 64}}
+        with mock.patch.object(apply, "previous_recovery_inputs", return_value=(previous_dir, self.previous)), \
+                mock.patch.object(apply, "partial_bootstrap_proof", return_value=proof), \
+                mock.patch.object(apply, "validate_recovery_preview"), \
+                mock.patch.object(apply, "finish_bootstrap"):
+            apply.recover_bootstrap(azure, self.current, {}, SimpleNamespace(approved_recovery_sha256=digest))
+        ids = [c.args[c.args.index("--resource-id") + 1] for c in azure.cli.call_args_list]
+        self.assertEqual(ids, [self.previous["scope"]["verificationResourceGroupId"],
+                               self.previous["scope"]["cleanupResourceGroupId"]])
+        self.assertNotIn(self.previous["scope"]["automationAccountId"], ids)
+        self.assertEqual(self.tags["orka-source-digest"], "a" * 64)
+
+
 class NewTemplateTests(unittest.TestCase):
     def compile(self, name):
         result = subprocess.run(["az", "bicep", "build", "--file", str(SOURCE / (name + ".bicep")), "--stdout"],
@@ -266,6 +402,16 @@ class NewTemplateTests(unittest.TestCase):
         self.assertTrue(account["properties"]["disableLocalAuth"])
         self.assertFalse(account["properties"]["publicNetworkAccess"])
         self.assertFalse(any("schedules" in r["type"].lower() for r in resources))
+        child_tags = nested["properties"]["template"]["variables"]["childOwnershipTags"]
+        self.assertEqual(len(child_tags), 3)
+        self.assertEqual(set(child_tags), {"orka-owner", "orka-deployment", "orka-cleanup-receipt"})
+        self.assertEqual(account["tags"], "[parameters('ownershipTags')]")
+        for resource in resources:
+            if resource["type"] != "Microsoft.Automation/automationAccounts":
+                self.assertEqual(resource["tags"], "[variables('childOwnershipTags')]")
+        for group in groups:
+            self.assertEqual(group["tags"], "[variables('tags')]")
+        self.assertEqual(len(template["variables"]["tags"]), 7)
 
     def test_cleanup_roles_are_exact_delete_only_and_assignments_are_narrow(self):
         template = self.compile("cleanup-access")
@@ -287,6 +433,19 @@ class NewTemplateTests(unittest.TestCase):
         self.assertEqual(peers_read["properties"]["permissions"][0]["actions"],
                          ["Microsoft.Network/virtualNetworks/virtualNetworkPeerings/read"])
         self.assertIn("Microsoft.Resources/resourceGroups", peers_read["properties"]["assignableScopes"][0])
+
+    def test_tag_recovery_cannot_put_existing_account_or_change_child_configuration(self):
+        recovery = self.compile("cleanup-recovery")
+        normal = self.compile("cleanup")
+        nested = next(r for r in normal["resources"] if r["type"] == "Microsoft.Resources/deployments")
+        original = {r["type"]: r for r in nested["properties"]["template"]["resources"]}
+        self.assertEqual(len(recovery["resources"]), 2)
+        for resource in recovery["resources"]:
+            self.assertIn(resource["type"], ("Microsoft.Automation/automationAccounts/runbooks",
+                                             "Microsoft.Automation/automationAccounts/runtimeEnvironments"))
+            self.assertEqual(resource["properties"], original[resource["type"]]["properties"])
+            self.assertEqual(resource["tags"], "[variables('childOwnershipTags')]")
+        self.assertEqual(len(recovery["variables"]["childOwnershipTags"]), 3)
 
     def test_registry_assignments_are_pull_only_on_the_single_new_registry(self):
         template = self.compile("registry-pull")
