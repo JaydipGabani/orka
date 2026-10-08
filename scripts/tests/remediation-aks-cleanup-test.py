@@ -218,6 +218,131 @@ class ArmedPlanTests(unittest.TestCase):
         apply.schedules(FakeAzure(), bundle, receipt)
         self.assertEqual(len(writes), 4, "readback must not rewrite an existing one-time binding")
 
+    def arm_fixture(self, early_minutes=0):
+        scope = self.bundle["scope"]
+        principal = "33333333-3333-3333-3333-333333333333"
+        tenant = "44444444-4444-4444-4444-444444444444"
+        kubelet = {"objectId": "55555555-5555-5555-5555-555555555555",
+                   "clientId": "66666666-6666-6666-6666-666666666666",
+                   "resourceId": f"/subscriptions/{self.bundle['subscriptionId']}/resourceGroups/control/providers/Microsoft.ManagedIdentity/userAssignedIdentities/kubelet"}
+        bundle = {**self.bundle, "tenantId": tenant, "suffix": "sample01", "publicKeyReady": True,
+                  "controlKubeletIdentity": kubelet, "authorizationModel": apply.AUTHORIZATION_MODEL,
+                  "roleGuids": apply.builtin_role_guids(), "compiledHashes": {"main": "a" * 64}}
+        receipt = {"phase": "bootstrap-ready", "preflightCompleted": "2026-01-01T00:00:00Z",
+                   "principalId": principal, "cleanupAssignments": {}}
+        stored = {
+            scope["verificationResourceGroupId"]: copy.deepcopy(self.prepared),
+            scope["cleanupResourceGroupId"]: {"id": scope["cleanupResourceGroupId"], "tags": dict(self.tags)},
+            scope["automationAccountId"]: {"id": scope["automationAccountId"], "tags": dict(self.tags),
+                "identity": {"type": "SystemAssigned", "tenantId": tenant, "principalId": principal}},
+            scope["controlClusterId"]: {"id": scope["controlClusterId"],
+                "properties": {"identityProfile": {"kubeletidentity": kubelet}}},
+        }
+        assignments = []
+        for key, (assignment_scope, role_name) in apply.cleanup_assignment_scopes(bundle).items():
+            identity, body = apply.scoped_assignment(bundle, receipt, assignment_scope, role_name)
+            receipt["cleanupAssignments"][key] = identity
+            assignments.append({"id": identity, "properties": {**body["properties"], "scope": assignment_scope}})
+        for guid, name, actions in apply.BUILTIN_ROLES.values():
+            identity = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/{guid}"
+            stored[identity] = {"id": identity, "properties": {"type": "BuiltInRole", "roleName": name,
+                "permissions": [{"actions": sorted(actions), "notActions": [], "dataActions": [], "notDataActions": []}]}}
+        apply.write_json(self.directory / "compute-inputs.json", {"sourceDigest": bundle["sourceDigest"]})
+        events, previews = [], []
+        outer = self
+
+        class FakeAzure:
+            work = outer.directory
+
+            def cli(self, *arguments):
+                if arguments[:2] == ("acr", "check-name"):
+                    return {"nameAvailable": True}
+                if arguments[:2] == ("resource", "list"):
+                    return []
+                outer.assertEqual(arguments[:3], ("rest", "--method", "GET"))
+                return {"value": assignments}
+
+            def get(self, identity, version, absent=False):
+                events.append(("GET", identity, absent))
+                return copy.deepcopy(stored.get(identity))
+
+            def deploy(self, name, template, values, preview=False, validation=None):
+                outer.assertTrue(preview)
+                outer.assertEqual(validation, "Provider")
+                previews.append(copy.deepcopy(values))
+                apply.write_json(self.work / (name + ".parameters.json"), apply.arm_parameters(values))
+                result = copy.deepcopy(outer.preview)
+                result["changes"][0]["after"]["tags"].update({
+                    "orka-budget-start-utc": receipt["T0"], "orka-expires-at-utc": receipt["deadline"]})
+                return result
+
+            def rest(self, method, identity, version, body):
+                outer.assertEqual(method, "PUT")
+                events.append(("PUT", identity, copy.deepcopy(body)))
+                stored[identity] = {"id": identity, **copy.deepcopy(body)}
+                if "/schedules/" in identity:
+                    value = apply.dt.datetime.fromisoformat(body["properties"]["startTime"].replace("Z", "+00:00"))
+                    value = value.replace(second=0, microsecond=0) - apply.dt.timedelta(minutes=early_minutes)
+                    stored[identity]["properties"].update({
+                        "startTime": value.isoformat(), "isEnabled": True, "timeZone": "Etc/UTC"})
+
+        return FakeAzure(), bundle, receipt, events, previews
+
+    def test_arm_uses_one_whole_minute_for_provider_schedules_and_24_hour_deadline(self):
+        for second in (0, 1, 30, 59):
+            with self.subTest(second=second):
+                azure, bundle, receipt, events, previews = self.arm_fixture()
+                now = apply.dt.datetime(2026, 10, 8, 22, 13, second, tzinfo=apply.dt.timezone.utc)
+                later = now + apply.dt.timedelta(seconds=59)
+                with mock.patch.object(apply, "utc", side_effect=[now, later, later]):
+                    apply.arm(azure, bundle, receipt)
+                start = apply.dt.datetime.fromisoformat(receipt["T0"].replace("Z", "+00:00"))
+                deadline = apply.dt.datetime.fromisoformat(receipt["deadline"].replace("Z", "+00:00"))
+                self.assertEqual(start.second, 0)
+                self.assertEqual(start.microsecond, 0)
+                self.assertGreaterEqual(start - now, apply.dt.timedelta(minutes=10))
+                self.assertEqual(start, now.replace(second=0) + apply.dt.timedelta(minutes=11))
+                self.assertEqual(deadline, start + apply.dt.timedelta(hours=24))
+                self.assertEqual(previews[0]["budgetStartUtc"], receipt["T0"])
+                self.assertEqual(receipt["phase"], "armed")
+                puts = [entry for entry in events if entry[0] == "PUT"]
+                self.assertEqual(len(puts), 4)
+                for name, hours in (("PrimaryCleanup", 22), ("CatchupCleanup", 23)):
+                    identity = bundle["scope"]["automationAccountId"] + "/schedules/" + name
+                    binding = bundle["scope"]["automationAccountId"] + "/jobSchedules/" + str(
+                        uuid.uuid5(uuid.NAMESPACE_URL, bundle["scope"]["automationAccountId"] + "/" + name))
+                    index = next(index for index, entry in enumerate(events) if entry[:2] == ("PUT", identity))
+                    self.assertEqual(events[index - 2:index], [("GET", identity, True), ("GET", binding, True)])
+                    self.assertEqual(events[index][2]["properties"]["startTime"],
+                                     apply.timestamp(start + apply.dt.timedelta(hours=hours)))
+                    self.assertEqual(events[index + 1][1], binding)
+                    self.assertEqual(events[index + 1][2]["properties"]["parameters"],
+                                     apply.runbook_parameters(bundle, receipt, cleanup=True))
+
+    def test_nonminute_or_non24_hour_clock_is_rejected_before_schedule_operations(self):
+        bundle = {**self.bundle, "tenantId": "44444444-4444-4444-4444-444444444444", "suffix": "sample01"}
+        for second in (1, 30, 59):
+            start = apply.dt.datetime(2026, 10, 8, 22, 13, second, tzinfo=apply.dt.timezone.utc)
+            receipt = {"T0": apply.timestamp(start), "deadline": apply.timestamp(start + apply.dt.timedelta(hours=24))}
+            azure = mock.Mock()
+            with self.subTest(second=second), self.assertRaisesRegex(apply.Failure, "minute-aligned-24-hour"):
+                apply.schedules(azure, bundle, receipt, create=True)
+            azure.get.assert_not_called()
+            azure.rest.assert_not_called()
+        azure = mock.Mock()
+        with self.assertRaisesRegex(apply.Failure, "minute-aligned-24-hour"):
+            apply.schedules(azure, bundle, {"T0": "2026-10-08T22:14:00Z", "deadline": "2026-10-09T22:13:00Z"})
+        azure.get.assert_not_called()
+
+    def test_minute_aligned_arm_still_rejects_an_early_provider_schedule(self):
+        azure, bundle, receipt, _, _ = self.arm_fixture(early_minutes=1)
+        now = apply.dt.datetime(2026, 10, 8, 22, 13, 30, tzinfo=apply.dt.timezone.utc)
+        with mock.patch.object(apply, "utc", return_value=now), self.assertRaisesRegex(
+                apply.Failure, "schedule-readback-mismatch"):
+            apply.arm(azure, bundle, receipt)
+        self.assertEqual(receipt["phase"], "arming-intent")
+        self.assertNotIn("armedReadbackUtc", receipt)
+
     def test_preflight_job_serializes_each_parameter_before_the_outer_request(self):
         bundle = {**self.bundle, "tenantId": "44444444-4444-4444-4444-444444444444", "suffix": "sample01"}
         receipt = {"principalId": "33333333-3333-3333-3333-333333333333"}
@@ -1232,6 +1357,104 @@ class QualifiedBootstrapTests(unittest.TestCase):
         self.azure.runner = transient_get
         return fault
 
+    def abandoned_arming_fixture(self):
+        self.prepare()
+        abandoned = self.work
+        qualified = copy.deepcopy(self.bundle)
+        qualified["sourceHashes"]["scripts/remediation_aks_apply.py"] = "e" * 64
+        qualified["sourceDigest"] = apply.sha(apply.wire(qualified["sourceHashes"]))
+        values = json.loads((abandoned / "compute-inputs.json").read_text())
+        values["sourceDigest"] = qualified["sourceDigest"]
+        apply.write_json(abandoned / "compute-inputs.json", values)
+        qualified["computeInputsSha256"] = apply.sha((abandoned / "compute-inputs.json").read_bytes())
+        apply.write_json(abandoned / "bundle.json", qualified)
+        old_link = apply.qualified_bootstrap_link(self.link["plan"]["inputDirectories"],
+            self.link["plan"]["inputHashes"], self.previous, qualified, self.link["plan"]["proof"])
+        old_record = {"plan": old_link, "sha256": apply.sha(apply.wire(old_link))}
+        apply.write_json(abandoned / "authorization-link.json", old_record)
+        start = "2026-10-08T22:23:55Z"
+        deadline = "2026-10-09T22:23:55Z"
+        preview_values = {**values, "budgetStartUtc": start}
+        apply.write_json(abandoned / "provider-verification-preview.parameters.json", apply.arm_parameters(preview_values))
+        for key in ("verificationResourceGroupId", "cleanupResourceGroupId"):
+            self.objects[self.scope[key]]["tags"]["orka-source-digest"] = qualified["sourceDigest"]
+        prepared = copy.deepcopy(self.objects[self.scope["verificationResourceGroupId"]])
+        prepared["location"] = "eastus2"
+        after = copy.deepcopy(prepared)
+        after["tags"].update({"orka-budget-start-utc": start, "orka-expires-at-utc": deadline})
+        preview = {"status": "Succeeded", "changes": [
+            {"resourceId": self.scope["verificationResourceGroupId"], "changeType": "Modify",
+             "before": prepared, "after": after, "delta": [{"path": "tags.orka-budget-start-utc"}]},
+            *({"resourceId": self.scope[key], "changeType": "Create"} for key in
+              ("verificationClusterId", "builderVirtualMachineId", "verificationRegistryId")),
+        ]}
+        apply.write_json(abandoned / "provider-verification-preview.what-if.json", preview)
+        failed = apply.qualified_bootstrap_intent(qualified, self.previous, self.old, self.passed,
+                                                old_link["inputHashes"], old_record["sha256"])
+        failed.update({"phase": "arming-intent", "preflightJobId": self.passed_job,
+                       "preflightCompleted": self.passed["endTime"], "T0": start, "deadline": deadline,
+                       "applyParametersSha256": apply.sha((abandoned / "provider-verification-preview.parameters.json").read_bytes()),
+                       "applyTemplateSha256": qualified["compiledHashes"]["main"]})
+        apply.write_json(abandoned / "receipt.json", failed)
+        rollback = self.directory / "verified-arming-rollback"
+        rollback.mkdir()
+        (rollback / "failed-arming-receipt.json").write_bytes((abandoned / "receipt.json").read_bytes())
+        schedule_id = self.account + "/schedules/PrimaryCleanup"
+        binding_id = self.account + "/jobSchedules/" + str(uuid.uuid5(uuid.NAMESPACE_URL, self.account + "/PrimaryCleanup"))
+        apply.write_json(rollback / "receipt.json", {
+            "phase": "exact-partial-arming-rollback-verified", "oldSourceDigest": qualified["sourceDigest"],
+            "oldReceiptSha256": apply.sha((abandoned / "receipt.json").read_bytes()),
+            "abandonedUnarmedT0": start, "abandonedUnarmedDeadline": deadline,
+            "scheduleId": schedule_id, "bindingId": binding_id,
+            "deleted": [binding_id, schedule_id], "noComputeExisted": True,
+        })
+        self.abandoned_dir = abandoned
+        self.rollback_dir = rollback
+        self.abandoned_bundle = qualified
+        self.abandoned_receipt = failed
+        self.abandoned_before = {path: path.read_bytes() for directory in (abandoned, rollback)
+                                 for path in directory.iterdir() if path.is_file()}
+        self.work = self.directory / "minute-rearm"
+        self.work.mkdir()
+        self.args.work_dir = str(self.work)
+        self.args.abandoned_arming_work_dir = str(abandoned)
+        self.args.arming_rollback_work_dir = str(rollback)
+        self.azure = apply.Azure(self.subscription, self.work, runner=self.runner)
+        self.calls.clear()
+        self.writes.clear()
+
+    def rehash_abandoned_arming_fixture(self, start=None, preview_start=None):
+        failed = copy.deepcopy(self.abandoned_receipt)
+        if start is not None:
+            failed["T0"] = start
+            failed["deadline"] = apply.timestamp(
+                apply.dt.datetime.fromisoformat(start.replace("Z", "+00:00")) + apply.dt.timedelta(hours=24))
+        values = json.loads((self.abandoned_dir / "compute-inputs.json").read_text())
+        values["budgetStartUtc"] = preview_start if preview_start is not None else failed["T0"]
+        parameters = self.abandoned_dir / "provider-verification-preview.parameters.json"
+        apply.write_json(parameters, apply.arm_parameters(values))
+        failed["applyParametersSha256"] = apply.sha(parameters.read_bytes())
+        preview_path = self.abandoned_dir / "provider-verification-preview.what-if.json"
+        preview = json.loads(preview_path.read_text())
+        group = next(change for change in preview["changes"]
+                     if change["resourceId"] == self.scope["verificationResourceGroupId"])
+        group["after"]["tags"].update({
+            "orka-budget-start-utc": failed["T0"], "orka-expires-at-utc": failed["deadline"]})
+        apply.write_json(preview_path, preview)
+        receipt_path = self.abandoned_dir / "receipt.json"
+        apply.write_json(receipt_path, failed)
+        backup = self.rollback_dir / "failed-arming-receipt.json"
+        backup.write_bytes(receipt_path.read_bytes())
+        rollback_path = self.rollback_dir / "receipt.json"
+        rollback = json.loads(rollback_path.read_text())
+        rollback.update({"oldReceiptSha256": apply.sha(receipt_path.read_bytes()),
+                         "abandonedUnarmedT0": failed["T0"], "abandonedUnarmedDeadline": failed["deadline"]})
+        apply.write_json(rollback_path, rollback)
+        self.assertEqual(backup.read_bytes(), receipt_path.read_bytes())
+        self.assertEqual(failed["applyParametersSha256"], apply.sha(parameters.read_bytes()))
+        self.assertEqual(rollback["oldReceiptSha256"], apply.sha(backup.read_bytes()))
+        return failed
+
     def test_read_only_plan_and_real_adopt_path_only_merge_two_current_digest_tags(self):
         self.prepare()
         self.assertFalse(self.writes)
@@ -1562,6 +1785,199 @@ class QualifiedBootstrapTests(unittest.TestCase):
             self.adopt()
         self.assertFalse(self.writes)
         self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_verified_unarmed_rollback_reuses_handoff_without_copying_or_editing_the_old_clock(self):
+        self.abandoned_arming_fixture()
+        self.prepare()
+        self.assertEqual(self.link["plan"]["previousSourceDigest"], self.abandoned_bundle["sourceDigest"])
+        self.assertEqual(set(self.link["plan"]["inputHashes"]), {"previous", "preflight", "diagnostic", "abandoned", "rollback"})
+        self.assertFalse(self.writes)
+        self.assertFalse((self.work / "receipt.json").exists())
+        self.adopt()
+        ready = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(ready["phase"], "bootstrap-ready")
+        self.assertEqual(ready["preflightJobId"], self.passed_job)
+        self.assertEqual(ready["preflightCompleted"], self.passed["endTime"])
+        self.assertEqual(ready["qualificationOf"]["previousSourceDigest"], self.abandoned_bundle["sourceDigest"])
+        self.assertNotIn("T0", ready)
+        self.assertNotIn("deadline", ready)
+        self.assertNotIn("armedReadbackUtc", ready)
+        self.assertEqual(self.writes, [(self.scope[key], "orka-source-digest=" + self.bundle["sourceDigest"])
+                                      for key in ("verificationResourceGroupId", "cleanupResourceGroupId")])
+        self.assertTrue(all(path.read_bytes() == data for path, data in self.abandoned_before.items()))
+        self.assertTrue(all(path.read_bytes() == data for path, data in self.before.items()))
+
+    def test_rearm_handoff_retains_same_link_partial_tag_retry_without_minting_clock(self):
+        self.abandoned_arming_fixture()
+        self.prepare()
+        self.fail_get_once_after_merges(1)
+        with self.assertRaisesRegex(apply.Failure, "azure-command-failed"):
+            self.adopt()
+        intent = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(intent["phase"], "qualified-bootstrap-intent")
+        self.assertNotIn("T0", intent)
+        self.adopt()
+        ready = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(ready["phase"], "bootstrap-ready")
+        self.assertNotIn("T0", ready)
+        self.assertNotIn("deadline", ready)
+        self.assertEqual(len(self.writes), 2)
+        self.assertEqual(len({identity for identity, _ in self.writes}), 2)
+        self.assertTrue(all(path.read_bytes() == data for path, data in self.abandoned_before.items()))
+
+    def test_rearm_never_adopts_an_armed_compute_or_other_clock_history(self):
+        self.abandoned_arming_fixture()
+        receipt_path = self.abandoned_dir / "receipt.json"
+        backup_path = self.rollback_dir / "failed-arming-receipt.json"
+        rollback_path = self.rollback_dir / "receipt.json"
+        originals = {path: path.read_bytes() for path in (receipt_path, backup_path, rollback_path)}
+        for change in ("armed", "compute-intent", "ready", "retired", "armedReadbackUtc", "computeEvidence",
+                       "already-minute", "deadline-extension"):
+            failed = copy.deepcopy(self.abandoned_receipt)
+            rollback = json.loads(originals[rollback_path])
+            if change in ("armed", "compute-intent", "ready", "retired"):
+                failed["phase"] = change
+            elif change in ("armedReadbackUtc", "computeEvidence"):
+                failed[change] = "work-started"
+            elif change == "already-minute":
+                failed["T0"], failed["deadline"] = "2026-10-08T22:24:00Z", "2026-10-09T22:24:00Z"
+                rollback["abandonedUnarmedT0"], rollback["abandonedUnarmedDeadline"] = failed["T0"], failed["deadline"]
+            else:
+                failed["deadline"] = "2026-10-10T22:23:55Z"
+                rollback["abandonedUnarmedDeadline"] = failed["deadline"]
+            apply.write_json(receipt_path, failed)
+            backup_path.write_bytes(receipt_path.read_bytes())
+            rollback["oldReceiptSha256"] = apply.sha(receipt_path.read_bytes())
+            apply.write_json(rollback_path, rollback)
+            with self.subTest(change=change), self.assertRaises(apply.Failure):
+                self.prepare()
+            self.assertFalse(self.writes)
+            self.assertFalse((self.work / "receipt.json").exists())
+            for path, raw in originals.items():
+                path.write_bytes(raw)
+
+    def test_rearm_rejects_fully_rehashed_whole_minute_abandoned_clock_at_precision_guard(self):
+        self.abandoned_arming_fixture()
+        failed = self.rehash_abandoned_arming_fixture(start="2026-10-08T22:24:00Z")
+        self.assertEqual(failed["deadline"], "2026-10-09T22:24:00Z")
+        parameters = json.loads((self.abandoned_dir / "provider-verification-preview.parameters.json").read_text())
+        self.assertEqual(parameters["parameters"]["budgetStartUtc"]["value"], failed["T0"])
+        with self.assertRaisesRegex(apply.Failure, "^only-nonminute-unarmed-clock-rollback-supported$"):
+            self.prepare()
+        self.assertFalse(self.calls)
+        self.assertFalse(self.writes)
+        self.assertFalse((self.work / "bundle.json").exists())
+        self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_rearm_rejects_rehashed_preview_clock_mismatch_at_parameter_equality_guard(self):
+        self.abandoned_arming_fixture()
+        failed = self.rehash_abandoned_arming_fixture(preview_start="2026-10-08T22:24:55Z")
+        self.assertEqual(failed["T0"], "2026-10-08T22:23:55Z")
+        parameters = json.loads((self.abandoned_dir / "provider-verification-preview.parameters.json").read_text())
+        self.assertNotEqual(parameters["parameters"]["budgetStartUtc"]["value"], failed["T0"])
+        with self.assertRaisesRegex(apply.Failure, "^abandoned-arming-parameter-drift$"):
+            self.prepare()
+        self.assertFalse(self.calls)
+        self.assertFalse(self.writes)
+        self.assertFalse((self.work / "bundle.json").exists())
+        self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_rearm_requires_exact_rollback_ids_no_compute_attestation_and_immutable_inputs(self):
+        self.abandoned_arming_fixture()
+        path = self.rollback_dir / "receipt.json"
+        raw = path.read_bytes()
+        for change in ("no-compute", "numeric-attestation", "binding-id", "schedule-id", "wrong-order",
+                       "old-source", "old-receipt-hash"):
+            rollback = json.loads(raw)
+            if change == "no-compute":
+                rollback["noComputeExisted"] = False
+            elif change == "numeric-attestation":
+                rollback["noComputeExisted"] = 1
+            elif change == "binding-id":
+                rollback["bindingId"] += "-foreign"
+            elif change == "schedule-id":
+                rollback["scheduleId"] = self.account + "/schedules/CatchupCleanup"
+            elif change == "wrong-order":
+                rollback["deleted"].reverse()
+            elif change == "old-source":
+                rollback["oldSourceDigest"] = "f" * 64
+            else:
+                rollback["oldReceiptSha256"] = "f" * 64
+            apply.write_json(path, rollback)
+            with self.subTest(change=change), self.assertRaises(apply.Failure):
+                self.prepare()
+            path.write_bytes(raw)
+        backup = self.rollback_dir / "failed-arming-receipt.json"
+        backup.write_bytes(backup.read_bytes() + b"\n")
+        with self.assertRaisesRegex(apply.Failure, "receipt-copy-drift"):
+            self.prepare()
+        backup.write_bytes(self.abandoned_before[backup])
+        self.prepare()
+        for source in (self.abandoned_dir / "authorization-link.json",
+                       self.abandoned_dir / "provider-verification-preview.parameters.json",
+                       self.abandoned_dir / "provider-verification-preview.what-if.json",
+                       self.abandoned_dir / "bundle.json", self.abandoned_dir / "main.arm.json",
+                       self.rollback_dir / "receipt.json"):
+            before = source.read_bytes()
+            source.write_bytes(before + b" ")
+            with self.subTest(file=source.name), self.assertRaises(apply.Failure):
+                self.adopt()
+            source.write_bytes(before)
+        self.assertFalse(self.writes)
+
+    def test_rearm_requires_individual_404s_and_unchanged_live_qualification(self):
+        self.abandoned_arming_fixture()
+        self.prepare()
+        rollback = json.loads((self.rollback_dir / "receipt.json").read_text())
+        for identity in rollback["deleted"]:
+            self.objects[identity] = {"id": identity}
+            with self.subTest(identity=identity.rsplit("/", 1)[-1]), self.assertRaisesRegex(
+                    apply.Failure, "rolled-back-schedule-still-present"):
+                self.adopt()
+            del self.objects[identity]
+        for collection in ("schedules", "jobSchedules", "jobs", "runbooks"):
+            identity = self.account + "/" + collection
+            self.objects[identity]["value"].append({"id": identity + "/foreign"})
+            with self.subTest(collection=collection), self.assertRaises(apply.Failure):
+                self.adopt()
+            self.objects[identity]["value"].pop()
+        runtime = self.objects[self.account + "/runtimeEnvironments"]["value"][0]
+        runtime["properties"]["description"] = "changed-after-qualified-bootstrap"
+        with self.assertRaisesRegex(apply.Failure, "rolled-back-qualified-state-drift"):
+            self.adopt()
+        runtime["properties"].pop("description")
+        for key, value in (("orka-budget-start-utc", self.abandoned_receipt["T0"]),
+                           ("orka-expires-at-utc", self.abandoned_receipt["deadline"])):
+            tags = self.objects[self.scope["verificationResourceGroupId"]]["tags"]
+            previous = tags[key]
+            tags[key] = value
+            with self.subTest(tag=key), self.assertRaises(apply.Failure):
+                self.adopt()
+            tags[key] = previous
+        resources = self.objects[self.scope["verificationResourceGroupId"] + "/resources"]["value"]
+        resources.append({"id": self.scope["builderVirtualMachineId"]})
+        with self.assertRaisesRegex(apply.Failure, "empty-verification-footprint"):
+            self.adopt()
+        resources.pop()
+        self.objects[self.scope["managedNodeResourceGroupId"]] = {"id": self.scope["managedNodeResourceGroupId"]}
+        with self.assertRaises(apply.Failure):
+            self.adopt()
+        self.assertFalse(self.writes)
+
+    def test_rearm_requires_paired_inputs_and_refuses_recursive_clock_abandonment(self):
+        self.abandoned_arming_fixture()
+        self.args.arming_rollback_work_dir = None
+        with self.assertRaisesRegex(apply.Failure, "paired-abandoned"):
+            self.prepare()
+        self.args.arming_rollback_work_dir = str(self.rollback_dir)
+        path = self.abandoned_dir / "authorization-link.json"
+        record = json.loads(path.read_text())
+        record["plan"]["inputDirectories"]["rollback"] = str(self.rollback_dir)
+        record["sha256"] = apply.sha(apply.wire(record["plan"]))
+        apply.write_json(path, record)
+        with self.assertRaisesRegex(apply.Failure, "abandoned-qualified-link-required"):
+            self.prepare()
+        self.assertFalse(self.writes)
 
     def test_templates_and_compute_inputs_may_not_change_with_the_handoff(self):
         original = self.compile_fixture

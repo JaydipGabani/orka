@@ -808,13 +808,21 @@ def resume_builtin_bootstrap(azure, bundle, receipt, args):
 def qualified_bootstrap_inputs(args, paths):
     work = plan.private_path(args.work_dir)
     directories = {name: plan.private_path(path) for name, path in paths.items()}
-    require(set(directories) == {"previous", "preflight", "diagnostic"} and
-            len(set(directories.values())) == 3 and
+    base_names = {"previous", "preflight", "diagnostic"}
+    rearming = set(directories) == base_names | {"abandoned", "rollback"}
+    require((set(directories) == base_names or rearming) and
+            len(set(directories.values())) == len(directories) and
             all(not work.is_relative_to(path) and not path.is_relative_to(work) for path in directories.values()),
             "fresh-qualified-bootstrap-directory-required")
     filenames = {"previous": ("bundle.json", "receipt.json", "authorization-link.json"),
                  "preflight": ("plan.json", "job-request.json", "receipt.json", "safe-output.json"),
                  "diagnostic": ("receipt.json", "safe-output.json")}
+    if rearming:
+        filenames.update({
+            "abandoned": ("bundle.json", "receipt.json", "authorization-link.json", "compute-inputs.json",
+                          "provider-verification-preview.parameters.json", "provider-verification-preview.what-if.json"),
+            "rollback": ("receipt.json", "failed-arming-receipt.json"),
+        })
     hashes, records = {}, {}
     for name, directory in directories.items():
         hashes[name], records[name] = {}, {}
@@ -908,7 +916,68 @@ def qualified_bootstrap_inputs(args, paths):
             diagnostic["originalRunbookUnchanged"] is True and diagnostic["foundationRecordsUnchanged"] is True and
             records["diagnostic"]["safe-output.json"].get("outcome") == "diagnostic-succeeded",
             "qualified-diagnostic-provenance-mismatch")
+    if rearming:
+        previous = qualified_arming_rollback_inputs(directories, records, hashes, previous, old, tags)
     return previous, old, tags, records, hashes
+
+
+def qualified_arming_rollback_inputs(directories, records, hashes, previous, old, tags):
+    abandoned = records["abandoned"]
+    bundle, failed, record = (abandoned[name] for name in ("bundle.json", "receipt.json", "authorization-link.json"))
+    link = record["plan"]
+    base_paths = {name: str(directories[name]) for name in ("previous", "preflight", "diagnostic")}
+    base_hashes = {name: hashes[name] for name in base_paths}
+    require(record["sha256"] == sha(wire(link)) and link == qualified_bootstrap_link(
+        base_paths, base_hashes, previous, bundle, link["proof"]),
+        "abandoned-qualified-link-required")
+    require(bundle == {**previous, "sourceHashes": bundle["sourceHashes"], "sourceDigest": bundle["sourceDigest"],
+                       "computeInputsSha256": bundle["computeInputsSha256"]} and
+            sha(wire(bundle["sourceHashes"])) == bundle["sourceDigest"] and
+            set(bundle["sourceHashes"]) == set(previous["sourceHashes"]) and
+            all(bundle["sourceHashes"][key] == previous["sourceHashes"][key] for key in previous["sourceHashes"]
+                if key not in ("scripts/remediation_aks_apply.py", "config/development/remediation-aks/README.md")),
+            "abandoned-qualified-bundle-drift")
+    values = json.loads((directories["previous"] / "compute-inputs.json").read_text())
+    values["sourceDigest"] = bundle["sourceDigest"]
+    require(abandoned["compute-inputs.json"] == values and
+            hashes["abandoned"]["compute-inputs.json"] == bundle["computeInputsSha256"],
+            "abandoned-compute-input-drift")
+    for name, digest in bundle["compiledHashes"].items():
+        require(sha((directories["abandoned"] / (name + ".arm.json")).read_bytes()) == digest,
+                "abandoned-compiled-template-drift")
+    require(hashes["abandoned"]["receipt.json"] == hashes["rollback"]["failed-arming-receipt.json"] and
+            (directories["abandoned"] / "receipt.json").read_bytes() ==
+            (directories["rollback"] / "failed-arming-receipt.json").read_bytes(),
+            "abandoned-arming-receipt-copy-drift")
+    for name in ("T0", "deadline"):
+        require(isinstance(failed.get(name), str) and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", failed[name]), "abandoned-unarmed-clock-required")
+    start = dt.datetime.fromisoformat(failed["T0"].replace("Z", "+00:00"))
+    require(start.second != 0 and failed["deadline"] == timestamp(start + dt.timedelta(hours=24)),
+            "only-nonminute-unarmed-clock-rollback-supported")
+    passed = records["preflight"]["receipt.json"]
+    expected = qualified_bootstrap_intent(bundle, previous, old, passed, base_hashes, record["sha256"])
+    expected.update({"phase": "arming-intent", "preflightJobId": passed["jobId"],
+        "preflightCompleted": passed["endTime"], "T0": failed["T0"], "deadline": failed["deadline"],
+        "applyParametersSha256": hashes["abandoned"]["provider-verification-preview.parameters.json"],
+        "applyTemplateSha256": bundle["compiledHashes"]["main"]})
+    require(wire(failed) == wire(expected), "only-abandoned-unarmed-intent-supported")
+    values["budgetStartUtc"] = failed["T0"]
+    require(abandoned["provider-verification-preview.parameters.json"] == arm_parameters(values),
+            "abandoned-arming-parameter-drift")
+    prepared = {"id": bundle["scope"]["verificationResourceGroupId"], "location": "eastus2",
+                "tags": {**tags, "orka-source-digest": bundle["sourceDigest"]}}
+    validate_armed_preview(abandoned["provider-verification-preview.what-if.json"], bundle, failed, prepared)
+    account = bundle["scope"]["automationAccountId"]
+    schedule_id = account + "/schedules/PrimaryCleanup"
+    binding_id = account + "/jobSchedules/" + str(uuid.uuid5(uuid.NAMESPACE_URL, account + "/PrimaryCleanup"))
+    require(wire(records["rollback"]["receipt.json"]) == wire({
+        "phase": "exact-partial-arming-rollback-verified", "oldSourceDigest": bundle["sourceDigest"],
+        "oldReceiptSha256": hashes["abandoned"]["receipt.json"], "abandonedUnarmedT0": failed["T0"],
+        "abandonedUnarmedDeadline": failed["deadline"], "scheduleId": schedule_id, "bindingId": binding_id,
+        "deleted": [binding_id, schedule_id], "noComputeExisted": True,
+    }), "exact-approved-unarmed-rollback-required")
+    return bundle
 
 
 def qualified_collection(azure, identity, version=AUTO_API):
@@ -1049,10 +1118,16 @@ def qualified_bootstrap_proof(azure, previous, old, tags, records, group_digest=
             output = azure.rest("GET", identity + "/output", AUTO_API, raw=True)
             require(len(output) <= 8192 and wire(json.loads(output)) ==
                     wire(records["diagnostic"]["safe-output.json"]), "qualified-diagnostic-output-drift")
-    return {"principalId": old["principalId"], "groupTags": group_tags, "groupSourceDigests": group_sources,
-            "accountTags": tags,
-            "cleanupAssignments": old["cleanupAssignments"], "publishedContent": contents,
-            "runtimeCatalogueSha256": runtime_proof, "jobs": jobs}
+    proof = {"principalId": old["principalId"], "groupTags": group_tags, "groupSourceDigests": group_sources,
+             "accountTags": tags, "cleanupAssignments": old["cleanupAssignments"], "publishedContent": contents,
+             "runtimeCatalogueSha256": runtime_proof, "jobs": jobs}
+    if "rollback" in records:
+        for identity in records["rollback"]["receipt.json"]["deleted"]:
+            require(azure.get(identity, AUTO_API, absent=True) is None, "rolled-back-schedule-still-present")
+        baseline = records["abandoned"]["authorization-link.json"]["plan"]["proof"]
+        require(proof == {**baseline, "groupTags": group_tags, "groupSourceDigests": group_sources},
+                "rolled-back-qualified-state-drift")
+    return proof
 
 
 def qualified_bootstrap_link(paths, hashes, previous, bundle, proof):
@@ -1074,6 +1149,11 @@ def prepare_qualified_bootstrap(args, work, azure):
             "fresh-qualified-bootstrap-plan-required")
     paths = {"previous": args.previous_work_dir, "preflight": args.qualified_preflight_work_dir,
              "diagnostic": args.diagnostic_work_dir}
+    abandoned = getattr(args, "abandoned_arming_work_dir", None)
+    rollback = getattr(args, "arming_rollback_work_dir", None)
+    require(bool(abandoned) == bool(rollback), "paired-abandoned-arming-and-rollback-inputs-required")
+    if abandoned:
+        paths.update({"abandoned": abandoned, "rollback": rollback})
     previous, old, tags, records, hashes = qualified_bootstrap_inputs(args, paths)
     proof = qualified_bootstrap_proof(azure, previous, old, tags, records)
     current = source_hashes()
@@ -1494,6 +1574,10 @@ def recover_bootstrap(azure, bundle, receipt, args):
 def schedules(azure, bundle, receipt, create=False):
     account = bundle["scope"]["automationAccountId"]
     start = dt.datetime.fromisoformat(receipt["T0"].replace("Z", "+00:00"))
+    deadline = dt.datetime.fromisoformat(receipt["deadline"].replace("Z", "+00:00"))
+    require(start.utcoffset() == deadline.utcoffset() == dt.timedelta(0) and
+            start.second == start.microsecond == deadline.second == deadline.microsecond == 0 and
+            deadline == start + dt.timedelta(hours=24), "minute-aligned-24-hour-clock-required")
     parameters = runbook_parameters(bundle, receipt, cleanup=True)
     for name, hours in (("PrimaryCleanup", 22), ("CatchupCleanup", 23)):
         identity = account + "/schedules/" + name
@@ -1580,7 +1664,9 @@ def arm(azure, bundle, receipt):
     children = azure.cli("resource", "list", "--resource-group",
                          bundle["scope"]["verificationResourceGroupId"].split("/")[-1])
     require(not children, "prepared-verification-group-not-empty")
-    start = utc() + dt.timedelta(minutes=10)
+    # Automation drops seconds. Eleven minutes from the UTC minute boundary
+    # preserves at least ten minutes of lead time even at second 59.
+    start = utc().replace(second=0, microsecond=0) + dt.timedelta(minutes=11)
     receipt.update({"T0": timestamp(start), "deadline": timestamp(start + dt.timedelta(hours=24))})
     values = json.loads((azure.work / "compute-inputs.json").read_text())
     values["budgetStartUtc"] = receipt["T0"]
@@ -1811,6 +1897,8 @@ def parser():
     p.add_argument("--continue-granted-bootstrap", action="store_true")
     p.add_argument("--qualified-preflight-work-dir")
     p.add_argument("--diagnostic-work-dir")
+    p.add_argument("--abandoned-arming-work-dir")
+    p.add_argument("--arming-rollback-work-dir")
     return p
 
 

@@ -515,6 +515,52 @@ This phase creates no clock or compute. The existing `arm` phase still performs
 the explicit live JobSchedule wire-parameter readback gate before compute; the
 two-node/one-builder/Basic-ACR footprint and 22h/23h/24h cleanup budget are unchanged.
 
+### Minute-aligned arming after an approved unarmed rollback
+
+Automation stores schedule times at whole-minute precision. `arm` therefore
+chooses **the current UTC minute boundary plus eleven minutes**, leaving at
+least ten minutes of lead time even at second 59. The provider preview's
+`budgetStartUtc`, primary cleanup at +22h, catch-up at +23h and deadline at +24h
+all derive from that single minute-aligned `T0`. Schedule readback remains exact:
+early, rounded or shifted instants are rejected, not tolerated. Both the schedule
+name and deterministic binding ID must still return 404 immediately before each
+PUT pair. The runbook's `cleanup-not-due` check and compute's 30-minute freshness
+gate are unchanged.
+
+Only the explicitly abandoned **non-minute, unarmed** arming intent may use the
+existing qualified handoff to prepare a fresh bootstrap-ready receipt after the
+operator-approved partial-schedule rollback:
+
+```bash
+python3 "$APPLY" plan-qualified-bootstrap --subscription "$APPROVED_SUBSCRIPTION" \
+  --control-vnet-id "$CONTROL_VNET_ID" --control-aks-id "$CONTROL_AKS_ID" \
+  --previous-work-dir "$FAILED_PREFLIGHT_BUNDLE_DIR" \
+  --qualified-preflight-work-dir "$CORRECTED_ORIGINAL_PREFLIGHT_DIR" \
+  --diagnostic-work-dir "$DIAGNOSTIC_EXECUTION_DIR" \
+  --abandoned-arming-work-dir "$ABANDONED_QUALIFIED_BUNDLE_DIR" \
+  --arming-rollback-work-dir "$VERIFIED_PARTIAL_ROLLBACK_DIR" \
+  --work-dir "$MINUTE_REARM_BUNDLE_DIR"
+```
+
+This does **not** roll back Azure resources, reset an old receipt, arm a clock or
+automatically extend a lifetime. The two optional directories are mandatory as a
+pair. Their input hashes bind the earlier qualified link/BOM, its exact
+`arming-intent`, the byte-identical archived failed receipt and the verified
+rollback receipt. The only accepted rollback records deletion of the exact
+PrimaryCleanup binding followed by PrimaryCleanup, with `noComputeExisted:
+true`. The original provider-preview parameters/template must match the
+abandoned clock. Any armed-readback marker, armed/compute/later phase, different
+clock/receipt/rollback ID or recursively abandoned rearm is refused.
+
+Live proof still requires zero schedules and bindings, individual 404s for both
+rolled-back IDs, the same three jobs/two books/runtime definitions, empty
+verification resources, no node group, pending budget tags and unchanged
+identity/grants/account. Only the existing two resource-group source-tag merges
+are permitted by a separately reviewed `adopt-qualified-bootstrap` invocation.
+It creates a **new** ready receipt referencing the existing successful original
+preflight; all older clocks and records stay immutable. Only a subsequent,
+explicitly approved `arm` can mint the fresh minute-aligned 24-hour window.
+
 This is not a generic resume/adoption framework. Outside the exact same-link
 handoff retry above, a partially failed phase stops with a private intent receipt
 and requires bounded operator recovery; never silently reuse an existing name
