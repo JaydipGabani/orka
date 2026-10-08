@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 import uuid
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
@@ -994,6 +995,591 @@ class BuiltinAuthorizationTests(unittest.TestCase):
         self.assertEqual(azure.cli.call_count, 2)
         azure.rest.assert_not_called()
         azure.deploy.assert_not_called()
+
+
+class QualifiedBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        fixture = BuiltinAuthorizationTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.directory = fixture.directory
+        self.private = mock.patch.object(apply.plan, "private_path", side_effect=Path)
+        self.private.start()
+        self.addCleanup(self.private.stop)
+        self.diagnostic_text = "# reviewed offline diagnostic"
+        pinned = mock.patch.object(apply, "QUALIFIED_DIAGNOSTIC_SHA256",
+                                   apply.sha(self.diagnostic_text.encode()))
+        pinned.start()
+        self.addCleanup(pinned.stop)
+        stopped, _, _, tags, args = fixture.transition_fixture()
+        self.args = args
+        self.tags = tags
+        self.subscription = fixture.subscription
+        self.scope = fixture.scope
+        self.account = self.scope["automationAccountId"]
+        source_hashes = apply.source_hashes()
+        source_hashes["scripts/remediation_aks_apply.py"] = "b" * 64
+        proof = {"principalId": fixture.principal, "accountTags": tags,
+                 "groupTags": {**tags, "orka-source-digest": "a" * 64}}
+        args.previous_work_dir = str(stopped)
+        granted_dir = Path(args.work_dir)
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=proof), \
+             mock.patch.object(apply, "source_hashes", return_value=source_hashes), \
+             mock.patch.object(apply, "compile_templates", side_effect=self.compile_fixture):
+            apply.prepare_builtin_resume(args, granted_dir, fixture.grant_client())
+        granted_bundle = json.loads((granted_dir / "bundle.json").read_text())
+        record = json.loads((granted_dir / "authorization-link.json").read_text())
+        args.approved_authorization_sha256 = record["sha256"]
+        legacy = mock.Mock(work=granted_dir)
+        legacy.get.return_value = {"tags": {**proof["groupTags"], "orka-source-digest": granted_bundle["sourceDigest"]}}
+        granted_receipt = {}
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=proof), \
+             mock.patch.object(apply, "validate_builtin_roles"), mock.patch.object(apply, "finish_bootstrap"):
+            apply.resume_builtin_bootstrap(legacy, granted_bundle, granted_receipt, args)
+        _, assignments, role_objects = fixture.assignment_fixture()
+        granted_receipt["cleanupAssignments"] = {key: assignments["cleanupAssignments"][key]
+                                                for key in ("verification", "groupsRead")}
+        apply.write_json(granted_dir / "receipt.json", granted_receipt)
+        self.previous_dir = self.directory / "failed-original-preflight"
+        self.previous_dir.mkdir()
+        args.work_dir = str(self.previous_dir)
+        args.previous_work_dir = str(granted_dir)
+        args.continue_granted_bootstrap = True
+        source_hashes["scripts/remediation_aks_apply.py"] = "c" * 64
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=proof), \
+             mock.patch.object(apply, "source_hashes", return_value=source_hashes), \
+             mock.patch.object(apply, "compile_templates", side_effect=self.compile_fixture):
+            apply.prepare_builtin_resume(args, self.previous_dir, fixture.grant_client())
+        self.previous = json.loads((self.previous_dir / "bundle.json").read_text())
+        record = json.loads((self.previous_dir / "authorization-link.json").read_text())
+        args.approved_authorization_sha256 = record["sha256"]
+        legacy = mock.Mock(work=self.previous_dir)
+        legacy.get.return_value = {"tags": {**proof["groupTags"], "orka-source-digest": self.previous["sourceDigest"]}}
+        self.old = {}
+        with mock.patch.object(apply, "quota_blocked_proof", return_value=proof), \
+             mock.patch.object(apply, "validate_builtin_roles"), mock.patch.object(apply, "finish_bootstrap"):
+            apply.resume_builtin_bootstrap(legacy, self.previous, self.old, args)
+        self.failed_job = self.account + "/jobs/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        self.diag_job = self.account + "/jobs/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        self.passed_job = self.account + "/jobs/cccccccc-cccc-cccc-cccc-cccccccccccc"
+        self.old.update({"nodeScopeReady": False, "peeringScopeReady": False, "preflightJobId": self.failed_job})
+        apply.write_json(self.previous_dir / "receipt.json", self.old)
+        self.work = self.directory / "qualified"
+        self.work.mkdir()
+        self.preflight = self.directory / "corrected-preflight"
+        self.diagnostic = self.directory / "diagnostic"
+        self.preflight.mkdir()
+        self.diagnostic.mkdir()
+        args.work_dir = str(self.work)
+        args.previous_work_dir = str(self.previous_dir)
+        args.qualified_preflight_work_dir = str(self.preflight)
+        args.diagnostic_work_dir = str(self.diagnostic)
+        source_hashes["scripts/remediation_aks_apply.py"] = "d" * 64
+        original_hash = apply.sha((SOURCE / "cleanup-runbook.ps1").read_bytes())
+        old_hashes = {name: apply.sha((self.previous_dir / name).read_bytes())
+                      for name in ("bundle.json", "receipt.json", "authorization-link.json")}
+        self.request = {"properties": {"runbook": {"name": "ExactFoundationCleanup"},
+                                       "parameters": apply.runbook_parameters(self.previous, self.old)}}
+        apply.write_json(self.preflight / "job-request.json", self.request)
+        apply.write_json(self.preflight / "safe-output.json", apply.PREFLIGHT_PROOF)
+        self.passed = {
+            "phase": "corrected-preflight-passed", "jobId": self.passed_job, "jobStatus": "Completed",
+            "jobPutAttempts": 1, "sourceReviewClosed": True, "foundationInputs": old_hashes,
+            "foundationReceiptsUnchanged": True, "noPermissionScheduleComputeChanges": True,
+            "originalRunbookUnchanged": True, "originalRunbookSha256": original_hash,
+            "requestSha256": apply.sha((self.preflight / "job-request.json").read_bytes()),
+            "safeOutputSha256": apply.sha((self.preflight / "safe-output.json").read_bytes()),
+            "sourceDigest": apply.sha(apply.wire(source_hashes)),
+            "startTime": "2026-10-08T20:43:14.8073784+00:00", "endTime": "2026-10-08T20:43:19.3712445+00:00",
+        }
+        apply.write_json(self.preflight / "receipt.json", self.passed)
+        apply.write_json(self.preflight / "plan.json", {
+            "kind": "corrected-original-preflight-once", "subscriptionId": self.subscription,
+            "jobId": self.passed_job, "runbookId": self.account + "/runbooks/ExactFoundationCleanup",
+            "allowedJobPuts": 1, "preflightRuntimeLimitSeconds": apply.PREFLIGHT_EXECUTION_SECONDS,
+            "noGrantsOrSchedulesOrCompute": True, "foundationInputs": old_hashes,
+            "jobRequestSha256": self.passed["requestSha256"], "currentSourceHashes": source_hashes,
+            "currentSourceDigest": self.passed["sourceDigest"], "originalPublishedRunbookSha256": original_hash,
+            "expectedManifestDigest": apply.sha(apply.wire(apply.manifest(self.previous, self.old))),
+        })
+        self.diag_output = {"outcome": "diagnostic-succeeded"}
+        apply.write_json(self.diagnostic / "safe-output.json", self.diag_output)
+        apply.write_json(self.diagnostic / "receipt.json", {
+            "jobId": self.diag_job, "jobStatus": "Completed", "jobPutAttempts": 1, "sourceReviewClosed": True,
+            "runbookId": self.account + "/runbooks/" + apply.QUALIFIED_DIAGNOSTIC,
+            "runbookSHA256": apply.QUALIFIED_DIAGNOSTIC_SHA256,
+            "safeOutputSHA256": apply.sha((self.diagnostic / "safe-output.json").read_bytes()),
+            "originalRunbookUnchanged": True, "foundationRecordsUnchanged": True,
+        })
+        self.objects = copy.deepcopy(fixture.roles)
+        group_tags = {**tags, "orka-source-digest": self.previous["sourceDigest"]}
+        for key in ("verificationResourceGroupId", "cleanupResourceGroupId", "automationAccountId"):
+            identity = self.scope[key]
+            self.objects[identity] = {"id": identity, "tags": copy.deepcopy(tags if identity == self.account else group_tags)}
+        self.objects[self.account].update({
+            "properties": {"state": "Ok", "disableLocalAuth": True, "publicNetworkAccess": False},
+            "identity": {"type": "SystemAssigned", "tenantId": self.previous["tenantId"],
+                         "principalId": self.old["principalId"]}})
+        self.assignments = role_objects[:2]
+        self.objects.update({item["id"]: item for item in self.assignments})
+        self.text = {}
+        books = []
+        for name, content in (("ExactFoundationCleanup", (SOURCE / "cleanup-runbook.ps1").read_text()),
+                              (apply.QUALIFIED_DIAGNOSTIC, self.diagnostic_text + "\n")):
+            identity = self.account + "/runbooks/" + name
+            books.append({"id": identity})
+            self.objects[identity] = {"id": identity, "tags": {}, "properties": {
+                "state": "Published", "runbookType": "PowerShell", "runtimeEnvironment": "PowerShell74",
+                "logVerbose": False, "logProgress": False}}
+            self.text[identity + "/content"] = content
+        self.objects[self.account + "/runbooks"] = {"value": books}
+        self.objects[self.scope["cleanupResourceGroupId"] + "/resources"] = {"value": [{"id": self.account}, *books]}
+        self.objects[self.scope["verificationResourceGroupId"] + "/resources"] = {"value": []}
+        runtimes = {**apply.SYSTEM_RUNTIMES, "PowerShell74": ("PowerShell", "7.4")}
+        self.objects[self.account + "/runtimeEnvironments"] = {"value": [
+            {"id": self.account + "/runtimeEnvironments/" + name, "tags": {}, "properties": {
+                "runtime": {"language": language, "version": version}, "defaultPackages": {}}}
+            for name, (language, version) in runtimes.items()]}
+        for collection in ("schedules", "jobSchedules", "webhooks", "credentials", "connections", "variables",
+                           "certificates", "sourceControls", "watchers", "hybridRunbookWorkerGroups",
+                           "runtimeEnvironments/PowerShell74/packages"):
+            self.objects[self.account + "/" + collection] = {"value": []}
+        old_parameters = {"ManifestJson": apply.wire(apply.manifest(self.previous, self.old)).decode(), "Mode": "Preflight"}
+        for identity, book, state in ((self.failed_job, "ExactFoundationCleanup", "Failed"),
+                                       (self.diag_job, apply.QUALIFIED_DIAGNOSTIC, "Completed"),
+                                       (self.passed_job, "ExactFoundationCleanup", "Completed")):
+            self.objects[identity] = {"id": identity, "name": identity.rsplit("/", 1)[-1], "properties": {
+                "jobId": str(uuid.uuid4()), "runbook": {"name": book}, "status": state, "runOn": "",
+                "parameters": copy.deepcopy(self.request["properties"]["parameters"] if identity == self.passed_job else old_parameters),
+                "startTime": self.passed["startTime"], "endTime": self.passed["endTime"]}}
+        self.objects[self.account + "/jobs"] = {"value": [{"id": identity} for identity in
+                                                         (self.failed_job, self.diag_job, self.passed_job)]}
+        self.text[self.passed_job + "/output"] = json.dumps(apply.PREFLIGHT_PROOF)
+        self.text[self.diag_job + "/output"] = json.dumps(self.diag_output)
+        self.calls = []
+        self.writes = []
+        self.azure = apply.Azure(self.subscription, self.work, runner=self.runner)
+        self.before = {path: path.read_bytes() for path in self.directory.rglob("*.json")}
+
+    def compile_fixture(self, work):
+        result = {}
+        for name in (*apply.NEW_TEMPLATES, "main"):
+            apply.write_json(work / (name + ".arm.json"), {"resources": [], "fixture": name})
+            result[name] = apply.sha((work / (name + ".arm.json")).read_bytes())
+        return result
+
+    def runner(self, command, **_kwargs):
+        self.assertEqual(command[0], "az")
+        self.assertEqual(command[command.index("--subscription") + 1], self.subscription)
+        arguments = command[1:command.index("--subscription")]
+        self.calls.append(arguments)
+        result = None
+        if arguments[:2] == ["account", "show"]:
+            result = {"subscription": self.subscription, "tenant": self.previous["tenantId"], "environment": "AzureCloud"}
+        elif arguments[:2] == ["tag", "update"]:
+            identity = arguments[arguments.index("--resource-id") + 1]
+            self.assertIn(identity, (self.scope["verificationResourceGroupId"], self.scope["cleanupResourceGroupId"]))
+            self.assertEqual(arguments[arguments.index("--operation") + 1], "Merge")
+            tag = arguments[arguments.index("--tags") + 1]
+            self.assertTrue(tag.startswith("orka-source-digest="))
+            self.assertEqual(len(arguments) - arguments.index("--tags"), 2)
+            self.objects[identity]["tags"]["orka-source-digest"] = tag.split("=", 1)[1]
+            self.writes.append((identity, tag))
+            result = self.objects[identity]
+        else:
+            self.assertEqual(arguments[:3], ["rest", "--method", "GET"], "only-tag-merges-may-mutate")
+            uri = urlsplit(arguments[arguments.index("--url") + 1])
+            self.assertEqual(uri.scheme + "://" + uri.netloc, apply.ARM)
+            identity = uri.path
+            if identity.endswith("/roleAssignments") and "$filter" in parse_qs(uri.query):
+                result = {"value": self.assignments}
+            elif identity in self.text:
+                return SimpleNamespace(returncode=0, stdout=self.text[identity], stderr="")
+            elif identity in self.objects:
+                result = self.objects[identity]
+            else:
+                return SimpleNamespace(returncode=1, stdout="",
+                    stderr='ERROR: Not Found({"error":{"code":"ResourceNotFound"}})')
+        return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr="")
+
+    def prepare(self):
+        with mock.patch.object(apply, "compile_templates", side_effect=self.compile_fixture):
+            apply.prepare_qualified_bootstrap(self.args, self.work, self.azure)
+        self.bundle = json.loads((self.work / "bundle.json").read_text())
+        self.link = json.loads((self.work / "authorization-link.json").read_text())
+        self.calls.clear()
+
+    def adopt(self, approved=None, reviewed=None):
+        arguments = ["apply", "adopt-qualified-bootstrap", "--subscription", self.subscription,
+            "--control-vnet-id", self.scope["controlVnetId"], "--control-aks-id", self.scope["controlClusterId"],
+            "--work-dir", str(self.work), "--reviewed-source-sha256", reviewed or self.bundle["sourceDigest"],
+            "--approved-authorization-sha256", approved or self.link["sha256"]]
+        with mock.patch.object(sys, "argv", arguments), mock.patch.object(apply, "Azure", return_value=self.azure):
+            apply.main()
+
+    def fail_get_once_after_merges(self, count, suffix=None):
+        fault = {"fired": False}
+
+        def transient_get(command, **kwargs):
+            if command[1:4] == ["rest", "--method", "GET"]:
+                identity = urlsplit(command[command.index("--url") + 1]).path
+                if ((self.work / "receipt.json").exists() and len(self.writes) == count and not fault["fired"] and
+                        (suffix is None or identity.endswith(suffix))):
+                    fault["fired"] = True
+                    return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: transient read unavailable")
+            return self.runner(command, **kwargs)
+
+        self.azure.runner = transient_get
+        return fault
+
+    def test_read_only_plan_and_real_adopt_path_only_merge_two_current_digest_tags(self):
+        self.prepare()
+        self.assertFalse(self.writes)
+        self.assertFalse((self.work / "receipt.json").exists())
+        before_account = copy.deepcopy(self.objects[self.account])
+        self.adopt()
+        receipt = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(receipt["phase"], "bootstrap-ready")
+        self.assertEqual(receipt["preflightJobId"], self.passed_job)
+        self.assertEqual(receipt["preflightCompleted"], self.passed["endTime"])
+        self.assertEqual(receipt["cleanupAssignments"], self.old["cleanupAssignments"])
+        self.assertNotIn("T0", receipt)
+        self.assertNotIn("deadline", receipt)
+        self.assertEqual(self.objects[self.account], before_account)
+        self.assertEqual(self.writes, [(self.scope[key], "orka-source-digest=" + self.bundle["sourceDigest"])
+                                      for key in ("verificationResourceGroupId", "cleanupResourceGroupId")])
+        self.assertTrue(all(path.read_bytes() == data for path, data in self.before.items()))
+        self.assertNotEqual(self.bundle["sourceDigest"], self.previous["sourceDigest"])
+        self.assertEqual(self.bundle["compiledHashes"], self.previous["compiledHashes"])
+        with self.assertRaisesRegex(apply.Failure, "qualified-receipt-reentry-mismatch"):
+            self.adopt()
+        self.assertEqual(len(self.writes), 2)
+
+    def test_adopt_rejects_unapproved_or_changed_source_before_mutation(self):
+        self.prepare()
+        for kind in ("approval", "source"):
+            with self.subTest(kind=kind), self.assertRaises(apply.Failure):
+                self.adopt(approved="f" * 64 if kind == "approval" else None,
+                           reviewed="f" * 64 if kind == "source" else None)
+            self.assertFalse(self.writes)
+            self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_job_identity_status_encoded_parameters_and_exact_original_output_are_required(self):
+        self.prepare()
+        baseline = copy.deepcopy(self.objects[self.passed_job])
+        output = self.text[self.passed_job + "/output"]
+        for change in ("failed", "foreign-id", "foreign-name", "diagnostic-book", "decoded-instead-of-encoded",
+                       "other-manifest", "other-mode", "extra-parameter", "other-time", "hybrid-target",
+                       "diagnostic-proof", "partial-proof", "numeric-booleans", "extra-proof-field"):
+            with self.subTest(change=change):
+                job = self.objects[self.passed_job]
+                properties = job["properties"]
+                if change == "failed":
+                    properties["status"] = "Failed"
+                elif change == "foreign-id":
+                    job["id"] = self.diag_job
+                elif change == "foreign-name":
+                    job["name"] = self.diag_job.rsplit("/", 1)[-1]
+                elif change == "diagnostic-book":
+                    properties["runbook"]["name"] = apply.QUALIFIED_DIAGNOSTIC
+                elif change == "decoded-instead-of-encoded":
+                    properties["parameters"] = {key: json.loads(value) for key, value in properties["parameters"].items()}
+                elif change == "other-manifest":
+                    properties["parameters"]["ManifestJson"] = apply.wire("{}").decode()
+                elif change == "other-mode":
+                    properties["parameters"]["Mode"] = apply.wire("Cleanup").decode()
+                elif change == "extra-parameter":
+                    properties["parameters"]["LibraryOnly"] = "true"
+                elif change == "other-time":
+                    properties["endTime"] = "2026-10-08T20:44:19Z"
+                elif change == "hybrid-target":
+                    properties["runOn"] = "foreign"
+                else:
+                    value = dict(apply.PREFLIGHT_PROOF)
+                    if change == "diagnostic-proof":
+                        value = self.diag_output
+                    elif change == "partial-proof":
+                        value.pop("principalMatched")
+                    elif change == "numeric-booleans":
+                        value["principalMatched"] = 1
+                    else:
+                        value["extra"] = True
+                    self.text[self.passed_job + "/output"] = json.dumps(value)
+                with self.assertRaises(apply.Failure):
+                    self.adopt()
+                self.assertFalse(self.writes)
+                self.assertFalse((self.work / "receipt.json").exists())
+                self.objects[self.passed_job] = copy.deepcopy(baseline)
+                self.text[self.passed_job + "/output"] = output
+
+    def test_all_live_inventories_and_unarmed_ownership_are_fail_closed(self):
+        self.prepare()
+        for collection in ("jobs", "runbooks", "runtimeEnvironments", "schedules", "jobSchedules", "webhooks",
+                           "credentials", "connections", "variables", "certificates", "sourceControls", "watchers",
+                           "hybridRunbookWorkerGroups", "runtimeEnvironments/PowerShell74/packages"):
+            for kind in ("extra", "pagination"):
+                identity = self.account + "/" + collection
+                baseline = copy.deepcopy(self.objects[identity])
+                with self.subTest(collection=collection, kind=kind):
+                    if kind == "extra":
+                        self.objects[identity]["value"].append({"id": identity + "/unapproved"})
+                    else:
+                        self.objects[identity]["nextLink"] = apply.ARM + identity + "?next=true"
+                    with self.assertRaises(apply.Failure):
+                        self.adopt()
+                    self.assertFalse(self.writes)
+                    self.assertFalse((self.work / "receipt.json").exists())
+                    self.objects[identity] = baseline
+        for key in ("verificationResourceGroupId", "cleanupResourceGroupId"):
+            identity = self.scope[key] + "/resources"
+            self.objects[identity]["value"].append({"id": self.scope[key] + "/providers/Microsoft.Compute/virtualMachines/foreign"})
+            with self.subTest(group=key), self.assertRaises(apply.Failure):
+                self.adopt()
+            self.objects[identity]["value"].pop()
+        self.objects[self.scope["managedNodeResourceGroupId"]] = {"id": self.scope["managedNodeResourceGroupId"]}
+        with self.assertRaises(apply.Failure):
+            self.adopt()
+        del self.objects[self.scope["managedNodeResourceGroupId"]]
+        for field, value in (("orka-budget-start-utc", "active"), ("orka-expires-at-utc", "active"),
+                             ("orka-owner", "foreign"), ("orka-source-digest", "f" * 64)):
+            tags = self.objects[self.scope["verificationResourceGroupId"]]["tags"]
+            before = tags[field]
+            tags[field] = value
+            with self.subTest(field=field), self.assertRaises(apply.Failure):
+                self.adopt()
+            tags[field] = before
+        self.assertFalse(self.writes)
+
+    def test_role_and_principal_changes_are_rejected_at_the_real_adopt_path(self):
+        self.prepare()
+        before = copy.deepcopy(self.assignments)
+        for change in ("extra", "missing", "scope", "principal", "condition", "builtin-wildcard", "identity"):
+            with self.subTest(change=change):
+                objects = copy.deepcopy(self.objects)
+                if change == "extra":
+                    self.assignments.append(copy.deepcopy(self.assignments[0]))
+                elif change == "missing":
+                    self.assignments.pop()
+                elif change in ("scope", "principal", "condition"):
+                    field = {"scope": "scope", "principal": "principalId", "condition": "condition"}[change]
+                    self.assignments[0]["properties"][field] = "unapproved"
+                elif change == "identity":
+                    self.objects[self.account]["identity"]["principalId"] = "99999999-9999-9999-9999-999999999999"
+                else:
+                    role = self.assignments[0]["properties"]["roleDefinitionId"]
+                    self.objects[role]["properties"]["permissions"][0]["actions"].append("*")
+                with self.assertRaises(apply.Failure):
+                    self.adopt()
+                self.assertFalse(self.writes)
+                self.objects = objects
+                self.assignments = copy.deepcopy(before)
+
+    def test_published_source_and_pinned_private_evidence_cannot_be_substituted(self):
+        self.prepare()
+        for name in ("ExactFoundationCleanup", apply.QUALIFIED_DIAGNOSTIC):
+            key = self.account + "/runbooks/" + name + "/content"
+            before = self.text[key]
+            self.text[key] = before + "# changed\n"
+            with self.subTest(book=name), self.assertRaises(apply.Failure):
+                self.adopt()
+            self.text[key] = before
+        for path in (self.previous_dir / "bundle.json", self.previous_dir / "receipt.json",
+                     self.previous_dir / "authorization-link.json", self.previous_dir / "compute-inputs.json",
+                     self.previous_dir / "main.arm.json",
+                     self.preflight / "plan.json", self.preflight / "job-request.json",
+                     self.preflight / "receipt.json", self.preflight / "safe-output.json",
+                     self.diagnostic / "receipt.json", self.diagnostic / "safe-output.json"):
+            before = path.read_bytes()
+            path.write_bytes(before + b" ")
+            with self.subTest(file=path.name), self.assertRaises(apply.Failure):
+                self.adopt()
+            path.write_bytes(before)
+        self.assertFalse(self.writes)
+        self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_partial_tag_merges_retry_same_exact_intent_without_remerging(self):
+        self.prepare()
+        baseline = copy.deepcopy(self.objects)
+        link_bytes = (self.work / "authorization-link.json").read_bytes()
+        bundle_bytes = (self.work / "bundle.json").read_bytes()
+        for completed in (0, 1, 2):
+            with self.subTest(completed=completed):
+                self.objects = copy.deepcopy(baseline)
+                self.writes.clear()
+                (self.work / "receipt.json").unlink(missing_ok=True)
+                fault = self.fail_get_once_after_merges(completed)
+                with self.assertRaisesRegex(apply.Failure, "azure-command-failed"):
+                    self.adopt()
+                self.assertTrue(fault["fired"])
+                intent = json.loads((self.work / "receipt.json").read_text())
+                self.assertEqual(intent["phase"], "qualified-bootstrap-intent")
+                self.assertNotIn("preflightCompleted", intent)
+                self.assertNotIn("T0", intent)
+                self.assertEqual(len(self.writes), completed)
+                self.adopt()
+                receipt = json.loads((self.work / "receipt.json").read_text())
+                self.assertEqual(receipt["phase"], "bootstrap-ready")
+                self.assertEqual(receipt["preflightJobId"], self.passed_job)
+                self.assertEqual(receipt["preflightCompleted"], self.passed["endTime"])
+                self.assertEqual(self.writes, [
+                    (self.scope[key], "orka-source-digest=" + self.bundle["sourceDigest"])
+                    for key in ("verificationResourceGroupId", "cleanupResourceGroupId")])
+                self.assertEqual((self.work / "authorization-link.json").read_bytes(), link_bytes)
+                self.assertEqual((self.work / "bundle.json").read_bytes(), bundle_bytes)
+                self.assertTrue(all(path.read_bytes() == data for path, data in self.before.items()))
+
+    def test_transient_final_recheck_retries_without_any_new_merge(self):
+        self.prepare()
+        fault = self.fail_get_once_after_merges(2, suffix="/runtimeEnvironments")
+        with self.assertRaisesRegex(apply.Failure, "azure-command-failed"):
+            self.adopt()
+        self.assertTrue(fault["fired"])
+        receipt = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(receipt["phase"], "qualified-bootstrap-intent")
+        self.assertNotIn("preflightCompleted", receipt)
+        self.assertNotIn("T0", receipt)
+        writes = list(self.writes)
+        self.assertEqual(len(writes), 2)
+        self.adopt()
+        self.assertEqual(self.writes, writes)
+        self.assertEqual(json.loads((self.work / "receipt.json").read_text())["phase"], "bootstrap-ready")
+
+    def test_retry_checks_each_group_independently_and_skips_new_second_group(self):
+        self.prepare()
+        self.fail_get_once_after_merges(0)
+        with self.assertRaisesRegex(apply.Failure, "azure-command-failed"):
+            self.adopt()
+        cleanup = self.scope["cleanupResourceGroupId"]
+        self.objects[cleanup]["tags"]["orka-source-digest"] = self.bundle["sourceDigest"]
+        self.adopt()
+        self.assertEqual(self.writes, [
+            (self.scope["verificationResourceGroupId"], "orka-source-digest=" + self.bundle["sourceDigest"])])
+        self.assertEqual(json.loads((self.work / "receipt.json").read_text())["phase"], "bootstrap-ready")
+
+    def test_retry_requires_byte_exact_intent_and_only_old_or_approved_group_tags(self):
+        self.prepare()
+        self.fail_get_once_after_merges(1)
+        with self.assertRaisesRegex(apply.Failure, "azure-command-failed"):
+            self.adopt()
+        original = (self.work / "receipt.json").read_bytes()
+        intent = json.loads(original)
+        variants = [original + b"\n", (json.dumps(intent, sort_keys=True, indent=2) + "\n").encode(), b"{}\n"]
+        for change in ("approval", "input-hash", "source", "phase", "completion", "clock", "extra"):
+            changed = copy.deepcopy(intent)
+            if change == "approval":
+                changed["qualificationOf"]["approvalLinkSha256"] = "f" * 64
+            elif change == "input-hash":
+                changed["qualificationOf"]["inputHashes"]["preflight"]["safe-output.json"] = "f" * 64
+            elif change == "source":
+                changed["sourceDigest"] = "f" * 64
+            elif change == "phase":
+                changed["phase"] = "bootstrap-ready"
+            elif change == "completion":
+                changed["preflightCompleted"] = self.passed["endTime"]
+            elif change == "clock":
+                changed["T0"] = self.passed["endTime"]
+            else:
+                changed["unapproved"] = True
+            variants.append((json.dumps(changed, indent=2) + "\n").encode())
+        for index, raw in enumerate(variants):
+            with self.subTest(receipt_variant=index):
+                (self.work / "receipt.json").write_bytes(raw)
+                with self.assertRaises(apply.Failure):
+                    self.adopt()
+                self.assertEqual(len(self.writes), 1)
+                self.assertEqual((self.work / "receipt.json").read_bytes(), raw)
+        (self.work / "receipt.json").write_bytes(original)
+        for key in ("verificationResourceGroupId", "cleanupResourceGroupId"):
+            for tag, value in (("orka-source-digest", "e" * 64), ("orka-owner", "unapproved"),
+                               ("orka-expires-at-utc", "active"), ("extra-tag", "unapproved")):
+                tags = self.objects[self.scope[key]]["tags"]
+                previous = copy.deepcopy(tags)
+                tags[tag] = value
+                with self.subTest(group=key, tag=tag), self.assertRaises(apply.Failure):
+                    self.adopt()
+                self.objects[self.scope[key]]["tags"] = previous
+                self.assertEqual(len(self.writes), 1)
+                self.assertEqual((self.work / "receipt.json").read_bytes(), original)
+        with self.assertRaises(apply.Failure):
+            self.adopt(approved="f" * 64)
+        self.assertEqual(len(self.writes), 1)
+        self.adopt()
+        self.assertEqual(len(self.writes), 2)
+
+    def test_promoted_group_without_exact_intent_is_not_fresh_adoption(self):
+        self.prepare()
+        self.objects[self.scope["verificationResourceGroupId"]]["tags"]["orka-source-digest"] = self.bundle["sourceDigest"]
+        with self.assertRaisesRegex(apply.Failure, "qualified-ownership-or-clock-drift"):
+            self.adopt()
+        self.assertFalse(self.writes)
+        self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_late_child_or_runtime_change_after_second_merge_prevents_finalization(self):
+        self.prepare()
+        baseline = copy.deepcopy(self.objects)
+        for collection in ("schedules", "jobs", "runtime-properties"):
+            with self.subTest(collection=collection):
+                self.objects = copy.deepcopy(baseline)
+                self.writes.clear()
+                (self.work / "receipt.json").unlink(missing_ok=True)
+
+                def create_after_merge(command, **kwargs):
+                    result = self.runner(command, **kwargs)
+                    if command[1:3] == ["tag", "update"] and len(self.writes) == 2:
+                        if collection == "runtime-properties":
+                            runtime = self.objects[self.account + "/runtimeEnvironments"]["value"][0]
+                            runtime["properties"]["description"] = "changed-between-runtime-reads"
+                        else:
+                            self.objects[self.account + "/" + collection]["value"].append({
+                                "id": self.account + "/" + collection + "/unapproved-late-child"})
+                    return result
+
+                self.azure.runner = create_after_merge
+                with self.assertRaises(apply.Failure):
+                    self.adopt()
+                receipt = json.loads((self.work / "receipt.json").read_text())
+                self.assertEqual(receipt["phase"], "qualified-bootstrap-intent")
+                self.assertNotIn("preflightCompleted", receipt)
+                self.assertNotIn("T0", receipt)
+                self.assertEqual(len(self.writes), 2)
+
+    def test_same_id_system_runtime_projection_properties_change_rejects_adoption(self):
+        self.prepare()
+        catalogue = self.objects[self.account + "/runtimeEnvironments"]["value"]
+        runtime = next(item for item in catalogue if item["id"].endswith("/PowerShell-5.1"))
+        identity = runtime["id"]
+        runtime["properties"]["description"] = "changed-system-projection"
+        with self.assertRaisesRegex(apply.Failure, "qualified-approved-proof-drift"):
+            self.adopt()
+        self.assertEqual(runtime["id"], identity)
+        self.assertFalse(self.writes)
+        self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_live_diagnostic_output_change_rejects_adoption(self):
+        self.prepare()
+        self.text[self.diag_job + "/output"] = json.dumps({"outcome": "diagnostic-failed"})
+        with self.assertRaisesRegex(apply.Failure, "qualified-diagnostic-output-drift"):
+            self.adopt()
+        self.assertFalse(self.writes)
+        self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_templates_and_compute_inputs_may_not_change_with_the_handoff(self):
+        original = self.compile_fixture
+        def different(work):
+            result = original(work)
+            result["main"] = "f" * 64
+            return result
+        with mock.patch.object(apply, "compile_templates", side_effect=different), \
+             self.assertRaisesRegex(apply.Failure, "compiled-footprint"):
+            apply.prepare_qualified_bootstrap(self.args, self.work, self.azure)
+        self.assertFalse((self.work / "bundle.json").exists())
+        self.prepare()
+        values = json.loads((self.work / "compute-inputs.json").read_text())
+        values["newUnapprovedCompute"] = True
+        apply.write_json(self.work / "compute-inputs.json", values)
+        with self.assertRaises(apply.Failure):
+            self.adopt()
+        self.assertFalse(self.writes)
 
 
 class RecoveryPlanTests(unittest.TestCase):

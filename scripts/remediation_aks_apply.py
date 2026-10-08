@@ -47,6 +47,17 @@ PREFLIGHT_QUEUE_ALLOWANCE_SECONDS = 600
 PREFLIGHT_EXECUTION_SECONDS = 600
 ASSIGNMENT_READBACK_SECONDS = 120
 ACR_PULL_ROLE = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+QUALIFIED_DIAGNOSTIC = "ExactFoundationPreflightDiag542"
+QUALIFIED_DIAGNOSTIC_SHA256 = "068e68640c1a982e9eecf8eaeca474cfff3c33087002d3a47c4ae6e85e7eaac9"
+# These six read-only projections are created by the service, not our template:
+# https://learn.microsoft.com/azure/automation/runtime-environment-overview#system-generated-runtime-environments
+SYSTEM_RUNTIMES = {
+    "PowerShell-5.1": ("PowerShell", "5.1"), "PowerShell-7.1": ("PowerShell", "7.1"),
+    "PowerShell-7.2": ("PowerShell", "7.2"), "Python-2.7": ("Python", "2.7"),
+    "Python-3.8": ("Python", "3.8"), "Python-3.10": ("Python", "3.10"),
+}
+PREFLIGHT_PROOF = {"outcome": "preflight-succeeded", "principalMatched": True,
+                   "coreDeleteAuthority": True, "postDeleteGroupRead": True, "postDeletePeeringRead": True}
 
 
 def missing_azure_response(stderr, rest):
@@ -794,6 +805,361 @@ def resume_builtin_bootstrap(azure, bundle, receipt, args):
     finish_bootstrap(azure, bundle, receipt)
 
 
+def qualified_bootstrap_inputs(args, paths):
+    work = plan.private_path(args.work_dir)
+    directories = {name: plan.private_path(path) for name, path in paths.items()}
+    require(set(directories) == {"previous", "preflight", "diagnostic"} and
+            len(set(directories.values())) == 3 and
+            all(not work.is_relative_to(path) and not path.is_relative_to(work) for path in directories.values()),
+            "fresh-qualified-bootstrap-directory-required")
+    filenames = {"previous": ("bundle.json", "receipt.json", "authorization-link.json"),
+                 "preflight": ("plan.json", "job-request.json", "receipt.json", "safe-output.json"),
+                 "diagnostic": ("receipt.json", "safe-output.json")}
+    hashes, records = {}, {}
+    for name, directory in directories.items():
+        hashes[name], records[name] = {}, {}
+        for filename in filenames[name]:
+            raw = (directory / filename).read_bytes()
+            hashes[name][filename] = sha(raw)
+            records[name][filename] = json.loads(raw)
+    previous = records["previous"]["bundle.json"]
+    old = records["previous"]["receipt.json"]
+    record = records["previous"]["authorization-link.json"]
+    link = record["plan"]
+    require(record["sha256"] == sha(wire(link)) and link["kind"] == "builtin-prepublication-continuation" and
+            link["authorizationModel"] == AUTHORIZATION_MODEL and
+            link["nextSourceDigest"] == previous["sourceDigest"], "qualified-continuation-link-required")
+    origin_work, origin, origin_receipt, tags = granted_bootstrap_inputs(args, link["previousWorkDir"])
+    for filename, key in (("bundle.json", "previousBundleSha256"), ("receipt.json", "previousReceiptSha256"),
+                          ("authorization-link.json", "previousLinkSha256")):
+        require(sha((origin_work / filename).read_bytes()) == link[key], "qualified-origin-record-drift")
+    require(link["previousSourceDigest"] == origin["sourceDigest"] and
+            previous["version"] == 1 and previous.get("authorizationModel") == AUTHORIZATION_MODEL and
+            previous["roleGuids"] == builtin_role_guids() and
+            sha(wire(previous["sourceHashes"])) == previous["sourceDigest"] and
+            all(previous[key] == origin[key] for key in (
+                "subscriptionId", "tenantId", "scope", "suffix", "owner", "cleanupReceipt",
+                "controlKubeletIdentity", "publicKeyReady")), "qualified-origin-bundle-drift")
+    values = json.loads((origin_work / "compute-inputs.json").read_text())
+    values["sourceDigest"] = previous["sourceDigest"]
+    require(json.loads((directories["previous"] / "compute-inputs.json").read_text()) == values and
+            sha((directories["previous"] / "compute-inputs.json").read_bytes()) == previous["computeInputsSha256"],
+            "qualified-pending-compute-inputs-required")
+    require(set(previous["compiledHashes"]) == {*NEW_TEMPLATES, "main"}, "qualified-template-set-drift")
+    for name, digest in previous["compiledHashes"].items():
+        require(sha((directories["previous"] / (name + ".arm.json")).read_bytes()) == digest,
+                "qualified-previous-template-drift")
+    account = previous["scope"]["automationAccountId"]
+    failed_job = old.get("preflightJobId", "")
+    require(failed_job.startswith(account + "/jobs/") and
+            plan.UUID.fullmatch(failed_job.removeprefix(account + "/jobs/")), "qualified-failed-job-id-required")
+    require(old == {
+        "phase": "authorization-transition-intent", "subscriptionId": previous["subscriptionId"],
+        "cleanupReceipt": previous["cleanupReceipt"], "sourceDigest": previous["sourceDigest"],
+        "principalId": origin_receipt["principalId"], "authorizationModel": AUTHORIZATION_MODEL,
+        "authorizationOf": {"previousSourceDigest": origin["sourceDigest"],
+            "previousReceiptSha256": link["previousReceiptSha256"], "authorizationLinkSha256": record["sha256"]},
+        "cleanupAssignments": origin_receipt["cleanupAssignments"], "nodeScopeReady": False,
+        "peeringScopeReady": False, "preflightJobId": failed_job,
+    }, "only-unarmed-failed-preflight-intent-supported")
+    require(link["proof"]["accountTags"] == tags, "qualified-account-tag-origin-drift")
+    passed = records["preflight"]["receipt.json"]
+    approved = records["preflight"]["plan.json"]
+    request = records["preflight"]["job-request.json"]
+    diagnostic = records["diagnostic"]["receipt.json"]
+    original_book = account + "/runbooks/ExactFoundationCleanup"
+    diagnostic_book = account + "/runbooks/" + QUALIFIED_DIAGNOSTIC
+    for evidence in (passed, diagnostic):
+        require(evidence["jobId"].startswith(account + "/jobs/") and
+                plan.UUID.fullmatch(evidence["jobId"].removeprefix(account + "/jobs/")) and
+                evidence["jobStatus"] == "Completed" and evidence["jobPutAttempts"] == 1 and
+                evidence["sourceReviewClosed"] is True, "qualified-completed-reviewed-job-required")
+    require(len({failed_job, passed["jobId"], diagnostic["jobId"]}) == 3, "qualified-three-distinct-jobs-required")
+    source_key = "config/development/remediation-aks/cleanup-runbook.ps1"
+    require(approved["kind"] == "corrected-original-preflight-once" and
+            approved["subscriptionId"] == previous["subscriptionId"] and
+            approved["jobId"] == passed["jobId"] and approved["runbookId"] == original_book and
+            approved["allowedJobPuts"] == 1 and approved["preflightRuntimeLimitSeconds"] == PREFLIGHT_EXECUTION_SECONDS and
+            approved["noGrantsOrSchedulesOrCompute"] is True and
+            approved["foundationInputs"] == passed["foundationInputs"] == hashes["previous"] and
+            approved["jobRequestSha256"] == passed["requestSha256"] == hashes["preflight"]["job-request.json"] and
+            passed["safeOutputSha256"] == hashes["preflight"]["safe-output.json"] and
+            passed["phase"] == "corrected-preflight-passed" and
+            passed["foundationReceiptsUnchanged"] is True and passed["noPermissionScheduleComputeChanges"] is True and
+            passed["originalRunbookUnchanged"] is True, "qualified-corrected-preflight-evidence-mismatch")
+    require(approved["currentSourceDigest"] == passed["sourceDigest"] ==
+            sha(wire(approved["currentSourceHashes"])) and
+            approved["originalPublishedRunbookSha256"] == passed["originalRunbookSha256"] ==
+            previous["sourceHashes"][source_key] == sha((SOURCE / "cleanup-runbook.ps1").read_bytes()),
+            "qualified-published-source-drift")
+    current = source_hashes()
+    allowed_changes = {"scripts/remediation_aks_apply.py", "config/development/remediation-aks/README.md"}
+    require(set(current) == set(approved["currentSourceHashes"]) == set(previous["sourceHashes"]) and
+            all(current[key] == approved["currentSourceHashes"][key] == previous["sourceHashes"][key]
+                for key in current if key not in allowed_changes), "qualified-resource-source-footprint-drift")
+    require(request == {"properties": {"runbook": {"name": "ExactFoundationCleanup"},
+                                      "parameters": runbook_parameters(previous, old)}} and
+            approved["expectedManifestDigest"] == sha(wire(manifest(previous, old))) and
+            wire(records["preflight"]["safe-output.json"]) == wire(PREFLIGHT_PROOF),
+            "qualified-original-preflight-proof-required")
+    require(diagnostic["runbookId"] == diagnostic_book and
+            diagnostic["runbookSHA256"] == QUALIFIED_DIAGNOSTIC_SHA256 and
+            diagnostic["safeOutputSHA256"] == hashes["diagnostic"]["safe-output.json"] and
+            diagnostic["originalRunbookUnchanged"] is True and diagnostic["foundationRecordsUnchanged"] is True and
+            records["diagnostic"]["safe-output.json"].get("outcome") == "diagnostic-succeeded",
+            "qualified-diagnostic-provenance-mismatch")
+    return previous, old, tags, records, hashes
+
+
+def qualified_collection(azure, identity, version=AUTO_API):
+    result = azure.get(identity, version)
+    require(isinstance(result, dict) and isinstance(result.get("value"), list) and not result.get("nextLink"),
+            "qualified-inventory-incomplete")
+    items = result["value"]
+    require(all(isinstance(item, dict) and isinstance(item.get("id"), str) for item in items) and
+            len({item["id"].lower() for item in items}) == len(items), "qualified-inventory-identity-drift")
+    return items
+
+
+def qualified_content(azure, identity, expected):
+    content = azure.rest("GET", identity + "/content", AUTO_API, raw=True).replace("\r\n", "\n")
+    require(len(content) <= 65536, "qualified-published-content-too-large")
+    # Automation's text upload can add one final newline. Do not normalize code.
+    normalization = "none"
+    if sha(content.encode()) != expected and content.endswith("\n"):
+        content = content[:-1]
+        normalization = "one-transport-newline"
+    require(sha(content.encode()) == expected, "qualified-published-content-mismatch")
+    return {"sourceSha256": expected, "normalization": normalization}
+
+
+def qualified_bootstrap_proof(azure, previous, old, tags, records, group_digest=None, promoted_group_digest=None):
+    scope = previous["scope"]
+    account = scope["automationAccountId"]
+    group_tags = {**tags, "orka-source-digest": group_digest or previous["sourceDigest"]}
+    group_sources = {}
+    require(tags.get("orka-budget-start-utc") == tags.get("orka-expires-at-utc") == "pending",
+            "qualified-unarmed-tags-required")
+    for key in ("verificationResourceGroupId", "cleanupResourceGroupId", "automationAccountId"):
+        resource = azure.get(scope[key], AUTO_API if key == "automationAccountId" else "2024-03-01")
+        owned(resource, scope, previous["owner"], previous["cleanupReceipt"], scope[key])
+        if key == "automationAccountId":
+            require(resource["tags"] == tags, "qualified-ownership-or-clock-drift")
+            require(resource["properties"]["state"] == "Ok" and
+                    resource["properties"]["disableLocalAuth"] is True and
+                    resource["properties"]["publicNetworkAccess"] is False, "qualified-account-boundary-drift")
+        else:
+            permitted_tags = [group_tags]
+            if promoted_group_digest is not None:
+                permitted_tags.append({**group_tags, "orka-source-digest": promoted_group_digest})
+            require(resource["tags"] in permitted_tags, "qualified-ownership-or-clock-drift")
+            group_sources[scope[key]] = resource["tags"]["orka-source-digest"]
+    require(account_identity(azure, previous, old) == old["principalId"], "qualified-principal-drift")
+    validate_builtin_roles(azure, previous)
+    expected_assignments = cleanup_assignment_scopes(previous)
+    for key, (assignment_scope, role_name) in expected_assignments.items():
+        identity = old["cleanupAssignments"][key]
+        role = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + \
+            previous["roleGuids"][role_name]
+        assignment_readback(azure.get(identity, "2022-04-01"), {"properties": {
+            "principalId": old["principalId"], "roleDefinitionId": role}}, assignment_scope)
+    audit_cleanup_assignments(azure, previous, old, expected_assignments, complete=True)
+    require(qualified_collection(azure, scope["verificationResourceGroupId"] + "/resources", "2021-04-01") == [] and
+            azure.get(scope["managedNodeResourceGroupId"], "2024-03-01", absent=True) is None,
+            "qualified-empty-verification-footprint-required")
+    books = {account + "/runbooks/ExactFoundationCleanup": records["preflight"]["receipt.json"]["originalRunbookSha256"],
+             account + "/runbooks/" + QUALIFIED_DIAGNOSTIC: QUALIFIED_DIAGNOSTIC_SHA256}
+    runtime_id = account + "/runtimeEnvironments/PowerShell74"
+    resources = qualified_collection(azure, scope["cleanupResourceGroupId"] + "/resources", "2021-04-01")
+    require(account.lower() in {item["id"].lower() for item in resources} and
+            {item["id"].lower() for item in resources} <= {item.lower() for item in (account, runtime_id, *books)},
+            "qualified-foreign-cleanup-resource")
+    listed_books = qualified_collection(azure, account + "/runbooks")
+    require({item["id"].lower() for item in listed_books} == {item.lower() for item in books},
+            "qualified-runbook-inventory-drift")
+    contents = {}
+    for identity, digest in books.items():
+        book = azure.get(identity, AUTO_API)
+        require(book["id"].lower() == identity.lower() and not book.get("tags") and
+                book["properties"]["state"] == "Published" and
+                book["properties"]["runbookType"] == "PowerShell" and
+                book["properties"]["runtimeEnvironment"] == "PowerShell74" and
+                book["properties"].get("logVerbose") is False and book["properties"].get("logProgress") is False,
+                "qualified-runbook-metadata-drift")
+        contents[identity] = qualified_content(azure, identity, digest)
+    runtimes = {**SYSTEM_RUNTIMES, "PowerShell74": ("PowerShell", "7.4")}
+    catalogue = qualified_collection(azure, account + "/runtimeEnvironments")
+    require({item["id"].lower() for item in catalogue} ==
+            {(account + "/runtimeEnvironments/" + name).lower() for name in runtimes},
+            "qualified-runtime-inventory-drift")
+    runtime_proof = {}
+    for item in catalogue:
+        name = item["id"].rsplit("/", 1)[-1]
+        require(name in runtimes and not item.get("tags") and
+                item["properties"]["runtime"] == dict(zip(("language", "version"), runtimes[name])) and
+                (name != "PowerShell74" or not item["properties"].get("defaultPackages")),
+                "qualified-runtime-definition-drift")
+        runtime_proof[name] = sha(wire(item["properties"]))
+    for collection in ("schedules", "jobSchedules", "webhooks", "credentials", "connections", "variables",
+                       "certificates", "sourceControls", "watchers", "hybridRunbookWorkerGroups",
+                       "runtimeEnvironments/PowerShell74/packages"):
+        require(qualified_collection(azure, account + "/" + collection) == [], "qualified-unexpected-child")
+    for guid in role_guids(scope).values():
+        identity = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/{guid}"
+        require(azure.get(identity, "2022-04-01", absent=True) is None, "qualified-legacy-custom-role-present")
+    passed = records["preflight"]["receipt.json"]
+    diagnostic = records["diagnostic"]["receipt.json"]
+    expected_jobs = {old["preflightJobId"]: ("ExactFoundationCleanup", "Failed"),
+                     diagnostic["jobId"]: (QUALIFIED_DIAGNOSTIC, "Completed"),
+                     passed["jobId"]: ("ExactFoundationCleanup", "Completed")}
+    require({item["id"].lower() for item in qualified_collection(azure, account + "/jobs")} ==
+            {identity.lower() for identity in expected_jobs}, "qualified-job-inventory-drift")
+    jobs = {}
+    old_parameters = {"ManifestJson": wire(manifest(previous, old)).decode(), "Mode": "Preflight"}
+    for identity, (book, status) in expected_jobs.items():
+        job = azure.get(identity, AUTO_API)
+        properties = job["properties"]
+        require(job["id"].lower() == identity.lower() and job["name"] == identity.rsplit("/", 1)[-1] and
+                properties["runbook"] == {"name": book} and properties["status"] == status and
+                not properties.get("runOn") and isinstance(properties.get("jobId"), str) and
+                plan.UUID.fullmatch(properties["jobId"]), "qualified-job-identity-or-status-drift")
+        parameters = runbook_parameters(previous, old) if identity == passed["jobId"] else old_parameters
+        require(properties["parameters"] == parameters, "qualified-job-parameters-drift")
+        jobs[identity] = {"serviceJobId": properties["jobId"], "runbook": book, "status": status,
+                          "parametersSha256": sha(wire(parameters))}
+        if identity == passed["jobId"]:
+            for key in ("startTime", "endTime"):
+                value = properties[key]
+                require(isinstance(value, str) and re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|\+00:00)", value) and
+                    value == passed[key], "qualified-preflight-time-drift")
+                jobs[identity][key] = value
+            duration = dt.datetime.fromisoformat(properties["endTime"].replace("Z", "+00:00")) - \
+                dt.datetime.fromisoformat(properties["startTime"].replace("Z", "+00:00"))
+            require(0 <= duration.total_seconds() <= PREFLIGHT_EXECUTION_SECONDS,
+                    "qualified-preflight-duration-invalid")
+            decoded = {key: json.loads(value) for key, value in parameters.items()}
+            require(decoded["Mode"] == "Preflight" and isinstance(decoded["ManifestJson"], str) and
+                    json.loads(decoded["ManifestJson"]) == manifest(previous, old),
+                    "qualified-decoded-manifest-mismatch")
+            output = azure.rest("GET", identity + "/output", AUTO_API, raw=True)
+            require(len(output) <= 4096 and wire(json.loads(output)) == wire(PREFLIGHT_PROOF),
+                    "qualified-live-original-proof-mismatch")
+        elif identity == diagnostic["jobId"]:
+            output = azure.rest("GET", identity + "/output", AUTO_API, raw=True)
+            require(len(output) <= 8192 and wire(json.loads(output)) ==
+                    wire(records["diagnostic"]["safe-output.json"]), "qualified-diagnostic-output-drift")
+    return {"principalId": old["principalId"], "groupTags": group_tags, "groupSourceDigests": group_sources,
+            "accountTags": tags,
+            "cleanupAssignments": old["cleanupAssignments"], "publishedContent": contents,
+            "runtimeCatalogueSha256": runtime_proof, "jobs": jobs}
+
+
+def qualified_bootstrap_link(paths, hashes, previous, bundle, proof):
+    return {"kind": "qualified-bootstrap-handoff", "authorizationModel": AUTHORIZATION_MODEL,
+            "inputDirectories": paths, "inputHashes": hashes,
+            "previousSourceDigest": previous["sourceDigest"], "nextSourceDigest": bundle["sourceDigest"],
+            "compiledHashes": bundle["compiledHashes"], "computeInputsSha256": bundle["computeInputsSha256"],
+            "proof": proof, "allowedTagMerges": [
+                {"resourceId": bundle["scope"][key], "operation": "Merge",
+                 "tags": {"orka-source-digest": bundle["sourceDigest"]}}
+                for key in ("verificationResourceGroupId", "cleanupResourceGroupId")],
+            "accountWrites": False, "grantWrites": False, "runbookWrites": False,
+            "jobWrites": False, "scheduleWrites": False, "clockWrites": False, "computeWrites": False}
+
+
+def prepare_qualified_bootstrap(args, work, azure):
+    require(args.previous_work_dir and args.qualified_preflight_work_dir and args.diagnostic_work_dir and
+            not (work / "bundle.json").exists() and not (work / "receipt.json").exists(),
+            "fresh-qualified-bootstrap-plan-required")
+    paths = {"previous": args.previous_work_dir, "preflight": args.qualified_preflight_work_dir,
+             "diagnostic": args.diagnostic_work_dir}
+    previous, old, tags, records, hashes = qualified_bootstrap_inputs(args, paths)
+    proof = qualified_bootstrap_proof(azure, previous, old, tags, records)
+    current = source_hashes()
+    values = json.loads((Path(paths["previous"]) / "compute-inputs.json").read_text())
+    values["sourceDigest"] = sha(wire(current))
+    write_json(work / "compute-inputs.json", values)
+    compiled = compile_templates(work)
+    require(compiled == previous["compiledHashes"], "qualified-compiled-footprint-drift")
+    bundle = {**previous, "sourceHashes": current, "sourceDigest": values["sourceDigest"],
+              "compiledHashes": compiled, "computeInputsSha256": sha((work / "compute-inputs.json").read_bytes())}
+    require(source_hashes() == current and qualified_bootstrap_inputs(args, paths)[-1] == hashes,
+            "qualified-inputs-changed-during-plan")
+    link = qualified_bootstrap_link(paths, hashes, previous, bundle, proof)
+    write_json(work / "bundle.json", bundle)
+    write_json(work / "authorization-link.json", {"plan": link, "sha256": sha(wire(link))})
+    print("Read-only qualified bootstrap handoff prepared; source review and exact-link approval are required.")
+
+
+def qualified_bootstrap_intent(bundle, previous, old, passed, hashes, approval_digest):
+    return {"phase": "qualified-bootstrap-intent", "subscriptionId": bundle["subscriptionId"],
+        "cleanupReceipt": bundle["cleanupReceipt"], "sourceDigest": bundle["sourceDigest"],
+        "principalId": old["principalId"], "authorizationModel": AUTHORIZATION_MODEL,
+        "cleanupAssignments": dict(old["cleanupAssignments"]), "nodeScopeReady": False, "peeringScopeReady": False,
+        "qualificationOf": {"approvalLinkSha256": approval_digest, "inputHashes": hashes,
+            "previousSourceDigest": previous["sourceDigest"],
+            "originalPublishedRunbookSha256": passed["originalRunbookSha256"],
+            "preflightRequestSha256": passed["requestSha256"], "preflightOutputSha256": passed["safeOutputSha256"]}}
+
+
+def adopt_qualified_bootstrap(azure, bundle, receipt, args):
+    require(args.approved_authorization_sha256, "approved-qualified-handoff-required")
+    record = json.loads((azure.work / "authorization-link.json").read_text())
+    link = record["plan"]
+    require(record["sha256"] == sha(wire(link)) == args.approved_authorization_sha256 and
+            link["kind"] == "qualified-bootstrap-handoff", "approved-qualified-handoff-required")
+    previous, old, tags, records, hashes = qualified_bootstrap_inputs(args, link["inputDirectories"])
+    expected_bundle = {**previous, "sourceHashes": source_hashes(), "sourceDigest": sha(wire(source_hashes())),
+                       "compiledHashes": previous["compiledHashes"], "computeInputsSha256": bundle["computeInputsSha256"]}
+    require(bundle == expected_bundle, "qualified-current-bundle-drift")
+    values = json.loads((Path(link["inputDirectories"]["previous"]) / "compute-inputs.json").read_text())
+    values["sourceDigest"] = bundle["sourceDigest"]
+    require(json.loads((azure.work / "compute-inputs.json").read_text()) == values, "qualified-compute-input-drift")
+    passed = records["preflight"]["receipt.json"]
+    intent = qualified_bootstrap_intent(bundle, previous, old, passed, hashes, record["sha256"])
+    receipt_path = azure.work / "receipt.json"
+    resuming = receipt_path.exists()
+    # Use the same bytes save_receipt writes; semantic JSON equality would accept
+    # edited receipts, duplicate keys or additional completion fields.
+    intent_bytes = (json.dumps(intent, indent=2) + "\n").encode()
+    require(not receipt_path.is_symlink() and
+            ((not resuming and not receipt) or
+             (resuming and receipt == intent and receipt_path.read_bytes() == intent_bytes)),
+            "qualified-receipt-reentry-mismatch")
+    proof = qualified_bootstrap_proof(azure, previous, old, tags, records,
+                                     promoted_group_digest=bundle["sourceDigest"] if resuming else None)
+    approved_proof = {**proof, "groupSourceDigests": {
+        identity: previous["sourceDigest"] for identity in proof["groupSourceDigests"]}}
+    require(link == qualified_bootstrap_link(link["inputDirectories"], hashes, previous, bundle, approved_proof),
+            "qualified-approved-proof-drift")
+    require(source_hashes() == bundle["sourceHashes"] and
+            qualified_bootstrap_inputs(args, link["inputDirectories"])[-1] == hashes,
+            "qualified-inputs-changed-before-adoption")
+    if not resuming:
+        receipt.update(intent)
+        save_receipt(azure.work, receipt)
+    promoted_tags = {**proof["groupTags"], "orka-source-digest": bundle["sourceDigest"]}
+    for change in link["allowedTagMerges"]:
+        resource = azure.get(change["resourceId"], "2024-03-01")
+        owned(resource, bundle["scope"], bundle["owner"], bundle["cleanupReceipt"], change["resourceId"])
+        require(resource["tags"] in (proof["groupTags"], promoted_tags), "qualified-ownership-or-clock-drift")
+        if resource["tags"] == promoted_tags:
+            continue
+        azure.cli("tag", "update", "--resource-id", change["resourceId"], "--operation", "Merge",
+                  "--tags", "orka-source-digest=" + bundle["sourceDigest"])
+        resource = azure.get(change["resourceId"], "2024-03-01")
+        require(resource["tags"] == promoted_tags, "qualified-tag-merge-readback-drift")
+    fresh = qualified_bootstrap_proof(azure, previous, old, tags, records, group_digest=bundle["sourceDigest"])
+    require(fresh == {**approved_proof, "groupTags": promoted_tags, "groupSourceDigests": {
+                identity: bundle["sourceDigest"] for identity in proof["groupSourceDigests"]}} and
+            qualified_bootstrap_inputs(args, link["inputDirectories"])[-1] == hashes,
+            "qualified-final-proof-drift")
+    receipt.update({"phase": "bootstrap-ready", "preflightJobId": passed["jobId"],
+                    "preflightCompleted": passed["endTime"]})
+    save_receipt(azure.work, receipt)
+
+
 def save_receipt(work, receipt):
     write_json(work / "receipt.json", receipt)
 
@@ -1427,8 +1793,9 @@ def retire(azure, bundle, receipt):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("operation", choices=("plan", "plan-recovery", "plan-builtin-resume", "bootstrap",
+    p.add_argument("operation", choices=("plan", "plan-recovery", "plan-builtin-resume", "plan-qualified-bootstrap", "bootstrap",
                                         "recover-bootstrap", "resume-builtin-bootstrap",
+                                        "adopt-qualified-bootstrap",
                                         "arm", "compute", "connect", "retire"))
     p.add_argument("--subscription", required=True)
     p.add_argument("--control-vnet-id", required=True)
@@ -1442,6 +1809,8 @@ def parser():
     p.add_argument("--approved-recovery-sha256")
     p.add_argument("--approved-authorization-sha256")
     p.add_argument("--continue-granted-bootstrap", action="store_true")
+    p.add_argument("--qualified-preflight-work-dir")
+    p.add_argument("--diagnostic-work-dir")
     return p
 
 
@@ -1463,6 +1832,9 @@ def main():
     if args.operation == "plan-builtin-resume":
         prepare_builtin_resume(args, work, azure)
         return
+    if args.operation == "plan-qualified-bootstrap":
+        prepare_qualified_bootstrap(args, work, azure)
+        return
     bundle = load_bundle(args, work)
     account = azure.cli("account", "show", "--query",
                         "{subscription:id,tenant:tenantId,environment:environmentName}")
@@ -1481,6 +1853,10 @@ def main():
     if args.operation == "resume-builtin-bootstrap":
         resume_builtin_bootstrap(azure, bundle, receipt, args)
         print("Reviewed built-in cleanup bootstrap completed; no compute or lifetime was started.")
+        return
+    if args.operation == "adopt-qualified-bootstrap":
+        adopt_qualified_bootstrap(azure, bundle, receipt, args)
+        print("Reviewed original preflight adopted; only two group source tags changed, with no new job or clock.")
         return
     actions = {"bootstrap": bootstrap, "arm": arm, "compute": compute, "connect": connect, "retire": retire}
     actions[args.operation](azure, bundle, receipt)

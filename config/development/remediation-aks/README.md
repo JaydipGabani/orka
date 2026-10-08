@@ -444,9 +444,81 @@ updated; the stopped receipt remains immutable. The same approved assignments
 are carried into the new receipt before the idempotent access/publish/preflight
 path, so existing recorded grants are not mistaken for unrelated permissions.
 
-This is not a generic resume/adoption framework. A partially failed phase stops
-with a private intent receipt and requires bounded operator recovery; never
-silently reuse an existing name or extend its lifetime.
+### Adopt a separately qualified original preflight
+
+If that continuation published the original runbook but its first preflight
+failed, **do not edit its intent receipt or replay bootstrap**. After a separately
+reviewed parameter-wire correction and an explicitly approved successful
+**original** preflight, prepare a current-source handoff:
+
+```bash
+python3 "$APPLY" plan-qualified-bootstrap --subscription "$APPROVED_SUBSCRIPTION" \
+  --control-vnet-id "$CONTROL_VNET_ID" --control-aks-id "$CONTROL_AKS_ID" \
+  --previous-work-dir "$FAILED_PREFLIGHT_BUNDLE_DIR" \
+  --qualified-preflight-work-dir "$CORRECTED_ORIGINAL_PREFLIGHT_DIR" \
+  --diagnostic-work-dir "$DIAGNOSTIC_EXECUTION_DIR" \
+  --work-dir "$QUALIFIED_BUNDLE_DIR"
+# Review the NEW source/BOM and authorization-link.json. Planning is GET-only.
+python3 "$APPLY" adopt-qualified-bootstrap \
+  --subscription "$APPROVED_SUBSCRIPTION" \
+  --control-vnet-id "$CONTROL_VNET_ID" --control-aks-id "$CONTROL_AKS_ID" \
+  --work-dir "$QUALIFIED_BUNDLE_DIR" \
+  --reviewed-source-sha256 "$NEW_REVIEWED_SOURCE_DIGEST" \
+  --approved-authorization-sha256 "$QUALIFIED_HANDOFF_LINK_DIGEST"
+```
+
+This intentionally supports only the recorded failed original preflight, the
+reviewed `ExactFoundationPreflightDiag542` diagnostic, and the corrected original
+preflight: exactly three jobs and two published runbooks. Diagnostic success is
+not an original-preflight proof. The handoff binds the old bundle/receipt/link and
+the corrected plan/request/output/receipt by file hash. Live GETs must match each
+job's ARM identity, runbook, status and parameters. The successful original job
+must have the exact per-value JSON-encoded parameters, decoding to the old
+approved manifest, and the exact five-field original success output. Its actual
+UTC completion time, not adoption time, becomes the new `preflightCompleted`.
+ARM job resource names and the service's separate `properties.jobId` are both
+recorded; they are not assumed to be the same identifier.
+
+Complete inventories must show empty verification resources, no node group,
+no schedules or job-schedule bindings, no unapproved Automation assets, the
+unchanged system identity/ownership/pending-clock tags, and only the two exact
+recorded built-in grants. The runtime catalogue permits only `PowerShell74` plus
+Azure's [six documented system-generated, non-editable runtime projections](https://learn.microsoft.com/azure/automation/runtime-environment-overview#system-generated-runtime-environments).
+Their definitions are bound into the reviewed proof; an extra runtime or changed
+catalogue fails closed. Published content must match the reviewed original and
+diagnostic source, allowing only CRLF normalization and one transport-added final
+newline. No code changes or publication are performed by this phase.
+
+Current templates are recompiled and must retain all seven approved compiled
+hashes. Only `sourceDigest` may change in compute inputs. Adoption rechecks the
+live proof, writes a **new** intent receipt, and merges only that new handoff
+bundle's source digest into the two owned resource groups, with individual
+readbacks and a final complete recheck. The account, old receipts, grants,
+runbooks, jobs and schedules are untouched. Only then is the new receipt marked
+`bootstrap-ready`.
+
+An interrupted adoption may be explicitly retried with the **same reviewed
+source, bundle, approval link and approval digest**, but only if `receipt.json`
+is byte-for-byte the expected `qualified-bootstrap-intent` for those inputs,
+without completion or clock fields. Do not edit or reformat that receipt. A
+retry performs the entire pre-merge proof again, permitting each of the two
+groups' source tags independently to be either the old or approved new digest;
+every other tag and resource must remain unchanged. Only groups still carrying
+the old digest are merged. Already-promoted groups are never merged again.
+Both groups must have the new digest and the final complete proof, including
+unchanged runtime definitions, jobs, schedules and diagnostic output, must pass
+before finalization. A changed intent, unrelated tag value, changed projection
+or other drift fails closed rather than gaining a new approval or fallback.
+Fresh adoption without an intent still requires both old source tags.
+
+This phase creates no clock or compute. The existing `arm` phase still performs
+the explicit live JobSchedule wire-parameter readback gate before compute; the
+two-node/one-builder/Basic-ACR footprint and 22h/23h/24h cleanup budget are unchanged.
+
+This is not a generic resume/adoption framework. Outside the exact same-link
+handoff retry above, a partially failed phase stops with a private intent receipt
+and requires bounded operator recovery; never silently reuse an existing name
+or extend its lifetime.
 
 If deployment partially fails, the armed cleanup deadline still applies. Do not
 retry using another SKU/region or reuse an unrelated resource group. Preserve
