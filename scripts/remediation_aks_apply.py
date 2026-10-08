@@ -970,10 +970,18 @@ def manifest(bundle, receipt, cleanup=False):
             "requireNodeScope": cleanup, "requirePeeringScope": cleanup}
 
 
+def runbook_parameters(bundle, receipt, cleanup=False):
+    # Automation deserializes each parameter value before PowerShell binding,
+    # as does Az.Automation's ProcessRunbookParameters/ConvertTo-Json path.
+    values = {"ManifestJson": wire(manifest(bundle, receipt, cleanup=cleanup)).decode(),
+              "Mode": "Cleanup" if cleanup else "Preflight"}
+    return {name: wire(value).decode() for name, value in values.items()}
+
+
 def preflight_job(azure, bundle, receipt):
     account = bundle["scope"]["automationAccountId"]
     job = account + "/jobs/" + str(uuid.uuid4())
-    parameters = {"ManifestJson": wire(manifest(bundle, receipt)).decode(), "Mode": "Preflight"}
+    parameters = runbook_parameters(bundle, receipt)
     azure.rest("PUT", job, AUTO_API, {"properties": {"runbook": {"name": "ExactFoundationCleanup"},
                                                   "parameters": parameters}})
     receipt["preflightJobId"] = job
@@ -1120,7 +1128,7 @@ def recover_bootstrap(azure, bundle, receipt, args):
 def schedules(azure, bundle, receipt, create=False):
     account = bundle["scope"]["automationAccountId"]
     start = dt.datetime.fromisoformat(receipt["T0"].replace("Z", "+00:00"))
-    parameters = {"ManifestJson": wire(manifest(bundle, receipt, cleanup=True)).decode(), "Mode": "Cleanup"}
+    parameters = runbook_parameters(bundle, receipt, cleanup=True)
     for name, hours in (("PrimaryCleanup", 22), ("CatchupCleanup", 23)):
         identity = account + "/schedules/" + name
         binding = account + "/jobSchedules/" + str(uuid.uuid5(uuid.NAMESPACE_URL, account + "/" + name))

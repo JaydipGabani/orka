@@ -205,8 +205,58 @@ class ArmedPlanTests(unittest.TestCase):
         self.assertEqual(len(writes), 4)
         self.assertEqual({body["name"] for identity, body in writes if "/schedules/" in identity},
                          {"PrimaryCleanup", "CatchupCleanup"})
+        for identity, body in writes:
+            if "/jobSchedules/" not in identity:
+                continue
+            values = {key: json.loads(value) for key, value in body["properties"]["parameters"].items()}
+            self.assertEqual(values["Mode"], "Cleanup")
+            self.assertIsInstance(values["ManifestJson"], str)
+            self.assertEqual(json.loads(values["ManifestJson"]), apply.manifest(bundle, receipt, cleanup=True))
+            self.assertTrue(json.loads(values["ManifestJson"])["requireNodeScope"])
+            self.assertTrue(json.loads(values["ManifestJson"])["requirePeeringScope"])
         apply.schedules(FakeAzure(), bundle, receipt)
         self.assertEqual(len(writes), 4, "readback must not rewrite an existing one-time binding")
+
+    def test_preflight_job_serializes_each_parameter_before_the_outer_request(self):
+        bundle = {**self.bundle, "tenantId": "44444444-4444-4444-4444-444444444444", "suffix": "sample01"}
+        receipt = {"principalId": "33333333-3333-3333-3333-333333333333"}
+        azure = mock.Mock(work=self.directory)
+        captured = []
+
+        def request(method, identity, version, body=None, raw=False):
+            if method == "PUT":
+                captured.append(copy.deepcopy(body))
+                return None
+            self.assertEqual(method, "GET")
+            self.assertTrue(identity.endswith("/output"))
+            return json.dumps({"outcome": "preflight-succeeded", "principalMatched": True,
+                               "coreDeleteAuthority": True, "postDeleteGroupRead": True,
+                               "postDeletePeeringRead": True})
+
+        azure.rest.side_effect = request
+        azure.get.return_value = {"properties": {"status": "Completed"}}
+        apply.preflight_job(azure, bundle, receipt)
+        self.assertEqual(len(captured), 1)
+        parameters = captured[0]["properties"]["parameters"]
+        self.assertEqual(set(parameters), {"ManifestJson", "Mode"})
+        values = {key: json.loads(value) for key, value in parameters.items()}
+        self.assertEqual(values["Mode"], "Preflight")
+        self.assertIsInstance(values["ManifestJson"], str)
+        self.assertEqual(values["ManifestJson"], apply.wire(apply.manifest(bundle, receipt)).decode())
+        self.assertEqual(json.loads(values["ManifestJson"]), apply.manifest(bundle, receipt))
+        self.assertFalse(json.loads(values["ManifestJson"])["requireNodeScope"])
+        self.assertIn("preflightCompleted", receipt)
+
+    def test_parameter_encoding_preserves_quotes_backslashes_and_unicode_after_service_decode(self):
+        bundle = {**self.bundle, "tenantId": "44444444-4444-4444-4444-444444444444",
+                  "suffix": "sample01", "owner": 'quoted "owner" \\ caf\u00e9'}
+        receipt = {**self.receipt, "principalId": "33333333-3333-3333-3333-333333333333"}
+        for cleanup in (False, True):
+            parameters = apply.runbook_parameters(bundle, receipt, cleanup=cleanup)
+            decoded = json.loads(parameters["ManifestJson"])
+            self.assertIsInstance(decoded, str)
+            self.assertEqual(decoded, apply.wire(apply.manifest(bundle, receipt, cleanup=cleanup)).decode())
+            self.assertEqual(json.loads(decoded)["owner"], bundle["owner"])
 
     def test_reader_is_explicitly_subscription_scoped_without_network_write(self):
         self.bundle["roleGuids"] = apply.builtin_role_guids()

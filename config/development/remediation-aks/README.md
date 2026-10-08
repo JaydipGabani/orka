@@ -331,6 +331,24 @@ Cleanup bootstrap, cleanup-access grants and registry-pull grants each run
 **Provider-level validation immediately before create**, with the same compiled
 template and parameter hashes. Static Bicep compilation is not RP validation.
 
+### Automation parameter wire format
+
+Automation deserializes each job parameter value before binding it to the
+published PowerShell parameter type. Serialize **each value** as JSON, in
+addition to encoding the outer ARM request. In particular, the string that
+contains the manifest JSON needs this additional string-encoding layer; sending
+the manifest text directly can arrive as a different PowerShell string and
+fail `Read-CleanupManifest`. `Mode` is encoded the same way.
+
+Preflight jobs and both cleanup job-schedule bindings share this encoder.
+It matches the official Azure PowerShell client's
+[`ProcessRunbookParameters`](https://github.com/Azure/azure-powershell/blob/cd392c7ebd14264312318eb463b1c8a22b305eb0/src/Automation/Automation/Common/AutomationPSClient.cs#L2477),
+used by both `StartRunbook` and `RegisterScheduledRunbook`. Tests verify the
+actual request bodies: one service-side JSON decode must produce the exact
+original manifest **string**, not a dictionary. Preserve the original failed
+jobs and diagnostic receipts; a parameter fix does not retroactively qualify
+their preflight results.
+
 ### Preserved child-recovery history
 
 The live Automation RP rejected both seven runtime-environment tags and a
