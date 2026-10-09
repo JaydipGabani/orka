@@ -1998,6 +1998,967 @@ class QualifiedBootstrapTests(unittest.TestCase):
         self.assertFalse(self.writes)
 
 
+class ComputeRepairPlanTests(unittest.TestCase):
+    def setUp(self):
+        fixture = ArmedPlanTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.directory = fixture.directory
+        self.previous = {**fixture.bundle, "tenantId": "44444444-4444-4444-4444-444444444444",
+                         "suffix": "sample01", "authorizationModel": apply.AUTHORIZATION_MODEL,
+                         "roleGuids": apply.builtin_role_guids(), "controlKubeletIdentity": {},
+                         "publicKeyReady": True}
+        self.bundle = {**self.previous, "sourceDigest": "b" * 64}
+        self.receipt = {"phase": "compute-intent", "T0": "2026-10-08T23:38:00Z",
+                        "deadline": "2026-10-09T23:38:00Z", "armedReadbackUtc": "2026-10-08T23:27:27Z"}
+        clock = mock.patch.object(apply, "utc", return_value=apply.dt.datetime(
+            2026, 10, 9, 0, 0, tzinfo=apply.dt.timezone.utc))
+        clock.start()
+        self.addCleanup(clock.stop)
+        existing, self.missing = apply.compute_repair_resource_sets(self.previous)
+        tags = {**fixture.tags, "orka-budget-start-utc": self.receipt["T0"],
+                "orka-expires-at-utc": self.receipt["deadline"]}
+        principal = "33333333-3333-3333-3333-333333333333"
+        role = f"/subscriptions/{self.previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + \
+            apply.BUILTIN_ROLES["peering-cleanup"][0]
+        self.resources = {}
+        for identity in existing:
+            if "/providers/Microsoft.Authorization/roleAssignments/" in identity:
+                properties = {"scope": identity.split("/providers/Microsoft.Authorization/roleAssignments/")[0],
+                              "principalId": principal, "roleDefinitionId": role}
+                self.resources[identity] = {"id": identity, "properties": properties}
+            else:
+                self.resources[identity] = {"id": identity, "tags": dict(tags), "properties": {}}
+                if "/userAssignedIdentities/" in identity:
+                    self.resources[identity]["properties"]["principalId"] = principal
+        self.preview = {"status": "Succeeded", "changes": [
+            {"resourceId": identity, "changeType": "NoChange", "before": copy.deepcopy(value),
+             "after": copy.deepcopy(value)}
+            for identity, value in self.resources.items()
+        ] + [{"resourceId": identity, "changeType": "Create"} for identity in self.missing]}
+
+    def validate(self):
+        apply.validate_compute_repair_preview(self.preview, self.previous, self.bundle, self.receipt, self.resources)
+
+    def test_only_missing_creates_and_explicit_source_tag_only_modifications_are_eligible(self):
+        self.validate()
+        for change in self.preview["changes"]:
+            if change["resourceId"] not in self.resources or "roleAssignments/" in change["resourceId"]:
+                continue
+            change["changeType"] = "Modify"
+            change["after"]["tags"]["orka-source-digest"] = self.bundle["sourceDigest"]
+            change["delta"] = [{"path": "tags.orka-source-digest", "propertyChangeType": "Modify"}]
+        self.validate()
+        self.assertEqual(len(self.resources), 8)
+        self.assertEqual(len(self.missing), 6)
+
+    def test_provider_reported_existing_configuration_and_role_deltas_fail_closed(self):
+        original = copy.deepcopy(self.preview)
+        for suffix, path, kind in (
+                ("/registries/orkaverifsample01", "properties.dataEndpointEnabled", "Delete"),
+                ("/natGateways/orka-verify-sample01-egress", "sku.tier", "Delete"),
+                ("/publicIPAddresses/orka-verify-sample01-egress", "properties.ddosSettings", "Delete"),
+                ("/networkSecurityGroups/orka-verify-sample01-nodes", "properties.securityRules", "Array")):
+            change = next(item for item in self.preview["changes"] if item["resourceId"].endswith(suffix))
+            change.update({"changeType": "Modify", "delta": [{"path": path, "propertyChangeType": kind}]})
+            with self.subTest(path=path), self.assertRaisesRegex(apply.Failure, "existing-config-change-forbidden"):
+                self.validate()
+            self.preview = copy.deepcopy(original)
+        for change in self.preview["changes"]:
+            if change["resourceId"] in self.resources and "roleAssignments/" in change["resourceId"]:
+                change.update({"changeType": "Modify", "delta": [
+                    {"path": "properties.principalId", "propertyChangeType": "Modify"}]})
+                with self.assertRaisesRegex(apply.Failure, "existing-role-change-forbidden"):
+                    self.validate()
+                change["changeType"] = "NoChange"
+                change.pop("delta")
+
+    def test_missing_duplicate_foreign_and_existing_replacements_are_rejected(self):
+        original = copy.deepcopy(self.preview)
+        for mode in ("missing", "duplicate", "foreign", "delete", "ignore", "existing-create"):
+            self.preview = copy.deepcopy(original)
+            if mode == "missing":
+                self.preview["changes"].pop()
+            elif mode == "duplicate":
+                self.preview["changes"].append(self.preview["changes"][0])
+            elif mode == "foreign":
+                self.preview["changes"].append({"resourceId": self.previous["scope"]["controlVnetId"],
+                                                "changeType": "Modify"})
+            else:
+                self.preview["changes"][0]["changeType"] = {
+                    "delete": "Delete", "ignore": "Ignore", "existing-create": "Create"}[mode]
+            with self.subTest(mode=mode), self.assertRaises(apply.Failure):
+                self.validate()
+
+    def test_existing_full_lifetime_tags_and_network_role_principals_remain_fenced(self):
+        group = self.previous["scope"]["verificationResourceGroupId"]
+        self.resources[group]["tags"]["orka-expires-at-utc"] = "2026-10-10T23:38:00Z"
+        with self.assertRaisesRegex(apply.Failure, "original-lifetime-tags-drift"):
+            self.validate()
+        self.resources[group]["tags"]["orka-expires-at-utc"] = self.receipt["deadline"]
+        assignment = next(value for identity, value in self.resources.items() if "roleAssignments/" in identity)
+        assignment["properties"]["principalId"] = "99999999-9999-9999-9999-999999999999"
+        with self.assertRaisesRegex(apply.Failure, "assignment-readback-mismatch"):
+            self.validate()
+
+    def test_repair_cutoff_is_fixed_before_primary_without_resetting_the_clock(self):
+        window = apply.compute_repair_window(self.receipt)
+        self.assertEqual(window["latestAllocationStartUtc"], "2026-10-09T19:38:00Z")
+        self.assertEqual(window["primaryCleanupUtc"], "2026-10-09T21:38:00Z")
+        self.assertEqual(window["catchupCleanupUtc"], "2026-10-09T22:38:00Z")
+        self.assertEqual(window["deadline"], "2026-10-09T23:38:00Z")
+        self.assertEqual(window["maximumAllocationWaitSeconds"], 3600)
+        cutoff = apply.dt.datetime(2026, 10, 9, 19, 38, tzinfo=apply.dt.timezone.utc)
+        with mock.patch.object(apply, "utc", return_value=cutoff):
+            apply.compute_repair_window(self.receipt)
+        with mock.patch.object(apply, "utc", return_value=cutoff + apply.dt.timedelta(seconds=1)), \
+             self.assertRaisesRegex(apply.Failure, "allocation-start-cutoff"):
+            apply.compute_repair_window(self.receipt)
+        self.receipt["deadline"] = "2026-10-10T23:38:00Z"
+        with self.assertRaisesRegex(apply.Failure, "original-armed-compute-clock"):
+            apply.compute_repair_window(self.receipt)
+
+    def create_only_preview(self):
+        result = copy.deepcopy(self.preview)
+        role = f"/subscriptions/{self.previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + \
+            apply.BUILTIN_ROLES["peering-cleanup"][0]
+        for change in result["changes"]:
+            if change["resourceId"] in self.resources:
+                change["changeType"] = "Ignore"
+            elif "roleAssignments/" in change["resourceId"]:
+                change["after"] = {"properties": {"principalId": "33333333-3333-3333-3333-333333333333",
+                                                  "principalType": "ServicePrincipal", "roleDefinitionId": role}}
+        return result
+
+    def test_create_only_preview_never_permits_existing_source_tag_or_role_puts(self):
+        preview = self.create_only_preview()
+        principal = "33333333-3333-3333-3333-333333333333"
+        apply.validate_create_only_compute_preview(preview, self.previous, self.receipt, principal, self.resources)
+        for change in preview["changes"]:
+            if change["resourceId"] not in self.resources:
+                continue
+            change.update({"changeType": "Modify", "delta": [
+                {"path": "tags.orka-source-digest", "propertyChangeType": "Modify"}]})
+            with self.subTest(identity=change["resourceId"]), self.assertRaisesRegex(
+                    apply.Failure, "existing-put-forbidden"):
+                apply.validate_create_only_compute_preview(preview, self.previous, self.receipt, principal, self.resources)
+            change["changeType"] = "Ignore"
+            change.pop("delta")
+
+    def test_create_only_new_binding_requires_the_actual_pinned_principal_not_a_reference(self):
+        preview = self.create_only_preview()
+        binding = next(change for change in preview["changes"]
+                       if change["resourceId"] in self.missing and "roleAssignments/" in change["resourceId"])
+        binding["after"]["properties"].pop("principalType")
+        apply.validate_create_only_compute_preview(preview, self.previous, self.receipt,
+            "33333333-3333-3333-3333-333333333333", self.resources)
+        binding["after"]["properties"]["principalType"] = "User"
+        with self.assertRaisesRegex(apply.Failure, "actual-vnet-principal-required"):
+            apply.validate_create_only_compute_preview(preview, self.previous, self.receipt,
+                "33333333-3333-3333-3333-333333333333", self.resources)
+        binding["after"]["properties"]["principalType"] = "ServicePrincipal"
+        for value in ("[reference('unresolved').principalId]", "99999999-9999-9999-9999-999999999999", None):
+            binding["after"]["properties"]["principalId"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(apply.Failure, "actual-vnet-principal-required"):
+                apply.validate_create_only_compute_preview(preview, self.previous, self.receipt,
+                    "33333333-3333-3333-3333-333333333333", self.resources)
+
+    def test_create_only_preview_digest_binds_the_exact_redacted_review_file(self):
+        preview = self.create_only_preview()
+        vm = next(change for change in preview["changes"]
+          if "/virtualMachines/" in change["resourceId"])
+        vm["after"] = {"properties": {"osProfile": {"keyData": "SYNTHETIC_PUBLIC_KEY"}}}
+        path = self.directory / "review.what-if.json"
+        apply.write_json(path, apply.redacted(preview))
+        digest = apply.create_only_preview_digest(path, preview)
+        self.assertEqual(digest, apply.sha(path.read_bytes()))
+        self.assertNotEqual(digest, apply.sha(apply.wire(preview)))
+        self.assertNotIn("SYNTHETIC_PUBLIC_KEY", path.read_text())
+        changed = json.loads(path.read_text())
+        changed["changes"].pop()
+        apply.write_json(path, changed)
+        with self.assertRaisesRegex(apply.Failure, "saved-preview-drift"):
+            apply.create_only_preview_digest(path, preview)
+
+
+class CreateOnlyAllocationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = ROOT / "bin/remediation-aks-tests" / uuid.uuid4().hex
+        self.directory.mkdir(parents=True)
+        self.addCleanup(lambda: shutil.rmtree(self.directory))
+        subscription = "11111111-1111-1111-1111-111111111111"
+        control = f"/subscriptions/{subscription}/resourceGroups/control/providers/"
+        self.scope = apply.plan.targets(subscription, "sample01", control + "Microsoft.Network/virtualNetworks/control",
+                                        control + "Microsoft.ContainerService/managedClusters/control")
+        self.bundle = {"subscriptionId": subscription, "sourceDigest": "b" * 64, "scope": self.scope}
+        self.old = {"phase": "compute-intent", "sourceDigest": "a" * 64, "T0": "2026-10-08T23:38:00Z",
+                    "deadline": "2026-10-09T23:38:00Z", "armedReadbackUtc": "2026-10-08T23:27:27Z",
+                    "cleanupReceipt": "22222222-2222-2222-2222-222222222222"}
+        self.deployment = self.scope["verificationResourceGroupId"] + \
+            "/providers/Microsoft.Resources/deployments/bounded-dns-repair-" + self.bundle["sourceDigest"][:32]
+        self.link = {"repairDeploymentId": self.deployment, "proof": {"fixture": True}, "inputHashes": {},
+                     "repairTemplateSha256": "c" * 64, "repairParametersSha256": "d" * 64,
+                     "window": {"latestAllocationStartUtc": "2026-10-09T19:38:00Z"}}
+        self.record = {"plan": self.link, "sha256": "e" * 64}
+        self.previous = {"sourceDigest": "a" * 64}
+        self.parameters = {"controlPlanePrincipalId": "33333333-3333-3333-3333-333333333333"}
+        apply.write_json(self.directory / "compute-repair.arm.json", {"resources": []})
+        self.now = 0
+        self.events = []
+        self.puts = 0
+        self.cancels = 0
+        self.outcome = "Running"
+        self.submit_failure = False
+        self.cancel_failure = False
+        self.inventory_failure = False
+        self.preexisting = False
+        outer = self
+
+        class FakeAzure:
+            work = outer.directory
+
+            def cli(self, *arguments):
+                outer.assertEqual(arguments[:2], ("vm", "list-usage"))
+                return [{"name": {"value": name}, "limit": 100, "currentValue": 0}
+                        for name in ("standardDSv5Family", "cores")]
+
+            def get(self, identity, version, absent=False, timeout=900):
+                outer.events.append(("GET", identity, outer.now, timeout))
+                if identity == outer.deployment:
+                    if outer.puts == 0 and not outer.preexisting:
+                        return None
+                    return {"id": identity, "properties": {"provisioningState": outer.outcome}}
+                if identity == outer.scope["managedNodeResourceGroupId"]:
+                    return None
+                outer.assertEqual(identity, outer.scope["verificationResourceGroupId"] + "/resources")
+                if outer.inventory_failure:
+                    raise apply.Failure("synthetic-inventory-failure")
+                return {"value": [{"id": outer.scope["verificationClusterId"],
+                                   "type": "Microsoft.ContainerService/managedClusters"}]}
+
+            def rest(self, method, identity, version, body=None, timeout=900):
+                outer.events.append((method, identity, outer.now, timeout))
+                if method == "PUT":
+                    outer.assertEqual(identity, outer.deployment)
+                    outer.assertEqual(body["properties"]["mode"], "Incremental")
+                    outer.assertEqual(body["properties"]["parameters"], apply.arm_parameters(outer.parameters)["parameters"])
+                    outer.puts += 1
+                    if outer.submit_failure:
+                        raise apply.Failure("synthetic-ambiguous-put")
+                    return {}
+                outer.assertEqual(method, "POST")
+                outer.assertEqual(identity, outer.deployment + "/cancel")
+                outer.assertGreaterEqual(outer.now, 3600)
+                outer.cancels += 1
+                if outer.cancel_failure:
+                    raise apply.Failure("synthetic-cancel-failure")
+                outer.outcome = "Canceling"
+                return {}
+
+        self.azure = FakeAzure()
+        self.args = SimpleNamespace(approved_compute_repair_sha256=self.record["sha256"])
+        self.start = apply.dt.datetime(2026, 10, 9, 0, 0, tzinfo=apply.dt.timezone.utc)
+        patches = [
+            mock.patch.object(apply, "load_create_only_repair", return_value=(
+                self.record, self.previous, self.old, {}, {}, {}, self.parameters)),
+            mock.patch.object(apply, "create_only_compute_proof", return_value=self.link["proof"]),
+            mock.patch.object(apply, "schedules"),
+            mock.patch.object(apply, "utc", side_effect=lambda: self.start + apply.dt.timedelta(seconds=self.now)),
+            mock.patch.object(apply.time, "monotonic", side_effect=lambda: self.now),
+            mock.patch.object(apply.time, "sleep", side_effect=self.advance),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def test_new_deployment_absence_requires_exact_404_and_deployment_code(self):
+        self.assertTrue(apply.missing_azure_response(
+            'ERROR: Not Found({"error":{"code":"DeploymentNotFound"}})', rest=True))
+        self.assertFalse(apply.missing_azure_response(
+            'ERROR: Forbidden({"error":{"code":"DeploymentNotFound"}})', rest=True))
+        self.assertFalse(apply.missing_azure_response(
+            'ERROR: Not Found({"error":{"code":"AuthorizationFailed"}})', rest=True))
+
+    def test_success_creates_current_source_operating_receipt_without_qualification_grants(self):
+        self.outcome = "Succeeded"
+        receipt = {}
+        with mock.patch.object(apply, "finish_compute") as finish:
+            apply.allocate_create_only_compute(self.azure, self.bundle, receipt, self.args)
+        finish.assert_not_called()
+        self.assertEqual(receipt["phase"], "compute-repair-provisioned")
+        self.assertEqual(receipt["T0"], self.old["T0"])
+        self.assertEqual(receipt["deadline"], self.old["deadline"])
+        self.assertEqual(receipt["sourceDigest"], self.bundle["sourceDigest"])
+        self.assertEqual(receipt["resourceOriginSourceDigest"], self.old["sourceDigest"])
+        self.assertEqual(self.puts, 1)
+        self.assertEqual(self.cancels, 0)
+        with self.assertRaisesRegex(apply.Failure, "one-new-repair-attempt-only"):
+            apply.allocate_create_only_compute(self.azure, self.bundle, receipt, self.args)
+        self.assertEqual(self.puts, 1)
+
+    def test_one_hour_bound_cancels_only_new_deployment_then_inventories_without_hard_stop_claim(self):
+        receipt = {}
+        with self.assertRaisesRegex(apply.Failure, "allocation-bound-reached"):
+            apply.allocate_create_only_compute(self.azure, self.bundle, receipt, self.args)
+        self.assertEqual(self.now, 3600)
+        self.assertEqual(self.puts, 1)
+        self.assertEqual(self.cancels, 1)
+        self.assertEqual(receipt["repairCancelTarget"], self.deployment)
+        self.assertEqual(receipt["repairCancelOutcome"], "requested-not-a-hard-stop")
+        self.assertEqual(receipt["repairPostCancelState"], "Canceling")
+        self.assertEqual(receipt["phase"], "compute-repair-timeout")
+        self.assertEqual(receipt["deadline"], self.old["deadline"])
+        inventory = json.loads((self.directory / "repair-allocation-inventory.json").read_text())
+        self.assertTrue(inventory["authoritative"])
+        self.assertEqual(inventory["nodeGroup"], "Absent")
+        self.assertTrue(all(event[3] <= 30 for event in self.events if event[0] == "GET"))
+        self.assertFalse(any("bounded-verification-compute/cancel" in event[1] for event in self.events))
+
+    def test_ambiguous_submission_is_never_replayed_and_cancel_failure_is_reported_safely(self):
+        self.submit_failure = True
+        self.cancel_failure = True
+        self.inventory_failure = True
+        receipt = {}
+        with self.assertRaisesRegex(apply.Failure, "allocation-bound-reached"):
+            apply.allocate_create_only_compute(self.azure, self.bundle, receipt, self.args)
+        self.assertEqual(self.puts, 1)
+        self.assertEqual(self.cancels, 1)
+        self.assertEqual(receipt["repairSubmitOutcome"], "unconfirmed-no-replay")
+        self.assertEqual(receipt["repairCancelOutcome"], "unconfirmed")
+        self.assertEqual(receipt["repairPostCancelState"], "Running")
+        self.assertFalse(json.loads((self.directory / "repair-allocation-inventory.json").read_text())["authoritative"])
+        self.assertNotIn("synthetic", (self.directory / "receipt.json").read_text())
+
+    def test_terminal_failure_and_existing_deployment_never_replay_or_cancel_old_work(self):
+        self.preexisting = True
+        with self.assertRaisesRegex(apply.Failure, "deployment-already-exists"):
+            apply.allocate_create_only_compute(self.azure, self.bundle, {}, self.args)
+        self.assertEqual(self.puts, 0)
+        self.assertFalse((self.directory / "receipt.json").exists())
+        self.preexisting = False
+        self.outcome = "Failed"
+        receipt = {}
+        with self.assertRaisesRegex(apply.Failure, "terminal-failure-no-retry"):
+            apply.allocate_create_only_compute(self.azure, self.bundle, receipt, self.args)
+        self.assertEqual(self.puts, 1)
+        self.assertEqual(self.cancels, 0)
+        self.assertEqual(receipt["phase"], "compute-repair-stopped")
+
+    def test_start_after_fixed_cutoff_fails_before_deployment_put(self):
+        self.start = apply.dt.datetime(2026, 10, 9, 19, 38, 1, tzinfo=apply.dt.timezone.utc)
+        with self.assertRaisesRegex(apply.Failure, "allocation-start-cutoff"):
+            apply.allocate_create_only_compute(self.azure, self.bundle, {}, self.args)
+        self.assertEqual(self.puts, 0)
+        self.assertFalse((self.directory / "receipt.json").exists())
+
+    def test_qualification_is_separate_and_never_accepts_a_canceled_or_timed_out_receipt(self):
+        qualification = {"actions": ["original-node-group-cleanup-assignment", "original-registry-pull-assignments"]}
+        self.link["qualification"] = qualification
+        self.link["qualificationSha256"] = apply.sha(apply.wire(qualification))
+        self.link["window"] = apply.compute_repair_window(self.old)
+        self.args.approved_compute_qualification_sha256 = "f" * 64
+        receipt = {**self.old, "sourceDigest": self.bundle["sourceDigest"], "phase": "compute-repair-provisioned",
+                   "repairOf": {"approvalSha256": self.record["sha256"], "deploymentId": self.deployment,
+                                "inputHashes": {}, "originalSourceDigest": self.old["sourceDigest"],
+                                "templateSha256": self.link["repairTemplateSha256"],
+                                "parametersSha256": self.link["repairParametersSha256"]},
+                   "resourceOriginSourceDigest": self.old["sourceDigest"],
+                   "repairPutAttempts": 1, "repairCancelAttempted": False,
+                   "repairStartedUtc": "2026-10-09T00:00:00Z", "repairAllocationLimitUtc": "2026-10-09T01:00:00Z",
+                   "repairCompletedUtc": "2026-10-09T00:00:00Z", "repairDeploymentState": "Succeeded"}
+        with mock.patch.object(apply, "finish_compute") as finish:
+            with self.assertRaisesRegex(apply.Failure, "separate-original-compute-qualification"):
+                apply.qualify_create_only_compute(self.azure, self.bundle, receipt, self.args)
+            finish.assert_not_called()
+            self.args.approved_compute_qualification_sha256 = self.link["qualificationSha256"]
+            receipt["repairCancelAttempted"] = True
+            with self.assertRaisesRegex(apply.Failure, "recorded-repair-cancel-scope"):
+                apply.qualify_create_only_compute(self.azure, self.bundle, receipt, self.args)
+            finish.assert_not_called()
+            receipt["repairCancelAttempted"] = False
+            receipt["phase"] = "compute-repair-timeout"
+            with self.assertRaisesRegex(apply.Failure, "timely-provisioned"):
+                apply.qualify_create_only_compute(self.azure, self.bundle, receipt, self.args)
+            finish.assert_not_called()
+        self.assertEqual(self.puts, 0)
+        self.assertEqual(self.cancels, 0)
+
+
+class CreateOnlyIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cache = ROOT / "bin/remediation-aks-tests" / uuid.uuid4().hex
+        cls.cache.mkdir(parents=True)
+        apply.compile_templates(cls.cache)
+        apply.compile_create_only_compute(cls.cache)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.cache)
+
+    def setUp(self):
+        self.directory = ROOT / "bin/remediation-aks-tests" / uuid.uuid4().hex
+        self.directory.mkdir(parents=True)
+        self.addCleanup(lambda: shutil.rmtree(self.directory))
+        self.old_work = self.directory / "previous"
+        self.blocked_work = self.directory / "blocked"
+        self.work = self.directory / "repair"
+        for path in (self.old_work, self.blocked_work, self.work):
+            path.mkdir()
+        private = mock.patch.object(apply.plan, "private_path", side_effect=Path)
+        private.start()
+        self.addCleanup(private.stop)
+        self.base_time = apply.dt.datetime(2026, 10, 9, 0, 0, tzinfo=apply.dt.timezone.utc)
+        self.wall = self.mono = 0
+        self.get_hook = None
+        self.fail_followup = False
+        self.interrupt_poll = False
+        self.deployment_state = "Succeeded"
+        self.submitted = False
+        self.quota_free = 12
+        self.events = []
+        self.puts = self.cancels = 0
+        patches = [
+            mock.patch.object(apply, "utc", side_effect=lambda: self.base_time + apply.dt.timedelta(seconds=self.wall)),
+            mock.patch.object(apply.time, "monotonic", side_effect=lambda: self.mono),
+            mock.patch.object(apply.time, "sleep", side_effect=self.sleep),
+            mock.patch.object(apply, "compile_templates", side_effect=self.compile_fixture),
+            mock.patch.object(apply, "compile_create_only_compute", side_effect=self.compile_core_fixture),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.sub = "11111111-1111-1111-1111-111111111111"
+        control = f"/subscriptions/{self.sub}/resourceGroups/control/providers/"
+        self.scope = apply.plan.targets(self.sub, "sample01", control + "Microsoft.Network/virtualNetworks/control",
+                                        control + "Microsoft.ContainerService/managedClusters/control")
+        self.account = self.scope["automationAccountId"]
+        hashes = apply.source_hashes()
+        hashes.pop("config/development/remediation-aks/compute-core.bicep")
+        for name in ("scripts/remediation_aks_apply.py", "config/development/remediation-aks/resources.bicep",
+                     "config/development/remediation-aks/README.md"):
+            hashes[name] = "a" * 64
+        self.origin = {"version": 1, "subscriptionId": self.sub,
+            "tenantId": "44444444-4444-4444-4444-444444444444", "scope": self.scope, "suffix": "sample01",
+            "owner": "fixture-owner", "cleanupReceipt": "22222222-2222-2222-2222-222222222222",
+            "authorizationModel": apply.AUTHORIZATION_MODEL, "roleGuids": apply.builtin_role_guids(),
+            "controlKubeletIdentity": {}, "publicKeyReady": True, "sourceHashes": hashes,
+            "sourceDigest": apply.sha(apply.wire(hashes))}
+        compiled = self.compile_fixture(self.old_work)
+        legacy = ROOT / "scripts/tests/fixtures/remediation-aks-corrected-main.arm.json"
+        (self.old_work / "main.arm.json").write_bytes(legacy.read_bytes())
+        compiled["main"] = apply.sha(legacy.read_bytes())
+        self.origin["compiledHashes"] = compiled
+        self.old = {"phase": "compute-intent", "sourceDigest": self.origin["sourceDigest"], "subscriptionId": self.sub,
+            "cleanupReceipt": self.origin["cleanupReceipt"], "principalId": "77777777-7777-7777-7777-777777777777",
+            "T0": "2026-10-08T23:38:00Z", "deadline": "2026-10-09T23:38:00Z",
+            "armedReadbackUtc": "2026-10-08T23:27:27Z", "cleanupAssignments": {},
+            "authorizationModel": apply.AUTHORIZATION_MODEL, "nodeScopeReady": False, "peeringScopeReady": False}
+        values = {"suffix": "sample01", "location": "eastus2", "owner": self.origin["owner"],
+            "sourceDigest": self.origin["sourceDigest"], "cleanupReceipt": self.origin["cleanupReceipt"],
+            "budgetStartUtc": self.old["T0"], "vnetCidr": "10.241.0.0/16", "podCidr": "10.242.0.0/16",
+            "serviceCidr": "10.243.0.0/16", "trustedBuildClientCidr": "10.1.0.0/24",
+            "trustedControlVnetCidr": "10.1.0.0/16", "builderImageVersion": "24.04.202601010",
+            "operatorSshPublicKey": "ssh-ed25519 SYNTHETIC_PUBLIC_KEY"}
+        apply.write_json(self.old_work / "compute-inputs.json", values)
+        self.origin["computeInputsSha256"] = apply.sha((self.old_work / "compute-inputs.json").read_bytes())
+        apply.write_json(self.old_work / "provider-verification-preview.parameters.json", apply.arm_parameters(values))
+        (self.old_work / "bounded-verification-compute.parameters.json").write_bytes(
+            (self.old_work / "provider-verification-preview.parameters.json").read_bytes())
+        apply.write_json(self.old_work / "provider-verification-preview.what-if.json", {"status": "Succeeded"})
+        self.old["applyParametersSha256"] = apply.sha((self.old_work / "provider-verification-preview.parameters.json").read_bytes())
+        self.old["applyTemplateSha256"] = compiled["main"]
+        tags = {"orka-purpose": "isolated-remediation-verification", "orka-owner": self.origin["owner"],
+                "orka-deployment": "orka-verify-sample01", "orka-cleanup-receipt": self.origin["cleanupReceipt"],
+                "orka-source-digest": self.origin["sourceDigest"], "orka-budget-start-utc": self.old["T0"],
+                "orka-expires-at-utc": self.old["deadline"]}
+        self.objects = {}
+        self.text = {}
+        self.assignments = []
+        self.network = []
+        self.principal = "33333333-3333-3333-3333-333333333333"
+        self.existing, self.missing = apply.compute_repair_resource_sets(self.origin)
+        network_role = f"/subscriptions/{self.sub}/providers/Microsoft.Authorization/roleDefinitions/" + \
+            apply.BUILTIN_ROLES["peering-cleanup"][0]
+        for identity in self.existing:
+            if "/roleAssignments/" in identity:
+                resource = {"id": identity, "properties": {"principalId": self.principal,
+                    "roleDefinitionId": network_role,
+                    "scope": identity.split("/providers/Microsoft.Authorization/roleAssignments/")[0]}}
+                self.network.append(resource)
+            else:
+                resource = {"id": identity, "tags": dict(tags), "properties": {"provisioningState": "Succeeded"}}
+                if "/userAssignedIdentities/" in identity:
+                    resource["properties"].update({"principalId": self.principal,
+                                                   "clientId": "55555555-5555-5555-5555-555555555555"})
+            self.objects[identity] = resource
+        self.control_identity = next(identity for identity in self.existing if "/userAssignedIdentities/" in identity)
+        snapshot = copy.deepcopy(self.objects)
+        self.objects[self.scope["verificationResourceGroupId"] + "/resources"] = {"value": [
+            {"id": identity} for identity in self.existing
+            if identity != self.scope["verificationResourceGroupId"] and "/roleAssignments/" not in identity]}
+        account = {"id": self.account, "tags": dict(tags), "identity": {
+            "type": "SystemAssigned", "tenantId": self.origin["tenantId"], "principalId": self.old["principalId"]}}
+        self.objects[self.account] = account
+        for guid, title, actions in apply.BUILTIN_ROLES.values():
+            identity = f"/subscriptions/{self.sub}/providers/Microsoft.Authorization/roleDefinitions/{guid}"
+            self.objects[identity] = {"id": identity, "properties": {"type": "BuiltInRole", "roleName": title,
+                "permissions": [{"actions": sorted(actions), "notActions": [], "dataActions": [], "notDataActions": []}]}}
+        for name, (scope, role) in apply.cleanup_assignment_scopes(self.origin).items():
+            identity, body = apply.scoped_assignment(self.origin, self.old, scope, role)
+            self.old["cleanupAssignments"][name] = identity
+            item = {"id": identity, "properties": {**body["properties"], "scope": scope}}
+            self.assignments.append(item)
+            self.objects[identity] = item
+        book = self.account + "/runbooks/ExactFoundationCleanup"
+        self.text[book + "/content"] = (SOURCE / "cleanup-runbook.ps1").read_text()
+        cleanup = {"accountSha256": apply.sha(apply.wire(account)), "publishedContent": {
+            book: {"sourceSha256": apply.sha((SOURCE / "cleanup-runbook.ps1").read_bytes()), "normalization": "none"}},
+            "jobs": {}, "schedules": {}, "bindings": {}}
+        self.objects[self.account + "/runbooks"] = {"value": [{"id": book}]}
+        for digit in ("a", "b", "c"):
+            identity = self.account + "/jobs/" + str(uuid.UUID(digit * 32))
+            cleanup["jobs"][identity] = {"status": "Completed"}
+        self.objects[self.account + "/jobs"] = {"value": [{"id": identity} for identity in cleanup["jobs"]]}
+        start = apply.dt.datetime.fromisoformat(self.old["T0"].replace("Z", "+00:00"))
+        for name, hours in (("PrimaryCleanup", 22), ("CatchupCleanup", 23)):
+            identity = self.account + "/schedules/" + name
+            binding = self.account + "/jobSchedules/" + str(uuid.uuid5(uuid.NAMESPACE_URL, self.account + "/" + name))
+            cleanup["schedules"][identity] = {"id": identity, "properties": {
+                "frequency": "OneTime", "isEnabled": True, "startTime": apply.timestamp(start + apply.dt.timedelta(hours=hours))}}
+            cleanup["bindings"][binding] = {"id": binding, "properties": {
+                "schedule": {"name": name}, "runbook": {"name": "ExactFoundationCleanup"},
+                "parameters": apply.runbook_parameters(self.origin, self.old, cleanup=True)}}
+        for kind, collection in (("schedules", "schedules"), ("bindings", "jobSchedules")):
+            self.objects.update(copy.deepcopy(cleanup[kind]))
+            self.objects[self.account + "/" + collection] = {"value": [{"id": identity} for identity in cleanup[kind]]}
+        nested = self.scope["verificationResourceGroupId"] + "/providers/Microsoft.Resources/deployments/isolated-verification-foundation"
+        outer = f"/subscriptions/{self.sub}/providers/Microsoft.Resources/deployments/bounded-verification-compute"
+        failures = {"deployments": {}, "failedOperations": [{
+            "targetId": self.scope["verificationResourceGroupId"] + "/providers/Microsoft.Network/networkSecurityGroups/orka-verify-sample01-builder",
+            "errorCodes": ["SecurityRuleInvalidAccessType"]}]}
+        for identity in (outer, nested):
+            failures["deployments"][identity] = {"state": "Failed", "templateHash": "123",
+                "correlationId": "66666666-6666-6666-6666-666666666666", "timestamp": self.old["T0"]}
+            self.objects[identity] = {"id": identity, "properties": {
+                "provisioningState": "Failed", **{k: v for k, v in failures["deployments"][identity].items() if k != "state"}}}
+        self.operations = nested + "/operations"
+        self.objects[self.operations] = {"value": [{"id": self.operations + "/one", "properties": {
+            "provisioningState": "Failed", "targetResource": {"id": failures["failedOperations"][0]["targetId"]},
+            "statusMessage": {"error": {"code": "SecurityRuleInvalidAccessType"}}}}]}
+        apply.write_json(self.old_work / "bundle.json", self.origin)
+        apply.write_json(self.old_work / "receipt.json", self.old)
+        apply.write_json(self.old_work / "authorization-link.json", {"fixture": "old-reviewed-qualification"})
+        apply.write_json(self.blocked_work / "owned-partial-state.json", snapshot)
+        apply.write_json(self.blocked_work / "armed-cleanup-snapshot.json", cleanup)
+        apply.write_json(self.blocked_work / "failed-deployment-proof.json", failures)
+        (self.blocked_work / "main.arm.json").write_bytes(legacy.read_bytes())
+        old_inputs = {str(path): apply.sha(path.read_bytes()) for path in self.old_work.iterdir() if path.is_file()}
+        blocked = {"kind": "blocked-armed-platform-dns-compute-repair", "oldSourceDigest": self.origin["sourceDigest"],
+            "approvalForExecution": False, "executableContinuationEnabled": False, "oldInputs": old_inputs,
+            "window": {"T0": self.old["T0"], "deadline": self.old["deadline"]},
+            "compiledHashes": {"main": apply.sha(legacy.read_bytes())}}
+        for filename, key in (("owned-partial-state.json", "ownedPartialStateSha256"),
+                              ("armed-cleanup-snapshot.json", "cleanupSnapshotSha256"),
+                              ("failed-deployment-proof.json", "failedDeploymentProofSha256")):
+            blocked[key] = apply.sha((self.blocked_work / filename).read_bytes())
+        apply.write_json(self.blocked_work / "blocked-repair-plan.json", {"plan": blocked, "sha256": apply.sha(apply.wire(blocked))})
+        self.args = SimpleNamespace(subscription=self.sub, control_vnet_id=self.scope["controlVnetId"],
+            control_aks_id=self.scope["controlClusterId"], work_dir=str(self.work),
+            previous_work_dir=str(self.old_work), blocked_compute_repair_work_dir=str(self.blocked_work))
+        self.azure = apply.Azure(self.sub, self.work, runner=self.runner)
+
+    def compile_fixture(self, work):
+        result = {}
+        for name in (*apply.NEW_TEMPLATES, "main"):
+            path = work / (name + ".arm.json")
+            path.write_bytes((self.cache / path.name).read_bytes())
+            result[name] = apply.sha(path.read_bytes())
+        return result
+
+    def compile_core_fixture(self, work):
+        path = work / "compute-repair.arm.json"
+        path.write_bytes((self.cache / path.name).read_bytes())
+        return apply.sha(path.read_bytes())
+
+    def sleep(self, seconds):
+        self.wall += seconds
+        self.mono += seconds
+
+    def runner(self, command, **_kwargs):
+        self.assertEqual(command[0], "az")
+        self.assertEqual(command[command.index("--subscription") + 1], self.sub)
+        args = command[1:command.index("--subscription")]
+        self.events.append(args)
+        if args[:2] == ["account", "show"]:
+            value = {"subscription": self.sub, "tenant": self.origin["tenantId"], "environment": "AzureCloud"}
+        elif args[:2] == ["vm", "list-usage"]:
+            value = [{"name": {"value": name}, "limit": self.quota_free, "currentValue": 0}
+                     for name in ("standardDSv5Family", "cores")]
+        elif args[:3] == ["deployment", "group", "what-if"]:
+            parameters = json.loads(Path(args[args.index("--parameters") + 1][1:]).read_text())["parameters"]
+            role = f"/subscriptions/{self.sub}/providers/Microsoft.Authorization/roleDefinitions/" + \
+                apply.BUILTIN_ROLES["peering-cleanup"][0]
+            value = {"status": "Succeeded", "changes": [{"resourceId": identity, "changeType": "Ignore"}
+                for identity in self.existing if identity != self.scope["verificationResourceGroupId"] and
+                "/roleAssignments/" not in identity] + [
+                {"resourceId": identity, "changeType": "Create", "after": {"properties": {
+                    "principalId": parameters["controlPlanePrincipalId"]["value"], "roleDefinitionId": role}}}
+                if "/roleAssignments/" in identity else {"resourceId": identity, "changeType": "Create"}
+                for identity in self.missing]}
+        else:
+            self.assertEqual(args[0], "rest")
+            method = args[args.index("--method") + 1]
+            url = urlsplit(args[args.index("--url") + 1])
+            identity = url.path
+            if method == "PUT":
+                self.assertEqual(identity, self.link["plan"]["repairDeploymentId"])
+                self.puts += 1
+                self.submitted = True
+                value = {"id": identity, "properties": {"provisioningState": "Accepted"}}
+            elif method == "POST":
+                self.assertEqual(identity, self.link["plan"]["repairDeploymentId"] + "/cancel")
+                self.assertGreaterEqual(self.wall, 3600)
+                self.cancels += 1
+                self.deployment_state = "Canceling"
+                value = {}
+            else:
+                self.assertEqual(method, "GET")
+                if hasattr(self, "link") and identity == self.link["plan"]["repairDeploymentId"] and self.submitted:
+                    if self.interrupt_poll:
+                        self.interrupt_poll = False
+                        raise KeyboardInterrupt
+                    if self.get_hook:
+                        hook, self.get_hook = self.get_hook, None
+                        hook()
+                    value = {"id": identity, "properties": {"provisioningState": self.deployment_state}}
+                elif identity.endswith("/roleAssignments") and "$filter" in parse_qs(url.query):
+                    value = {"value": self.network if self.principal in parse_qs(url.query)["$filter"][0] else self.assignments}
+                elif identity in self.text:
+                    return SimpleNamespace(returncode=0, stdout=self.text[identity], stderr="")
+                elif identity in self.objects:
+                    receipt_path = self.work / "receipt.json"
+                    if self.fail_followup and self.submitted and self.deployment_state == "Succeeded" and \
+                            "/schedules/" in identity and receipt_path.exists():
+                        return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: transient followup")
+                    value = self.objects[identity]
+                else:
+                    return SimpleNamespace(returncode=1, stdout="",
+                        stderr='ERROR: Not Found({"error":{"code":"ResourceNotFound"}})')
+        return SimpleNamespace(returncode=0, stdout=json.dumps(value), stderr="")
+
+    def prepare(self):
+        apply.prepare_create_only_compute(self.args, self.work, self.azure)
+        self.bundle = json.loads((self.work / "bundle.json").read_text())
+        self.link = json.loads((self.work / "compute-repair-link.json").read_text())
+        self.args.approved_compute_repair_sha256 = self.link["sha256"]
+        self.args.approved_compute_qualification_sha256 = self.link["plan"]["qualificationSha256"]
+        self.args.reviewed_source_sha256 = self.bundle["sourceDigest"]
+        self.events.clear()
+
+    def command(self, operation):
+        argv = ["apply", operation, "--subscription", self.sub, "--control-vnet-id", self.scope["controlVnetId"],
+            "--control-aks-id", self.scope["controlClusterId"], "--work-dir", str(self.work),
+            "--reviewed-source-sha256", self.bundle["sourceDigest"],
+            "--approved-compute-repair-sha256", self.args.approved_compute_repair_sha256,
+            "--approved-compute-qualification-sha256", self.args.approved_compute_qualification_sha256]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(apply, "Azure", return_value=self.azure):
+            apply.main()
+
+    def proof(self):
+        previous, old, _, _, snapshot, cleanup, failures = apply.create_only_compute_inputs(
+            self.args, self.link["plan"]["inputDirectories"])
+        return apply.create_only_compute_proof(self.azure, previous, old, snapshot, cleanup, failures)
+
+    def resign_link(self):
+        self.link["sha256"] = apply.sha(apply.wire(self.link["plan"]))
+        self.args.approved_compute_repair_sha256 = self.link["sha256"]
+        apply.write_json(self.work / "compute-repair-link.json", self.link)
+
+    def test_real_prepare_allocate_and_qualify_success_path(self):
+        self.prepare()
+        self.command("allocate-create-only-compute-repair")
+        saved = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(saved["phase"], "compute-repair-provisioned")
+        self.assertEqual(saved["deadline"], self.old["deadline"])
+        with mock.patch.object(apply, "finish_compute") as finish:
+            self.command("qualify-create-only-compute-repair")
+            finish.assert_called_once()
+        self.assertEqual(self.puts, 1)
+        self.assertEqual(self.cancels, 0)
+
+    def test_quota_failure_is_before_intent_and_put_and_does_not_consume_attempt(self):
+        self.prepare()
+        self.quota_free = 11
+        with self.assertRaisesRegex(apply.Failure, "approved-sku-quota-unavailable"):
+            self.command("allocate-create-only-compute-repair")
+        self.assertFalse((self.work / "receipt.json").exists())
+        self.assertEqual(self.puts, 0)
+        self.quota_free = 12
+        self.command("allocate-create-only-compute-repair")
+        self.assertEqual(self.puts, 1)
+
+    def test_preput_proof_equality_is_executed_before_any_intent_or_put(self):
+        self.prepare()
+        key = next(iter(self.link["plan"]["proof"]["existingResourcesSha256"]))
+        self.link["plan"]["proof"]["existingResourcesSha256"][key] = "f" * 64
+        self.resign_link()
+        with self.assertRaisesRegex(apply.Failure, "create-only-preallocation-proof-drift"):
+            self.command("allocate-create-only-compute-repair")
+        self.assertEqual(self.puts, 0)
+        self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_real_proof_rejects_partial_snapshot_node_role_and_failed_operation_drift(self):
+        self.prepare()
+        baseline = copy.deepcopy(self.objects)
+        role_baseline = copy.deepcopy(self.network)
+        resource_list = self.scope["verificationResourceGroupId"] + "/resources"
+        for kind in ("extra", "missing", "snapshot", "node", "missing-target-present", "third-role", "failure-operation"):
+            with self.subTest(kind=kind):
+                if kind == "extra":
+                    self.objects[resource_list]["value"].append({"id": self.scope["builderVirtualMachineId"]})
+                elif kind == "missing":
+                    self.objects[resource_list]["value"].pop()
+                elif kind == "snapshot":
+                    identity = next(key for key in self.existing if "/natGateways/" in key and "/roleAssignments/" not in key)
+                    self.objects[identity]["properties"]["idleTimeoutInMinutes"] = 99
+                elif kind == "node":
+                    self.objects[self.scope["managedNodeResourceGroupId"]] = {"id": self.scope["managedNodeResourceGroupId"]}
+                elif kind == "missing-target-present":
+                    self.objects[self.scope["builderVirtualMachineId"]] = {"id": self.scope["builderVirtualMachineId"]}
+                elif kind == "third-role":
+                    extra = copy.deepcopy(self.network[0])
+                    extra["id"] += "-third"
+                    self.network.append(extra)
+                else:
+                    self.objects[self.operations]["value"][0]["properties"]["statusMessage"]["error"]["code"] = "OtherFailure"
+                with self.assertRaises(apply.Failure):
+                    self.proof()
+                self.assertEqual(self.puts, 0)
+                self.objects = copy.deepcopy(baseline)
+                self.network = copy.deepcopy(role_baseline)
+
+    def test_real_loader_rejects_wrong_approval_deployment_parameters_preview_and_qualification(self):
+        self.prepare()
+        original = copy.deepcopy(self.link)
+        parameters_path = self.work / self.link["plan"]["repairParametersFile"]
+        preview_path = self.work / self.link["plan"]["previewFile"]
+        parameter_bytes, preview_bytes = parameters_path.read_bytes(), preview_path.read_bytes()
+        for kind in ("approval", "deployment", "parameters", "preview", "qualification"):
+            with self.subTest(kind=kind):
+                if kind == "approval":
+                    self.args.approved_compute_repair_sha256 = "f" * 64
+                elif kind == "deployment":
+                    self.link["plan"]["repairDeploymentId"] += "-foreign"
+                    self.resign_link()
+                elif kind == "parameters":
+                    parameters = json.loads(parameter_bytes)
+                    parameters["parameters"]["controlPlanePrincipalId"]["value"] = "99999999-9999-9999-9999-999999999999"
+                    apply.write_json(parameters_path, parameters)
+                    self.link["plan"]["repairParametersSha256"] = apply.sha(parameters_path.read_bytes())
+                    self.resign_link()
+                elif kind == "preview":
+                    preview_path.write_bytes(preview_bytes + b" ")
+                else:
+                    self.link["plan"]["qualification"]["nodeCleanupScope"] = self.scope["controlVnetId"]
+                    self.link["plan"]["qualificationSha256"] = apply.sha(apply.wire(self.link["plan"]["qualification"]))
+                    self.resign_link()
+                with self.assertRaises(apply.Failure):
+                    apply.load_create_only_repair(self.azure, self.bundle, self.args)
+                self.assertEqual(self.puts, 0)
+                self.link = copy.deepcopy(original)
+                self.args.approved_compute_repair_sha256 = original["sha256"]
+                apply.write_json(self.work / "compute-repair-link.json", original)
+                parameters_path.write_bytes(parameter_bytes)
+                preview_path.write_bytes(preview_bytes)
+
+    def test_real_inputs_reject_a_resigned_wrong_blocked_plan_kind(self):
+        path = self.blocked_work / "blocked-repair-plan.json"
+        record = json.loads(path.read_text())
+        record["plan"]["kind"] = "unapproved-generic-retry"
+        record["sha256"] = apply.sha(apply.wire(record["plan"]))
+        apply.write_json(path, record)
+        with self.assertRaisesRegex(apply.Failure, "exact-blocked-repair-lineage-required"):
+            apply.prepare_create_only_compute(self.args, self.work, self.azure)
+        self.assertEqual(self.puts, 0)
+
+    def test_success_is_durable_before_followup_failure_and_qualification_can_recover(self):
+        self.prepare()
+        self.fail_followup = True
+        with self.assertRaisesRegex(apply.Failure, "azure-command-failed"):
+            self.command("allocate-create-only-compute-repair")
+        saved = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(saved["phase"], "compute-repair-provisioned")
+        self.assertEqual(saved["repairCompletedUtc"], "2026-10-09T00:00:00Z")
+        self.fail_followup = False
+        with mock.patch.object(apply, "finish_compute") as finish:
+            self.command("qualify-create-only-compute-repair")
+            finish.assert_called_once()
+        self.assertEqual(self.puts, 1)
+
+    def test_success_is_durable_even_when_inventory_persistence_is_interrupted(self):
+        self.prepare()
+        write = apply.write_json
+
+        def unavailable_inventory(path, value):
+            if path.name == "repair-allocation-inventory.json":
+                raise OSError("synthetic-private-inventory-write-failure")
+            return write(path, value)
+
+        with mock.patch.object(apply, "write_json", side_effect=unavailable_inventory), self.assertRaises(OSError):
+            self.command("allocate-create-only-compute-repair")
+        saved = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(saved["phase"], "compute-repair-provisioned")
+        self.assertEqual(saved["repairCompletedUtc"], "2026-10-09T00:00:00Z")
+        self.wall = 3700
+        self.command("reconcile-create-only-compute-repair")
+        reconciled = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(reconciled["repairCompletedUtc"], saved["repairCompletedUtc"])
+        self.assertEqual(self.puts, 1)
+        self.assertEqual(self.cancels, 0)
+
+    def test_interrupted_receipt_replace_preserves_the_prior_durable_intent(self):
+        self.prepare()
+        self.interrupt_poll = True
+        with self.assertRaisesRegex(apply.Failure, "interrupted-reconcile-required"):
+            self.command("allocate-create-only-compute-repair")
+        path = self.work / "receipt.json"
+        original = path.read_bytes()
+        receipt = json.loads(original)
+        receipt["phase"] = "compute-repair-provisioned"
+        with mock.patch.object(apply.os, "replace", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            apply.save_receipt(self.work, receipt)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse((self.work / "receipt.next.json").exists())
+        self.command("reconcile-create-only-compute-repair")
+        self.assertEqual(json.loads(path.read_text())["phase"], "compute-repair-provisioned")
+        self.assertEqual(self.puts, 1)
+
+    def test_interrupted_intent_reconciles_without_snapshot_replay_or_new_put(self):
+        self.prepare()
+        self.interrupt_poll = True
+        with self.assertRaisesRegex(apply.Failure, "repair-interrupted-reconcile-required"):
+            self.command("allocate-create-only-compute-repair")
+        self.assertEqual(json.loads((self.work / "receipt.json").read_text())["phase"], "compute-repair-intent")
+        for identity in self.existing:
+            if "/natGateways/" in identity or "/networkSecurityGroups/" in identity:
+                if "/roleAssignments/" not in identity:
+                    self.objects[identity]["properties"]["subnets"] = [{"id": self.scope["verificationVnetId"] + "/subnets/nodes"}]
+        self.wall = 60
+        with mock.patch.object(apply, "create_only_compute_proof", side_effect=AssertionError("must not replay pre-PUT proof")):
+            self.command("reconcile-create-only-compute-repair")
+        self.assertEqual(json.loads((self.work / "receipt.json").read_text())["phase"], "compute-repair-provisioned")
+        self.assertEqual(self.puts, 1)
+        self.assertEqual(self.cancels, 0)
+
+    def test_wall_clock_suspend_rejects_late_success_with_frozen_monotonic_clock(self):
+        self.prepare()
+        self.get_hook = lambda: setattr(self, "wall", 3601)
+        with self.assertRaisesRegex(apply.Failure, "repair-allocation-bound-reached"):
+            self.command("allocate-create-only-compute-repair")
+        saved = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(self.mono, 0)
+        self.assertEqual(saved["phase"], "compute-repair-timeout")
+        self.assertNotIn("repairCompletedUtc", saved)
+        self.assertEqual(self.cancels, 0, "a late terminal success is not a running deployment to cancel")
+        self.assertEqual(self.puts, 1)
+
+    def test_wall_clock_suspend_cancels_running_attempt_without_waiting_for_monotonic_time(self):
+        self.prepare()
+        self.deployment_state = "Running"
+        self.get_hook = lambda: setattr(self, "wall", 3601)
+        with self.assertRaisesRegex(apply.Failure, "repair-allocation-bound-reached"):
+            self.command("allocate-create-only-compute-repair")
+        self.assertEqual(self.mono, 0)
+        self.assertEqual(self.cancels, 1)
+        saved = json.loads((self.work / "receipt.json").read_text())
+        self.assertEqual(saved["repairCancelTarget"], self.link["plan"]["repairDeploymentId"])
+        self.assertEqual(saved["phase"], "compute-repair-timeout")
+
+    def test_reconcile_never_cancels_early_and_records_at_most_one_cancel(self):
+        self.prepare()
+        self.deployment_state = "Running"
+        self.interrupt_poll = True
+        with self.assertRaises(apply.Failure):
+            self.command("allocate-create-only-compute-repair")
+        self.wall = 3599
+        self.command("reconcile-create-only-compute-repair")
+        self.assertEqual(self.cancels, 0)
+        self.wall = 3601
+        with self.assertRaisesRegex(apply.Failure, "allocation-bound-reached"):
+            self.command("reconcile-create-only-compute-repair")
+        self.assertEqual(self.cancels, 1)
+        with self.assertRaisesRegex(apply.Failure, "allocation-bound-reached"):
+            self.command("reconcile-create-only-compute-repair")
+        self.assertEqual(self.cancels, 1)
+        self.assertEqual(self.puts, 1)
+
+    def test_reconcile_is_fenced_to_original_source_approval_deployment_and_utc_window(self):
+        self.prepare()
+        self.interrupt_poll = True
+        with self.assertRaisesRegex(apply.Failure, "interrupted-reconcile-required"):
+            self.command("allocate-create-only-compute-repair")
+        path = self.work / "receipt.json"
+        original = path.read_bytes()
+        for kind in ("source", "approval", "deployment", "window", "start", "clock", "cancel-scope"):
+            saved = json.loads(original)
+            if kind == "source":
+                saved["sourceDigest"] = "f" * 64
+            elif kind == "approval":
+                saved["repairOf"]["approvalSha256"] = "f" * 64
+            elif kind == "deployment":
+                saved["repairOf"]["deploymentId"] = self.account + "/jobs/foreign"
+            elif kind == "window":
+                saved["repairAllocationLimitUtc"] = "2026-10-09T02:00:00Z"
+            elif kind == "start":
+                saved["repairStartedUtc"] = "2026-10-09T20:00:00Z"
+                saved["repairAllocationLimitUtc"] = "2026-10-09T21:00:00Z"
+            elif kind == "clock":
+                saved["deadline"] = "2026-10-10T23:38:00Z"
+            else:
+                saved.update({"phase": "compute-repair-timeout", "repairCancelAttempted": True,
+                              "repairCancelTarget": self.account})
+            apply.write_json(path, saved)
+            with self.subTest(kind=kind), self.assertRaises(apply.Failure):
+                self.command("reconcile-create-only-compute-repair")
+            self.assertEqual(self.puts, 1)
+            self.assertEqual(self.cancels, 0)
+        path.write_bytes(original)
+        self.wall = 3601
+        with self.assertRaisesRegex(apply.Failure, "allocation-bound-reached"):
+            self.command("reconcile-create-only-compute-repair")
+        self.assertEqual(json.loads(path.read_text())["phase"], "compute-repair-timeout")
+        self.assertEqual(self.puts, 1)
+        self.assertEqual(self.cancels, 0, "unproven late success must not be qualified or need terminal cancellation")
+
+    def test_qualification_rejects_late_completion_late_observation_and_non_succeeded_deployment(self):
+        self.prepare()
+        self.command("allocate-create-only-compute-repair")
+        path = self.work / "receipt.json"
+        original = path.read_bytes()
+        saved = json.loads(original)
+        saved["repairCompletedUtc"] = "2026-10-09T01:00:01Z"
+        apply.write_json(path, saved)
+        with self.assertRaisesRegex(apply.Failure, "timely-durable-repair-completion"):
+            self.command("qualify-create-only-compute-repair")
+        path.write_bytes(original)
+        self.wall = int((apply.dt.datetime(2026, 10, 9, 21, 38, tzinfo=apply.dt.timezone.utc) - self.base_time).total_seconds())
+        with mock.patch.object(apply, "finish_compute") as finish:
+            with self.assertRaisesRegex(apply.Failure, "timely-provisioned-repair-required"):
+                self.command("qualify-create-only-compute-repair")
+            finish.assert_not_called()
+        self.wall = 60
+        self.deployment_state = "Failed"
+        with mock.patch.object(apply, "finish_compute") as finish:
+            with self.assertRaisesRegex(apply.Failure, "successful-repair-deployment-required"):
+                self.command("qualify-create-only-compute-repair")
+            finish.assert_not_called()
+        self.assertEqual(self.puts, 1)
+
+
 class RecoveryPlanTests(unittest.TestCase):
     def setUp(self):
         self.directory = ROOT / "bin/remediation-aks-tests" / uuid.uuid4().hex
@@ -2313,6 +3274,57 @@ class NewTemplateTests(unittest.TestCase):
         self.assertFalse(peer["useRemoteGateways"])
         link = self.compile("dns-link")["resources"][0]["properties"]
         self.assertFalse(link["registrationEnabled"])
+
+    def test_dns_repair_template_delta_cannot_relax_other_network_or_compute_boundaries(self):
+        current = self.compile("main")
+        previous = copy.deepcopy(current)
+        nested = apply.arm_resource_definitions(previous)
+        builder = next(item for item in nested if item["type"] == "Microsoft.Network/networkSecurityGroups" and
+                       any(rule["name"] == "trusted-build-client-mtls" for rule in item["properties"]["securityRules"]))
+        builder["properties"]["securityRules"].insert(2, {"name": "platform-dns", "properties": {
+            "priority": 105, "access": "Allow", "direction": "Outbound", "protocol": "*",
+            "sourceAddressPrefix": "*", "sourcePortRange": "*",
+            "destinationAddressPrefix": "AzurePlatformDNS", "destinationPortRange": "53"}})
+        apply.validate_platform_dns_repair_template(previous, current)
+        nested_after = apply.arm_resource_definitions(current)
+        builder_after = next(item for item in nested_after if item["type"] == "Microsoft.Network/networkSecurityGroups" and
+                             any(rule["name"] == "trusted-build-client-mtls" for rule in item["properties"]["securityRules"]))
+        next(rule for rule in builder_after["properties"]["securityRules"]
+             if rule["name"] == "deny-lateral-connections")["properties"]["access"] = "Allow"
+        with self.assertRaisesRegex(apply.Failure, "template-scope-drift"):
+            apply.validate_platform_dns_repair_template(previous, current)
+
+    def test_shared_compute_core_has_only_six_creates_and_identical_canonical_properties(self):
+        canonical = self.compile("main")
+        core = self.compile("compute-core")
+        outer = next(item["properties"]["template"] for item in canonical["resources"]
+                     if item["type"] == "Microsoft.Resources/deployments")
+        module = next(item for item in outer["resources"] if item["type"] == "Microsoft.Resources/deployments")
+        self.assertEqual(module["properties"]["template"], core)
+        self.assertEqual(len(core["resources"]), 6)
+        self.assertFalse(any(item["type"] in ("Microsoft.ContainerRegistry/registries",
+            "Microsoft.Network/natGateways", "Microsoft.Network/publicIPAddresses",
+            "Microsoft.ManagedIdentity/userAssignedIdentities") for item in core["resources"]))
+        self.assertEqual(sum(item["type"] == "Microsoft.Authorization/roleAssignments" for item in core["resources"]), 1)
+        self.assertEqual(len(core["outputs"]["existingResourceIds"]["value"]), 5)
+        fixture = ROOT / "scripts/tests/fixtures/remediation-aks-corrected-main.arm.json"
+        self.assertEqual(apply.sha(fixture.read_bytes()),
+                         "3823613b20076623ef7361145916ada433c5d4c981d3f9199a3deaf5ac41014b")
+        previous = json.loads(fixture.read_text())
+        apply.validate_create_only_compute_template(previous, canonical, core)
+        changed = copy.deepcopy(core)
+        cluster = next(item for item in changed["resources"] if item["type"] == "Microsoft.ContainerService/managedClusters")
+        cluster["properties"]["agentPoolProfiles"][0]["count"] = 3
+        with self.assertRaisesRegex(apply.Failure, "canonical-compute-module"):
+            apply.validate_create_only_compute_template(previous, canonical, changed)
+        changed_canonical = copy.deepcopy(canonical)
+        nested = next(item["properties"]["template"] for item in changed_canonical["resources"]
+                      if item["type"] == "Microsoft.Resources/deployments")
+        changed_module = next(item for item in nested["resources"]
+                              if item["type"] == "Microsoft.Resources/deployments")
+        changed_module["properties"]["template"] = changed
+        with self.assertRaisesRegex(apply.Failure, "canonical-refactor-resource-property-drift"):
+            apply.validate_create_only_compute_template(previous, changed_canonical, changed)
 
     def test_real_powershell_runbook_contracts_without_azure(self):
         executable = ROOT / "bin/remediation-aks-pwsh/pwsh"

@@ -165,6 +165,13 @@ DNS link, or trusted setup Job is created by this template or the planner.
    permits only trusted control-node mTLS clients on TCP 1234. Check effective
    routes, private-endpoint behavior and policy-injected NSG rules before any
    network enforcement claim.
+   Do not add an `Allow` rule for `AzurePlatformDNS`: platform service tags are
+   deny-only opt-outs. [Azure's 168.63.129.16 documentation](https://learn.microsoft.com/azure/virtual-network/what-is-ip-address-168-63-129-16#scope-of-azure-ip-address-1686312916)
+   states that platform DNS on TCP/UDP 53 bypasses NSGs unless explicitly denied
+   with that tag; host-agent WireServer TCP 80/32526 also bypasses NSGs.
+   Removing the invalid DNS allow does not relax the builder's lateral deny,
+   HTTPS-only ordinary outbound allowance, ingress boundary, or independent
+   guest CNI/nftables IMDS and WireServer controls.
    No peering or existing-network DNS mutation is included in this template.
    Use one nonprivileged, bounded trusted setup Job/ServiceAccount in the existing
    control namespace, reached through that cluster's already working public API,
@@ -565,6 +572,129 @@ This is not a generic resume/adoption framework. Outside the exact same-link
 handoff retry above, a partially failed phase stops with a private intent receipt
 and requires bounded operator recovery; never silently reuse an existing name
 or extend its lifetime.
+
+### Read-only platform-DNS compute-repair proposal
+
+A compute deployment rejected at the builder NSG with
+`SecurityRuleInvalidAccessType` is **not** an unarmed rollback. Once compute has
+started, preserve its original `T0`, primary/catch-up schedules, encoded cleanup
+bindings and 24-hour deadline. Do not edit the old `compute-intent`, rerun `arm`,
+or invoke the normal creation-only path against partial resources.
+
+The DNS correction removes only the invalid `AzurePlatformDNS` allow rule.
+`validate_platform_dns_repair_template` requires that single compiled-template
+change (apart from generated template hashes); the normal
+`validate_armed_preview` remains creation-only. The dedicated
+`validate_compute_repair_preview` accepts Create only for the exact missing
+original resources, NoChange for the two existing network-role bindings, and
+NoChange or an explicitly reviewed source-digest-only tag delta for the owned
+resource group and five succeeded resources. Any existing property, principal,
+rule-array, replacement, deletion, foreign resource or incomplete preview blocks
+the proposal. Provider what-if differences are not automatically dismissed as
+defaults or expression-resolution artifacts.
+
+A candidate repair must bind the old full compute parameters/BOM/receipt,
+original published cleanup content and active schedules, exact failed
+deployment/NSG error, and live owned partial-resource properties and role
+principals. It needs a new current-source bundle and explicit review/approval,
+not a source-drift bypass. The proposed repair start cutoff is two hours before
+the unchanged primary cleanup, with at most one hour of allocation observation.
+A client wait timeout is **not** proof that Azure allocation stopped:
+cancellation/settlement behavior must be reviewed before enabling execution.
+The initial compute path's 30-minute freshness check is unchanged.
+
+If Provider what-if reports unapproved existing-resource or role changes, stop.
+Keep the independent cleanup backstop armed against the partial billable
+resources and report the exact rejected delta paths. The initial full-template
+proposal was blocked for precisely this reason; those deltas are never ignored.
+
+### Create-only continuation of the same armed compute attempt
+
+`compute-core.bicep` is both the canonical full stack's compute module and the
+standalone repair template. It declares the exact ACR, PIP, NAT, node NSG and
+control-plane UAMI as `existing`; only the builder NSG, VNet, VNet-scoped Network
+Contributor binding, AKS, builder NIC and builder VM appear as creates. The two
+existing network-role bindings are never PUT. The actual UAMI principal GUID is
+read, pinned and supplied explicitly, and an unresolved/different what-if
+principal is rejected. The existing 2×D4 nodes, 1×D4 builder, Basic ACR, private
+API, fixed version and disabled autoscaling/upgrades remain canonical.
+
+```bash
+python3 "$APPLY" plan-create-only-compute-repair \
+  --subscription "$APPROVED_SUBSCRIPTION" \
+  --control-vnet-id "$CONTROL_VNET_ID" --control-aks-id "$CONTROL_AKS_ID" \
+  --previous-work-dir "$FAILED_ARMED_COMPUTE_DIR" \
+  --blocked-compute-repair-work-dir "$FROZEN_BLOCKED_DNS_PROPOSAL_DIR" \
+  --work-dir "$CREATE_ONLY_REPAIR_DIR"
+# Root review must approve the exact current source and compute-repair-link.json.
+python3 "$APPLY" allocate-create-only-compute-repair ... \
+  --reviewed-source-sha256 "$REPAIR_SOURCE_DIGEST" \
+  --approved-compute-repair-sha256 "$REPAIR_LINK_DIGEST"
+```
+
+The operating bundle is current-source qualified. Existing resource tags retain
+their frozen original source digest; newly created resources carry the repair
+source digest. `resourceOriginSourceDigest` and `repairOf` record both identities
+without rewriting the old receipt, old inputs, `T0`, schedules, bindings or
+deadline. The repair starts no later than two hours before the original primary
+cleanup. One new, digest-reserved group deployment is PUT at most once. Its
+controller allocation budget is one hour, including submission and polling.
+Both the recorded absolute UTC limit and a monotonic limit are enforced:
+host/WSL suspension cannot stretch the allocation window. The original eastus2
+DSv5-family **and total-core** quota checks require at least 12 free cores after
+the live proof and before writing an intent or making the PUT. A quota shortfall
+does not consume the attempt. An ambiguous submit is observed, never replayed.
+
+At the bound, the controller attempts cancellation of **only that new repair
+deployment**, then records deployment state and a fresh partial-resource/node
+inventory. ARM cancellation is best-effort and does not prove already-issued
+resource-provider operations have stopped. Timeout, failure and uncertain
+outcomes do not qualify readiness or permit a new allocation; the independent
+original cleanup backstop remains armed. There is no hard cloud-kill claim.
+
+A timely Succeeded observation is durably marked `compute-repair-provisioned`
+**before** inventory or schedule follow-up GETs. If those reads fail, the
+successful receipt remains usable for the separately gated qualification.
+Receipt replacement is atomic, so interruption leaves the prior complete
+intent or the complete new state, not a partially rewritten JSON receipt.
+Interruptions leave the durable intent rather than triggering an early cancel.
+Ctrl-C records the interruption; abrupt termination may leave just the intent.
+Use the same source, approval, deployment ID and recorded UTC window to observe
+that existing attempt:
+
+```bash
+python3 "$APPLY" reconcile-create-only-compute-repair ... \
+  --reviewed-source-sha256 "$REPAIR_SOURCE_DIGEST" \
+  --approved-compute-repair-sha256 "$REPAIR_LINK_DIGEST"
+```
+
+Reconciliation never PUTs a deployment and does not replay the pre-allocation
+exact snapshot proof: legitimate subnet attachments change the NAT/NSG GET
+bodies. It uses GETs, except for the **single durable cancellation attempt** at
+the original recorded limit if work is still nonterminal. A previously recorded
+cancel is never replayed. Success observed within the UTC window can be
+reconciled to provisioned; late success is fail-closed, not backdated from
+unverified ARM timestamps. A durable timely completion remains valid after a
+follow-up failure, but qualification still requires that completion timestamp
+to be within the original one-hour window and runs before primary cleanup.
+Neither process restart nor reconciliation changes any clock.
+
+Successful allocation produces `compute-repair-provisioned`, not a false
+`compute-ready`. The original post-compute readbacks, node-group cleanup grant
+and two registry pull assignments remain a separate explicit gate:
+
+```bash
+python3 "$APPLY" qualify-create-only-compute-repair ... \
+  --reviewed-source-sha256 "$REPAIR_SOURCE_DIGEST" \
+  --approved-compute-repair-sha256 "$REPAIR_LINK_DIGEST" \
+  --approved-compute-qualification-sha256 "$ORIGINAL_QUALIFICATION_SCOPE_DIGEST"
+```
+
+Review that qualification digest separately: it permits only the original
+node-RG cleanup and isolated-registry scopes, with identity readback before
+grants. These assignments are not performed during allocation. Once qualified,
+the normal `connect`/`retire` paths consume the current-source receipt without a
+source-guard bypass. No repair operation resets the original lifetime.
 
 If deployment partially fails, the armed cleanup deadline still applies. Do not
 retry using another SKU/region or reuse an unrelated resource group. Preserve

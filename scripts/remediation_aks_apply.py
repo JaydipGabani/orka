@@ -42,7 +42,7 @@ BUILTIN_ROLES = {
     }),
 }
 ABSENT_CODES = frozenset(("ResourceNotFound", "ResourceGroupNotFound", "NotFound", "RoleDefinitionDoesNotExist",
-                         "RoleAssignmentNotFound", "ParentResourceNotFound"))
+                         "RoleAssignmentNotFound", "ParentResourceNotFound", "DeploymentNotFound"))
 PREFLIGHT_QUEUE_ALLOWANCE_SECONDS = 600
 PREFLIGHT_EXECUTION_SECONDS = 600
 ASSIGNMENT_READBACK_SECONDS = 120
@@ -224,7 +224,7 @@ class Azure:
         plan.check_subscription_ids(value, self.subscription)
         return value
 
-    def rest(self, method, identity, version, body=None, absent=False, text_file=None, raw=False):
+    def rest(self, method, identity, version, body=None, absent=False, text_file=None, raw=False, timeout=900):
         require(identity.startswith(f"/subscriptions/{self.subscription}/"), "rest-outside-subscription")
         require("?" not in identity and "#" not in identity and ".." not in identity, "invalid-rest-resource-id")
         arguments = ["rest", "--method", method, "--url", ARM + identity + "?api-version=" + version]
@@ -236,10 +236,10 @@ class Azure:
             arguments += ["--body", "@" + str(path)]
         if text_file is not None:
             arguments += ["--body", "@" + str(text_file), "--headers", "Content-Type=text/plain"]
-        return self.cli(*arguments, absent=absent, raw=raw)
+        return self.cli(*arguments, absent=absent, raw=raw, timeout=timeout)
 
-    def get(self, identity, version, absent=False):
-        return self.rest("GET", identity, version, absent=absent)
+    def get(self, identity, version, absent=False, timeout=900):
+        return self.rest("GET", identity, version, absent=absent, timeout=timeout)
 
     def deploy(self, name, template, values, group=None, preview=False, validation="Template",
                expected_parameters=None, expected_template=None, provider_validate=False):
@@ -1241,7 +1241,17 @@ def adopt_qualified_bootstrap(azure, bundle, receipt, args):
 
 
 def save_receipt(work, receipt):
-    write_json(work / "receipt.json", receipt)
+    path = work / "receipt.json"
+    pending = work / "receipt.next.json"
+    require(not path.is_symlink() and not pending.is_symlink(), "receipt-symlink-forbidden")
+    try:
+        write_json(pending, receipt)
+        with pending.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(pending, path)
+    finally:
+        if pending.exists():
+            pending.unlink()
 
 
 def account_identity(azure, bundle, receipt):
@@ -1642,6 +1652,737 @@ def validate_armed_preview(preview, bundle, receipt, prepared_group):
     require(required.issubset(found), "incomplete-provider-preview")
 
 
+def validate_platform_dns_repair_template(previous, current):
+    before = json.loads(wire(previous))
+    after = json.loads(wire(current))
+    removed = []
+
+    def clean(value, remove_rule=False):
+        if isinstance(value, dict):
+            generator = value.get("metadata", {}).get("_generator")
+            if isinstance(generator, dict):
+                generator.pop("templateHash", None)
+            if value.get("type") == "Microsoft.Network/networkSecurityGroups":
+                rules = value["properties"]["securityRules"]
+                for rule in list(rules):
+                    properties = rule["properties"]
+                    platform = any(str(properties.get(key, "")).startswith("AzurePlatform")
+                                   for key in ("sourceAddressPrefix", "destinationAddressPrefix"))
+                    if remove_rule and rule["name"] == "platform-dns":
+                        require(rule == {"name": "platform-dns", "properties": {
+                            "priority": 105, "access": "Allow", "direction": "Outbound", "protocol": "*",
+                            "sourceAddressPrefix": "*", "sourcePortRange": "*",
+                            "destinationAddressPrefix": "AzurePlatformDNS", "destinationPortRange": "53"}},
+                            "unexpected-original-platform-dns-rule")
+                        rules.remove(rule)
+                        removed.append(rule)
+                    else:
+                        require(not (platform and properties["access"] == "Allow"),
+                                "invalid-platform-service-tag-allow")
+            for item in value.values():
+                clean(item, remove_rule)
+        elif isinstance(value, list):
+            for item in value:
+                clean(item, remove_rule)
+
+    clean(before, True)
+    clean(after)
+    require(len(removed) == 1 and before == after, "compute-repair-template-scope-drift")
+
+
+def compute_repair_resource_sets(bundle):
+    scope = bundle["scope"]
+    group = scope["verificationResourceGroupId"]
+    prefix = "orka-verify-" + bundle["suffix"]
+    identity = group + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/" + prefix + "-aks-control-plane"
+    existing = {
+        group: "2024-03-01", scope["verificationRegistryId"]: "2025-11-01",
+        group + "/providers/Microsoft.Network/publicIPAddresses/" + prefix + "-egress": "2024-05-01",
+        group + "/providers/Microsoft.Network/natGateways/" + prefix + "-egress": "2024-05-01",
+        group + "/providers/Microsoft.Network/networkSecurityGroups/" + prefix + "-nodes": "2024-05-01",
+        identity: "2023-01-31",
+    }
+    missing = {
+        scope["verificationClusterId"]: "2025-07-01", scope["builderVirtualMachineId"]: "2024-11-01",
+        scope["verificationVnetId"]: "2024-05-01",
+        group + "/providers/Microsoft.Network/networkInterfaces/" + prefix + "-builder": "2024-05-01",
+        group + "/providers/Microsoft.Network/networkSecurityGroups/" + prefix + "-builder": "2024-05-01",
+    }
+    role = f"/subscriptions/{bundle['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + \
+        BUILTIN_ROLES["peering-cleanup"][0]
+    for name, assignment_scope in network_assignment_scopes(bundle).items():
+        assignment = assignment_scope + "/providers/Microsoft.Authorization/roleAssignments/" + \
+            arm_guid(assignment_scope, identity, role)
+        (missing if name == "vnet" else existing)[assignment] = "2022-04-01"
+    return existing, missing
+
+
+def compute_repair_window(receipt, check_start=True):
+    start = dt.datetime.fromisoformat(receipt["T0"].replace("Z", "+00:00"))
+    deadline = dt.datetime.fromisoformat(receipt["deadline"].replace("Z", "+00:00"))
+    require(receipt.get("phase") == "compute-intent" and receipt.get("armedReadbackUtc") and
+            start.utcoffset() == deadline.utcoffset() == dt.timedelta(0) and
+            start.second == start.microsecond == deadline.second == deadline.microsecond == 0 and
+            deadline == start + dt.timedelta(hours=24), "original-armed-compute-clock-required")
+    primary = start + dt.timedelta(hours=22)
+    cutoff = primary - dt.timedelta(hours=2)
+    if check_start:
+        require(utc() < deadline, "original-compute-deadline-expired")
+        require(start <= utc() <= cutoff, "compute-repair-allocation-start-cutoff")
+    return {"T0": receipt["T0"], "deadline": receipt["deadline"], "primaryCleanupUtc": timestamp(primary),
+            "catchupCleanupUtc": timestamp(start + dt.timedelta(hours=23)),
+            "latestAllocationStartUtc": timestamp(cutoff), "maximumAllocationWaitSeconds": 3600}
+
+
+def validate_compute_repair_preview(preview, previous, bundle, receipt, existing_resources):
+    compute_repair_window(receipt)
+    require(preview.get("status") == "Succeeded" and not preview.get("error"), "compute-repair-provider-proof-required")
+    require(all(bundle[key] == previous[key] for key in (
+        "subscriptionId", "tenantId", "scope", "owner", "suffix", "cleanupReceipt", "roleGuids",
+        "authorizationModel", "controlKubeletIdentity", "publicKeyReady")), "compute-repair-boundary-drift")
+    existing, missing = compute_repair_resource_sets(previous)
+    require(set(existing_resources) == set(existing), "compute-repair-partial-inventory-mismatch")
+    expected_tags = {
+        "orka-purpose": "isolated-remediation-verification", "orka-owner": previous["owner"],
+        "orka-deployment": "orka-verify-" + previous["suffix"], "orka-cleanup-receipt": previous["cleanupReceipt"],
+        "orka-budget-start-utc": receipt["T0"], "orka-expires-at-utc": receipt["deadline"],
+        "orka-source-digest": previous["sourceDigest"],
+    }
+    next_tags = {**expected_tags, "orka-source-digest": bundle["sourceDigest"]}
+    control_identity = previous["scope"]["verificationResourceGroupId"] + \
+        "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/orka-verify-" + previous["suffix"] + "-aks-control-plane"
+    principal = existing_resources[control_identity]["properties"]["principalId"]
+    require(isinstance(principal, str) and plan.UUID.fullmatch(principal), "compute-repair-control-principal-required")
+    role = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + \
+        BUILTIN_ROLES["peering-cleanup"][0]
+    seen = set()
+    for change in preview["changes"]:
+        identity = change["resourceId"]
+        require(identity in existing or identity in missing, "compute-repair-preview-outside-footprint")
+        require(identity not in seen, "compute-repair-duplicate-preview-resource")
+        seen.add(identity)
+        if identity in missing:
+            require(change["changeType"] == "Create", "compute-repair-missing-resource-must-be-create")
+            continue
+        resource = existing_resources[identity]
+        require(resource["id"].lower() == identity.lower(), "compute-repair-existing-identity-drift")
+        if "/providers/Microsoft.Authorization/roleAssignments/" in identity:
+            assignment_readback(resource, {"properties": {"principalId": principal, "roleDefinitionId": role}},
+                                identity.split("/providers/Microsoft.Authorization/roleAssignments/")[0])
+            require(change["changeType"] == "NoChange" and not change.get("delta"),
+                    "compute-repair-existing-role-change-forbidden")
+            continue
+        owned(resource, previous["scope"], previous["owner"], previous["cleanupReceipt"], identity)
+        require(resource["tags"] == expected_tags, "compute-repair-original-lifetime-tags-drift")
+        require(change["changeType"] in ("NoChange", "Modify"), "compute-repair-existing-replace-forbidden")
+        if change["changeType"] == "NoChange":
+            require(not change.get("delta"), "compute-repair-existing-config-change-forbidden")
+            continue
+        before, after = change.get("before") or {}, change.get("after") or {}
+        deltas = change.get("delta") or []
+        require(len(deltas) == 1 and deltas[0].get("path") == "tags.orka-source-digest" and
+                deltas[0].get("propertyChangeType") == "Modify" and
+                before.get("tags") == expected_tags and after.get("tags") == next_tags and
+                {key: value for key, value in before.items() if key != "tags"} ==
+                {key: value for key, value in after.items() if key != "tags"},
+                "compute-repair-existing-config-change-forbidden")
+    require(seen == set(existing) | set(missing), "compute-repair-provider-preview-incomplete")
+
+
+def compile_create_only_compute(work):
+    completed = subprocess.run(["az", "bicep", "build", "--file", str(SOURCE / "compute-core.bicep"), "--stdout"],
+                               capture_output=True, text=True, timeout=120, check=False)
+    require(completed.returncode == 0 and not completed.stderr.strip(), "create-only-template-build-failed")
+    template = json.loads(completed.stdout)
+    reject_custom_role_definitions(template)
+    write_json(work / "compute-repair.arm.json", template)
+    return sha((work / "compute-repair.arm.json").read_bytes())
+
+
+def arm_resource_definitions(template):
+    result = []
+    for resource in template["resources"]:
+        if resource["type"] == "Microsoft.Resources/deployments":
+            result.extend(arm_resource_definitions(resource["properties"]["template"]))
+        else:
+            result.append(resource)
+    return result
+
+
+def validate_create_only_compute_template(previous_corrected, canonical, repair):
+    modules = []
+
+    def find(template):
+        for resource in template["resources"]:
+            if resource["type"] == "Microsoft.Resources/deployments":
+                nested = resource["properties"]["template"]
+                if any(item["type"] == "Microsoft.ContainerService/managedClusters" for item in nested["resources"]):
+                    modules.append(resource)
+                find(nested)
+
+    find(canonical)
+    require(len(modules) == 1 and wire(modules[0]["properties"]["template"]) == wire(repair),
+            "repair-must-use-canonical-compute-module")
+    require(len(repair["resources"]) == 6 and sorted(item["type"] for item in repair["resources"]) == sorted((
+        "Microsoft.Network/networkSecurityGroups", "Microsoft.Network/virtualNetworks",
+        "Microsoft.Authorization/roleAssignments", "Microsoft.ContainerService/managedClusters",
+        "Microsoft.Network/networkInterfaces", "Microsoft.Compute/virtualMachines")),
+        "create-only-six-resource-footprint-required")
+    before = {(item["type"], item["name"]): item for item in arm_resource_definitions(previous_corrected)}
+    after = {(item["type"], item["name"]): item for item in arm_resource_definitions(canonical)}
+    require(set(before) == set(after), "canonical-refactor-resource-set-drift")
+    principal = modules[0]["properties"]["parameters"]["controlPlanePrincipalId"]["value"]
+    for key in before:
+        old = {name: value for name, value in before[key].items() if name != "dependsOn"}
+        new = json.loads(wire({name: value for name, value in after[key].items() if name != "dependsOn"}))
+        if new.get("properties", {}).get("principalId") == "[parameters('controlPlanePrincipalId')]":
+            new["properties"]["principalId"] = principal
+        require(old == new, "canonical-refactor-resource-property-drift")
+
+
+def validate_create_only_compute_preview(preview, previous, receipt, principal, existing_resources, check_start=True):
+    compute_repair_window(receipt, check_start=check_start)
+    require(preview.get("status") == "Succeeded" and not preview.get("error"), "create-only-provider-proof-required")
+    existing, missing = compute_repair_resource_sets(previous)
+    require(set(existing_resources) == set(existing) and plan.UUID.fullmatch(principal),
+            "create-only-partial-proof-required")
+    seen, created = set(), set()
+    for change in preview["changes"]:
+        identity = change["resourceId"]
+        require(identity in existing or identity in missing, "create-only-preview-outside-footprint")
+        require(identity not in seen, "create-only-duplicate-preview-resource")
+        seen.add(identity)
+        if identity in existing:
+            require(change["changeType"] in ("Ignore", "NoChange") and not change.get("delta"),
+                    "create-only-existing-put-forbidden")
+            continue
+        require(change["changeType"] == "Create", "create-only-missing-resource-must-be-create")
+        created.add(identity)
+        if "/providers/Microsoft.Authorization/roleAssignments/" in identity:
+            after = change.get("after") or {}
+            properties = after.get("properties") or {}
+            role = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + \
+                BUILTIN_ROLES["peering-cleanup"][0]
+            # What-if can omit principalType for a Create. The pinned compiled
+            # resource still requires ServicePrincipal; the GUID must resolve.
+            require(properties.get("principalId") == principal and
+                    properties.get("principalType", "ServicePrincipal") == "ServicePrincipal" and
+                    str(properties.get("roleDefinitionId", "")).lower() == role.lower(),
+                    "create-only-actual-vnet-principal-required")
+    require(created == set(missing), "create-only-provider-preview-incomplete")
+
+
+def create_only_preview_digest(path, preview):
+    # Azure.deploy persists a redacted review artifact; bind those exact bytes,
+    # not the unredacted in-memory response (for example SSH public-key fields).
+    require(json.loads(path.read_text()) == redacted(preview), "create-only-saved-preview-drift")
+    return sha(path.read_bytes())
+
+
+def create_only_compute_inputs(args, paths, check_start=True):
+    work = plan.private_path(args.work_dir)
+    require(set(paths) == {"previous", "blocked"}, "create-only-input-directories-required")
+    previous_work, blocked_work = (plan.private_path(paths[key]) for key in ("previous", "blocked"))
+    require(all(work != path and not work.is_relative_to(path) and not path.is_relative_to(work)
+                for path in (previous_work, blocked_work)), "fresh-create-only-directory-required")
+    bundle = json.loads((previous_work / "bundle.json").read_text())
+    receipt = json.loads((previous_work / "receipt.json").read_text())
+    record = json.loads((blocked_work / "blocked-repair-plan.json").read_text())
+    blocked = record["plan"]
+    require(record["sha256"] == sha(wire(blocked)) and blocked["kind"] == "blocked-armed-platform-dns-compute-repair" and
+            blocked["oldSourceDigest"] == bundle["sourceDigest"] and blocked["approvalForExecution"] is False and
+            blocked["executableContinuationEnabled"] is False, "exact-blocked-repair-lineage-required")
+    require(bundle["subscriptionId"] == args.subscription and
+            bundle["scope"] == plan.targets(args.subscription, bundle["suffix"], args.control_vnet_id, args.control_aks_id) and
+            bundle["authorizationModel"] == AUTHORIZATION_MODEL and bundle["roleGuids"] == builtin_role_guids() and
+            sha(wire(bundle["sourceHashes"])) == bundle["sourceDigest"] and
+            receipt["sourceDigest"] == bundle["sourceDigest"], "create-only-original-bundle-drift")
+    compute_repair_window(receipt, check_start=check_start)
+    hashes = {"blocked-repair-plan.json": sha((blocked_work / "blocked-repair-plan.json").read_bytes())}
+    for filename, key in (("owned-partial-state.json", "ownedPartialStateSha256"),
+                          ("armed-cleanup-snapshot.json", "cleanupSnapshotSha256"),
+                          ("failed-deployment-proof.json", "failedDeploymentProofSha256")):
+        hashes[filename] = sha((blocked_work / filename).read_bytes())
+        require(hashes[filename] == blocked[key], "blocked-partial-proof-file-drift")
+    hashes["main.arm.json"] = sha((blocked_work / "main.arm.json").read_bytes())
+    require(hashes["main.arm.json"] == blocked["compiledHashes"]["main"], "blocked-corrected-template-drift")
+    for path, expected in blocked["oldInputs"].items():
+        require(sha(plan.private_path(path).read_bytes()) == expected, "original-armed-input-file-drift")
+    for filename in ("bundle.json", "receipt.json", "authorization-link.json", "compute-inputs.json",
+                     "provider-verification-preview.parameters.json", "provider-verification-preview.what-if.json",
+                     "bounded-verification-compute.parameters.json"):
+        path = previous_work / filename
+        require(blocked["oldInputs"].get(str(path)) == sha(path.read_bytes()),
+                "create-only-exact-old-input-directory-required")
+    require(blocked["window"]["T0"] == receipt["T0"] and blocked["window"]["deadline"] == receipt["deadline"],
+            "create-only-original-lifetime-drift")
+    parameters = (previous_work / "provider-verification-preview.parameters.json").read_bytes()
+    require(sha(parameters) == receipt["applyParametersSha256"] and
+            (previous_work / "bounded-verification-compute.parameters.json").read_bytes() == parameters and
+            bundle["compiledHashes"]["main"] == receipt["applyTemplateSha256"], "create-only-original-parameters-drift")
+    for name, digest in bundle["compiledHashes"].items():
+        require(sha((previous_work / (name + ".arm.json")).read_bytes()) == digest, "create-only-original-template-drift")
+    snapshot = json.loads((blocked_work / "owned-partial-state.json").read_text())
+    cleanup = json.loads((blocked_work / "armed-cleanup-snapshot.json").read_text())
+    failures = json.loads((blocked_work / "failed-deployment-proof.json").read_text())
+    return bundle, receipt, blocked, hashes, snapshot, cleanup, failures
+
+
+def compute_failure_codes(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    if isinstance(value, list):
+        return sorted({code for item in value for code in compute_failure_codes(item)})
+    if not isinstance(value, dict):
+        return []
+    result = {value["code"]} if value.get("code") in {
+        "DeploymentFailed", "ResourceDeploymentFailure", "SecurityRuleInvalidAccessType"} else set()
+    for key in ("error", "details", "statusMessage"):
+        if key in value:
+            result.update(compute_failure_codes(value[key]))
+    return sorted(result)
+
+
+def create_only_compute_proof(azure, previous, receipt, snapshot, cleanup, failures):
+    compute_repair_window(receipt)
+    schedules(azure, previous, receipt)
+    account_identity(azure, previous, receipt)
+    validate_builtin_roles(azure, previous)
+    audit_cleanup_assignments(azure, previous, receipt, cleanup_assignment_scopes(previous), complete=True)
+    scope = previous["scope"]
+    account = scope["automationAccountId"]
+    current_account = azure.get(account, AUTO_API)
+    require(sha(wire(current_account)) == cleanup["accountSha256"], "create-only-account-drift")
+    for identity, proof in cleanup["publishedContent"].items():
+        require(qualified_content(azure, identity, proof["sourceSha256"]) == proof, "create-only-publication-drift")
+    require({item["id"] for item in qualified_collection(azure, account + "/jobs")} == set(cleanup["jobs"]) and
+            {item["id"] for item in qualified_collection(azure, account + "/runbooks")} == set(cleanup["publishedContent"]),
+            "create-only-job-or-book-set-drift")
+    for kind in ("schedules", "bindings"):
+        collection = "jobSchedules" if kind == "bindings" else kind
+        require({item["id"] for item in qualified_collection(azure, account + "/" + collection)} == set(cleanup[kind]),
+                "create-only-cleanup-set-drift")
+        for identity, expected in cleanup[kind].items():
+            require(azure.get(identity, AUTO_API) == expected, "create-only-armed-cleanup-drift")
+    existing, missing = compute_repair_resource_sets(previous)
+    require(set(snapshot) == set(existing), "create-only-eight-existing-identities-required")
+    current = {identity: azure.get(identity, version) for identity, version in existing.items()}
+    require(current == snapshot, "create-only-existing-full-properties-drift")
+    ordinary = {identity for identity in existing if identity != scope["verificationResourceGroupId"] and
+                "/providers/Microsoft.Authorization/roleAssignments/" not in identity}
+    require({item["id"] for item in qualified_collection(
+        azure, scope["verificationResourceGroupId"] + "/resources", "2021-04-01")} == ordinary,
+        "create-only-exact-five-resource-inventory-required")
+    for identity, version in missing.items():
+        require(azure.get(identity, version, absent=True) is None, "create-only-target-not-absent")
+    require(azure.get(scope["managedNodeResourceGroupId"], "2024-03-01", absent=True) is None,
+            "create-only-node-group-not-absent")
+    control_id = next(identity for identity in existing if "/userAssignedIdentities/" in identity)
+    principal = current[control_id]["properties"]["principalId"]
+    require(isinstance(principal, str) and plan.UUID.fullmatch(principal), "create-only-control-principal-required")
+    assignments = principal_assignments(azure, previous, principal)
+    expected_roles = {identity.lower() for identity in existing if "/roleAssignments/" in identity}
+    require(len(assignments) == 2 and {item["id"].lower() for item in assignments} == expected_roles,
+            "create-only-network-role-inventory-drift")
+    role = f"/subscriptions/{previous['subscriptionId']}/providers/Microsoft.Authorization/roleDefinitions/" + \
+        BUILTIN_ROLES["peering-cleanup"][0]
+    for item in assignments:
+        assignment_readback(item, {"properties": {"principalId": principal, "roleDefinitionId": role}},
+                            item["id"].split("/providers/Microsoft.Authorization/roleAssignments/")[0])
+    for identity, expected in failures["deployments"].items():
+        resource = azure.get(identity, "2024-03-01")
+        properties = resource["properties"]
+        require(resource["id"].lower() == identity.lower() and properties["provisioningState"] == "Failed" and
+                properties.get("templateHash") == expected["templateHash"] and
+                properties.get("correlationId") == expected["correlationId"] and
+                properties.get("timestamp") == expected["timestamp"], "create-only-failed-deployment-drift")
+    nested = scope["verificationResourceGroupId"] + "/providers/Microsoft.Resources/deployments/isolated-verification-foundation"
+    failed = [{"targetId": item["properties"]["targetResource"]["id"],
+               "errorCodes": compute_failure_codes(item["properties"].get("statusMessage"))}
+              for item in qualified_collection(azure, nested + "/operations", "2024-03-01")
+              if item["properties"]["provisioningState"] == "Failed"]
+    require(failed == failures["failedOperations"], "create-only-original-nsg-failure-drift")
+    return {"principalId": principal, "existingResourcesSha256": {identity: sha(wire(resource))
+            for identity, resource in current.items()}, "cleanupSha256": sha(wire(cleanup)),
+            "failedDeploymentSha256": sha(wire(failures)), "T0": receipt["T0"], "deadline": receipt["deadline"]}
+
+
+def create_only_compute_parameters(previous_work, previous, receipt, principal, source_digest):
+    original = json.loads((previous_work / "provider-verification-preview.parameters.json").read_text())
+    values = {name: value["value"] for name, value in original["parameters"].items()}
+    old_template = json.loads((previous_work / "main.arm.json").read_text())
+    parameters = {name: values[name] for name in (
+        "location", "vnetCidr", "podCidr", "serviceCidr", "trustedBuildClientCidr",
+        "builderImageVersion", "operatorSshPublicKey")}
+    parameters["builderAdminUsername"] = values.get(
+        "builderAdminUsername", old_template["parameters"]["builderAdminUsername"]["defaultValue"])
+    parameters.update({"prefix": "orka-verify-" + previous["suffix"], "controlPlanePrincipalId": principal,
+        "ownershipTags": {"orka-purpose": "isolated-remediation-verification", "orka-owner": previous["owner"],
+            "orka-deployment": "orka-verify-" + previous["suffix"], "orka-cleanup-receipt": previous["cleanupReceipt"],
+            "orka-budget-start-utc": receipt["T0"], "orka-expires-at-utc": receipt["deadline"],
+            "orka-source-digest": source_digest}})
+    return values, parameters
+
+
+def prepare_create_only_compute(args, work, azure):
+    require(args.previous_work_dir and args.blocked_compute_repair_work_dir and not (work / "bundle.json").exists() and
+            not (work / "receipt.json").exists(), "fresh-create-only-plan-required")
+    paths = {"previous": args.previous_work_dir, "blocked": args.blocked_compute_repair_work_dir}
+    previous, receipt, blocked, input_hashes, snapshot, cleanup, failures = create_only_compute_inputs(args, paths)
+    proof = create_only_compute_proof(azure, previous, receipt, snapshot, cleanup, failures)
+    hashes = source_hashes()
+    require(set(hashes) == set(previous["sourceHashes"]) | {"config/development/remediation-aks/compute-core.bicep"} and
+            all(hashes[name] == digest for name, digest in previous["sourceHashes"].items() if name not in (
+                "config/development/remediation-aks/resources.bicep", "scripts/remediation_aks_apply.py",
+                "config/development/remediation-aks/README.md")), "create-only-unrelated-source-drift")
+    digest = sha(wire(hashes))
+    compiled = compile_templates(work)
+    compiled["compute-repair"] = compile_create_only_compute(work)
+    blocked_work = Path(paths["blocked"])
+    validate_create_only_compute_template(json.loads((blocked_work / "main.arm.json").read_text()),
+        json.loads((work / "main.arm.json").read_text()), json.loads((work / "compute-repair.arm.json").read_text()))
+    require(all(compiled[name] == expected for name, expected in previous["compiledHashes"].items() if name != "main"),
+            "create-only-unrelated-template-drift")
+    values, parameters = create_only_compute_parameters(Path(paths["previous"]), previous, receipt, proof["principalId"], digest)
+    values["sourceDigest"] = digest
+    write_json(work / "compute-inputs.json", values)
+    bundle = {**previous, "sourceHashes": hashes, "sourceDigest": digest, "compiledHashes": compiled,
+              "computeInputsSha256": sha((work / "compute-inputs.json").read_bytes())}
+    deployment_name = "bounded-dns-repair-" + digest[:32]
+    deployment_id = previous["scope"]["verificationResourceGroupId"] + \
+        "/providers/Microsoft.Resources/deployments/" + deployment_name
+    require(azure.get(deployment_id, "2024-03-01", absent=True) is None, "create-only-deployment-name-not-fresh")
+    preview = azure.deploy("review-" + deployment_name, work / "compute-repair.arm.json", parameters,
+                           group=previous["scope"]["verificationResourceGroupId"].rsplit("/", 1)[-1],
+                           preview=True, validation="Provider")
+    validate_create_only_compute_preview(preview, previous, receipt, proof["principalId"], snapshot)
+    parameter_file = work / ("review-" + deployment_name + ".parameters.json")
+    window = compute_repair_window(receipt)
+    link = {"kind": "create-only-armed-compute-repair", "inputDirectories": paths, "inputHashes": input_hashes,
+        "oldInputs": blocked["oldInputs"], "previousSourceDigest": previous["sourceDigest"], "nextSourceDigest": digest,
+        "resourceOriginSourceDigest": previous["sourceDigest"], "proof": proof, "window": window,
+        "repairDeploymentId": deployment_id, "repairTemplateSha256": compiled["compute-repair"],
+        "repairParametersFile": parameter_file.name, "repairParametersSha256": sha(parameter_file.read_bytes()),
+        "compiledHashes": compiled, "computeInputsSha256": bundle["computeInputsSha256"],
+        "previewFile": "review-" + deployment_name + ".what-if.json",
+        "previewSha256": create_only_preview_digest(work / ("review-" + deployment_name + ".what-if.json"), preview),
+        "createOnlyIds": sorted(compute_repair_resource_sets(previous)[1]),
+        "existingIdsNeverPut": sorted(compute_repair_resource_sets(previous)[0]), "maximumDeploymentPuts": 1,
+        "cancelOnlyThisDeploymentAfterSeconds": 3600, "cancelIsBestEffort": True,
+        "wallClockLimitRequired": True, "reconcileAllocationPuts": 0,
+        "quotaMinimumFreeCores": 12, "quotaFamilies": ["standardDSv5Family", "cores"],
+        "qualificationActions": ["original-node-group-cleanup-assignment", "original-registry-pull-assignments"],
+        "clockWrites": False, "scheduleWrites": False, "jobWrites": False, "existingResourceWrites": False}
+    qualification = {"sourceDigest": digest, "repairDeploymentId": deployment_id,
+        "nodeCleanupScope": previous["scope"]["managedNodeResourceGroupId"],
+        "registryPullScope": previous["scope"]["verificationRegistryId"],
+        "controlKubeletIdentity": previous["controlKubeletIdentity"], "actions": link["qualificationActions"]}
+    link["qualification"] = qualification
+    link["qualificationSha256"] = sha(wire(qualification))
+    require(source_hashes() == hashes and create_only_compute_proof(
+        azure, previous, receipt, snapshot, cleanup, failures) == proof and
+        create_only_compute_inputs(args, paths)[3] == input_hashes, "create-only-proof-changed-during-plan")
+    write_json(work / "bundle.json", bundle)
+    write_json(work / "compute-repair-link.json", {"plan": link, "sha256": sha(wire(link))})
+    print("Create-only armed repair planned; allocation and qualification remain separately approval-gated.")
+
+
+def load_create_only_repair(azure, bundle, args, check_start=True):
+    require(args.approved_compute_repair_sha256, "explicit-create-only-repair-approval-required")
+    record = json.loads((azure.work / "compute-repair-link.json").read_text())
+    link = record["plan"]
+    require(record["sha256"] == sha(wire(link)) == args.approved_compute_repair_sha256 and
+            link["kind"] == "create-only-armed-compute-repair" and link["nextSourceDigest"] == bundle["sourceDigest"] and
+            link["maximumDeploymentPuts"] == 1 and link["cancelOnlyThisDeploymentAfterSeconds"] == 3600 and
+            link["cancelIsBestEffort"] is True and
+            link["wallClockLimitRequired"] is True and link["reconcileAllocationPuts"] == 0 and
+            link["quotaMinimumFreeCores"] == 12 and link["quotaFamilies"] == ["standardDSv5Family", "cores"] and
+            all(link[name] is False for name in ("clockWrites", "scheduleWrites", "jobWrites", "existingResourceWrites")),
+            "reviewed-create-only-repair-link-required")
+    previous, old, blocked, hashes, snapshot, cleanup, failures = create_only_compute_inputs(
+        args, link["inputDirectories"], check_start=check_start)
+    require(link["inputHashes"] == hashes and link["oldInputs"] == blocked["oldInputs"] and
+            link["previousSourceDigest"] == previous["sourceDigest"] and
+            link["resourceOriginSourceDigest"] == previous["sourceDigest"] and
+            link["createOnlyIds"] == sorted(compute_repair_resource_sets(previous)[1]) and
+            link["existingIdsNeverPut"] == sorted(compute_repair_resource_sets(previous)[0]),
+            "create-only-approved-boundary-drift")
+    deployment = previous["scope"]["verificationResourceGroupId"] + \
+        "/providers/Microsoft.Resources/deployments/bounded-dns-repair-" + bundle["sourceDigest"][:32]
+    require(link["repairDeploymentId"] == deployment and
+            link["repairTemplateSha256"] == bundle["compiledHashes"]["compute-repair"] and
+            link["compiledHashes"] == bundle["compiledHashes"] and
+            link["computeInputsSha256"] == bundle["computeInputsSha256"] and
+            sha((azure.work / "compute-repair.arm.json").read_bytes()) == link["repairTemplateSha256"],
+            "create-only-approved-deployment-drift")
+    window = compute_repair_window(old, check_start=check_start)
+    require(window == link["window"], "create-only-armed-window-drift")
+    values, parameters = create_only_compute_parameters(Path(link["inputDirectories"]["previous"]), previous, old,
+                                                         link["proof"]["principalId"], bundle["sourceDigest"])
+    values["sourceDigest"] = bundle["sourceDigest"]
+    require(json.loads((azure.work / "compute-inputs.json").read_text()) == values and
+            sha((azure.work / "compute-inputs.json").read_bytes()) == link["computeInputsSha256"],
+            "create-only-operating-parameters-drift")
+    expected_file = "review-bounded-dns-repair-" + bundle["sourceDigest"][:32] + ".parameters.json"
+    require(link["repairParametersFile"] == expected_file and
+            sha((azure.work / expected_file).read_bytes()) == link["repairParametersSha256"] and
+            json.loads((azure.work / expected_file).read_text()) == arm_parameters(parameters),
+            "create-only-approved-parameters-drift")
+    preview_file = expected_file.replace(".parameters.json", ".what-if.json")
+    require(link["previewFile"] == preview_file and
+            sha((azure.work / preview_file).read_bytes()) == link["previewSha256"],
+            "create-only-reviewed-preview-file-drift")
+    validate_create_only_compute_preview(json.loads((azure.work / preview_file).read_text()), previous, old,
+                                        link["proof"]["principalId"], snapshot, check_start=check_start)
+    require(source_hashes() == bundle["sourceHashes"], "create-only-reviewed-source-drift")
+    require(all(bundle[key] == previous[key] for key in (
+        "subscriptionId", "tenantId", "scope", "owner", "suffix", "cleanupReceipt", "roleGuids",
+        "authorizationModel", "controlKubeletIdentity", "publicKeyReady")), "create-only-operating-boundary-drift")
+    qualification = {"sourceDigest": bundle["sourceDigest"], "repairDeploymentId": deployment,
+        "nodeCleanupScope": previous["scope"]["managedNodeResourceGroupId"],
+        "registryPullScope": previous["scope"]["verificationRegistryId"],
+        "controlKubeletIdentity": previous["controlKubeletIdentity"],
+        "actions": ["original-node-group-cleanup-assignment", "original-registry-pull-assignments"]}
+    require(link["qualification"] == qualification and link["qualificationSha256"] == sha(wire(qualification)) and
+            link["qualificationActions"] == qualification["actions"], "create-only-qualification-scope-drift")
+    return record, previous, old, snapshot, cleanup, failures, parameters
+
+
+def compute_repair_inventory(azure, bundle, receipt):
+    scope = bundle["scope"]
+    inventory = {"resourceGroup": scope["verificationResourceGroupId"], "resources": [],
+                 "nodeGroup": "Unverified", "authoritative": False}
+    try:
+        result = azure.get(scope["verificationResourceGroupId"] + "/resources", "2021-04-01", timeout=30)
+        require(isinstance(result, dict) and isinstance(result.get("value"), list) and not result.get("nextLink"),
+                "repair-inventory-incomplete")
+        for item in result["value"]:
+            identity = item.get("id", "")
+            require(identity.lower().startswith(scope["verificationResourceGroupId"].lower() + "/"),
+                    "repair-inventory-outside-group")
+            inventory["resources"].append({"id": identity, "type": item.get("type")})
+        inventory["authoritative"] = True
+    except (Failure, OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        node = azure.get(scope["managedNodeResourceGroupId"], "2024-03-01", absent=True, timeout=30)
+        inventory["nodeGroup"] = "Absent" if node is None else "Present"
+    except (Failure, OSError, ValueError, KeyError, TypeError):
+        pass
+    write_json(azure.work / "repair-allocation-inventory.json", inventory)
+    receipt["repairInventorySha256"] = sha((azure.work / "repair-allocation-inventory.json").read_bytes())
+    return inventory
+
+
+def compute_quota(azure):
+    quota = azure.cli("vm", "list-usage", "--location", "eastus2",
+                     "--query", "[?name.value=='standardDSv5Family' || name.value=='cores']")
+    require(isinstance(quota, list) and len(quota) == 2 and
+            {item["name"]["value"] for item in quota} == {"standardDSv5Family", "cores"} and
+            all(int(item["limit"]) - int(item["currentValue"]) >= 12 for item in quota),
+            "approved-sku-quota-unavailable")
+
+
+def repair_attempt_window(record, previous, old, bundle, receipt):
+    link = record["plan"]
+    require(receipt.get("phase") in ("compute-repair-intent", "compute-repair-provisioned",
+                                    "compute-repair-stopped", "compute-repair-timeout") and
+            receipt.get("sourceDigest") == bundle["sourceDigest"] and
+            receipt.get("resourceOriginSourceDigest") == previous["sourceDigest"] and
+            type(receipt.get("repairPutAttempts")) is int and receipt["repairPutAttempts"] == 1 and
+            type(receipt.get("repairCancelAttempted")) is bool and
+            receipt.get("repairOf") == {"approvalSha256": record["sha256"], "inputHashes": link["inputHashes"],
+                "originalSourceDigest": previous["sourceDigest"], "deploymentId": link["repairDeploymentId"],
+                "templateSha256": link["repairTemplateSha256"], "parametersSha256": link["repairParametersSha256"]} and
+            all(receipt.get(key) == value for key, value in old.items() if key not in ("phase", "sourceDigest")),
+            "same-reviewed-repair-attempt-required")
+    for key in ("repairStartedUtc", "repairAllocationLimitUtc"):
+        require(isinstance(receipt.get(key), str) and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", receipt[key]), "recorded-repair-utc-window-required")
+    started = dt.datetime.fromisoformat(receipt["repairStartedUtc"].replace("Z", "+00:00"))
+    limit = dt.datetime.fromisoformat(receipt["repairAllocationLimitUtc"].replace("Z", "+00:00"))
+    require(dt.datetime.fromisoformat(old["T0"].replace("Z", "+00:00")) <= started <=
+            dt.datetime.fromisoformat(link["window"]["latestAllocationStartUtc"].replace("Z", "+00:00")) and
+            limit == started + dt.timedelta(hours=1), "recorded-repair-window-drift")
+    if receipt["repairCancelAttempted"]:
+        require(receipt.get("repairCancelTarget") == link["repairDeploymentId"] and
+                receipt["phase"] == "compute-repair-timeout", "recorded-repair-cancel-scope-drift")
+    if receipt["phase"] == "compute-repair-provisioned":
+        require(isinstance(receipt.get("repairCompletedUtc"), str) and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", receipt["repairCompletedUtc"]) and
+                started <= dt.datetime.fromisoformat(receipt["repairCompletedUtc"].replace("Z", "+00:00")) <= limit and
+                receipt.get("repairDeploymentState") == "Succeeded" and receipt["repairCancelAttempted"] is False,
+                "timely-durable-repair-completion-required")
+    return started, limit
+
+
+def observe_repair_deployment(azure, deployment, timeout=30):
+    current = azure.get(deployment, "2024-03-01", absent=True, timeout=timeout)
+    if current is None:
+        return "Absent"
+    require(current["id"].lower() == deployment.lower(), "repair-deployment-identity-drift")
+    state = current["properties"]["provisioningState"]
+    return state if state in ("Succeeded", "Failed", "Canceled", "Running", "Accepted",
+                              "Canceling", "Creating") else "Unverified"
+
+
+def record_repair_success(azure, bundle, receipt, observed):
+    receipt.update({"phase": "compute-repair-provisioned", "repairDeploymentState": "Succeeded",
+                    "repairCompletedUtc": timestamp(observed)})
+    # These durable facts must survive a later inventory/schedule GET or process
+    # interruption. Qualification independently rechecks the cleanup bindings.
+    save_receipt(azure.work, receipt)
+    compute_repair_inventory(azure, bundle, receipt)
+    schedules(azure, bundle, receipt)
+    save_receipt(azure.work, receipt)
+
+
+def cancel_overdue_repair_once(azure, bundle, receipt, deployment, limit, state):
+    require(utc() >= limit, "repair-cancellation-before-recorded-limit-forbidden")
+    receipt.update({"phase": "compute-repair-timeout", "repairDeploymentState": state})
+    if state not in ("Succeeded", "Failed", "Canceled", "Absent") and not receipt["repairCancelAttempted"]:
+        receipt["repairCancelAttempted"] = True
+        receipt["repairCancelTarget"] = deployment
+        save_receipt(azure.work, receipt)
+        try:
+            azure.rest("POST", deployment + "/cancel", "2024-03-01", timeout=30)
+            receipt["repairCancelOutcome"] = "requested-not-a-hard-stop"
+        except (Failure, OSError, ValueError, KeyError, TypeError):
+            receipt["repairCancelOutcome"] = "unconfirmed"
+    elif receipt["repairCancelAttempted"]:
+        receipt.setdefault("repairCancelOutcome", "unconfirmed-not-replayed")
+    elif state == "Succeeded":
+        receipt["repairCancelOutcome"] = "late-success-not-qualified"
+    else:
+        receipt["repairCancelOutcome"] = "terminal-or-absent-no-cancel"
+    save_receipt(azure.work, receipt)
+    try:
+        receipt["repairPostCancelState"] = observe_repair_deployment(azure, deployment)
+    except (Failure, OSError, ValueError, KeyError, TypeError):
+        receipt["repairPostCancelState"] = "Unverified"
+    compute_repair_inventory(azure, bundle, receipt)
+    save_receipt(azure.work, receipt)
+
+
+def allocate_create_only_compute(azure, bundle, receipt, args):
+    require(not receipt and not (azure.work / "receipt.json").exists(), "one-new-repair-attempt-only")
+    record, previous, old, snapshot, cleanup, failures, parameters = load_create_only_repair(azure, bundle, args)
+    link = record["plan"]
+    require(create_only_compute_proof(azure, previous, old, snapshot, cleanup, failures) == link["proof"],
+            "create-only-preallocation-proof-drift")
+    compute_quota(azure)
+    deployment = link["repairDeploymentId"]
+    require(azure.get(deployment, "2024-03-01", absent=True, timeout=30) is None,
+            "create-only-deployment-already-exists")
+    compute_repair_window(old)
+    started = utc()
+    receipt.update({**old, "phase": "compute-repair-intent", "sourceDigest": bundle["sourceDigest"],
+        "repairOf": {"approvalSha256": record["sha256"], "inputHashes": link["inputHashes"],
+            "originalSourceDigest": previous["sourceDigest"], "deploymentId": deployment,
+            "templateSha256": link["repairTemplateSha256"], "parametersSha256": link["repairParametersSha256"]},
+        "resourceOriginSourceDigest": previous["sourceDigest"], "repairPutAttempts": 1,
+        "repairStartedUtc": timestamp(started), "repairAllocationLimitUtc": timestamp(started + dt.timedelta(hours=1)),
+        "repairCancelAttempted": False})
+    save_receipt(azure.work, receipt)
+    end = time.monotonic() + 3600
+    limit = dt.datetime.fromisoformat(receipt["repairAllocationLimitUtc"].replace("Z", "+00:00"))
+    try:
+        try:
+            azure.rest("PUT", deployment, "2024-03-01", {"properties": {
+                "mode": "Incremental", "template": json.loads((azure.work / "compute-repair.arm.json").read_text()),
+                "parameters": arm_parameters(parameters)["parameters"]}}, timeout=60)
+        except (Failure, OSError, ValueError, KeyError, TypeError):
+            receipt["repairSubmitOutcome"] = "unconfirmed-no-replay"
+            save_receipt(azure.work, receipt)
+        state = "Unverified"
+        while True:
+            remaining = min(end - time.monotonic(), (limit - utc()).total_seconds())
+            if remaining <= 0:
+                break
+            try:
+                state = observe_repair_deployment(azure, deployment, timeout=max(0.001, min(30, remaining)))
+            except (Failure, OSError, ValueError, KeyError, TypeError):
+                state = "Unverified"
+            observed = utc()
+            if state == "Succeeded" and observed <= limit and time.monotonic() <= end:
+                record_repair_success(azure, bundle, receipt, observed)
+                return
+            if state in ("Failed", "Canceled"):
+                receipt.update({"phase": "compute-repair-stopped", "repairDeploymentState": state})
+                save_receipt(azure.work, receipt)
+                compute_repair_inventory(azure, bundle, receipt)
+                save_receipt(azure.work, receipt)
+                raise Failure("repair-deployment-terminal-failure-no-retry")
+            time.sleep(max(0, min(5, end - time.monotonic(), (limit - utc()).total_seconds())))
+        if utc() >= limit:
+            cancel_overdue_repair_once(azure, bundle, receipt, deployment, limit, state)
+        else:
+            # A backwards wall-clock jump does not authorize an early cancel.
+            receipt.update({"phase": "compute-repair-timeout", "repairDeploymentState": state})
+            receipt["repairObservationInterrupted"] = "monotonic-bound-before-utc-limit-reconcile-required"
+            save_receipt(azure.work, receipt)
+    except KeyboardInterrupt:
+        receipt["repairObservationInterrupted"] = "interrupted-reconcile-required"
+        save_receipt(azure.work, receipt)
+        raise Failure("repair-interrupted-reconcile-required") from None
+    raise Failure("repair-allocation-bound-reached-no-retry")
+
+
+def reconcile_create_only_compute(azure, bundle, receipt, args):
+    record, previous, old, _, _, _, _ = load_create_only_repair(azure, bundle, args, check_start=False)
+    _, limit = repair_attempt_window(record, previous, old, bundle, receipt)
+    deployment = record["plan"]["repairDeploymentId"]
+    try:
+        state = observe_repair_deployment(azure, deployment)
+    except (Failure, OSError, ValueError, KeyError, TypeError):
+        state = "Unverified"
+    observed = utc()
+    if receipt["phase"] == "compute-repair-provisioned":
+        require(state == "Succeeded", "durable-repair-success-state-drift")
+        compute_repair_inventory(azure, bundle, receipt)
+        save_receipt(azure.work, receipt)
+        return
+    if receipt["phase"] == "compute-repair-intent" and state == "Succeeded" and observed <= limit:
+        record_repair_success(azure, bundle, receipt, observed)
+        return
+    if observed >= limit:
+        cancel_overdue_repair_once(azure, bundle, receipt, deployment, limit, state)
+        raise Failure("repair-allocation-bound-reached-no-retry")
+    if state in ("Failed", "Canceled"):
+        receipt.update({"phase": "compute-repair-stopped", "repairDeploymentState": state})
+        save_receipt(azure.work, receipt)
+        compute_repair_inventory(azure, bundle, receipt)
+        save_receipt(azure.work, receipt)
+        raise Failure("repair-deployment-terminal-failure-no-retry")
+    receipt["repairLastObservedState"] = state
+    save_receipt(azure.work, receipt)
+
+
+def qualify_create_only_compute(azure, bundle, receipt, args):
+    record, previous, old, snapshot, cleanup, failures, _ = load_create_only_repair(
+        azure, bundle, args, check_start=False)
+    link = record["plan"]
+    require(args.approved_compute_qualification_sha256 == link["qualificationSha256"] ==
+            sha(wire(link["qualification"])), "separate-original-compute-qualification-approval-required")
+    repair_attempt_window(record, previous, old, bundle, receipt)
+    require(receipt.get("phase") == "compute-repair-provisioned" and
+            receipt.get("repairOf", {}).get("approvalSha256") == record["sha256"] and
+            receipt["repairOf"]["deploymentId"] == link["repairDeploymentId"] and
+            receipt["repairPutAttempts"] == 1 and receipt["repairCancelAttempted"] is False and
+            receipt["T0"] == old["T0"] and receipt["deadline"] == old["deadline"] and
+            utc() < dt.datetime.fromisoformat(link["window"]["primaryCleanupUtc"].replace("Z", "+00:00")),
+            "timely-provisioned-repair-required")
+    current = azure.get(link["repairDeploymentId"], "2024-03-01")
+    require(current["id"] == link["repairDeploymentId"] and
+            current["properties"]["provisioningState"] == "Succeeded", "successful-repair-deployment-required")
+    schedules(azure, bundle, receipt)
+    account_identity(azure, bundle, receipt)
+    finish_compute(azure, bundle, receipt)
+
+
 def arm(azure, bundle, receipt):
     require(receipt.get("phase") == "bootstrap-ready" and receipt.get("preflightCompleted"),
             "successful-cleanup-preflight-required")
@@ -1699,10 +2440,7 @@ def compute(azure, bundle, receipt):
         require(azure.get(bundle["scope"][key], version, absent=True) is None, "unexpected-existing-compute")
     require(azure.cli("group", "exists", "--name",
             bundle["scope"]["managedNodeResourceGroupId"].split("/")[-1]) is False, "unexpected-existing-node-group")
-    quota = azure.cli("vm", "list-usage", "--location", "eastus2",
-                     "--query", "[?name.value=='standardDSv5Family' || name.value=='cores']")
-    require(len(quota) == 2 and all(int(q["limit"]) - int(q["currentValue"]) >= 12 for q in quota),
-            "approved-sku-quota-unavailable")
+    compute_quota(azure)
     parameters = azure.work / "provider-verification-preview.parameters.json"
     require(sha(parameters.read_bytes()) == receipt["applyParametersSha256"] and
             sha((azure.work / "main.arm.json").read_bytes()) == receipt["applyTemplateSha256"],
@@ -1718,6 +2456,10 @@ def compute(azure, bundle, receipt):
                  expected_template=receipt["applyTemplateSha256"])
     require(sha((azure.work / "bounded-verification-compute.parameters.json").read_bytes()) ==
             receipt["applyParametersSha256"], "applied-parameter-digest-mismatch")
+    finish_compute(azure, bundle, receipt)
+
+
+def finish_compute(azure, bundle, receipt):
     node = azure.get(bundle["scope"]["managedNodeResourceGroupId"], "2024-03-01")
     require(node.get("managedBy", "").lower() == bundle["scope"]["verificationClusterId"].lower(),
             "node-group-owner-mismatch")
@@ -1879,7 +2621,9 @@ def retire(azure, bundle, receipt):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("operation", choices=("plan", "plan-recovery", "plan-builtin-resume", "plan-qualified-bootstrap", "bootstrap",
+    p.add_argument("operation", choices=("plan", "plan-recovery", "plan-builtin-resume", "plan-qualified-bootstrap",
+                                        "plan-create-only-compute-repair", "allocate-create-only-compute-repair",
+                                        "reconcile-create-only-compute-repair", "qualify-create-only-compute-repair", "bootstrap",
                                         "recover-bootstrap", "resume-builtin-bootstrap",
                                         "adopt-qualified-bootstrap",
                                         "arm", "compute", "connect", "retire"))
@@ -1899,6 +2643,9 @@ def parser():
     p.add_argument("--diagnostic-work-dir")
     p.add_argument("--abandoned-arming-work-dir")
     p.add_argument("--arming-rollback-work-dir")
+    p.add_argument("--blocked-compute-repair-work-dir")
+    p.add_argument("--approved-compute-repair-sha256")
+    p.add_argument("--approved-compute-qualification-sha256")
     return p
 
 
@@ -1923,6 +2670,9 @@ def main():
     if args.operation == "plan-qualified-bootstrap":
         prepare_qualified_bootstrap(args, work, azure)
         return
+    if args.operation == "plan-create-only-compute-repair":
+        prepare_create_only_compute(args, work, azure)
+        return
     bundle = load_bundle(args, work)
     account = azure.cli("account", "show", "--query",
                         "{subscription:id,tenant:tenantId,environment:environmentName}")
@@ -1945,6 +2695,18 @@ def main():
     if args.operation == "adopt-qualified-bootstrap":
         adopt_qualified_bootstrap(azure, bundle, receipt, args)
         print("Reviewed original preflight adopted; only two group source tags changed, with no new job or clock.")
+        return
+    if args.operation == "allocate-create-only-compute-repair":
+        allocate_create_only_compute(azure, bundle, receipt, args)
+        print("Repair allocation stopped or completed within its reviewed controller budget; no clock was reset.")
+        return
+    if args.operation == "qualify-create-only-compute-repair":
+        qualify_create_only_compute(azure, bundle, receipt, args)
+        print("Original post-compute readbacks and separately approved assignment scopes qualified.")
+        return
+    if args.operation == "reconcile-create-only-compute-repair":
+        reconcile_create_only_compute(azure, bundle, receipt, args)
+        print("Existing repair attempt reconciled without replaying allocation or extending its UTC window.")
         return
     actions = {"bootstrap": bootstrap, "arm": arm, "compute": compute, "connect": connect, "retire": retire}
     actions[args.operation](azure, bundle, receipt)

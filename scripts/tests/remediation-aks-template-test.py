@@ -146,7 +146,15 @@ class TemplateTests(unittest.TestCase):
         cls.template = json.loads(result.stdout)
         nested = next(r for r in cls.template["resources"]
                       if r["type"] == "Microsoft.Resources/deployments")
-        cls.resources = nested["properties"]["template"]["resources"]
+        def flatten(template):
+            result = []
+            for resource in template["resources"]:
+                if resource["type"] == "Microsoft.Resources/deployments":
+                    result.extend(flatten(resource["properties"]["template"]))
+                else:
+                    result.append(resource)
+            return result
+        cls.resources = flatten(nested["properties"]["template"])
 
     def resource(self, kind):
         matches = [r for r in self.resources if r["type"] == kind]
@@ -248,7 +256,13 @@ class TemplateTests(unittest.TestCase):
         self.assertFalse(any(r["access"] == "Deny" and r["direction"] == "Outbound" and
                              r["destinationAddressPrefix"] == "AzurePlatformIMDS" for r in rules.values()))
         self.assertEqual(rules["deny-lateral-connections"]["destinationAddressPrefix"], "VirtualNetwork")
-        self.assertLess(rules["platform-dns"]["priority"], rules["deny-lateral-connections"]["priority"])
+        self.assertNotIn("platform-dns", rules)
+        outbound = [name for name, rule in rules.items()
+                    if rule["direction"] == "Outbound" and rule["access"] == "Allow"]
+        self.assertEqual(outbound, ["https-egress"])
+        self.assertEqual(rules["https-egress"]["protocol"], "Tcp")
+        self.assertEqual(rules["https-egress"]["destinationPortRange"], "443")
+        self.assertLess(rules["deny-lateral-connections"]["priority"], rules["https-egress"]["priority"])
         nat = self.resource("Microsoft.Network/natGateways")
         self.assertEqual(len(nat["properties"]["publicIpAddresses"]), 1)
         subnets = self.resource("Microsoft.Network/virtualNetworks")["properties"]["subnets"]
@@ -256,6 +270,17 @@ class TemplateTests(unittest.TestCase):
         self.assertTrue(all(s["properties"]["defaultOutboundAccess"] is False for s in subnets))
         nodes = next(s for s in subnets if s["name"] == "nodes")
         self.assertEqual(nodes["properties"]["privateEndpointNetworkPolicies"], "NetworkSecurityGroupEnabled")
+
+    def test_no_explicit_platform_service_tag_allow_rules_are_compiled(self):
+        invalid = [
+            rule["name"] for resource in self.resources
+            if resource["type"] == "Microsoft.Network/networkSecurityGroups"
+            for rule in resource["properties"]["securityRules"]
+            if rule["properties"]["access"] == "Allow" and any(
+                str(rule["properties"].get(key, "")).startswith("AzurePlatform")
+                for key in ("sourceAddressPrefix", "destinationAddressPrefix"))
+        ]
+        self.assertEqual(invalid, [], "Azure platform service tags are deny-only opt-outs")
 
     def test_staged_daemon_requires_mtls_and_independent_state(self):
         config = tomllib.loads((SOURCE / "buildkitd.toml").read_text())

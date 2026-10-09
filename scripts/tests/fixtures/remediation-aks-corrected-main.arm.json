@@ -1,0 +1,782 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.48.1.52935",
+      "templateHash": "1169323750306182407"
+    }
+  },
+  "parameters": {
+    "suffix": {
+      "type": "string",
+      "minLength": 6,
+      "maxLength": 12,
+      "metadata": {
+        "description": "Unique suffix for a NEW verification deployment. Existing resource groups must not be reused."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "eastus2",
+      "allowedValues": [
+        "eastus2"
+      ]
+    },
+    "owner": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "budgetStartUtc": {
+      "type": "string",
+      "metadata": {
+        "description": "Actual UTC start, set only AFTER an independently durable cleanup schedule is armed."
+      }
+    },
+    "cleanupReceipt": {
+      "type": "string",
+      "minLength": 1,
+      "metadata": {
+        "description": "Identifier of the reviewed, armed external cleanup receipt; never a credential."
+      }
+    },
+    "sourceDigest": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "metadata": {
+        "description": "Reviewed source bundle digest, preserved from cleanup preparation."
+      }
+    },
+    "vnetCidr": {
+      "type": "string",
+      "metadata": {
+        "description": "Nonoverlapping RFC1918 /16; nodes use its first /22, the builder uses /27 number 128."
+      }
+    },
+    "podCidr": {
+      "type": "string",
+      "metadata": {
+        "description": "Nonoverlapping overlay pod /16. Never route these addresses across clusters."
+      }
+    },
+    "serviceCidr": {
+      "type": "string",
+      "metadata": {
+        "description": "Nonoverlapping Kubernetes Service /16."
+      }
+    },
+    "trustedBuildClientCidr": {
+      "type": "string",
+      "metadata": {
+        "description": "Trusted control-cluster NODE subnet, not overlay pod CIDRs; private peering requires separate approval."
+      }
+    },
+    "trustedControlVnetCidr": {
+      "type": "string",
+      "metadata": {
+        "description": "Entire existing control VNet CIDR; new NSG rules deny other cross-VNet connections."
+      }
+    },
+    "builderImageVersion": {
+      "type": "string",
+      "metadata": {
+        "description": "Pinned Canonical ubuntu-24_04-lts/server image version available in eastus2; never latest."
+      }
+    },
+    "builderAdminUsername": {
+      "type": "string",
+      "defaultValue": "buildoperator",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "operatorSshPublicKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Public SSH key only. No private key, password, kubeconfig, registry credential, or token."
+      }
+    }
+  },
+  "variables": {
+    "prefix": "[format('orka-verify-{0}', parameters('suffix'))]",
+    "ownershipTags": {
+      "orka-purpose": "isolated-remediation-verification",
+      "orka-owner": "[parameters('owner')]",
+      "orka-deployment": "[variables('prefix')]",
+      "orka-budget-start-utc": "[parameters('budgetStartUtc')]",
+      "orka-expires-at-utc": "[dateTimeAdd(parameters('budgetStartUtc'), 'P1D')]",
+      "orka-cleanup-receipt": "[parameters('cleanupReceipt')]",
+      "orka-source-digest": "[parameters('sourceDigest')]"
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Resources/resourceGroups",
+      "apiVersion": "2024-03-01",
+      "name": "[format('rg-{0}', variables('prefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('ownershipTags')]"
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "isolated-verification-foundation",
+      "resourceGroup": "[format('rg-{0}', variables('prefix'))]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "prefix": {
+            "value": "[variables('prefix')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "ownershipTags": {
+            "value": "[variables('ownershipTags')]"
+          },
+          "vnetCidr": {
+            "value": "[parameters('vnetCidr')]"
+          },
+          "podCidr": {
+            "value": "[parameters('podCidr')]"
+          },
+          "serviceCidr": {
+            "value": "[parameters('serviceCidr')]"
+          },
+          "trustedBuildClientCidr": {
+            "value": "[parameters('trustedBuildClientCidr')]"
+          },
+          "trustedControlVnetCidr": {
+            "value": "[parameters('trustedControlVnetCidr')]"
+          },
+          "builderImageVersion": {
+            "value": "[parameters('builderImageVersion')]"
+          },
+          "builderAdminUsername": {
+            "value": "[parameters('builderAdminUsername')]"
+          },
+          "operatorSshPublicKey": {
+            "value": "[parameters('operatorSshPublicKey')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.48.1.52935",
+              "templateHash": "13767762944191614071"
+            }
+          },
+          "parameters": {
+            "prefix": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "ownershipTags": {
+              "type": "object"
+            },
+            "vnetCidr": {
+              "type": "string"
+            },
+            "podCidr": {
+              "type": "string"
+            },
+            "serviceCidr": {
+              "type": "string"
+            },
+            "trustedBuildClientCidr": {
+              "type": "string"
+            },
+            "trustedControlVnetCidr": {
+              "type": "string"
+            },
+            "builderImageVersion": {
+              "type": "string"
+            },
+            "builderAdminUsername": {
+              "type": "string"
+            },
+            "operatorSshPublicKey": {
+              "type": "securestring"
+            }
+          },
+          "variables": {
+            "nodeSubnetCidr": "[cidrSubnet(parameters('vnetCidr'), 22, 0)]",
+            "builderSubnetCidr": "[cidrSubnet(parameters('vnetCidr'), 27, 128)]",
+            "builderPrivateIP": "[cidrHost(variables('builderSubnetCidr'), 4)]",
+            "networkRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4d97b98b-1d4f-4787-a291-c67834d212e7')]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.ContainerRegistry/registries",
+              "apiVersion": "2025-11-01",
+              "name": "[format('orkaverif{0}', replace(parameters('prefix'), 'orka-verify-', ''))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('ownershipTags')]",
+              "sku": {
+                "name": "Basic"
+              },
+              "properties": {
+                "adminUserEnabled": false,
+                "anonymousPullEnabled": false,
+                "publicNetworkAccess": "Enabled",
+                "roleAssignmentMode": "LegacyRegistryPermissions"
+              }
+            },
+            {
+              "type": "Microsoft.Network/publicIPAddresses",
+              "apiVersion": "2024-05-01",
+              "name": "[format('{0}-egress', parameters('prefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('ownershipTags')]",
+              "sku": {
+                "name": "Standard"
+              },
+              "properties": {
+                "publicIPAllocationMethod": "Static",
+                "publicIPAddressVersion": "IPv4"
+              }
+            },
+            {
+              "type": "Microsoft.Network/natGateways",
+              "apiVersion": "2024-05-01",
+              "name": "[format('{0}-egress', parameters('prefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('ownershipTags')]",
+              "sku": {
+                "name": "Standard"
+              },
+              "properties": {
+                "idleTimeoutInMinutes": 4,
+                "publicIpAddresses": [
+                  {
+                    "id": "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-egress', parameters('prefix')))]"
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-egress', parameters('prefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Network/networkSecurityGroups",
+              "apiVersion": "2024-05-01",
+              "name": "[format('{0}-nodes', parameters('prefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('ownershipTags')]",
+              "properties": {
+                "securityRules": [
+                  {
+                    "name": "deny-public-workload-ingress",
+                    "properties": {
+                      "priority": 100,
+                      "access": "Deny",
+                      "direction": "Inbound",
+                      "protocol": "*",
+                      "sourceAddressPrefix": "Internet",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "*",
+                      "destinationPortRange": "*"
+                    }
+                  },
+                  {
+                    "name": "trusted-control-api",
+                    "properties": {
+                      "priority": 110,
+                      "access": "Allow",
+                      "direction": "Inbound",
+                      "protocol": "Tcp",
+                      "sourceAddressPrefix": "[parameters('trustedBuildClientCidr')]",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "*",
+                      "destinationPortRange": "443"
+                    }
+                  },
+                  {
+                    "name": "deny-other-control-ingress",
+                    "properties": {
+                      "priority": 120,
+                      "access": "Deny",
+                      "direction": "Inbound",
+                      "protocol": "*",
+                      "sourceAddressPrefix": "[parameters('trustedControlVnetCidr')]",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "*",
+                      "destinationPortRange": "*"
+                    }
+                  },
+                  {
+                    "name": "deny-connections-to-control",
+                    "properties": {
+                      "priority": 100,
+                      "access": "Deny",
+                      "direction": "Outbound",
+                      "protocol": "*",
+                      "sourceAddressPrefix": "*",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "[parameters('trustedControlVnetCidr')]",
+                      "destinationPortRange": "*"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "type": "Microsoft.Network/networkSecurityGroups",
+              "apiVersion": "2024-05-01",
+              "name": "[format('{0}-builder', parameters('prefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('ownershipTags')]",
+              "properties": {
+                "securityRules": [
+                  {
+                    "name": "trusted-build-client-mtls",
+                    "properties": {
+                      "priority": 100,
+                      "access": "Allow",
+                      "direction": "Inbound",
+                      "protocol": "Tcp",
+                      "sourceAddressPrefix": "[parameters('trustedBuildClientCidr')]",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "[variables('builderPrivateIP')]",
+                      "destinationPortRange": "1234"
+                    }
+                  },
+                  {
+                    "name": "deny-other-ingress",
+                    "properties": {
+                      "priority": 200,
+                      "access": "Deny",
+                      "direction": "Inbound",
+                      "protocol": "*",
+                      "sourceAddressPrefix": "*",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "*",
+                      "destinationPortRange": "*"
+                    }
+                  },
+                  {
+                    "name": "deny-lateral-connections",
+                    "properties": {
+                      "priority": 110,
+                      "access": "Deny",
+                      "direction": "Outbound",
+                      "protocol": "*",
+                      "sourceAddressPrefix": "*",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "VirtualNetwork",
+                      "destinationPortRange": "*"
+                    }
+                  },
+                  {
+                    "name": "https-egress",
+                    "properties": {
+                      "priority": 120,
+                      "access": "Allow",
+                      "direction": "Outbound",
+                      "protocol": "Tcp",
+                      "sourceAddressPrefix": "*",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "Internet",
+                      "destinationPortRange": "443"
+                    }
+                  },
+                  {
+                    "name": "deny-other-internet-egress",
+                    "properties": {
+                      "priority": 200,
+                      "access": "Deny",
+                      "direction": "Outbound",
+                      "protocol": "*",
+                      "sourceAddressPrefix": "*",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "Internet",
+                      "destinationPortRange": "*"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "type": "Microsoft.Network/virtualNetworks",
+              "apiVersion": "2024-05-01",
+              "name": "[format('{0}-vnet', parameters('prefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('ownershipTags')]",
+              "properties": {
+                "addressSpace": {
+                  "addressPrefixes": [
+                    "[parameters('vnetCidr')]"
+                  ]
+                },
+                "subnets": [
+                  {
+                    "name": "nodes",
+                    "properties": {
+                      "addressPrefix": "[variables('nodeSubnetCidr')]",
+                      "networkSecurityGroup": {
+                        "id": "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nodes', parameters('prefix')))]"
+                      },
+                      "natGateway": {
+                        "id": "[resourceId('Microsoft.Network/natGateways', format('{0}-egress', parameters('prefix')))]"
+                      },
+                      "defaultOutboundAccess": false,
+                      "privateEndpointNetworkPolicies": "NetworkSecurityGroupEnabled"
+                    }
+                  },
+                  {
+                    "name": "builder",
+                    "properties": {
+                      "addressPrefix": "[variables('builderSubnetCidr')]",
+                      "networkSecurityGroup": {
+                        "id": "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-builder', parameters('prefix')))]"
+                      },
+                      "natGateway": {
+                        "id": "[resourceId('Microsoft.Network/natGateways', format('{0}-egress', parameters('prefix')))]"
+                      },
+                      "defaultOutboundAccess": false
+                    }
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-builder', parameters('prefix')))]",
+                "[resourceId('Microsoft.Network/natGateways', format('{0}-egress', parameters('prefix')))]",
+                "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nodes', parameters('prefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+              "apiVersion": "2023-01-31",
+              "name": "[format('{0}-aks-control-plane', parameters('prefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('ownershipTags')]"
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('prefix')))]",
+              "name": "[guid(resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('prefix'))), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix'))), variables('networkRoleId'))]",
+              "properties": {
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix'))), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[variables('networkRoleId')]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix')))]",
+                "[resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('prefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nodes', parameters('prefix')))]",
+              "name": "[guid(resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nodes', parameters('prefix'))), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix'))), variables('networkRoleId'))]",
+              "properties": {
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix'))), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[variables('networkRoleId')]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix')))]",
+                "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nodes', parameters('prefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Network/natGateways', format('{0}-egress', parameters('prefix')))]",
+              "name": "[guid(resourceId('Microsoft.Network/natGateways', format('{0}-egress', parameters('prefix'))), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix'))), variables('networkRoleId'))]",
+              "properties": {
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix'))), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[variables('networkRoleId')]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix')))]",
+                "[resourceId('Microsoft.Network/natGateways', format('{0}-egress', parameters('prefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.ContainerService/managedClusters",
+              "apiVersion": "2025-07-01",
+              "name": "[format('{0}-aks', parameters('prefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('ownershipTags')]",
+              "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                  "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix'))))]": {}
+                }
+              },
+              "sku": {
+                "name": "Base",
+                "tier": "Free"
+              },
+              "properties": {
+                "kubernetesVersion": "1.35.8",
+                "dnsPrefix": "[parameters('prefix')]",
+                "nodeResourceGroup": "[format('rg-{0}-nodes', parameters('prefix'))]",
+                "enableRBAC": true,
+                "disableLocalAccounts": true,
+                "aadProfile": {
+                  "managed": true,
+                  "enableAzureRBAC": true,
+                  "tenantID": "[subscription().tenantId]"
+                },
+                "apiServerAccessProfile": {
+                  "enablePrivateCluster": true,
+                  "enablePrivateClusterPublicFQDN": false,
+                  "privateDNSZone": "system",
+                  "disableRunCommand": true
+                },
+                "oidcIssuerProfile": {
+                  "enabled": true
+                },
+                "securityProfile": {
+                  "workloadIdentity": {
+                    "enabled": true
+                  }
+                },
+                "workloadAutoScalerProfile": {
+                  "keda": {
+                    "enabled": false
+                  }
+                },
+                "autoUpgradeProfile": {
+                  "upgradeChannel": "none",
+                  "nodeOSUpgradeChannel": "None"
+                },
+                "agentPoolProfiles": [
+                  {
+                    "name": "verify",
+                    "mode": "System",
+                    "type": "VirtualMachineScaleSets",
+                    "count": 2,
+                    "vmSize": "Standard_D4s_v5",
+                    "osType": "Linux",
+                    "osSKU": "Ubuntu",
+                    "osDiskSizeGB": 64,
+                    "osDiskType": "Managed",
+                    "enableAutoScaling": false,
+                    "maxPods": 30,
+                    "orchestratorVersion": "1.35.8",
+                    "vnetSubnetID": "[resourceId('Microsoft.Network/virtualNetworks/subnets', format('{0}-vnet', parameters('prefix')), 'nodes')]",
+                    "kubeletConfig": {
+                      "podMaxPids": 512
+                    },
+                    "upgradeSettings": {
+                      "maxSurge": "1",
+                      "maxUnavailable": "0"
+                    },
+                    "tags": "[parameters('ownershipTags')]",
+                    "nodeLabels": {
+                      "orka.ai/isolated-verification": "true"
+                    }
+                  }
+                ],
+                "networkProfile": {
+                  "networkPlugin": "azure",
+                  "networkPluginMode": "overlay",
+                  "networkPolicy": "cilium",
+                  "networkDataplane": "cilium",
+                  "podCidr": "[parameters('podCidr')]",
+                  "serviceCidr": "[parameters('serviceCidr')]",
+                  "dnsServiceIP": "[cidrHost(parameters('serviceCidr'), 10)]",
+                  "loadBalancerSku": "standard",
+                  "outboundType": "userAssignedNATGateway"
+                },
+                "storageProfile": {
+                  "diskCSIDriver": {
+                    "enabled": true
+                  },
+                  "fileCSIDriver": {
+                    "enabled": false
+                  },
+                  "snapshotController": {
+                    "enabled": false
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix')))]",
+                "[extensionResourceId(resourceId('Microsoft.Network/natGateways', format('{0}-egress', parameters('prefix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Network/natGateways', format('{0}-egress', parameters('prefix'))), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix'))), variables('networkRoleId')))]",
+                "[extensionResourceId(resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('prefix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('prefix'))), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix'))), variables('networkRoleId')))]",
+                "[extensionResourceId(resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nodes', parameters('prefix'))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nodes', parameters('prefix'))), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-aks-control-plane', parameters('prefix'))), variables('networkRoleId')))]",
+                "[resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('prefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Network/networkInterfaces",
+              "apiVersion": "2024-05-01",
+              "name": "[format('{0}-builder', parameters('prefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('ownershipTags')]",
+              "properties": {
+                "enableIPForwarding": false,
+                "ipConfigurations": [
+                  {
+                    "name": "private",
+                    "properties": {
+                      "privateIPAllocationMethod": "Static",
+                      "privateIPAddress": "[variables('builderPrivateIP')]",
+                      "subnet": {
+                        "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', format('{0}-vnet', parameters('prefix')), 'builder')]"
+                      }
+                    }
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('prefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Compute/virtualMachines",
+              "apiVersion": "2024-11-01",
+              "name": "[format('{0}-builder', parameters('prefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('ownershipTags')]",
+              "properties": {
+                "hardwareProfile": {
+                  "vmSize": "Standard_D4s_v5"
+                },
+                "osProfile": {
+                  "computerName": "verification-builder",
+                  "adminUsername": "[parameters('builderAdminUsername')]",
+                  "allowExtensionOperations": false,
+                  "linuxConfiguration": {
+                    "disablePasswordAuthentication": true,
+                    "provisionVMAgent": true,
+                    "ssh": {
+                      "publicKeys": [
+                        {
+                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('builderAdminUsername'))]",
+                          "keyData": "[parameters('operatorSshPublicKey')]"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "storageProfile": {
+                  "imageReference": {
+                    "publisher": "Canonical",
+                    "offer": "ubuntu-24_04-lts",
+                    "sku": "server",
+                    "version": "[parameters('builderImageVersion')]"
+                  },
+                  "osDisk": {
+                    "name": "[format('{0}-builder-os', parameters('prefix'))]",
+                    "createOption": "FromImage",
+                    "diskSizeGB": 64,
+                    "deleteOption": "Delete",
+                    "managedDisk": {
+                      "storageAccountType": "StandardSSD_LRS"
+                    }
+                  },
+                  "dataDisks": [
+                    {
+                      "name": "[format('{0}-builder-state', parameters('prefix'))]",
+                      "lun": 0,
+                      "createOption": "Empty",
+                      "diskSizeGB": 64,
+                      "deleteOption": "Delete",
+                      "managedDisk": {
+                        "storageAccountType": "StandardSSD_LRS"
+                      }
+                    }
+                  ]
+                },
+                "networkProfile": {
+                  "networkInterfaces": [
+                    {
+                      "id": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-builder', parameters('prefix')))]",
+                      "properties": {
+                        "deleteOption": "Delete"
+                      }
+                    }
+                  ]
+                },
+                "diagnosticsProfile": {
+                  "bootDiagnostics": {
+                    "enabled": false
+                  }
+                },
+                "securityProfile": {
+                  "securityType": "TrustedLaunch",
+                  "uefiSettings": {
+                    "secureBootEnabled": true,
+                    "vTpmEnabled": true
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-builder', parameters('prefix')))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "clusterId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.ContainerService/managedClusters', format('{0}-aks', parameters('prefix')))]"
+            },
+            "builderId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Compute/virtualMachines', format('{0}-builder', parameters('prefix')))]"
+            },
+            "vnetId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('prefix')))]"
+            },
+            "registryId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.ContainerRegistry/registries', format('orkaverif{0}', replace(parameters('prefix'), 'orka-verify-', '')))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', format('rg-{0}', variables('prefix')))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "verificationResourceGroupId": {
+      "type": "string",
+      "value": "[subscriptionResourceId('Microsoft.Resources/resourceGroups', format('rg-{0}', variables('prefix')))]"
+    },
+    "managedNodeResourceGroupName": {
+      "type": "string",
+      "value": "[format('rg-{0}-nodes', variables('prefix'))]"
+    },
+    "verificationClusterId": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, format('rg-{0}', variables('prefix'))), 'Microsoft.Resources/deployments', 'isolated-verification-foundation'), '2025-04-01').outputs.clusterId.value]"
+    },
+    "builderVirtualMachineId": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, format('rg-{0}', variables('prefix'))), 'Microsoft.Resources/deployments', 'isolated-verification-foundation'), '2025-04-01').outputs.builderId.value]"
+    },
+    "verificationVnetId": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, format('rg-{0}', variables('prefix'))), 'Microsoft.Resources/deployments', 'isolated-verification-foundation'), '2025-04-01').outputs.vnetId.value]"
+    },
+    "verificationRegistryId": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, format('rg-{0}', variables('prefix'))), 'Microsoft.Resources/deployments', 'isolated-verification-foundation'), '2025-04-01').outputs.registryId.value]"
+    },
+    "expiresAtUtc": {
+      "type": "string",
+      "value": "[variables('ownershipTags')['orka-expires-at-utc']]"
+    }
+  }
+}
