@@ -122,7 +122,7 @@ End-to-end tests run against a dedicated Kind cluster:
 | `test/e2e/scheduled_task_test.go` | Cron scheduling, suspend, `concurrencyPolicy: Forbid`, history-limit cleanup |
 | `test/e2e/task_lifecycle_test.go` | Timeout/retry/cancel plus session serialization and lock release |
 | `scripts/agent-runtime-e2e.sh` | Canonical deployed-cluster ACP smoke/release gate for Codex, OpenCode, Claude, and Copilot RuntimePools, exact Pod/runtime identity, workspace read/write, continuation/fork, cancellation/timeout, restart/replacement, publication/PR verification, drain/scale-to-zero, immutable images, and cleanup |
-| `.github/workflows/agent-runtime-e2e.yml` / `scripts/agent-runtime-kind-e2e.sh` | Trusted-branch/nightly/manual agent runtime smoke that calls real model providers, requires credentials, and bootstraps an ephemeral Kind cluster, Vekil, and the production ACP topology before invoking the canonical validator |
+| `.github/workflows/agent-runtime-e2e.yml` / `scripts/agent-runtime-kind-e2e.sh` | Manual agent runtime smoke that calls real model providers, requires credentials, and bootstraps an ephemeral Kind cluster, Vekil, and the production ACP topology before invoking the canonical validator |
 | `.github/workflows/release-qualification.yml` / `scripts/agent-runtime-kind-e2e.sh` | Environment-approved chart and runtime acceptance, real local Git publication tests, GitHub API fixture tests, and cleanup; no stored Git publication credentials |
 
 The Gateway Live E2E workflow (`.github/workflows/gateway-e2e.yml`) runs on manual dispatch and on pull requests or pushes that touch Gateway-relevant source, configuration, E2E, image, or dependency paths. It creates a dedicated Kind cluster, generates disposable TLS and bearer credentials, deploys the TLS reference adapter and deterministic echo `AgentRuntime`, and verifies invalid bearer rejection, accepted and duplicate ingress, runtime-backed Task completion, final delivery, idempotency, and correlation metadata. The workflow is model-free and secret-free; it does not use repository or provider credentials.
@@ -145,13 +145,12 @@ missing or mismatched artifacts staying not ready.
 - `scripts/agent-runtime-kind-e2e.sh` is the CI/local bootstrap entrypoint. It
   creates an ephemeral Kind cluster, deploys Vekil and the production ACP
   topology with digest-pinned local images, and then calls the canonical script.
-- `.github/workflows/agent-runtime-e2e.yml` runs on relevant pushes to the
-  default branch, nightly, and manual dispatch. It requires the repository's
+- `.github/workflows/agent-runtime-e2e.yml` runs by manual dispatch only. It
+  requires the repository's
   `COPILOT_GITHUB_TOKEN` secret so Vekil can exercise Codex, OpenCode, Claude, and
   Copilot against real model providers without mounting provider credentials
   into RuntimePools. The workflow rejects dispatches from other branches before
-  using the secret. It runs unattended as ordinary CI without a deployment
-  environment.
+  using the secret. It runs as ordinary CI without a deployment environment.
   When migrating from `live-acp-runtime-smoke`, ensure the provider secret is
   available at repository scope. After the renamed workflow succeeds, retire
   the old environment and preserve its deployment history.
