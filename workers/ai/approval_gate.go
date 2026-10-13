@@ -801,8 +801,10 @@ func injectIdempotencyKey(args json.RawMessage, key string) (json.RawMessage, er
 		return args, nil
 	}
 	params := map[string]any{}
-	if len(strings.TrimSpace(string(args))) > 0 {
-		if err := json.Unmarshal(args, &params); err != nil {
+	if len(bytes.TrimSpace(args)) > 0 {
+		var err error
+		params, err = tools.DecodeToolArgumentObject(args)
+		if err != nil {
 			return nil, fmt.Errorf("parse tool arguments for idempotency key injection: %w", err)
 		}
 	}
@@ -903,14 +905,26 @@ func handleExplicitRequestApprovalBatch(
 		if _, ok := allowedToolCalls["request_approval"]; !ok {
 			return nil, nil
 		}
-		call = normalizeRequestApprovalCall(call)
 		if gate != nil && len(gate.resolved) > 0 {
+			// Validate the original bytes before normalization, including duplicate
+			// keys and Unicode. Execution below still receives the original call.
+			matchingCall := call
+			if tool, ok := tools.DefaultRegistry.Get(strings.TrimSpace(call.Name)); ok {
+				args, err := tools.NormalizeToolArguments(tool, call.Arguments)
+				if err != nil {
+					return &approvalBatchDecision{
+						continueLLM: true,
+						toolResults: approvalValidationBatchToolResults(calls, call.ID, err),
+					}, nil
+				}
+				matchingCall.Arguments = args
+			}
 			var matchingArgs map[string]any
-			_ = json.Unmarshal(call.Arguments, &matchingArgs)
-			// Do not let missing targetArguments inherit the empty-object
-			// approval matching default before request_approval validates it.
+			_ = json.Unmarshal(matchingCall.Arguments, &matchingArgs)
+			// A declared null is omitted by normalization. Do not let missing
+			// targetArguments inherit the empty-object approval matching default.
 			_, hasTargetArguments := matchingArgs["targetArguments"].(map[string]any)
-			target, err := explicitApprovalTargetForCall(ctx, call, customTools, baseToolCtx)
+			target, err := explicitApprovalTargetForCall(ctx, matchingCall, customTools, baseToolCtx)
 			if hasTargetArguments && err == nil {
 				if decision, found := gate.resolvedDecision(target); found {
 					return &approvalBatchDecision{
@@ -922,7 +936,9 @@ func handleExplicitRequestApprovalBatch(
 		}
 		result, err := executeRequestApprovalToolCall(ctx, call, customTools, eventRecorder, baseToolCtx)
 		if err != nil {
-			if _, ok := errors.AsType[*tools.RequestApprovalValidationError](err); ok {
+			_, invalidRequest := errors.AsType[*tools.RequestApprovalValidationError](err)
+			_, invalidArgument := errors.AsType[*tools.ToolArgumentError](err)
+			if invalidRequest || invalidArgument {
 				return &approvalBatchDecision{
 					continueLLM: true,
 					toolResults: approvalValidationBatchToolResults(calls, call.ID, err),
@@ -933,29 +949,6 @@ func handleExplicitRequestApprovalBatch(
 		return &approvalBatchDecision{result: result}, nil
 	}
 	return nil, nil
-}
-
-// normalizeRequestApprovalCall applies the registry's stringified-object semantics
-// before both resolved-decision matching and execution. Invalid and non-object
-// targetArguments stay unchanged so the request_approval tool rejects them.
-func normalizeRequestApprovalCall(call llm.ToolCall) llm.ToolCall {
-	var args map[string]json.RawMessage
-	if err := json.Unmarshal(call.Arguments, &args); err != nil {
-		return call
-	}
-	var encoded string
-	if err := json.Unmarshal(args["targetArguments"], &encoded); err != nil {
-		return call
-	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(encoded), &object); err != nil || object == nil {
-		return call
-	}
-	args["targetArguments"] = json.RawMessage(encoded)
-	if normalized, err := json.Marshal(args); err == nil {
-		call.Arguments = normalized
-	}
-	return call
 }
 
 func blockingApprovalOverflowBatchToolResults(

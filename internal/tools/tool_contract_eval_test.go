@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -302,8 +303,9 @@ func TestToolEvalRegistriesCoverKnownTools(t *testing.T) {
 // NestedArgumentTypes probe types with executable controls. A tool must never
 // panic, accept a non-null non-object root, or accept missing required fields.
 // Object strings must be rejected or decoded equivalently, and every failure
-// must have a diagnostic. Chat tools must return a structured result instead of
-// a Go error, which the chat executor reports to the model as an unknown tool.
+// must have a diagnostic. Chat tools return structured results or typed
+// ToolArgumentError values that the chat executor turns into structured errors;
+// other Go errors are failures.
 func TestToolEvalMalformedArguments(t *testing.T) {
 	evalToolSandbox(t)
 	// Worker tools resolve their parent Task from the environment; the seeded
@@ -356,8 +358,8 @@ func TestToolEvalMalformedArguments(t *testing.T) {
 					switch {
 					case panicked != nil:
 						fatal = append(fatal, fmt.Sprintf("%s: panicked: %v", key, panicked))
-					case label == "chat" && err != nil:
-						fatal = append(fatal, fmt.Sprintf("%s: returned Go error %q, which the chat executor reports as an unknown tool", key, err))
+					case label == "chat" && err != nil && !errors.As(err, new(*ToolArgumentError)):
+						fatal = append(fatal, fmt.Sprintf("%s: returned Go error %q instead of a structured result", key, err))
 					case failed && strings.TrimSpace(message) == "":
 						fatal = append(fatal, fmt.Sprintf("%s: failed without an error message: %q", key, result))
 					case (input == "array" || input == "string" || input == "number" || input == "boolean") && !failed:
@@ -408,8 +410,8 @@ func evalObjectStringHandling(label, name string, required []any, properties map
 			if panicked != nil {
 				return true, evalPanicked + fmt.Sprintf(": %v", panicked)
 			}
-			if label == "chat" && err != nil {
-				return true, evalGoError + fmt.Sprintf(" %q, which the chat executor reports as an unknown tool", err)
+			if label == "chat" && err != nil && !errors.As(err, new(*ToolArgumentError)) {
+				return true, evalGoError + fmt.Sprintf(" %q instead of a structured result", err)
 			}
 			failed, _ := evalToolFailure(result, err)
 			return failed, evalClusterSnapshot(fc)
@@ -1073,6 +1075,38 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 
 	cases := []evalLimitCase{
 		{
+			name:   "chat wait_for_task timeout bounds",
+			limits: []string{"chat/wait_for_task.timeout minimum=1", "chat/wait_for_task.timeout maximum=60"},
+			check: func(t *testing.T) (bool, string) {
+				call := func() (Tool, context.Context) {
+					task := &corev1alpha1.Task{
+						ObjectMeta: metav1.ObjectMeta{Name: evalPlaceholder, Namespace: defaultNamespace},
+						Status:     corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseSucceeded},
+					}
+					return chatTool("wait_for_task", newFakeClient(task))
+				}
+				// The actual maximum wait is pinned with virtual time by
+				// TestWaitForTaskTool_Execute_TimeoutClampsToMax.
+				return evalRejectsChange(call, `{"name":"eval","timeout":1}`, `{"name":"eval","timeout":0}`, "timeout")
+			},
+		},
+		{
+			name:   "chat create_agent runtime turns",
+			limits: []string{"chat/create_agent.runtime.defaultMaxTurns minimum=1", "chat/create_agent.runtime.defaultMaxTurns maximum=1000"},
+			check: func(t *testing.T) (bool, string) {
+				call := func() (Tool, context.Context) { return chatTool("create_agent", newFakeClient()) }
+				turns := func(v int) string {
+					return fmt.Sprintf(`{"name":"a","model":{"name":"test-model"},"runtime":{"type":"claude","defaultMaxTurns":%d}}`, v)
+				}
+				return evalAll(
+					func() (bool, string) { return evalRejectsChange(call, turns(1), turns(0), "runtime.defaultMaxTurns") },
+					func() (bool, string) {
+						return evalRejectsChange(call, turns(1000), turns(1001), "runtime.defaultMaxTurns")
+					},
+				)
+			},
+		},
+		{
 			name:   "chat create_agent model counts",
 			limits: []string{"chat/create_agent.model.contextWindow minimum=1", "chat/create_agent.model.maxTokens minimum=1"},
 			check: func(t *testing.T) (bool, string) {
@@ -1157,6 +1191,35 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 			},
 		},
 		{
+			name: "task priority",
+			limits: []string{
+				"chat/create_ai_task.priority maximum=1000", "chat/create_ai_task.priority minimum=0",
+				"chat/create_container_task.priority maximum=1000", "chat/create_container_task.priority minimum=0",
+				"worker/create_container_task.priority maximum=1000", "worker/create_container_task.priority minimum=0",
+			},
+			check: func(t *testing.T) (bool, string) {
+				t.Setenv(envOrkaTaskName, "parent")
+				ai := func() (Tool, context.Context) { return chatTool("create_ai_task", newFakeClient()) }
+				chatContainer := func() (Tool, context.Context) { return chatTool("create_container_task", newFakeClient()) }
+				workerContainer := func() (Tool, context.Context) { return workerTool("create_container_task", evalParentTaskCluster()) }
+				aiTask := func(p int) string { return fmt.Sprintf(`{"prompt":"p","priority":%d}`, p) }
+				containerTask := func(p int) string {
+					return fmt.Sprintf(`{"image":"cgr.dev/chainguard/bash:latest","command":["echo","hi"],"priority":%d}`, p)
+				}
+				checks := make([]func() (bool, string), 0, 6)
+				for _, c := range []struct {
+					call evalCall
+					args func(int) string
+				}{{ai, aiTask}, {chatContainer, containerTask}, {workerContainer, containerTask}} {
+					checks = append(checks,
+						func() (bool, string) { return evalRejectsChange(c.call, c.args(1000), c.args(1001), "priority") },
+						func() (bool, string) { return evalRejectsChange(c.call, c.args(0), c.args(-1), "priority") },
+					)
+				}
+				return evalAll(checks...)
+			},
+		},
+		{
 			name:   "chat create_pr_monitor",
 			limits: []string{"chat/create_pr_monitor.per_page maximum=100", "chat/create_pr_monitor.per_page minimum=1", "chat/create_pr_monitor.review_event enum=COMMENT|APPROVE|REQUEST_CHANGES"},
 			check: func(t *testing.T) (bool, string) {
@@ -1209,6 +1272,11 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 				}
 				return true, ""
 			},
+		},
+		{
+			name:   "chat list_tasks result bound",
+			limits: []string{"chat/list_tasks.limit maximum=100"},
+			check:  evalTaskListBound,
 		},
 		{
 			name:   "worker code_exec language and maximum timeout",
@@ -2100,26 +2168,8 @@ func evalSetArgumentPath(value any, schema map[string]any, path, prefix []string
 func TestToolEvalNullRequiredFields(t *testing.T) {
 	evalToolSandbox(t)
 	knownDefects := map[string]string{
-		"chat/cancel_task: null name":           "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/check_task_progress: null name":   "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_agent: null name":          "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_agent_task: null agentRef": "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_agent_task: null prompt":   "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_ai_task: null prompt":      "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_pr_monitor: null agentRef": "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_pr_monitor: null name":     "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_pr_monitor: null schedule": "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_tool: null description":    "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_tool: null name":           "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_tool: null url":            "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/delete_agent: null name":          "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/delete_session: null sessionId":   "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/delete_tool: null name":           "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/fetch_task_output: null name":     "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/update_agent: null name":          "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/wait_for_task: null name":         "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"worker/file_write: null content":       "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"worker/request_approval: null action":  "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"worker/file_write: null content":      "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"worker/request_approval: null action": "the tool accepts or coerces explicit null instead of rejecting the required field",
 	}
 	violations := map[string]string{}
 	declared, executed := map[string]bool{}, map[string]bool{}
@@ -2192,79 +2242,7 @@ func evalRequiredNullProbes(node map[string]any, path []string, visit func([]str
 func TestToolEvalTopLevelArgumentTypes(t *testing.T) {
 	evalToolSandbox(t)
 	wrong := map[string]any{"string": map[string]any{"k": "v"}, "integer": "many", "number": "many", "boolean": "yes", "array": map[string]any{"k": "v"}, "object": []any{}}
-	const (
-		ignoredTopLevelType = "the tool drops or coerces a top-level value whose type contradicts its schema"
-		coercedLookupType   = "the tool coerces a wrong-typed value and then fails a resource lookup instead of rejecting the type"
-	)
-	knownDefects := map[string]string{
-		"chat/cancel_task: name as wrong type":                    coercedLookupType,
-		"chat/cancel_task: namespace as wrong type":               coercedLookupType,
-		"chat/check_task_progress: name as wrong type":            coercedLookupType,
-		"chat/check_task_progress: namespace as wrong type":       coercedLookupType,
-		"chat/create_agent: initialPrompt as wrong type":          ignoredTopLevelType,
-		"chat/create_agent: name as wrong type":                   ignoredTopLevelType,
-		"chat/create_agent: namespace as wrong type":              ignoredTopLevelType,
-		"chat/create_agent: providerRef as wrong type":            coercedLookupType,
-		"chat/create_agent: systemPrompt as wrong type":           ignoredTopLevelType,
-		"chat/create_agent: tools as wrong type":                  ignoredTopLevelType,
-		"chat/create_agent_task: agentRef as wrong type":          ignoredTopLevelType,
-		"chat/create_agent_task: namespace as wrong type":         ignoredTopLevelType,
-		"chat/create_agent_task: prompt as wrong type":            ignoredTopLevelType,
-		"chat/create_agent_task: schedule as wrong type":          ignoredTopLevelType,
-		"chat/create_ai_task: agentRef as wrong type":             ignoredTopLevelType,
-		"chat/create_ai_task: namespace as wrong type":            ignoredTopLevelType,
-		"chat/create_ai_task: priority as wrong type":             ignoredTopLevelType,
-		"chat/create_ai_task: prompt as wrong type":               ignoredTopLevelType,
-		"chat/create_ai_task: providerRef as wrong type":          ignoredTopLevelType,
-		"chat/create_ai_task: schedule as wrong type":             ignoredTopLevelType,
-		"chat/create_ai_task: sessionRef as wrong type":           ignoredTopLevelType,
-		"chat/create_container_task: args as wrong type":          ignoredTopLevelType,
-		"chat/create_container_task: command as wrong type":       ignoredTopLevelType,
-		"chat/create_container_task: image as wrong type":         ignoredTopLevelType,
-		"chat/create_container_task: namespace as wrong type":     ignoredTopLevelType,
-		"chat/create_container_task: prior_task as wrong type":    ignoredTopLevelType,
-		"chat/create_container_task: priority as wrong type":      ignoredTopLevelType,
-		"chat/create_container_task: schedule as wrong type":      ignoredTopLevelType,
-		"chat/create_pr_monitor: agentRef as wrong type":          coercedLookupType,
-		"chat/create_pr_monitor: name as wrong type":              ignoredTopLevelType,
-		"chat/create_pr_monitor: per_page as wrong type":          ignoredTopLevelType,
-		"chat/create_pr_monitor: prompt as wrong type":            ignoredTopLevelType,
-		"chat/create_pr_monitor: providerRef as wrong type":       ignoredTopLevelType,
-		"chat/create_pr_monitor: readCredentialRef as wrong type": coercedLookupType,
-		"chat/create_pr_monitor: schedule as wrong type":          ignoredTopLevelType,
-		"chat/create_tool: description as wrong type":             ignoredTopLevelType,
-		"chat/create_tool: method as wrong type":                  ignoredTopLevelType,
-		"chat/create_tool: name as wrong type":                    ignoredTopLevelType,
-		"chat/create_tool: namespace as wrong type":               ignoredTopLevelType,
-		"chat/create_tool: url as wrong type":                     ignoredTopLevelType,
-		"chat/delete_agent: name as wrong type":                   coercedLookupType,
-		"chat/delete_agent: namespace as wrong type":              coercedLookupType,
-		"chat/delete_session: namespace as wrong type":            ignoredTopLevelType,
-		"chat/delete_session: sessionId as wrong type":            ignoredTopLevelType,
-		"chat/delete_tool: name as wrong type":                    coercedLookupType,
-		"chat/delete_tool: namespace as wrong type":               coercedLookupType,
-		"chat/fetch_task_output: name as wrong type":              coercedLookupType,
-		"chat/fetch_task_output: namespace as wrong type":         coercedLookupType,
-		"chat/list_agents: namespace as wrong type":               ignoredTopLevelType,
-		"chat/list_tasks: limit as wrong type":                    ignoredTopLevelType,
-		"chat/list_tasks: namespace as wrong type":                ignoredTopLevelType,
-		"chat/list_tasks: status as wrong type":                   ignoredTopLevelType,
-		"chat/list_tools: namespace as wrong type":                ignoredTopLevelType,
-		"chat/update_agent: name as wrong type":                   coercedLookupType,
-		"chat/update_agent: namespace as wrong type":              coercedLookupType,
-		"chat/update_agent: systemPrompt as wrong type":           ignoredTopLevelType,
-		"chat/update_agent: tools as wrong type":                  ignoredTopLevelType,
-		"chat/wait_for_task: name as wrong type":                  coercedLookupType,
-		"chat/wait_for_task: namespace as wrong type":             coercedLookupType,
-		"chat/wait_for_task: timeout as wrong type":               ignoredTopLevelType,
-		"worker/create_container_task: args as wrong type":        ignoredTopLevelType,
-		"worker/create_container_task: command as wrong type":     ignoredTopLevelType,
-		"worker/create_container_task: image as wrong type":       ignoredTopLevelType,
-		"worker/create_container_task: namespace as wrong type":   coercedLookupType,
-		"worker/create_container_task: prior_task as wrong type":  ignoredTopLevelType,
-		"worker/create_container_task: priority as wrong type":    ignoredTopLevelType,
-		"worker/create_container_task: schedule as wrong type":    ignoredTopLevelType,
-	}
+	knownDefects := map[string]string{}
 	violations := map[string]string{}
 	declared, executed := map[string]bool{}, map[string]bool{}
 	for label, registry := range evalToolRegistries(newFakeClient()) {
@@ -2308,45 +2286,7 @@ func TestToolEvalTopLevelArgumentTypes(t *testing.T) {
 func TestToolEvalNestedArgumentTypes(t *testing.T) {
 	evalToolSandbox(t)
 	wrong := map[string]any{"string": map[string]any{"k": "v"}, "integer": "many", "number": "many", "boolean": "yes", "array": "a,b", "object": []any{}}
-	const ignoredNestedType = "the tool drops or coerces a nested value whose type contradicts its schema"
-	knownDefects := map[string]string{
-		"chat/create_agent: model.name as wrong type":                                    ignoredNestedType,
-		"chat/create_agent: model.provider as wrong type":                                ignoredNestedType,
-		"chat/create_agent: model.temperature as wrong type":                             ignoredNestedType,
-		"chat/create_agent: runtime.defaultAllowBash as wrong type":                      ignoredNestedType,
-		"chat/create_agent: runtime.defaultAllowedTools as wrong type":                   ignoredNestedType,
-		"chat/create_agent: runtime.defaultAllowedTools[] as wrong type":                 ignoredNestedType,
-		"chat/create_agent: runtime.defaultMaxTurns as wrong type":                       ignoredNestedType,
-		"chat/create_agent: runtime.secretRef as wrong type":                             ignoredNestedType,
-		"chat/create_agent: tools[] as wrong type":                                       ignoredNestedType,
-		"chat/create_agent_task: workspace.forgeCredentialRef as wrong type":             ignoredNestedType,
-		"chat/create_agent_task: workspace.prBaseBranch as wrong type":                   ignoredNestedType,
-		"chat/create_agent_task: workspace.publicationCredentialRef as wrong type":       ignoredNestedType,
-		"chat/create_agent_task: workspace.publicationReadCredentialRef as wrong type":   ignoredNestedType,
-		"chat/create_agent_task: workspace.readCredentialRef as wrong type":              ignoredNestedType,
-		"chat/create_agent_task: workspace.subPath as wrong type":                        ignoredNestedType,
-		"chat/create_container_task: args[] as wrong type":                               ignoredNestedType,
-		"chat/create_container_task: command[] as wrong type":                            ignoredNestedType,
-		"chat/create_container_task: workspace.branch as wrong type":                     ignoredNestedType,
-		"chat/create_container_task: workspace.gitRepo as wrong type":                    ignoredNestedType,
-		"chat/create_container_task: workspace.publicationCredentialRef as wrong type":   ignoredNestedType,
-		"chat/create_container_task: workspace.publicationGitRepo as wrong type":         ignoredNestedType,
-		"chat/create_container_task: workspace.pushBranch as wrong type":                 ignoredNestedType,
-		"chat/create_container_task: workspace.readCredentialRef as wrong type":          ignoredNestedType,
-		"chat/create_container_task: workspace.ref as wrong type":                        ignoredNestedType,
-		"chat/create_container_task: workspace.subPath as wrong type":                    ignoredNestedType,
-		"chat/update_agent: tools[] as wrong type":                                       ignoredNestedType,
-		"worker/create_container_task: args[] as wrong type":                             ignoredNestedType,
-		"worker/create_container_task: command[] as wrong type":                          ignoredNestedType,
-		"worker/create_container_task: workspace.branch as wrong type":                   ignoredNestedType,
-		"worker/create_container_task: workspace.gitRepo as wrong type":                  ignoredNestedType,
-		"worker/create_container_task: workspace.publicationCredentialRef as wrong type": ignoredNestedType,
-		"worker/create_container_task: workspace.publicationGitRepo as wrong type":       ignoredNestedType,
-		"worker/create_container_task: workspace.pushBranch as wrong type":               ignoredNestedType,
-		"worker/create_container_task: workspace.readCredentialRef as wrong type":        ignoredNestedType,
-		"worker/create_container_task: workspace.ref as wrong type":                      ignoredNestedType,
-		"worker/create_container_task: workspace.subPath as wrong type":                  ignoredNestedType,
-	}
+	knownDefects := map[string]string{}
 	violations := map[string]string{}
 	declared, executed := map[string]bool{}, map[string]bool{}
 	for label, registry := range evalToolRegistries(newFakeClient()) {
@@ -2399,7 +2339,7 @@ func evalArgumentFailure(t *testing.T, label string, ctx context.Context, tool T
 	if panicked != nil {
 		t.Fatalf("tool panicked: %v", panicked)
 	}
-	if label == "chat" && err != nil {
+	if label == "chat" && err != nil && !errors.As(err, new(*ToolArgumentError)) {
 		t.Fatalf("chat tool returned a Go error instead of a structured result: %v", err)
 	}
 	failed, message := evalToolFailure(result, err)
@@ -2428,4 +2368,37 @@ func evalToolReportExecutedViolations(t *testing.T, violations, knownDefects map
 		}
 	}
 	evalToolReportViolations(t, violations, selected)
+}
+
+// evalTaskListBound keeps the declared list_tasks maximum paired with a valid control.
+func evalTaskListBound(t *testing.T) (bool, string) {
+	objects := make([]client.Object, 0, maxListTasksLimit+1)
+	for i := 0; i <= maxListTasksLimit; i++ {
+		objects = append(objects, &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("bounded-task-%03d", i), Namespace: defaultNamespace,
+		}})
+	}
+	fc := newFakeClient(objects...)
+	call := func() (Tool, context.Context) {
+		tool, _ := evalToolRegistries(fc)["chat"].Get("list_tasks")
+		return tool, evalToolContext(fc)
+	}
+	args := func(limit int) string { return fmt.Sprintf(`{"limit":%d}`, limit) }
+	if ok, detail := evalSucceeds(call, args(maxListTasksLimit)); !ok {
+		return false, detail
+	}
+	tool, ctx := call()
+	result, panicked, err := evalToolExecute(ctx, tool, args(maxListTasksLimit+1))
+	if panicked != nil {
+		return false, fmt.Sprintf("panicked: %v", panicked)
+	}
+	if failed, message := evalToolFailure(result, err); failed {
+		return evalFieldMentioned(message, "limit"), message
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		return false, err.Error()
+	}
+	items, ok := response.Data.([]any)
+	return ok && len(items) == maxListTasksLimit, "list_tasks did not clamp to its declared maximum"
 }
