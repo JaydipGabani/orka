@@ -95,8 +95,7 @@ func TestScannerEvalIgnoreInstructionsPattern(t *testing.T) {
 // patch stage edits files that Orka publishes.
 func TestScannerEvalPromptsTreatRepositoryContentAsUntrusted(t *testing.T) {
 	// Each stage has its own marker so stages can be fixed one at a time.
-	const defect = "the prompt does not tell the model to ignore instructions embedded in repository content"
-	knownDefects := map[string]string{"threat model": defect, "review": defect, "validation": defect, "patch": defect}
+	knownDefects := map[string]string{}
 	for name, prompt := range scannerEvalPrompts() {
 		t.Run(name, func(t *testing.T) {
 			if name == "review" && !strings.Contains(prompt, scannerEvalRepositoryExcerpt) {
@@ -127,10 +126,16 @@ func scannerEvalReviewRepositoryTrust(prompt string) (bool, string) {
 		}
 		at += offset
 		start := strings.LastIndex(prompt[:at], header)
+		headerLength := len(header)
+		const plainHeader = "\nMAPPER-OWNED REVIEW CONTEXT:\n"
+		if plainStart := strings.LastIndex(prompt[:at], plainHeader); plainStart > start {
+			start = plainStart
+			headerLength = len(plainHeader)
+		}
 		if start < 0 {
 			return false, "review prompt has no mapper-owned context header before the excerpt"
 		}
-		start += len(header)
+		start += headerLength
 		// Duplicates can share a mapper boundary; exclude the previous excerpt.
 		if start < offset {
 			start = offset
@@ -155,6 +160,7 @@ func TestScannerEvalReviewRepositoryTrustPredicate(t *testing.T) {
 		ok     bool
 	}{
 		{name: "current production introduction", prompt: header + "The context below is the complete evidence boundary. Cite only its included paths and line ranges.\n" + scannerEvalRepositoryExcerpt, ok: true},
+		{name: "plain mapper header", prompt: "\nMAPPER-OWNED REVIEW CONTEXT:\n" + untrusted + scannerEvalRepositoryExcerpt, ok: true},
 		{name: "explicitly untrusted excerpts", prompt: header + untrusted + scannerEvalRepositoryExcerpt, ok: true},
 		{name: "trusted header and trailing metadata", prompt: header + untrusted + scannerEvalRepositoryExcerpt + "TRUSTED output metadata\n", ok: true},
 		{name: "duplicate untrusted excerpts under one mapper boundary", prompt: header + untrusted + scannerEvalRepositoryExcerpt + untrusted + scannerEvalRepositoryExcerpt, ok: true},

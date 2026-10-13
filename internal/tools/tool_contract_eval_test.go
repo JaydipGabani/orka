@@ -157,13 +157,25 @@ var evalToolClusters = map[string]func() client.Client{
 
 const evalPlaceholder = "eval"
 
-// evalToolContextFor gives brokered tools the authenticated context the ACP
-// broker builds and other tools the chat context, so each takes its real path.
+// evalToolContextFor gives each tool the context its caller builds, so each
+// takes its real path: chat tools the chat executor's, worker tools a
+// worker's narrower one, and brokered tools the ACP broker's authenticated one.
 func evalToolContextFor(label string, fc client.Client) context.Context {
-	if label == "brokered" {
+	switch label {
+	case "worker":
+		return WithToolContext(context.Background(), &ToolContext{Client: fc, Namespace: defaultNamespace, ExecutionMode: executionmode.HarnessV2})
+	case "brokered":
 		return WithToolContext(context.Background(), &ToolContext{Client: fc, Brokered: true, Namespace: defaultNamespace, TaskID: evalPlaceholder, TaskUID: "eval-uid"})
 	}
 	return evalToolContext(fc)
+}
+
+// evalRegistryExecute runs a tool through Registry.Execute, the path chat,
+// worker, and broker calls take, converting a panic into a reported failure.
+func evalRegistryExecute(ctx context.Context, registry *Registry, name, args string) (result string, panicked any, err error) {
+	defer func() { panicked = recover() }()
+	result, err = registry.Execute(ctx, name, json.RawMessage(args))
+	return result, nil, err
 }
 
 // evalToolContext is the chat tool context, with the execution mode a real
@@ -294,25 +306,11 @@ func TestToolEvalRegistriesCoverKnownTools(t *testing.T) {
 // a Go error, which the chat executor reports to the model as an unknown tool.
 func TestToolEvalMalformedArguments(t *testing.T) {
 	evalToolSandbox(t)
-	const (
-		ignoredName        = "the create_*_task schemas require name, but the tools ignore it and always generate one"
-		droppedWorkspace   = "a workspace that is not an object is ignored, so the Task runs without the repository"
-		modelStringAsName  = "a JSON-encoded model object is stored as the model name"
-		droppedCoordinator = "a coordination value that is not an object is ignored, so the Agent is created without coordination"
-		droppedRuntime     = "a runtime value that is not an object is ignored, so a runtime Agent is created as a plain AI Agent"
-	)
-	knownDefects := map[string]string{
-		"chat/create_agent: coordination as JSON string":         droppedCoordinator,
-		"chat/create_agent: model as JSON string":                modelStringAsName,
-		"chat/create_agent: runtime as JSON string":              droppedRuntime,
-		"chat/update_agent: model as JSON string":                modelStringAsName,
-		"chat/create_container_task: empty object":               ignoredName,
-		"chat/create_container_task: null":                       ignoredName,
-		"chat/create_container_task: workspace as JSON string":   droppedWorkspace,
-		"worker/create_container_task: empty object":             ignoredName,
-		"worker/create_container_task: null":                     ignoredName,
-		"worker/create_container_task: workspace as JSON string": droppedWorkspace,
-	}
+	// Worker tools resolve their parent Task from the environment; the seeded
+	// cluster holds it.
+	t.Setenv(envOrkaTaskName, evalPlaceholder)
+	t.Setenv(envOrkaTaskNamespace, defaultNamespace)
+	knownDefects := map[string]string{}
 	violations := map[string]string{}
 	// Panics, Go errors from chat tools, and failures without a message are
 	// never accepted as known defects.
@@ -352,8 +350,7 @@ func TestToolEvalMalformedArguments(t *testing.T) {
 			for _, input := range inputNames {
 				for _, cluster := range []string{"empty", "seeded"} {
 					fc := evalToolClusters[cluster]()
-					fresh, _ := evalToolRegistries(fc)[label].Get(name)
-					result, panicked, err := evalToolExecute(evalToolContextFor(label, fc), fresh, inputs[input])
+					result, panicked, err := evalRegistryExecute(evalToolContextFor(label, fc), evalToolRegistries(fc)[label], name, inputs[input])
 					key := fmt.Sprintf("%s/%s: %s", label, name, input)
 					failed, message := evalToolFailure(result, err)
 					switch {
@@ -407,8 +404,7 @@ func evalObjectStringHandling(label, name string, required []any, properties map
 			}
 			raw, _ := json.Marshal(args)
 			fc := evalToolClusters[cluster]()
-			tool, _ := evalToolRegistries(fc)[label].Get(name)
-			result, panicked, err := evalToolExecute(evalToolContextFor(label, fc), tool, string(raw))
+			result, panicked, err := evalRegistryExecute(evalToolContextFor(label, fc), evalToolRegistries(fc)[label], name, string(raw))
 			if panicked != nil {
 				return true, evalPanicked + fmt.Sprintf(": %v", panicked)
 			}
@@ -881,7 +877,9 @@ func TestToolEvalCodeExecMinimumTimeout(t *testing.T) {
 				name:       tool.Name(),
 				parameters: tool.Parameters(),
 				executeFunc: func(ctx context.Context, raw json.RawMessage) (string, error) {
-					var args CodeExecArgs
+					var args struct {
+						Timeout int `json:"timeout"`
+					}
 					if err := json.Unmarshal(raw, &args); err != nil {
 						return "", err
 					}
@@ -1062,7 +1060,7 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 	}
 	workerTool := func(name string, fc client.Client) (Tool, context.Context) {
 		tool, _ := evalToolRegistries(fc)["worker"].Get(name)
-		return tool, evalToolContext(fc)
+		return tool, evalToolContextFor("worker", fc)
 	}
 	githubTask := func() client.Client {
 		task, secret := githubRepoTaskWithSecret(testOrgTestRepoURL)
@@ -1232,7 +1230,6 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 				tool, sandbox := evalRecordingCodeExec(t)
 				return evalCodeExecMinimumTimeout(tool, sandbox)
 			},
-			knownDefect: "code_exec treats a timeout below 1 as unset and uses the 30s default instead of rejecting or clamping it",
 		},
 		{
 			name:   "brokered web_search",
@@ -1269,7 +1266,6 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 					return tool, context.Background()
 				})
 			},
-			knownDefect: "brokered web_fetch advertises url maxLength in characters but only enforces its 64 KiB byte limit",
 		},
 		{
 			name:   "worker create_agent model contextWindow",
@@ -1294,7 +1290,6 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 				}
 				return evalRejectsChange(call, tokens(1), tokens(0), "maxTokens")
 			},
-			knownDefect: "worker create_agent stores maxTokens below 1, and the Agent CRD sets no minimum for it",
 		},
 		{
 			name:   "worker delegate_task workspace",
@@ -1374,10 +1369,9 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 			},
 		},
 		{
-			name:        "worker merge_pull_request merge_method",
-			limits:      []string{"worker/merge_pull_request.merge_method enum=merge|squash|rebase"},
-			check:       evalMergeMethodEnforced(func(c client.Client, url string) Tool { return &MergePullRequestTool{k8sClient: c, apiBaseURL: url} }),
-			knownDefect: "merge_pull_request forwards an unsupported merge_method to GitHub instead of rejecting it",
+			name:   "worker merge_pull_request merge_method",
+			limits: []string{"worker/merge_pull_request.merge_method enum=merge|squash|rebase"},
+			check:  evalMergeMethodEnforced(func(c client.Client, url string) Tool { return &MergePullRequestTool{k8sClient: c, apiBaseURL: url} }),
 		},
 		{
 			name:   "worker auto_merge_pull_request merge_method",
@@ -1385,7 +1379,6 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 			check: evalMergeMethodEnforced(func(c client.Client, url string) Tool {
 				return &AutoMergePullRequestTool{k8sClient: c, apiBaseURL: url}
 			}),
-			knownDefect: "auto_merge_pull_request forwards an unsupported merge_method to GitHub instead of rejecting it",
 		},
 		{
 			name:   "worker post_review_comment event",
@@ -1476,9 +1469,8 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 			},
 		},
 		{
-			name:        "worker request_approval severity",
-			limits:      []string{"worker/request_approval.severity enum=warning|critical"},
-			knownDefect: "request_approval forwards an unsupported severity to the approval emitter instead of rejecting it",
+			name:   "worker request_approval severity",
+			limits: []string{"worker/request_approval.severity enum=warning|critical"},
 			check: func(t *testing.T) (bool, string) {
 				var emitted []approvals.ApprovalTarget
 				tool, _ := workerTool("request_approval", newFakeClient())
@@ -1514,46 +1506,67 @@ func TestToolEvalSchemaLimitsEnforced(t *testing.T) {
 			},
 		},
 		{
-			name:        "chat create_agent allowed agent name",
-			limits:      []string{"chat/create_agent.coordination.allowedAgents[].name required"},
-			check:       evalAllowedAgentNameRequired(chatTool, `"name":"a","systemPrompt":"p"`),
-			knownDefect: "chat create_agent drops an allowed agent without a name and reports success",
+			name: "chat create_agent allowed agent name",
+			limits: []string{
+				"chat/create_agent.coordination.allowedAgents[].name required",
+				"chat/create_agent.coordination.allowedAgents[].name minLength=1",
+				"chat/create_agent.coordination.allowedAgents[].name pattern=\\S",
+			},
+			check: evalAllowedAgentNameRequired(chatTool, `"name":"a","systemPrompt":"p"`),
 		},
 		{
-			name:        "worker create_agent allowed agent name",
-			limits:      []string{"worker/create_agent.coordination.allowedAgents[].name required"},
-			check:       evalAllowedAgentNameRequired(workerTool, `"role":"coder","systemPrompt":"p"`),
-			knownDefect: "worker create_agent stores an allowed agent with an empty name",
+			name: "worker create_agent allowed agent name",
+			limits: []string{
+				"worker/create_agent.coordination.allowedAgents[].name required",
+				"worker/create_agent.coordination.allowedAgents[].name minLength=1",
+				"worker/create_agent.coordination.allowedAgents[].name pattern=\\S",
+			},
+			check: evalAllowedAgentNameRequired(workerTool, `"role":"coder","systemPrompt":"p"`),
 		},
 		{
-			name:        "worker post_review_comment comment path",
-			limits:      []string{"worker/post_review_comment.comments[].path required"},
-			check:       evalReviewCommentFieldRequired("path"),
-			knownDefect: "post_review_comment forwards a line comment without path to GitHub instead of rejecting it",
+			name:   "worker post_review_comment comment path",
+			limits: []string{"worker/post_review_comment.comments[].path required"},
+			check:  evalReviewCommentFieldRequired("path"),
 		},
 		{
-			name:        "worker post_review_comment comment line",
-			limits:      []string{"worker/post_review_comment.comments[].line required"},
-			check:       evalReviewCommentFieldRequired("line"),
-			knownDefect: "post_review_comment forwards a line comment without line to GitHub instead of rejecting it",
+			name:   "worker post_review_comment comment line",
+			limits: []string{"worker/post_review_comment.comments[].line required"},
+			check:  evalReviewCommentFieldRequired("line"),
 		},
 		{
-			name:        "worker post_review_comment comment body",
-			limits:      []string{"worker/post_review_comment.comments[].body required"},
-			check:       evalReviewCommentFieldRequired("body"),
-			knownDefect: "post_review_comment forwards a line comment without body to GitHub instead of rejecting it",
+			name: "worker post_review_comment comment text",
+			limits: []string{
+				"worker/post_review_comment.comments[].path minLength=1", "worker/post_review_comment.comments[].path pattern=\\S",
+				"worker/post_review_comment.comments[].body minLength=1", "worker/post_review_comment.comments[].body pattern=\\S",
+			},
+			check: func(t *testing.T) (bool, string) {
+				return evalAll(
+					func() (bool, string) { return evalReviewCommentText(t, "path", "") },
+					func() (bool, string) { return evalReviewCommentText(t, "path", " ") },
+					func() (bool, string) { return evalReviewCommentText(t, "body", "") },
+					func() (bool, string) { return evalReviewCommentText(t, "body", " ") },
+				)
+			},
 		},
 		{
-			name:        "worker update_plan progress maximum",
-			limits:      []string{"worker/update_plan.progress_pct maximum=100"},
-			check:       evalProgressEnforced(100, 101),
-			knownDefect: "update_plan sends a progress_pct above 100 to the controller instead of rejecting or clamping it",
+			name:   "worker post_review_comment comment line minimum",
+			limits: []string{"worker/post_review_comment.comments[].line minimum=1"},
+			check:  evalReviewCommentLine(0),
 		},
 		{
-			name:        "worker update_plan progress minimum",
-			limits:      []string{"worker/update_plan.progress_pct minimum=0"},
-			check:       evalProgressEnforced(0, -1),
-			knownDefect: "update_plan sends a negative progress_pct to the controller instead of rejecting or clamping it",
+			name:   "worker post_review_comment comment body",
+			limits: []string{"worker/post_review_comment.comments[].body required"},
+			check:  evalReviewCommentFieldRequired("body"),
+		},
+		{
+			name:   "worker update_plan progress maximum",
+			limits: []string{"worker/update_plan.progress_pct maximum=100"},
+			check:  evalProgressEnforced(100, 101),
+		},
+		{
+			name:   "worker update_plan progress minimum",
+			limits: []string{"worker/update_plan.progress_pct minimum=0"},
+			check:  evalProgressEnforced(0, -1),
 		},
 	}
 
@@ -1663,9 +1676,9 @@ func evalDelegateCluster() client.Client {
 }
 
 // evalAllowedAgentNameRequired checks that create_agent, given its required
-// fields, rejects an allowed agent without a name instead of dropping it or
-// storing it unnamed. The worker tool resolves its parent Task from the
-// environment.
+// fields, rejects missing, empty, or whitespace-only allowed agent names
+// instead of dropping or storing them. The worker tool resolves its parent
+// Task from the environment.
 func evalAllowedAgentNameRequired(get func(string, client.Client) (Tool, context.Context), required string) func(*testing.T) (bool, string) {
 	return func(t *testing.T) (bool, string) {
 		t.Setenv(envOrkaTaskName, "parent")
@@ -1673,7 +1686,17 @@ func evalAllowedAgentNameRequired(get func(string, client.Client) (Tool, context
 		allowed := func(agent string) string {
 			return `{` + required + `,"coordination":{"enabled":true,"allowedAgents":[` + agent + `]}}`
 		}
-		return evalRejectsChange(call, allowed(`{"name":"coder","namespace":"default"}`), allowed(`{"namespace":"default"}`), "allowedAgents")
+		valid := allowed(`{"name":"coder","namespace":"default"}`)
+		for _, agent := range []string{
+			`{"namespace":"default"}`,
+			`{"name":"","namespace":"default"}`,
+			`{"name":" \t\r\n ","namespace":"default"}`,
+		} {
+			if ok, detail := evalRejectsChange(call, valid, allowed(agent), "allowedAgents"); !ok {
+				return false, detail
+			}
+		}
+		return true, ""
 	}
 }
 
@@ -1696,6 +1719,44 @@ func evalReviewCommentFieldRequired(field string) func(*testing.T) (bool, string
 		ok, detail := evalRejectsChange(call, review(""), review(field), "comments")
 		if !ok && stub.sent(`"comments":[`) {
 			detail = "sent a line comment without " + field + " to GitHub"
+		}
+		return ok, detail
+	}
+}
+
+// evalReviewCommentText checks that post_review_comment rejects a line comment
+// whose path or body is the given text.
+func evalReviewCommentText(t *testing.T, field, text string) (bool, string) {
+	task, secret := githubRepoTaskWithSecret(testOrgTestRepoURL)
+	stub := newEvalHTTPStub(t)
+	t.Setenv(envOrkaTaskName, testCoderTaskName)
+	tool := &PostReviewCommentTool{k8sClient: newFakeClient(task, secret), apiBaseURL: stub.URL}
+	review := func(value string) string {
+		comment := map[string]any{"path": "main.go", "line": 1, "body": "nit"}
+		comment[field] = value
+		raw, _ := json.Marshal(map[string]any{"task_name": testCoderTaskName, "pr_number": 1, "body": "x", "event": "COMMENT", "comments": []any{comment}})
+		return string(raw)
+	}
+	call := func() (Tool, context.Context) { return tool, context.Background() }
+	return evalRejectsChange(call, review(map[string]string{"path": "main.go", "body": "nit"}[field]), review(text), field)
+}
+
+// evalReviewCommentLine checks that post_review_comment rejects a line comment
+// with an out-of-range line, reporting whether it reached the GitHub stub.
+func evalReviewCommentLine(line int) func(*testing.T) (bool, string) {
+	return func(t *testing.T) (bool, string) {
+		task, secret := githubRepoTaskWithSecret(testOrgTestRepoURL)
+		stub := newEvalHTTPStub(t)
+		t.Setenv(envOrkaTaskName, testCoderTaskName)
+		tool := &PostReviewCommentTool{k8sClient: newFakeClient(task, secret), apiBaseURL: stub.URL}
+		review := func(line int) string {
+			raw, _ := json.Marshal(map[string]any{"task_name": testCoderTaskName, "pr_number": 1, "body": "x", "event": "COMMENT", "comments": []any{map[string]any{"path": "main.go", "line": line, "body": "nit"}}})
+			return string(raw)
+		}
+		call := func() (Tool, context.Context) { return tool, context.Background() }
+		ok, detail := evalRejectsChange(call, review(1), review(line), "line")
+		if !ok && stub.sent(`"comments":[`) {
+			detail = fmt.Sprintf("sent a line comment with line %d to GitHub", line)
 		}
 		return ok, detail
 	}
@@ -1871,12 +1932,8 @@ func evalWebClient() *http.Client {
 func TestToolEvalRequiredFields(t *testing.T) {
 	evalToolSandbox(t)
 	knownDefects := map[string]string{
-		"chat/create_agent_task: missing name":       "the tool ignores name and generates one",
-		"chat/create_ai_task: missing name":          "the tool ignores name and generates one",
-		"chat/create_container_task: missing name":   "the tool ignores name and generates one",
-		"worker/create_container_task: missing name": "the tool ignores name and generates one",
-		"worker/file_write: missing content":         "the tool treats omitted content as an empty file",
-		"worker/request_approval: missing action":    "the tool emits an approval without the required action",
+		"worker/file_write: missing content":      "the tool treats omitted content as an empty file",
+		"worker/request_approval: missing action": "the tool emits an approval without the required action",
 	}
 	violations := map[string]string{}
 	declared, executed := map[string]bool{}, map[string]bool{}
@@ -2043,35 +2100,26 @@ func evalSetArgumentPath(value any, schema map[string]any, path, prefix []string
 func TestToolEvalNullRequiredFields(t *testing.T) {
 	evalToolSandbox(t)
 	knownDefects := map[string]string{
-		"chat/cancel_task: null name":                                 "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/check_task_progress: null name":                         "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_agent: null coordination.allowedAgents[].name":   "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_agent: null name":                                "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_agent_task: null agentRef":                       "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_agent_task: null name":                           "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_agent_task: null prompt":                         "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_ai_task: null name":                              "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_ai_task: null prompt":                            "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_container_task: null name":                       "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_pr_monitor: null agentRef":                       "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_pr_monitor: null name":                           "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_pr_monitor: null schedule":                       "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_tool: null description":                          "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_tool: null name":                                 "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/create_tool: null url":                                  "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/delete_agent: null name":                                "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/delete_session: null sessionId":                         "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/delete_tool: null name":                                 "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/fetch_task_output: null name":                           "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/update_agent: null name":                                "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"chat/wait_for_task: null name":                               "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"worker/create_agent: null coordination.allowedAgents[].name": "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"worker/create_container_task: null name":                     "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"worker/file_write: null content":                             "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"worker/post_review_comment: null comments[].body":            "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"worker/post_review_comment: null comments[].line":            "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"worker/post_review_comment: null comments[].path":            "the tool accepts or coerces explicit null instead of rejecting the required field",
-		"worker/request_approval: null action":                        "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/cancel_task: null name":           "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/check_task_progress: null name":   "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/create_agent: null name":          "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/create_agent_task: null agentRef": "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/create_agent_task: null prompt":   "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/create_ai_task: null prompt":      "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/create_pr_monitor: null agentRef": "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/create_pr_monitor: null name":     "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/create_pr_monitor: null schedule": "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/create_tool: null description":    "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/create_tool: null name":           "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/create_tool: null url":            "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/delete_agent: null name":          "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/delete_session: null sessionId":   "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/delete_tool: null name":           "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/fetch_task_output: null name":     "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/update_agent: null name":          "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"chat/wait_for_task: null name":         "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"worker/file_write: null content":       "the tool accepts or coerces explicit null instead of rejecting the required field",
+		"worker/request_approval: null action":  "the tool accepts or coerces explicit null instead of rejecting the required field",
 	}
 	violations := map[string]string{}
 	declared, executed := map[string]bool{}, map[string]bool{}
@@ -2153,22 +2201,17 @@ func TestToolEvalTopLevelArgumentTypes(t *testing.T) {
 		"chat/cancel_task: namespace as wrong type":               coercedLookupType,
 		"chat/check_task_progress: name as wrong type":            coercedLookupType,
 		"chat/check_task_progress: namespace as wrong type":       coercedLookupType,
-		"chat/create_agent: coordination as wrong type":           ignoredTopLevelType,
 		"chat/create_agent: initialPrompt as wrong type":          ignoredTopLevelType,
-		"chat/create_agent: model as wrong type":                  ignoredTopLevelType,
 		"chat/create_agent: name as wrong type":                   ignoredTopLevelType,
 		"chat/create_agent: namespace as wrong type":              ignoredTopLevelType,
 		"chat/create_agent: providerRef as wrong type":            coercedLookupType,
-		"chat/create_agent: runtime as wrong type":                ignoredTopLevelType,
 		"chat/create_agent: systemPrompt as wrong type":           ignoredTopLevelType,
 		"chat/create_agent: tools as wrong type":                  ignoredTopLevelType,
 		"chat/create_agent_task: agentRef as wrong type":          ignoredTopLevelType,
-		"chat/create_agent_task: name as wrong type":              ignoredTopLevelType,
 		"chat/create_agent_task: namespace as wrong type":         ignoredTopLevelType,
 		"chat/create_agent_task: prompt as wrong type":            ignoredTopLevelType,
 		"chat/create_agent_task: schedule as wrong type":          ignoredTopLevelType,
 		"chat/create_ai_task: agentRef as wrong type":             ignoredTopLevelType,
-		"chat/create_ai_task: name as wrong type":                 ignoredTopLevelType,
 		"chat/create_ai_task: namespace as wrong type":            ignoredTopLevelType,
 		"chat/create_ai_task: priority as wrong type":             ignoredTopLevelType,
 		"chat/create_ai_task: prompt as wrong type":               ignoredTopLevelType,
@@ -2178,12 +2221,10 @@ func TestToolEvalTopLevelArgumentTypes(t *testing.T) {
 		"chat/create_container_task: args as wrong type":          ignoredTopLevelType,
 		"chat/create_container_task: command as wrong type":       ignoredTopLevelType,
 		"chat/create_container_task: image as wrong type":         ignoredTopLevelType,
-		"chat/create_container_task: name as wrong type":          ignoredTopLevelType,
 		"chat/create_container_task: namespace as wrong type":     ignoredTopLevelType,
 		"chat/create_container_task: prior_task as wrong type":    ignoredTopLevelType,
 		"chat/create_container_task: priority as wrong type":      ignoredTopLevelType,
 		"chat/create_container_task: schedule as wrong type":      ignoredTopLevelType,
-		"chat/create_container_task: workspace as wrong type":     ignoredTopLevelType,
 		"chat/create_pr_monitor: agentRef as wrong type":          coercedLookupType,
 		"chat/create_pr_monitor: name as wrong type":              ignoredTopLevelType,
 		"chat/create_pr_monitor: per_page as wrong type":          ignoredTopLevelType,
@@ -2219,12 +2260,10 @@ func TestToolEvalTopLevelArgumentTypes(t *testing.T) {
 		"worker/create_container_task: args as wrong type":        ignoredTopLevelType,
 		"worker/create_container_task: command as wrong type":     ignoredTopLevelType,
 		"worker/create_container_task: image as wrong type":       ignoredTopLevelType,
-		"worker/create_container_task: name as wrong type":        ignoredTopLevelType,
 		"worker/create_container_task: namespace as wrong type":   coercedLookupType,
 		"worker/create_container_task: prior_task as wrong type":  ignoredTopLevelType,
 		"worker/create_container_task: priority as wrong type":    ignoredTopLevelType,
 		"worker/create_container_task: schedule as wrong type":    ignoredTopLevelType,
-		"worker/create_container_task: workspace as wrong type":   ignoredTopLevelType,
 	}
 	violations := map[string]string{}
 	declared, executed := map[string]bool{}, map[string]bool{}
@@ -2271,13 +2310,6 @@ func TestToolEvalNestedArgumentTypes(t *testing.T) {
 	wrong := map[string]any{"string": map[string]any{"k": "v"}, "integer": "many", "number": "many", "boolean": "yes", "array": "a,b", "object": []any{}}
 	const ignoredNestedType = "the tool drops or coerces a nested value whose type contradicts its schema"
 	knownDefects := map[string]string{
-		"chat/create_agent: coordination.allowedAgents as wrong type":                    ignoredNestedType,
-		"chat/create_agent: coordination.allowedAgents[] as wrong type":                  ignoredNestedType,
-		"chat/create_agent: coordination.allowedAgents[].name as wrong type":             ignoredNestedType,
-		"chat/create_agent: coordination.allowedAgents[].namespace as wrong type":        ignoredNestedType,
-		"chat/create_agent: coordination.enabled as wrong type":                          ignoredNestedType,
-		"chat/create_agent: coordination.maxConcurrentChildren as wrong type":            ignoredNestedType,
-		"chat/create_agent: coordination.maxDepth as wrong type":                         ignoredNestedType,
 		"chat/create_agent: model.name as wrong type":                                    ignoredNestedType,
 		"chat/create_agent: model.provider as wrong type":                                ignoredNestedType,
 		"chat/create_agent: model.temperature as wrong type":                             ignoredNestedType,

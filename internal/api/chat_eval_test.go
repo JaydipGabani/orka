@@ -168,6 +168,35 @@ func expectChatEvalCheck(t *testing.T, ok bool, detail, knownDefect string) {
 // TestChatEvalRequestContextReachesModel checks that request fields the prompt
 // tells the model to act on change what the model sees. Identical model input
 // for different requests means the model cannot follow that instruction.
+func TestChatEvalFeatureGateDoesNotRestrictUnscopedPrompt(t *testing.T) {
+	for _, connectorsEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("connectors=%v", connectorsEnabled), func(t *testing.T) {
+			provider := &evalRecordingProvider{chatMockProvider: chatMockProvider{
+				name: chatEvalProviderType, responses: []*llm.CompletionResponse{{Content: "done"}},
+			}}
+			llm.RegisterProvider(chatEvalProviderType, func(llm.ProviderConfig) (llm.Provider, error) { return provider, nil })
+			cfg := DefaultChatConfig()
+			cfg.ConnectorsEnabled = connectorsEnabled
+			ch := newTestChatHandler(t, chatEvalCluster(t, defaultNamespace), newTestSessionStore(t), newTestResultStore(t), cfg)
+			app := fiber.New()
+			app.Post("/api/v1/chat", ch.HandleChat)
+			body, err := json.Marshal(ChatRequest{Message: "hello", Provider: "openai"})
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json")
+			resp, err := app.Test(req)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, resp.Body.Close()) }()
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Len(t, provider.requests, 1)
+			require.Contains(t, provider.requests[0].SystemPrompt, "<capabilities>")
+			require.NotContains(t, provider.requests[0].SystemPrompt, "<available_chat_tools>")
+			require.Equal(t, connectorsEnabled, slices.Contains(completionToolNames(provider.requests[0].Tools), chattools.ListConnectionsToolName))
+		})
+	}
+}
+
 func TestChatEvalRequestContextReachesModel(t *testing.T) {
 	const message = "review the design doc at https://example.com/design.md and list the top 3 risks"
 	tests := []struct {
@@ -217,22 +246,30 @@ func TestChatEvalRequestContextReachesModel(t *testing.T) {
 // selected agent must stay visible even when its tool is not offered.
 func TestChatEvalScopedCallerPromptMatchesTools(t *testing.T) {
 	tests := []struct {
-		name         string
-		allowedTools []string
-		agentRef     string
-		knownDefect  string
+		name               string
+		allowedTools       []string
+		agentRef           string
+		connectorsDisabled bool
+		knownDefect        string
 	}{
 		{name: "all chat tools allowed", allowedTools: chattools.ChatToolNames()},
 		{
+			name:               "connectors disabled despite connector read scope",
+			allowedTools:       []string{"list_tasks", chattools.ListConnectionsToolName},
+			connectorsDisabled: true,
+		},
+		{
 			name:         "read-only tools allowed",
 			allowedTools: []string{"list_tasks", "list_agents", "check_task_progress", "fetch_task_output"},
-			knownDefect:  "the system prompt is static, so a token's allowedTools removes tools the prompt still tells the model to call",
+		},
+		{
+			name:         "polling tools without a task creation tool",
+			allowedTools: []string{"wait_for_task", "fetch_task_output"},
 		},
 		{
 			name:         "selected runtime agent without its task tool",
 			allowedTools: []string{"list_tasks", "list_agents", "check_task_progress", "fetch_task_output"},
 			agentRef:     "coder",
-			knownDefect:  "the prompt and the selected-agent hint name task tools that a token's allowedTools removed",
 		},
 	}
 	for _, tt := range tests {
@@ -249,7 +286,7 @@ func TestChatEvalScopedCallerPromptMatchesTools(t *testing.T) {
 			llm.RegisterProvider(chatEvalProviderType, func(llm.ProviderConfig) (llm.Provider, error) { return provider, nil })
 			c := chatEvalCluster(t, defaultNamespace)
 			cfg := DefaultChatConfig()
-			cfg.ConnectorsEnabled = true
+			cfg.ConnectorsEnabled = !tt.connectorsDisabled
 			cfg.RuntimeAvailability = ACPRuntimeAvailability{Codex: true, Copilot: true}
 			ch := newTestChatHandler(t, c, newTestSessionStore(t), newTestResultStore(t), cfg)
 			ch.contextTokenAuthorization = authz
@@ -276,13 +313,21 @@ func TestChatEvalScopedCallerPromptMatchesTools(t *testing.T) {
 			for _, tool := range req.Tools {
 				offered[tool.Name] = true
 			}
-			require.Equal(t, slices.Sorted(slices.Values(tt.allowedTools)), slices.Sorted(maps.Keys(offered)),
-				"offered chat tools must match the token's allowedTools")
+			expectedTools := slices.Clone(tt.allowedTools)
+			if tt.connectorsDisabled {
+				expectedTools = slices.DeleteFunc(expectedTools, func(name string) bool { return name == chattools.ListConnectionsToolName })
+			}
+			require.Equal(t, slices.Sorted(slices.Values(expectedTools)), slices.Sorted(maps.Keys(offered)),
+				"offered chat tools must match authorized and enabled tools")
 			var unavailable []string
 			for _, name := range chattools.ChatToolNames() {
 				if !offered[name] && regexp.MustCompile(`\b`+name+`\b`).MatchString(chatEvalModelInput(req)) {
 					unavailable = append(unavailable, name)
 				}
+			}
+			taskCreator := func(name string) bool { return strings.HasPrefix(name, "create_") && strings.HasSuffix(name, "_task") }
+			if !slices.ContainsFunc(tt.allowedTools, taskCreator) && strings.Contains(chatEvalModelInput(req), "create_*_task") {
+				unavailable = append(unavailable, "create_*_task")
 			}
 			expectChatEvalCheck(t, len(unavailable) == 0, "model input names tools the caller cannot use: "+strings.Join(unavailable, ","), tt.knownDefect)
 			if tt.agentRef != "" {

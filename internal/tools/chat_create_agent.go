@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -53,7 +54,7 @@ func (t *ChatCreateAgentTool) Parameters() json.RawMessage {
 			enabledString:           map[string]any{jsonSchemaTypeField: jsonSchemaTypeBoolean, jsonSchemaDescriptionField: "Enable coordination (delegate_task/wait_for_tasks tools)"},
 			"maxConcurrentChildren": map[string]any{jsonSchemaTypeField: jsonSchemaTypeInteger, jsonSchemaDescriptionField: "Max concurrent child tasks (default 5)"},
 			"maxDepth":              map[string]any{jsonSchemaTypeField: jsonSchemaTypeInteger, jsonSchemaDescriptionField: "Max delegation depth (default 3)"},
-			"allowedAgents":         map[string]any{jsonSchemaTypeField: jsonSchemaTypeArray, jsonSchemaDescriptionField: "List of agent names this agent can delegate to. If empty, can delegate to any agent.", itemsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaPropertiesField: map[string]any{nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: agentNameDescription}, namespaceField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Agent namespace (defaults to same namespace)"}}, jsonSchemaRequiredField: []string{nameField}}},
+			"allowedAgents":         map[string]any{jsonSchemaTypeField: jsonSchemaTypeArray, jsonSchemaDescriptionField: "List of agent names this agent can delegate to. If empty, can delegate to any agent.", itemsField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeObject, jsonSchemaPropertiesField: map[string]any{nameField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: agentNameDescription, jsonSchemaMinLengthField: 1, jsonSchemaPatternField: `\S`}, namespaceField: map[string]any{jsonSchemaTypeField: jsonSchemaTypeString, jsonSchemaDescriptionField: "Agent namespace (defaults to same namespace)"}}, jsonSchemaRequiredField: []string{nameField}}},
 		},
 		},
 	}, jsonSchemaRequiredField: []string{nameField},
@@ -75,6 +76,11 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 	name := chatGetStringArg(a, nameField)
 	if name == "" {
 		return ChatToolErrorResult("invalid_arguments", "name is required", "Provide a name for the agent")
+	}
+	for _, key := range []string{"coordination", runtimeField} {
+		if r, ok := requireChatObjectArg(a, key); !ok {
+			return r, nil
+		}
 	}
 
 	namespace := chatGetStringArgDefault(a, namespaceField, tc.Namespace)
@@ -136,6 +142,9 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 			} else {
 				agent.Spec.Model = &corev1alpha1.ModelConfig{Name: modelName}
 			}
+		case nil:
+		default:
+			return ChatToolErrorResult("invalid_arguments", "model must be an object or a provider/model string", "Pass model as a JSON object, or as a string such as openai/gpt-4.1")
 		}
 	}
 
@@ -176,7 +185,9 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 			"Use the built-in runtime contract selected by this Orka installation.",
 		)
 	}
-	parseCoordinationConfig(a, agent)
+	if errResult, ok := parseCoordinationConfig(a, agent); !ok {
+		return errResult, nil
+	}
 
 	if chatGetStringArg(a, "initialPrompt") != "" && tc.AuthorizeAgentInitialTask != nil {
 		if err := tc.AuthorizeAgentInitialTask(ctx, agent); err != nil {
@@ -447,39 +458,72 @@ func normalizeChatOpenCodeModel(agent *corev1alpha1.Agent) (string, bool) {
 	return "", true
 }
 
-// parseCoordinationConfig extracts coordination configuration from chat args into the agent spec.
-func parseCoordinationConfig(a map[string]any, agent *corev1alpha1.Agent) {
+// parseCoordinationConfig extracts coordination configuration from chat args
+// into the agent spec. It returns an error result and false for a field with
+// the wrong JSON type or an allowed agent without a name. Ignoring either would
+// drop a restriction: an empty allowedAgents lets the Agent delegate to any
+// agent.
+func parseCoordinationConfig(a map[string]any, agent *corev1alpha1.Agent) (string, bool) {
 	coord, ok := a["coordination"]
 	if !ok {
-		return
+		return "", true
 	}
 	coordMap, ok := coord.(map[string]any)
 	if !ok {
-		return
+		return "", true
+	}
+	invalid := func(field, want string) (string, bool) {
+		result, _ := ChatToolErrorResult(invalidArgumentsErrorType, "coordination."+field+" must be "+want, "Resend coordination."+field+" as "+want)
+		return result, false
 	}
 	coordCfg := &corev1alpha1.CoordinationConfig{}
-	if enabled, ok := coordMap[enabledString].(bool); ok {
+	if value := coordMap[enabledString]; value != nil {
+		enabled, ok := value.(bool)
+		if !ok {
+			return invalid(enabledString, "a boolean")
+		}
 		coordCfg.Enabled = enabled
 	}
-	if maxCC, ok := coordMap["maxConcurrentChildren"].(float64); ok {
-		coordCfg.MaxConcurrentChildren = int32(maxCC)
+	for _, limit := range []struct {
+		field  string
+		target *int32
+	}{{"maxConcurrentChildren", &coordCfg.MaxConcurrentChildren}, {"maxDepth", &coordCfg.MaxDepth}} {
+		value := coordMap[limit.field]
+		if value == nil {
+			continue
+		}
+		// Out-of-range values would wrap when narrowed to int32, possibly into
+		// the range the Agent CRD accepts.
+		number, ok := value.(float64)
+		if !ok || number != math.Trunc(number) || number < math.MinInt32 || number > math.MaxInt32 {
+			return invalid(limit.field, "a whole number")
+		}
+		*limit.target = int32(number)
 	}
-	if maxD, ok := coordMap["maxDepth"].(float64); ok {
-		coordCfg.MaxDepth = int32(maxD)
-	}
-	if allowed, ok := coordMap["allowedAgents"].([]any); ok {
-		for _, item := range allowed {
-			aMap, ok := item.(map[string]any)
-			if !ok {
-				continue
+	if value := coordMap["allowedAgents"]; value != nil {
+		allowed, ok := value.([]any)
+		if !ok {
+			return invalid("allowedAgents", "an array of agents")
+		}
+		for i, item := range allowed {
+			aMap, _ := item.(map[string]any)
+			nameValue, hasName := aMap[nameField]
+			name, ok := nameValue.(string)
+			if hasName && !ok {
+				return invalid(fmt.Sprintf("allowedAgents[%d].name", i), "a string")
 			}
-			aa := corev1alpha1.AllowedAgent{
-				Name:      chatGetStringArg(aMap, nameField),
-				Namespace: chatGetStringArg(aMap, namespaceField),
+			if strings.TrimSpace(name) == "" {
+				result, _ := ChatToolErrorResult(invalidArgumentsErrorType, fmt.Sprintf("coordination.allowedAgents[%d].name is required", i), "Give each allowed agent a name, or omit allowedAgents to allow any agent")
+				return result, false
 			}
-			if aa.Name != "" {
-				coordCfg.AllowedAgents = append(coordCfg.AllowedAgents, aa)
+			namespace := ""
+			if value, supplied := aMap[namespaceField]; supplied {
+				namespace, ok = value.(string)
+				if !ok {
+					return invalid(fmt.Sprintf("allowedAgents[%d].namespace", i), "a string")
+				}
 			}
+			coordCfg.AllowedAgents = append(coordCfg.AllowedAgents, corev1alpha1.AllowedAgent{Name: name, Namespace: namespace})
 		}
 	}
 	agent.Spec.Coordination = coordCfg
@@ -487,4 +531,5 @@ func parseCoordinationConfig(a map[string]any, agent *corev1alpha1.Agent) {
 		agent.Spec.Runtime = nil
 		agent.Spec.SecretRef = nil
 	}
+	return "", true
 }
