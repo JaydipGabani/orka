@@ -154,6 +154,45 @@ The supervisor also sets `MODEL_PROVIDER` to the destination provider ID;
 [Codex session migration guide](../../../website/docs/guides/codex-session-migration.md)
 for supported history, import/export commands, and recovery limits.
 
+When the agent advertises `sessionCapabilities.close`, Orka sends
+`session/close` before the bounded process stop on deletion. When an adapter
+child exits while its RuntimeSession is idle and the agent advertises
+`sessionCapabilities.resume`, the supervisor restarts the adapter under the
+same session identity and reconnects it with `session/resume` (no history
+replay) before the next prompt. The restart finishes before that prompt gets
+provider or MCP access, so a model request the agent makes before answering
+`session/resume` is refused instead of counting against the prompt's
+`maxTurns`; Claude Agent ACP 0.89.1 completes its one such request before it
+answers. Notifications received while the resume
+handshake is in flight are discarded. Session-control updates such as
+`available_commands_update` are excluded from harness prompt streams
+regardless of arrival order. This resume is same-Pod only: the agent's state
+lives in the ephemeral session home, so a cold resume after suspension or a
+pool replacement still recreates the RuntimeSession from Orka's canonical
+transcript, and an idle exit the agent cannot resume retires the session the
+same way. Before any ACP prompt write, the supervisor returns non-retryable
+`prompt_not_accepted` for that idle-exit retirement; the controller records
+`Failed`/`RuntimeLost` without automatic replay, and the next continuation
+rebuilds from the canonical transcript. Orka does not use `session/load`
+(removed in the ACP v2 draft in favor of `session/resume` with `replayFrom`),
+`session/list`, or the still-unstable `session/fork`.
+
+Session-lifecycle capabilities advertised by the pinned runtimes, verified by
+driving each adapter over stdio (`initialize`, `session/new`, `session/prompt`,
+process kill, fresh process, `session/resume` or `session/load`, `session/close`)
+when each pin last changed: Codex on 2026-10-06, and Claude, Copilot and
+OpenCode on 2026-10-12:
+
+| Runtime | `loadSession` | `resume` | `close` | `list` | `fork` | Resume across adapter restart |
+| --- | --- | --- | --- | --- | --- | --- |
+| Codex ACP 2.1.1 (Codex CLI 0.160.0) | yes | yes | yes | yes | yes (unstable) | works; only `available_commands_update` follows |
+| Claude Agent ACP 0.89.1 (Claude Code 2.1.293) | yes | yes | yes | yes | yes (unstable) | works; sends one model request before the next prompt |
+| Copilot CLI 1.0.96 | yes | no (`Method not found`) | yes | yes | no | `session/load` only, replays full history |
+| OpenCode 1.19.0 | yes | yes | yes | yes | yes (unstable) | works |
+
+Re-run the probe when any of these pins change; Copilot is the only built-in
+runtime whose idle adapter exit cannot be resumed in place.
+
 The Copilot image instead installs the unmodified official per-architecture
 release executable. Its tar asset is checksum-verified, must contain exactly one
 `copilot` entry, and is never downloaded at runtime. The four built-in final

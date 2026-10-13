@@ -15,6 +15,7 @@ const (
 	MethodSessionNew        = "session/new"
 	MethodSessionLoad       = "session/load"
 	MethodSessionResume     = "session/resume"
+	MethodSessionClose      = "session/close"
 	MethodSessionPrompt     = "session/prompt"
 	MethodSessionCancel     = "session/cancel"
 	MethodSessionUpdate     = "session/update"
@@ -22,7 +23,15 @@ const (
 	MethodCancelRequest     = "$/cancel_request"
 )
 
-const SessionCapabilityResume = "resume"
+const (
+	// SessionCapabilityResume is the ACP sessionCapabilities key for
+	// session/resume: reconnecting to an existing provider session without a
+	// history replay (stable in ACP v1 since 2026-04).
+	SessionCapabilityResume = "resume"
+	// SessionCapabilityClose is the ACP sessionCapabilities key for
+	// session/close: an explicit graceful end of a provider session.
+	SessionCapabilityClose = "close"
+)
 
 type Meta map[string]any
 
@@ -187,6 +196,15 @@ type ResumeSessionResponse struct {
 	Models        json.RawMessage   `json:"models,omitempty"`
 	ConfigOptions []json.RawMessage `json:"configOptions,omitempty"`
 	Meta          Meta              `json:"_meta,omitempty"`
+}
+
+type CloseSessionRequest struct {
+	SessionID string `json:"sessionId"`
+	Meta      Meta   `json:"_meta,omitempty"`
+}
+
+type CloseSessionResponse struct {
+	Meta Meta `json:"_meta,omitempty"`
 }
 
 type LoadSessionRequest struct {

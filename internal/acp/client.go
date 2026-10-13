@@ -311,6 +311,16 @@ func (c *Client) ResumeSession(ctx context.Context, request ResumeSessionRequest
 	return response, nil
 }
 
+// CloseSession asks the agent to end a provider session gracefully. Callers
+// must first check AgentCapabilities.SessionCapability(SessionCapabilityClose).
+func (c *Client) CloseSession(ctx context.Context, sessionID string) error {
+	if sessionID == "" {
+		return fmt.Errorf("ACP session ID is required")
+	}
+	var response CloseSessionResponse
+	return c.Call(ctx, MethodSessionClose, CloseSessionRequest{SessionID: sessionID}, &response)
+}
+
 func (c *Client) LoadSession(ctx context.Context, request LoadSessionRequest) (LoadSessionResponse, error) {
 	if request.SessionID == "" {
 		return LoadSessionResponse{}, fmt.Errorf("ACP session/load requires sessionId")
