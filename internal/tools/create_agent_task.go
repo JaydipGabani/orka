@@ -90,13 +90,6 @@ func (t *CreateAgentTaskTool) Execute(ctx context.Context, args json.RawMessage)
 	if r, ok := checkChatNamespaceScope(tc, namespace); !ok {
 		return r, nil
 	}
-	policyReader := toolPolicyReader(ctx, tc.Client)
-	agent, err := loadAgent(ctx, policyReader, namespace, agentRef)
-	if err != nil {
-		result, _ := ChatToolErrorResult(internalErrorType, err.Error(), "")
-		return result, nil
-	}
-
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      tc.GenerateTaskName(),
@@ -112,6 +105,25 @@ func (t *CreateAgentTaskTool) Execute(ctx context.Context, args json.RawMessage)
 		},
 	}
 
+	// Check only the reference before lookup. Full Task authorization needs the
+	// external runtime's materialized tool policy and runs after construction.
+	if tc.AuthorizeAgentReference != nil {
+		reference := &corev1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: agentRef, Namespace: namespace}}
+		if err := tc.AuthorizeAgentReference(ctx, reference); err != nil {
+			return ChatToolErrorResult(err.Type, err.Message, err.Suggestion)
+		}
+	}
+	policyReader := toolPolicyReader(ctx, tc.Client)
+	agent, err := loadAgent(ctx, policyReader, namespace, agentRef)
+	if err != nil {
+		result, _ := ChatToolErrorResult(internalErrorType, err.Error(), "")
+		return result, nil
+	}
+	if agent != nil && agent.Spec.Runtime == nil {
+		return ChatToolErrorResult(invalidArgumentsErrorType,
+			fmt.Sprintf("agent %q has no runtime; create_agent_task only runs Agents with a runtime", agentRef),
+			fmt.Sprintf("Use create_ai_task with agentRef=%q instead", agentRef))
+	}
 	if d, errResult, ok := parseTimeoutArg(a); !ok {
 		return errResult, nil
 	} else if d > 0 {

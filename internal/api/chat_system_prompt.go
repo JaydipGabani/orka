@@ -9,6 +9,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
@@ -27,6 +28,7 @@ type SystemPromptBuilder struct {
 	client              client.Client
 	namespace           string
 	runtimeAvailability ACPRuntimeAvailability
+	chatProvider        string
 }
 
 // NewSystemPromptBuilder creates a new SystemPromptBuilder.
@@ -36,6 +38,12 @@ func NewSystemPromptBuilder(c client.Client, namespace string, availability ACPR
 		namespace:           namespace,
 		runtimeAvailability: availability,
 	}
+}
+
+// SetChatProvider names the Provider serving this chat session so the prompt
+// can tell the model which provider to reuse.
+func (b *SystemPromptBuilder) SetChatProvider(name string) {
+	b.chatProvider = name
 }
 
 // BuildSystemPrompt assembles the full system prompt with dynamic context.
@@ -151,7 +159,7 @@ func buildTaskTypesSection() string {
 `)
 	sb.WriteString(`  All containers run as non-root with read-only root filesystem.
   Writable paths: /tmp, /home/nonroot. Do NOT assume root access.
-- ai: Run an LLM-powered task. Use create_ai_task with a providerRef.
+- ai: Run an LLM-powered task. Use create_ai_task; omit providerRef unless the user explicitly requests another provider.
   Use for: reasoning, analysis, content generation, code review, summarization,
   answering questions about data. The AI worker has built-in tools (code_exec,
   web_search, file_read, web_fetch, file_write) but runs in a minimal container without CLI tools.
@@ -162,7 +170,7 @@ func buildTaskTypesSection() string {
   IMPORTANT: When the user specifies an agent (via --agent or agentRef) that has a
   runtime configured, ALWAYS use create_agent_task with that agent name.
   If the specified Agent has no runtime listed, including coordinator Agents backed
-  by providerRef/model only, use create_ai_task with agentRef and providerRef instead.
+  by providerRef/model only, use create_ai_task with agentRef instead. Omit providerRef unless the user explicitly requests another provider.
   When the task involves a git repository, ALWAYS include the gitRepo URL in the
   workspace config so credentials are automatically mounted:
     create_agent_task(agent: "coder", prompt: "...", gitRepo: "https://github.com/org/repo", timeout: "15m")
@@ -172,7 +180,7 @@ func buildTaskTypesSection() string {
   and does not use runtime.secretRef. When omitted, OpenCode defaults defaultAllowedTools to Read, Write, Edit, Bash, Glob,
   and Grep, with defaultAllowBash=true; only override these when the user asks.
   Use whichever runtime is available. If multiple runtimes are available, prefer codex, then copilot.
-  If no agent runtimes are available, use create_ai_task with agentRef/providerRef for existing non-runtime agents, or create_ai_task directly for LLM-only work.
+  If no agent runtimes are available, use create_ai_task with agentRef (omitting providerRef unless explicitly overridden) for existing non-runtime agents, or create_ai_task directly for LLM-only work.
   Agent tasks need more time than AI tasks. Set timeout to at least 15m.
   Do NOT use create_container_task or create_ai_task for runtime agents.
   Do NOT use create_agent_task for non-runtime agents.
@@ -235,7 +243,7 @@ MANUAL (multi-step): For more control, create agents separately:
 1. Create specialist agents with create_agent
 2. Create a coordinator agent with coordination.enabled=true
 3. Create a task referencing the coordinator: use create_agent_task only when the
-   coordinator has runtime listed; otherwise use create_ai_task with agentRef and providerRef.
+   coordinator has runtime listed; otherwise use create_ai_task with agentRef; omit providerRef unless the user explicitly requests another provider.
 
 When no agents exist and the user needs complex work done:
 - For simple commands (e.g., "list pods", "check disk"): use create_container_task
@@ -269,11 +277,14 @@ func buildRulesSection() string {
 2. Use create_ai_task ONLY for work that requires a SEPARATE long-running LLM job
    (e.g., code generation, detailed code review, multi-file analysis). Do NOT
    create an AI task just to answer a question — answer it yourself directly.
-3. When creating an ai task, always set providerRef to an available provider name
-   (e.g., "openai"). Use the same provider that this chat session is using.
+3. For an Agent-backed ai task, omit providerRef to use the selected Agent's configured provider
+   unless the user explicitly requests another provider.
+   For tasks without agentRef, use this chat session's provider by omitting providerRef
+   unless the user explicitly requests another provider.
 4. After creating a task, IMMEDIATELY call wait_for_task then fetch_task_output
    in the SAME turn — do not stop to narrate between tool calls.
-5. Never guess namespace — use the namespace from the request or ask the user.
+5. Use the current namespace (namespace in the Runtime line) unless the user names another.
+   Tool calls that omit namespace run there, so do not ask which namespace to use.
 6. Provide clear summaries of what you did, what succeeded, and what failed.
 7. If a task fails, check the error and try a different approach before giving up.
 8. Do not create more tasks than necessary.
@@ -282,12 +293,12 @@ func buildRulesSection() string {
    available_agents section, ALWAYS use create_agent_task — never create_container_task
    or create_ai_task. Runtime agents have their own CLI environment with full tool access.
    When an agent has no "runtime" listed, including coordinator agents, use create_ai_task
-   with agentRef and providerRef — never create_agent_task.
+   with agentRef, omitting providerRef unless explicitly overridden — never create_agent_task.
 11. For multi-step workflows involving coding + review + PR creation:
     - Prefer available coordinator candidates: agents whose names contain "coordinator";
       if "dev-coordinator" exists, prefer it.
     - If the chosen coordinator has "runtime" listed in available_agents, start it with create_agent_task.
-    - If the chosen coordinator has no "runtime" listed, start it with create_ai_task using agentRef and providerRef.
+    - If the chosen coordinator has no "runtime" listed, start it with create_ai_task using agentRef; omit providerRef unless the user explicitly requests another provider.
       A coordinator handles the full workflow: code → validate → review repair loop → PR → CI repair loop → validate + re-review → approve.
     - If no coordinator candidate exists, use the coordinator pattern: create a coordinator agent that delegates to
       specialist agents (coder, reviewer) sequentially.
@@ -301,6 +312,7 @@ func buildRulesSection() string {
         run validation and reviewers again, then re-check CI;
       * bound CI repair to at most 3 repair tasks; if checks are still pending after 30 minutes of pending-check waiting (status=pending with wait_timed_out=true), report CI_PENDING;
       * prefer additional focused repair iterations over stopping early when reviewers identify concrete diff-backed security, correctness, or acceptance-criteria issues;
+      * report REVIEW_BLOCKED or CI_BLOCKED when the review or CI repair bound is exhausted;
       * avoid merge tools unless the user explicitly asks to merge.
     - Do NOT bundle all steps into a single agent task prompt.
 12. Agent tasks run for 5-20 minutes. NEVER stop polling wait_for_task while a task
@@ -325,7 +337,7 @@ Example 3: "process this CSV with Python"
 → wait_for_task → fetch_task_output
 
 Example 4: "review this code for security issues"
-→ create_ai_task (prompt: "Review for security vulnerabilities: ...", providerRef: "openai")
+→ create_ai_task (prompt: "Review for security vulnerabilities: ...")
 → wait_for_task → fetch_task_output → summarize findings
 
 Example 5: "refactor the auth module" (with runtime agent available)
@@ -427,8 +439,12 @@ func (b *SystemPromptBuilder) buildDynamicContext(ctx context.Context) (agentsSe
 		runtimeInfo = strings.Join(availableRuntimes, ", ")
 	}
 
-	providersSection = fmt.Sprintf("Runtime: providers=[%s] | agents=%d | tools=%d | container=yes | agent_runtimes=[%s]\n",
-		strings.Join(providerNames, ", "), len(agentList.Items), len(toolList.Items)+5, runtimeInfo)
+	sessionInfo := fmt.Sprintf("namespace=%s", b.namespace)
+	if b.chatProvider != "" && slices.Contains(providerNames, b.chatProvider) {
+		sessionInfo += fmt.Sprintf(" | chat_provider=%s", b.chatProvider)
+	}
+	providersSection = fmt.Sprintf("Runtime: %s | providers=[%s] | agents=%d | tools=%d | container=yes | agent_runtimes=[%s]\n",
+		sessionInfo, strings.Join(providerNames, ", "), len(agentList.Items), len(toolList.Items)+5, runtimeInfo)
 
 	// Fetch skills
 	var skillList corev1alpha1.SkillList
