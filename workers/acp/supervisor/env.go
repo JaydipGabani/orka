@@ -622,8 +622,8 @@ func copilotSessionProjection(
 	if err != nil {
 		return ProviderSessionProjection{}, err
 	}
-	if request.AgentConfiguration.SystemPrompt != "" {
-		return ProviderSessionProjection{}, fmt.Errorf("copilot ACP runtime cannot exactly enforce Agent systemPrompt")
+	if err := acp.ValidateCopilotInstructions(request.AgentConfiguration.SystemPrompt); err != nil {
+		return ProviderSessionProjection{}, err
 	}
 	if request.AgentConfiguration.ReasoningEffort != "" {
 		return ProviderSessionProjection{}, fmt.Errorf("copilot ACP runtime cannot enforce reasoning effort")
@@ -662,10 +662,14 @@ func copilotSessionProjection(
 	}
 	// The CLI reports the exclusion list back as "Info:" agent message chunks
 	// at prompt start; the filter withholds exactly those chunks.
-	return ProviderSessionProjection{
+	projection := ProviderSessionProjection{
 		AdditionalArgs:        args,
 		AgentDiagnosticFilter: &AgentDiagnosticFilter{Startup: copilotStartupDiagnostic(excluded)},
-	}, nil
+	}
+	if prompt := request.AgentConfiguration.SystemPrompt; prompt != "" {
+		projection.Instructions = nativeInstructionProjection(providerKindCopilot, prompt)
+	}
+	return projection, nil
 }
 
 func openCodeSessionProjection(
@@ -691,9 +695,7 @@ func openCodeSessionProjection(
 		request.Profile.Model != model || request.AgentConfiguration.Model != model {
 		return ProviderSessionProjection{}, fmt.Errorf("provider session configuration does not match runtime profile")
 	}
-	if request.AgentConfiguration.SystemPrompt != "" {
-		return ProviderSessionProjection{}, fmt.Errorf("opencode ACP runtime cannot exactly enforce Agent systemPrompt")
-	}
+
 	if request.AgentConfiguration.ReasoningEffort != "" {
 		return ProviderSessionProjection{}, fmt.Errorf("opencode ACP runtime cannot enforce reasoning effort")
 	}
@@ -710,7 +712,11 @@ func openCodeSessionProjection(
 			)
 		}
 	}
-	return ProviderSessionProjection{}, nil
+	projection := ProviderSessionProjection{}
+	if prompt := request.AgentConfiguration.SystemPrompt; prompt != "" {
+		projection.Instructions = nativeInstructionProjection(providerKindOpencode, prompt)
+	}
+	return projection, nil
 }
 
 func providerProfile(
@@ -940,6 +946,10 @@ func openCodeSessionConfig(
 		permissions[openCodeToolGrep] = openCodePermissionDeny
 		permissions[openCodeToolWrite] = openCodePermissionDeny
 	}
+	instructions := []string{openCodeRootInstructionPath, filepath.Join(paths.Workspace, "AGENTS.md")}
+	if request.AgentConfiguration != nil && request.AgentConfiguration.SystemPrompt != "" {
+		instructions = append(instructions, filepath.Join(paths.Home, ".orka", "agent-instructions.md"))
+	}
 	return json.Marshal(map[string]any{
 		// Native ACP returns before background title inference settles. Titles
 		// must not consume prompt quota or outlive the governed prompt.
@@ -948,7 +958,7 @@ func openCodeSessionConfig(
 		"autoupdate":        false,
 		"enabled_providers": []string{openCodeProviderID},
 		"formatter":         false,
-		"instructions":      []string{openCodeRootInstructionPath, filepath.Join(paths.Workspace, "AGENTS.md")},
+		"instructions":      instructions,
 		"lsp":               false,
 		"mcp":               map[string]any{},
 		"model":             openCodeProviderID + "/" + model,
@@ -1234,4 +1244,18 @@ func readRequiredSecretFile(envName string) (string, error) {
 		return "", fmt.Errorf("%s file is empty", envName)
 	}
 	return value, nil
+}
+
+func nativeInstructionProjection(provider, prompt string) *acp.InstructionProjection {
+	if prompt == "" {
+		return nil
+	}
+	switch provider {
+	case providerKindCopilot:
+		return &acp.InstructionProjection{RelativePath: ".copilot/copilot-instructions.md", Content: prompt}
+	case providerKindOpencode:
+		return &acp.InstructionProjection{RelativePath: ".orka/agent-instructions.md", Content: prompt}
+	default:
+		return nil
+	}
 }

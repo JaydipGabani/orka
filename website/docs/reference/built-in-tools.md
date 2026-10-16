@@ -385,7 +385,7 @@ Coordinators can create the specialists they need at runtime; see the
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `create_agent` | Create an Agent at runtime | `name`, `provider`, `model` (required); `systemPrompt` (required except OpenCode; omit for OpenCode), `tools`, `coordination` |
+| `create_agent` | Create an Agent at runtime | `name`, `provider`, `model` (required); `systemPrompt` (role instructions), `soul` (optional persona source), `tools`, `coordination` |
 | `delete_agent` | Delete an Agent | `name` (required), `namespace` |
 
 ## Tools for specific features

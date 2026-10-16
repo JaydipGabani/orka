@@ -23,8 +23,8 @@ The [Agent reference](../reference/resources.md#agent) lists every field, and
 ## Write the system prompt
 
 Set `systemPrompt.inline`, or keep longer prompts in a ConfigMap with `systemPrompt.configMapRef`.
-OpenCode Agents are the exception: they must omit `systemPrompt`, so put instructions in each
-Task's `prompt`.
+All four built-in runtimes, including OpenCode, accept `systemPrompt`. For an optional persona
+kept separate from role instructions, see [Soul](../concepts/soul.md).
 
 Keep the prompt minimal and requirement-focused. A study of repository context files for
 coding agents ([arxiv 2602.11988](https://arxiv.org/abs/2602.11988)) found that they do not

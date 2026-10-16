@@ -26,6 +26,7 @@ const sidebars = {
             'guides/multi-agent-coordination',
             'guides/autonomous-tasks',
             'concepts/memory',
+            'concepts/soul',
           ],
         },
         {

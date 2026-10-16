@@ -25,9 +25,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/orka-agents/orka/internal/agentcontext"
+
 	"github.com/go-logr/logr"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -1408,6 +1411,32 @@ func (s *Service) projectTerminal(
 	messageMetadata := map[string]string{
 		"gateway": event.GatewayName, "binding": event.BindingName,
 		eventIDField: event.ID, "taskName": task.Name, "deliveryId": deliveryID,
+	}
+	if digest := agentcontext.SessionDigest(task.Status.SoulBinding); digest != "" {
+		messageMetadata[store.SessionSoulDigestMetadata] = digest
+	} else if task.Spec.Type == corev1alpha1.TaskTypeAI && task.Status.Phase == corev1alpha1.TaskPhaseFailed &&
+		task.UID != "" && task.Status.SoulBinding == nil && task.Status.Attempts == 0 && task.Status.StartTime == nil &&
+		task.Status.JobName == "" && task.Status.JobUID == "" && task.Status.Iteration == 0 &&
+		task.Status.Execution == nil && task.Status.ExecutionOutcome == nil && task.Status.ResultRef == nil {
+		// Any failure before binding and execution, including soul, Provider and
+		// compatibility errors, ran no model turn, so it must not pin absence.
+		// The status alone cannot rule out an earlier no-soul Job whose
+		// start-status write was lost, so an owned Job also counts as execution.
+		// Read failures retry projection rather than pin the wrong identity.
+		var jobs batchv1.JobList
+		if err := s.freshReader().List(ctx, &jobs, client.InNamespace(task.Namespace)); err != nil {
+			return false, err
+		}
+		unbound := true
+		for i := range jobs.Items {
+			if metav1.IsControlledBy(&jobs.Items[i], task) {
+				unbound = false
+				break
+			}
+		}
+		if unbound {
+			messageMetadata[store.SessionSoulUnboundMetadata] = "true"
+		}
 	}
 	deliveryTrace := orkatracing.InjectContext(ctx)
 	deliveryExpiresAt := gatewayDeliveryExpiresAt(event.ExpiresAt, now, s.Config)

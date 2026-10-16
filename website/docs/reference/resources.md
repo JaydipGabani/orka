@@ -357,8 +357,9 @@ spec:
 | `runtime.runtimeRef` | Selects an external [AgentRuntime](../guides/bring-your-own-agent-runtime.md) instead of a built-in type. |
 | `runtime.toolboxes` | Built-in types only. Read-only [toolbox](../guides/toolboxes.md) images whose tool folders are added to the agent's `PATH`. |
 
-OpenCode Agents must omit `spec.systemPrompt`, because the runtime cannot enforce
-Agent-level prompts; put instructions in each Task's `spec.prompt` instead. OpenCode
+All four built-in harness v2 runtimes support `spec.systemPrompt` and the optional
+[`spec.soul`](../concepts/soul.md) persona source. Copilot and OpenCode receive
+protected native instruction files outside the repository workspace. OpenCode
 model IDs use literal `provider/model` form, for example `openai/gpt-6-astra`, and
 `spec.model.contextWindow` and `spec.model.maxTokens` are both required positive reviewed
 ceilings, with `contextWindow > maxTokens`. They are part of the immutable runtime

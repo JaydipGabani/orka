@@ -886,6 +886,10 @@ func (r *TaskReconciler) handlePending(ctx context.Context, task *corev1alpha1.T
 	}
 
 	if task.Spec.Type == corev1alpha1.TaskTypeAgent {
+		// Admission allows an omitted built-in contract. Use the same effective
+		// Agent for routing, SOUL validation and binding before its reconciler
+		// has had a chance to persist the namespace-mode default.
+		agent = withEffectiveBuiltInContract(agent, r.Mode)
 		plan := r.planAgentExecution(ctx, task, agent)
 		if err := validatePlannedRuntimeRefAgentTaskRestrictions(task, agent, plan); err != nil {
 			return r.rejectPlannedAgentExecution(ctx, task, rejectAgentExecutionPlan(err.Error()))
@@ -1537,6 +1541,16 @@ func (r *TaskReconciler) createTaskJob(ctx context.Context, task *corev1alpha1.T
 		if err := r.retireRejectedTaskJob(ctx, latest); err != nil {
 			return ctrl.Result{}, err
 		}
+		if latest.Spec.Type == corev1alpha1.TaskTypeAI {
+			job := &batchv1.Job{}
+			err := reader.Get(ctx, client.ObjectKey{Namespace: latest.Namespace, Name: latest.Status.JobName}, job)
+			if err == nil {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+			if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+		}
 		return r.failTask(ctx, task, meta.FindStatusCondition(latest.Status.Conditions, ConditionTypeJobCreated).Message)
 	}
 	// Recheck the persisted deadline after the uncached read so an older
@@ -1564,9 +1578,10 @@ func (r *TaskReconciler) createTaskJob(ctx context.Context, task *corev1alpha1.T
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	jobTask := task
-	if validationTask {
-		// Render from the same fresh object whose immutable binding was just
-		// verified. This closes the gap between the reconcile read and Job build.
+	if validationTask || latest.Spec.Type == corev1alpha1.TaskTypeAI {
+		// Validation tasks use the verified immutable binding. AI tasks use
+		// fresh status as well as spec so soul preparation cannot miss an
+		// existing binding or execution attempt from a stale cache snapshot.
 		jobTask = latest
 	}
 
@@ -1614,18 +1629,55 @@ func (r *TaskReconciler) createTaskJob(ctx context.Context, task *corev1alpha1.T
 			if latest.UID != task.UID || latest.Generation != task.Generation || task.Spec.AgentRef == nil || agent == nil {
 				return ctrl.Result{RequeueAfter: time.Second}, nil
 			}
-			agentKey := client.ObjectKey{Namespace: task.Spec.AgentRef.Namespace, Name: task.Spec.AgentRef.Name}
-			if agentKey.Namespace == "" {
-				agentKey.Namespace = task.Namespace
-			}
-			latestAgent := &corev1alpha1.Agent{}
-			if err := reader.Get(ctx, agentKey, latestAgent); err != nil {
-				return ctrl.Result{}, fmt.Errorf("recheck gateway Job Agent: %w", err)
-			}
-			if latestAgent.UID != agent.UID || latestAgent.Generation != agent.Generation || !latestAgent.DeletionTimestamp.IsZero() {
-				return ctrl.Result{RequeueAfter: time.Second}, nil
+			if changed, err := taskAgentRevisionChanged(ctx, reader, task, agent); err != nil || changed {
+				return ctrl.Result{RequeueAfter: time.Second}, err
 			}
 		}
+	}
+
+	if (task.Spec.Type == corev1alpha1.TaskTypeAI || latest.Spec.Type == corev1alpha1.TaskTypeAI) &&
+		!existingGatewayJob && (task.UID != latest.UID || task.Generation != latest.Generation) {
+		// Agent/provider inputs belong to the caller's Task revision, even
+		// when its resolved Agent had no soul. Reconcile the complete tuple.
+		return ctrl.Result{}, aiSoulTaskChanged(task)
+	}
+	if !gatewayReplyEligible && jobTask.Spec.Type == corev1alpha1.TaskTypeAI && jobTask.Status.SoulBinding == nil &&
+		task.Spec.AgentRef != nil && agent != nil {
+		// The first binding pins the Agent revision. A cached Agent can lag an
+		// update the API server accepted before this Task, so recheck it and
+		// let compatibility, Provider selection, and binding use one revision.
+		if changed, err := taskAgentRevisionChanged(ctx, reader, task, agent); err != nil || changed {
+			return ctrl.Result{RequeueAfter: time.Second}, err
+		}
+	}
+
+	var aiSoul *resolvedAISoul
+	if existingGatewayJob && jobTask.Spec.Type == corev1alpha1.TaskTypeAI && jobTask.Status.SoulBinding == nil &&
+		agent != nil && agent.Spec.Soul != nil {
+		// Bindings are persisted before Job creation, so an unbound existing Job
+		// ran without a soul even when its start-status write was lost. Retire it
+		// without binding: a new digest would misstate what already executed.
+		err = invalidAISoulConfiguration("AI Task cannot acquire a soul after execution has started; create a new Task")
+	} else {
+		aiSoul, err = r.prepareAISoul(ctx, jobTask, agent)
+	}
+	if err != nil {
+		if isPermanentAISoulConfigurationError(err) {
+			message := fmt.Sprintf("AI soul configuration: %v", err)
+			retired, retirementErr := r.retireAISoulTaskJob(ctx, jobTask, message)
+			if retirementErr != nil {
+				return ctrl.Result{}, retirementErr
+			}
+			if retired {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+			return r.failTask(ctx, task, message)
+		}
+		return ctrl.Result{}, err
+	}
+	if jobTask.Spec.Type == corev1alpha1.TaskTypeAI {
+		// Keep the launch attempt count consistent with the fresh Job inputs.
+		task.Status = jobTask.Status
 	}
 
 	// Freeze the requester's Connections before anything is created, so a
@@ -1647,6 +1699,7 @@ func (r *TaskReconciler) createTaskJob(ctx context.Context, task *corev1alpha1.T
 	// Create the Job
 	job, err := r.JobBuilder.BuildWithOptions(ctx, jobTask, agent, provider, JobBuildOptions{
 		ResolvedApprovalsJSON:       resolvedApprovalsJSON,
+		AISoul:                      aiSoul,
 		RepositoryMonitorValidation: validationTask,
 		ConnectionBindings:          connectionBindings,
 		ConnectionBindingsFrozen:    true,
@@ -3449,6 +3502,10 @@ func validatePlannedRuntimeRefAgentTaskRestrictions(
 	agent *corev1alpha1.Agent,
 	plan agentExecutionPlan,
 ) error {
+	// Soul compatibility applies to every new Agent Task path, not only runtimeRef.
+	if err := validateSoulRuntime(agent); err != nil {
+		return err
+	}
 	// planAgentExecution resolves runtimeRef before selecting the external path,
 	// so these v2-only checks cannot change harness v1 compatibility.
 	if plan.path != agentExecutionPathExternal {
@@ -4816,6 +4873,9 @@ func (r *TaskReconciler) handleAutonomousApprovalState(ctx context.Context, task
 	if !r.isAutonomousTask(ctx, task) {
 		return ctrl.Result{}, false, nil
 	}
+	if result, refused, err := r.refuseSoulBoundAutonomy(ctx, task); err != nil || refused {
+		return result, true, err
+	}
 	if result, parked, err := r.parkOnPendingApproval(ctx, task); err != nil || parked {
 		return result, true, err
 	}
@@ -4909,6 +4969,9 @@ func (r *TaskReconciler) handleAutonomousIteration(ctx context.Context, task *co
 		log.Error(err, "failed to collect iteration result")
 	}
 
+	if result, refused, err := r.refuseSoulBoundAutonomy(ctx, task); err != nil || refused {
+		return result, err
+	}
 	if result, parked, err := r.parkOnPendingApproval(ctx, task); err != nil || parked {
 		return result, err
 	}
@@ -5010,4 +5073,18 @@ func (r *TaskReconciler) handleAutonomousIteration(ctx context.Context, task *co
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// taskAgentRevisionChanged reports whether the Task's Agent differs from the
+// resolved revision on the uncached reader.
+func taskAgentRevisionChanged(ctx context.Context, reader client.Reader, task *corev1alpha1.Task, agent *corev1alpha1.Agent) (bool, error) {
+	key := client.ObjectKey{Namespace: task.Spec.AgentRef.Namespace, Name: task.Spec.AgentRef.Name}
+	if key.Namespace == "" {
+		key.Namespace = task.Namespace
+	}
+	latest := &corev1alpha1.Agent{}
+	if err := reader.Get(ctx, key, latest); err != nil {
+		return false, fmt.Errorf("recheck Task Agent revision: %w", err)
+	}
+	return latest.UID != agent.UID || latest.Generation != agent.Generation || !latest.DeletionTimestamp.IsZero(), nil
 }
