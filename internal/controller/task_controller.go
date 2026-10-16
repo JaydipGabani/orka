@@ -790,6 +790,20 @@ func (r *TaskReconciler) handlePending(ctx context.Context, task *corev1alpha1.T
 		return r.handleScheduledTask(ctx, task)
 	}
 
+	// A pause requested between autonomous iterations stops the next iteration
+	// before dispatch; handleAutonomousIteration covers a pause that arrives
+	// while a Job runs. Only autonomous iteration advances Iteration.
+	if task.Status.Iteration > 0 && task.Spec.Suspend != nil && *task.Spec.Suspend {
+		message := fmt.Sprintf("autonomous task suspended at iteration %d", task.Status.Iteration)
+		if task.Status.Message != message {
+			task.Status.Message = message
+			if err := r.Status().Update(ctx, task); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	// A persisted execution binding is the sole routing and recovery authority.
 	// Do not resolve mutable Agent/configuration state, or acquire the legacy
 	// SQLite Session lock, after a Task has been bound to either harness plane.
@@ -4873,9 +4887,6 @@ func (r *TaskReconciler) handleAutonomousApprovalState(ctx context.Context, task
 	if !r.isAutonomousTask(ctx, task) {
 		return ctrl.Result{}, false, nil
 	}
-	if result, refused, err := r.refuseSoulBoundAutonomy(ctx, task); err != nil || refused {
-		return result, true, err
-	}
 	if result, parked, err := r.parkOnPendingApproval(ctx, task); err != nil || parked {
 		return result, true, err
 	}
@@ -4969,9 +4980,6 @@ func (r *TaskReconciler) handleAutonomousIteration(ctx context.Context, task *co
 		log.Error(err, "failed to collect iteration result")
 	}
 
-	if result, refused, err := r.refuseSoulBoundAutonomy(ctx, task); err != nil || refused {
-		return result, err
-	}
 	if result, parked, err := r.parkOnPendingApproval(ctx, task); err != nil || parked {
 		return result, err
 	}
