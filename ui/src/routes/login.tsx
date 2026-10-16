@@ -1,7 +1,7 @@
 import { createFileRoute, useLocation, useNavigate } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { useAuthStore } from '@/stores/auth'
-import { takeLoginReturn } from '@/lib/login-return'
+import { hasPendingHashToken, takeHashToken, takeLoginReturn } from '@/lib/login-return'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -14,45 +14,43 @@ export const Route = createFileRoute('/login')({
 function LoginPage() {
   const [tokenInput, setTokenInput] = useState('')
   const [error, setError] = useState('')
-  const [isValidating, setIsValidating] = useState(false)
+  const [isValidating, setIsValidating] = useState(hasPendingHashToken)
   const { setToken, token } = useAuthStore()
   const navigate = useNavigate()
   const location = useLocation()
 
-  // Handle #token=... hash fragment from CLI login
+  // Sign in with the #token=... fragment from `orka login` or a deep link.
+  // captureHashToken took it out of the address bar at app start.
   useEffect(() => {
-    const hash = window.location.hash
-    if (hash.startsWith('#token=')) {
-      const t = hash.slice(7)
-      if (t) {
-        window.location.hash = ''
-        setIsValidating(true)
-        fetch('/api/v1/auth/validate', {
-          headers: { 'Authorization': `Bearer ${t}` },
-        }).then(res => {
-          if (res.ok) {
-            setToken(t)
-          } else {
-            setError('Token from CLI is invalid or expired. Please generate a new one.')
-          }
-        }).catch(() => {
-          setError('Could not validate token. Is the server running?')
-        }).finally(() => {
-          setIsValidating(false)
-        })
+    const t = takeHashToken()
+    if (!t) return
+    setIsValidating(true)
+    fetch('/api/v1/auth/validate', {
+      headers: { 'Authorization': `Bearer ${t}` },
+    }).then(res => {
+      if (res.ok) {
+        setToken(t)
+      } else {
+        setError('Token from CLI is invalid or expired. Please generate a new one.')
       }
-    }
+    }).catch(() => {
+      setError('Could not validate token. Is the server running?')
+    }).finally(() => {
+      setIsValidating(false)
+    })
   }, [setToken])
 
-  // Already authenticated: return to the page that sent us here. Only while
-  // the address is still /login: the token swaps the root layout before the
-  // route match changes, so this page mounts again for a moment at the
-  // destination, where the return has already been taken.
+  // Authenticated and no token still being validated: return to the page that
+  // sent us here. Only while the address is still /login: the token swaps the
+  // root layout before the route match changes, so this page mounts again for
+  // a moment at the destination, where the return has already been taken.
+  // A rejected sign-in stays here with its error, even when an earlier token
+  // is still stored, instead of silently continuing as the old identity.
   useEffect(() => {
-    if (token && location.pathname === '/login') {
+    if (token && !isValidating && !error && location.pathname === '/login') {
       navigate({ href: takeLoginReturn() })
     }
-  }, [token, location.pathname, navigate])
+  }, [token, isValidating, error, location.pathname, navigate])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

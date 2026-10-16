@@ -18,7 +18,7 @@ export function GatewayStatusBadge({ state }: { state?: string }) {
 export function GatewayBindingsTable({ bindings, loading }: { bindings: GatewayBinding[]; loading: boolean }) {
   return (
     <TableFrame>
-      <Table>
+      <Table scrollRegionLabel="Gateway bindings">
         <TableHeader><TableRow><TableHead>Binding</TableHead><TableHead>Gateway → Agent</TableHead><TableHead>External context</TableHead><TableHead>Session mode</TableHead><TableHead>Last activity</TableHead><TableHead>Status</TableHead></TableRow></TableHeader>
         <TableBody>
           {loading ? <LoadingRows columns={6} /> : bindings.length === 0 ? <EmptyRow columns={6} text="No GatewayBindings are configured." /> : bindings.map((binding) => (
@@ -52,7 +52,7 @@ export function GatewayBindingsTable({ bindings, loading }: { bindings: GatewayB
 export function GatewayEventsTable({ events, loading }: { events: GatewayEvent[]; loading: boolean }) {
   return (
     <TableFrame>
-      <Table>
+      <Table scrollRegionLabel="Gateway events">
         <TableHeader><TableRow><TableHead>Event</TableHead><TableHead>State</TableHead><TableHead>Context</TableHead><TableHead>Session</TableHead><TableHead>Task</TableHead><TableHead>Received</TableHead></TableRow></TableHeader>
         <TableBody>
           {loading ? <LoadingRows columns={6} /> : events.length === 0 ? <EmptyRow columns={6} text="No gateway events have been admitted." /> : events.map((event) => (
@@ -85,7 +85,7 @@ export function GatewayDeliveriesTable({ deliveries, loading }: { deliveries: Ga
   const retry = useRetryGatewayDelivery()
   return (
     <TableFrame>
-      <Table>
+      <Table scrollRegionLabel="Gateway deliveries">
         <TableHeader><TableRow><TableHead>Delivery</TableHead><TableHead>State</TableHead><TableHead>Kind</TableHead><TableHead>Correlation</TableHead><TableHead>Attempts</TableHead><TableHead>Updated</TableHead><TableHead className="w-16" /></TableRow></TableHeader>
         <TableBody>
           {loading ? <LoadingRows columns={7} /> : deliveries.length === 0 ? <EmptyRow columns={7} text="No adapter deliveries have been created." /> : deliveries.map((delivery) => (

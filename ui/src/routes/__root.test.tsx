@@ -24,6 +24,7 @@ vi.mock('@tanstack/react-router', async () => {
 
 import { useUIStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
+import { captureHashToken, takeHashToken } from '@/lib/login-return'
 import { Route } from './__root'
 
 describe('__root route', () => {
@@ -32,6 +33,7 @@ describe('__root route', () => {
     mockPathname = '/'
     mockSearchStr = ''
     sessionStorage.clear()
+    takeHashToken()
     useUIStore.setState({ namespace: 'default', sidebarCollapsed: false, theme: 'light' })
     useAuthStore.setState({ token: 'test-token' })
     // jsdom doesn't implement matchMedia
@@ -79,6 +81,31 @@ describe('__root route', () => {
     render(<RootComponent />)
     expect(mockNavigate).toHaveBeenCalledWith({ to: '/login', hash: 'completion=one-time' })
     expect(sessionStorage.getItem('orka-login-return')).toBe('/settings/connectors?status=pending&connection=github-1')
+    window.history.replaceState(null, '', '/')
+  })
+
+  it('sends a deep-link #token= to the login page without the token in the address', () => {
+    useAuthStore.setState({ token: null })
+    window.history.replaceState(null, '', '/monitors/example?tab=runs#token=deep-link-token')
+    captureHashToken()
+    mockPathname = '/monitors/example'
+    mockSearchStr = '?tab=runs'
+    const RootComponent = Route.component!
+    render(<RootComponent />)
+    expect(window.location.href).not.toContain('deep-link-token')
+    expect(mockNavigate).toHaveBeenCalledWith({ to: '/login' })
+    expect(sessionStorage.getItem('orka-login-return')).toBe('/monitors/example?tab=runs')
+    window.history.replaceState(null, '', '/')
+  })
+
+  it('treats a captured #token= as a sign-in request over an existing token', () => {
+    window.history.replaceState(null, '', '/tasks#token=new-token')
+    captureHashToken()
+    mockPathname = '/tasks'
+    const RootComponent = Route.component!
+    const { container } = render(<RootComponent />)
+    expect(mockNavigate).toHaveBeenCalledWith({ to: '/login' })
+    expect(container.querySelector('[data-testid="outlet"]')).not.toBeInTheDocument()
     window.history.replaceState(null, '', '/')
   })
 

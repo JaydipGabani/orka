@@ -19,7 +19,7 @@ export function Header() {
     <header className="z-20 flex h-14 shrink-0 items-center justify-between border-b border-border bg-card/80 px-6 backdrop-blur-md">
       <div className="flex items-center gap-4">
         <Select value={namespace} onValueChange={setNamespace}>
-          <SelectTrigger className="w-48">
+          <SelectTrigger className="w-48" aria-label="Namespace">
             <SelectValue placeholder="Namespace" />
           </SelectTrigger>
           <SelectContent>

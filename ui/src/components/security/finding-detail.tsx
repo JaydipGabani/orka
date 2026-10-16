@@ -1,9 +1,12 @@
+import { Link } from '@tanstack/react-router'
+import { ArrowLeft } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { PageHeader } from '@/components/layout/page-header'
+import { AccessErrorView, NotFoundView } from '@/components/common/not-found-page'
 import {
   useCreatePullRequest,
   useDismissFinding,
@@ -13,7 +16,9 @@ import {
   useReopenFinding,
   useValidateFinding,
 } from '@/hooks/use-security'
+import { isForbiddenError, isNotFoundError } from '@/lib/api-client'
 import { useUIStore } from '@/stores/ui'
+import type { SecurityFinding } from '@/schemas/security'
 import { PatchProposalCard } from './patch-proposal-card'
 
 function severityVariant(severity?: string): 'destructive' | 'secondary' | 'outline' {
@@ -24,21 +29,48 @@ function severityVariant(severity?: string): 'destructive' | 'secondary' | 'outl
 
 export function FindingDetail({ findingId }: { findingId: string }) {
   const namespace = useUIStore((s) => s.namespace)
-  const { data: finding, isLoading } = useFinding(findingId)
+  const { data: finding, isLoading, error } = useFinding(findingId)
+
+  if (isLoading) {
+    return <Skeleton className="h-96 w-full" />
+  }
+
+  const backToSecurity = (
+    <Button asChild variant="outline">
+      <Link to="/security"><ArrowLeft className="mr-1 h-4 w-4" />Back to Security</Link>
+    </Button>
+  )
+
+  // A 403 replaces cached data (the token lost access); any other failure
+  // keeps what already loaded and only blocks a page that never loaded.
+  if (isForbiddenError(error) || (error && !isNotFoundError(error) && !finding)) {
+    return <AccessErrorView title="Could not load finding" resource={`finding ${findingId}`} error={error} action={backToSecurity} />
+  }
+
+  // A 404 wins over cached data. The patch proposals query lives in
+  // FindingDetailContent, so a missing finding sends no further requests.
+  if (isNotFoundError(error) || !finding) {
+    return (
+      <NotFoundView
+        title="Finding not found"
+        headline={`No finding with ID "${findingId}" in ${namespace}`}
+        hint="It may belong to another namespace, or its repository may have been removed."
+        action={backToSecurity}
+      />
+    )
+  }
+
+  return <FindingDetailContent findingId={findingId} finding={finding} />
+}
+
+function FindingDetailContent({ findingId, finding }: { findingId: string; finding: SecurityFinding }) {
+  const namespace = useUIStore((s) => s.namespace)
   const patches = usePatchProposals(findingId)
   const generatePatch = useGeneratePatch(findingId)
   const validateFinding = useValidateFinding(findingId)
   const createPullRequest = useCreatePullRequest(findingId)
   const dismissFinding = useDismissFinding(findingId)
   const reopenFinding = useReopenFinding(findingId)
-
-  if (isLoading) {
-    return <Skeleton className="h-96 w-full" />
-  }
-
-  if (!finding) {
-    return <div className="text-muted-foreground">Finding not found.</div>
-  }
 
   const latestSuccessfulPatch = (patches.data?.items ?? []).find((proposal) => proposal.status === 'succeeded' || proposal.status === 'pr_opened')
   let parsedValidation: Record<string, unknown> | null = null

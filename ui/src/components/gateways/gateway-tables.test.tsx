@@ -107,6 +107,18 @@ describe('gateway tables', () => {
     }
   })
 
+  it.each([
+    ['Gateway bindings', () => <GatewayBindingsTable bindings={[binding]} loading={false} />],
+    ['Gateway events', () => <GatewayEventsTable events={[event]} loading={false} />],
+    ['Gateway deliveries', () => <GatewayDeliveriesTable deliveries={[]} loading={false} />],
+  ])('lets the keyboard scroll the %s table on narrow screens', (name, table) => {
+    render(table())
+
+    const region = screen.getByRole('region', { name })
+    expect(region).toHaveAttribute('tabindex', '0')
+    expect(region).toContainElement(screen.getByRole('table'))
+  })
+
   it('surfaces manual delivery retry failures', async () => {
     const delivery: GatewayDelivery = {
       id: 'delivery-failed', namespace: 'default', gatewayName: 'chat', eventId: 'event-1',

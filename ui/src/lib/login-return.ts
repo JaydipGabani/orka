@@ -31,3 +31,32 @@ export function takeLoginReturn(): string {
   }
   return path + window.location.hash
 }
+
+const hashTokenPrefix = '#token='
+let pendingHashToken: string | null = null
+
+/**
+ * Takes a `#token=...` sign-in fragment (from `orka login` or a deep link)
+ * out of the address bar and holds it in memory. Runs once at app start,
+ * before the router reads the URL, so the root redirect and the login page
+ * never race over the fragment and the token never lands in history.
+ */
+export function captureHashToken() {
+  const { hash, pathname, search } = window.location
+  if (!hash.startsWith(hashTokenPrefix)) return
+  window.history.replaceState(window.history.state, '', pathname + search)
+  const token = hash.slice(hashTokenPrefix.length)
+  if (token) pendingHashToken = token
+}
+
+/** Whether a captured sign-in token is still waiting for the login page. */
+export function hasPendingHashToken(): boolean {
+  return pendingHashToken !== null
+}
+
+/** Hands the captured sign-in token to the login page, once. */
+export function takeHashToken(): string | null {
+  const token = pendingHashToken
+  pendingHashToken = null
+  return token
+}
