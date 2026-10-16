@@ -30,6 +30,11 @@ While it is off, paths outside the APIs answer with a JSON 404, `orka dashboard`
 with an error, and connector consent finishes with `orka connection complete` (see
 [Connectors](connectors.md#3-link-an-account)).
 
+:::tip Try it without a cluster
+The [dashboard demo](pathname:///demo/) runs in your browser on sample data, with a
+guided tour of the main pages. Nothing in it reaches a cluster or a model.
+:::
+
 ## Open it
 
 Forward the API port if it is not already forwarded, and have a client token ready
