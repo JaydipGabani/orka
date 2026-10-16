@@ -24,7 +24,7 @@ export default function HeroSection() {
           to="/docs/getting-started"
           className="button button--primary button--lg"
         >
-          Get Started
+          Get started
         </Link>
         <Link
           to="pathname:///demo/"
