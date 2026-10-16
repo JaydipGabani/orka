@@ -38,7 +38,7 @@ const hashTokenPrefix = '#token='
 let pendingHashToken: string | null = null
 
 /**
- * Takes a `#token=...` sign-in fragment (from `orka login` or a deep link)
+ * Takes a `#token=...` sign-in fragment (from `orka dashboard` or a deep link)
  * out of the address bar and holds it in memory. Runs once at app start,
  * before the router reads the URL, so the root redirect and the login page
  * never race over the fragment and the token never lands in history.

