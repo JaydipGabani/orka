@@ -20,8 +20,13 @@ describe('login return', () => {
 
   it('carries the fragment the address bar still holds', () => {
     rememberLoginReturn('/settings/connectors?status=pending')
-    window.history.replaceState(null, '', '/login#completion=one-time')
-    expect(takeLoginReturn()).toBe('/settings/connectors?status=pending#completion=one-time')
+    expect(takeLoginReturn('completion=one-time')).toBe('/settings/connectors?status=pending#completion=one-time')
+  })
+
+  it('ignores the address bar fragment, which is the route under hash routing', () => {
+    rememberLoginReturn('/security')
+    window.history.replaceState(null, '', '/#/login#/security')
+    expect(takeLoginReturn()).toBe('/security')
   })
 
   it.each(['//evil.example/x', '/\\evil.example', 'https://evil.example/', '/login?x=1'])('refuses %s', (path) => {

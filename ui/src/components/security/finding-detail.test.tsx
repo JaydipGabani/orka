@@ -25,8 +25,10 @@ vi.mock('@/hooks/use-security', async (importOriginal) => {
 
 import { http, HttpResponse } from 'msw'
 import { server } from '@/test/mocks/server'
-import { render, screen } from '@/test/test-utils'
+import userEvent from '@testing-library/user-event'
+import { render, screen, waitFor } from '@/test/test-utils'
 import { ApiError } from '@/lib/api-client'
+import { useAuthStore } from '@/stores/auth'
 import { useUIStore } from '@/stores/ui'
 import type { SecurityFinding } from '@/schemas/security'
 import { FindingDetail } from './finding-detail'
@@ -101,6 +103,49 @@ describe('FindingDetail', () => {
     expect(alert).toHaveTextContent('Could not load finding f-1')
     expect(alert).toHaveTextContent('security store unavailable')
     expect(screen.queryByText('Finding not found')).not.toBeInTheDocument()
+  })
+
+  it('downloads evidence artifacts with the bearer token instead of linking to the API', async () => {
+    useAuthStore.setState({ token: 'test-token' })
+    let downloadUrl = ''
+    let auth: string | null = null
+    server.use(http.get('/api/v1/tasks/:id/artifacts/:file', ({ request }) => {
+      downloadUrl = request.url
+      auth = request.headers.get('authorization')
+      return HttpResponse.text('{}')
+    }))
+    // jsdom lacks blob URL + anchor click plumbing; stub them.
+    const createUrl = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:x')
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    findingQuery.current = {
+      isLoading: false,
+      error: null,
+      data: { ...finding, evidence: [{ kind: 'artifact', taskName: 'scan task', name: 'semgrep report.json', label: 'Semgrep report' }] },
+    }
+
+    try {
+      render(<FindingDetail findingId="f-1" />)
+      expect(screen.queryByRole('link', { name: 'Semgrep report' })).not.toBeInTheDocument()
+      await userEvent.click(screen.getByRole('button', { name: 'Semgrep report' }))
+
+      await waitFor(() => expect(downloadUrl).toContain('/api/v1/tasks/scan%20task/artifacts/semgrep%20report.json?namespace=default'))
+      expect(auth).toBe('Bearer test-token')
+    } finally {
+      createUrl.mockRestore(); revoke.mockRestore(); click.mockRestore()
+    }
+  })
+
+  it('keeps line breaks in evidence quotes', () => {
+    findingQuery.current = {
+      isLoading: false,
+      error: null,
+      data: { ...finding, evidence: [{ kind: 'code', path: 'internal/search.go', startLine: 40, quote: 'q := "SELECT *"\nrows, _ := db.Query(q + term)' }] },
+    }
+
+    render(<FindingDetail findingId="f-1" />)
+
+    expect(screen.getByText(/rows, _ := db.Query/)).toHaveClass('whitespace-pre-wrap')
   })
 
   it('keeps showing a loaded finding when a refetch fails', () => {

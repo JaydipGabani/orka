@@ -24,10 +24,10 @@ function RootComponent() {
       // Come back here after signing in, and keep the fragment in the address
       // bar: a connector consent callback carries its completion token there.
       rememberLoginReturn(location.pathname + location.searchStr)
-      const hash = window.location.hash.slice(1)
+      const hash = location.hash
       navigate({ to: '/login', ...(hash && { hash }) })
     }
-  }, [signingIn, location.pathname, location.searchStr, navigate])
+  }, [signingIn, location.pathname, location.searchStr, location.hash, navigate])
 
   if (location.pathname === '/login') {
     return <Outlet />

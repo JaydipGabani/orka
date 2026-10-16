@@ -16,9 +16,11 @@ export function rememberLoginReturn(path: string) {
 
 /**
  * Where to go after signing in: the remembered dashboard path with the
- * fragment the address bar still holds, or the dashboard home.
+ * fragment the address bar still holds (the router's `location.hash`, without
+ * the `#`), or the dashboard home. The router's fragment is used rather than
+ * `window.location.hash`, which holds the route itself under hash routing.
  */
-export function takeLoginReturn(): string {
+export function takeLoginReturn(fragment = ''): string {
   let path: string | null = null
   try {
     path = sessionStorage.getItem(loginReturnKey)
@@ -29,7 +31,7 @@ export function takeLoginReturn(): string {
   if (!path || !path.startsWith('/') || path.startsWith('//') || path.startsWith('/\\') || path.startsWith('/login')) {
     return '/'
   }
-  return path + window.location.hash
+  return fragment ? `${path}#${fragment}` : path
 }
 
 const hashTokenPrefix = '#token='

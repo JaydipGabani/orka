@@ -15,7 +15,8 @@ vi.mock('@tanstack/react-router', async () => {
     ...actual,
     createFileRoute: (_path: string) => (opts: any) => ({ ...opts, path: _path }),
     useNavigate: () => mockNavigate,
-    useLocation: () => ({ pathname: mockPathname }),
+    // Like the browser-history router, the fragment mirrors the address bar.
+    useLocation: () => ({ pathname: mockPathname, hash: window.location.hash.slice(1) }),
   }
 })
 
@@ -23,6 +24,7 @@ import { http, HttpResponse } from 'msw'
 import { server } from '@/test/mocks/server'
 import { useAuthStore } from '@/stores/auth'
 import { captureHashToken, takeHashToken } from '@/lib/login-return'
+import { DEMO_TOKEN } from '@/demo/token'
 import { Route } from './login'
 
 describe('login route', () => {
@@ -193,5 +195,22 @@ describe('login route', () => {
     expect(useAuthStore.getState().token).toBeNull()
     expect(mockNavigate).not.toHaveBeenCalled()
     window.history.replaceState(null, '', '/')
+  })
+
+  it('signs in to the demo build without asking for a token', async () => {
+    vi.stubEnv('MODE', 'demo')
+    try {
+      const LoginPage = Route.component!
+      render(<LoginPage />)
+
+      expect(screen.queryByPlaceholderText('Paste your token here...')).not.toBeInTheDocument()
+      expect(screen.queryByText(/kubectl create token/)).not.toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Sign in to the demo' }))
+
+      expect(useAuthStore.getState().token).toBe(DEMO_TOKEN)
+      await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith({ href: '/' }))
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 })

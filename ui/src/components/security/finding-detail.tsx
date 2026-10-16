@@ -17,6 +17,7 @@ import {
   useValidateFinding,
 } from '@/hooks/use-security'
 import { isForbiddenError, isNotFoundError } from '@/lib/api-client'
+import { downloadTaskArtifact } from '@/hooks/use-task-artifacts'
 import { useUIStore } from '@/stores/ui'
 import type { SecurityFinding } from '@/schemas/security'
 import { PatchProposalCard } from './patch-proposal-card'
@@ -81,9 +82,10 @@ function FindingDetailContent({ findingId, finding }: { findingId: string; findi
       parsedValidation = null
     }
   }
-  const validationArtifactRefs = (finding.evidence ?? []).filter((evidence) =>
+  type Evidence = NonNullable<SecurityFinding['evidence']>[number]
+  const validationArtifactRefs = (finding.evidence ?? []).filter((evidence): evidence is Evidence & { taskName: string; name: string } =>
     evidence.kind === 'artifact' &&
-    evidence.taskName &&
+    !!evidence.taskName &&
     (evidence.name === 'security-validation.json' || evidence.name === 'security-validation.txt'),
   )
 
@@ -252,14 +254,14 @@ function FindingDetailContent({ findingId, finding }: { findingId: string; findi
               {(finding.evidence ?? []).map((evidence, index) => (
                 <div key={`${evidence.name || evidence.label || 'evidence'}-${index}`} className="rounded-md border border-border p-3 text-sm">
                   {evidence.kind === 'artifact' && evidence.taskName && evidence.name ? (
-                    <a
-                      href={`/api/v1/tasks/${evidence.taskName}/artifacts/${evidence.name}?namespace=${encodeURIComponent(namespace)}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="font-medium text-primary hover:underline"
+                    <ArtifactDownloadLink
+                      taskName={evidence.taskName}
+                      filename={evidence.name}
+                      namespace={namespace}
+                      className="font-medium"
                     >
                       {evidence.label || evidence.name || 'Evidence'}
-                    </a>
+                    </ArtifactDownloadLink>
                   ) : (
                     <div className="font-medium">
                       {evidence.path
@@ -270,7 +272,7 @@ function FindingDetailContent({ findingId, finding }: { findingId: string; findi
                   <div className="text-muted-foreground">{evidence.kind}</div>
                   {evidence.symbol && <div className="text-xs text-muted-foreground">Symbol: {evidence.symbol}</div>}
                   {evidence.taskName && <div className="text-xs text-muted-foreground">Task: {evidence.taskName}</div>}
-                  {evidence.quote && <div className="mt-2 rounded bg-muted p-2 font-mono text-xs">{evidence.quote}</div>}
+                  {evidence.quote && <div className="mt-2 whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-xs">{evidence.quote}</div>}
                 </div>
               ))}
             </div>
@@ -347,15 +349,15 @@ function FindingDetailContent({ findingId, finding }: { findingId: string; findi
                 <div className="font-medium">Validation Artifacts</div>
                 <div className="mt-2 space-y-2 text-sm">
                   {validationArtifactRefs.map((evidence, index) => (
-                    <a
+                    <ArtifactDownloadLink
                       key={`${evidence.taskName || 'task'}-${evidence.name || index}`}
-                      href={`/api/v1/tasks/${evidence.taskName}/artifacts/${evidence.name}?namespace=${encodeURIComponent(namespace)}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="block text-primary hover:underline"
+                      taskName={evidence.taskName}
+                      filename={evidence.name}
+                      namespace={namespace}
+                      className="block"
                     >
                       {evidence.label || evidence.name}
-                    </a>
+                    </ArtifactDownloadLink>
                   ))}
                 </div>
               </div>
@@ -385,5 +387,27 @@ function FindingDetailContent({ findingId, finding }: { findingId: string; findi
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+// Evidence artifacts download through the authenticated fetch path: a plain
+// link to the API cannot carry the bearer token, so the server would answer 401.
+function ArtifactDownloadLink({ taskName, filename, namespace, className, children }: {
+  taskName: string
+  filename: string
+  namespace: string
+  className?: string
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      className={`text-left text-primary hover:underline ${className ?? ''}`}
+      onClick={() => {
+        downloadTaskArtifact(taskName, filename, namespace).catch(() => toast.error(`Failed to download ${filename}`))
+      }}
+    >
+      {children}
+    </button>
   )
 }

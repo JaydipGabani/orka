@@ -27,6 +27,14 @@ export function Header() {
             <SelectItem value="orka-system">orka-system</SelectItem>
           </SelectContent>
         </Select>
+        {import.meta.env.MODE === 'demo' && (
+          <span
+            title="This dashboard runs on sample data in your browser. Nothing is sent to a cluster or a model."
+            className="hidden shrink-0 rounded-full border border-border px-2.5 py-0.5 text-xs font-medium text-muted-foreground sm:inline"
+          >
+            Demo<span className="hidden lg:inline"> · sample data, no live cluster or model</span>
+          </span>
+        )}
       </div>
       <div className="flex items-center gap-2">
         <Button

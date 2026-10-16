@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { RouterProvider, createRouter } from '@tanstack/react-router'
+import { RouterProvider, createHashHistory, createRouter } from '@tanstack/react-router'
 import { routeTree } from './routeTree.gen'
 import { NotFoundPage } from './components/common/not-found-page'
 import { captureHashToken } from './lib/login-return'
@@ -46,8 +46,14 @@ useUIStore.subscribe((state) => {
 // Before the router reads the URL: see captureHashToken.
 captureHashToken()
 
-// Unknown addresses render inside the root layout's Outlet.
-const router = createRouter({ routeTree, defaultNotFoundComponent: NotFoundPage })
+// Unknown addresses render inside the root layout's Outlet. The demo is served
+// from a static host that cannot fall back to index.html for deep links, so it
+// keeps the route in the URL fragment instead.
+const router = createRouter({
+  routeTree,
+  defaultNotFoundComponent: NotFoundPage,
+  ...(import.meta.env.MODE === 'demo' && { history: createHashHistory() }),
+})
 
 declare module '@tanstack/react-router' {
   interface Register {

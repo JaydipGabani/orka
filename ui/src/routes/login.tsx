@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { OrcaMark } from '@/components/ui/orca-mark'
+import { DEMO_TOKEN } from '@/demo/token'
 
 export const Route = createFileRoute('/login')({
   component: LoginPage,
@@ -48,9 +49,9 @@ function LoginPage() {
   // is still stored, instead of silently continuing as the old identity.
   useEffect(() => {
     if (token && !isValidating && !error && location.pathname === '/login') {
-      navigate({ href: takeLoginReturn() })
+      navigate({ href: takeLoginReturn(location.hash) })
     }
-  }, [token, isValidating, error, location.pathname, navigate])
+  }, [token, isValidating, error, location.pathname, location.hash, navigate])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -82,36 +83,52 @@ function LoginPage() {
           <OrcaMark className="mx-auto mb-2 h-12 w-12" />
           <CardTitle className="text-2xl">Orka</CardTitle>
           <CardDescription>
-            Enter your Kubernetes service account token or use <code className="text-xs">orka login</code> from the CLI.
+            {import.meta.env.MODE === 'demo'
+              ? 'This demo runs on sample data in your browser and needs no token.'
+              : <>Enter your Kubernetes service account token or use <code className="text-xs">orka login</code> from the CLI.</>}
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <Input
-              type="password"
-              placeholder="Paste your token here..."
-              value={tokenInput}
-              onChange={(e) => { setTokenInput(e.target.value); setError('') }}
-              autoFocus
-            />
-            {error && (
-              <p className="text-sm text-destructive">{error}</p>
-            )}
-            <Button type="submit" className="w-full" disabled={!tokenInput.trim() || isValidating}>
-              {isValidating ? 'Validating…' : 'Sign In'}
-            </Button>
-          </form>
-          <div className="mt-6 space-y-3 border-t pt-4">
-            <p className="text-sm text-muted-foreground font-medium">How to get a token:</p>
-            <div className="rounded-md bg-muted p-3">
-              <code className="text-xs break-all select-all">
-                kubectl create token default -n default
-              </code>
+          {/* The public demo never asks for a real cluster token. */}
+          {import.meta.env.MODE === 'demo' ? (
+            <div className="space-y-4">
+              {error && (
+                <p className="text-sm text-destructive">{error}</p>
+              )}
+              <Button className="w-full" disabled={isValidating} onClick={() => { setError(''); setToken(DEMO_TOKEN) }}>
+                Sign in to the demo
+              </Button>
             </div>
-            <p className="text-xs text-muted-foreground">
-              Or use the CLI: <code className="text-xs">orka login --server http://localhost:8080</code>
-            </p>
-          </div>
+          ) : (
+            <>
+              <form onSubmit={handleSubmit} className="space-y-4">
+                <Input
+                  type="password"
+                  placeholder="Paste your token here..."
+                  value={tokenInput}
+                  onChange={(e) => { setTokenInput(e.target.value); setError('') }}
+                  autoFocus
+                />
+                {error && (
+                  <p className="text-sm text-destructive">{error}</p>
+                )}
+                <Button type="submit" className="w-full" disabled={!tokenInput.trim() || isValidating}>
+                  {isValidating ? 'Validating…' : 'Sign In'}
+                </Button>
+              </form>
+              <div className="mt-6 space-y-3 border-t pt-4">
+                <p className="text-sm text-muted-foreground font-medium">How to get a token:</p>
+                <div className="rounded-md bg-muted p-3">
+                  <code className="text-xs break-all select-all">
+                    kubectl create token default -n default
+                  </code>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Or use the CLI: <code className="text-xs">orka login --server http://localhost:8080</code>
+                </p>
+              </div>
+            </>
+          )}
         </CardContent>
       </Card>
     </div>

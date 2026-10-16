@@ -58,7 +58,7 @@ export function GatewayEventsTable({ events, loading }: { events: GatewayEvent[]
           {loading ? <LoadingRows columns={6} /> : events.length === 0 ? <EmptyRow columns={6} text="No gateway events have been admitted." /> : events.map((event) => (
             <TableRow key={event.id}>
               <TableCell><div className="font-mono text-xs">{event.id}</div><div className="mt-1 max-w-56 truncate text-xs text-muted-foreground">{event.externalEventId}</div></TableCell>
-              <TableCell><GatewayStatusBadge state={event.state} />{event.stateMessage && <p className="mt-1 max-w-52 text-xs text-muted-foreground">{event.stateMessage}</p>}</TableCell>
+              <TableCell><GatewayStatusBadge state={event.state} />{event.stateMessage && <p className="mt-1 max-w-52 whitespace-normal break-words text-xs text-muted-foreground">{event.stateMessage}</p>}</TableCell>
               <TableCell className="font-mono text-xs">{event.accountId}/{event.contextId}</TableCell>
               <TableCell>
                 {event.sessionName ? (
@@ -91,7 +91,7 @@ export function GatewayDeliveriesTable({ deliveries, loading }: { deliveries: Ga
           {loading ? <LoadingRows columns={7} /> : deliveries.length === 0 ? <EmptyRow columns={7} text="No adapter deliveries have been created." /> : deliveries.map((delivery) => (
             <TableRow key={delivery.id}>
               <TableCell><div className="font-mono text-xs">{delivery.id}</div>{delivery.providerMessageId && <div className="mt-1 max-w-56 truncate text-xs text-muted-foreground">{delivery.providerMessageId}</div>}</TableCell>
-              <TableCell><GatewayStatusBadge state={delivery.state} />{delivery.lastError && <p className="mt-1 max-w-56 text-xs text-muted-foreground">{delivery.lastError}</p>}</TableCell>
+              <TableCell><GatewayStatusBadge state={delivery.state} />{delivery.lastError && <p className="mt-1 max-w-56 whitespace-normal break-words text-xs text-muted-foreground">{delivery.lastError}</p>}</TableCell>
               <TableCell>{delivery.kind}</TableCell>
               <TableCell><div className="font-mono text-xs">{delivery.eventId}</div>{delivery.taskName && <div className="mt-1 text-xs text-muted-foreground">{delivery.taskName}</div>}</TableCell>
               <TableCell className="font-mono text-xs tabular-nums">{delivery.attemptCount}/{delivery.maxAttempts}</TableCell>
