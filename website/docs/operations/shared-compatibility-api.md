@@ -136,6 +136,10 @@ spec:
           port: 8080
 ```
 
+Such a controller policy must also admit the Publisher and any native workspace
+workers, because Core does not grant controller ingress for them. See the
+[workspace provider guide](https://github.com/orka-agents/orka/blob/main/docs/development/workspace-provider-authoring.md).
+
 If router egress is restricted, allow DNS, the Kubernetes API for TokenReview,
 and the configured installation API destinations. Router health probes report
 the listener's health; they do not imply that every installation is available.

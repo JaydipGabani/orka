@@ -69,6 +69,7 @@ jobs:
             # passing runs take about 30m in total.
             job_timeout: 60
             test_timeout: 45m
+            ginkgo_timeout: 40m
           # The built-in runtime lifecycle specs restart the controller and
           # park, replace, and scale RuntimePools, so they get their own
           # cluster.
@@ -81,6 +82,7 @@ jobs:
             idle_ttl: 15m
             job_timeout: 75
             test_timeout: 60m
+            ginkgo_timeout: 55m
     env:
       KIND_CLUSTER: ${{ matrix.cluster }}
       E2E_CLEANUP_REPORT_DIR: ${{ github.workspace }}/bin/e2e-cleanup/${{ matrix.lane }}-${{ matrix.part }}
@@ -89,6 +91,8 @@ jobs:
       E2E_GINKGO_SKIP_FILE: ${{ matrix.part == 2 && matrix.split || '' }}
       E2E_ACP_IDLE_POOL_TTL: ${{ matrix.idle_ttl }}
       E2E_GO_TEST_TIMEOUT: ${{ matrix.test_timeout }}
+      E2E_GINKGO_TIMEOUT: ${{ matrix.ginkgo_timeout }}
+      E2E_GINKGO_GRACE_PERIOD: 2m
     steps:
       - name: Clone the code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -20,10 +20,10 @@ values are in [Configuration](configuration.md), and HTTP endpoints are in the
 | [ConnectorProvider](#connectorprovider) and [Connection](#connection) | `core.orka.ai` | An OAuth service people can link, and one person's link to it. |
 | [RepositoryScan](#repositoryscan) | `core.orka.ai` | A repository to scan for security findings. |
 | [RepositoryMonitor](#repositorymonitor) | `core.orka.ai` | A repository whose pull requests and issues agents review, implement, and repair. |
-| [SubstrateActorPool](#substrateactorpool) | `core.orka.ai` | A pool of Agent Substrate actors for Tasks and MCP Tools. |
+| [SubstrateActorPool](#substrateactorpool) | `core.orka.ai` | A pool of Agent Substrate actors for MCP Tools. |
 | AgentRuntime | `core.orka.ai` | An external agent runtime registration. See [Bring your own agent runtime](../guides/bring-your-own-agent-runtime.md). |
 | GatewayClass, Gateway, GatewayBinding | `gateway.orka.ai` | Connections to chat apps and other agents. See [Gateways](../guides/gateways.md) and the [Gateway API](gateway-api.md). |
-| ExecutionWorkspaceClass and related resources | `workspace.orka.ai`, `acp.workspace.orka.ai` | Sandboxed execution workspaces. See [Workspace providers](configuration.md#workspace-providers). |
+| ExecutionWorkspaceClass and related resources | `workspace.orka.ai` | Sandboxed execution workspaces from separately installed providers. See [Workspace providers](configuration.md#workspace-providers). |
 
 The controller creates and owns several more resources, such as RuntimePools and
 PromptAttempts. Read them when debugging, but do not edit them. [Architecture](../concepts/architecture.md#custom-resources)
@@ -188,7 +188,7 @@ execution:
 | `nodeSelector` | map[string]string | Restricts native worker Pods to nodes with matching labels |
 | `tolerations` | list | Allows native worker Pods onto tainted runtime-specific node pools |
 | `affinity` | object | Adds Kubernetes affinity or anti-affinity rules for native worker Pods |
-| `workspace` | object | Execution-workspace provider request. With workspace dispatch enabled, `provider: agent-sandbox` (no `templateRef`) or `provider: substrate` (with a required infrastructure `templateRef`) hosts the Task's RuntimeSession in a workspace-provider-backed RuntimePool; everything else fails closed. Repository access always uses top-level `Task.spec.workspace`. |
+| `workspace` | object | Class-only execution-workspace request. `classRef` selects an admitted external provider and immutable profile for a dedicated ACP RuntimeSession. Repository access uses top-level `Task.spec.workspace`. |
 
 Resolution order:
 
@@ -199,7 +199,15 @@ Resolution order:
 
 #### Execution workspace requests
 
-`Task.spec.execution.workspace` requests a physical execution-workspace provider for the Task's ACP RuntimeSession. With `--acp-workspace-dispatch-enabled`, `provider: agent-sandbox` (requires `--agent-sandbox-enabled`; `templateRef` must be omitted) or `provider: substrate` (requires `--substrate-enabled`; an infrastructure `templateRef` is required) executes the RuntimeSession in a dedicated workspace-provider-backed RuntimePool. Unsupported options (`cleanupPolicy: retain`, boot/pool/snapshot/hibernation, `onDetach`) fail closed before any workspace or RuntimePool demand, with the reason projected to `Task.status.executionWorkspace`. There is no worker Job fallback and no harness-v1 fallback. Top-level `Task.spec.workspace` remains the verified source/publication contract.
+`Task.spec.execution.workspace.classRef` selects an administrator-managed class for
+a dedicated workspace-backed ACP RuntimeSession. Dispatch requires the workspace
+provider API, `--acp-workspace-dispatch-enabled`, required admission webhooks, live
+class-use authorization, and an admitted external provider with the required
+contracts and capabilities. Optional `reusePolicy`, `workspaceSlot`, and `onDetach`
+must satisfy the frozen class lifecycle. Direct provider, template, pool, boot,
+snapshot, and cleanup selectors are removed. Rejections appear in
+`Task.status.executionWorkspace` before compute demand. Top-level
+`Task.spec.workspace` remains the verified source/publication contract.
 
 See [Agent Sandbox Workspaces](../concepts/agent-sandbox.md), [Agent Substrate Workspaces](../concepts/substrate.md), and ADRs 0024/0025 for the provider-neutral contract.
 
@@ -932,7 +940,7 @@ See [Repository Monitors](../guides/repository-monitors.md) for the workflow, AP
 
 ## SubstrateActorPool
 
-`SubstrateActorPool` is an operator-owned pool of deterministic Substrate actors for pooled Task placement, MCP actor-backed Tools, and density reporting.
+`SubstrateActorPool` is an operator-owned pool of deterministic Substrate actors for native MCP Tools and density reporting. It does not place ACP Tasks. Enable it with `--substrate-mcp-tools-enabled`.
 
 ```yaml
 apiVersion: core.orka.ai/v1alpha1
@@ -956,7 +964,7 @@ spec:
 | `templateRef.namespace` | string | Pool namespace | Native Substrate Atespace containing the `ActorTemplate`. |
 | `workerPoolRef.name` | string | empty | Optional Substrate `WorkerPool` used for capacity and density reporting. |
 | `workerPoolRef.namespace` | string | Pool namespace | Namespace containing the `WorkerPool`. |
-| `targetActors` | integer | `0` | Desired stateful actor count, capped at `1000`. References from Tasks or Tools require at least `1`. |
+| `targetActors` | integer | `0` | Desired stateful actor count, capped at `1000`. References from Tools require at least `1`. |
 | `precreateActors` | boolean | `false` | Pre-create deterministic warm actors up to `targetActors`. |
 
 `spec.templateRef` is immutable. Orka records the first accepted native template

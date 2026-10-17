@@ -14,10 +14,7 @@ This page is for people changing Orka itself. For how the pieces fit together, r
 orka/
 ├── api/                    # Custom resource types
 │   ├── v1alpha1/           # core.orka.ai: Task, Agent, Provider, Tool, RuntimePool, ...
-│   ├── gateway/            # gateway.orka.ai: GatewayClass, Gateway, GatewayBinding
-│   ├── workspace/          # workspace.orka.ai: execution workspace classes, pools, checkpoints
-│   ├── acp.workspace/      # acp.workspace.orka.ai: runtime provider settings and profiles
-│   └── fake.workspace/     # development-only fake workspace provider
+│   └── gateway/            # gateway.orka.ai: GatewayClass, Gateway, GatewayBinding
 ├── cmd/
 │   ├── main.go             # Controller entrypoint
 │   ├── cli/                # The orka CLI

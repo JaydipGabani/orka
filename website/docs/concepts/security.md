@@ -113,8 +113,8 @@ A shared pool is a same-administrative-trust-domain density boundary, not a hard
 ACP Tasks reject per-Task container settings and custom resource requests. Runtime isolation
 and resources come from the reviewed RuntimePool profile. For built-in runtimes,
 `spec.execution.workspace` can bind a dedicated RuntimePool through a sandbox provider when
-the operator enables `--acp-workspace-dispatch-enabled` plus `--agent-sandbox-enabled` or
-`--substrate-enabled`. External `runtimeRef` dispatch rejects execution workspaces. Other
+the operator enables the workspace provider API and `--acp-workspace-dispatch-enabled`,
+with required admission webhooks and an admitted external provider and class. External `runtimeRef` dispatch rejects execution workspaces. Other
 per-Task execution placement fields fail closed.
 
 ### Workspace/Publisher
@@ -209,7 +209,7 @@ dashboard signed in with it.
 - Delegation tools can exchange a mounted subject token for a child-scope TxToken when `ORKA_CONTEXT_TOKEN_TTS_ENDPOINT`, `ORKA_CONTEXT_TOKEN_SUBJECT_TOKEN_FILE`, and `ORKA_CONTEXT_TOKEN_CHILD_SCOPE` are configured; the requested child scope must be a subset of the parent transaction scopes, and the child token is stored in an ephemeral Secret that is referenced by Task annotation, adopted by the child Task after creation, and mounted into the child worker as a token file
 - Worker HTTP Tool CRD calls can propagate a TxToken from a mounted file using `ORKA_TRANSACTION_TOKEN_FILE`; when `ORKA_CONTEXT_TOKEN_TTS_ENDPOINT` and `ORKA_CONTEXT_TOKEN_SUBJECT_TOKEN_FILE` are configured, workers exchange the subject token for an operation-scoped outbound TxToken before calling the tool. Token values are read at request time and are not stored in Task spec/status; downstream services must still verify incoming TxTokens and enforce their own policy
 - Workspace-backed agent Tasks run through controller-owned `acp-ws-*` RuntimePools; the controller never forwards mounted transaction/context-subject token files into the workspace, and raw TxTokens are still not written to Task spec/status/logs.
-- Provider-backed `Task.spec.execution.workspace` dispatch is fail-closed behind `--acp-workspace-dispatch-enabled` plus the selected provider flag. Agent Sandbox uses only controller-rendered templates; Substrate accepts only an operator-owned infrastructure `templateRef` and derives the credential-free runtime template. Both providers bind one dedicated RuntimeSession workspace, bootstrap the exact attested instance with one-time credentials, keep provider-native identifiers out of Task status, and delete the physical workspace only after authenticated drain. Raw transaction tokens are never staged into retained workspaces or provider child environments.
+- Workspace-backed Tasks select only `execution.workspace.classRef`. A separate provider receives a frozen public runtime request and reports infrastructure evidence through `workspace.orka.ai`. Core independently checks the exact Pod or native worker, completes sealed bootstrap, verifies the authenticated boot, and authorizes retirement after drain. Provider readiness cannot authorize prompts or replace core admission. Shared ownership policies separate provider status from core conditions and private attachment credentials. Raw transaction tokens never enter retained workspaces or provider child environments.
 
 ## API authorization
 

@@ -37,14 +37,21 @@ E2E_EPHEMERAL_CLUSTER=true \
 E2E_GINKGO_FOCUS="Gateway live E2E" \
 make test-e2e
 
-# Run Agent Substrate E2E (requires Docker, Go, git, curl, kind, kubectl, ko, jq)
-bash scripts/agent-substrate-e2e.sh
+# External workspace proof runs from the separate orka-workspace checkout.
+# See Development's external workspace local proof section.
 
 # Lint
 make lint
 make lint-fix
 make ui-lint
 ```
+
+The E2E runner uses separate Go and Ginkgo deadlines. Local defaults are
+`E2E_GO_TEST_TIMEOUT=50m`, `E2E_GINKGO_TIMEOUT=45m`, and
+`E2E_GINKGO_GRACE_PERIOD=2m`. Each CI lane sets its Ginkgo deadline 5m
+below its Go deadline, and Gateway live E2E uses `75m` and `70m`.
+When overriding these values, leave room inside the Go deadline for both an
+interrupted spec and suite cleanup to finish their grace periods.
 
 ### Native Codex handoff gate
 
@@ -152,7 +159,6 @@ End-to-end tests run against a dedicated Kind cluster:
 | `test/e2e/agent_runtime_matrix_test.go` | Codex against a pinned read workspace, OpenCode read-intent enforcement, and Claude session wiring through the provider proxy (aimock as Vekil, or the live proxy), plus a digest-pinned Copilot image smoke assertion; it is not the canonical ACP release gate |
 | `test/e2e/gateway_test.go` | Authenticated Gateway ingress through a deterministic external `AgentRuntime`, including TLS adapter readiness, invalid bearer rejection, accepted and duplicate events, Task execution, completed events, delivered replies, idempotency, and Task/delivery correlation |
 | `.github/workflows/gateway-e2e.yml` | Focused, model-free, secret-free Gateway live E2E in Kind using generated bearer tokens, an ephemeral CA, the TLS reference adapter, and the deterministic echo runtime |
-| `.github/workflows/live-agent-sandbox-e2e.yml` / `scripts/live-agent-sandbox-e2e.sh` | Live upstream `agent-sandbox` Kind validation for Orka agent workspace claim, sandbox execution, delete cleanup, retained-session reuse, and token scrubbing using a fake model-free Claude runtime |
 | `.github/workflows/repository-monitor-smoke.yml` | Focused RepositoryMonitor smoke coverage for store CRUD, API handlers, pull request event handling, targeted single-PR inventory runs, controller queue/review flow, blocked status counts, read-only review task job building, result stdout forwarding, `create_pr_monitor` repository URL and credential validation, GitHub tool `repo_url` scope enforcement, and PR review marker tooling |
 | `.github/workflows/security-scan-e2e.yml` / `scripts/security-scan-e2e.sh` | Secret-free repository security scan Kind validation against pinned `sozercan/nodejs-goof` using the real mapper, deterministic fake Codex analyzer, v2 finding ingestion/drop diagnostics, threat-model rejection, idempotent rescan, and HITL no-auto-patch gating |
 | `test/e2e/tools_test.go` | Built-in tools (including `web_fetch`, `file_write`) and custom Tool CRD |
@@ -166,8 +172,8 @@ The Gateway Live E2E workflow (`.github/workflows/gateway-e2e.yml`) runs on manu
 
 ### Which CI lanes run for a pull request
 
-The Kind-based lanes are the slowest checks, so they skip changes that cannot affect them. `E2E Tests`,
-`Live Agent Sandbox E2E`, and `Live GitHub OIDC E2E` run for any change except `ui/`, `website/`, `docs/`, `examples/`,
+The Kind-based lanes are the slowest checks, so they skip changes that cannot affect them. `E2E Tests`
+and `Live GitHub OIDC E2E` run for any change except `ui/`, `website/`, `docs/`, `examples/`,
 Markdown, `.agents/`, `.claude/`, `LICENSE`, `.gitignore`, and `.github/` (a change to the lane's own workflow or to
 `.github/actions/` still runs it). `Gateway Live E2E` and the other path-listed lanes run only for the paths in their
 workflow. A UI change is covered by `UI Lint`, `UI Tests`, and the `Website` workflow, whose dashboard build runs `tsc -b`;
@@ -418,18 +424,26 @@ Secrets without printing their values and redact provider/GitHub token patterns
 from failure diagnostics.
 
 
-The live agent-sandbox workflow validates both the direct workspace-adapter
-lifecycle and the initial workspace-backed Orka harness v2 happy path. It builds the
-real Codex supervisor, routes a prompt through a local Responses-compatible
-fixture, waits for the Task to succeed, verifies provider-neutral status, and
-cleans up the dedicated RuntimePool. It does not replace release qualification
-or provide publication evidence. Its direct-adapter assertions
-also include:
+External workspace provider and core handoff tests live in the
+[shared repository](https://github.com/orka-agents/orka-workspace/blob/main/hack/external-workspace-e2e/README.md).
+The fake provider lane checks two-replica leader election, API field ownership,
+unauthorized writers, exact public Pod identity, and authorized retirement. Its
+core lane runs the production supervisor and a real RuntimeSession/Task with a
+deterministic ACP agent, verifies authenticated boot and prompt fences, and
+observes credential revocation and exact Pod termination.
 
-- the adapter creates a v1beta1 `SandboxClaim` with the expected `warmPoolRef` and executes a command with caller-supplied env inside the sandbox
-- `cleanupPolicy: delete` removes the generated `SandboxClaim`
-- `cleanupPolicy: retain` plus `reusePolicy: session` reattaches to the deterministic session claim
-- retained workspace state persists across tasks
+Standalone Sandbox and Substrate lanes verify native allocation, cold resume,
+filesystem data, and exact cleanup. Substrate also exports and imports verified
+data checkpoints after source deletion. They do not claim real core credential
+bootstrap or full-memory restore. NetworkPolicy object checks on default kind do
+not prove packet enforcement. An additional
+[native Core Task lane](https://github.com/orka-agents/orka-workspace/blob/v0.1.0-alpha.2/hack/external-substrate-e2e/README.md#actual-core-and-deployed-provider-task-proof)
+passed real fail-closed admission, sealed bootstrap, authenticated Serving,
+RuntimeSession and prompt execution, persisted result, and exact native/Core
+compute and credential retirement. The upgrade lane tests stock binary rejection of
+legacy pools and every retained workspace state before and after schema pruning.
+See [external workspace local proof](development.md#external-workspace-local-proof)
+for the two-repository workflow.
 
 The RepositoryMonitor validation bundle covers the canonical signed `orka:implement` entrypoint, durable intake, pause controls, and replay against GitHub fixtures.
 
@@ -441,41 +455,11 @@ The live GitHub OIDC workflow (`.github/workflows/live-github-oidc-e2e.yml`) run
 - top-level `requestedBy` and nested `spec.requestedBy` client tampering are rejected with `400`
 - the OIDC token does not appear in controller logs
 
-The Agent Substrate workflow runs the official pin in
-`hack/agent-substrate/upstream.env` without provider source patches. Every run
-includes direct sealed execution and files, MCP, ACP, controller restart,
-DataOnly suspension, cold continuation, checkpoint export and restore,
-cancellation, timeout, and cleanup. Native unit tests cover TLS and credential
-rotation, lost responses, source identity changes, reference races, and explicit
-recovery. Tests do not supply fork-only lifecycle preconditions.
-
-The ACP file scenario uses the real Codex runtime with a deterministic Responses
-fixture. The file Tasks have read-only intent, so each one runs a shell probe
-that must find no canary file and be denied creating one. The scenario probes,
-exports a checkpoint, probes again in the same session, deletes the source
-workspace, then restores the checkpoint and probes the restored workspace. The
-fixture requires successful probe output from the current turn, and the suite
-requires successful execution and `ReadValidated` delivery. Because read-intent
-Tasks cannot write, this scenario does not compare file bytes across a
-checkpoint. The workflow also
-runs a Linux regression as root to verify durable file ownership after session
-deletion, drain, and supervisor shutdown.
-
-The lifetime case starts a real shell command with a 300-second hold in a
-workspace with a 120-second `maxLifetime`. It verifies that expiry cancels the
-original prompt and removes its worker before the command can finish. The Task
-has a longer timeout, and the test does not cancel or delete it to force expiry.
-Session, workspace, pool, and saved-data cleanup must finish afterward.
-
-```bash
-bash scripts/tests/agent-substrate-e2e-hardening-test.sh
-KEEP_CLUSTER=1 bash scripts/agent-substrate-e2e.sh
-```
-
-Use a new dedicated `KIND_CLUSTER` or explicitly select
-`SUBSTRATE_REUSE_CLUSTER=1`. The installer never recreates an existing cluster.
-The provider owns its gVisor kind setup; the kubeconfig stays under the run's
-`bin/` directory. Live conformance requires a working Docker engine.
+Native Substrate MCP Tool and actor-pool behavior remains in core. External ACP
+allocation, lifecycle, and checkpoint conformance belongs to the shared provider
+repository. Each native proof records the pinned backend, provider source,
+resource identities, and observed termination; it does not add native lifecycle
+UID/version preconditions that the upstream protocol lacks.
 
 ### Frontend tests
 

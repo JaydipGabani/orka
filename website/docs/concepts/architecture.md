@@ -134,7 +134,7 @@ you can read them with `kubectl get`, but you never create or edit those objects
 | **AgentRuntime** | An external agent runtime registration. See [Bring your own agent runtime](../guides/bring-your-own-agent-runtime.md) |
 | **SubstrateActorPool** | A pool of Agent Substrate actors |
 | **GatewayClass**, **Gateway**, **GatewayBinding** | Connect chat apps and other agents (`gateway.orka.ai`). See [Gateways](../guides/gateways.md) |
-| **ExecutionWorkspaceClass** and related resources | Sandboxed execution workspaces (`workspace.orka.ai`, `acp.workspace.orka.ai`). Off by default. See [Execution workspaces](execution-workspaces.md) |
+| **ExecutionWorkspaceClass** and related resources | Sandboxed execution workspaces (`workspace.orka.ai`) from separately installed providers. Off by default. See [Execution workspaces](execution-workspaces.md) |
 
 Every field is in the [Resource reference](../reference/resources.md).
 

@@ -13,8 +13,9 @@ an external provider, dedicated to one Session. That buys two things.
   next message with its files intact. With Agent Substrate, its files can also be
   checkpointed, restored into a new workspace, or used as the starting point of a fork.
 
-Execution workspaces are off by default and flag-gated. Orka does not install or upgrade the
-providers; you run them.
+Execution workspaces are off by default and flag-gated. Each provider is a separate
+Deployment from the [orka-workspace](https://github.com/orka-agents/orka-workspace)
+repository. Orka does not install or upgrade the providers or their backends; you run them.
 
 :::note[Two different "workspaces"]
 `Task.spec.workspace` is the **repository** an agent works on: what to clone and where to
@@ -27,7 +28,7 @@ publish. Coding agents need it to clone or publish; without it they get an empty
 | | [Agent Sandbox](agent-sandbox.md) | [Agent Substrate](substrate.md) |
 | --- | --- | --- |
 | Project | [kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) | [Agent Substrate](https://github.com/agent-substrate/substrate) |
-| Where the agent runs | A sandbox Pod from a template Orka renders | A gVisor-isolated actor on a dedicated worker pool |
+| Where the agent runs | A sandbox Pod the provider creates from Orka's frozen runtime request | A gVisor-isolated actor on a dedicated worker pool |
 | Suspend and cold resume | Yes, keeping a durable volume | Yes, keeping a data-only snapshot |
 | Checkpoint, restore, and fork from saved files | No | Yes |
 | Also hosts | — | MCP servers for [Tools](../reference/resources.md#tool) |
@@ -43,11 +44,8 @@ Watch [Suspend an agent workspace and keep its files](https://www.youtube.com/wa
 
 ## Request a workspace
 
-There are two ways to ask for one.
-
-**Name a class.** An operator publishes `ExecutionWorkspaceClass` objects that bundle the
-provider, its parameters, and lifecycle rules, and users pick one by name. This is the
-recommended path, and the only one that supports suspension and checkpoints:
+An operator publishes `ExecutionWorkspaceClass` objects that bind a registered provider, its
+profile, and lifecycle rules. Users pick one by name:
 
 ```yaml
 spec:
@@ -59,28 +57,19 @@ spec:
       reusePolicy: session
 ```
 
-**Name a provider directly.** A Task can also select a provider without a class:
-
-```yaml
-spec:
-  type: agent
-  execution:
-    workspace:
-      enabled: true
-      provider: agent-sandbox
-```
-
-Either way, repository access still comes from top-level `spec.workspace`, and each workspace
-gets its own single-session RuntimePool named `acp-ws-*`. Task status reports a
-provider-neutral phase and reason; provider-native names never appear in it. Options Orka
-cannot honor are rejected before anything is created.
+Repository access still comes from top-level `spec.workspace`, and each workspace gets its
+own single-session RuntimePool named `acp-ws-*`. Task status reports a provider-neutral phase
+and reason; provider-native names never appear in it. Provider, template, and pool selectors
+do not belong in a Task. Options the class does not permit are rejected before anything is
+created.
 
 ## Turn it on
 
-| What you want | Controller flags |
-| --- | --- |
-| Direct provider requests | `--acp-workspace-dispatch-enabled` plus `--agent-sandbox-enabled` or `--substrate-enabled`. Agent Substrate also needs its API connection settings and `--substrate-direct-egress-enabled`; see [Agent Substrate](substrate.md#native-provider-setup). |
-| Classes, suspension, and checkpoints | The above, plus `--enable-workspace-provider-api` and the Task provenance and workspace-class-use admission webhooks |
+Core needs `--enable-workspace-provider-api`, `--acp-workspace-dispatch-enabled`, and the Task
+provenance and workspace-class-use admission webhooks. Core has no Sandbox or Substrate
+allocation flag: install the provider and admit its registration and classes as described in
+[Agent Sandbox](agent-sandbox.md#install-and-select-a-class) and
+[Agent Substrate](substrate.md#install-the-external-acp-provider).
 
 Choosing a class is authorized: the caller needs Kubernetes `use` on that
 `ExecutionWorkspaceClass`, and restoring needs `use` on the checkpoint.
@@ -89,7 +78,7 @@ admission webhooks, the class resources, detach behavior, and expiry.
 
 ## Read next
 
-- [Agent Sandbox workspaces](agent-sandbox.md) — the execution model and fail-closed boundaries.
+- [Agent Sandbox workspaces](agent-sandbox.md) — installation, startup ownership, suspension, and deletion.
 - [Agent Substrate workspaces](substrate.md) — provider setup, cold suspension, checkpoints, forks, and recovery.
 - [Architecture decision records](https://github.com/orka-agents/orka/tree/main/docs/adr) 0024–0031 —
   the full provider-neutral contract.

@@ -203,7 +203,7 @@ func TestPlanAgentExecutionRejectsToolboxCombinations(t *testing.T) {
 	}
 
 	workspaceTask := task.DeepCopy()
-	workspaceTask.Spec.Execution = &corev1alpha1.ExecutionSpec{Workspace: &corev1alpha1.ExecutionWorkspaceSpec{Enabled: true}}
+	workspaceTask.Spec.Execution = &corev1alpha1.ExecutionSpec{Workspace: &corev1alpha1.ExecutionWorkspaceSpec{ClassRef: &corev1alpha1.WorkspaceClassReference{Name: "acp-class"}}}
 	plan = reconciler.planAgentExecution(t.Context(), workspaceTask, acpTestToolboxAgent(acpTestToolbox("/opt/yq", "bin")))
 	if plan.path != agentExecutionPathRejected || !strings.Contains(plan.rejectionReason, "execution.workspace") {
 		t.Fatalf("execution workspace with toolboxes must be rejected, got %#v", plan)
