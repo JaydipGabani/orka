@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
@@ -154,7 +155,11 @@ func (fixture *packetFixture) packet(names ...string) Packet {
 func TestPacketPinnedPublicSelectionWithoutMaterializingVendoredSource(t *testing.T) {
 	t.Setenv("GH_TOKEN", "synthetic-only")
 	t.Setenv("GITHUB_TOKEN", "synthetic-only")
-	t.Setenv("HTTPS_PROXY", "http://fixture:fixture@127.0.0.1:1")
+	t.Setenv("HTTPS_PROXY", (&url.URL{
+		Scheme: "http",
+		Host:   "127.0.0.1:1",
+		User:   url.UserPassword("SYNTHETIC_USER_"+rand.Text(), "SYNTHETIC_PASSWORD_"+rand.Text()),
+	}).String())
 	for _, identityLength := range []int{40, 64} {
 		t.Run(fmt.Sprint(identityLength), func(t *testing.T) {
 			fixture := newPacketFixture(t, identityLength,
@@ -236,7 +241,12 @@ func TestPacketSelectionValidationPrecedesAllHTTP(t *testing.T) {
 		func(target *Target) { target.Repository.Owner = "other" },
 		func(target *Target) { target.Repository.Name = "other" },
 		func(target *Target) {
-			target.Repository.URL = "https://fixture-user@github.com/source-fixtures/project"
+			target.Repository.URL = (&url.URL{
+				Scheme: "https",
+				Host:   "github.com",
+				Path:   "/source-fixtures/project",
+				User:   url.User("SYNTHETIC_USER_" + rand.Text()),
+			}).String()
 		},
 		func(target *Target) { target.Repository.URL += ".git" },
 		func(target *Target) { target.Repository.URL += "?token=synthetic" },

@@ -1,7 +1,9 @@
 package source
 
 import (
+	"crypto/rand"
 	"encoding/json"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -88,7 +90,14 @@ func TestDecodePacketRejectsAmbiguousMalformedAndInexactDocuments(t *testing.T) 
 	}
 	for _, mutate := range []func(*Packet){
 		func(packet *Packet) { packet.Target.Commit = "HEAD" },
-		func(packet *Packet) { packet.Target.Repository.URL = "https://user:fixture@github.com/owner/repo" },
+		func(packet *Packet) {
+			packet.Target.Repository.URL = (&url.URL{
+				Scheme: "https",
+				Host:   "github.com",
+				Path:   "/owner/repo",
+				User:   url.UserPassword("SYNTHETIC_USER_"+rand.Text(), "SYNTHETIC_PASSWORD_"+rand.Text()),
+			}).String()
+		},
 		func(packet *Packet) { packet.Files = nil },
 		func(packet *Packet) { packet.Files = append(packet.Files, packet.Files[0]) },
 		func(packet *Packet) { packet.Files[0].Path = "../file" },

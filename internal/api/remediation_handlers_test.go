@@ -3,12 +3,14 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -343,6 +345,8 @@ func TestRemediationNamespacesAndRunIDsAreExact(t *testing.T) {
 func TestRemediationInputValidationBeforeSubmission(t *testing.T) {
 	base := remediationTestRequest()
 	baseJSON := remediationRequestJSON(t, base)
+	password := "SYNTHETIC_PASSWORD_" + rand.Text()
+	credentials := url.UserPassword("SYNTHETIC_USER_"+rand.Text(), password)
 	cases := map[string]string{
 		"not-object":           `[]`,
 		"null":                 `null`,
@@ -383,7 +387,14 @@ func TestRemediationInputValidationBeforeSubmission(t *testing.T) {
 		{"conflicting-ref", func(r *contract.Request) {
 			r.Report = json.RawMessage(`{"title":"Synthetic","problem":"Synthetic","ref":"other"}`)
 		}},
-		{"credentials-in-repository", func(r *contract.Request) { r.Repository = "https://user:synthetic@github.com/example/synthetic" }},
+		{"credentials-in-repository", func(r *contract.Request) {
+			r.Repository = (&url.URL{
+				Scheme: "https",
+				Host:   "github.com",
+				Path:   "/example/synthetic",
+				User:   credentials,
+			}).String()
+		}},
 		{"ref-whitespace", func(r *contract.Request) { r.Ref = " v1.0.0" }},
 	} {
 		request := base
@@ -403,7 +414,8 @@ func TestRemediationInputValidationBeforeSubmission(t *testing.T) {
 			require.Equal(t, expected, status, result)
 			require.Empty(t, service.calls)
 			require.NotContains(t, result, "Synthetic")
-			require.NotContains(t, result, "user:")
+			require.NotContains(t, result, credentials.Username())
+			require.NotContains(t, result, password)
 			require.Equal(t, "private, no-store", headers.Get("Cache-Control"))
 		})
 	}

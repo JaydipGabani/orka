@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -140,7 +141,12 @@ func TestResolveRejectsNoncanonicalRepositoryURLsBeforeHTTP(t *testing.T) {
 		"", " ", "https://github.com", fixtureURL + "/", fixtureURL + "/tree/main", fixtureURL + "?x=y",
 		fixtureURL + "?", fixtureURL + "#fragment", fixtureURL + "#", fixtureURL + "%00",
 		"http://github.com/source-fixtures/project", "ssh://github.com/source-fixtures/project",
-		"git@github.com:source-fixtures/project.git", "https://token@github.com/source-fixtures/project",
+		"git@github.com:source-fixtures/project.git", (&url.URL{
+			Scheme: "https",
+			Host:   "github.com",
+			Path:   "/source-fixtures/project",
+			User:   url.User("SYNTHETIC_USER_" + rand.Text()),
+		}).String(),
 		"https://github.com:443/source-fixtures/project", "https://github.com./source-fixtures/project",
 		"https://GITHUB.COM/source-fixtures/project", "https://github.com.evil.invalid/source-fixtures/project",
 		"https://github.com/source-fixtures/..", "https://github.com/source-fixtures/.",
@@ -261,11 +267,24 @@ func TestResolveRejectsEveryRedirect(t *testing.T) {
 		destinationRequests.Add(1)
 	}))
 	t.Cleanup(destination.Close)
-	for _, location := range []string{destination.URL, "/different", "https://api.github.com/other", "http://user:fixture@127.0.0.1/"} {
-		t.Run(location, func(t *testing.T) {
+	password := "SYNTHETIC_PASSWORD_" + rand.Text()
+	credentials := url.UserPassword("SYNTHETIC_USER_"+rand.Text(), password)
+	credentialURL := (&url.URL{
+		Scheme: "http",
+		Host:   "127.0.0.1",
+		Path:   "/",
+		User:   credentials,
+	}).String()
+	for _, redirect := range []struct{ name, location string }{
+		{"absolute", destination.URL},
+		{"relative", "/different"},
+		{"foreign-host", "https://api.github.com/other"},
+		{"credentials", credentialURL},
+	} {
+		t.Run(redirect.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				require.Equal(t, fixturePrefix, request.URL.Path)
-				http.Redirect(writer, request, location, http.StatusFound)
+				http.Redirect(writer, request, redirect.location, http.StatusFound)
 			}))
 			t.Cleanup(server.Close)
 			client := Client{APIBaseURL: server.URL, HTTPClient: server.Client()}
@@ -275,7 +294,8 @@ func TestResolveRejectsEveryRedirect(t *testing.T) {
 			}
 			_, err := client.Resolve(t.Context(), fixtureURL, "")
 			require.ErrorContains(t, err, "HTTP 302")
-			require.NotContains(t, err.Error(), "user:fixture")
+			require.NotContains(t, err.Error(), credentials.Username())
+			require.NotContains(t, err.Error(), password)
 		})
 	}
 	require.Zero(t, destinationRequests.Load())
@@ -284,7 +304,11 @@ func TestResolveRejectsEveryRedirect(t *testing.T) {
 func TestResolveIsAnonymousDespiteAmbientCredentials(t *testing.T) {
 	t.Setenv("GH_TOKEN", "synthetic-token-only")
 	t.Setenv("GITHUB_TOKEN", "synthetic-token-only")
-	t.Setenv("HTTPS_PROXY", "http://fixture:fixture@127.0.0.1:1")
+	t.Setenv("HTTPS_PROXY", (&url.URL{
+		Scheme: "http",
+		Host:   "127.0.0.1:1",
+		User:   url.UserPassword("SYNTHETIC_USER_"+rand.Text(), "SYNTHETIC_PASSWORD_"+rand.Text()),
+	}).String())
 	fixture := newAPIFixture(t, map[string]apiReply{
 		fixturePrefix:                   {http.StatusOK, repositoryJSON()},
 		fixturePrefix + "/commits/main": {http.StatusOK, commitJSON(fixtureCommit, fixtureTree)},
@@ -315,7 +339,11 @@ func TestResolveAPIOverrideAndDeadlines(t *testing.T) {
 	for _, base := range []string{
 		"https://elsewhere.invalid", "http://api.github.com", "https://api.github.com/",
 		"http://127.0.0.1/path", "http://127.0.0.1?x=y", "http://127.0.0.1?", "http://127.0.0.1#",
-		"http://user:fixture@127.0.0.1", "file:///tmp", "http://0.0.0.0", "http://127.0.0.1.evil.invalid",
+		(&url.URL{
+			Scheme: "http",
+			Host:   "127.0.0.1",
+			User:   url.UserPassword("SYNTHETIC_USER_"+rand.Text(), "SYNTHETIC_PASSWORD_"+rand.Text()),
+		}).String(), "file:///tmp", "http://0.0.0.0", "http://127.0.0.1.evil.invalid",
 	} {
 		_, err := (Client{APIBaseURL: base}).apiBase()
 		require.Error(t, err)

@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,6 +95,8 @@ func TestRemediationCommandSurface(t *testing.T) {
 func TestRemediationRequiredInputsAndModes(t *testing.T) {
 	directory := remediationTestDirectory(t)
 	patch := remediationTestFile(t, directory, "candidate.patch", remediationSyntheticPatch)
+	password := "SYNTHETIC_PASSWORD_" + rand.Text()
+	credentials := url.UserPassword("SYNTHETIC_USER_"+rand.Text(), password)
 	for _, tc := range []struct {
 		name, report, mode, patch string
 	}{
@@ -101,7 +105,11 @@ func TestRemediationRequiredInputsAndModes(t *testing.T) {
 		{"missing-repository", `{"title":"synthetic","problem":"synthetic","ref":"v1"}`, "generate", ""},
 		{"missing-ref", `{"title":"synthetic","problem":"synthetic","repository":"https://github.com/example/synthetic"}`, "generate", ""},
 		{"version-not-ref", `{"title":"synthetic","problem":"synthetic","repository":"https://github.com/example/synthetic","version":"v1"}`, "generate", ""},
-		{"credential-url", strings.Replace(remediationSyntheticReport, "https://github.com", "https://synthetic:credential@github.com", 1), "generate", ""},
+		{"credential-url", strings.Replace(remediationSyntheticReport, "https://github.com", (&url.URL{
+			Scheme: "https",
+			Host:   "github.com",
+			User:   credentials,
+		}).String(), 1), "generate", ""},
 		{"local-source", strings.Replace(remediationSyntheticReport, "https://github.com/example/synthetic", "./source", 1), "generate", ""},
 		{"duplicate-ref", strings.TrimSuffix(remediationSyntheticReport, "}") + `,"ref":"other"}`, "generate", ""},
 		{"case-collision", strings.TrimSuffix(remediationSyntheticReport, "}") + `,"REF":"other"}`, "generate", ""},
@@ -121,7 +129,8 @@ func TestRemediationRequiredInputsAndModes(t *testing.T) {
 			}
 			_, err := readRemediationInput(input, contract.Mode(tc.mode), "request-one")
 			require.Error(t, err)
-			require.NotContains(t, err.Error(), "synthetic:credential")
+			require.NotContains(t, err.Error(), credentials.Username())
+			require.NotContains(t, err.Error(), password)
 		})
 	}
 	description := remediationTestFile(t, directory, "description.json", strings.Replace(remediationSyntheticReport, `"problem":`, `"description":`, 1))

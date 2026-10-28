@@ -1,6 +1,8 @@
 package intake
 
 import (
+	"crypto/rand"
+	"net/url"
 	"reflect"
 	"slices"
 	"strings"
@@ -70,6 +72,7 @@ func TestSensitiveTechnicalTextIsRedacted(t *testing.T) {
 	t.Parallel()
 	token := "ghp_" + strings.Repeat("s", 36)
 	key := "-----BEGIN PRIVATE KEY-----\nSYNTHETIC_KEY_MARKER\n-----END PRIVATE KEY-----"
+	username, password := "SYNTHETIC_USER_"+rand.Text(), "SYNTHETIC_PASSWORD_"+rand.Text()
 	report := parseFixture(t, marshalFixture(t, map[string]any{
 		"title": "Synthetic contact synthetic.person@example.invalid",
 		"problem": strings.Join([]string{
@@ -81,7 +84,12 @@ func TestSensitiveTechnicalTextIsRedacted(t *testing.T) {
 			"api_key=SYNTHETIC_ASSIGNMENT_MARKER",
 			"Token is SYNTHETIC_NATURAL_MARKER",
 			"credential token " + token,
-			"See https://synthetic-user:SYNTHETIC_URL_MARKER@github.com/fixture-org/repo",
+			"See " + (&url.URL{
+				Scheme: "https",
+				Host:   "github.com",
+				Path:   "/fixture-org/repo",
+				User:   url.UserPassword(username, password),
+			}).String(),
 			"See https://github.com/fixture-org/repo?sig=SYNTHETIC_QUERY_MARKER",
 			"Customer: SYNTHETIC_CUSTOMER_MARKER",
 			"Tenant ID: SYNTHETIC_TENANT_MARKER",
@@ -91,7 +99,7 @@ func TestSensitiveTechnicalTextIsRedacted(t *testing.T) {
 	}))
 	for _, forbidden := range []string{
 		"synthetic.person", "11111111", "555555555555", "SYNTHETIC_", token,
-		"synthetic-user", "PRIVATE KEY",
+		username, password, "PRIVATE KEY",
 	} {
 		assertNoMarker(t, report, forbidden)
 	}
@@ -107,8 +115,18 @@ func TestOnlyCanonicalRepositoryReferencesQualify(t *testing.T) {
 	for _, repository := range []string{
 		"http://github.com/fixture-org/repo",
 		"git@github.com:fixture-org/repo",
-		"https://synthetic-user:SYNTHETIC_VALUE@github.com/fixture-org/repo",
-		"https://synthetic-user@github.com/fixture-org/repo",
+		(&url.URL{
+			Scheme: "https",
+			Host:   "github.com",
+			Path:   "/fixture-org/repo",
+			User:   url.UserPassword("SYNTHETIC_USER_"+rand.Text(), "SYNTHETIC_PASSWORD_"+rand.Text()),
+		}).String(),
+		(&url.URL{
+			Scheme: "https",
+			Host:   "github.com",
+			Path:   "/fixture-org/repo",
+			User:   url.User("SYNTHETIC_USER_" + rand.Text()),
+		}).String(),
 		"https://github.com/fixture-org/repo?token=SYNTHETIC_VALUE",
 		"https://github.com/fixture-org/repo?tab=readme",
 		"https://github.com/fixture-org/repo?",
