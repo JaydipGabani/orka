@@ -16,6 +16,7 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
+	"github.com/orka-agents/orka/internal/workerenv"
 )
 
 const (
@@ -91,7 +92,7 @@ var childMessagingToolNames = []string{
 	checkMessagesToolName,
 }
 
-// MemoryToolNames returns the AI worker's always-on memory tool names.
+// MemoryToolNames returns the AI worker's automatically enabled memory tools.
 func MemoryToolNames() []string {
 	return append([]string(nil), memoryToolNames...)
 }
@@ -137,7 +138,7 @@ func IsImplicitTool(task *corev1alpha1.Task, agent *corev1alpha1.Agent, name str
 			}
 		}
 	}
-	return task != nil && task.Spec.Type == corev1alpha1.TaskTypeAI && containsTool(memoryToolNames, name)
+	return injectsMemoryTools(task) && containsTool(memoryToolNames, name)
 }
 
 func containsTool(tools []string, name string) bool {
@@ -150,6 +151,18 @@ func usesAIWorkerToolRegistry(task *corev1alpha1.Task, agent *corev1alpha1.Agent
 		return false
 	}
 	return task == nil || task.Spec.Type == "" || task.Spec.Type == corev1alpha1.TaskTypeAI
+}
+
+func injectsMemoryTools(task *corev1alpha1.Task) bool {
+	if task == nil || task.Spec.Type != corev1alpha1.TaskTypeAI {
+		return false
+	}
+	for _, variable := range slices.Backward(task.Spec.Env) {
+		if variable.Name == workerenv.MemoryToolsAutoEnable {
+			return variable.ValueFrom != nil || !strings.EqualFold(strings.TrimSpace(variable.Value), "false")
+		}
+	}
+	return true
 }
 
 func injectsChildMessagingTools(task *corev1alpha1.Task, agent *corev1alpha1.Agent) bool {
@@ -175,7 +188,8 @@ func injectsChildMessagingTools(task *corev1alpha1.Task, agent *corev1alpha1.Age
 // Resolve returns the ordered, de-duplicated configured and implicit tool set
 // exposed for task. Container tasks do not expose AI tools. Agent tasks retain
 // configured/brokered tools and built-in agent children get messaging tools.
-// The in-process AI worker additionally gets its always-on memory tools.
+// The in-process AI worker additionally gets memory tools unless automatic
+// injection is explicitly disabled.
 // Consumers loading Tool CRs must also enforce ValidateRemoteMCPSelection;
 // this name-only resolver cannot distinguish remote backends from legacy Tools.
 func Resolve(task *corev1alpha1.Task, agent *corev1alpha1.Agent) []string {
@@ -226,7 +240,7 @@ func Resolve(task *corev1alpha1.Task, agent *corev1alpha1.Agent) []string {
 		appendTools(childMessagingToolNames)
 	}
 
-	if task != nil && task.Spec.Type == corev1alpha1.TaskTypeAI {
+	if injectsMemoryTools(task) {
 		appendTools(memoryToolNames)
 	}
 

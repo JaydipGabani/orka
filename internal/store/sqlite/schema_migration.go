@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,9 +14,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// Fingerprints cover every non-internal object, not just object counts or a
-// version marker. Keep these and the transition SQL immutable: deriving them
-// from currentSchemaStatements would accidentally recognize unknown layouts.
+// Fingerprints cover every core object after exact optional-schema validation,
+// not just object counts or a version marker. Keep these and the transition SQL
+// immutable: deriving them from currentSchemaStatements would accidentally
+// recognize unknown layouts.
 const (
 	schema149 = "ed423eaa2f45dedb1bd935dff5840016ea0d5976709a2ffecc9d2efb6a9d5ff7" // 0e567418
 	schema150 = "66de67c84e6cf135ea10f5aa98ebb0a65eb920f2742be8c0bd27c5d651167df8" // #731, 1f18614c
@@ -77,7 +79,11 @@ func upgradeSchema(db *sql.DB, path string, validationErr error) error {
 	if err != nil {
 		return err
 	}
-	source := schemaFingerprint(schema)
+	core, optional, err := splitOptionalValidationSchema(schema)
+	if err != nil {
+		return err
+	}
+	source := schemaFingerprint(core)
 	steps := schemaMigrations()
 	first := -1
 	for i, step := range steps {
@@ -94,13 +100,15 @@ func upgradeSchema(db *sql.DB, path string, validationErr error) error {
 		return fmt.Errorf("back up SQLite before upgrade: %w", err)
 	}
 	log.FromContext(ctx).WithName("sqlite-store").Info("Retained SQLite pre-upgrade backup", "path", backup)
-	if err := runSchemaMigrations(ctx, conn, source, steps[first:]); err != nil {
+	if err := runSchemaMigrations(ctx, conn, source, optional, steps[first:]); err != nil {
 		return fmt.Errorf("upgrade SQLite (pre-upgrade backup %q): %w", backup, err)
 	}
 	return nil
 }
 
-func runSchemaMigrations(ctx context.Context, conn *sql.Conn, source string, steps []schemaMigration) error {
+// optional is the exact retained schema captured before backup, not a set
+// rediscovered after acquiring the write lock.
+func runSchemaMigrations(ctx context.Context, conn *sql.Conn, source string, optional map[string]string, steps []schemaMigration) error {
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return err
 	}
@@ -109,7 +117,8 @@ func runSchemaMigrations(ctx context.Context, conn *sql.Conn, source string, ste
 	if err != nil {
 		return err
 	}
-	if schemaFingerprint(schema) != source {
+	core, retained, err := splitOptionalValidationSchema(schema)
+	if err != nil || schemaFingerprint(core) != source || !maps.Equal(retained, optional) {
 		return fmt.Errorf("SQLite schema changed after backup; refusing upgrade")
 	}
 	for _, step := range steps {
@@ -123,12 +132,13 @@ func runSchemaMigrations(ctx context.Context, conn *sql.Conn, source string, ste
 		if err != nil {
 			return err
 		}
-		if schemaFingerprint(schema) != step.to {
+		core, retained, err = splitOptionalValidationSchema(schema)
+		if err != nil || schemaFingerprint(core) != step.to || !maps.Equal(retained, optional) {
 			return fmt.Errorf("SQLite transition produced an unexpected layout")
 		}
 		source = step.to
 	}
-	if err := validateSchema(schema, currentSchemaStatements()); err != nil {
+	if err := validateSchema(core, currentSchemaStatements()); err != nil {
 		return err
 	}
 	if err := checkSchemaIntegrity(ctx, conn); err != nil {

@@ -47,6 +47,7 @@ const sidebars = {
             'guides/repository-monitors',
             'guides/issue-to-pr-automation',
             'guides/repository-security-scanning',
+            'guides/report-remediation',
             'guides/usage-and-pr-outcomes',
           ],
         },

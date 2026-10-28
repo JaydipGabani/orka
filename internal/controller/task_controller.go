@@ -116,6 +116,8 @@ type TaskReconciler struct {
 	APIReader                    client.Reader
 	Scheme                       *runtime.Scheme
 	JobBuilder                   *JobBuilder
+	ValidationTaskReconciler     ValidationTaskReconciler
+	RemediationTaskReconciler    RemediationTaskReconciler
 	GatewayService               *gatewayruntime.Service
 	SessionManager               *SessionManager
 	WebhookNotifier              *WebhookNotifier
@@ -312,6 +314,14 @@ func taskPhaseCountsTowardConcurrency(phase corev1alpha1.TaskPhase) bool {
 	}
 }
 
+type ValidationTaskReconciler interface {
+	ReconcileValidationTask(context.Context, *corev1alpha1.Task) (ctrl.Result, bool, error)
+}
+
+type RemediationTaskReconciler interface {
+	ReconcileRemediationTask(context.Context, *corev1alpha1.Task) (ctrl.Result, bool, error)
+}
+
 // Reconcile handles the reconciliation loop for Task resources
 func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -330,6 +340,18 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 	if err := r.retainUsageTask(ctx, task); err != nil {
 		return ctrl.Result{}, err
+	}
+	if r.RemediationTaskReconciler != nil {
+		result, handled, err := r.RemediationTaskReconciler.ReconcileRemediationTask(ctx, task)
+		if handled || err != nil {
+			return result, err
+		}
+	}
+	if r.ValidationTaskReconciler != nil {
+		result, handled, err := r.ValidationTaskReconciler.ReconcileValidationTask(ctx, task)
+		if handled || err != nil {
+			return result, err
+		}
 	}
 	if tx := task.Spec.Transaction; tx != nil {
 		values := []any{}

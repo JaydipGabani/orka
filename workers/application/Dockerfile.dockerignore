@@ -1,0 +1,9 @@
+**
+!go.mod
+!go.sum
+!internal
+!internal/patchverification
+!internal/patchverification/**
+!workers
+!workers/application
+!workers/application/**
