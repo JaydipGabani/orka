@@ -378,7 +378,12 @@ hold; admission must not be removed while an authorized workload can still act.
 
 Normal zero-to-one activation requires actual actor stimulus, subject
 reconciliation and real changed replica/ready-replica observations, not an
-actor/model-created HPA or fabricated status. Full one-to-many autoscaling and
+actor/model-created HPA or fabricated status. The positive, non-initial ready
+transition is required only for a healthy normal result. Failed normal results
+still require exact Deployment/descendant identities and measured count/output
+agreement, so an unchanged or partially ready count can be compared against the
+frozen failure expectation rather than discarded as invalid evidence.
+Full one-to-many autoscaling and
 metrics-adapter behavior are outside that minimal control claim and require
 their real operator-provided prerequisites. No general `apps`/`batch`,
 cross-namespace target, arbitrary model PodSpec, Jobs or template mutation is

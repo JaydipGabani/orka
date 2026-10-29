@@ -25,7 +25,7 @@ func validateApplicationReplicaEvidence(manifest Manifest, check Check, observat
 		return err
 	}
 	if check.Kind == Normal {
-		return validateApplicationReplicaNormal(observation)
+		return validateApplicationReplicaNormal(check, observation)
 	}
 	return nil
 }
@@ -66,10 +66,12 @@ func validateApplicationReplicaDescendants(profile *ApplicationFixtureProfile, o
 	return nil
 }
 
-func validateApplicationReplicaNormal(observation Observation) error {
+func validateApplicationReplicaNormal(check Check, observation Observation) error {
 	proof := observation.Application.Replica
-	if proof.ReadyReplicas == 0 || proof.DesiredReplicas != proof.ReadyReplicas ||
-		proof.ReadyReplicas == proof.InitialReplicas {
+	content, _ := json.Marshal(observation.Application.Kubernetes.Result)
+	if string(content) == check.Healthy.Stdout &&
+		(proof.ReadyReplicas == 0 || proof.DesiredReplicas != proof.ReadyReplicas ||
+			proof.ReadyReplicas == proof.InitialReplicas) {
 		return errors.New("normal scaling must demonstrate non-initial ready replicas, not a fixture assertion")
 	}
 	raw, _ := json.Marshal(proof.ReadyReplicas)
